@@ -463,6 +463,10 @@ struct DemoApp {
     /// Audio-integration seam: interactive key presses are delivered here.
     note_sink: Option<NoteSink>,
 
+    /// Set by raw_input_hook when Tab is pressed (stripped from egui's input
+    /// so focus navigation never sees it); consumed in ui().
+    flip_requested: bool,
+
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
     key_input: String,
@@ -565,6 +569,7 @@ impl DemoApp {
             help_foot_g: None,
             arrivals: [(0, 0.0); 32],
             note_sink,
+            flip_requested: false,
             assistant: Assistant::new(),
             key_input: String::new(),
             chat_input: String::new(),
@@ -2151,6 +2156,24 @@ fn p_side(unit: usize, app: &DemoApp) -> f32 {
 }
 
 impl eframe::App for DemoApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Tab belongs to the rack flip, ALWAYS. Strip it from raw input before
+        // egui processes anything, so its focus navigation can't steal it and
+        // bounce focus between the assistant field and the widgets.
+        let mut flip = false;
+        raw_input.events.retain(|ev| {
+            if matches!(ev, egui::Event::Key { key: Key::Tab, pressed: true, .. }) {
+                flip = true;
+                false
+            } else {
+                true
+            }
+        });
+        if flip {
+            self.flip_requested = true;
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ensure_galleys(&ctx);
@@ -2167,10 +2190,8 @@ impl eframe::App for DemoApp {
             eprintln!("ui scale: first-frame ppp={:.2}", ctx.pixels_per_point());
         }
 
-        // Tab ALWAYS flips the rack — consume it before egui's focus navigation
-        // or the typing gate can steal it (the assistant panel has focusable
-        // widgets; without this, Tab silently moves focus instead of flipping).
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+        if self.flip_requested {
+            self.flip_requested = false;
             self.start_flip();
         }
 

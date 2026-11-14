@@ -275,7 +275,7 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **Done when:** installed from the launcher, gig-ready.
 
 **Later:** Ableton Link · MIDI clock · OSC · VST3 · out-of-process hosting ·
-embedded plugin UIs · multichannel · MPE · 96 kHz.
+cpal native-PipeWire host (`pipewire` feature) · multichannel · MPE · 96 kHz.
 
 Estimates: playable host ≈ 3–4 weeks · AUM-core ≈ 6 weeks · full ≈ 3 months (evenings).
 

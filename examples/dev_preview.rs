@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use midir::os::unix::VirtualInput;
-use midir::{Ignore, MidiInput};
+use midir::os::unix::{VirtualInput, VirtualOutput};
+use midir::{Ignore, MidiInput, MidiOutput};
 
 const MAX_EVENTS: usize = 200;
 const BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x16, 0x1e);
@@ -45,6 +45,11 @@ struct PreviewApp {
     midi_status: String,
     // Kept alive so the virtual port stays open.
     _midi_conn: Option<midir::MidiInputConnection<()>>,
+    keys_out: Option<midir::MidiOutputConnection>,
+    keys_tx: rtrb::Producer<(u8, bool)>,
+    _synth_stream: Option<cpal::Stream>,
+    synth_status: String,
+    pressed_note: Option<u8>,
     tone_busy: Arc<AtomicBool>,
     audio_info: String,
 }
@@ -97,10 +102,74 @@ impl PreviewApp {
             Err(e) => (format!("MIDI unavailable: {e}"), None),
         };
 
+        // On-screen keys also expose a real ALSA output port, so they can be
+        // wired into other apps (e.g. Surge standalone) via aconnect/qpwgraph.
+        let keys_out = MidiOutput::new("kabelsalat-keys")
+            .ok()
+            .and_then(|out| out.create_virtual("kabelsalat-keys").ok());
+
+        // Built-in sine synth, loaded at start: a persistent output stream driven
+        // by a lock-free ring of (note, on) messages from the on-screen keys.
+        let (keys_tx, mut synth_rx) = rtrb::RingBuffer::<(u8, bool)>::new(64);
+        let synth = (|| -> anyhow::Result<cpal::Stream> {
+            let host = cpal::default_host();
+            let device = host
+                .default_output_device()
+                .ok_or_else(|| anyhow::anyhow!("no output device"))?;
+            let cfg = device.default_output_config()?;
+            let sr = cfg.sample_rate() as f64;
+            let ch = cfg.channels() as usize;
+            let mut freq = 440.0f64;
+            let mut gate = false;
+            let mut env = 0.0f32;
+            let mut phase = 0.0f64;
+            let mut current_note = 0u8;
+            let stream = device.build_output_stream(
+                cfg.into(),
+                move |data: &mut [f32], _| {
+                    while let Ok((note, on)) = synth_rx.pop() {
+                        if on {
+                            current_note = note;
+                            freq = 440.0 * 2.0f64.powf((note as f64 - 69.0) / 12.0);
+                            gate = true;
+                        } else if note == current_note {
+                            gate = false;
+                        }
+                    }
+                    let target = if gate { 0.15f32 } else { 0.0 };
+                    let coeff = if gate { 0.005f32 } else { 0.0005 };
+                    for frame in data.chunks_mut(ch) {
+                        env += (target - env) * coeff;
+                        phase += freq / sr;
+                        if phase >= 1.0 {
+                            phase -= 1.0;
+                        }
+                        let s = (phase * std::f64::consts::TAU).sin() as f32 * env;
+                        for x in frame.iter_mut() {
+                            *x = s;
+                        }
+                    }
+                },
+                |e| eprintln!("synth stream error: {e}"),
+                None,
+            )?;
+            stream.play()?;
+            Ok(stream)
+        })();
+        let (synth_status, synth_stream) = match synth {
+            Ok(s) => ("sine synth loaded — click the keys".to_string(), Some(s)),
+            Err(e) => (format!("synth failed: {e}"), None),
+        };
+
         Self {
             events,
             midi_status,
             _midi_conn: midi_conn,
+            keys_out,
+            keys_tx,
+            _synth_stream: synth_stream,
+            synth_status,
+            pressed_note: None,
             tone_busy: Arc::new(AtomicBool::new(false)),
             audio_info,
         }
@@ -155,6 +224,119 @@ impl PreviewApp {
             busy.store(false, Ordering::SeqCst);
         });
     }
+
+    fn note_event(&mut self, note: u8, on: bool) {
+        let _ = self.keys_tx.push((note, on));
+        let msg = [if on { 0x90 } else { 0x80 }, note, if on { 100 } else { 0 }];
+        if let Some(conn) = &mut self.keys_out {
+            let _ = conn.send(&msg);
+        }
+        let text = format!(
+            "[keys] {} key={}",
+            if on { "Note on " } else { "Note off" },
+            note
+        );
+        if let Ok(mut q) = self.events.lock() {
+            q.push_back(text);
+            while q.len() > MAX_EVENTS {
+                q.pop_front();
+            }
+        }
+    }
+
+    /// Two octaves of click-to-play piano, C4..C6.
+    fn keyboard(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "On-screen keys — click to play the sine synth (also an ALSA output: 'kabelsalat-keys')",
+            )
+            .small(),
+        );
+        const WHITE: [u8; 15] = [60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79, 81, 83, 84];
+        const BLACK: [(usize, u8); 10] = [
+            (0, 61), (1, 63), (3, 66), (4, 68), (5, 70),
+            (7, 73), (8, 75), (10, 78), (11, 80), (12, 82),
+        ];
+        let width = ui.available_width().min(860.0);
+        let height = 110.0;
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+        let painter = ui.painter();
+        let wk = width / 15.0;
+        let bh = height * 0.62;
+        let bw = wk * 0.62;
+
+        // Which key is under the pointer right now?
+        let mut current: Option<u8> = None;
+        if response.is_pointer_button_down_on() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if rect.contains(pos) {
+                    let x = pos.x - rect.left();
+                    let y = pos.y - rect.top();
+                    let wi = (x / wk).floor().clamp(0.0, 14.0) as usize;
+                    let mut black = None;
+                    if y < bh {
+                        for (b, note) in BLACK {
+                            let cx = (b + 1) as f32 * wk;
+                            if (x - cx).abs() < bw / 2.0 {
+                                black = Some(note);
+                                break;
+                            }
+                        }
+                    }
+                    current = Some(black.unwrap_or(WHITE[wi]));
+                }
+            }
+        }
+
+        // White keys.
+        for (i, note) in WHITE.iter().enumerate() {
+            let r = egui::Rect::from_min_size(
+                egui::pos2(rect.left() + i as f32 * wk, rect.top()),
+                egui::vec2(wk - 1.0, height),
+            );
+            let active = current == Some(*note);
+            painter.rect_filled(
+                r,
+                2.0,
+                if active { YELLOW } else { egui::Color32::from_rgb(0xe8, 0xe8, 0xec) },
+            );
+            if note % 12 == 0 {
+                painter.text(
+                    r.center_bottom() - egui::vec2(0.0, 6.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("C{}", note / 12 - 1),
+                    egui::FontId::proportional(10.0),
+                    egui::Color32::from_rgb(0x66, 0x66, 0x77),
+                );
+            }
+        }
+        // Black keys.
+        for (b, note) in BLACK {
+            let cx = rect.left() + (b + 1) as f32 * wk;
+            let r = egui::Rect::from_min_size(
+                egui::pos2(cx - bw / 2.0, rect.top()),
+                egui::vec2(bw, bh),
+            );
+            let active = current == Some(note);
+            painter.rect_filled(
+                r,
+                2.0,
+                if active { YELLOW } else { egui::Color32::from_rgb(0x1a, 0x1b, 0x24) },
+            );
+        }
+
+        // Note on/off on transitions (glissando-friendly).
+        if current != self.pressed_note {
+            if let Some(old) = self.pressed_note {
+                self.note_event(old, false);
+            }
+            if let Some(new) = current {
+                self.note_event(new, true);
+            }
+            self.pressed_note = current;
+        }
+    }
 }
 
 impl eframe::App for PreviewApp {
@@ -172,6 +354,7 @@ impl eframe::App for PreviewApp {
                 );
                 ui.add_space(10.0);
                 ui.label(format!("Audio: {}", self.audio_info));
+                ui.label(format!("Synth: {}", self.synth_status));
                 ui.horizontal(|ui| {
                     if ui.button("▶  Play test tone (440 Hz, 1 s)").clicked() {
                         Self::play_tone(self.tone_busy.clone());
@@ -179,6 +362,8 @@ impl eframe::App for PreviewApp {
                     ui.label(format!("MIDI: {}", self.midi_status));
                 });
                 ui.add_space(10.0);
+                self.keyboard(ui);
+                ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new("The rack — preview").strong());
@@ -199,7 +384,7 @@ impl eframe::App for PreviewApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "MIDI monitor — send notes to the 'kabelsalat-dev' ALSA port",
+                        "MIDI monitor — on-screen keys + the 'kabelsalat-dev' ALSA port",
                     )
                     .strong(),
                 );

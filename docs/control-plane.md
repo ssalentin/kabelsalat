@@ -31,9 +31,20 @@ read snapshots; nothing here touches the audio thread directly.
 
 ## Status
 
-- Model + bus + tests: **done** (4 unit tests green).
-- Engine integration (generic graph replacing the fixed-topology atomics in
-  `engine.rs`): in progress — the atomics remain the interim path so the app
-  stays playable during the transition.
-- Frontend migration (UI patching → commands, assistant get_status → graph
-  snapshot): follows engine integration.
+- Model + bus + tests: **done** (unit tests green).
+- Engine integration: **done** — `GraphEngine` is multi-voice. Each Clap node
+  owns a Surge voice; each Dsp node owns a real built-in processor (`dsp.rs`,
+  allocation-proven). `render` walks graph edges: voices render, feed the DSP
+  nodes they're wired to, and everything wired to the master is summed. Notes
+  fan out to every instrument with a Keys→instrument MIDI cable. Unplugging a
+  cable silences that path independently.
+- Starter patch (`Graph::demo_patch`): TWO channel stacks (Surge A + Delay A,
+  Surge B + Delay B) mixed to a shared master. Node ids 0=Keys, 1=Surge A,
+  2=Delay A, 3=Master, 4=Surge B, 5=Delay B; cable ids 1,3,4,5 (A) and 6,7,8,9 (B).
+- Param ids: P_LEVEL=0 (instrument), P_TIME=1 / P_MIX=2 (delay, translated to
+  the processor's native ids), P_VOL=3 / P_WARM=4 (master).
+- Frontend migration: UI patching/knobs already issue commands; the multi-stack
+  UI (two visible columns) is in progress. Assistant graph queries and the MCP
+  server follow.
+- Dynamic AddNode(Clap) with off-thread plugin loading: follow-up (voices are
+  currently created at startup).

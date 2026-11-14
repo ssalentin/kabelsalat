@@ -31,6 +31,9 @@ Status: **P0 complete — GO for P1** (see docs/p0-report.md) · Name: `kabelsal
 - **2026-11-14** — **Built-in assistant requested** (user): DeepSeek-powered, BYOK,
   tool access to the app (rewire/setup/fixes). Same control plane as MCP (§2c);
   key stored locally 0600, never committed. Shipped in the dev preview.
+- **2026-11-14** — **AUM operating model reaffirmed** (user): multiple independent
+  rigs, each taking input from a different MIDI device or audio source, freely
+  wired and mixed. Per-rig input selection is core (§1).
 
 ## 1. Goal
 
@@ -44,6 +47,16 @@ instrument — and it moves.
 **Two muses.** AUM supplies the workflow (routing, mixer, live hosting); GarageBand
 supplies the soul — approachable, playful, instant music-making. Opening kabelsalat
 should produce sound in under a minute, no manual required.
+
+**Operating model (AUM, user's explicit north star).** You build **multiple
+independent rigs** (channel stacks). Each rig picks its **own input** — a specific
+hardware MIDI device, a virtual port, the on-screen keys, or an **audio source**
+(system playback / file player) — runs through its own instrument + FX chain, and
+mixes to the master. Rig 1 can be driven by MIDI keyboard A while rig 2 is driven
+by keyboard B or a backing track, simultaneously. Free wiring on the back panel;
+per-rig input selection on the front. This is the defining behavior, not a
+nice-to-have: one shared keyboard fanning out is only the demo, the real app routes
+**any source → any rig**.
 
 Reference plugin for all hosting work: **Surge XT** (user's choice; ARM-native CLAP).
 

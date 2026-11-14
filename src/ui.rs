@@ -27,8 +27,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
-use midir::os::unix::VirtualInput;
-use midir::{Ignore, MidiInput};
+use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{Command, CommandBus, Graph, PortKind as CPortKind, PortRef};
@@ -57,7 +56,7 @@ const SUBTEXT: Color32 = Color32::from_rgb(0x8f, 0x95, 0xad);
 const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 
-const N_UNITS: usize = 4;
+const N_UNITS: usize = 6;
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
 const MAX_CABLES: usize = 64;
@@ -513,19 +512,27 @@ impl DemoApp {
         };
 
         use PortKind::{Audio, Midi};
+        // Node ids match the engine contract: 0=KEYS, 1=SURGE A, 2=DELAY A,
+        // 3=MASTER, 4=SURGE B, 5=DELAY B.
         let units = vec![
             mk_unit("KEYS", "midi source · click the keys", YELLOW, &[], &[Midi],
                 [knob("RATE", 0.5), knob("VEL", 0.8)],
                 &[(Dir::Out, 0, 0.62, "MIDI OUT")]),
-            mk_unit("SURGE XT", "synth · clap", BLUE, &[Midi], &[Audio],
+            mk_unit("SURGE A", "synth · clap", BLUE, &[Midi], &[Audio],
                 [knob("TONE", 0.35), knob("LEVEL", 0.85)],
                 &[(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")]),
-            mk_unit("DELAY", "insert fx · midi tap", PURPLE, &[Audio, Midi], &[Audio],
+            mk_unit("DELAY A", "insert fx · midi tap", PURPLE, &[Audio, Midi], &[Audio],
                 [knob("TIME", 0.4), knob("MIX", 0.5)],
                 &[(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.44, "MIDI"), (Dir::Out, 0, 0.76, "OUT")]),
-            mk_unit("MASTER OUT", "stereo bus", ORANGE, &[Audio, Audio], &[],
+            mk_unit("MASTER OUT", "stereo bus · both stacks", ORANGE, &[Audio, Audio], &[],
                 [knob("VOLUME", 0.8), knob("WARM", 0.15)],
                 &[(Dir::In, 0, 0.36, "L"), (Dir::In, 1, 0.64, "R")]),
+            mk_unit("SURGE B", "synth · clap", BLUE, &[Midi], &[Audio],
+                [knob("TONE", 0.35), knob("LEVEL", 0.85)],
+                &[(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")]),
+            mk_unit("DELAY B", "insert fx", PURPLE, &[Audio], &[Audio],
+                [knob("TIME", 0.4), knob("MIX", 0.5)],
+                &[(Dir::In, 0, 0.26, "IN"), (Dir::Out, 0, 0.74, "OUT")]),
         ];
 
         let mut app = Self {
@@ -634,14 +641,18 @@ impl DemoApp {
             format!("MIDI in: {}", hw_names.join(", "))
         };
 
-        // Demo patch (back panel).
-        app.add_cable(0, 0, 1, 0, Midi, 0);  // Keys → Surge (melody)
-        app.add_cable(0, 0, 2, 1, Midi, 1);  // Keys → Delay (tap, long run)
-        app.add_cable(1, 0, 2, 0, Audio, 0); // Surge → Delay
-        app.add_cable(2, 0, 3, 0, Audio, 0); // Delay → Master L
-        app.add_cable(1, 0, 3, 1, Audio, 0); // Surge → Master R (dry)
-        if let Some(c) = app.cables.first_mut() { c.next_event = 0.35; }
-        if let Some(c) = app.cables.get_mut(1) { c.next_event = 1.1; }
+        // Demo patch — ids mirror Graph::demo_patch exactly (the engine
+        // pre-wires these; our per-frame Connect publishes are duplicates).
+        // Stack A: 1,3,4,5 · Stack B: 6,7,8,9. Master inputs fan in.
+        app.add_cable_id(1, 0, 0, 1, 0, Midi);  // Keys → Surge A
+        app.add_cable_id(3, 1, 0, 2, 0, Audio); // Surge A → Delay A
+        app.add_cable_id(4, 2, 0, 3, 0, Audio); // Delay A → Master L
+        app.add_cable_id(5, 1, 0, 3, 1, Audio); // Surge A → Master R (dry)
+        app.add_cable_id(6, 0, 0, 4, 0, Midi);  // Keys → Surge B
+        app.add_cable_id(7, 4, 0, 5, 0, Audio); // Surge B → Delay B
+        app.add_cable_id(8, 5, 0, 3, 0, Audio); // Delay B → Master L
+        app.add_cable_id(9, 4, 0, 3, 1, Audio); // Surge B → Master R (dry)
+        app.next_id = 10; // engine's next_edge
         app
     }
 
@@ -679,14 +690,15 @@ impl DemoApp {
             FontId::proportional(12.0), YELLOW, f32::INFINITY));
         self.help_title_g = Some(layout("kabelsalat — the cables are the show", FontId::proportional(17.0), TEXT, f32::INFINITY));
         self.help_body_g = Some(layout(
-            "Tab                flip the rack · front = perform, back = patch\n\
+            "two stacks A/B share KEYS and MASTER — play both at once\n\
+             Tab                flip the rack · front = perform, back = patch\n\
              drag knobs         shape the sound · right-click resets\n\
-             click the keys     play Keys — pulses run down the cables\n\
-             drag jack to jack  patch a cable (back)\n\
+             click the keys     play Keys — pulses run down both stacks\n\
+             laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
+             drag jack to jack  patch a cable (back) · master jacks fan in\n\
              grab a cable       shake it — watch it swing and settle (back)\n\
              tug a plug         pull it out to unplug (back)\n\
              click a cable      highlight its whole signal path\n\
-             space              play / pause the band\n\
              R reset knobs · D stats · ? help · esc cancel",
             FontId::monospace(12.5), Color32::from_rgb(0xc6, 0xca, 0xde), 560.0));
         self.help_foot_g = Some(layout("esc or ? to close", FontId::proportional(11.5), SUBTEXT, f32::INFINITY));
@@ -695,21 +707,37 @@ impl DemoApp {
     // -- layout -----------------------------------------------------------
 
     fn layout(&mut self, rect: Rect) {
-        self.rack_w = (rect.width() - 250.0).clamp(320.0, 700.0);
-        self.unit_h = ((rect.height() - 235.0) / N_UNITS as f32).clamp(84.0, 142.0);
+        // Two channel stacks side by side, shared KEYS (left) and MASTER
+        // (right), both full height. Columns: KEYS | A | B | MASTER.
+        self.rack_w = (rect.width() - 60.0).clamp(560.0, 1240.0);
+        self.unit_h = ((rect.height() - 210.0) / 2.0).clamp(96.0, 190.0);
         let gap = 10.0;
         let pad = 16.0;
-        self.rack_h = pad * 2.0 + N_UNITS as f32 * self.unit_h + (N_UNITS as f32 - 1.0) * gap;
+        let rail = 14.0;
+        self.rack_h = pad * 2.0 + 2.0 * self.unit_h + gap;
+        let inner_w = self.rack_w - 2.0 * (pad + rail);
+        let usable = inner_w - 3.0 * gap;
+        let cw = [usable * 0.26, usable * 0.24, usable * 0.24, usable * 0.26];
+        let x0 = pad + rail;
+        let xs = [
+            x0,
+            x0 + cw[0] + gap,
+            x0 + cw[0] + cw[1] + 2.0 * gap,
+            x0 + cw[0] + cw[1] + cw[2] + 3.0 * gap,
+        ];
+        let tall_h = 2.0 * self.unit_h + gap;
+        let row1_y = pad + self.unit_h + gap;
+        let mk = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
+        self.unit_rects[0] = mk(xs[0], pad, cw[0], tall_h);          // KEYS
+        self.unit_rects[1] = mk(xs[1], pad, cw[1], self.unit_h);     // SURGE A
+        self.unit_rects[2] = mk(xs[1], row1_y, cw[1], self.unit_h);  // DELAY A
+        self.unit_rects[3] = mk(xs[3], pad, cw[3], tall_h);          // MASTER
+        self.unit_rects[4] = mk(xs[2], pad, cw[2], self.unit_h);     // SURGE B
+        self.unit_rects[5] = mk(xs[2], row1_y, cw[2], self.unit_h);  // DELAY B
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0,
             rect.center().y - self.rack_h / 2.0 + 16.0,
         );
-        for i in 0..N_UNITS {
-            self.unit_rects[i] = Rect::from_min_size(
-                Pos2::new(pad + 14.0, pad + i as f32 * (self.unit_h + gap)),
-                Vec2::new(self.rack_w - 2.0 * (pad + 14.0), self.unit_h),
-            );
-        }
         // Flip transform.
         let mut sy = 1.0f32;
         if self.flipping {
@@ -740,14 +768,16 @@ impl DemoApp {
     // -- graph edits --------------------------------------------------------
 
     fn add_cable(&mut self, src: usize, src_port: usize, dst: usize, dst_port: usize, kind: PortKind, pattern: u8) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.add_cable_id(id, src, src_port, dst, dst_port, kind);
+        let _ = pattern; // patterns retired with the demo band
+    }
+
+    /// Add a cable with an explicit id (demo patch mirrors engine edge ids).
+    /// Inputs fan in: several cables may share one input jack (master bus).
+    fn add_cable_id(&mut self, id: u32, src: usize, src_port: usize, dst: usize, dst_port: usize, kind: PortKind) {
         if self.cables.len() >= MAX_CABLES || src == dst { return; }
-        for c in &mut self.cables {
-            if c.dst == dst && c.dst_port == dst_port && c.dying < 0.0 {
-                c.dying = 0.0;
-                c.detach_dst = true;
-                c.drift = if rng01(&mut c.rng) > 0.5 { 34.0 } else { -34.0 };
-            }
-        }
         if self.cables.iter().any(|c| c.dying < 0.0 && c.src == src && c.src_port == src_port && c.dst == dst && c.dst_port == dst_port) {
             return;
         }
@@ -759,9 +789,7 @@ impl DemoApp {
                 c
             }
         };
-        let id = self.next_id;
-        self.next_id += 1;
-        let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, pattern, id * 7919 + 13);
+        let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, 0, id * 7919 + 13);
         c.next_event = self.time + 0.2 + rng01(&mut c.rng) as f64 * 0.4;
         // Bulge away from the rack centerline; vary per cable for organic look.
         let a = self.endpoint(&c, Dir::Out);
@@ -802,7 +830,8 @@ impl DemoApp {
     }
 
     fn cable_at_jack(&self, unit: usize, dir: Dir, port: usize) -> Option<usize> {
-        self.cables.iter().position(|c| {
+        // Last plug wins: with fan-in, click/drag grabs the most recent cable.
+        self.cables.iter().rposition(|c| {
             c.dying < 0.0
                 && if dir == Dir::In { c.dst == unit && c.dst_port == port }
                    else { c.src == unit && c.src_port == port }
@@ -1018,6 +1047,8 @@ impl DemoApp {
     }
 
     fn fire_keys(&mut self, semitone: usize, amp: f32) {
+        // VEL knob scales keyboard velocity (note-offs pass through at 0).
+        let amp = amp * (0.35 + self.units[0].knobs[1].value * 0.65);
         self.key_leds[semitone % 12] = 1.0;
         self.units[0].led = 1.0;
         for ci in 0..self.cables.len() {
@@ -1138,13 +1169,19 @@ impl DemoApp {
         for u in &mut self.units { u.led *= (-dt / 0.20).exp(); }
         for k in &mut self.key_leds { *k *= (-dt / 0.22).exp(); }
 
-        // Knob → simulation mapping.
-        let rate = 0.5 + self.units[0].knobs[0].value * 1.5;
-        let vel_mul = 0.35 + self.units[0].knobs[1].value * 0.65;
-        let surge_level = 0.25 + self.units[1].knobs[1].value * 0.75;
-        let delay_time = 0.55 + self.units[2].knobs[0].value * 1.3;
-        let delay_mix = 0.15 + self.units[2].knobs[1].value * 0.85;
-        let volume = 0.15 + self.units[3].knobs[0].value * 0.85;
+        // Knob → simulation mapping, per stack (A: units 1/2, B: units 4/5).
+        let surge_level = [
+            0.25 + self.units[1].knobs[1].value * 0.75,
+            0.25 + self.units[4].knobs[1].value * 0.75,
+        ];
+        let delay_time = [
+            0.55 + self.units[2].knobs[0].value * 1.3,
+            0.55 + self.units[5].knobs[0].value * 1.3,
+        ];
+        let delay_mix = [
+            0.15 + self.units[2].knobs[1].value * 0.85,
+            0.15 + self.units[5].knobs[1].value * 0.85,
+        ];
 
         let mut n_arrivals = 0usize;
         for ci in 0..self.cables.len() {
@@ -1162,11 +1199,20 @@ impl DemoApp {
                 if c.detach_dst { b += fall; } else { a += fall; }
             }
 
-            // Inertial feed: endpoint motion whips the cable.
-            let feed_a = clamp_len((c.prev_a - a) / dt.max(1e-4), 2400.0) * 0.28;
-            let feed_b = clamp_len((c.prev_b - b) / dt.max(1e-4), 2400.0) * 0.28;
+            // Inertial feed: endpoint motion whips the cable. On the first
+            // frame prev_* is still the constructor placeholder (unit rects
+            // were Rect::NOTHING → NaN), so skip the feed and seed bulge side.
+            let first = !c.prev_a.is_finite();
+            let feed_a = if first { Vec2::ZERO } else { clamp_len((c.prev_a - a) / dt.max(1e-4), 2400.0) * 0.28 };
+            let feed_b = if first { Vec2::ZERO } else { clamp_len((c.prev_b - b) / dt.max(1e-4), 2400.0) * 0.28 };
             c.v1 += feed_a;
             c.v2 += feed_b;
+            if first {
+                let mid_x = (a.x + b.x) * 0.5;
+                c.bulge_side = if (mid_x - self.rack_w / 2.0).abs() < 26.0 {
+                    if c.id % 2 == 0 { 1.0 } else { -1.0 }
+                } else if mid_x < self.rack_w / 2.0 { -1.0 } else { 1.0 };
+            }
             c.prev_a = a;
             c.prev_b = b;
 
@@ -1193,7 +1239,7 @@ impl DemoApp {
             // (fire_keys), so the rack shows exactly what is being played.
 
             // Pulses travel; arrivals excite the destination.
-            let speed_mul = if c.src == 2 { delay_time } else { 1.0 };
+            let speed_mul = match c.src { 2 => delay_time[0], 5 => delay_time[1], _ => 1.0 };
             for p in &mut c.pulses {
                 if !p.active { continue; }
                 p.t += p.speed * speed_mul * dt;
@@ -1217,8 +1263,13 @@ impl DemoApp {
             for c in &mut self.cables {
                 if c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0 {
                     let mut a = amp * 0.95;
-                    if unit == 1 { a *= surge_level; }
-                    if unit == 2 { a *= delay_mix; }
+                    match unit {
+                        1 => a *= surge_level[0],
+                        4 => a *= surge_level[1],
+                        2 => a *= delay_mix[0],
+                        5 => a *= delay_mix[1],
+                        _ => {}
+                    }
                     c.env = c.env.max(a);
                 }
             }
@@ -1292,32 +1343,38 @@ impl DemoApp {
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
-        Vec2::new(r.right() - 118.0 + idx as f32 * 68.0, r.center().y + 4.0)
+        if unit == 0 || unit == 3 {
+            // Tall shared units: knobs along the bottom.
+            let fx = if idx == 0 { 0.32 } else { 0.68 };
+            Vec2::new(r.left() + r.width() * fx, r.bottom() - 40.0)
+        } else {
+            // Stack units: knob column on the right.
+            Vec2::new(r.right() - 86.0 + idx as f32 * 56.0, r.center().y + 14.0)
+        }
     }
 
-    /// Horizontal space between the label block and the knob column —
-    /// device displays adapt to it so narrow windows never overlap.
+    /// Display space left of the knob column on stack units.
     fn display_area(&self, unit: usize) -> (f32, f32) {
         let r = self.unit_rects[unit];
-        let start = r.left() + 190.0;
-        let width = (r.right() - 140.0 - start).max(0.0);
+        let start = r.left() + 20.0;
+        let width = (r.right() - 112.0 - start).max(0.0);
         (start, width)
     }
 
     fn key_w(&self) -> f32 {
         let r = self.unit_rects[0];
-        let avail = (r.right() - 140.0) - (r.left() + 185.0);
+        let avail = r.width() - 40.0;
         if avail < 96.0 { return 0.0; } // too narrow: hide the keyboard
-        (avail / 8.0).clamp(12.0, 28.0)
+        (avail / 8.0).clamp(12.0, 30.0)
     }
 
     fn key_rect(&self, white_idx: usize) -> Rect {
         let r = self.unit_rects[0];
-        let x0 = r.left() + 185.0;
         let kw = self.key_w();
+        let x0 = r.center().x - kw * 4.0;
         Rect::from_min_size(
-            Pos2::new(x0 + white_idx as f32 * kw, r.center().y - 24.0),
-            Vec2::new(kw - 1.0, 52.0),
+            Pos2::new(x0 + white_idx as f32 * kw, r.center().y - 30.0),
+            Vec2::new(kw - 1.0, 60.0),
         )
     }
 
@@ -1655,8 +1712,8 @@ impl DemoApp {
             let rail = Rect::from_min_size(Pos2::new(side_x, 8.0), Vec2::new(14.0, self.rack_h - 16.0));
             painter.rect_filled(xf.rect(rail), 6.0, RAIL);
         }
-        // Screws at unit boundaries.
-        for i in 0..=N_UNITS {
+        // Screws at the row boundaries.
+        for i in 0..=2 {
             let y = 16.0 + i as f32 * (self.unit_h + 10.0) - 5.0;
             for x in [15.0, self.rack_w - 15.0] {
                 let c = xf.p(Vec2::new(x, y));
@@ -1707,8 +1764,8 @@ impl DemoApp {
 
             match ui {
                 0 => self.draw_keyboard(painter),
-                1 => self.draw_surge_display(painter, r),
-                2 => self.draw_delay_display(painter, r),
+                1 | 4 => self.draw_surge_display(painter, ui),
+                2 | 5 => self.draw_delay_display(painter, ui),
                 3 => self.draw_meter(painter, r),
                 _ => {}
             }
@@ -1737,55 +1794,58 @@ impl DemoApp {
             let bw = self.key_w() * 0.62;
             let kr = Rect::from_min_size(
                 Pos2::new(base.right() - bw / 2.0 + 0.5, base.top()),
-                Vec2::new(bw, 32.0),
+                Vec2::new(bw, 38.0),
             );
             let lit = self.key_leds[BLACK_SEMI[bi]];
             painter.rect_filled(xf.rect(kr), 2.5, mix(Color32::from_rgb(0x1a, 0x1b, 0x24), YELLOW, lit * 0.7));
         }
     }
 
-    fn draw_surge_display(&self, painter: &egui::Painter, r: Rect) {
-        let vis = 0.25 + 0.75 * self.units[1].led.max(
-            self.cables.iter().filter(|c| c.src == 1 && c.kind == PortKind::Audio).map(|c| c.level).fold(0.0, f32::max));
-        let (start, width) = self.display_area(1);
+    fn draw_surge_display(&self, painter: &egui::Painter, unit: usize) {
+        let r = self.unit_rects[unit];
+        let vis = 0.25 + 0.75 * self.units[unit].led.max(
+            self.cables.iter().filter(|c| c.src == unit && c.kind == PortKind::Audio).map(|c| c.level).fold(0.0, f32::max));
+        let (start, width) = self.display_area(unit);
         if width < 40.0 { return; }
         let pitch = (width / 11.0).min(9.0);
         for i in 0..11 {
-            let h = (0.25 + 0.75 * (self.ui_time * 2.6 + i as f32 * 0.55).sin().abs()) * 40.0 * vis;
+            let h = (0.25 + 0.75 * (self.ui_time * 2.6 + i as f32 * 0.55).sin().abs()) * 34.0 * vis;
             let bar = Rect::from_center_size(
-                Pos2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 4.0),
+                Pos2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0),
                 Vec2::new(pitch * 0.45, h.max(2.0)),
             );
             painter.rect_filled(self.xf.rect(bar), 2.0, alpha(BLUE, 0.5 + 0.5 * vis));
         }
     }
 
-    fn draw_delay_display(&self, painter: &egui::Painter, r: Rect) {
-        let led = self.units[2].led;
-        let (start, width) = self.display_area(2);
+    fn draw_delay_display(&self, painter: &egui::Painter, unit: usize) {
+        let r = self.unit_rects[unit];
+        let led = self.units[unit].led;
+        let (start, width) = self.display_area(unit);
         if width < 40.0 { return; }
         let pitch = (width / 4.5).min(26.0);
         for i in 0..4 {
-            let c = Vec2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 4.0);
+            let c = Vec2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0);
             let a = 0.15 + 0.85 * led * (1.0 - i as f32 * 0.2);
             self.ell(painter, c, 6.0 - i as f32 * 1.1, alpha(PURPLE, a), Stroke::NONE);
         }
         if led > 0.05 {
-            let c = Vec2::new(start + pitch * 0.5, r.center().y + 4.0);
+            let c = Vec2::new(start + pitch * 0.5, r.center().y + 16.0);
             self.ell(painter, c, 10.0 + (1.0 - led) * 14.0, alpha(PURPLE, 0.25 * led), Stroke::NONE);
         }
     }
 
+    /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
         let lit = (self.meter * n as f32).ceil() as usize;
-        let (start, width) = self.display_area(3);
-        if width < 40.0 { return; }
-        let pitch = (width / n as f32).min(16.0);
+        let pitch = ((r.height() - 130.0) / n as f32).clamp(8.0, 17.0);
+        let x = r.left() + 34.0;
+        let bottom = r.bottom() - 62.0;
         for i in 0..n {
             let seg = Rect::from_min_size(
-                Pos2::new(start + i as f32 * pitch, r.center().y - 11.0),
-                Vec2::new(pitch * 0.75, 26.0),
+                Pos2::new(x, bottom - (i + 1) as f32 * pitch),
+                Vec2::new(22.0, pitch * 0.72),
             );
             let col = if i < 8 { GREEN } else if i < 11 { YELLOW } else { ORANGE };
             let fill = if i < lit { col } else { Color32::from_rgb(0x26, 0x28, 0x38) };
@@ -1900,7 +1960,7 @@ impl DemoApp {
     fn cable_color(&self, c: &Cable) -> Color32 {
         let mut col = c.color;
         if c.kind == PortKind::Audio {
-            if c.src == 1 { col = mix(col, ORANGE, self.units[1].knobs[0].value * 0.45); }
+            if c.src == 1 || c.src == 4 { col = mix(col, ORANGE, self.units[c.src].knobs[0].value * 0.45); }
             col = mix(col, ORANGE, self.units[3].knobs[1].value * 0.30);
         }
         col
@@ -1985,11 +2045,27 @@ impl DemoApp {
 
     fn draw_plugs(&self, painter: &egui::Painter) {
         let xf = &self.xf;
-        for c in &self.cables {
+        for (ci, c) in self.cables.iter().enumerate() {
             if c.dying >= 0.0 { continue; }
             let a = Self::cable_alpha(c, false, true);
             for end in [Dir::Out, Dir::In] {
-                let p = if end == Dir::Out { c.over_a.unwrap_or(c.prev_a) } else { c.over_b.unwrap_or(c.prev_b) };
+                let over = if end == Dir::Out { c.over_a } else { c.over_b };
+                let base = if end == Dir::Out { c.prev_a } else { c.prev_b };
+                // Fan-in: stacked plugs on one jack spread slightly.
+                let p = if let Some(q) = over { q } else {
+                    let (u, port) = if end == Dir::Out { (c.src, c.src_port) } else { (c.dst, c.dst_port) };
+                    let mut k = 0.0f32;
+                    let mut n = 0.0f32;
+                    for (cj, c2) in self.cables.iter().enumerate() {
+                        if c2.dying >= 0.0 { continue; }
+                        let (u2, p2) = if end == Dir::Out { (c2.src, c2.src_port) } else { (c2.dst, c2.dst_port) };
+                        if u2 == u && p2 == port {
+                            if cj < ci { k += 1.0; }
+                            n += 1.0;
+                        }
+                    }
+                    base + Vec2::new(0.0, (k - (n - 1.0) / 2.0) * 5.0)
+                };
                 let body = Rect::from_center_size(p.to_pos2(), Vec2::new(20.0, 16.0));
                 painter.rect_filled(xf.rect(body), 3.5, alpha(PLUG, a));
                 painter.rect_stroke(xf.rect(body), 3.5, Stroke::new(1.0, alpha(mix(PLUG, WHITE, 0.25), a)), egui::StrokeKind::Inside);
@@ -2250,6 +2326,9 @@ impl eframe::App for DemoApp {
             let _ = b.send(Command::SetParam { node: 2, param: P_MIX, value: self.units[2].knobs[1].value as f64 });
             let _ = b.send(Command::SetParam { node: 3, param: P_VOL, value: self.units[3].knobs[0].value as f64 });
             let _ = b.send(Command::SetParam { node: 3, param: P_WARM, value: self.units[3].knobs[1].value as f64 });
+            let _ = b.send(Command::SetParam { node: 4, param: P_LEVEL, value: self.units[4].knobs[1].value as f64 });
+            let _ = b.send(Command::SetParam { node: 5, param: P_TIME, value: self.units[5].knobs[0].value as f64 });
+            let _ = b.send(Command::SetParam { node: 5, param: P_MIX, value: self.units[5].knobs[1].value as f64 });
         }
 
         self.tessellate();

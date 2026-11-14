@@ -12,9 +12,9 @@ query tools read the model + engine output level. Live cpal output (PipeWire,
 512 frames, 2 Surge voices); a dummy render-loop fallback keeps tools working
 even without an audio device.
 
-**12 tools, 1:1 with the control plane:**
+**13 tools, 1:1 with the control plane:**
 `get_graph`, `get_status`, `add_node`, `remove_node`, `connect`, `disconnect`,
-`set_param`, `set_rig_source`, `note_on`, `note_off`, `transport_play`,
+`set_param`, `set_rig_source`, `set_split`, `note_on`, `note_off`, `transport_play`,
 `transport_stop`.
 
 Because every tool maps to the same typed `Command`/query the UI and assistant
@@ -23,7 +23,7 @@ use, agent access is structurally 1:1 with the app (PLAN §2c) — no parallel A
 ## Verified
 
 - `initialize` → serverInfo `kabelsalat 0.0.1`, protocol `2024-11-05`.
-- `tools/list` → all 12 tools with JSON schemas.
+- `tools/list` → all 13 tools with JSON schemas.
 - `tools/call get_graph` → 6 nodes, 8 edges (ids 1,3,4,5,6,7,8,9), correct kinds.
 - `note_on`, `get_status` (audio_live, sample_rate), plus 17 extended checks
   (auto edge-id, duplicate/self-connect rejection, remove cleans edges,

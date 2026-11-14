@@ -19,11 +19,18 @@
 //! arc-length LUTs, cached galleys, fixed pulse arrays — no per-frame
 //! allocation storms. Pure snapshot-style simulation; never touches audio.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
+use midir::os::unix::VirtualInput;
+use midir::{Ignore, MidiInput};
+
+use crate::assistant::{Assistant, ChatLine, FromWorker};
+use crate::host::{ClapVoice, ClapVoiceMain, VoiceController};
 
 // ---------------------------------------------------------------------------
 // Palette (assets/logo.svg + Omarchy/Tokyo-night accents)
@@ -452,6 +459,21 @@ struct DemoApp {
 
     /// Audio-integration seam: interactive key presses are delivered here.
     note_sink: Option<NoteSink>,
+
+    // --- Integrated app (task-4 merge): audio, assistant, input routing ---
+    assistant: Assistant,
+    key_input: String,
+    chat_input: String,
+    octave: u8,
+    held_keys: Vec<(Key, usize)>,
+    note_offs: Vec<(std::time::Instant, usize)>,
+    hw_queue: Arc<Mutex<VecDeque<NoteEvent>>>,
+    _hw_conns: Vec<midir::MidiInputConnection<()>>,
+    hw_status: String,
+    surge_status: String,
+    // !Send: CLAP main-thread object; DemoApp never leaves the UI thread.
+    _surge_main: Option<ClapVoiceMain>,
+    _audio_stream: Option<cpal::Stream>,
 }
 
 impl DemoApp {
@@ -539,6 +561,65 @@ impl DemoApp {
             help_foot_g: None,
             arrivals: [(0, 0.0); 32],
             note_sink,
+            assistant: Assistant::new(),
+            key_input: String::new(),
+            chat_input: String::new(),
+            octave: 4,
+            held_keys: Vec::new(),
+            note_offs: Vec::new(),
+            hw_queue: Arc::new(Mutex::new(VecDeque::new())),
+            _hw_conns: Vec::new(),
+            hw_status: String::new(),
+            surge_status: "no synth loaded".into(),
+            _surge_main: None,
+            _audio_stream: None,
+        };
+
+        // Hardware MIDI auto-wire at startup: events queue here and are drained
+        // on the UI thread through fire_keys, so sound and cable animation stay
+        // in sync.
+        let mut hw_names = Vec::new();
+        if let Ok(probe) = MidiInput::new("kabelsalat-probe") {
+            for port in probe.ports() {
+                let name = probe.port_name(&port).unwrap_or_default();
+                if name.contains("kabelsalat")
+                    || name.contains("Midi Through")
+                    || name == "System"
+                    || name == "Announce"
+                {
+                    continue;
+                }
+                if let Ok(mi) = MidiInput::new("kabelsalat-hw") {
+                    let q = app.hw_queue.clone();
+                    if let Ok(conn) = mi.connect(
+                        &port,
+                        "kabelsalat-hw",
+                        move |_stamp, msg: &[u8], _| {
+                            if msg.len() >= 3 {
+                                let st = msg[0] & 0xF0;
+                                if st == 0x90 || st == 0x80 {
+                                    let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
+                                    if let Ok(mut q) = q.lock() {
+                                        q.push_back(NoteEvent { note: msg[1], velocity: vel });
+                                        while q.len() > 256 {
+                                            q.pop_front();
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        (),
+                    ) {
+                        app._hw_conns.push(conn);
+                        hw_names.push(name);
+                    }
+                }
+            }
+        }
+        app.hw_status = if hw_names.is_empty() {
+            "no hardware MIDI — laptop keys live".into()
+        } else {
+            format!("MIDI in: {}", hw_names.join(", "))
         };
 
         // Demo patch (back panel).
@@ -715,6 +796,202 @@ impl DemoApp {
     /// Play a key: light it, launch visual pulses, and emit a note event to the
     /// audio seam. This is the single entry point for on-screen keys, laptop
     /// keys, and (later) hardware MIDI — task-4 routes sound from here.
+    fn with_audio(mut self, main: ClapVoiceMain, stream: cpal::Stream) -> Self {
+        self._surge_main = Some(main);
+        self._audio_stream = Some(stream);
+        self.surge_status = "Surge XT loaded — play!".into();
+        self
+    }
+
+    fn laptop_key_offset(key: Key) -> Option<usize> {
+        Some(match key {
+            Key::A => 0, Key::W => 1, Key::S => 2, Key::E => 3, Key::D => 4,
+            Key::F => 5, Key::T => 6, Key::G => 7, Key::Y => 8, Key::H => 9,
+            Key::U => 10, Key::J => 11, Key::K => 12, Key::O => 13, Key::L => 14,
+            Key::P => 15,
+            _ => return None,
+        })
+    }
+
+    fn handle_laptop_key(&mut self, key: Key, pressed: bool, repeat: bool) {
+        if pressed && !repeat {
+            if key == Key::Z {
+                let held: Vec<_> = self.held_keys.drain(..).collect();
+                for (_, semi) in held {
+                    self.fire_keys(semi, 0.0);
+                }
+                self.octave = self.octave.saturating_sub(1).max(1);
+                return;
+            }
+            if key == Key::X {
+                let held: Vec<_> = self.held_keys.drain(..).collect();
+                for (_, semi) in held {
+                    self.fire_keys(semi, 0.0);
+                }
+                self.octave = (self.octave + 1).min(7);
+                return;
+            }
+        }
+        let Some(off) = Self::laptop_key_offset(key) else { return };
+        let semi = (off as i16 + (self.octave as i16 - 4) * 12).max(0) as usize;
+        if pressed {
+            if repeat || self.held_keys.iter().any(|(k, _)| *k == key) {
+                return;
+            }
+            self.held_keys.push((key, semi));
+            self.fire_keys(semi, 0.8);
+        } else if let Some(pos) = self.held_keys.iter().position(|(k, _)| *k == key) {
+            let (_, semi) = self.held_keys.remove(pos);
+            self.fire_keys(semi, 0.0);
+        }
+    }
+
+    fn poll_assistant(&mut self) {
+        for ev in self.assistant.poll() {
+            match ev {
+                FromWorker::Text(t) => self
+                    .assistant
+                    .history
+                    .push(ChatLine { role: "assistant".into(), text: t }),
+                FromWorker::ToolCall { id, name, args } => {
+                    let result = self.exec_tool(&name, &args);
+                    self.assistant.send_tool_result(id, result);
+                }
+                FromWorker::Done => self.assistant.busy = false,
+                FromWorker::Error(e) => {
+                    self.assistant.busy = false;
+                    self.assistant
+                        .history
+                        .push(ChatLine { role: "error".into(), text: e });
+                }
+            }
+        }
+    }
+
+    fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
+        match name {
+            "get_status" => serde_json::json!({
+                "synth": self.surge_status,
+                "midi_in": self.hw_status,
+                "octave": self.octave,
+                "rack_side": match self.side { Side::Front => "front", Side::Back => "back" },
+                "playing": self.playing,
+                "cables": self.cables.len(),
+                "fps": self.fps,
+            })
+            .to_string(),
+            "play_note" => {
+                let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127);
+                let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).min(10000);
+                let semi = (note as i16 - 60).max(0) as usize;
+                self.fire_keys(semi, 0.8);
+                self.note_offs.push((
+                    std::time::Instant::now() + std::time::Duration::from_millis(ms),
+                    semi,
+                ));
+                format!("played note {note} for {ms} ms")
+            }
+            "set_octave" => {
+                let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 7) as u8;
+                self.octave = oct;
+                format!("octave set to C{oct}")
+            }
+            "flip_rack" => {
+                self.start_flip();
+                "rack flipped".into()
+            }
+            _ => format!("unknown tool: {name}"),
+        }
+    }
+
+    fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
+        egui::Panel::right("assistant")
+            .default_size(340.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(0x1e, 0x20, 0x2e))
+                    .inner_margin(egui::Margin::same(10)),
+            )
+            .show(root, |ui| {
+                ui.heading("Assistant");
+                ui.label(egui::RichText::new("DeepSeek · bring your own key").small());
+                ui.add_space(6.0);
+                if !self.assistant.key_set {
+                    ui.label("Paste your DeepSeek API key:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.key_input)
+                            .password(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ui.button("Save key").clicked() && !self.key_input.trim().is_empty() {
+                        let k = self.key_input.trim().to_string();
+                        match crate::assistant::save_key(&k) {
+                            Ok(()) => {
+                                self.assistant.set_key(k);
+                                self.key_input.clear();
+                            }
+                            Err(e) => self.assistant.history.push(ChatLine {
+                                role: "error".into(),
+                                text: format!("could not save key: {e}"),
+                            }),
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
+                        )
+                        .small()
+                        .italics(),
+                    );
+                } else {
+                    let avail = ui.available_height();
+                    egui::ScrollArea::vertical()
+                        .max_height((avail - 90.0).max(100.0))
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &self.assistant.history {
+                                let (label, color) = match line.role.as_str() {
+                                    "user" => ("You", YELLOW),
+                                    "assistant" => ("Assistant", GREEN),
+                                    _ => ("Error", Color32::from_rgb(0xf7, 0x76, 0x8e)),
+                                };
+                                ui.label(egui::RichText::new(label).small().strong().color(color));
+                                ui.label(&line.text);
+                                ui.add_space(6.0);
+                            }
+                            if self.assistant.busy {
+                                ui.label(egui::RichText::new("thinking…").italics().small());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.chat_input)
+                                .desired_width((ui.available_width() - 64.0).max(80.0))
+                                .hint_text("Ask or instruct…"),
+                        );
+                        let enter =
+                            edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if (ui.button("Send").clicked() || enter)
+                            && !self.chat_input.trim().is_empty()
+                            && !self.assistant.busy
+                        {
+                            let t = self.chat_input.trim().to_string();
+                            self.chat_input.clear();
+                            self.assistant.send_user(t);
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("{} · octave C{}", self.surge_status, self.octave))
+                            .small()
+                            .italics(),
+                    );
+                    ui.label(egui::RichText::new(&self.hw_status).small().italics());
+                }
+            });
+    }
+
     fn fire_keys(&mut self, semitone: usize, amp: f32) {
         self.key_leds[semitone.min(12)] = 1.0;
         self.units[0].led = 1.0;
@@ -1860,13 +2137,53 @@ fn p_side(unit: usize, app: &DemoApp) -> f32 {
 impl eframe::App for DemoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let rect = ui.max_rect();
         self.ensure_galleys(&ctx);
+
+        // Assistant panel takes the right strip; the rack gets the rest.
+        self.assistant_panel_ui(ui);
+
+        // Laptop keys (disabled while the assistant text field has focus).
+        if !ctx.egui_wants_keyboard_input() {
+            let events = ctx.input(|i| i.events.clone());
+            for ev in events {
+                if let egui::Event::Key { key, pressed, repeat, .. } = ev {
+                    self.handle_laptop_key(key, pressed, repeat);
+                }
+            }
+        }
+        self.poll_assistant();
+
+        // Scheduled note-offs (assistant play_note tool).
+        let now = std::time::Instant::now();
+        let mut i = 0;
+        while i < self.note_offs.len() {
+            if self.note_offs[i].0 <= now {
+                let (_, semi) = self.note_offs.remove(i);
+                self.fire_keys(semi, 0.0);
+            } else {
+                i += 1;
+            }
+        }
+
+        // Hardware MIDI → fire_keys (sound + cable animation in sync).
+        let hw: Vec<NoteEvent> = self
+            .hw_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for ev in hw {
+            let semi = (ev.note as i16 - 60).max(0) as usize;
+            self.fire_keys(semi, ev.velocity);
+        }
+
+        let rect = ui.max_rect();
         let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
         self.layout(rect);
-        self.handle_input(&ctx, rect);
+        if !ctx.egui_wants_keyboard_input() {
+            self.handle_input(&ctx, rect);
+        }
         self.update(dt);
         self.tessellate();
         self.draw(ui);
@@ -1880,20 +2197,75 @@ impl eframe::App for DemoApp {
 // ---------------------------------------------------------------------------
 
 pub fn run_demo() -> anyhow::Result<()> {
-    run_demo_with_note_sink(None)
+    run_inner(None, false)
 }
 
 /// Same demo, but every interactive key press is also delivered to `sink`.
 /// This is the audio-integration seam (task-4): the UI already emits note
 /// events here, so the engine can subscribe without touching the render path.
 pub fn run_demo_with_note_sink(sink: Option<NoteSink>) -> anyhow::Result<()> {
+    run_inner(sink, false)
+}
+
+/// The integrated app: rack UI + Surge XT audio + assistant, one window.
+/// This is the default mode (`cargo run`).
+pub fn run_app() -> anyhow::Result<()> {
+    run_inner(None, true)
+}
+
+/// Load Surge XT and open the audio stream. Called on the main thread inside
+/// the eframe creator (CLAP main-thread rules). The voice itself moves into
+/// the cpal callback; the controller stays available for the note sink.
+fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController)> {
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let cfg = device.default_output_config()?;
+    let sample_rate = cfg.sample_rate() as f64;
+    let ch = cfg.channels() as usize;
+    let (voice, main) = ClapVoice::new(sample_rate)?;
+    let ctrl = voice.controller();
+    let mut config: cpal::StreamConfig = cfg.into();
+    config.buffer_size = cpal::BufferSize::Fixed(512);
+    let mut voice = voice;
+    let mut scratch = vec![0.0f32; 8192 * 2];
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [f32], _| {
+            let frames = data.len() / ch;
+            if frames * 2 <= scratch.len() {
+                voice.render(&mut scratch[..frames * 2]);
+                for (i, frame) in data.chunks_mut(ch).enumerate() {
+                    frame[0] = scratch[i * 2];
+                    if ch > 1 {
+                        frame[1] = scratch[i * 2 + 1];
+                    }
+                    for s in frame.iter_mut().skip(2) {
+                        *s = 0.0;
+                    }
+                }
+            } else {
+                for s in data.iter_mut() {
+                    *s = 0.0;
+                }
+            }
+        },
+        |e| eprintln!("audio stream error: {e}"),
+        None,
+    )?;
+    stream.play()?;
+    Ok((main, stream, ctrl))
+}
+
+fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
             .with_min_inner_size([760.0, 520.0])
             .with_maximized(true)
             .with_app_id("kabelsalat")
-            .with_title("kabelsalat — animated wiring"),
+            .with_title("kabelsalat"),
         ..Default::default()
     };
     eframe::run_native(
@@ -1912,7 +2284,31 @@ pub fn run_demo_with_note_sink(sink: Option<NoteSink>) -> anyhow::Result<()> {
             visuals.window_fill = BG;
             visuals.override_text_color = Some(TEXT);
             cc.egui_ctx.set_visuals(visuals);
-            Ok(Box::new(DemoApp::new_with_sink(sink)))
+
+            let mut sink = sink;
+            let mut audio = None;
+            if with_audio {
+                match build_audio() {
+                    Ok((main, stream, ctrl)) => {
+                        sink = Some(Box::new(move |ev: NoteEvent| {
+                            let note = 60 + ev.note as u16;
+                            if ev.velocity > 0.0 {
+                                ctrl.note_on(note, ev.velocity as f64);
+                            } else {
+                                ctrl.note_off(note);
+                            }
+                        }));
+                        audio = Some((main, stream));
+                    }
+                    Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
+                }
+            }
+            let app = DemoApp::new_with_sink(sink);
+            let app = match audio {
+                Some((main, stream)) => app.with_audio(main, stream),
+                None => app,
+            };
+            Ok(Box::new(app))
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))

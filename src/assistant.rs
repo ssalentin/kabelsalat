@@ -156,6 +156,11 @@ fn tools() -> Value {
             "name":"set_octave",
             "description":"Set the laptop-keyboard base octave (1-7)",
             "parameters":{"type":"object","properties":{"octave":{"type":"integer"}},"required":["octave"]}
+        }},
+        {"type":"function","function":{
+            "name":"flip_rack",
+            "description":"Flip the rack between front (perform) and back (patch cables)",
+            "parameters":{"type":"object","properties":{}}
         }}
     ])
 }

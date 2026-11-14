@@ -5,6 +5,9 @@
 //! reserved graph storage — no allocation in the callback) and renders
 //! strictly according to what is plugged. Unplug a cable and the signal stops.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use crate::control::{Command, CommandDrain, DspKind, Graph, NodeKind, ParamId, PortKind};
 use crate::host::ClapVoice;
 
@@ -73,6 +76,8 @@ pub struct GraphEngine {
     mix: f32,
     vol: f32,
     warm: f32,
+    // Real output peak for the UI meter (f32 bits).
+    out_peak: Arc<AtomicU32>,
 }
 
 impl GraphEngine {
@@ -93,6 +98,7 @@ impl GraphEngine {
             mix: 0.5,
             vol: 0.8,
             warm: 0.15,
+            out_peak: Arc::new(AtomicU32::new(0)),
         };
         e.refresh_routes();
         e
@@ -100,6 +106,11 @@ impl GraphEngine {
 
     pub fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    /// Handle to the real output peak (f32 bits) for the UI meter.
+    pub fn level_handle(&self) -> Arc<AtomicU32> {
+        self.out_peak.clone()
     }
 
     fn refresh_routes(&mut self) {
@@ -198,6 +209,7 @@ impl GraphEngine {
         self.delay
             .process(&mut self.delay_in[..frames * 2], self.time, self.mix);
 
+        let mut peak = 0.0f32;
         for (i, frame) in data.chunks_mut(ch).enumerate() {
             let mut l = 0.0f32;
             let mut r = 0.0f32;
@@ -211,6 +223,7 @@ impl GraphEngine {
             }
             l = (l * (1.0 + self.warm * 3.0)).tanh() * self.vol;
             r = (r * (1.0 + self.warm * 3.0)).tanh() * self.vol;
+            peak = peak.max(l.abs()).max(r.abs());
             frame[0] = l;
             if ch > 1 {
                 frame[1] = r;
@@ -219,5 +232,6 @@ impl GraphEngine {
                 *s = 0.0;
             }
         }
+        self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
     }
 }

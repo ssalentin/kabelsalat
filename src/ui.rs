@@ -482,6 +482,7 @@ struct DemoApp {
     _surge_main: Option<ClapVoiceMain>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
+    out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
 }
 
 impl DemoApp {
@@ -583,6 +584,7 @@ impl DemoApp {
             _surge_main: None,
             _audio_stream: None,
             bus: None,
+            out_level: None,
         };
 
         // Hardware MIDI auto-wire at startup: events queue here and are drained
@@ -815,10 +817,12 @@ impl DemoApp {
         main: ClapVoiceMain,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
+        level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         self._surge_main = Some(main);
         self._audio_stream = Some(stream);
         self.bus = Some(bus);
+        self.out_level = Some(level);
         self.surge_status = "Surge XT loaded — play!".into();
         self
     }
@@ -1014,7 +1018,7 @@ impl DemoApp {
     }
 
     fn fire_keys(&mut self, semitone: usize, amp: f32) {
-        self.key_leds[semitone.min(12)] = 1.0;
+        self.key_leds[semitone % 12] = 1.0;
         self.units[0].led = 1.0;
         for ci in 0..self.cables.len() {
             let c = &mut self.cables[ci];
@@ -1185,38 +1189,19 @@ impl DemoApp {
                 Self::step_spring(&mut c.c2, &mut c.v2, t2, h);
             }
 
-            // Simulated band on MIDI runs.
-            if c.kind == PortKind::Midi && c.dying < 0.0 && self.playing {
-                let pattern: &[(f32, f32)] = if c.pattern == 1 { &TAP } else { &MELODY };
-                let mut guard = 0;
-                while self.time >= c.next_event && guard < 8 {
-                    let (beats, vel) = pattern[c.pat_idx % pattern.len()];
-                    if vel > 0.0 {
-                        c.spawn_pulse(0.0, vel * vel_mul);
-                        self.units[c.src].led = self.units[c.src].led.max(vel * 0.7);
-                        if c.pattern == 0 {
-                            let note = NOTE_SEQ[c.pat_idx % NOTE_SEQ.len()];
-                            self.key_leds[note] = 1.0;
-                        }
-                    }
-                    c.pat_idx += 1;
-                    c.next_event += beats as f64 * BEAT / rate as f64;
-                    guard += 1;
-                }
-            }
+            // No simulated band: pulses are fired ONLY by real key presses
+            // (fire_keys), so the rack shows exactly what is being played.
 
             // Pulses travel; arrivals excite the destination.
-            if self.playing {
-                let speed_mul = if c.src == 2 { delay_time } else { 1.0 };
-                for p in &mut c.pulses {
-                    if !p.active { continue; }
-                    p.t += p.speed * speed_mul * dt;
-                    if p.t >= 1.0 {
-                        p.active = false;
-                        if c.dying < 0.0 && n_arrivals < self.arrivals.len() {
-                            self.arrivals[n_arrivals] = (c.dst, p.amp);
-                            n_arrivals += 1;
-                        }
+            let speed_mul = if c.src == 2 { delay_time } else { 1.0 };
+            for p in &mut c.pulses {
+                if !p.active { continue; }
+                p.t += p.speed * speed_mul * dt;
+                if p.t >= 1.0 {
+                    p.active = false;
+                    if c.dying < 0.0 && n_arrivals < self.arrivals.len() {
+                        self.arrivals[n_arrivals] = (c.dst, p.amp);
+                        n_arrivals += 1;
                     }
                 }
             }
@@ -1239,11 +1224,10 @@ impl DemoApp {
             }
         }
 
-        // Master meter.
-        let target = self.cables.iter()
-            .filter(|c| c.dst == 3 && c.dying < 0.0)
-            .map(|c| c.level)
-            .fold(0.0f32, f32::max) * volume;
+        // Master meter: the engine's real output peak, not a simulation.
+        let target = self.out_level.as_ref()
+            .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+            .unwrap_or(0.0);
         self.meter += (target - self.meter) * (1.0 - (-dt / 0.08).exp());
 
         let selected = self.selected;
@@ -2312,7 +2296,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
+fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -2335,6 +2319,7 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
     );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(voice, drain, sample_rate);
+    let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
@@ -2344,7 +2329,7 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
         None,
     )?;
     stream.play()?;
-    Ok((main, stream, bus))
+    Ok((main, stream, bus, level))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -2391,7 +2376,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((main, stream, bus)) => {
+                    Ok((main, stream, bus, level)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         let b = bus.clone();
                         sink = Some(Box::new(move |ev: NoteEvent| {
@@ -2405,14 +2390,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((main, stream, bus));
+                        audio = Some((main, stream, bus, level));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((main, stream, bus)) => app.with_audio(main, stream, bus),
+                Some((main, stream, bus, level)) => app.with_audio(main, stream, bus, level),
                 None => app,
             };
             Ok(Box::new(app))

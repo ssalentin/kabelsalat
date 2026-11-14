@@ -2,7 +2,7 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: P0 spike · Name: `kabelsalat` (binary = package = `.desktop` = icon = Wayland app id) · Location: `~/Work/kabelsalat`
+Status: **P0 complete — GO for P1** (see docs/p0-report.md) · Name: `kabelsalat` (binary = package = `.desktop` = icon = Wayland app id) · Location: `~/Work/kabelsalat`
 
 ## 0. Decision log
 

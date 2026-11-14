@@ -15,6 +15,7 @@ use midir::os::unix::{VirtualInput, VirtualOutput};
 use midir::{Ignore, MidiInput, MidiOutput};
 
 const MAX_EVENTS: usize = 200;
+const KEY_LETTERS: [char; 16] = ['A', 'W', 'S', 'E', 'D', 'F', 'T', 'G', 'Y', 'H', 'U', 'J', 'K', 'O', 'L', 'P'];
 const BG: egui::Color32 = egui::Color32::from_rgb(0x15, 0x16, 0x1e);
 const PANEL: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x20, 0x2e);
 const YELLOW: egui::Color32 = egui::Color32::from_rgb(0xff, 0xd6, 0x0a);
@@ -50,6 +51,8 @@ struct PreviewApp {
     _synth_stream: Option<cpal::Stream>,
     synth_status: String,
     pressed_note: Option<u8>,
+    octave: u8,
+    held_keys: Vec<(egui::Key, u8)>,
     tone_busy: Arc<AtomicBool>,
     audio_info: String,
 }
@@ -170,6 +173,8 @@ impl PreviewApp {
             _synth_stream: synth_stream,
             synth_status,
             pressed_note: None,
+            octave: 4,
+            held_keys: Vec::new(),
             tone_busy: Arc::new(AtomicBool::new(false)),
             audio_info,
         }
@@ -225,6 +230,52 @@ impl PreviewApp {
         });
     }
 
+    fn base_note(&self) -> u8 {
+        (self.octave + 1) * 12
+    }
+
+    fn key_offset(key: egui::Key) -> Option<u8> {
+        use egui::Key::*;
+        Some(match key {
+            A => 0, W => 1, S => 2, E => 3, D => 4, F => 5, T => 6, G => 7,
+            Y => 8, H => 9, U => 10, J => 11, K => 12, O => 13, L => 14, P => 15,
+            _ => return None,
+        })
+    }
+
+    fn shift_octave(&mut self, delta: i8) {
+        let held: Vec<_> = self.held_keys.drain(..).collect();
+        for (_, note) in held {
+            self.note_event(note, false);
+        }
+        self.octave = (self.octave as i8 + delta).clamp(1, 7) as u8;
+    }
+
+    fn handle_key(&mut self, key: egui::Key, pressed: bool, repeat: bool) {
+        if pressed && !repeat {
+            if key == egui::Key::Z {
+                self.shift_octave(-1);
+                return;
+            }
+            if key == egui::Key::X {
+                self.shift_octave(1);
+                return;
+            }
+        }
+        let Some(off) = Self::key_offset(key) else { return };
+        if pressed {
+            if repeat || self.held_keys.iter().any(|(k, _)| *k == key) {
+                return;
+            }
+            let note = self.base_note().saturating_add(off).min(127);
+            self.held_keys.push((key, note));
+            self.note_event(note, true);
+        } else if let Some(pos) = self.held_keys.iter().position(|(k, _)| *k == key) {
+            let (_, note) = self.held_keys.remove(pos);
+            self.note_event(note, false);
+        }
+    }
+
     fn note_event(&mut self, note: u8, on: bool) {
         let _ = self.keys_tx.push((note, on));
         let msg = [if on { 0x90 } else { 0x80 }, note, if on { 100 } else { 0 }];
@@ -247,9 +298,10 @@ impl PreviewApp {
     /// Two octaves of click-to-play piano, C4..C6.
     fn keyboard(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            egui::RichText::new(
-                "On-screen keys — click to play the sine synth (also an ALSA output: 'kabelsalat-keys')",
-            )
+            egui::RichText::new(format!(
+                "Play with mouse or laptop keys: A W S E D F T G Y H U J K O L P · Z/X = octave (now C{}) · ALSA out: 'kabelsalat-keys'",
+                self.octave
+            ))
             .small(),
         );
         const WHITE: [u8; 15] = [60, 62, 64, 65, 67, 69, 71, 72, 74, 76, 77, 79, 81, 83, 84];
@@ -310,6 +362,16 @@ impl PreviewApp {
                     egui::Color32::from_rgb(0x66, 0x66, 0x77),
                 );
             }
+            let off = *note as i16 - self.base_note() as i16;
+            if (0..16).contains(&off) {
+                painter.text(
+                    r.center_bottom() - egui::vec2(0.0, 20.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    KEY_LETTERS[off as usize].to_string(),
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_rgb(0x88, 0x88, 0x99),
+                );
+            }
         }
         // Black keys.
         for (b, note) in BLACK {
@@ -324,6 +386,16 @@ impl PreviewApp {
                 2.0,
                 if active { YELLOW } else { egui::Color32::from_rgb(0x1a, 0x1b, 0x24) },
             );
+            let off = note as i16 - self.base_note() as i16;
+            if (0..16).contains(&off) {
+                painter.text(
+                    r.center_bottom() - egui::vec2(0.0, 4.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    KEY_LETTERS[off as usize].to_string(),
+                    egui::FontId::proportional(8.0),
+                    egui::Color32::from_rgb(0xaa, 0xaa, 0xbb),
+                );
+            }
         }
 
         // Note on/off on transitions (glissando-friendly).
@@ -344,6 +416,13 @@ impl eframe::App for PreviewApp {
         // Keep the MIDI monitor fresh without burning CPU at full frame rate.
         let ctx = root.ctx().clone();
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Laptop-keyboard playing.
+        let events = ctx.input(|i| i.events.clone());
+        for ev in events {
+            if let egui::Event::Key { key, pressed, repeat, .. } = ev {
+                self.handle_key(key, pressed, repeat);
+            }
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(egui::Margin::same(16)))
             .show(root, |ui| {

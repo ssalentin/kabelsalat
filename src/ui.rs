@@ -33,6 +33,7 @@ use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{Command, CommandBus, Graph, PortKind as CPortKind, PortRef};
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 use crate::host::{ClapVoice, ClapVoiceMain};
+use crate::matrix::SourceId;
 
 // ---------------------------------------------------------------------------
 // Palette (assets/logo.svg + Omarchy/Tokyo-night accents)
@@ -185,6 +186,7 @@ fn ease_out_back(x: f32) -> f32 {
 pub struct NoteEvent {
     pub note: u8,
     pub velocity: f32,
+    pub source: SourceId,
 }
 
 /// Sink for [`NoteEvent`]s. `Send` so the engine can move it to its own thread.
@@ -466,6 +468,9 @@ struct DemoApp {
     /// so focus navigation never sees it); consumed in ui().
     flip_requested: bool,
 
+    /// Source tag applied to the next fire_keys (set by each input path).
+    current_source: SourceId,
+
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
     key_input: String,
@@ -578,6 +583,7 @@ impl DemoApp {
             arrivals: [(0, 0.0); 32],
             note_sink,
             flip_requested: false,
+            current_source: SourceId::Keys,
             assistant: Assistant::new(),
             key_input: String::new(),
             chat_input: String::new(),
@@ -619,7 +625,7 @@ impl DemoApp {
                                 if st == 0x90 || st == 0x80 {
                                     let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
                                     if let Ok(mut q) = q.lock() {
-                                        q.push_back(NoteEvent { note: msg[1], velocity: vel });
+                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(0) });
                                         while q.len() > 256 {
                                             q.pop_front();
                                         }
@@ -867,6 +873,7 @@ impl DemoApp {
     }
 
     fn handle_laptop_key(&mut self, key: Key, pressed: bool, repeat: bool) {
+        self.current_source = SourceId::LaptopKeys;
         if pressed && !repeat {
             if key == Key::Z {
                 let held: Vec<_> = self.held_keys.drain(..).collect();
@@ -937,6 +944,7 @@ impl DemoApp {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127);
                 let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).min(10000);
                 let semi = (note as i16 - 60).max(0) as usize;
+                self.current_source = SourceId::Keys;
                 self.fire_keys(semi, 0.8);
                 self.note_offs.push((
                     std::time::Instant::now() + std::time::Duration::from_millis(ms),
@@ -952,6 +960,16 @@ impl DemoApp {
             "flip_rack" => {
                 self.start_flip();
                 "rack flipped".into()
+            }
+            "set_rig_source" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let keys = args.get("keys").and_then(|v| v.as_bool()).unwrap_or(true);
+                let laptop = args.get("laptop").and_then(|v| v.as_bool()).unwrap_or(true);
+                let hardware = args.get("hardware").and_then(|v| v.as_bool()).unwrap_or(true);
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keys, laptop, hardware });
+                }
+                format!("rig {node} sources: keys={keys} laptop={laptop} hardware={hardware}")
             }
             _ => format!("unknown tool: {name}"),
         }
@@ -1058,7 +1076,7 @@ impl DemoApp {
             }
         }
         if let Some(sink) = &mut self.note_sink {
-            sink(NoteEvent { note: semitone.min(127) as u8, velocity: amp.clamp(0.0, 1.0) });
+            sink(NoteEvent { note: semitone.min(127) as u8, velocity: amp.clamp(0.0, 1.0), source: self.current_source });
         }
     }
 
@@ -1508,6 +1526,7 @@ impl DemoApp {
                     self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
                 }
                 Hit::Key(semi) => {
+                    self.current_source = SourceId::Keys;
                     self.fire_keys(semi, 0.95);
                 }
                 Hit::Jack { unit, jack } if self.side == Side::Back => {
@@ -2275,6 +2294,7 @@ impl eframe::App for DemoApp {
         while i < self.note_offs.len() {
             if self.note_offs[i].0 <= now {
                 let (_, semi) = self.note_offs.remove(i);
+                self.current_source = SourceId::Keys;
                 self.fire_keys(semi, 0.0);
             } else {
                 i += 1;
@@ -2289,6 +2309,7 @@ impl eframe::App for DemoApp {
             .unwrap_or_default();
         for ev in hw {
             let semi = (ev.note as i16 - 60).max(0) as usize;
+            self.current_source = ev.source;
             self.fire_keys(semi, ev.velocity);
         }
 
@@ -2470,9 +2491,9 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             // gates them on the Keys→Surge cable being plugged.
                             let note = 60 + ev.note;
                             let cmd = if ev.velocity > 0.0 {
-                                Command::NoteOn { note, velocity: ev.velocity }
+                                Command::NoteOn { note, velocity: ev.velocity, source: ev.source }
                             } else {
-                                Command::NoteOff { note }
+                                Command::NoteOff { note, source: ev.source }
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));

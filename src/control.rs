@@ -10,6 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::matrix::SourceId;
+
 pub type NodeId = u32;
 pub type EdgeId = u32;
 pub type ParamId = u32;
@@ -184,8 +186,12 @@ pub enum Command {
     Connect { id: EdgeId, from: PortRef, to: PortRef, kind: PortKind },
     Disconnect(EdgeId),
     SetParam { node: NodeId, param: ParamId, value: f64 },
-    NoteOn { note: u8, velocity: f32 },
-    NoteOff { note: u8 },
+    NoteOn { note: u8, velocity: f32, source: SourceId },
+    NoteOff { note: u8, source: SourceId },
+    /// Per-rig input selection (AUM operating model): which source classes
+    /// feed this instrument node. The MIDI cable still gates routing; this
+    /// filters by source on top. Default: all true.
+    SetRigSource { node: NodeId, keys: bool, laptop: bool, hardware: bool },
     TransportPlay,
     TransportStop,
 }
@@ -260,7 +266,7 @@ mod tests {
     #[test]
     fn bus_roundtrip() {
         let (mut bus, mut drain) = command_bus();
-        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8 }));
+        assert!(bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys }));
         let mut got = Vec::new();
         drain.drain(|c| got.push(c));
         assert_eq!(got.len(), 1);

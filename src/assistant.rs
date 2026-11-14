@@ -161,6 +161,11 @@ fn tools() -> Value {
             "name":"flip_rack",
             "description":"Flip the rack between front (perform) and back (patch cables)",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_rig_source",
+            "description":"Select which input sources feed a rig (AUM per-rig input). node 1=Surge A, 4=Surge B. Toggle keys (on-screen keyboard), laptop (laptop keyboard), hardware (MIDI devices). Omitted flags default to true.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"keys":{"type":"boolean"},"laptop":{"type":"boolean"},"hardware":{"type":"boolean"}},"required":["node"]}
         }}
     ])
 }

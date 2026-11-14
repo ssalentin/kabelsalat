@@ -18,6 +18,7 @@ use std::sync::Arc;
 use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind};
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
+use crate::matrix::SourceId;
 
 // Engine-level param ids (what the UI/assistant send). Translated to each
 // processor's native param ids in `dsp_native_param`.
@@ -47,6 +48,21 @@ struct VoiceSlot {
     voice: ClapVoice,
     level: f32,
     scratch: Vec<f32>,
+    // Per-rig input selection (AUM): which source classes feed this rig.
+    src_keys: bool,
+    src_laptop: bool,
+    src_hw: bool,
+}
+
+/// Does this rig accept notes from the given source? (The MIDI cable gate is
+/// checked separately by the caller.)
+fn source_accepted(s: &VoiceSlot, source: SourceId) -> bool {
+    match source {
+        SourceId::Keys => s.src_keys,
+        SourceId::LaptopKeys => s.src_laptop,
+        SourceId::Hardware(_) => s.src_hw,
+        _ => true,
+    }
 }
 
 struct DspSlot {
@@ -79,7 +95,15 @@ impl GraphEngine {
         let keys_node = graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
         let voices = voices
             .into_iter()
-            .map(|(node, voice)| VoiceSlot { node, voice, level: 0.85, scratch: vec![0.0; 8192 * 2] })
+            .map(|(node, voice)| VoiceSlot {
+                node,
+                voice,
+                level: 0.85,
+                scratch: vec![0.0; 8192 * 2],
+                src_keys: true,
+                src_laptop: true,
+                src_hw: true,
+            })
             .collect();
         let dsp = graph
             .nodes
@@ -147,22 +171,33 @@ impl GraphEngine {
                     }
                 }
             }
-            Command::NoteOn { note, velocity } => {
+            Command::NoteOn { note, velocity, source } => {
                 if let Some(keys) = self.keys_node {
                     for s in &mut self.voices {
-                        if self.graph.has_route(keys, s.node, PortKind::Midi) {
+                        if self.graph.has_route(keys, s.node, PortKind::Midi)
+                            && source_accepted(s, source)
+                        {
                             s.voice.note_on(note as u16, velocity as f64);
                         }
                     }
                 }
             }
-            Command::NoteOff { note } => {
+            Command::NoteOff { note, source } => {
                 if let Some(keys) = self.keys_node {
                     for s in &mut self.voices {
-                        if self.graph.has_route(keys, s.node, PortKind::Midi) {
+                        if self.graph.has_route(keys, s.node, PortKind::Midi)
+                            && source_accepted(s, source)
+                        {
                             s.voice.note_off(note as u16);
                         }
                     }
+                }
+            }
+            Command::SetRigSource { node, keys, laptop, hardware } => {
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                    s.src_keys = keys;
+                    s.src_laptop = laptop;
+                    s.src_hw = hardware;
                 }
             }
             Command::TransportPlay | Command::TransportStop => {} // P2

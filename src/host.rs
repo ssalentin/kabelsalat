@@ -51,7 +51,8 @@ use clack_host::prelude::*;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt, CreateWindowAux, EventMask, PropMode, WindowClass,
+    AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
+    EventMask, PropMode, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -1269,4 +1270,438 @@ fn embed_gui_inner(
     Ok(format!(
         "EMBEDDED OK (x11/XWayland, {evidence}; reparented={reparented}, created={created}, resize requests={resizes}, final size={final_size:?})"
     ))
+}
+
+// ---------------------------------------------------------------------------
+// EmbeddedEditor — plugin GUI inside the app's MAIN window (P1, task-15)
+// ---------------------------------------------------------------------------
+//
+// Same CLAP sequence as the P0 spike (create → set_parent → show → resize
+// pump), but the parent is the egui main window itself (X11 id obtained from
+// eframe via raw-window-handle), not a host-owned top-level. The editor is an
+// X11 CHILD of the main window, positioned by the UI into a reserved region
+// (physical pixels). One dedicated x11rb connection per editor discovers and
+// configures the child; CLAP gui requests are drained from HostShared.
+//
+// The parent window is NOT owned here — never destroy it. Teardown order is
+// gui.hide() → gui.destroy() (the plugin destroys its child itself); the X
+// connection may go away at any time afterwards.
+
+/// A rectangle in the main window's X11 coordinate space (physical pixels).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EditorRect {
+    pub x: i16,
+    pub y: i16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Result of [`EmbeddedEditor::pump`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EditorStatus {
+    Ok,
+    /// The plugin closed/destroyed its own GUI; the UI should drop the editor.
+    Closed,
+}
+
+pub struct EmbeddedEditor {
+    conn: RustConnection,
+    /// Main app window (borrowed, NOT owned).
+    parent: u32,
+    gui: PluginGui,
+    /// The plugin's editor window inside `parent`, once discovered.
+    child: Option<u32>,
+    /// Main-window children present before set_parent (discovery baseline).
+    baseline: Vec<u32>,
+    /// Plugin-side editor size (what Surge draws, physical px).
+    size: GuiSize,
+    /// Last region requested by the UI + when it last changed (debounce).
+    last_rect: Option<EditorRect>,
+    rect_changed: Instant,
+    /// Last geometry actually applied to the child (avoid configure spam).
+    last_geom: Option<(i16, i16, u16, u16)>,
+    mapped: bool,
+    /// Plugin reported closed/destroyed — skip hide/destroy on teardown.
+    gui_gone: bool,
+    next_evidence: Instant,
+}
+
+impl EmbeddedEditor {
+    /// Create the plugin GUI and embed it into `parent` (the main window's
+    /// X11 id), fitted to `rect`. Call on the main thread. On success the
+    /// editor is shown and (usually) already positioned; [`Self::pump`] keeps
+    /// it in sync afterwards.
+    pub fn open(main: &mut ClapVoiceMain, parent: u32, rect: EditorRect) -> Result<Self> {
+        ensure_display();
+        let gui = main
+            .gui()
+            .ok_or_else(|| anyhow!("plugin exposes no GUI extension"))?;
+        let cfg = GuiConfiguration {
+            api_type: GuiApiType::X11,
+            is_floating: false, // embedded into the main window — never floating
+        };
+        if !gui.is_api_supported(&main.instance_mut().plugin_handle(), cfg) {
+            bail!("Surge rejected x11 embedded GUI configuration");
+        }
+        gui.create(&main.instance_mut().plugin_handle(), cfg)
+            .context("step=create(x11, embedded)")?;
+        // GUI exists from here on: destroy it on every error path.
+        let result = Self::open_inner(main, gui, parent, rect);
+        if result.is_err() {
+            let _ = gui.hide(&main.instance_mut().plugin_handle());
+            gui.destroy(&main.instance_mut().plugin_handle());
+        }
+        result
+    }
+
+    fn open_inner(
+        main: &mut ClapVoiceMain,
+        gui: PluginGui,
+        parent: u32,
+        rect: EditorRect,
+    ) -> Result<Self> {
+        let (conn, _screen) = x11rb::connect(None).context("connecting to X server (DISPLAY)")?;
+        let baseline = conn
+            .query_tree(parent)
+            .context("query_tree(main window)")?
+            .reply()
+            .context("query_tree reply")?
+            .children;
+
+        // CLAP X11 embedding: hand Surge the MAIN window's id. Surge creates
+        // its editor directly as a child of it (P0: CreateNotify, no reparent).
+        // SAFETY: the main window outlives the GUI (eframe owns it; the editor
+        // is destroyed on toggle-off / app exit before the window goes away).
+        unsafe {
+            gui.set_parent(
+                &main.instance_mut().plugin_handle(),
+                ClapWindow::from_x11_handle(parent as _),
+            )
+            .context("step=set_parent(main window)")?;
+        }
+        gui.show(&main.instance_mut().plugin_handle())
+            .context("step=show")?;
+
+        let mut ed = Self {
+            conn,
+            parent,
+            gui,
+            child: None,
+            baseline,
+            size: GuiSize { width: 900, height: 600 },
+            last_rect: None,
+            rect_changed: Instant::now(),
+            last_geom: None,
+            mapped: true,
+            gui_gone: false,
+            next_evidence: Instant::now(),
+        };
+
+        // Discover the child synchronously (Surge creates it during
+        // set_parent/show) so it can be positioned before the first frame.
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while ed.child.is_none() && Instant::now() < deadline {
+            ed.discover_child();
+            if ed.child.is_none() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if ed.child.is_none() {
+            eprintln!("editor: no child window yet after 600 ms — will keep looking in pump()");
+        }
+        ed.fit_and_place(main, rect, true);
+        ed.log_evidence("open");
+        Ok(ed)
+    }
+
+    /// The plugin's editor X11 window, once discovered (for UI status).
+    pub fn child(&self) -> Option<u32> {
+        self.child
+    }
+
+    /// Per-frame maintenance: drain X events + CLAP gui requests, keep the
+    /// child fitted to `rect` (physical px in the main window). Main thread.
+    pub fn pump(&mut self, main: &mut ClapVoiceMain, rect: EditorRect) -> EditorStatus {
+        if self.gui_gone {
+            return EditorStatus::Closed;
+        }
+        // 1. X events on our dedicated connection (child StructureNotify).
+        loop {
+            match self.conn.poll_for_event() {
+                Ok(Some(event)) => match event {
+                    x11rb::protocol::Event::CreateNotify(ev) if ev.parent == self.parent => {
+                        if self.child.is_none() {
+                            self.adopt_child(ev.window);
+                        }
+                    }
+                    x11rb::protocol::Event::ReparentNotify(ev) if ev.parent == self.parent => {
+                        if self.child.is_none() {
+                            self.adopt_child(ev.window);
+                        }
+                    }
+                    x11rb::protocol::Event::DestroyNotify(ev) if Some(ev.window) == self.child => {
+                        eprintln!("editor: child window {} destroyed by plugin", ev.window);
+                        self.child = None;
+                        self.gui_gone = true;
+                        return EditorStatus::Closed;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("editor: X event poll failed: {e}");
+                    break;
+                }
+            }
+        }
+        // 2. Child not seen yet? Poll the tree (covers missed events).
+        if self.child.is_none() {
+            self.discover_child();
+        }
+        // 3. CLAP gui requests (dispatched to the shared handler by clack).
+        let req = main
+            .instance_mut()
+            .access_shared_handler(|h| h.resize_request.lock().unwrap().take());
+        if let Some(req) = req {
+            let target = self.adjusted_fit(main, clamp_size(req, rect), rect);
+            let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
+            self.size = self
+                .gui
+                .get_size(&main.instance_mut().plugin_handle())
+                .unwrap_or(target);
+            self.last_geom = None; // force reconfigure
+            eprintln!("editor: request_resize {req:?} -> {target:?}");
+        }
+        if main.instance_mut().access_shared_handler(|h| h.show_request.swap(false, Ordering::SeqCst)) {
+            let _ = self.gui.show(&main.instance_mut().plugin_handle());
+            self.set_mapped(true);
+        }
+        if main.instance_mut().access_shared_handler(|h| h.hide_request.swap(false, Ordering::SeqCst)) {
+            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
+            self.set_mapped(false);
+        }
+        if main.instance_mut().access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst)) {
+            self.gui_gone = true;
+            return EditorStatus::Closed;
+        }
+        if main.instance_mut().access_shared_handler(|h| h.callback_requested.swap(false, Ordering::SeqCst)) {
+            main.instance_mut().call_on_main_thread_callback();
+        }
+        // 4. Keep the child fitted + centered in the reserved region.
+        self.fit_and_place(main, rect, false);
+        // 5. Periodic hard evidence: the main window's child list.
+        if Instant::now() >= self.next_evidence {
+            self.log_evidence("pump");
+            self.next_evidence = Instant::now() + Duration::from_secs(5);
+        }
+        EditorStatus::Ok
+    }
+
+    /// Hide + destroy the plugin GUI (the plugin destroys its X11 child).
+    /// Consumes the editor; the X connection is dropped afterwards.
+    pub fn close(mut self, main: &mut ClapVoiceMain) {
+        if !self.gui_gone {
+            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
+            self.gui.destroy(&main.instance_mut().plugin_handle());
+        }
+        self.child = None;
+        eprintln!("editor: closed (gui destroyed, main window {} untouched)", self.parent);
+    }
+
+    // -- internals ----------------------------------------------------------
+
+    /// Find a new child of the main window (vs. the pre-embed baseline) and
+    /// adopt it as the editor. Prefer Surge's WM_CLASS; else the largest new
+    /// window. Selects StructureNotify on the child to observe its lifecycle.
+    fn discover_child(&mut self) {
+        let Ok(reply) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
+            return;
+        };
+        let Ok(tree) = reply else { return };
+        let mut best: Option<(u32, u32)> = None; // (window, area)
+        for &child in &tree.children {
+            if self.baseline.contains(&child) {
+                continue;
+            }
+            let class = self.window_class(child);
+            let area = self
+                .conn
+                .get_geometry(child)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|g| g.width as u32 * g.height as u32)
+                .unwrap_or(0);
+            if class.to_lowercase().contains("surge") {
+                self.adopt_child(child);
+                return;
+            }
+            if best.map_or(true, |(_, a)| area > a) {
+                best = Some((child, area));
+            }
+        }
+        if let Some((child, _)) = best {
+            self.adopt_child(child);
+        }
+    }
+
+    fn adopt_child(&mut self, child: u32) {
+        self.child = Some(child);
+        self.baseline.push(child); // never re-adopt
+        // Observe the child's own lifecycle (destroy/configure). This does not
+        // touch the main window's event mask (winit owns that).
+        let _ = self.conn.change_window_attributes(
+            child,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        );
+        let _ = self.conn.flush();
+        eprintln!(
+            "editor: X11 child {} (WM_CLASS {:?}) lives INSIDE main window {} — embedded",
+            child,
+            self.window_class(child),
+            self.parent
+        );
+    }
+
+    fn window_class(&self, win: u32) -> String {
+        self.conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| String::from_utf8_lossy(&r.value).replace('\0', " ").trim().to_string())
+            .unwrap_or_default()
+    }
+
+    fn set_mapped(&mut self, mapped: bool) {
+        if self.mapped == mapped {
+            return;
+        }
+        self.mapped = mapped;
+        if let Some(child) = self.child {
+            let _ = if mapped {
+                self.conn.map_window(child)
+            } else {
+                self.conn.unmap_window(child)
+            };
+            let _ = self.conn.flush();
+        }
+    }
+
+    /// Fit the editor to the region (debounced while the region is actively
+    /// resizing) and center the child in it. `force` skips the debounce.
+    fn fit_and_place(&mut self, main: &mut ClapVoiceMain, rect: EditorRect, force: bool) {
+        if rect.w < 16 || rect.h < 16 {
+            return;
+        }
+        let region_changed = self.last_rect != Some(rect);
+        if region_changed {
+            if force {
+                self.rect_changed = Instant::now() - Duration::from_secs(1);
+            } else if self.last_rect.is_none() {
+                self.rect_changed = Instant::now();
+            }
+            self.last_rect = Some(rect);
+        }
+        // Re-fit the plugin size only once the region settles (150 ms), so
+        // live window resizes don't re-zoom Surge every frame.
+        let settled = self.rect_changed.elapsed() >= Duration::from_millis(150);
+        if (region_changed && settled) || force {
+            let desired = GuiSize { width: rect.w as u32, height: rect.h as u32 };
+            let target = self.adjusted_fit(main, desired, rect);
+            if target != self.size || force {
+                let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
+                self.size = self
+                    .gui
+                    .get_size(&main.instance_mut().plugin_handle())
+                    .unwrap_or(target);
+            }
+            self.last_geom = None;
+        }
+        // Center the child in the region; never exceed it (X children are
+        // only clipped by the main window, not by our reserved region).
+        let Some(child) = self.child else { return };
+        let cw = self.size.width.min(rect.w as u32) as u16;
+        let ch = self.size.height.min(rect.h as u32) as u16;
+        let cx = rect.x + ((rect.w.saturating_sub(cw)) / 2) as i16;
+        let cy = rect.y + ((rect.h.saturating_sub(ch)) / 2) as i16;
+        let geom = (cx, cy, cw, ch);
+        if self.last_geom != Some(geom) {
+            let _ = self.conn.configure_window(
+                child,
+                &ConfigureWindowAux::new()
+                    .x(cx as i32)
+                    .y(cy as i32)
+                    .width(cw as u32)
+                    .height(ch as u32),
+            );
+            let _ = self.conn.flush();
+            self.last_geom = Some(geom);
+        }
+        if !self.mapped {
+            self.set_mapped(true);
+        }
+    }
+
+    /// CLAP-correct size fitting: `set_size` must receive a size approved by
+    /// `adjust_size` (Surge snaps to its zoom steps and may round UP). Shrink
+    /// the request proportionally and re-adjust until it fits the region.
+    fn adjusted_fit(&self, main: &mut ClapVoiceMain, desired: GuiSize, rect: EditorRect) -> GuiSize {
+        let mut want = desired;
+        let mut last = desired;
+        for _ in 0..8 {
+            let adj = self
+                .gui
+                .adjust_size(&main.instance_mut().plugin_handle(), want)
+                .unwrap_or(want);
+            last = adj;
+            if adj.width <= rect.w as u32 && adj.height <= rect.h as u32 {
+                return adj;
+            }
+            let s = (rect.w as f64 / adj.width as f64).min(rect.h as f64 / adj.height as f64);
+            want = GuiSize {
+                width: ((want.width as f64 * s) as u32).max(1),
+                height: ((want.height as f64 * s) as u32).max(1),
+            };
+        }
+        last // zoom granularity may leave a few px overflow; centered anyway
+    }
+
+    /// Hard evidence: enumerate the main window's children with WM_CLASS and
+    /// geometry (x11rb query_tree — the xwininfo -tree equivalent).
+    fn log_evidence(&self, when: &str) {
+        let Ok(tree) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
+            return;
+        };
+        let Ok(tree) = tree else { return };
+        let mut lines = Vec::new();
+        for &child in &tree.children {
+            let geom = self
+                .conn
+                .get_geometry(child)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map(|g| format!("{}x{}+{}+{}", g.width, g.height, g.x, g.y))
+                .unwrap_or_else(|| "?".into());
+            lines.push(format!(
+                "    child {} WM_CLASS {:?} geom {}{}",
+                child,
+                self.window_class(child),
+                geom,
+                if Some(child) == self.child { "  <-- Surge editor" } else { "" }
+            ));
+        }
+        eprintln!(
+            "editor evidence [{when}]: main window {} has {} child window(s):\n{}",
+            self.parent,
+            tree.children.len(),
+            lines.join("\n")
+        );
+    }
+}
+
+/// Clamp a plugin size to the reserved region (never cover the rack).
+fn clamp_size(size: GuiSize, rect: EditorRect) -> GuiSize {
+    GuiSize {
+        width: size.width.min(rect.w as u32).max(1),
+        height: size.height.min(rect.h as u32).max(1),
+    }
 }

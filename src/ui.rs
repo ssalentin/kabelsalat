@@ -32,7 +32,7 @@ use midir::MidiInput;
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{Command, CommandBus, Graph, PortKind as CPortKind, PortRef};
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
-use crate::host::{ClapVoice, ClapVoiceMain};
+use crate::host::{ClapVoice, ClapVoiceMain, EditorRect, EditorStatus, EmbeddedEditor};
 use crate::matrix::SourceId;
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,9 @@ const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
 const MAX_CABLES: usize = 64;
 const FLIP_SECS: f32 = 0.35;
+/// Header strip of the embedded-editor panel (egui points); the X11 child
+/// window occupies the panel area below it.
+const EDITOR_HEADER_H: f32 = 28.0;
 
 // Damped spring: omega ≈ 11.4 rad/s (~1.8 Hz), zeta ≈ 0.3 → a few visible
 // swings before settling. Semi-implicit Euler at ≤ 1/240 s substeps.
@@ -496,6 +499,16 @@ struct DemoApp {
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
+
+    // --- Embedded Surge editor (task-15): ONE window, X11 child of the main
+    // window, positioned into a reserved bottom region. One pane at a time.
+    editor: Option<EmbeddedEditor>,
+    /// Which rig's editor is open: 0 = Surge A (unit 1), 1 = Surge B (unit 4).
+    editor_rig: usize,
+    /// Pending open/close request (strip button or F2/F3); handled in ui()
+    /// where the eframe Frame (X11 handle) is available.
+    editor_toggle: Option<usize>,
+    editor_status: String,
 }
 
 impl DemoApp {
@@ -609,6 +622,10 @@ impl DemoApp {
             _audio_stream: None,
             bus: None,
             out_level: None,
+            editor: None,
+            editor_rig: 0,
+            editor_toggle: None,
+            editor_status: String::new(),
         };
 
         // Hardware MIDI auto-wire at startup: events queue here and are drained
@@ -709,6 +726,7 @@ impl DemoApp {
         self.help_body_g = Some(layout(
             "two stacks A/B share KEYS and MASTER — play both at once\n\
              Tab                flip the rack · front = perform, back = patch\n\
+             F2 / F3            embed the Surge A / B editor in this window\n\
              drag knobs         shape the sound · right-click resets\n\
              click the keys     play Keys — pulses run down both stacks\n\
              laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
@@ -1122,6 +1140,130 @@ impl DemoApp {
         }
     }
 
+    // -- embedded Surge editor (task-15) -------------------------------------
+    //
+    // ONE window: the plugin GUI is created with set_parent(main window X11
+    // id) and lives as an X11 CHILD, positioned into a reserved bottom region
+    // (physical pixels = egui points × pixels_per_point). The region is fixed
+    // — the rack flip transform never touches it.
+
+    /// Reserved bottom region for the editor, in egui points.
+    fn editor_region(avail: Rect) -> Rect {
+        let h = (avail.height() * 0.55).clamp(220.0, 760.0);
+        Rect::from_min_size(
+            Pos2::new(avail.left(), avail.bottom() - h),
+            Vec2::new(avail.width(), h),
+        )
+    }
+
+    /// Open/close a rig's embedded editor. Needs the eframe Frame for the
+    /// main window's X11 handle. One editor pane at a time.
+    fn toggle_editor(&mut self, rig: usize, frame: &eframe::Frame, ui: &egui::Ui) {
+        if self.editor.is_some() && self.editor_rig == rig {
+            self.close_editor();
+            self.editor_status = "editor closed".into();
+            return;
+        }
+        self.close_editor();
+        let Some(main) = self._surge_main.get_mut(rig) else {
+            self.editor_status = "no synth loaded — editor unavailable".into();
+            return;
+        };
+        let Some(x11) = main_window_x11(frame) else {
+            self.editor_status = "no X11 window handle (run under XWayland)".into();
+            return;
+        };
+        let region = Self::editor_region(ui.available_rect_before_wrap());
+        let rect = phys_editor_rect(region, ui.ctx().pixels_per_point());
+        match EmbeddedEditor::open(main, x11, rect) {
+            Ok(ed) => {
+                eprintln!(
+                    "editor: Surge {} opened inside main window {x11:#x}",
+                    if rig == 0 { "A" } else { "B" },
+                );
+                self.editor = Some(ed);
+                self.editor_rig = rig;
+                self.editor_status = "embedded — X11 child of this window".into();
+            }
+            Err(e) => {
+                eprintln!("editor: open failed: {e:#}");
+                self.editor_status = format!("editor failed: {e}");
+            }
+        }
+    }
+
+    fn close_editor(&mut self) {
+        if let Some(ed) = self.editor.take() {
+            if let Some(main) = self._surge_main.get_mut(self.editor_rig) {
+                ed.close(main);
+            }
+        }
+    }
+
+    /// Allocate the editor's bottom panel (header + placeholder). The X11
+    /// child window composites OVER the placeholder area. Returns the panel
+    /// rect in egui points.
+    fn editor_panel(&mut self, ui: &mut egui::Ui) -> Rect {
+        let region = Self::editor_region(ui.available_rect_before_wrap());
+        let rig = self.editor_rig;
+        let status = self.editor_status.clone();
+        let child = self.editor.as_ref().and_then(|e| e.child());
+        let resp = egui::Panel::bottom("surge_editor")
+            .exact_size(region.height())
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(0x10, 0x11, 0x18))
+                    .inner_margin(egui::Margin::same(0)),
+            )
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    Vec2::new(ui.available_width(), EDITOR_HEADER_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add_space(12.0);
+                        let name = if rig == 0 { "SURGE A" } else { "SURGE B" };
+                        ui.label(
+                            egui::RichText::new(format!("{name} — embedded editor"))
+                                .small().strong().color(BLUE),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(status).small().italics().color(SUBTEXT));
+                        if let Some(c) = child {
+                            ui.label(egui::RichText::new(format!("X11 child {c:#x}")).small().color(SUBTEXT));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(8.0);
+                            if ui.button("Close").clicked() {
+                                self.editor_toggle = Some(rig);
+                            }
+                        });
+                    },
+                );
+                // Dark placeholder under the header — the plugin's X11 child
+                // covers this; any uncovered sliver matches the chassis.
+                let rest = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(rest, 0.0, Color32::from_rgb(0x0b, 0x0c, 0x12));
+            });
+        resp.response.rect
+    }
+
+    /// Per-frame editor maintenance: X events, CLAP gui requests, geometry.
+    fn pump_editor(&mut self, region: Rect, ppp: f32) {
+        let rect = phys_editor_rect(region, ppp);
+        let rig = self.editor_rig;
+        let Some(main) = self._surge_main.get_mut(rig) else { return };
+        let Some(ed) = self.editor.as_mut() else { return };
+        if ed.pump(main, rect) == EditorStatus::Closed {
+            // Plugin closed its own GUI; drop the editor (close() skips the
+            // CLAP calls because gui_gone is set).
+            if let Some(ed) = self.editor.take() {
+                ed.close(main);
+            }
+            self.editor_status = "editor closed by plugin".into();
+        }
+    }
+
     /// AUM-style per-rig input selection: which sources feed each rig.
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("rig_inputs")
@@ -1156,6 +1298,18 @@ impl DemoApp {
                                 self.send_rig_source(node);
                             }
                         }
+                        // Embedded Surge editor toggle (task-15): opens the
+                        // plugin GUI INSIDE this window (X11 child), not a
+                        // separate floating window. Handled in ui().
+                        let ed_on = self.editor.is_some() && self.editor_rig == rig;
+                        let ed_fill = if ed_on { alpha(accent, 0.55) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                        let ed_txt = if ed_on { TEXT } else { SUBTEXT };
+                        let btn = egui::Button::new(egui::RichText::new("Editor").small().color(ed_txt))
+                            .fill(ed_fill)
+                            .corner_radius(4.0);
+                        if ui.add(btn).on_hover_text("embed the Surge editor in this window (F2/F3)").clicked() {
+                            self.editor_toggle = Some(rig);
+                        }
                         ui.add_space(14.0);
                     }
                     ui.add_space(4.0);
@@ -1173,6 +1327,10 @@ impl DemoApp {
                         }
                     }
                     ui.add_space(10.0);
+                    if self.editor.is_none() && !self.editor_status.is_empty() {
+                        ui.label(egui::RichText::new(&self.editor_status).small().italics().color(ORANGE));
+                        ui.add_space(8.0);
+                    }
                     ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
                 });
             });
@@ -1343,6 +1501,11 @@ impl DemoApp {
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
+        eprintln!(
+            "rack flip: {} -> {} (embedded editor stays in its fixed region)",
+            if self.side == Side::Front { "front" } else { "back" },
+            if self.flip_to == Side::Front { "front" } else { "back" },
+        );
     }
 
     fn toggle_play(&mut self) {
@@ -1669,6 +1832,9 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
             if i.consume_key(Modifiers::NONE, Key::D) { self.show_stats = !self.show_stats; }
+            // Embedded Surge editors: F2 = rig A, F3 = rig B (task-15).
+            if i.consume_key(Modifiers::NONE, Key::F2) { self.editor_toggle = Some(0); }
+            if i.consume_key(Modifiers::NONE, Key::F3) { self.editor_toggle = Some(1); }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
             }
@@ -2432,6 +2598,40 @@ fn dt_of(ctx: &egui::Context) -> f32 {
     ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0)
 }
 
+/// The main window's X11 id, via eframe's raw-window-handle implementation.
+///
+/// eframe 0.37: `Frame: HasWindowHandle` (epi.rs). The trait and types live in
+/// raw-window-handle 0.6, re-exported as `eframe::wgpu::rwh` (wgpu is a default
+/// eframe feature) — no extra dependency. Under `WINIT_UNIX_BACKEND=x11`
+/// winit yields `RawWindowHandle::Xlib` (the Xlib `Window` id).
+fn main_window_x11(frame: &eframe::Frame) -> Option<u32> {
+    use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+    let handle = frame.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Xlib(h) => Some(h.window as u32),
+        RawWindowHandle::Xcb(h) => Some(h.window.get()),
+        other => {
+            eprintln!("editor: unsupported raw window handle: {other:?}");
+            None
+        }
+    }
+}
+
+/// Editor panel rect (egui points) → X11 child rect (physical pixels),
+/// excluding the header strip. X11 coords are relative to the main window.
+fn phys_editor_rect(region: Rect, ppp: f32) -> EditorRect {
+    let x = (region.left() * ppp).round().max(0.0) as i32;
+    let y = ((region.top() + EDITOR_HEADER_H) * ppp).round().max(0.0) as i32;
+    let w = (region.width() * ppp).round().max(1.0) as i32;
+    let h = ((region.height() - EDITOR_HEADER_H) * ppp).round().max(1.0) as i32;
+    EditorRect {
+        x: x.min(i16::MAX as i32) as i16,
+        y: y.min(i16::MAX as i32) as i16,
+        w: w.min(u16::MAX as i32) as u16,
+        h: h.min(u16::MAX as i32) as u16,
+    }
+}
+
 fn p_side(unit: usize, app: &DemoApp) -> f32 {
     let x = app.jack_pos(unit, 0).x;
     if x < app.rack_w / 2.0 { -1.0 } else { 1.0 }
@@ -2456,7 +2656,7 @@ impl eframe::App for DemoApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ensure_galleys(&ctx);
 
@@ -2480,6 +2680,18 @@ impl eframe::App for DemoApp {
         // Per-rig input selection strip (top), then assistant (right), then rack.
         self.rig_inputs_panel(ui);
         self.assistant_panel_ui(ui);
+
+        // Embedded Surge editor (task-15): handle open/close requests here
+        // (the eframe Frame carries the main window's X11 handle), then
+        // reserve the bottom region. The rack lays out in what remains.
+        if let Some(rig) = self.editor_toggle.take() {
+            self.toggle_editor(rig, frame, ui);
+        }
+        let editor_region = if self.editor.is_some() {
+            Some(self.editor_panel(ui))
+        } else {
+            None
+        };
 
         // Laptop keys (disabled while the assistant text field has focus).
         if !ctx.egui_wants_keyboard_input() {
@@ -2559,7 +2771,18 @@ impl eframe::App for DemoApp {
         self.tessellate();
         self.draw(ui);
 
+        // Keep the embedded editor alive: X events, CLAP gui requests, and
+        // child geometry in the reserved region (physical pixels).
+        if let Some(region) = editor_region {
+            self.pump_editor(region, ctx.pixels_per_point());
+        }
+
         ctx.request_repaint();
+    }
+
+    fn on_exit(&mut self) {
+        // Destroy the plugin GUI before the CLAP instances drop (CLAP rule).
+        self.close_editor();
     }
 }
 
@@ -2686,6 +2909,16 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
     // and egui's pixels_per_point handles element sizing.
     if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
         std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
+    // winit >= 0.29 REMOVED WINIT_UNIX_BACKEND: it picks Wayland whenever
+    // WAYLAND_DISPLAY is set, else X11 via DISPLAY. To actually force X11
+    // (required for editor embedding), hide the Wayland socket — but only
+    // when an X display is available, so we never strand the app backend-less.
+    let have_x = std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
+        || std::fs::read_dir("/tmp/.X11-unix").map(|mut d| d.next().is_some()).unwrap_or(false);
+    if have_x && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        eprintln!("ui: forcing X11 backend (WAYLAND_DISPLAY hidden; embedding needs XWayland)");
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -471,6 +471,9 @@ struct DemoApp {
     /// Source tag applied to the next fire_keys (set by each input path).
     current_source: SourceId,
 
+    /// Per-rig input selection (keys, laptop, hardware) for rigs A=node1, B=node4.
+    rig_sources: [(bool, bool, bool); 2],
+
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
     key_input: String,
@@ -584,6 +587,7 @@ impl DemoApp {
             note_sink,
             flip_requested: false,
             current_source: SourceId::Keys,
+            rig_sources: [(true, true, true); 2],
             assistant: Assistant::new(),
             key_input: String::new(),
             chat_input: String::new(),
@@ -973,6 +977,55 @@ impl DemoApp {
             }
             _ => format!("unknown tool: {name}"),
         }
+    }
+
+    fn send_rig_source(&self, node: u32) {
+        let rig = if node == 1 { 0 } else { 1 };
+        let (keys, laptop, hardware) = self.rig_sources[rig];
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keys, laptop, hardware });
+        }
+    }
+
+    /// AUM-style per-rig input selection: which sources feed each rig.
+    fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
+        egui::Panel::top("rig_inputs")
+            .default_size(36.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(0x1e, 0x20, 0x2e))
+                    .inner_margin(egui::Margin::same(6)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("RIG INPUTS").small().strong().color(SUBTEXT));
+                    ui.add_space(10.0);
+                    for (rig, node, accent) in [(0usize, 1u32, BLUE), (1usize, 4u32, GREEN)] {
+                        let label = if rig == 0 { "A" } else { "B" };
+                        ui.label(egui::RichText::new(format!("RIG {label}")).small().strong().color(accent));
+                        let (k, l, h) = self.rig_sources[rig];
+                        for (name, on, idx) in [("Keys", k, 0usize), ("Laptop", l, 1), ("HW", h, 2)] {
+                            let fill = if on { alpha(accent, 0.35) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                            let txt = if on { TEXT } else { SUBTEXT };
+                            let btn = egui::Button::new(egui::RichText::new(name).small().color(txt))
+                                .fill(fill)
+                                .corner_radius(4.0);
+                            if ui.add(btn).clicked() {
+                                let s = &mut self.rig_sources[rig];
+                                match idx {
+                                    0 => s.0 = !s.0,
+                                    1 => s.1 = !s.1,
+                                    _ => s.2 = !s.2,
+                                }
+                                self.send_rig_source(node);
+                            }
+                        }
+                        ui.add_space(14.0);
+                    }
+                    ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
+                });
+            });
     }
 
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
@@ -2274,7 +2327,8 @@ impl eframe::App for DemoApp {
             self.start_flip();
         }
 
-        // Assistant panel takes the right strip; the rack gets the rest.
+        // Per-rig input selection strip (top), then assistant (right), then rack.
+        self.rig_inputs_panel(ui);
         self.assistant_panel_ui(ui);
 
         // Laptop keys (disabled while the assistant text field has focus).

@@ -11,6 +11,7 @@ mod dsp;
 mod engine;
 mod host;
 mod matrix;
+mod mcp;
 mod midi;
 mod preview;
 mod session;
@@ -25,8 +26,9 @@ fn main() -> anyhow::Result<()> {
         "midi-test" => midi::run_test(),
         "host-test" => host::run_test(),
         "ui-demo" => ui::run_demo(),
+        "mcp" => mcp::run(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp");
             std::process::exit(1);
         }
     }

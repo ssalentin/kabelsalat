@@ -71,16 +71,6 @@ const SPRING_D: f32 = 6.8;
 const BPM: f64 = 96.0;
 const BEAT: f64 = 60.0 / BPM;
 
-// Simulated band: swung eighths with accents and a breath at the end (2 bars).
-const MELODY: [(f32, f32); 16] = [
-    (0.55, 1.0), (0.45, 0.55), (0.55, 0.8), (0.45, 0.6),
-    (0.55, 0.95), (0.45, 0.5), (0.55, 0.75), (0.45, 0.65),
-    (0.55, 1.0), (0.45, 0.55), (0.55, 0.85), (0.45, 0.6),
-    (0.55, 0.9), (0.45, 0.7), (0.55, 0.5), (0.45, 0.0),
-];
-const TAP: [(f32, f32); 4] = [(2.0, 0.75), (2.0, 0.6), (2.0, 0.75), (2.0, 0.9)];
-// Which key lights up per melody step (semitones, 0..12).
-const NOTE_SEQ: [usize; 16] = [0, 4, 7, 4, 2, 5, 9, 5, 0, 4, 7, 9, 11, 7, 4, 2];
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 const BLACK_SEMI: [usize; 5] = [1, 3, 6, 8, 10];
 const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black key follows

@@ -1,14 +1,27 @@
 //! CLAP plugin hosting via clack-host + clack-extensions. Reference plugin: Surge XT.
-//! Owned by the clap-host workstream. P0: discover ~/.clap, load Surge,
-//! enumerate params, process audio with note events (audible arpeggio through
-//! the default cpal output), save/restore state, and EMBED the plugin GUI into
-//! a host-owned X11 window (XWayland) — no detached plugin windows.
+//! Owned by the clap-host workstream.
+//!
+//! Public API: [`ClapVoice`] — a reusable, RT-safe Surge voice.
+//! - `ClapVoice::new(sample_rate)` loads Surge XT from ~/.clap, activates it and
+//!   returns `(ClapVoice, ClapVoiceMain)`.
+//! - `ClapVoice` is `Send`: move it to the audio thread and call
+//!   `render(&mut out)` (stereo-interleaved f32, NO allocation/locks inside).
+//! - `note_on`/`note_off` push into a lock-free command ring; they lock a mutex
+//!   on the *caller* side, so call them from non-RT threads (UI). For cross-thread
+//!   use grab a `VoiceController` before moving the voice.
+//! - `ClapVoiceMain` stays on the creating (main) thread: state save/restore,
+//!   params, embedded GUI, deactivation (CLAP [main-thread] rules).
+//!
+//! `run_test` is a demo built entirely on this API: discover ~/.clap, enumerate
+//! params, play an audible arpeggio through the default cpal output,
+//! save/restore state, and EMBED the plugin GUI into a host-owned X11 window
+//! (XWayland) — no detached plugin windows.
 //!
 //! Architecture (matches PLAN.md §7):
 //! - main thread: plugin instance lifecycle, params/state/GUI (CLAP [main-thread])
-//! - processing thread: owns the `StartedPluginAudioProcessor`, renders blocks,
-//!   pushes interleaved f32 into a lock-free `rtrb` ring (CLAP [audio-thread])
-//! - cpal callback: drains the ring into the device buffer (RT, no alloc/locks)
+//! - audio thread: owns `ClapVoice` (the `StartedPluginAudioProcessor`), renders
+//!   blocks (CLAP [audio-thread])
+//! - cpal callback: drains a lock-free `rtrb` ring into the device buffer
 
 use std::cell::Cell;
 use std::ffi::CString;
@@ -191,69 +204,381 @@ struct Exts {
 }
 
 // ---------------------------------------------------------------------------
+// ClapVoice — reusable, RT-safe Surge voice (public API)
+// ---------------------------------------------------------------------------
+
+/// A command bound for the voice, applied at the next rendered block.
+#[derive(Copy, Clone)]
+pub enum VoiceCmd {
+    NoteOn(u16, f64),
+    NoteOff(u16),
+    Param(ClapId, f64),
+}
+
+/// Event capacity per block; pushes beyond this are dropped (never allocates
+/// inside `render`).
+const EVENT_CAP: u32 = 256;
+/// Command ring depth (UI -> audio).
+const CMD_RING: usize = 1024;
+
+/// Send handle for pushing notes/params into a [`ClapVoice`] from any non-RT
+/// thread (e.g. the egui keyboard handler). Cheap to clone.
+#[derive(Clone)]
+pub struct VoiceController(Arc<Mutex<rtrb::Producer<VoiceCmd>>>);
+
+impl VoiceController {
+    /// Press a key (MIDI note number, velocity 0.0..=1.0).
+    pub fn note_on(&self, note: u16, velocity: f64) {
+        let _ = self.0.lock().unwrap().push(VoiceCmd::NoteOn(note, velocity));
+    }
+    /// Release a key.
+    pub fn note_off(&self, note: u16) {
+        let _ = self.0.lock().unwrap().push(VoiceCmd::NoteOff(note));
+    }
+    /// Set a plugin parameter (plain value) at the next block.
+    pub fn set_param(&self, id: ClapId, value: f64) {
+        let _ = self.0.lock().unwrap().push(VoiceCmd::Param(id, value));
+    }
+}
+
+// Named fn (not a closure) so the lifetime elision ties input and output.
+fn as_mut_slice_f32(b: &mut Vec<f32>) -> &mut [f32] {
+    b.as_mut_slice()
+}
+macro_rules! out_port {
+    ($p:ident) => {
+        AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_output_only($p.iter_mut().map(as_mut_slice_f32)),
+        }
+    };
+}
+
+/// A live Surge XT voice: the CLAP audio processor plus preallocated buffers.
+///
+/// `Send` but `!Sync`: create it on the main thread, then move it to the audio
+/// thread. `render` is RT-safe (no allocation, no locks, no syscalls). Notes
+/// arrive via a lock-free ring; `note_on`/`note_off` lock a mutex on the caller
+/// side and must NOT be called from the render thread — use a
+/// [`VoiceController`] from the UI thread instead.
+pub struct ClapVoice {
+    processor: StartedPluginAudioProcessor<TestHost>,
+    cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
+    cmds_rx: rtrb::Consumer<VoiceCmd>,
+    /// Optional sample-accurate sequence (frame offset, command), e.g. the
+    /// host-test arpeggio. Preallocated; consumed with a cursor.
+    schedule: Vec<(u64, VoiceCmd)>,
+    sched_idx: usize,
+    frame: u64,
+    sample_rate: f64,
+    in_count: usize,
+    main_out: usize,
+    n_out: usize,
+    in_bufs: Vec<Vec<f32>>,
+    out_bufs: [Vec<Vec<f32>>; MAX_OUT_PORTS],
+    in_ports: AudioPorts,
+    out_ports: AudioPorts,
+    ev_in: EventBuffer,
+    ev_out: EventBuffer,
+    process_errors: u64,
+}
+
+impl ClapVoice {
+    /// Load Surge XT from `~/.clap`, instantiate, activate and start processing
+    /// at `sample_rate`. Returns the audio-side voice and the main-thread
+    /// handle (state/GUI/deactivation). Call on the main thread.
+    pub fn new(sample_rate: f64) -> Result<(ClapVoice, ClapVoiceMain)> {
+        let (entry, plugin_id) = discover_surge()?;
+        let host_info = HostInfo::new(
+            "kabelsalat",
+            "kabelsalat",
+            "https://github.com/kabelsalat",
+            env!("CARGO_PKG_VERSION"),
+        )?;
+        let mut plugin = PluginInstance::<TestHost>::new(
+            |_| HostShared::default(),
+            |_| HostMainThread::new(),
+            &entry,
+            &plugin_id,
+            &host_info,
+        )
+        .context("instantiating Surge XT")?;
+        println!("instantiated: {}", plugin_id.to_string_lossy());
+
+        let exts = plugin.access_shared_handler(|h| Exts {
+            params: h.params.get().copied().flatten(),
+            state: h.state.get().copied().flatten(),
+            gui: h.gui.get().copied().flatten(),
+            latency: h.latency.get().copied().flatten(),
+            audio_ports: h.audio_ports.get().copied().flatten(),
+        });
+        println!(
+            "extensions: params={} state={} gui={} latency={} audio-ports={}",
+            exts.params.is_some(),
+            exts.state.is_some(),
+            exts.gui.is_some(),
+            exts.latency.is_some(),
+            exts.audio_ports.is_some()
+        );
+
+        let (in_count, in_ch, out_chs, main_out) =
+            inspect_audio_ports(&mut plugin, exts.audio_ports)?;
+
+        let audio_config = PluginAudioConfiguration {
+            sample_rate,
+            min_frames_count: 1,
+            max_frames_count: BLOCK as u32,
+        };
+        let stopped = plugin
+            .activate(|_, _| (), audio_config)
+            .context("activating Surge XT")?;
+        // Surge only reports meaningful latency once active.
+        let latency = exts.latency.map(|l| l.get(&plugin.plugin_handle())).unwrap_or(0);
+        println!("plugin-reported latency (active): {latency} samples");
+        let processor = stopped
+            .start_processing()
+            .map_err(|_| anyhow!("start_processing failed"))?;
+
+        let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let n_out = out_chs.len();
+        let voice = ClapVoice {
+            processor,
+            cmds_tx: Arc::new(Mutex::new(cmds_tx)),
+            cmds_rx,
+            schedule: Vec::new(),
+            sched_idx: 0,
+            frame: 0,
+            sample_rate,
+            in_count,
+            main_out,
+            n_out,
+            in_bufs: (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect(),
+            out_bufs: std::array::from_fn(|i| {
+                if i < n_out {
+                    (0..out_chs[i]).map(|_| vec![0.0; BLOCK]).collect()
+                } else {
+                    vec![vec![0.0; BLOCK]]
+                }
+            }),
+            in_ports: AudioPorts::with_capacity(in_ch.max(1), 1),
+            out_ports: AudioPorts::with_capacity(out_chs.iter().sum(), n_out),
+            ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
+            ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
+            process_errors: 0,
+        };
+        let main = ClapVoiceMain {
+            instance: plugin,
+            exts,
+            _entry: entry,
+        };
+        Ok((voice, main))
+    }
+
+    /// A `Send` controller for UI threads; grab it before moving the voice.
+    pub fn controller(&self) -> VoiceController {
+        VoiceController(self.cmds_tx.clone())
+    }
+
+    /// Press a key. Locks a mutex — call from non-RT threads only.
+    pub fn note_on(&self, note: u16, velocity: f64) {
+        let _ = self.cmds_tx.lock().unwrap().push(VoiceCmd::NoteOn(note, velocity));
+    }
+
+    /// Release a key. Locks a mutex — call from non-RT threads only.
+    pub fn note_off(&self, note: u16) {
+        let _ = self.cmds_tx.lock().unwrap().push(VoiceCmd::NoteOff(note));
+    }
+
+    /// Install a sample-accurate sequence of (frame offset, command), consumed
+    /// as rendering advances. Replaces any previous schedule. Main/setup thread.
+    pub fn set_schedule(&mut self, mut schedule: Vec<(u64, VoiceCmd)>) {
+        schedule.sort_by_key(|(t, _)| *t);
+        self.schedule = schedule;
+        self.sched_idx = 0;
+    }
+
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
+    /// Number of failed CLAP process calls (should stay 0).
+    pub fn process_errors(&self) -> u64 {
+        self.process_errors
+    }
+
+    /// Render `out.len() / 2` stereo-interleaved frames. RT-safe: no
+    /// allocation, no locks, no syscalls. Call from the audio thread only.
+    pub fn render(&mut self, out: &mut [f32]) {
+        let frames = out.len() / 2;
+        let mut done = 0usize;
+        while done < frames {
+            let n = (frames - done).min(BLOCK);
+            self.render_block(n, &mut out[done * 2..(done + n) * 2]);
+            done += n;
+        }
+    }
+
+    fn render_block(&mut self, n: usize, out: &mut [f32]) {
+        self.ev_in.clear();
+        self.ev_out.clear();
+
+        // Live commands (block-quantized) + scheduled events (sample-accurate).
+        while let Ok(cmd) = self.cmds_rx.pop() {
+            if self.ev_in.len() >= EVENT_CAP {
+                break;
+            }
+            push_cmd(&mut self.ev_in, 0, cmd);
+        }
+        while self.sched_idx < self.schedule.len()
+            && self.schedule[self.sched_idx].0 < self.frame + n as u64
+        {
+            if self.ev_in.len() >= EVENT_CAP {
+                break;
+            }
+            let (t, cmd) = self.schedule[self.sched_idx];
+            push_cmd(&mut self.ev_in, (t - self.frame) as u32, cmd);
+            self.sched_idx += 1;
+        }
+
+        let in_port = AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only(
+                self.in_bufs.iter_mut().map(|b| InputChannel::constant(b.as_mut_slice())),
+            ),
+        };
+        let mut input = if self.in_count == 1 {
+            self.in_ports.with_input_buffers([in_port])
+        } else {
+            // Zero input ports: same concrete type, empty iterator.
+            self.in_ports.with_input_buffers([in_port].into_iter().take(0))
+        };
+        // Stack array of port configs (no heap alloc); only the first n_out
+        // entries are handed to the plugin. Destructure into disjoint locals
+        // so the borrow checker accepts simultaneous per-port borrows.
+        let [p0, p1, p2, p3, p4, p5, p6, p7] = &mut self.out_bufs;
+        let out_arr = [
+            out_port!(p0),
+            out_port!(p1),
+            out_port!(p2),
+            out_port!(p3),
+            out_port!(p4),
+            out_port!(p5),
+            out_port!(p6),
+            out_port!(p7),
+        ];
+        let mut output = self.out_ports.with_output_buffers(out_arr.into_iter().take(self.n_out));
+        // Buffers are BLOCK-sized; process exactly n frames.
+        input.truncate(n as u32);
+        output.truncate(n as u32);
+
+        let status = self.processor.process(
+            &input,
+            &mut output,
+            &self.ev_in.as_input(),
+            &mut self.ev_out.as_output(),
+            Some(self.frame),
+            None,
+        );
+        if status.is_err() {
+            self.process_errors += 1;
+        }
+
+        // Mix the MAIN output port (stereo) into `out`; Scene A/B are rendered
+        // but unused. On process failure output silence.
+        let failed = status.is_err();
+        for i in 0..n {
+            out[i * 2] = if failed { 0.0 } else { self.out_bufs[self.main_out][0][i] };
+            out[i * 2 + 1] = if failed { 0.0 } else { self.out_bufs[self.main_out][1][i] };
+        }
+        self.frame += n as u64;
+    }
+
+    /// Stop processing and hand the processor back for main-thread
+    /// deactivation (`ClapVoiceMain::deactivate`). Call on the audio thread.
+    pub fn stop(self) -> StoppedPluginAudioProcessor<TestHost> {
+        self.processor.stop_processing()
+    }
+}
+
+fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
+    match cmd {
+        VoiceCmd::NoteOn(k, v) => {
+            ev_in.push(&NoteOnEvent::new(time, Pckn::new(0u16, 0u16, k, k as u32), v))
+        }
+        VoiceCmd::NoteOff(k) => {
+            ev_in.push(&NoteOffEvent::new(time, Pckn::new(0u16, 0u16, k, k as u32), 0.5))
+        }
+        VoiceCmd::Param(id, v) => ev_in.push(&ParamValueEvent::new(
+            time,
+            id,
+            Pckn::new(
+                Match::<u16>::All,
+                Match::<u16>::All,
+                Match::<u16>::All,
+                Match::<u32>::All,
+            ),
+            v,
+        )),
+    }
+}
+
+/// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
+/// `!Send`), state save/restore, GUI access and deactivation. Must stay on the
+/// thread that called `ClapVoice::new`.
+pub struct ClapVoiceMain {
+    instance: PluginInstance<TestHost>,
+    exts: Exts,
+    _entry: PluginEntry,
+}
+
+impl ClapVoiceMain {
+    /// Direct access for params inspection / embedded GUI (main thread only).
+    pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
+        &mut self.instance
+    }
+
+    /// The plugin's GUI extension, if any (for embedded-editor setup).
+    pub fn gui(&self) -> Option<PluginGui> {
+        self.exts.gui
+    }
+
+    /// Plugin-reported latency in samples (meaningful once active).
+    pub fn latency(&mut self) -> u32 {
+        self.exts.latency.map(|l| l.get(&self.instance.plugin_handle())).unwrap_or(0)
+    }
+
+    /// Serialize the full plugin state (Surge patch XML in a `sub3` container).
+    /// Allocates — main thread only.
+    pub fn save_state(&mut self) -> Result<Vec<u8>> {
+        let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
+        let mut buf = Vec::new();
+        state.save(&mut self.instance.plugin_handle(), &mut buf).context("saving plugin state")?;
+        Ok(buf)
+    }
+
+    /// Restore plugin state. Surge applies it on the audio thread: keep
+    /// rendering (or wait a few blocks) before reading parameter values back.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
+        let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
+        state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
+        Ok(())
+    }
+
+    /// Deactivate the plugin after the audio thread returned the processor via
+    /// `ClapVoice::stop`. Consumes both sides (CLAP lifecycle rule).
+    pub fn deactivate(mut self, stopped: StoppedPluginAudioProcessor<TestHost>) {
+        self.instance.deactivate(stopped);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 pub fn run_test() -> Result<()> {
     println!("=== kabelsalat host-test (CLAP via clack-host) ===");
 
-    // 1. Discover plugins in ~/.clap and pick Surge XT (the instrument).
-    let (entry, plugin_id) = discover_surge()?;
-
-    // 2. Instantiate.
-    let host_info = HostInfo::new(
-        "kabelsalat",
-        "kabelsalat",
-        "https://github.com/kabelsalat",
-        env!("CARGO_PKG_VERSION"),
-    )?;
-    let mut plugin = PluginInstance::<TestHost>::new(
-        |_| HostShared::default(),
-        |_| HostMainThread::new(),
-        &entry,
-        &plugin_id,
-        &host_info,
-    )
-    .context("instantiating Surge XT")?;
-    println!("instantiated: {}", plugin_id.to_string_lossy());
-
-    let exts = plugin.access_shared_handler(|h| Exts {
-        params: h.params.get().copied().flatten(),
-        state: h.state.get().copied().flatten(),
-        gui: h.gui.get().copied().flatten(),
-        latency: h.latency.get().copied().flatten(),
-        audio_ports: h.audio_ports.get().copied().flatten(),
-    });
-    println!(
-        "extensions: params={} state={} gui={} latency={} audio-ports={}",
-        exts.params.is_some(),
-        exts.state.is_some(),
-        exts.gui.is_some(),
-        exts.latency.is_some(),
-        exts.audio_ports.is_some()
-    );
-
-    // 3. Parameters: print a sample, pick one automatable param to modulate.
-    let mod_param = inspect_params(&mut plugin, exts.params)?;
-
-    // 4. Audio ports + latency. NOTE: Surge logs a HostMisbehaving warning if
-    // latency is queried before activation (it needs the sample rate first),
-    // so we only query it once active.
-    let (in_count, in_ch, out_chs, main_out) = inspect_audio_ports(&mut plugin, exts.audio_ports)?;
-
-    // 5. State round-trip, part 1: snapshot the pristine state.
-    let state_ext = exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
-    let mut state_a = Vec::new();
-    state_ext
-        .save(&mut plugin.plugin_handle(), &mut state_a)
-        .context("saving initial state")?;
-    println!("state A (initial): {} bytes", state_a.len());
-    let dump_state = std::env::var_os("KSALAT_DUMP_STATE").is_some();
-    if dump_state {
-        let _ = std::fs::write("/tmp/ksalat-state-a.bin", &state_a);
-    }
-
-    // 6. Audio output via cpal (ALSA -> PipeWire).
+    // 1. Audio output via cpal (ALSA -> PipeWire); the voice needs the rate.
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -268,39 +593,41 @@ pub fn run_test() -> Result<()> {
     println!("output: {dev_name} | {sample_rate} Hz | {dev_channels} ch | config: {supported:?}");
     let config: cpal::StreamConfig = supported.into();
 
-    // 7. Activate the plugin and start the processing thread.
-    let audio_config = PluginAudioConfiguration {
-        sample_rate,
-        min_frames_count: 1,
-        max_frames_count: BLOCK as u32,
-    };
-    let stopped = plugin
-        .activate(|_, _| (), audio_config)
-        .context("activating Surge XT")?;
-    let latency_active = exts.latency.map(|l| l.get(&plugin.plugin_handle())).unwrap_or(0);
-    println!("plugin-reported latency (active): {latency_active} samples");
+    // 2. Load Surge through the reusable voice API (discover ~/.clap,
+    //    instantiate, activate, start processing).
+    let (mut voice, mut main) = ClapVoice::new(sample_rate)?;
 
-    let schedule = build_schedule(sample_rate, mod_param.as_ref());
+    // 3. Parameters: print a sample, pick one automatable param to modulate.
+    let params_ext = main.exts.params;
+    let mod_param = inspect_params(main.instance_mut(), params_ext)?;
+
+    // 4. State round-trip, part 1: snapshot the pristine state.
+    let state_a = main.save_state()?;
+    println!("state A (initial): {} bytes", state_a.len());
+    let dump_state = std::env::var_os("KSALAT_DUMP_STATE").is_some();
+    if dump_state {
+        let _ = std::fs::write("/tmp/ksalat-state-a.bin", &state_a);
+    }
+
+    // 5. Arpeggio + param probe as a sample-accurate schedule on the voice.
+    voice.set_schedule(build_schedule(sample_rate, mod_param.as_ref()));
+
+    // 6. Processing thread: render through ClapVoice, feed the lock-free ring.
     let stop = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Stats::default());
     // 0.5 s of interleaved stereo headroom.
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(sample_rate as usize);
     let (tx, rx) = mpsc::sync_channel::<StoppedPluginAudioProcessor<TestHost>>(1);
-
     let proc_handle = {
         let stop = stop.clone();
         let stats = stats.clone();
         std::thread::Builder::new()
             .name("clap-process".into())
-            .spawn(move || {
-                processing_loop(
-                    stopped, schedule, in_count, in_ch, out_chs, main_out, stop, producer, stats, tx,
-                )
-            })
+            .spawn(move || voice_render_loop(voice, stop, producer, stats, tx))
             .context("spawning processing thread")?
     };
 
-    // 8. cpal stream: drain the ring (RT-safe: no alloc, no locks).
+    // 7. cpal stream: drain the ring (RT-safe: no alloc, no locks).
     let stream = {
         let stats = stats.clone();
         let mut consumer = consumer;
@@ -335,21 +662,20 @@ pub fn run_test() -> Result<()> {
     stream.play()?;
     println!("playing arpeggio (A3 C4 E4 A4 C5 ...) for {DEMO_SECONDS}s — GUI embedded below");
 
-    // 9. Embedded GUI (X11/XWayland). No detached-window fallback by design.
+    // 8. Embedded GUI (X11/XWayland). No detached-window fallback by design.
     ensure_display();
-    let gui_report = run_embedded_gui(&mut plugin, exts.gui, Duration::from_secs(DEMO_SECONDS));
+    let gui_ext = main.gui();
+    let gui_report = run_embedded_gui(main.instance_mut(), gui_ext, Duration::from_secs(DEMO_SECONDS));
     println!("GUI: {gui_report}");
 
-    // 10. State round-trip, part 2 — while processing is still running, like a
-    //     real host restoring a session during playback. Surge applies loaded
-    //     state on the audio thread, so we give it a few blocks to settle.
-    //     The scheduled param event must have stuck; save B (!= A), restore A,
-    //     verify the value, save C (== A).
+    // 9. State round-trip, part 2 — while processing is still running, like a
+    //    real host restoring a session during playback. Surge applies loaded
+    //    state on the audio thread, so we give it a few blocks to settle.
     if let Some(mp) = &mod_param {
-        let params = exts.params.ok_or_else(|| anyhow!("no params extension"))?;
+        let params = main.exts.params.ok_or_else(|| anyhow!("no params extension"))?;
         let tol = (mp.max - mp.min) * 1e-3 + 1e-9;
         let v = params
-            .get_value(&plugin.plugin_handle(), mp.id)
+            .get_value(&main.instance_mut().plugin_handle(), mp.id)
             .ok_or_else(|| anyhow!("param {} vanished", mp.id.get()))?;
         println!(
             "param '{}' after event: {v:.6} (target {:.6})",
@@ -358,8 +684,7 @@ pub fn run_test() -> Result<()> {
         if (v - mp.target).abs() > tol {
             bail!("param event did not round-trip through processing: {v} != {}", mp.target);
         }
-        let mut state_b = Vec::new();
-        state_ext.save(&mut plugin.plugin_handle(), &mut state_b)?;
+        let state_b = main.save_state()?;
         if dump_state {
             let _ = std::fs::write("/tmp/ksalat-state-b.bin", &state_b);
         }
@@ -367,21 +692,18 @@ pub fn run_test() -> Result<()> {
         if state_b == state_a {
             bail!("modified state is byte-identical to initial state — state save is broken");
         }
-        state_ext
-            .load(&mut plugin.plugin_handle(), &mut state_a.as_slice())
-            .context("restoring state A")?;
+        main.load_state(&state_a)?;
         // Let the audio thread apply the restored state.
         std::thread::sleep(Duration::from_millis(300));
-        plugin.call_on_main_thread_callback();
+        main.instance_mut().call_on_main_thread_callback();
         let v2 = params
-            .get_value(&plugin.plugin_handle(), mp.id)
+            .get_value(&main.instance_mut().plugin_handle(), mp.id)
             .ok_or_else(|| anyhow!("param {} vanished after load", mp.id.get()))?;
         println!("param '{}' after restore: {v2:.6} (original {:.6})", mp.name, mp.orig);
         if (v2 - mp.orig).abs() > tol {
             bail!("state load did not restore param value: {v2} != {}", mp.orig);
         }
-        let mut state_c = Vec::new();
-        state_ext.save(&mut plugin.plugin_handle(), &mut state_c)?;
+        let state_c = main.save_state()?;
         if dump_state {
             let _ = std::fs::write("/tmp/ksalat-state-c.bin", &state_c);
         }
@@ -396,14 +718,14 @@ pub fn run_test() -> Result<()> {
         println!("state round-trip: OK (save -> modify -> save != A -> load A -> value restored)");
     }
 
-    // 11. Shut down audio: stop the stream, then the processing thread, and
+    // 10. Shut down audio: stop the stream, then the processing thread, and
     //     hand the processor back to the main thread for deactivation.
     drop(stream);
     stop.store(true, Ordering::SeqCst);
     let stopped = rx
         .recv_timeout(Duration::from_secs(10))
         .context("processing thread did not return the audio processor")?;
-    proc_handle.join().map_err(|_| anyhow!("processing thread panicked"))??;
+    let process_errors = proc_handle.join().map_err(|_| anyhow!("processing thread panicked"))??;
 
     let peak = f32::from_bits(stats.peak_bits.load(Ordering::Relaxed));
     let blocks = stats.blocks.load(Ordering::Relaxed);
@@ -415,15 +737,17 @@ pub fn run_test() -> Result<()> {
     println!("non-quiet blocks: {nonquiet}");
     println!("peak sample:      {peak:.4}");
     println!("cpal callbacks:   {callbacks}, underrun frames: {underruns}");
+    println!("CLAP process errors: {process_errors}");
     if peak < 0.005 || nonquiet < 10 {
         bail!("Surge produced (near-)silence — arpeggio not audible (peak {peak:.5})");
     }
+    if process_errors > 0 {
+        bail!("{process_errors} CLAP process calls failed");
+    }
     println!("arpeggio: AUDIBLE (peak {peak:.4})");
 
-    // 12. Deactivate on the main thread, then drop everything.
-    plugin.deactivate(stopped);
-    drop(plugin);
-    drop(entry);
+    // 11. Deactivate on the main thread, then drop everything.
+    main.deactivate(stopped);
     println!("=== host-test PASS: Surge XT loads, plays, state round-trips ===");
     println!("GUI result: {gui_report}");
     Ok(())
@@ -622,17 +946,10 @@ fn inspect_audio_ports(
 }
 
 // ---------------------------------------------------------------------------
-// Arpeggio schedule + processing thread
+// Arpeggio schedule + render loop (host-test demo, built on ClapVoice)
 // ---------------------------------------------------------------------------
 
-#[derive(Copy, Clone)]
-enum SchedEv {
-    On(u16),
-    Off(u16),
-    Param(ClapId, f64),
-}
-
-fn build_schedule(sample_rate: f64, mod_param: Option<&ModParam>) -> Vec<(u64, SchedEv)> {
+fn build_schedule(sample_rate: f64, mod_param: Option<&ModParam>) -> Vec<(u64, VoiceCmd)> {
     // A-minor arpeggio, eighth notes at 132 BPM, 4 cycles (~7.3 s) + release tail.
     let step = (60.0 / 132.0 / 2.0 * sample_rate) as u64;
     let notes: [u16; 8] = [57, 60, 64, 69, 72, 69, 64, 60];
@@ -640,14 +957,13 @@ fn build_schedule(sample_rate: f64, mod_param: Option<&ModParam>) -> Vec<(u64, S
     for cycle in 0..4u64 {
         for (i, &key) in notes.iter().enumerate() {
             let t = (cycle * 8 + i as u64) * step;
-            schedule.push((t, SchedEv::On(key)));
-            schedule.push((t + step * 3 / 4, SchedEv::Off(key)));
+            schedule.push((t, VoiceCmd::NoteOn(key, 0.85)));
+            schedule.push((t + step * 3 / 4, VoiceCmd::NoteOff(key)));
         }
     }
     if let Some(mp) = mod_param {
-        schedule.push((sample_rate as u64, SchedEv::Param(mp.id, mp.target)));
+        schedule.push((sample_rate as u64, VoiceCmd::Param(mp.id, mp.target)));
     }
-    schedule.sort_by_key(|(t, _)| *t);
     schedule
 }
 
@@ -660,135 +976,30 @@ struct Stats {
     underruns: AtomicU64,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn processing_loop(
-    stopped: StoppedPluginAudioProcessor<TestHost>,
-    schedule: Vec<(u64, SchedEv)>,
-    in_count: usize,
-    in_ch: usize,
-    out_chs: Vec<usize>,
-    main_out: usize,
+/// Audio-side demo loop: render through the public `ClapVoice::render` API and
+/// pace into the device ring. Returns the CLAP process-error count.
+fn voice_render_loop(
+    mut voice: ClapVoice,
     stop: Arc<AtomicBool>,
     mut producer: rtrb::Producer<f32>,
     stats: Arc<Stats>,
     tx: mpsc::SyncSender<StoppedPluginAudioProcessor<TestHost>>,
-) -> Result<()> {
-    let mut proc = stopped
-        .start_processing()
-        .map_err(|_| anyhow!("start_processing failed"))?;
-
-    // All buffers preallocated; nothing below allocates in steady state.
-    let mut in_bufs: Vec<Vec<f32>> = (0..in_ch.max(1)).map(|_| vec![0.0; BLOCK]).collect();
-    // port -> channel -> samples (Surge: main mix + Scene A + Scene B).
-    // Fixed-size array so per-block configs can borrow disjoint elements.
-    let n_out = out_chs.len();
-    let mut out_bufs: [Vec<Vec<f32>>; MAX_OUT_PORTS] = std::array::from_fn(|i| {
-        if i < n_out {
-            (0..out_chs[i]).map(|_| vec![0.0; BLOCK]).collect()
-        } else {
-            vec![vec![0.0; BLOCK]]
-        }
-    });
-    let mut in_ports = AudioPorts::with_capacity(in_ch.max(1), 1);
-    let mut out_ports = AudioPorts::with_capacity(out_chs.iter().sum(), n_out);
-    let mut ev_in = EventBuffer::with_capacity(64);
-    let mut ev_out = EventBuffer::with_capacity(64);
-    // Named fn (not a closure) so the lifetime elision ties input and output.
-    fn as_mut_slice_f32(b: &mut Vec<f32>) -> &mut [f32] {
-        b.as_mut_slice()
-    }
-    macro_rules! out_port {
-        ($p:ident) => {
-            AudioPortBuffer {
-                latency: 0,
-                channels: AudioPortBufferType::f32_output_only($p.iter_mut().map(as_mut_slice_f32)),
-            }
-        };
-    }
-
-    let mut frame: u64 = 0;
-    let mut si = 0usize;
+) -> Result<u64> {
+    let mut block = [0.0f32; BLOCK * 2];
     while !stop.load(Ordering::Relaxed) {
-        ev_in.clear();
-        ev_out.clear();
-        // Sample-accurate event scheduling within this block.
-        while si < schedule.len() && schedule[si].0 < frame + BLOCK as u64 {
-            let t = (schedule[si].0 - frame) as u32;
-            match schedule[si].1 {
-                SchedEv::On(k) => {
-                    ev_in.push(&NoteOnEvent::new(t, Pckn::new(0u16, 0u16, k, k as u32), 0.85))
-                }
-                SchedEv::Off(k) => {
-                    ev_in.push(&NoteOffEvent::new(t, Pckn::new(0u16, 0u16, k, k as u32), 0.5))
-                }
-                SchedEv::Param(id, v) => ev_in.push(&ParamValueEvent::new(
-                    t,
-                    id,
-                    Pckn::new(
-                        Match::<u16>::All,
-                        Match::<u16>::All,
-                        Match::<u16>::All,
-                        Match::<u32>::All,
-                    ),
-                    v,
-                )),
-            }
-            si += 1;
-        }
-
-        let in_port = AudioPortBuffer {
-            latency: 0,
-            channels: AudioPortBufferType::f32_input_only(
-                in_bufs.iter_mut().map(|b| InputChannel::constant(b.as_mut_slice())),
-            ),
-        };
-        let input = if in_count == 1 {
-            in_ports.with_input_buffers([in_port])
-        } else {
-            // Zero input ports: same concrete type, empty iterator.
-            in_ports.with_input_buffers([in_port].into_iter().take(0))
-        };
-        // Stack array of port configs (no heap alloc); only the first n_out
-        // entries are handed to the plugin. Destructure into disjoint locals
-        // so the borrow checker accepts simultaneous per-port borrows.
-        let [p0, p1, p2, p3, p4, p5, p6, p7] = &mut out_bufs;
-        let out_arr = [
-            out_port!(p0),
-            out_port!(p1),
-            out_port!(p2),
-            out_port!(p3),
-            out_port!(p4),
-            out_port!(p5),
-            out_port!(p6),
-            out_port!(p7),
-        ];
-        let mut output = out_ports.with_output_buffers(out_arr.into_iter().take(n_out));
-
-        let _status = proc.process(
-            &input,
-            &mut output,
-            &ev_in.as_input(),
-            &mut ev_out.as_output(),
-            Some(frame),
-            None,
-        )?;
-
-        // Interleave the MAIN output port into the ring; block (sleep) when
-        // full -> real-time pacing. Scene A/B outputs are rendered but unused.
+        voice.render(&mut block);
+        // Interleave into the ring; block (sleep) when full -> real-time pacing.
         let mut peak = 0.0f32;
-        for i in 0..BLOCK {
-            for ch in 0..2 {
-                let s = out_bufs[main_out][ch][i];
-                peak = peak.max(s.abs());
-                loop {
-                    match producer.push(s) {
-                        Ok(()) => break,
-                        Err(_) => {
-                            if stop.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_micros(200));
+        for &s in &block {
+            peak = peak.max(s.abs());
+            loop {
+                match producer.push(s) {
+                    Ok(()) => break,
+                    Err(_) => {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
                         }
+                        std::thread::sleep(Duration::from_micros(200));
                     }
                 }
             }
@@ -798,13 +1009,13 @@ fn processing_loop(
             stats.nonquiet.fetch_add(1, Ordering::Relaxed);
         }
         stats.peak_bits.fetch_max(peak.to_bits(), Ordering::Relaxed);
-        frame += BLOCK as u64;
     }
 
     // Back to the main thread for deactivation (CLAP lifecycle rule).
-    let stopped = proc.stop_processing();
+    let errors = voice.process_errors();
+    let stopped = voice.stop();
     let _ = tx.send(stopped);
-    Ok(())
+    Ok(errors)
 }
 
 // ---------------------------------------------------------------------------

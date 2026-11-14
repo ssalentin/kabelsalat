@@ -10,7 +10,8 @@ plugin windows — embedding is the acceptance criterion and it works.
 ## 1. What was verified (evidence)
 
 Run: `cargo build --release && kabelsalat host-test`
-(`CARGO_TARGET_DIR=/tmp/ksalat-host-target`, release profile).
+(`CARGO_TARGET_DIR=$HOME/.cache/ksalat-host-target`, release profile; keep cargo
+targets off the 7.7 G `/tmp` tmpfs).
 
 | Check | Result |
 |---|---|
@@ -62,6 +63,58 @@ Matches PLAN.md §7 thread model:
 Host handlers: `HostShared` (extensions + request flags + GUI requests),
 `HostMainThread` (dirty/latency/rescan cells), `AudioProcessor = ()`.
 Declared host extensions: log, params, state, latency, gui.
+
+## 3.1 ClapVoice — reusable, RT-safe voice API (task-5)
+
+`src/host.rs` exposes the hosting logic as a reusable API; `run_test` is now a
+demo built entirely on it (no duplicated hosting logic). Verified: host-test
+PASS through the API (peak 0.35, 0 underruns, 0 CLAP process errors, state
+round-trip OK, embedded GUI OK).
+
+```rust
+use crate::host::{ClapVoice, ClapVoiceMain, VoiceController, VoiceCmd};
+
+// Main thread: load Surge XT from ~/.clap, activate, start processing.
+let (mut voice, mut main) = ClapVoice::new(sample_rate)?;   // e.g. 48_000.0
+let ctl: VoiceController = voice.controller();              // Send + Clone
+
+// Move `voice` to the audio thread / cpal callback. render is RT-safe:
+// no allocation, no locks, no syscalls; any buffer length (chunked at 256).
+voice.render(&mut data);            // data: &mut [f32], stereo-interleaved
+
+// UI thread (keyboard handler): block-quantized note commands via lock-free
+// ring. note_on/note_off lock a mutex on the CALLER side — never call them
+// from the render thread; use the controller there.
+ctl.note_on(60, 0.8);
+ctl.note_off(60);
+ctl.set_param(param_id, 0.5);       // ClapId, plain value
+
+// Optional sample-accurate sequences (host-test arpeggio uses this):
+voice.set_schedule(vec![(0, VoiceCmd::NoteOn(57, 0.85)), (2400, VoiceCmd::NoteOff(57))]);
+
+// Main thread only (ClapVoiceMain is !Send — CLAP [main-thread] rules):
+let blob: Vec<u8> = main.save_state()?;   // Surge patch XML in sub3 container
+main.load_state(&blob)?;                  // applied on the audio thread: keep
+                                          // rendering ~300 ms before reading values
+main.latency();                           // samples, meaningful once active
+main.instance_mut();                      // params inspection / embedded GUI
+main.gui();                               // Option<PluginGui>
+
+// Shutdown: audio thread stops, main thread deactivates.
+let stopped = voice.stop();               // audio thread
+main.deactivate(stopped);                 // main thread, consumes both sides
+```
+
+Threading contract:
+- `ClapVoice`: `Send`, `!Sync` — create on main, move to exactly one audio thread.
+- `VoiceController`: `Send + Sync + Clone` — any non-RT thread.
+- `ClapVoiceMain`: `!Send` — stays on the creating thread (state/GUI/deactivate).
+- Command ring: 1024 slots; events per block capped at 256 (overflow dropped,
+  never allocates in `render`). Notes are block-quantized (≤ 5.3 ms at 256
+  frames / 48 kHz); `set_schedule` events are sample-accurate.
+- `render` mixes Surge's `IS_MAIN` stereo output; Scene A/B ports are rendered
+  but discarded. Process failures output silence and increment
+  `voice.process_errors()`.
 
 ## 4. GUI embedding (the de-risked path for P1)
 
@@ -136,7 +189,7 @@ of a live run: `/tmp/ksalat-gui.png` (grim, Wayland capture; transient).
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-export CARGO_TARGET_DIR=/tmp/ksalat-host-target
+export CARGO_TARGET_DIR=$HOME/.cache/ksalat-host-target
 cd ~/Work/kabelsalat
 cargo build --release
 "$CARGO_TARGET_DIR/release/kabelsalat" host-test   # 9 s: arp + embedded Surge GUI

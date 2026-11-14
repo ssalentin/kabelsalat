@@ -4,12 +4,31 @@
 //! sibling frontends to this one typed API. Commands mutate the graph; the
 //! engine consumes them at block boundaries via a lock-free bus. Queries read
 //! snapshots. Nothing here touches the audio thread directly.
+//!
+//! RT discipline: commands are fixed-size (inline names, no String/Vec), so
+//! draining them never allocates or frees. Graph storage is reserved up front.
 
 use serde::{Deserialize, Serialize};
 
 pub type NodeId = u32;
 pub type EdgeId = u32;
 pub type ParamId = u32;
+
+/// Fixed-capacity inline name (no heap — safe to move through the RT bus).
+pub type Name = [u8; 32];
+
+pub fn name_bytes(s: &str) -> Name {
+    let mut n = [0u8; 32];
+    let b = s.as_bytes();
+    let len = b.len().min(31);
+    n[..len].copy_from_slice(&b[..len]);
+    n
+}
+
+pub fn name_str(n: &Name) -> &str {
+    let end = n.iter().position(|&b| b == 0).unwrap_or(n.len());
+    std::str::from_utf8(&n[..end]).unwrap_or("?")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DspKind {
@@ -28,7 +47,7 @@ pub enum NodeKind {
     /// MIDI source: on-screen keys, laptop keys, hardware MIDI.
     Keys,
     /// Hosted CLAP plugin (e.g. Surge XT).
-    Clap { plugin_id: String },
+    Clap { plugin_id: Name },
     /// Built-in processing node.
     Dsp(DspKind),
     /// Desktop playback capture (P2).
@@ -41,7 +60,7 @@ pub enum NodeKind {
 pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
-    pub name: String,
+    pub name: Name,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,7 +83,8 @@ pub struct Edge {
     pub kind: PortKind,
 }
 
-/// The patch. Serializable for sessions (task-8).
+/// The patch. Serializable for sessions (task-8). Storage is reserved so
+/// block-boundary edits within capacity never allocate.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Graph {
     pub nodes: Vec<Node>,
@@ -74,10 +94,15 @@ pub struct Graph {
 }
 
 impl Graph {
-    pub fn add_node(&mut self, kind: NodeKind, name: impl Into<String>) -> NodeId {
+    pub fn reserve(&mut self, nodes: usize, edges: usize) {
+        self.nodes.reserve(nodes);
+        self.edges.reserve(edges);
+    }
+
+    pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name: name.into() });
+        self.nodes.push(Node { id, kind, name });
         id
     }
 
@@ -86,23 +111,22 @@ impl Graph {
         self.edges.retain(|e| e.from.node != id && e.to.node != id);
     }
 
-    /// Connect two ports. Rejects self-connections and duplicates.
-    pub fn connect(&mut self, from: PortRef, to: PortRef, kind: PortKind) -> Option<EdgeId> {
+    /// Connect with a caller-chosen edge id (the UI uses its cable ids).
+    /// Rejects self-connections, duplicate ids, and duplicate endpoints.
+    pub fn connect_with_id(&mut self, id: EdgeId, from: PortRef, to: PortRef, kind: PortKind) -> bool {
         if from.node == to.node {
-            return None;
+            return false;
         }
         if !self.nodes.iter().any(|n| n.id == from.node)
             || !self.nodes.iter().any(|n| n.id == to.node)
         {
-            return None;
+            return false;
         }
-        if self.edges.iter().any(|e| e.from == from && e.to == to) {
-            return None;
+        if self.edges.iter().any(|e| e.id == id || (e.from == from && e.to == to)) {
+            return false;
         }
-        let id = self.next_edge;
-        self.next_edge += 1;
         self.edges.push(Edge { id, from, to, kind });
-        Some(id)
+        true
     }
 
     pub fn disconnect(&mut self, id: EdgeId) {
@@ -120,30 +144,34 @@ impl Graph {
     }
 
     /// The starter patch matching the rack: Keys → Surge → Delay → Master,
-    /// plus a dry Surge → Master run. Pre-wired and playable (PLAN §2b).
+    /// plus a dry Surge → Master run. Edge ids match the UI's demo cables
+    /// (1,3,4,5) so unplug commands line up; task-10 unifies the models.
     pub fn demo_patch() -> Self {
         let mut g = Self::default();
-        let keys = g.add_node(NodeKind::Keys, "KEYS");
+        g.reserve(64, 256);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let surge = g.add_node(
-            NodeKind::Clap { plugin_id: "org.surge-synth-team.surge-xt".into() },
-            "SURGE XT",
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SURGE XT"),
         );
-        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), "DELAY");
-        let master = g.add_node(NodeKind::MasterOut, "MASTER OUT");
-        g.connect(PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
-        g.connect(PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, PortKind::Audio);
-        g.connect(PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
-        g.connect(PortRef { node: surge, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        g.next_edge = 1;
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, PortKind::Audio);
+        g.connect_with_id(4, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(5, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        g.next_edge = 6;
         g
     }
 }
 
-/// Everything a frontend can ask the engine to do.
+/// Everything a frontend can ask the engine to do. Fixed-size: no heap.
 #[derive(Clone, Debug)]
 pub enum Command {
-    AddNode { kind: NodeKind, name: String },
+    AddNode { kind: NodeKind, name: Name },
     RemoveNode(NodeId),
-    Connect { from: PortRef, to: PortRef, kind: PortKind },
+    Connect { id: EdgeId, from: PortRef, to: PortRef, kind: PortKind },
     Disconnect(EdgeId),
     SetParam { node: NodeId, param: ParamId, value: f64 },
     NoteOn { note: u8, velocity: f32 },
@@ -175,6 +203,10 @@ impl CommandBus {
 }
 
 impl CommandDrain {
+    pub fn pop(&mut self) -> Option<Command> {
+        self.rx.pop().ok()
+    }
+
     pub fn drain(&mut self, mut f: impl FnMut(Command)) {
         while let Ok(cmd) = self.rx.pop() {
             f(cmd);
@@ -199,9 +231,9 @@ mod tests {
     fn connect_rejects_self_and_duplicates() {
         let mut g = Graph::demo_patch();
         let p = PortRef { node: 0, port: 0 };
-        assert!(g.connect(p, p, PortKind::Midi).is_none());
+        assert!(!g.connect_with_id(99, p, p, PortKind::Midi));
         let before = g.edges.len();
-        g.connect(PortRef { node: 0, port: 0 }, PortRef { node: 1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(99, PortRef { node: 0, port: 0 }, PortRef { node: 1, port: 0 }, PortKind::Midi);
         assert_eq!(g.edges.len(), before);
     }
 
@@ -220,5 +252,11 @@ mod tests {
         let mut got = Vec::new();
         drain.drain(|c| got.push(c));
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn names_roundtrip() {
+        let n = name_bytes("SURGE XT");
+        assert_eq!(name_str(&n), "SURGE XT");
     }
 }

@@ -7,10 +7,13 @@
 mod assistant;
 mod audio;
 mod control;
+mod dsp;
 mod engine;
 mod host;
+mod matrix;
 mod midi;
 mod preview;
+mod session;
 mod ui;
 
 fn main() -> anyhow::Result<()> {

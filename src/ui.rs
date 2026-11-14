@@ -31,10 +31,9 @@ use midir::os::unix::VirtualInput;
 use midir::{Ignore, MidiInput};
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
-use crate::engine::{
-    AudioShared, DelayLine, R_DELAY_MASTER, R_KEYS_SURGE, R_SURGE_DELAY, R_SURGE_MASTER,
-};
-use crate::host::{ClapVoice, ClapVoiceMain, VoiceController};
+use crate::control::{Command, CommandBus, PortKind as CPortKind, PortRef};
+use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
+use crate::host::{ClapVoice, ClapVoiceMain};
 
 // ---------------------------------------------------------------------------
 // Palette (assets/logo.svg + Omarchy/Tokyo-night accents)
@@ -478,7 +477,7 @@ struct DemoApp {
     // !Send: CLAP main-thread object; DemoApp never leaves the UI thread.
     _surge_main: Option<ClapVoiceMain>,
     _audio_stream: Option<cpal::Stream>,
-    audio_shared: Option<Arc<AudioShared>>,
+    bus: Option<Arc<Mutex<CommandBus>>>,
 }
 
 impl DemoApp {
@@ -578,7 +577,7 @@ impl DemoApp {
             surge_status: "no synth loaded".into(),
             _surge_main: None,
             _audio_stream: None,
-            audio_shared: None,
+            bus: None,
         };
 
         // Hardware MIDI auto-wire at startup: events queue here and are drained
@@ -781,6 +780,10 @@ impl DemoApp {
     fn unplug_cable(&mut self, idx: usize, detach_dst: bool) {
         let c = &mut self.cables[idx];
         if c.dying < 0.0 {
+            // The patch is real: tell the engine to drop this route.
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(Command::Disconnect(c.id));
+            }
             c.dying = 0.0;
             c.detach_dst = detach_dst;
             c.over_a = None;
@@ -806,11 +809,11 @@ impl DemoApp {
         mut self,
         main: ClapVoiceMain,
         stream: cpal::Stream,
-        shared: Arc<AudioShared>,
+        bus: Arc<Mutex<CommandBus>>,
     ) -> Self {
         self._surge_main = Some(main);
         self._audio_stream = Some(stream);
-        self.audio_shared = Some(shared);
+        self.bus = Some(bus);
         self.surge_status = "Surge XT loaded — play!".into();
         self
     }
@@ -2218,27 +2221,30 @@ impl eframe::App for DemoApp {
         }
         self.update(dt);
 
-        // Publish the patch: cables and knobs drive the audio engine.
-        if let Some(sh) = &self.audio_shared {
-            let mut r = 0u32;
+        // Publish the patch through the control plane: cables become Connect
+        // commands (duplicates rejected by the model), knobs become SetParam.
+        if let Some(bus) = &self.bus {
+            let mut b = bus.lock().unwrap();
             for c in &self.cables {
                 if c.dying >= 0.0 {
                     continue;
                 }
-                match (c.src, c.dst, c.kind) {
-                    (0, 1, PortKind::Midi) => r |= R_KEYS_SURGE,
-                    (1, 2, PortKind::Audio) => r |= R_SURGE_DELAY,
-                    (2, 3, PortKind::Audio) => r |= R_DELAY_MASTER,
-                    (1, 3, PortKind::Audio) => r |= R_SURGE_MASTER,
-                    _ => {}
-                }
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                let _ = b.send(Command::Connect {
+                    id: c.id,
+                    from: PortRef { node: c.src as u32, port: c.src_port as u8 },
+                    to: PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                    kind,
+                });
             }
-            sh.routes.store(r, Ordering::Relaxed);
-            AudioShared::set_f(&sh.surge_level, self.units[1].knobs[1].value);
-            AudioShared::set_f(&sh.delay_time, self.units[2].knobs[0].value);
-            AudioShared::set_f(&sh.delay_mix, self.units[2].knobs[1].value);
-            AudioShared::set_f(&sh.master_vol, self.units[3].knobs[0].value);
-            AudioShared::set_f(&sh.master_warm, self.units[3].knobs[1].value);
+            let _ = b.send(Command::SetParam { node: 1, param: P_LEVEL, value: self.units[1].knobs[1].value as f64 });
+            let _ = b.send(Command::SetParam { node: 2, param: P_TIME, value: self.units[2].knobs[0].value as f64 });
+            let _ = b.send(Command::SetParam { node: 2, param: P_MIX, value: self.units[2].knobs[1].value as f64 });
+            let _ = b.send(Command::SetParam { node: 3, param: P_VOL, value: self.units[3].knobs[0].value as f64 });
+            let _ = b.send(Command::SetParam { node: 3, param: P_WARM, value: self.units[3].knobs[1].value as f64 });
         }
 
         self.tessellate();
@@ -2285,7 +2291,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController, Arc<AudioShared>)> {
+fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -2294,11 +2300,8 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController
     let sample_rate = cfg.sample_rate() as f64;
     let ch = cfg.channels() as usize;
     let (voice, main) = ClapVoice::new(sample_rate)?;
-    let ctrl = voice.controller();
     let mut config: cpal::StreamConfig = cfg.into();
-    // Low latency from the start: 256 frames @48k = 5.3 ms. On the native
-    // PipeWire host this sets the stream's node latency, which drives the
-    // graph quantum — no ALSA bridge buffering in between.
+    // Low latency from the start: 256 frames @48k = 5.3 ms.
     config.buffer_size = cpal::BufferSize::Fixed(256);
     eprintln!(
         "audio: host={} device={} rate={} ch={} buffer=256 frames ({:.1} ms)",
@@ -2308,70 +2311,18 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController
         ch,
         256.0 / sample_rate * 1000.0
     );
-    let mut voice = voice;
-    let mut scratch = vec![0.0f32; 8192 * 2];
-    let shared = AudioShared::new();
-    let sh = shared.clone();
-    let mut delay = DelayLine::new(sample_rate, 2.0);
-    let mut delay_in = vec![0.0f32; 8192 * 2];
+    let (bus, drain) = crate::control::command_bus();
+    let mut engine = GraphEngine::new(voice, drain, sample_rate);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
-            let frames = data.len() / ch;
-            if frames * 2 > scratch.len() {
-                for s in data.iter_mut() {
-                    *s = 0.0;
-                }
-                return;
-            }
-            voice.render(&mut scratch[..frames * 2]);
-            let routes = sh.routes();
-            let level = sh.f(&sh.surge_level);
-            let vol = sh.f(&sh.master_vol);
-            let warm = sh.f(&sh.master_warm);
-            let time = sh.f(&sh.delay_time);
-            let mix = sh.f(&sh.delay_mix);
-            for s in scratch[..frames * 2].iter_mut() {
-                *s *= level;
-            }
-            // Delay path: feed Surge when wired, silence otherwise (tail rings out).
-            if routes & R_SURGE_DELAY != 0 {
-                delay_in[..frames * 2].copy_from_slice(&scratch[..frames * 2]);
-            } else {
-                for s in delay_in[..frames * 2].iter_mut() {
-                    *s = 0.0;
-                }
-            }
-            delay.process(&mut delay_in[..frames * 2], time, mix);
-            let dry = routes & R_SURGE_MASTER != 0;
-            let wet = routes & R_DELAY_MASTER != 0;
-            for (i, frame) in data.chunks_mut(ch).enumerate() {
-                let mut l = 0.0f32;
-                let mut r = 0.0f32;
-                if dry {
-                    l += scratch[i * 2];
-                    r += scratch[i * 2 + 1];
-                }
-                if wet {
-                    l += delay_in[i * 2];
-                    r += delay_in[i * 2 + 1];
-                }
-                l = (l * (1.0 + warm * 3.0)).tanh() * vol;
-                r = (r * (1.0 + warm * 3.0)).tanh() * vol;
-                frame[0] = l;
-                if ch > 1 {
-                    frame[1] = r;
-                }
-                for s in frame.iter_mut().skip(2) {
-                    *s = 0.0;
-                }
-            }
+            engine.render(data, ch);
         },
         |e| eprintln!("audio stream error: {e}"),
         None,
     )?;
     stream.play()?;
-    Ok((main, stream, ctrl, shared))
+    Ok((main, stream, bus))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -2409,28 +2360,28 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((main, stream, ctrl, shared)) => {
-                        let sh = shared.clone();
+                    Ok((main, stream, bus)) => {
+                        let bus = Arc::new(Mutex::new(bus));
+                        let b = bus.clone();
                         sink = Some(Box::new(move |ev: NoteEvent| {
-                            // The Keys→Surge MIDI cable is real: unplugged = silent.
-                            if sh.routes() & R_KEYS_SURGE == 0 {
-                                return;
-                            }
-                            let note = 60 + ev.note as u16;
-                            if ev.velocity > 0.0 {
-                                ctrl.note_on(note, ev.velocity as f64);
+                            // Notes flow through the control plane; the engine
+                            // gates them on the Keys→Surge cable being plugged.
+                            let note = 60 + ev.note;
+                            let cmd = if ev.velocity > 0.0 {
+                                Command::NoteOn { note, velocity: ev.velocity }
                             } else {
-                                ctrl.note_off(note);
-                            }
+                                Command::NoteOff { note }
+                            };
+                            let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((main, stream, shared));
+                        audio = Some((main, stream, bus));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((main, stream, shared)) => app.with_audio(main, stream, shared),
+                Some((main, stream, bus)) => app.with_audio(main, stream, bus),
                 None => app,
             };
             Ok(Box::new(app))

@@ -16,6 +16,13 @@ Status: P0 spike · Name: `kabelsalat` (binary = package = `.desktop` = icon = W
   existing projects with the same name (felixroos/kabelsalat JS audio graphs,
   ThePixelPilgrim/kabelsalat Rust terminal, a macOS Kabelsalat VST). User's call.
 - **2026-11-14** — **Animated wiring promoted to signature feature** (user request).
+- **2026-11-14** — **GarageBand added as second muse** (user request): approachability,
+  instant sound, smart controls, playful feedback (§2b).
+- **2026-11-14** — **System audio capture requested** (user): wire YouTube/browser
+  playback into the mix as a source node (P2, §7).
+- **2026-11-14** — **Slick, effortless UI + full MCP server** (user request): ease of
+  use is a top-level requirement; a built-in MCP server must expose every feature
+  1:1 through the same control plane the UI uses (§2c).
 
 ## 1. Goal
 
@@ -25,6 +32,10 @@ desktop: mixer channels with insert FX and sends, a MIDI matrix with
 splits/layers/filters, file players for backing tracks, synchronized recording,
 built-in processing nodes, session save/restore. **No timeline.** The graph is the
 instrument — and it moves.
+
+**Two muses.** AUM supplies the workflow (routing, mixer, live hosting); GarageBand
+supplies the soul — approachable, playful, instant music-making. Opening kabelsalat
+should produce sound in under a minute, no manual required.
 
 Reference plugin for all hosting work: **Surge XT** (user's choice; ARM-native CLAP).
 
@@ -48,6 +59,45 @@ The cables are not lines — they are patch cables, and they behave like it:
   out, animation decoupled from audio callback rate.
 
 Prototype in P0 (demo graph), full implementation on the real graph in P1.
+
+## 2b. UX principles — the GarageBand inheritance
+
+- **Instant sound:** first launch opens a playable starter template (pre-wired
+  synth + reverb); friendly empty states with big, obvious "add" affordances.
+- **Smart controls:** per-instrument macro knobs — many plugin parameters mapped to
+  a few expressive controls. Made for live playing; MIDI-learn binds them.
+- **Big, friendly controls:** touch-sized targets, rounded cards, playful visual
+  feedback — instruments and cables react visibly when played.
+- **Templates:** one-click starting points ("Lead + Reverb", "Drums + Bass",
+  "Ambient Pad") so the graph is never a blank page of fear.
+- **No manual required:** sensible defaults everywhere, `?` shortcut overlay,
+  discoverable interactions, errors explained in plain language in-window.
+- **One big record button** (P2): count-in, then immediate playback of the take.
+- **Slickness bar:** 60fps everywhere, consistent design tokens (spacing, radius,
+  type from the Omarchy theme), micro-interactions on every action, drag-and-drop
+  as the primary verb, undo for everything. Operating it should feel effortless.
+
+## 2c. Agent control — full MCP server, 1:1
+
+kabelsalat is agent-native: a built-in MCP (Model Context Protocol) server exposes
+**every** feature of the app — anything a human can do in the UI, an agent can do.
+
+- **One control plane.** All mutations are typed commands (AddNode, Connect,
+  LoadPlugin, SetParam, SetMacro, MatrixRoute, TransportPlay, StartRecord,
+  SetSystemAudioSource, SaveSession, …) and all reads are snapshot queries
+  (GetGraph, ListPlugins, GetParams, GetMeters, GetTransport, …). The egui UI and
+  the MCP server are *sibling frontends* to this single API — 1:1 parity is
+  structural, not aspirational.
+- **Implementation:** [rmcp](https://github.com/modelcontextprotocol/rust-sdk)
+  (official Tier-1 Rust SDK, `#[tool]` macros, JSON Schema via schemars).
+  `kabelsalat mcp` runs the server over stdio; streamable HTTP optional later.
+  Tools mirror commands; resources expose graph/session state; prompts offer
+  recipes ("build a split synth layer"). Tool catalog documented and versioned.
+- **RT-safe:** MCP commands enter the same lock-free command ring as UI commands;
+  queries read snapshots. Agents never touch the audio thread directly.
+- **Parity test:** CI enumerates UI actions vs MCP tools and fails on drift.
+- **Plain CLI too:** every command also available as `kabelsalat <cmd> --json`
+  (Omarchy convention), sharing the same control plane.
 
 ## 3. What already exists (verified survey, Nov 2026)
 
@@ -81,6 +131,8 @@ source-only. **No box64/emulation for live audio** — native ARM plugins only.
 | Graph canvas with **animated cables** (§2) | P0 proto / P1 full |
 | Channels: source + insert slots (pre/post fader), buses, sends | P1 |
 | Hardware in/out nodes (stereo first) | P1 |
+| **System audio source** — capture desktop playback (YouTube etc.) into the graph | P2 |
+| **Full MCP server** — 1:1 agent access to every feature via the shared control plane | API P1 / server P3 |
 | **MIDI matrix**: any→any, channel filter, transpose, key-range splits/layers, CC map | P1 |
 | Built-in nodes: gain/pan, parametric EQ, LP/HP + DJ filter, limiter, saturation, M/S | P1 core / P3 rest |
 | Sessions (incl. plugin state), undo, autosave | P1 |
@@ -120,11 +172,16 @@ crates/ (P1 split; P0 lives in a single spike crate)
   kabelsalat-engine/   # graph → RenderPlan, transport, scheduler, latency comp
   kabelsalat-host/     # clack CLAP (later lilv LV2, VST3); scan, state, GUI windows
   kabelsalat-dsp/      # built-in nodes (fundsp + custom)
-  kabelsalat-io/       # cpal duplex, midir, file streaming, recorder workers
+  kabelsalat-io/       # cpal duplex, midir, system-audio capture, file streaming, recorder
   kabelsalat-project/  # session model, serde/RON, undo commands
-src/main.rs            # clap CLI: `kabelsalat open [session]`, headless --json cmds
+  kabelsalat-control/  # typed command/query API — the single control plane
+  kabelsalat-mcp/      # rmcp server: tools/resources mirroring the control plane 1:1
+src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 ```
 
+- **Frontends are siblings:** egui UI, MCP server, and CLI all call the same control
+  plane (`kabelsalat-control`); every command flows through one lock-free ring into
+  the engine. This is what guarantees 1:1 MCP coverage (§2c).
 - **Threads:** UI (egui) · audio callback (cpal, RT) · MIDI in (midir) · disk pool.
   UI→audio: `rtrb` command rings. Audio→UI: `triple_buffer` snapshots (meters,
   playhead, **per-edge levels for cable animation**) + event ring (notes, xruns).
@@ -138,6 +195,10 @@ src/main.rs            # clap CLI: `kabelsalat open [session]`, headless --json 
   range (splits/layers), CC map. MIDI-learn binds CCs to any parameter.
 - **Latency comp:** nodes report latency (CLAP extension); align parallel paths at
   outputs. Uncompensated first (serial chains align naturally).
+- **System audio:** capture the default output's monitor via PipeWire's PulseAudio
+  compatibility (works today, no extra packages); per-app stream selection later via
+  native PipeWire (pipewire-rs) or pipewire-jack input ports. Feedback guard: exclude
+  our own output from capture (dedicated sink / node filter), warn in the UI.
 - **One render path** for realtime and offline bounce.
 - **Sessions:** `name.ksalat/` package: `session.ron` + plugin state + copied assets;
   atomic temp-then-rename; originals never modified.
@@ -156,21 +217,25 @@ src/main.rs            # clap CLI: `kabelsalat open [session]`, headless --json 
 ### P1 — Live core (~2–3 weeks)
 - Real graph canvas with full animated wiring; node browser; add/remove/wire
 - Channel strips, buses/sends, hardware I/O; built-in gain/pan/EQ/filter/limiter
-- MIDI matrix with splits/layers; sessions + undo
+- MIDI matrix with splits/layers; sessions + undo; starter templates + friendly empty
+  state; **control-plane command API** (the single API behind UI, MCP, and CLI)
 - **Done when:** two Surge layers split across the keyboard, one through EQ + reverb
   bus — save, reopen, play live.
 
 ### P2 — Performance (~2 weeks)
-- FilePlayer, transport + metronome + count-in; recorder (master + stems)
-- Latency compensation; MIDI-learn
+- FilePlayer, transport + metronome + count-in; recorder (master + stems);
+  **system audio source** (PipeWire monitor capture, e.g. YouTube into a channel)
+- Latency compensation; MIDI-learn; smart controls (macro knobs per instrument)
 - **Done when:** live set over a backing loop, recorded cleanly.
 
 ### P3 — Ecosystem (~2–3 weeks)
-- LV2 hosting (lilv); plugin scan/browser/presets; remaining built-in nodes
+- LV2 hosting (lilv); plugin scan/browser/presets; remaining built-in nodes;
+  **MCP server** (rmcp, stdio) exposing the full control plane
 - **Done when:** mixed CLAP + LV2 session stable for an hour.
 
 ### P4 — Live polish & packaging (~1–2 weeks)
-- Scenes/setlist, autosave; Omarchy theme following; keyboard-first (`Space`
+- Scenes/setlist, autosave; MCP 1:1 parity tests + tool catalog docs; Omarchy theme
+  following; keyboard-first (`Space`
   transport, `?` overlay, `Q` quit-with-confirm); PKGBUILD + `.desktop` + icon;
   headless CLI; README with screenshot
 - **Done when:** installed from the launcher, gig-ready.
@@ -190,6 +255,7 @@ Estimates: playable host ≈ 3–4 weeks · AUM-core ≈ 6 weeks · full ≈ 3 m
 | Animation costs UI frame time | tessellation caps, LOD, snapshot-driven; never on audio thread |
 | In-process plugin crash | autosave; out-of-process later |
 | ARM plugin ecosystem thinner | verified list §4; CLAP-first; no emulation |
+| System-audio feedback loop (capturing our own output) | exclude own stream; dedicated sink or per-app capture; UI warning |
 | Scope creep toward DAW | non-goals §5; the graph is the product |
 
 ## 10. Omarchy conventions
@@ -215,3 +281,4 @@ headless `--json` CLI · PKGBUILD → launcher.
 - Surge XT — https://surge-synthesizer.github.io/
 - cpal — https://github.com/RustAudio/cpal · midir — https://docs.rs/midir · fundsp — https://docs.rs/fundsp
 - egui — https://github.com/emilk/egui · rtrb — https://docs.rs/rtrb · ashpd — https://docs.rs/ashpd
+- rmcp (official Rust MCP SDK) — https://github.com/modelcontextprotocol/rust-sdk

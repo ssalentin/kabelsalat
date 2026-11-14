@@ -134,6 +134,14 @@ struct SetRigSourceArgs {
     hardware: bool,
 }
 
+/// Arguments for `set_split`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetSplitArgs {
+    /// MIDI note 0..=127 to split the keyboard at: rig A (node 1) plays below,
+    /// rig B (node 4) at/above. Omit (null) to disable the split.
+    point: Option<u8>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -432,6 +440,21 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "keys": args.keys, "laptop": args.laptop, "hardware": args.hardware}))
+    }
+
+    /// Split the keyboard across the two rigs.
+    #[tool(name = "set_split", description = "Split the keyboard across the two rigs (Command::SetSplit). point is a MIDI note 0..=127: rig A (node 1) plays below it, rig B (node 4) at/above. Omit point (null) to disable the split so both rigs play the full keyboard. Example: point 60 splits at C4.")]
+    fn set_split(&self, Parameters(args): Parameters<SetSplitArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Some(p) = args.point {
+            if p > 127 {
+                return tool_err("point must be 0..=127");
+            }
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetSplit { point: args.point }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"point": args.point, "split": args.point.is_some()}))
     }
 
     /// Press a key.

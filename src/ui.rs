@@ -2159,6 +2159,10 @@ impl eframe::App for DemoApp {
             ctx.set_pixels_per_point(1.6);
             eprintln!("ui scale: corrected to 1.60 on frame path");
         }
+        static SCALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SCALE_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!("ui scale: first-frame ppp={:.2}", ctx.pixels_per_point());
+        }
 
         // Tab ALWAYS flips the rack — consume it before egui's focus navigation
         // or the typing gate can steal it (the assistant panel has focusable

@@ -23,6 +23,11 @@ Status: P0 spike · Name: `kabelsalat` (binary = package = `.desktop` = icon = W
 - **2026-11-14** — **Slick, effortless UI + full MCP server** (user request): ease of
   use is a top-level requirement; a built-in MCP server must expose every feature
   1:1 through the same control plane the UI uses (§2c).
+- **2026-11-14** — **Embedded plugin editors required** (user): no scattered plugin
+  windows — editors open inside the host window (§6). Host runs under XWayland so
+  X11 reparenting works.
+- **2026-11-14** — **Reason's rack flip adopted as interaction model** (user):
+  labeled rack units, Tab flips to the back panel where the cables live (§2a).
 
 ## 1. Goal
 
@@ -58,7 +63,22 @@ The cables are not lines — they are patch cables, and they behave like it:
 - **Performance budget:** tessellation caps per cable, level-of-detail when zoomed
   out, animation decoupled from audio callback rate.
 
-Prototype in P0 (demo graph), full implementation on the real graph in P1.
+Prototype in P0 (mini rack with Tab flip), full implementation on the real graph in P1.
+
+## 2a. The rack flip — Reason's interaction model
+
+The graph is presented as a **rack of labeled hardware-style units** (Reason):
+
+- **Front (perform):** device faces with names, colored label strips, macro knobs,
+  meters — the GarageBand-friendly performance view.
+- **Back (patch):** press **Tab** and the rack flips around to reveal the patch
+  bay: jacks per device and the full cable salad dangling between them.
+- **The flip is animated** (slick vertical flip with easing); a visible hint
+  (`Tab ⇄ flip rack`) keeps it discoverable.
+- **Cables are physical:** grab one and it swings; shake the rack and they all
+  sway — a toy, on purpose. Patch by dragging jack → jack; unplug with a tug.
+- Front stays clean while playing; signal-activity glow shows which units are
+  live. One graph, two faces — no separate "patchbay window".
 
 ## 2b. UX principles — the GarageBand inheritance
 
@@ -76,6 +96,9 @@ Prototype in P0 (demo graph), full implementation on the real graph in P1.
 - **Slickness bar:** 60fps everywhere, consistent design tokens (spacing, radius,
   type from the Omarchy theme), micro-interactions on every action, drag-and-drop
   as the primary verb, undo for everything. Operating it should feel effortless.
+- **One window:** plugin editors open inline (panel/drawer inside the main window,
+  AUM-style). Nothing scatters across the desktop; host chrome stays around every
+  editor. Detached windows are a flagged fallback, never the default.
 
 ## 2c. Agent control — full MCP server, 1:1
 
@@ -161,8 +184,15 @@ Fixed limits for RT safety: 64 nodes, 8 inserts/channel, stereo buses (multichan
 3. **VST3 later** — no mature Rust hosting crate; study Maolan (BSD-2) or vst3-sys.
 4. **In-process first** (lowest latency); out-of-process crash isolation later
    (Maolan pattern). Autosave sessions meanwhile.
-5. **Plugin UIs:** CLAP GUI on Linux is X11 → XWayland under Hyprland. Own top-level
-   windows first (Carla-proven); canvas embedding later.
+5. **Plugin UIs — embedded, not detached (user requirement):** the CLAP GUI
+   extension is built for embedding: the plugin creates an X11 editor window which
+   the host reparents into its own. kabelsalat therefore runs under XWayland
+   (`WINIT_UNIX_BACKEND=x11`) and embeds editors inline — click a node, its editor
+   opens in a panel/drawer inside the main window, theme-matched chrome around it.
+   CLAP resize negotiation (`can_resize`/`adjust_size`) handles sizing; the same
+   mechanism later covers VST3 (X11) and LV2 (suil). P0 proves reparenting with
+   Surge; P1 integrates into the egui canvas (reserved rect → `XReparentWindow`).
+   Detached windows only as a flagged fallback for pathological plugins.
 
 ## 7. Architecture
 
@@ -182,6 +212,9 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **Frontends are siblings:** egui UI, MCP server, and CLI all call the same control
   plane (`kabelsalat-control`); every command flows through one lock-free ring into
   the engine. This is what guarantees 1:1 MCP coverage (§2c).
+- **Display:** the app runs under XWayland (X11) so plugin editors can be reparented
+  into the main window — CLAP/VST3/LV2 Linux GUIs are X11; native-Wayland plugin
+  GUIs don't exist in practice yet.
 - **Threads:** UI (egui) · audio callback (cpal, RT) · MIDI in (midir) · disk pool.
   UI→audio: `rtrb` command rings. Audio→UI: `triple_buffer` snapshots (meters,
   playhead, **per-edge levels for cable animation**) + event ring (notes, xruns).
@@ -207,15 +240,16 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 
 ### P0 — Spike (3–5 days) · go/no-go gate
 - cpal duplex through PipeWire, no xruns over 5 min; latency numbers
-- **Surge XT CLAP via clack-host: play notes → sound**; GUI in own window; state round-trip
+- **Surge XT CLAP via clack-host: play notes → sound**; GUI **embedded** in an X11
+  parent window (reparenting proof, not a detached window); state round-trip
 - midir input (hardware or virtual port) + egui on-screen keyboard
-- **Animated cable prototype:** demo graph with sagging splines, traveling pulses,
-  swing-on-drag — prove the signature feel
+- **Rack-flip prototype:** mini rack with labeled units, Tab flip to the back,
+  sagging physics cables, traveling pulses — prove the signature feel
 - In parallel: Element/Carla remain installed as the functional baseline
 - **Done when:** you can play Surge live through our spike, and the cables feel alive.
 
 ### P1 — Live core (~2–3 weeks)
-- Real graph canvas with full animated wiring; node browser; add/remove/wire
+- Rack front/back views with full animated wiring; device browser; add/remove/wire
 - Channel strips, buses/sends, hardware I/O; built-in gain/pan/EQ/filter/limiter
 - MIDI matrix with splits/layers; sessions + undo; starter templates + friendly empty
   state; **control-plane command API** (the single API behind UI, MCP, and CLI)
@@ -256,6 +290,7 @@ Estimates: playable host ≈ 3–4 weeks · AUM-core ≈ 6 weeks · full ≈ 3 m
 | In-process plugin crash | autosave; out-of-process later |
 | ARM plugin ecosystem thinner | verified list §4; CLAP-first; no emulation |
 | System-audio feedback loop (capturing our own output) | exclude own stream; dedicated sink or per-app capture; UI warning |
+| Plugin embedding quirks (resize, focus, HiDPI under XWayland) | CLAP resize negotiation; per-plugin fallback flag; XWayland scaling config; P0 proof with Surge |
 | Scope creep toward DAW | non-goals §5; the graph is the product |
 
 ## 10. Omarchy conventions

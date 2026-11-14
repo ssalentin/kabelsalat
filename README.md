@@ -22,10 +22,14 @@ interface. kabelsalat is that gap:
 - **Animated wiring is the signature.** Cables hang like real patch leads, MIDI
   notes launch visible pulses along them, audio cables breathe with their level,
   and dragging a node makes its cables swing and settle. You *see* your signal path.
+- **Reason's rack flip** — labeled rack units up front; press **Tab** to flip the
+  rack and patch the cables on the back. Cables swing, dangle, and beg to be grabbed.
 - **GarageBand-inspired approachability** — playable starter templates, smart macro
   controls, slick 60fps interactions, instant sound. No manual required.
 - **Agent-native** — a full MCP server gives AI agents 1:1 access to every feature,
   through the same control plane the UI uses.
+- **One window, no scatter** — plugin editors open embedded inside the app
+  (AUM-style), never as disconnected windows.
 - **System audio in the mix** — wire YouTube/browser playback straight into a
   channel (PipeWire monitor capture).
 - **MIDI matrix** — route any source to any destination with channel filters,
@@ -72,6 +76,7 @@ This app turns it into something beautiful.
 ## Inspiration & prior art
 
 - [AUM](https://kymatica.com/apps/aum) (Kymatica) — the workflow this brings to Linux
+- Reason (Reason Studios) — the rack flip: front to perform, back to patch
 - GarageBand (Apple) — the approachability bar: instant sound, smart controls, playfulness
 - [Surge XT](https://surge-synthesizer.github.io/) — reference instrument
 - [clack](https://github.com/prokopyl/clack), [Maolan](https://github.com/maolan/maolan) — Rust plugin hosting

@@ -6,6 +6,13 @@ description = "Live audio/MIDI wiring, alive — an AUM-style plugin host with a
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+clack-host = "0.2.0"
+cpal = "0.18.2"
+eframe = "0.37.0"
+egui = "0.37.0"
+midir = "0.11.1"
+rtrb = "0.4.1"
 
 [profile.release]
 lto = "thin"

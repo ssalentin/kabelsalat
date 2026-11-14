@@ -32,10 +32,14 @@ filtering gates correctly. Commits `fab4280` (routing) + `d8a990e` (picker).
    device set, and the picker from an HW toggle to a device dropdown.
 2. **Audio sources as rig inputs.** File player + system-audio capture nodes
    (P2) feed a rig's chain directly, selectable as the rig input.
-3. **Matrix splits/layers/transforms.** The built `matrix.rs` (37 tests) replaces
-   the simple source filter for advanced routing: per-rule channel filter,
-   transpose, key/velocity ranges (splits & layers), CC mapping. The source filter
-   is a stepping stone; the matrix is the routing layer.
+3. **Matrix splits/layers/transforms.** The built `matrix.rs` (37 tests) is now
+   wired into the engine as the MIDI routing layer: default rules mirror "every
+   source plays every rig", and `Command::SetSplit { point }` narrows key ranges
+   in place (RT-safe). **Keyboard split landed** (commit `56b2b20`): a "Split @ C4"
+   toggle in the RIG INPUTS strip + assistant `set_split` tool — rig A plays below
+   the split, rig B at/above; note-offs follow their zone. 2 engine tests verify
+   the partition. Still to expose: arbitrary per-rule layers, transpose, and CC
+   mapping via the matrix (the routing layer is in place; these are UI/config).
 
 ## Design note
 

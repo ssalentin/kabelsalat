@@ -28,6 +28,9 @@ Status: P0 spike · Name: `kabelsalat` (binary = package = `.desktop` = icon = W
   X11 reparenting works.
 - **2026-11-14** — **Reason's rack flip adopted as interaction model** (user):
   labeled rack units, Tab flips to the back panel where the cables live (§2a).
+- **2026-11-14** — **Built-in assistant requested** (user): DeepSeek-powered, BYOK,
+  tool access to the app (rewire/setup/fixes). Same control plane as MCP (§2c);
+  key stored locally 0600, never committed. Shipped in the dev preview.
 
 ## 1. Goal
 

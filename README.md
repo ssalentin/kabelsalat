@@ -27,7 +27,8 @@ interface. kabelsalat is that gap:
 - **GarageBand-inspired approachability** — playable starter templates, smart macro
   controls, slick 60fps interactions, instant sound. No manual required.
 - **Agent-native** — a full MCP server gives AI agents 1:1 access to every feature,
-  through the same control plane the UI uses.
+  through the same control plane the UI uses. Plus a **built-in assistant**
+  (DeepSeek, bring-your-own-key) that can inspect, play, and help set things up.
 - **One window, no scatter** — plugin editors open embedded inside the app
   (AUM-style), never as disconnected windows.
 - **System audio in the mix** — wire YouTube/browser playback straight into a

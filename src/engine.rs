@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind};
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
-use crate::matrix::SourceId;
+use crate::matrix::{Matrix, MidiMsg, SourceId};
 
 // Engine-level param ids (what the UI/assistant send). Translated to each
 // processor's native param ids in `dsp_native_param`.
@@ -81,6 +81,10 @@ pub struct GraphEngine {
     master_vol: f32,
     master_warm: f32,
     out_peak: Arc<AtomicU32>,
+    // MIDI routing matrix (source → rig, with key-range splits). Default rules
+    // mirror "every source plays every rig"; SetSplit edits key ranges in place.
+    matrix: Matrix,
+    route_out: Vec<(NodeId, MidiMsg)>,
 }
 
 impl GraphEngine {
@@ -93,7 +97,7 @@ impl GraphEngine {
         voices: Vec<(NodeId, ClapVoice)>,
     ) -> Self {
         let keys_node = graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
-        let voices = voices
+        let voices: Vec<VoiceSlot> = voices
             .into_iter()
             .map(|(node, voice)| VoiceSlot {
                 node,
@@ -118,6 +122,15 @@ impl GraphEngine {
                 _ => None,
             })
             .collect();
+        // Default routing: every source class feeds every rig (full range).
+        // SetSplit later narrows key ranges per rig, in place (RT-safe).
+        let mut matrix = Matrix::new();
+        matrix.reserve(64);
+        for v in &voices {
+            matrix.connect(SourceId::Keys, v.node);
+            matrix.connect(SourceId::LaptopKeys, v.node);
+            matrix.connect(SourceId::Hardware(0), v.node);
+        }
         Self {
             graph,
             drain,
@@ -127,6 +140,8 @@ impl GraphEngine {
             master_vol: 0.8,
             master_warm: 0.15,
             out_peak: Arc::new(AtomicU32::new(0)),
+            matrix,
+            route_out: Vec::with_capacity(64),
         }
     }
 
@@ -172,23 +187,35 @@ impl GraphEngine {
                 }
             }
             Command::NoteOn { note, velocity, source } => {
-                if let Some(keys) = self.keys_node {
-                    for s in &mut self.voices {
-                        if self.graph.has_route(keys, s.node, PortKind::Midi)
-                            && source_accepted(s, source)
-                        {
-                            s.voice.note_on(note as u16, velocity as f64);
+                let msg = MidiMsg::note_on(0, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
+                self.matrix.route_into(source, msg, &mut self.route_out);
+                let keys = self.keys_node;
+                for i in 0..self.route_out.len() {
+                    let (dest, m) = self.route_out[i];
+                    let gate = keys.map(|k| self.graph.has_route(k, dest, PortKind::Midi)).unwrap_or(false);
+                    if !gate {
+                        continue;
+                    }
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        if source_accepted(s, source) {
+                            s.voice.note_on(m.note() as u16, velocity as f64);
                         }
                     }
                 }
             }
             Command::NoteOff { note, source } => {
-                if let Some(keys) = self.keys_node {
-                    for s in &mut self.voices {
-                        if self.graph.has_route(keys, s.node, PortKind::Midi)
-                            && source_accepted(s, source)
-                        {
-                            s.voice.note_off(note as u16);
+                let msg = MidiMsg::note_off(0, note, 0);
+                self.matrix.route_into(source, msg, &mut self.route_out);
+                let keys = self.keys_node;
+                for i in 0..self.route_out.len() {
+                    let (dest, m) = self.route_out[i];
+                    let gate = keys.map(|k| self.graph.has_route(k, dest, PortKind::Midi)).unwrap_or(false);
+                    if !gate {
+                        continue;
+                    }
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        if source_accepted(s, source) {
+                            s.voice.note_off(m.note() as u16);
                         }
                     }
                 }
@@ -198,6 +225,24 @@ impl GraphEngine {
                     s.src_keys = keys;
                     s.src_laptop = laptop;
                     s.src_hw = hardware;
+                }
+            }
+            Command::SetSplit { point } => {
+                // Rig A (node 1) takes the low zone, rig B (node 4) the high zone.
+                // In-place key-range edits: no allocation on the audio thread.
+                for rule in &mut self.matrix.rules {
+                    rule.key_range = match point {
+                        None => (0, 127),
+                        Some(p) => {
+                            if rule.dest == 1 {
+                                (0, p.saturating_sub(1))
+                            } else if rule.dest == 4 {
+                                (p, 127)
+                            } else {
+                                (0, 127)
+                            }
+                        }
+                    };
                 }
             }
             Command::TransportPlay | Command::TransportStop => {} // P2
@@ -275,5 +320,61 @@ impl GraphEngine {
             }
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::matrix::{Matrix, MidiMsg, SourceId};
+
+    /// Mirror the engine's default matrix + SetSplit key-range edits.
+    fn split_matrix(point: Option<u8>) -> Matrix {
+        let mut m = Matrix::new();
+        for node in [1u32, 4u32] {
+            m.connect(SourceId::Keys, node);
+            m.connect(SourceId::LaptopKeys, node);
+        }
+        for rule in &mut m.rules {
+            rule.key_range = match point {
+                None => (0, 127),
+                Some(p) => {
+                    if rule.dest == 1 {
+                        (0, p.saturating_sub(1))
+                    } else if rule.dest == 4 {
+                        (p, 127)
+                    } else {
+                        (0, 127)
+                    }
+                }
+            };
+        }
+        m
+    }
+
+    fn dests(m: &Matrix, src: SourceId, msg: MidiMsg) -> Vec<u32> {
+        let mut out = Vec::new();
+        m.route_into(src, msg, &mut out);
+        out.iter().map(|(d, _)| *d).collect()
+    }
+
+    #[test]
+    fn no_split_both_rigs_play() {
+        let m = split_matrix(None);
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
+        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 30, 100)), vec![1, 4]);
+    }
+
+    #[test]
+    fn split_at_c4_partitions_keyboard() {
+        let m = split_matrix(Some(60));
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 59, 100)), vec![1]); // B3 → A
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 60, 100)), vec![4]); // C4 → B
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 96, 100)), vec![4]); // high → B
+        // Note-offs follow the same zone as their note-on.
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_off(0, 59, 0)), vec![1]);
+        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_off(0, 60, 0)), vec![4]);
+        // Laptop keys split identically.
+        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 48, 100)), vec![1]);
+        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 72, 100)), vec![4]);
     }
 }

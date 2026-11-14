@@ -464,6 +464,9 @@ struct DemoApp {
     /// Per-rig input selection (keys, laptop, hardware) for rigs A=node1, B=node4.
     rig_sources: [(bool, bool, bool); 2],
 
+    /// Keyboard split at C4 across the two rigs (A=low, B=high).
+    split_on: bool,
+
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
     key_input: String,
@@ -578,6 +581,7 @@ impl DemoApp {
             flip_requested: false,
             current_source: SourceId::Keys,
             rig_sources: [(true, true, true); 2],
+            split_on: false,
             assistant: Assistant::new(),
             key_input: String::new(),
             chat_input: String::new(),
@@ -965,6 +969,17 @@ impl DemoApp {
                 }
                 format!("rig {node} sources: keys={keys} laptop={laptop} hardware={hardware}")
             }
+            "set_split" => {
+                let point = args.get("point").and_then(|v| v.as_u64()).map(|p| p.min(127) as u8);
+                self.split_on = point.is_some();
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetSplit { point });
+                }
+                match point {
+                    Some(p) => format!("keyboard split at note {p}: rig A below, rig B at/above"),
+                    None => "split disabled — both rigs play the full keyboard".into(),
+                }
+            }
             _ => format!("unknown tool: {name}"),
         }
     }
@@ -1013,6 +1028,21 @@ impl DemoApp {
                         }
                         ui.add_space(14.0);
                     }
+                    ui.add_space(4.0);
+                    let split_txt = if self.split_on { "Split @ C4: ON" } else { "Split @ C4: off" };
+                    let split_fill = if self.split_on { alpha(YELLOW, 0.35) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                    let split_col = if self.split_on { TEXT } else { SUBTEXT };
+                    let btn = egui::Button::new(egui::RichText::new(split_txt).small().color(split_col))
+                        .fill(split_fill)
+                        .corner_radius(4.0);
+                    if ui.add(btn).clicked() {
+                        self.split_on = !self.split_on;
+                        let point = if self.split_on { Some(60) } else { None };
+                        if let Some(bus) = &self.bus {
+                            let _ = bus.lock().unwrap().send(Command::SetSplit { point });
+                        }
+                    }
+                    ui.add_space(10.0);
                     ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
                 });
             });

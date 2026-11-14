@@ -166,6 +166,11 @@ fn tools() -> Value {
             "name":"set_rig_source",
             "description":"Select which input sources feed a rig (AUM per-rig input). node 1=Surge A, 4=Surge B. Toggle keys (on-screen keyboard), laptop (laptop keyboard), hardware (MIDI devices). Omitted flags default to true.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"keys":{"type":"boolean"},"laptop":{"type":"boolean"},"hardware":{"type":"boolean"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_split",
+            "description":"Split the keyboard across the two rigs at a MIDI note: rig A plays below, rig B at/above. Omit point (or null) to disable the split so both rigs play the full keyboard. Example: point 60 splits at C4.",
+            "parameters":{"type":"object","properties":{"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit to disable"}}}
         }}
     ])
 }

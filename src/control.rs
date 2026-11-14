@@ -192,6 +192,9 @@ pub enum Command {
     /// feed this instrument node. The MIDI cable still gates routing; this
     /// filters by source on top. Default: all true.
     SetRigSource { node: NodeId, keys: bool, laptop: bool, hardware: bool },
+    /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
+    /// notes at/above → rig B (node 4). `None` disables the split (both full range).
+    SetSplit { point: Option<u8> },
     TransportPlay,
     TransportStop,
 }

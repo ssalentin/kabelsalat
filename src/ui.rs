@@ -2348,6 +2348,15 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
+    // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
+    // must reparent into our window; (2) winit has no fractional-scale support,
+    // so native Wayland on a 1.6x Hyprland output renders a logical-resolution
+    // buffer that the compositor upscales (blurry). With Omarchy's
+    // xwayland force_zero_scaling, X11 renders 1:1 at native pixels — sharp —
+    // and egui's pixels_per_point handles element sizing.
+    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
+        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])

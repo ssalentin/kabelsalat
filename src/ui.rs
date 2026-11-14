@@ -31,7 +31,7 @@ use midir::os::unix::VirtualInput;
 use midir::{Ignore, MidiInput};
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
-use crate::control::{Command, CommandBus, PortKind as CPortKind, PortRef};
+use crate::control::{Command, CommandBus, Graph, PortKind as CPortKind, PortRef};
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 use crate::host::{ClapVoice, ClapVoiceMain};
 
@@ -478,8 +478,8 @@ struct DemoApp {
     _hw_conns: Vec<midir::MidiInputConnection<()>>,
     hw_status: String,
     surge_status: String,
-    // !Send: CLAP main-thread object; DemoApp never leaves the UI thread.
-    _surge_main: Option<ClapVoiceMain>,
+    // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
+    _surge_main: Vec<ClapVoiceMain>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -581,7 +581,7 @@ impl DemoApp {
             _hw_conns: Vec::new(),
             hw_status: String::new(),
             surge_status: "no synth loaded".into(),
-            _surge_main: None,
+            _surge_main: Vec::new(),
             _audio_stream: None,
             bus: None,
             out_level: None,
@@ -814,12 +814,12 @@ impl DemoApp {
     /// keys, and (later) hardware MIDI — task-4 routes sound from here.
     fn with_audio(
         mut self,
-        main: ClapVoiceMain,
+        mains: Vec<ClapVoiceMain>,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        self._surge_main = Some(main);
+        self._surge_main = mains;
         self._audio_stream = Some(stream);
         self.bus = Some(bus);
         self.out_level = Some(level);
@@ -2296,7 +2296,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -2304,13 +2304,15 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus, Arc
     let cfg = device.default_output_config()?;
     let sample_rate = cfg.sample_rate() as f64;
     let ch = cfg.channels() as usize;
-    let (voice, main) = ClapVoice::new(sample_rate)?;
+    // Two instrument voices — one per channel stack (nodes 1 and 4).
+    let (voice_a, main_a) = ClapVoice::new(sample_rate)?;
+    let (voice_b, main_b) = ClapVoice::new(sample_rate)?;
     let mut config: cpal::StreamConfig = cfg.into();
     // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
     // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
     config.buffer_size = cpal::BufferSize::Fixed(512);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms)",
+        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms) voices=2",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
@@ -2318,7 +2320,12 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus, Arc
         512.0 / sample_rate * 1000.0
     );
     let (bus, drain) = crate::control::command_bus();
-    let mut engine = GraphEngine::new(voice, drain, sample_rate);
+    let mut engine = GraphEngine::new(
+        Graph::demo_patch(),
+        drain,
+        sample_rate,
+        vec![(1, voice_a), (4, voice_b)],
+    );
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -2329,7 +2336,7 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus, Arc
         None,
     )?;
     stream.play()?;
-    Ok((main, stream, bus, level))
+    Ok((vec![main_a, main_b], stream, bus, level))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -2376,7 +2383,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((main, stream, bus, level)) => {
+                    Ok((mains, stream, bus, level)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         let b = bus.clone();
                         sink = Some(Box::new(move |ev: NoteEvent| {
@@ -2390,14 +2397,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((main, stream, bus, level));
+                        audio = Some((mains, stream, bus, level));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((main, stream, bus, level)) => app.with_audio(main, stream, bus, level),
+                Some((mains, stream, bus, level)) => app.with_audio(mains, stream, bus, level),
                 None => app,
             };
             Ok(Box::new(app))

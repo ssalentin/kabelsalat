@@ -143,25 +143,35 @@ impl Graph {
             .any(|e| e.from.node == from && e.to.node == to && e.kind == kind)
     }
 
-    /// The starter patch matching the rack: Keys → Surge → Delay → Master,
-    /// plus a dry Surge → Master run. Edge ids match the UI's demo cables
-    /// (1,3,4,5) so unplug commands line up; task-10 unifies the models.
+    /// The starter patch: TWO channel stacks mixed to a shared master.
+    /// Stack A: Keys→Surge A→Delay A→Master (+dry). Stack B: Keys→Surge B→
+    /// Delay B→Master (+dry). Edge ids match the UI's cable ids; node ids
+    /// 0=Keys, 1=Surge A, 2=Delay A, 3=Master, 4=Surge B, 5=Delay B.
     pub fn demo_patch() -> Self {
         let mut g = Self::default();
         g.reserve(64, 256);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(
+        let surge_a = g.add_node(
             NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
-            name_bytes("SURGE XT"),
+            name_bytes("SURGE A"),
         );
-        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let delay_a = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY A"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        let surge_b = g.add_node(
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SURGE B"),
+        );
+        let delay_b = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY B"));
         g.next_edge = 1;
-        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
-        g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, PortKind::Audio);
-        g.connect_with_id(4, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
-        g.connect_with_id(5, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
-        g.next_edge = 6;
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge_a, port: 0 }, PortKind::Midi);
+        g.connect_with_id(3, PortRef { node: surge_a, port: 0 }, PortRef { node: delay_a, port: 0 }, PortKind::Audio);
+        g.connect_with_id(4, PortRef { node: delay_a, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(5, PortRef { node: surge_a, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        g.connect_with_id(6, PortRef { node: keys, port: 0 }, PortRef { node: surge_b, port: 0 }, PortKind::Midi);
+        g.connect_with_id(7, PortRef { node: surge_b, port: 0 }, PortRef { node: delay_b, port: 0 }, PortKind::Audio);
+        g.connect_with_id(8, PortRef { node: delay_b, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(9, PortRef { node: surge_b, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        g.next_edge = 10;
         g
     }
 }
@@ -221,10 +231,12 @@ mod tests {
     #[test]
     fn demo_patch_is_wired() {
         let g = Graph::demo_patch();
-        assert_eq!(g.nodes.len(), 4);
-        assert_eq!(g.edges.len(), 4);
+        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.edges.len(), 8);
         assert!(g.has_route(0, 1, PortKind::Midi));
+        assert!(g.has_route(0, 4, PortKind::Midi));
         assert!(g.has_route(1, 3, PortKind::Audio));
+        assert!(g.has_route(4, 3, PortKind::Audio));
     }
 
     #[test]
@@ -240,8 +252,8 @@ mod tests {
     #[test]
     fn remove_node_cleans_edges() {
         let mut g = Graph::demo_patch();
-        g.remove_node(1); // Surge
-        assert_eq!(g.nodes.len(), 3);
+        g.remove_node(1); // Surge A
+        assert_eq!(g.nodes.len(), 5);
         assert!(g.edges.iter().all(|e| e.from.node != 1 && e.to.node != 1));
     }
 

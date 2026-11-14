@@ -1,26 +1,32 @@
-//! Graph-driven audio engine: the control-plane graph IS the audio path.
+//! Graph-driven multi-voice audio engine: the control-plane graph IS the mix.
 //!
-//! `GraphEngine` owns the Surge voice, the delay line, and the patch. It
-//! drains control-plane commands at block boundaries (fixed-size commands,
-//! reserved graph storage — no allocation in the callback) and renders
-//! strictly according to what is plugged. Unplug a cable and the signal stops.
+//! Each Clap node owns a voice; each Delay node owns a delay line. `render`
+//! walks the graph edges: every voice renders, feeds the delays it is wired
+//! to, and everything wired to the master is summed. Notes fan out to every
+//! instrument that has a Keys→instrument MIDI cable. Unplug a cable and that
+//! path goes silent — what you patch is what you hear.
+//!
+//! RT discipline: commands are fixed-size, graph storage is reserved, buffers
+//! are preallocated, edge lookups are linear scans — no allocation in render.
+//! Voices are created at startup (plugin loading is main-thread work); dynamic
+//! AddNode(Clap) with off-thread loading is the follow-up.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use crate::control::{Command, CommandDrain, DspKind, Graph, NodeKind, ParamId, PortKind};
+use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind};
 use crate::host::ClapVoice;
 
-// Param ids for the fixed rack (task-10 generalizes to per-node param tables).
-pub const P_LEVEL: ParamId = 0; // Surge output level
-pub const P_TIME: ParamId = 1;  // Delay time
-pub const P_MIX: ParamId = 2;   // Delay mix
-pub const P_VOL: ParamId = 3;   // Master volume
-pub const P_WARM: ParamId = 4;  // Master saturation
+// Param ids (per node).
+pub const P_LEVEL: ParamId = 0; // instrument output level
+pub const P_TIME: ParamId = 1;  // delay time
+pub const P_MIX: ParamId = 2;   // delay mix
+pub const P_VOL: ParamId = 3;   // master volume
+pub const P_WARM: ParamId = 4;  // master saturation
 
 /// Preallocated stereo delay line. `process` is allocation-free.
 pub struct DelayLine {
-    buf: Vec<f32>, // stereo interleaved
+    buf: Vec<f32>,
     frames: usize,
     write: usize,
 }
@@ -28,15 +34,10 @@ pub struct DelayLine {
 impl DelayLine {
     pub fn new(sample_rate: f64, max_secs: f64) -> Self {
         let frames = (sample_rate * max_secs) as usize;
-        Self {
-            buf: vec![0.0; frames * 2],
-            frames,
-            write: 0,
-        }
+        Self { buf: vec![0.0; frames * 2], frames, write: 0 }
     }
 
-    /// Process a stereo block in place: out = dry*(1-mix) + delayed*mix.
-    /// `time` 0..1 maps to 0..max delay. Feeding silence rings the tail out.
+    /// out = dry*(1-mix) + delayed*mix. Feeding silence rings the tail out.
     pub fn process(&mut self, data: &mut [f32], time: f32, mix: f32) {
         let delay_frames =
             ((time.clamp(0.0, 1.0) as f64) * (self.frames as f64 - 2.0)) as usize;
@@ -58,178 +59,205 @@ impl DelayLine {
     }
 }
 
+struct VoiceSlot {
+    node: NodeId,
+    voice: ClapVoice,
+    level: f32,
+    scratch: Vec<f32>,
+}
+
+struct DelaySlot {
+    node: NodeId,
+    delay: DelayLine,
+    time: f32,
+    mix: f32,
+    buf: Vec<f32>,
+}
+
 pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
-    voice: ClapVoice,
-    delay: DelayLine,
-    scratch: Vec<f32>,
-    delay_in: Vec<f32>,
-    // Route cache, refreshed on structural commands.
-    keys_surge: bool,
-    surge_delay: bool,
-    delay_master: bool,
-    surge_master: bool,
-    // Knob cache.
-    level: f32,
-    time: f32,
-    mix: f32,
-    vol: f32,
-    warm: f32,
-    // Real output peak for the UI meter (f32 bits).
+    voices: Vec<VoiceSlot>,
+    delays: Vec<DelaySlot>,
+    keys_node: Option<NodeId>,
+    master_vol: f32,
+    master_warm: f32,
     out_peak: Arc<AtomicU32>,
 }
 
 impl GraphEngine {
-    pub fn new(voice: ClapVoice, drain: CommandDrain, sample_rate: f64) -> Self {
-        let mut e = Self {
-            graph: Graph::demo_patch(),
+    /// `voices` pairs each Clap node id with a loaded voice (created on the
+    /// main thread). Delay lines are built for every Dsp(Delay) node.
+    pub fn new(
+        graph: Graph,
+        drain: CommandDrain,
+        sample_rate: f64,
+        voices: Vec<(NodeId, ClapVoice)>,
+    ) -> Self {
+        let keys_node = graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
+        let voices = voices
+            .into_iter()
+            .map(|(node, voice)| VoiceSlot { node, voice, level: 0.85, scratch: vec![0.0; 8192 * 2] })
+            .collect();
+        let delays = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Delay)))
+            .map(|n| DelaySlot {
+                node: n.id,
+                delay: DelayLine::new(sample_rate, 2.0),
+                time: 0.4,
+                mix: 0.5,
+                buf: vec![0.0; 8192 * 2],
+            })
+            .collect();
+        Self {
+            graph,
             drain,
-            voice,
-            delay: DelayLine::new(sample_rate, 2.0),
-            scratch: vec![0.0; 8192 * 2],
-            delay_in: vec![0.0; 8192 * 2],
-            keys_surge: false,
-            surge_delay: false,
-            delay_master: false,
-            surge_master: false,
-            level: 0.85,
-            time: 0.4,
-            mix: 0.5,
-            vol: 0.8,
-            warm: 0.15,
+            voices,
+            delays,
+            keys_node,
+            master_vol: 0.8,
+            master_warm: 0.15,
             out_peak: Arc::new(AtomicU32::new(0)),
-        };
-        e.refresh_routes();
-        e
+        }
     }
 
     pub fn graph(&self) -> &Graph {
         &self.graph
     }
 
-    /// Handle to the real output peak (f32 bits) for the UI meter.
     pub fn level_handle(&self) -> Arc<AtomicU32> {
         self.out_peak.clone()
-    }
-
-    fn refresh_routes(&mut self) {
-        let find = |pred: fn(&NodeKind) -> bool| -> Option<u32> {
-            self.graph.nodes.iter().find(|n| pred(&n.kind)).map(|n| n.id)
-        };
-        let keys = find(|k| matches!(k, NodeKind::Keys));
-        let surge = find(|k| matches!(k, NodeKind::Clap { .. }));
-        let delay = find(|k| matches!(k, NodeKind::Dsp(DspKind::Delay)));
-        let master = find(|k| matches!(k, NodeKind::MasterOut));
-        let route = |a: Option<u32>, b: Option<u32>, kind: PortKind| -> bool {
-            match (a, b) {
-                (Some(a), Some(b)) => self.graph.has_route(a, b, kind),
-                _ => false,
-            }
-        };
-        self.keys_surge = route(keys, surge, PortKind::Midi);
-        self.surge_delay = route(surge, delay, PortKind::Audio);
-        self.delay_master = route(delay, master, PortKind::Audio);
-        self.surge_master = route(surge, master, PortKind::Audio);
     }
 
     fn apply(&mut self, cmd: Command) {
         match cmd {
             Command::AddNode { kind, name } => {
                 self.graph.add_node(kind, name);
-                self.refresh_routes();
             }
             Command::RemoveNode(id) => {
                 self.graph.remove_node(id);
-                self.refresh_routes();
             }
             Command::Connect { id, from, to, kind } => {
-                if self.graph.connect_with_id(id, from, to, kind) {
-                    self.refresh_routes();
-                }
+                self.graph.connect_with_id(id, from, to, kind);
             }
             Command::Disconnect(id) => {
                 self.graph.disconnect(id);
-                self.refresh_routes();
             }
             Command::SetParam { node, param, value } => {
                 let v = value as f32;
-                // Fixed rack: node 1 = Surge, 2 = Delay, 3 = Master.
-                match (node, param) {
-                    (1, P_LEVEL) => self.level = v,
-                    (2, P_TIME) => self.time = v,
-                    (2, P_MIX) => self.mix = v,
-                    (3, P_VOL) => self.vol = v,
-                    (3, P_WARM) => self.warm = v,
+                match param {
+                    P_LEVEL => {
+                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                            s.level = v;
+                        }
+                    }
+                    P_TIME => {
+                        if let Some(s) = self.delays.iter_mut().find(|s| s.node == node) {
+                            s.time = v;
+                        }
+                    }
+                    P_MIX => {
+                        if let Some(s) = self.delays.iter_mut().find(|s| s.node == node) {
+                            s.mix = v;
+                        }
+                    }
+                    P_VOL => self.master_vol = v,
+                    P_WARM => self.master_warm = v,
                     _ => {}
                 }
             }
             Command::NoteOn { note, velocity } => {
-                if self.keys_surge {
-                    self.voice.note_on(note as u16, velocity as f64);
+                if let Some(keys) = self.keys_node {
+                    for s in &mut self.voices {
+                        if self.graph.has_route(keys, s.node, PortKind::Midi) {
+                            s.voice.note_on(note as u16, velocity as f64);
+                        }
+                    }
                 }
             }
             Command::NoteOff { note } => {
-                if self.keys_surge {
-                    self.voice.note_off(note as u16);
+                if let Some(keys) = self.keys_node {
+                    for s in &mut self.voices {
+                        if self.graph.has_route(keys, s.node, PortKind::Midi) {
+                            s.voice.note_off(note as u16);
+                        }
+                    }
                 }
             }
             Command::TransportPlay | Command::TransportStop => {} // P2
         }
     }
 
-    /// Render one device block. Allocation-free: commands are fixed-size,
-    /// graph storage is reserved, buffers are preallocated.
+    /// Render one device block, allocation-free.
     pub fn render(&mut self, data: &mut [f32], ch: usize) {
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
         }
 
         let frames = data.len() / ch;
-        if frames * 2 > self.scratch.len() {
+        let cap = 8192;
+        if frames > cap {
             for s in data.iter_mut() {
                 *s = 0.0;
             }
             return;
         }
+        let n2 = frames * 2;
 
-        self.voice.render(&mut self.scratch[..frames * 2]);
-        for s in self.scratch[..frames * 2].iter_mut() {
-            *s *= self.level;
-        }
-
-        // Delay path: feed Surge when wired, silence otherwise (tail rings out).
-        if self.surge_delay {
-            self.delay_in[..frames * 2].copy_from_slice(&self.scratch[..frames * 2]);
-        } else {
-            for s in self.delay_in[..frames * 2].iter_mut() {
-                *s = 0.0;
+        // 1. Every instrument renders and applies its level.
+        for s in &mut self.voices {
+            s.voice.render(&mut s.scratch[..n2]);
+            for x in s.scratch[..n2].iter_mut() {
+                *x *= s.level;
             }
         }
-        self.delay
-            .process(&mut self.delay_in[..frames * 2], self.time, self.mix);
 
+        // 2. Each delay sums the instruments wired into it, then processes.
+        for d in &mut self.delays {
+            for x in d.buf[..n2].iter_mut() {
+                *x = 0.0;
+            }
+            for v in &self.voices {
+                if self.graph.has_route(v.node, d.node, PortKind::Audio) {
+                    for i in 0..n2 {
+                        d.buf[i] += v.scratch[i];
+                    }
+                }
+            }
+            d.delay.process(&mut d.buf[..n2], d.time, d.mix);
+        }
+
+        // 3. Master sums everything wired to it.
         let mut peak = 0.0f32;
-        for (i, frame) in data.chunks_mut(ch).enumerate() {
-            let mut l = 0.0f32;
-            let mut r = 0.0f32;
-            if self.surge_master {
-                l += self.scratch[i * 2];
-                r += self.scratch[i * 2 + 1];
-            }
-            if self.delay_master {
-                l += self.delay_in[i * 2];
-                r += self.delay_in[i * 2 + 1];
-            }
-            l = (l * (1.0 + self.warm * 3.0)).tanh() * self.vol;
-            r = (r * (1.0 + self.warm * 3.0)).tanh() * self.vol;
-            peak = peak.max(l.abs()).max(r.abs());
-            frame[0] = l;
-            if ch > 1 {
-                frame[1] = r;
-            }
-            for s in frame.iter_mut().skip(2) {
-                *s = 0.0;
+        let master = self.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id);
+        if let Some(master) = master {
+            for (i, frame) in data.chunks_mut(ch).enumerate() {
+                let mut l = 0.0f32;
+                let mut r = 0.0f32;
+                for v in &self.voices {
+                    if self.graph.has_route(v.node, master, PortKind::Audio) {
+                        l += v.scratch[i * 2];
+                        r += v.scratch[i * 2 + 1];
+                    }
+                }
+                for d in &self.delays {
+                    if self.graph.has_route(d.node, master, PortKind::Audio) {
+                        l += d.buf[i * 2];
+                        r += d.buf[i * 2 + 1];
+                    }
+                }
+                l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
+                r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
+                peak = peak.max(l.abs()).max(r.abs());
+                frame[0] = l;
+                if ch > 1 {
+                    frame[1] = r;
+                }
+                for s in frame.iter_mut().skip(2) {
+                    *s = 0.0;
+                }
             }
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);

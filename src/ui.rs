@@ -2322,15 +2322,16 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, CommandBus)> {
     let ch = cfg.channels() as usize;
     let (voice, main) = ClapVoice::new(sample_rate)?;
     let mut config: cpal::StreamConfig = cfg.into();
-    // Low latency from the start: 256 frames @48k = 5.3 ms.
-    config.buffer_size = cpal::BufferSize::Fixed(256);
+    // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
+    // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
+    config.buffer_size = cpal::BufferSize::Fixed(512);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer=256 frames ({:.1} ms)",
+        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms)",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
         ch,
-        256.0 / sample_rate * 1000.0
+        512.0 / sample_rate * 1000.0
     );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(voice, drain, sample_rate);

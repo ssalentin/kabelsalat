@@ -919,6 +919,7 @@ impl DemoApp {
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
         egui::Panel::right("assistant")
             .default_size(340.0)
+            .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(0x1e, 0x20, 0x2e))
@@ -1613,7 +1614,7 @@ impl DemoApp {
     // -- drawing ----------------------------------------------------------
 
     fn draw(&mut self, ui: &mut egui::Ui) {
-        let rect = ui.max_rect();
+        let rect = ui.available_rect_before_wrap();
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, BG);
         self.draw_grid(&painter, rect);
@@ -2203,7 +2204,7 @@ impl eframe::App for DemoApp {
             self.fire_keys(semi, ev.velocity);
         }
 
-        let rect = ui.max_rect();
+        let rect = ui.available_rect_before_wrap();
         let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
         self.fps += (1.0 / dt - self.fps) * 0.05;
 

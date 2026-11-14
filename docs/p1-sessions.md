@@ -152,3 +152,18 @@ the session stores opaque `(node, param, value)` triples either way.
 `cargo build` green; `control::` tests still 5/5 (no regression). The session
 module carries `#![allow(dead_code)]` until task-10 wires it into the UI/CLI,
 matching the convention in `src/matrix.rs`.
+
+## App integration (landed)
+
+The session model is now wired into the app via the assistant (commit `526665d`):
+- `save_session { name }` — captures the current patch (graph from live cables),
+  knob values (the 8-param map), and Surge plugin state (`ClapVoiceMain::save_state`)
+  into `~/kabelsalat-sessions/<name>.ksalat`.
+- `load_session { name }` — restores knob values + Surge plugin state (same-topology
+  recall; arbitrary-graph load arrives with the dynamic rack).
+- `list_sessions` — lists saved packages.
+- `kabelsalat session-test` — end-to-end self-test: capture→save→reset→load→restore,
+  asserts knobs + edge count round-trip. **Passes** (8 edges, 3 knobs restored).
+
+Still to come: a visual save/load UI, starter-template loading (needs the dynamic
+rack to render arbitrary graphs), and undo/redo wired to UI actions.

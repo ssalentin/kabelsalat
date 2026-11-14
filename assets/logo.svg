@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- kabelsalat: three patch cables, sagging, with signal pulses on the way -->
+  <rect width="512" height="512" fill="#15161e"/>
+
+  <!-- port rails -->
+  <rect x="56" y="100" width="24" height="240" rx="4" fill="#262838"/>
+  <rect x="432" y="100" width="24" height="240" rx="4" fill="#262838"/>
+
+  <!-- plugs, left -->
+  <rect x="80" y="129" width="28" height="22" rx="3" fill="#414459"/>
+  <rect x="80" y="209" width="28" height="22" rx="3" fill="#414459"/>
+  <rect x="80" y="289" width="28" height="22" rx="3" fill="#414459"/>
+  <!-- plugs, right -->
+  <rect x="404" y="129" width="28" height="22" rx="3" fill="#414459"/>
+  <rect x="404" y="209" width="28" height="22" rx="3" fill="#414459"/>
+  <rect x="404" y="289" width="28" height="22" rx="3" fill="#414459"/>
+
+  <!-- sagging cables -->
+  <path d="M 106 140 C 210 280, 302 280, 406 140" stroke="#ffd60a" stroke-width="16" fill="none" stroke-linecap="round"/>
+  <path d="M 106 220 C 210 360, 302 360, 406 220" stroke="#7aa2f7" stroke-width="16" fill="none" stroke-linecap="round"/>
+  <path d="M 106 300 C 210 430, 302 430, 406 300" stroke="#9ece6a" stroke-width="16" fill="none" stroke-linecap="round"/>
+
+  <!-- signal pulses traveling along the cables -->
+  <circle cx="256" cy="245" r="26" fill="#ffd60a" opacity="0.22"/>
+  <circle cx="256" cy="245" r="13" fill="#fffbe6"/>
+  <circle cx="256" cy="325" r="18" fill="#7aa2f7" opacity="0.22"/>
+  <circle cx="256" cy="325" r="9" fill="#e3ecff"/>
+</svg>

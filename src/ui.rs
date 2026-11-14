@@ -58,7 +58,7 @@ const N_UNITS: usize = 4;
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
 const MAX_CABLES: usize = 64;
-const FLIP_SECS: f32 = 0.55;
+const FLIP_SECS: f32 = 0.35;
 
 // Damped spring: omega ≈ 11.4 rad/s (~1.8 Hz), zeta ≈ 0.3 → a few visible
 // swings before settling. Semi-implicit Euler at ≤ 1/240 s substeps.
@@ -2139,6 +2139,20 @@ impl eframe::App for DemoApp {
         let ctx = ui.ctx().clone();
         self.ensure_galleys(&ctx);
 
+        // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
+        // output, and eframe re-applies it AFTER the app creator runs — so the
+        // correction must live here, on the frame path, not in the creator.
+        if ctx.pixels_per_point() < 1.05 {
+            ctx.set_pixels_per_point(1.6);
+        }
+
+        // Tab ALWAYS flips the rack — consume it before egui's focus navigation
+        // or the typing gate can steal it (the assistant panel has focusable
+        // widgets; without this, Tab silently moves focus instead of flipping).
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab)) {
+            self.start_flip();
+        }
+
         // Assistant panel takes the right strip; the rack gets the rest.
         self.assistant_panel_ui(ui);
 
@@ -2213,11 +2227,24 @@ pub fn run_app() -> anyhow::Result<()> {
     run_inner(None, true)
 }
 
+/// Prefer the native PipeWire host (bypasses the ALSA bridge and lets us
+/// request a small quantum directly); fall back to the default host.
+fn preferred_host() -> cpal::Host {
+    for id in cpal::available_hosts() {
+        if id.name().to_lowercase().contains("pipewire") {
+            if let Ok(h) = cpal::host_from_id(id) {
+                return h;
+            }
+        }
+    }
+    cpal::default_host()
+}
+
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
 fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController)> {
-    let host = cpal::default_host();
+    let host = preferred_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("no output device"))?;
@@ -2227,7 +2254,18 @@ fn build_audio() -> anyhow::Result<(ClapVoiceMain, cpal::Stream, VoiceController
     let (voice, main) = ClapVoice::new(sample_rate)?;
     let ctrl = voice.controller();
     let mut config: cpal::StreamConfig = cfg.into();
-    config.buffer_size = cpal::BufferSize::Fixed(512);
+    // Low latency from the start: 256 frames @48k = 5.3 ms. On the native
+    // PipeWire host this sets the stream's node latency, which drives the
+    // graph quantum — no ALSA bridge buffering in between.
+    config.buffer_size = cpal::BufferSize::Fixed(256);
+    eprintln!(
+        "audio: host={} device={} rate={} ch={} buffer=256 frames ({:.1} ms)",
+        host.id().name(),
+        device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
+        sample_rate,
+        ch,
+        256.0 / sample_rate * 1000.0
+    );
     let mut voice = voice;
     let mut scratch = vec![0.0f32; 8192 * 2];
     let stream = device.build_output_stream(
@@ -2279,6 +2317,10 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             if ppp < 1.05 {
                 cc.egui_ctx.set_pixels_per_point(1.6);
             }
+            eprintln!(
+                "ui scale: detected={ppp:.2} used={:.2}",
+                cc.egui_ctx.pixels_per_point()
+            );
             let mut visuals = egui::Visuals::dark();
             visuals.panel_fill = BG;
             visuals.window_fill = BG;

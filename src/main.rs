@@ -6,6 +6,7 @@
 
 mod assistant;
 mod audio;
+mod engine;
 mod host;
 mod midi;
 mod preview;

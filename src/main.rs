@@ -27,8 +27,9 @@ fn main() -> anyhow::Result<()> {
         "host-test" => host::run_test(),
         "ui-demo" => ui::run_demo(),
         "mcp" => mcp::run(),
+        "session-test" => ui::run_session_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp, session-test");
             std::process::exit(1);
         }
     }

@@ -171,6 +171,21 @@ fn tools() -> Value {
             "name":"set_split",
             "description":"Split the keyboard across the two rigs at a MIDI note: rig A plays below, rig B at/above. Omit point (or null) to disable the split so both rigs play the full keyboard. Example: point 60 splits at C4.",
             "parameters":{"type":"object","properties":{"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit to disable"}}}
+        }},
+        {"type":"function","function":{
+            "name":"save_session",
+            "description":"Save the current patch, knob values, and Surge plugin state as a named session package (.ksalat) in ~/kabelsalat-sessions.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Session name (no slashes)"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"load_session",
+            "description":"Load a saved session by name, restoring knob values and Surge plugin state.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_sessions",
+            "description":"List saved session names in ~/kabelsalat-sessions.",
+            "parameters":{"type":"object","properties":{}}
         }}
     ])
 }

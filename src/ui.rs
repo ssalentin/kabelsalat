@@ -54,6 +54,19 @@ const RING: Color32 = Color32::from_rgb(0x4a, 0x4e, 0x69);
 const PLUG: Color32 = Color32::from_rgb(0x41, 0x44, 0x59);
 const TEXT: Color32 = Color32::from_rgb(0xec, 0xee, 0xf6);
 const SUBTEXT: Color32 = Color32::from_rgb(0x8f, 0x95, 0xad);
+
+/// (node, engine param, unit index, knob index) — the knob↔param mapping used
+/// by per-frame publishing, session capture, and session restore.
+const PARAM_MAP: [(u32, u32, usize, usize); 8] = [
+    (1, P_LEVEL, 1, 1),
+    (2, P_TIME, 2, 0),
+    (2, P_MIX, 2, 1),
+    (3, P_VOL, 3, 0),
+    (3, P_WARM, 3, 1),
+    (4, P_LEVEL, 4, 1),
+    (5, P_TIME, 5, 0),
+    (5, P_MIX, 5, 1),
+];
 const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 
@@ -926,6 +939,76 @@ impl DemoApp {
         }
     }
 
+    fn sessions_dir() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let dir = std::path::PathBuf::from(home).join("kabelsalat-sessions");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Snapshot the current patch + knobs + plugin state into a Session.
+    fn capture_session(&mut self, name: &str) -> anyhow::Result<crate::session::Session> {
+        let mut graph = Graph::demo_patch();
+        graph.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 {
+                continue;
+            }
+            let kind = match c.kind {
+                PortKind::Midi => CPortKind::Midi,
+                PortKind::Audio => CPortKind::Audio,
+            };
+            graph.connect_with_id(
+                c.id,
+                PortRef { node: c.src as u32, port: c.src_port as u8 },
+                PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                kind,
+            );
+        }
+        let mut s = crate::session::Session::new(name, graph);
+        for &(node, param, unit, knob) in &PARAM_MAP {
+            s.set_param(node, param, self.units[unit].knobs[knob].value as f64);
+        }
+        let surge_id = "org.surge-synth-team.surge-xt";
+        if let Some(m) = self._surge_main.get_mut(0) {
+            if let Ok(blob) = m.save_state() {
+                s.set_plugin_state(1, surge_id, blob);
+            }
+        }
+        if let Some(m) = self._surge_main.get_mut(1) {
+            if let Ok(blob) = m.save_state() {
+                s.set_plugin_state(4, surge_id, blob);
+            }
+        }
+        Ok(s)
+    }
+
+    /// Restore knobs + plugin state from a Session (same-topology recall).
+    fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
+        for &(node, param, unit, knob) in &PARAM_MAP {
+            if let Some(v) = s.param(node, param) {
+                self.units[unit].knobs[knob].value = v as f32;
+            }
+        }
+        if let Some(bus) = &self.bus {
+            let mut b = bus.lock().unwrap();
+            for &(node, param, unit, knob) in &PARAM_MAP {
+                let _ = b.send(Command::SetParam { node, param, value: self.units[unit].knobs[knob].value as f64 });
+            }
+        }
+        if let Some(st) = s.plugin_state(1) {
+            if let Some(m) = self._surge_main.get_mut(0) {
+                let _ = m.load_state(&st.data);
+            }
+        }
+        if let Some(st) = s.plugin_state(4) {
+            if let Some(m) = self._surge_main.get_mut(1) {
+                let _ = m.load_state(&st.data);
+            }
+        }
+        Ok(())
+    }
+
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
         match name {
             "get_status" => serde_json::json!({
@@ -978,6 +1061,53 @@ impl DemoApp {
                 match point {
                     Some(p) => format!("keyboard split at note {p}: rig A below, rig B at/above"),
                     None => "split disabled — both rigs play the full keyboard".into(),
+                }
+            }
+            "save_session" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
+                match self.capture_session(name) {
+                    Ok(s) => {
+                        let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
+                        match path.and_then(|p| s.save(&p).map(|_| p)) {
+                            Ok(p) => format!("saved session '{}' to {}", name, p.display()),
+                            Err(e) => format!("save failed: {e}"),
+                        }
+                    }
+                    Err(e) => format!("capture failed: {e}"),
+                }
+            }
+            "load_session" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
+                let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
+                match path.and_then(|p| crate::session::Session::load(&p)) {
+                    Ok(s) => match self.apply_session(&s) {
+                        Ok(_) => format!("loaded session '{}' — knobs + plugin state restored", name),
+                        Err(e) => format!("apply failed: {e}"),
+                    },
+                    Err(e) => format!("load failed: {e}"),
+                }
+            }
+            "list_sessions" => {
+                let dir = Self::sessions_dir();
+                let mut names: Vec<String> = std::fs::read_dir(&dir)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter_map(|e| {
+                                let p = e.path();
+                                if p.extension().map(|x| x == "ksalat").unwrap_or(false) {
+                                    p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                if names.is_empty() {
+                    "no saved sessions yet".into()
+                } else {
+                    format!("sessions: {}", names.join(", "))
                 }
             }
             _ => format!("unknown tool: {name}"),
@@ -2436,6 +2566,40 @@ impl eframe::App for DemoApp {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+
+/// End-to-end session self-test: capture → save → reset → load → restore.
+/// Exercises the real capture_session/apply_session paths (no GUI/audio needed).
+pub fn run_session_test() -> anyhow::Result<()> {
+    let mut app = DemoApp::new_with_sink(None);
+    app.units[1].knobs[1].value = 0.42; // rig A level
+    app.units[3].knobs[0].value = 0.77; // master volume
+    app.units[5].knobs[1].value = 0.31; // rig B delay mix
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = std::path::PathBuf::from(home).join(".cache").join("ksalat-session-selftest");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let session = app.capture_session("selftest")?;
+    let pkg = crate::session::Session::package_path(&dir, "selftest")?;
+    session.save(&pkg)?;
+    let edges = session.graph.edges.len();
+
+    // Wipe the knobs, then restore from disk.
+    app.units[1].knobs[1].value = 0.0;
+    app.units[3].knobs[0].value = 0.0;
+    app.units[5].knobs[1].value = 0.0;
+    let loaded = crate::session::Session::load(&pkg)?;
+    app.apply_session(&loaded)?;
+
+    anyhow::ensure!((app.units[1].knobs[1].value - 0.42).abs() < 1e-6, "rig A level not restored");
+    anyhow::ensure!((app.units[3].knobs[0].value - 0.77).abs() < 1e-6, "master volume not restored");
+    anyhow::ensure!((app.units[5].knobs[1].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
+    anyhow::ensure!(loaded.graph.edges.len() == edges, "edge count changed across round-trip");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("session-test: OK — capture→save→load→restore verified ({edges} edges, 3 knobs restored)");
+    Ok(())
+}
 
 pub fn run_demo() -> anyhow::Result<()> {
     run_inner(None, false)

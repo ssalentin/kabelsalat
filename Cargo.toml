@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
-clack-extensions = { version = "0.2.0", features = ["all-extensions"] }
+clack-extensions = { version = "0.2.0", features = ["all-extensions", "clack-host"] }
 clack-host = "0.2.0"
 cpal = "0.18.2"
 eframe = "0.37.0"

@@ -1,61 +1,44 @@
 //! Graph-driven multi-voice audio engine: the control-plane graph IS the mix.
 //!
-//! Each Clap node owns a voice; each Delay node owns a delay line. `render`
-//! walks the graph edges: every voice renders, feeds the delays it is wired
-//! to, and everything wired to the master is summed. Notes fan out to every
-//! instrument that has a Keys→instrument MIDI cable. Unplug a cable and that
-//! path goes silent — what you patch is what you hear.
+//! Each Clap node owns a voice; each Dsp node owns a real built-in processor
+//! (see `dsp.rs`). `render` walks the graph edges: every voice renders, feeds
+//! the DSP nodes it is wired to, and everything wired to the master is summed.
+//! Notes fan out to every instrument that has a Keys→instrument MIDI cable.
+//! Unplug a cable and that path goes silent — what you patch is what you hear.
 //!
 //! RT discipline: commands are fixed-size, graph storage is reserved, buffers
-//! are preallocated, edge lookups are linear scans — no allocation in render.
-//! Voices are created at startup (plugin loading is main-thread work); dynamic
-//! AddNode(Clap) with off-thread loading is the follow-up.
+//! are preallocated, edge lookups are linear scans, and every processor is
+//! proven allocation-free — no allocation in render. Voices/processors are
+//! created at startup (loading is main-thread work); dynamic AddNode with
+//! off-thread loading is the follow-up.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind};
+use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 
-// Param ids (per node).
+// Engine-level param ids (what the UI/assistant send). Translated to each
+// processor's native param ids in `dsp_native_param`.
 pub const P_LEVEL: ParamId = 0; // instrument output level
 pub const P_TIME: ParamId = 1;  // delay time
-pub const P_MIX: ParamId = 2;   // delay mix
+pub const P_MIX: ParamId = 2;   // delay / effect mix
 pub const P_VOL: ParamId = 3;   // master volume
 pub const P_WARM: ParamId = 4;  // master saturation
 
-/// Preallocated stereo delay line. `process` is allocation-free.
-pub struct DelayLine {
-    buf: Vec<f32>,
-    frames: usize,
-    write: usize,
-}
-
-impl DelayLine {
-    pub fn new(sample_rate: f64, max_secs: f64) -> Self {
-        let frames = (sample_rate * max_secs) as usize;
-        Self { buf: vec![0.0; frames * 2], frames, write: 0 }
-    }
-
-    /// out = dry*(1-mix) + delayed*mix. Feeding silence rings the tail out.
-    pub fn process(&mut self, data: &mut [f32], time: f32, mix: f32) {
-        let delay_frames =
-            ((time.clamp(0.0, 1.0) as f64) * (self.frames as f64 - 2.0)) as usize;
-        let mix = mix.clamp(0.0, 1.0);
-        let n = data.len() / 2;
-        for i in 0..n {
-            let w = self.write;
-            let r = (w + self.frames - delay_frames) % self.frames;
-            let l_in = data[2 * i];
-            let r_in = data[2 * i + 1];
-            let l_d = self.buf[2 * r];
-            let r_d = self.buf[2 * r + 1];
-            self.buf[2 * w] = l_in;
-            self.buf[2 * w + 1] = r_in;
-            data[2 * i] = l_in * (1.0 - mix) + l_d * mix;
-            data[2 * i + 1] = r_in * (1.0 - mix) + r_d * mix;
-            self.write = (w + 1) % self.frames;
-        }
+/// Translate an engine param id to a processor's native param id for a kind.
+/// Returns None if the knob doesn't apply to this kind.
+fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
+    match kind {
+        // dsp::Delay native params: 0=time, 1=feedback, 2=mix, 4=damping.
+        DspKind::Delay => match p {
+            P_TIME => Some(0),
+            P_MIX => Some(2),
+            _ => None,
+        },
+        // Other kinds get their knob maps when the mixer UI exposes them.
+        _ => None,
     }
 }
 
@@ -66,11 +49,10 @@ struct VoiceSlot {
     scratch: Vec<f32>,
 }
 
-struct DelaySlot {
+struct DspSlot {
     node: NodeId,
-    delay: DelayLine,
-    time: f32,
-    mix: f32,
+    kind: DspKind,
+    proc: Box<dyn Processor>,
     buf: Vec<f32>,
 }
 
@@ -78,7 +60,7 @@ pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
     voices: Vec<VoiceSlot>,
-    delays: Vec<DelaySlot>,
+    dsp: Vec<DspSlot>,
     keys_node: Option<NodeId>,
     master_vol: f32,
     master_warm: f32,
@@ -87,7 +69,7 @@ pub struct GraphEngine {
 
 impl GraphEngine {
     /// `voices` pairs each Clap node id with a loaded voice (created on the
-    /// main thread). Delay lines are built for every Dsp(Delay) node.
+    /// main thread). A processor is built for every Dsp node in the graph.
     pub fn new(
         graph: Graph,
         drain: CommandDrain,
@@ -99,23 +81,24 @@ impl GraphEngine {
             .into_iter()
             .map(|(node, voice)| VoiceSlot { node, voice, level: 0.85, scratch: vec![0.0; 8192 * 2] })
             .collect();
-        let delays = graph
+        let dsp = graph
             .nodes
             .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Delay)))
-            .map(|n| DelaySlot {
-                node: n.id,
-                delay: DelayLine::new(sample_rate, 2.0),
-                time: 0.4,
-                mix: 0.5,
-                buf: vec![0.0; 8192 * 2],
+            .filter_map(|n| match &n.kind {
+                NodeKind::Dsp(kind) => Some(DspSlot {
+                    node: n.id,
+                    kind: kind.clone(),
+                    proc: build_processor(kind, sample_rate),
+                    buf: vec![0.0; 8192 * 2],
+                }),
+                _ => None,
             })
             .collect();
         Self {
             graph,
             drain,
             voices,
-            delays,
+            dsp,
             keys_node,
             master_vol: 0.8,
             master_warm: 0.15,
@@ -153,19 +136,15 @@ impl GraphEngine {
                             s.level = v;
                         }
                     }
-                    P_TIME => {
-                        if let Some(s) = self.delays.iter_mut().find(|s| s.node == node) {
-                            s.time = v;
-                        }
-                    }
-                    P_MIX => {
-                        if let Some(s) = self.delays.iter_mut().find(|s| s.node == node) {
-                            s.mix = v;
-                        }
-                    }
                     P_VOL => self.master_vol = v,
                     P_WARM => self.master_warm = v,
-                    _ => {}
+                    _ => {
+                        if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+                            if let Some(native) = dsp_native_param(&s.kind, param) {
+                                s.proc.set_param(native, v);
+                            }
+                        }
+                    }
                 }
             }
             Command::NoteOn { note, velocity } => {
@@ -214,8 +193,8 @@ impl GraphEngine {
             }
         }
 
-        // 2. Each delay sums the instruments wired into it, then processes.
-        for d in &mut self.delays {
+        // 2. Each DSP node sums the instruments wired into it, then processes.
+        for d in &mut self.dsp {
             for x in d.buf[..n2].iter_mut() {
                 *x = 0.0;
             }
@@ -226,7 +205,7 @@ impl GraphEngine {
                     }
                 }
             }
-            d.delay.process(&mut d.buf[..n2], d.time, d.mix);
+            d.proc.process(&mut d.buf[..n2], frames);
         }
 
         // 3. Master sums everything wired to it.
@@ -242,7 +221,7 @@ impl GraphEngine {
                         r += v.scratch[i * 2 + 1];
                     }
                 }
-                for d in &self.delays {
+                for d in &self.dsp {
                     if self.graph.has_route(d.node, master, PortKind::Audio) {
                         l += d.buf[i * 2];
                         r += d.buf[i * 2 + 1];

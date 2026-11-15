@@ -2833,8 +2833,9 @@ impl DemoApp {
                     no_wrap(ui, egui::RichText::new(sentence_case(&u.name)).font(theme::medium_font(13.0)).color(theme::INK));
                     // Single-graph mode: all nodes share rig 0 — don't label
                     // every column "rig A" (user report 2026-11-15).
-                    let rig_txt = if self.rig_count() > 1 { format!("rig {} · ", (b'A' + u.rig.min(25)) as char) } else { String::new() };
-                    no_wrap(ui, egui::RichText::new(format!("{rig_txt}midi {}", if gate { "in ✓" } else { "unplugged" }))
+                    // Same rig naming as the RIGS strip, same "MIDI" casing as everywhere.
+                    let rig_txt = if self.rig_count() > 1 { format!("{} · ", self.rig_name(u.rig as usize)) } else { String::new() };
+                    no_wrap(ui, egui::RichText::new(format!("{rig_txt}MIDI {}", if gate { "in ✓" } else { "unplugged" }))
                         .size(10.0).color(if gate { theme::LIVE_TEAL } else { theme::INK_2 }));
                 });
             }
@@ -5110,10 +5111,9 @@ impl DemoApp {
                 ui.add_space(14.0);
                 let h = ui.available_height();
                 // Strip height: name + sub + fader + value + bus controls.
-                let fader_h = (h - 150.0).clamp(90.0, 480.0);
-                let master_w = 120.0;
+                let fader_h = (h - 210.0).clamp(90.0, 480.0);
                 ui.horizontal_top(|ui| {
-                    let scroll_w = (ui.available_width() - master_w - 24.0).max(200.0);
+                    let scroll_w = ui.available_width().max(200.0);
                     ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -5146,19 +5146,24 @@ impl DemoApp {
                                             let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
                                             let mut m = self.rig_mix[rig.min(7)];
                                             let mut v = Some(m.vol);
-                                            let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
-                                            self.mixer_fader_rects.push(fr);
-                                            let mut changed = v != Some(m.vol);
-                                            m.vol = v.unwrap_or(m.vol);
-                                            // Pan + mute/solo under the bus strip.
-                                            ui.vertical(|ui| {
-                                                ui.add_space(fader_h * 0.5);
-                                                ui.label(egui::RichText::new("pan").size(10.0).color(theme::INK_2));
-                                                let mut p = m.pan;
-                                                let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2)));
-                                                if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
-                                                ui.add_space(6.0);
+                                            // One column: fader, then PAN and M/S directly under it.
+                                            let mut changed = false;
+                                            ui.allocate_ui_with_layout(egui::vec2(92.0, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
+                                                self.mixer_fader_rects.push(fr);
+                                                changed = v != Some(m.vol);
+                                                m.vol = v.unwrap_or(m.vol);
+                                                ui.add_space(4.0);
                                                 ui.horizontal(|ui| {
+                                                    ui.add_space(8.0);
+                                                    theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
+                                                    let mut p = m.pan;
+                                                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2)));
+                                                    if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
+                                                });
+                                                ui.add_space(4.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.add_space(18.0);
                                                     ui.spacing_mut().item_spacing.x = 4.0;
                                                     let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
                                                             .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
@@ -5179,21 +5184,27 @@ impl DemoApp {
                                         });
                                     });
                                 }
+                                // Master out sits right after the last rig bus
+                                // (the sum they feed) — not pinned far away.
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
+                                ui.vertical(|ui| {
+                                    ui.set_width(96.0);
+                                    theme::section_label(ui, "Master out");
+                                    ui.add_space(4.0);
+                                    let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
+                                    ui.add_space(8.0);
+                                    let (mr, _) = ui.allocate_exact_size(egui::vec2(14.0, fader_h), egui::Sense::hover());
+                                    paint_meter(ui.painter(), mr, self.meter, self.meter_peak);
+                                    ui.add_space(6.0);
+                                    // Meter-only strip: say so with a live peak readout.
+                                    let db = if self.meter_peak < 0.001 { "−∞ dB".to_string() } else { format!("{:.0} dB", 20.0 * self.meter_peak.log10()) };
+                                    ui.label(egui::RichText::new(db).size(11.0).monospace().color(theme::CREAM_MID))
+                                        .on_hover_text("output peak (meter only — set levels on the rig buses and sources)");
+                                });
                             });
                         });
-                    });
-                    // Master out: the physical output, every rig bus summed.
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(24.0, h - 8.0), egui::Sense::hover());
-                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
-                    ui.vertical(|ui| {
-                        ui.set_width(master_w - 24.0);
-                        theme::section_label(ui, "Master out");
-                        ui.add_space(8.0);
-                        let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
-                        ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
-                        ui.add_space(8.0);
-                        let (mr, _) = ui.allocate_exact_size(egui::vec2(14.0, fader_h), egui::Sense::hover());
-                        paint_meter(ui.painter(), mr, self.meter, self.meter_peak);
                     });
                 });
             });
@@ -5557,7 +5568,7 @@ impl DemoApp {
     /// Stepped cream→tomato→red (§4.8) with a slow-release peak-hold tick.
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
-        let lit = (self.meter * n as f32).ceil() as usize;
+        let lit = lit_segments(self.meter, n);
         let pitch = ((r.height() - 130.0) / n as f32).clamp(8.0, 17.0);
         let x = r.left() + 34.0;
         let bottom = r.bottom() - 62.0;
@@ -6113,11 +6124,19 @@ fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>
     fader_rect
 }
 
+/// Lit segments of an n-segment meter. Below the -60 dBFS floor (0.001)
+/// nothing lights: the smoothed meter decays toward zero without reaching
+/// it, and `ceil` of a 1e-9 tail kept one segment lit forever in silence.
+fn lit_segments(level: f32, n: usize) -> usize {
+    if level < 0.001 { return 0; }
+    ((level.min(1.0) * n as f32).ceil() as usize).min(n)
+}
+
 /// Vertical stepped meter (Hurricane: flat segments, cream → tomato → clip).
 fn paint_meter(p: &egui::Painter, r: Rect, level: f32, peak: f32) {
     let segs = ((r.height() / 6.0) as usize).max(4);
     let seg_h = r.height() / segs as f32;
-    let lit = (level.clamp(0.0, 1.0) * segs as f32).round() as usize;
+    let lit = lit_segments(level, segs);
     let peak_i = (peak.clamp(0.0, 1.0) * segs as f32).round() as usize;
     for i in 0..segs {
         let y = r.bottom() - (i + 1) as f32 * seg_h;
@@ -6253,7 +6272,14 @@ impl DemoApp {
         self.delete_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
-        ctx.request_repaint();
+        // Full frame rate while focused (the cables are the show); ~30 fps in
+        // the background — meters and cables still move, at a third of the
+        // UI thread's CPU when the user works in another window.
+        if ctx.input(|i| i.focused) {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
     }
 
 }
@@ -6478,16 +6504,18 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
     let mut config: cpal::StreamConfig = cfg.into();
-    // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
-    // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
+    // 256 frames @48k = 5.3 ms. Holds under full CPU load (all cores busy:
+    // 0 xruns, worst render 1.0 ms) because the render thread is promoted to
+    // realtime below; at normal priority even 512 frames underran.
     config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms) voices={VOICE_POOL}",
+        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={VOICE_POOL}",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
         ch,
-        512.0 / sample_rate * 1000.0
+        crate::bridge::BUFFER_FRAMES,
+        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0
     );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(
@@ -6520,10 +6548,29 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     // File player (backing tracks): decode thread + ring; UI holds the control.
     let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
     engine.set_player_sink(player_sink);
+    let mut rt_tried = false;
+    let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
+            // One-time realtime promotion via rtkit (first callback only; the
+            // D-Bus round trip happens once, never in the steady state).
+            // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
+            // render thread ran at normal priority and was preempted by the
+            // UI for up to 26 ms (> the 10.7 ms buffer) → xruns.
+            if !rt_tried {
+                rt_tried = true;
+                if std::env::var_os("KABELSALAT_NO_RT").is_none() {
+                    let frames = (data.len() / ch.max(1)) as u32;
+                    match audio_thread_priority::promote_current_thread_to_real_time(frames, sample_rate as u32) {
+                        Ok(h) => { _rt_handle = Some(h); eprintln!("audio: render thread promoted to realtime (rtkit)"); }
+                        Err(e) => eprintln!("audio: realtime promotion unavailable ({e}); running at normal priority"),
+                    }
+                }
+            }
+            let t0 = std::time::Instant::now();
             engine.render(data, ch);
+            crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), sample_rate);
         },
         |e| {
             crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7508,6 +7555,16 @@ mod rig_switch_tests {
             assert!(texts.iter().any(|t| t == want), "rig inputs label {want:?} in {texts:?}");
         }
         assert!(!texts.iter().any(|t| t == "Rig C"), "no slot letters posing as rigs");
+    }
+
+    #[test]
+    fn silent_meters_light_nothing() {
+        assert_eq!(lit_segments(0.0, 14), 0);
+        assert_eq!(lit_segments(1e-9, 14), 0, "a decaying tail is silence");
+        assert_eq!(lit_segments(0.0009, 14), 0);
+        assert_eq!(lit_segments(0.01, 14), 1, "real signal lights the first segment");
+        assert_eq!(lit_segments(0.5, 14), 7);
+        assert_eq!(lit_segments(3.0, 14), 14, "clipped input stays in range");
     }
 
     #[test]

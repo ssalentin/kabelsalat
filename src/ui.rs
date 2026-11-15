@@ -1449,6 +1449,19 @@ impl DemoApp {
                     None => format!("rig {node} listens to any hardware device"),
                 }
             }
+            "list_plugins" => {
+                let clap = crate::host::list_clap_plugins();
+                let lv2 = crate::lv2::discover();
+                let mut s = format!("CLAP plugins ({}):\n", clap.len());
+                for p in clap.iter().take(20) {
+                    s.push_str(&format!("  {} [{}] {}\n", p.name, p.id, p.features.join(",")));
+                }
+                s.push_str(&format!("LV2 plugins ({}):\n", lv2.len()));
+                for p in lv2.iter().take(30) {
+                    s.push_str(&format!("  {} — {}\n", p.name, p.uri));
+                }
+                s
+            }
             _ => format!("unknown tool: {name}"),
         }
     }

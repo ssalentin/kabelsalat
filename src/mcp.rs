@@ -602,6 +602,23 @@ impl McpServer {
         ok_json(json!({"node": args.node, "device": args.device}))
     }
 
+    /// List installed CLAP and LV2 plugins.
+    #[tool(name = "list_plugins", description = "List installed CLAP and LV2 plugins (name, id/uri, features) available to host.")]
+    fn list_plugins(&self) -> Result<CallToolResult, McpError> {
+        let clap = crate::host::list_clap_plugins();
+        let lv2 = crate::lv2::discover();
+        let clap_json: Vec<_> = clap
+            .iter()
+            .map(|p| json!({"id": p.id, "name": p.name, "vendor": p.vendor, "features": p.features}))
+            .collect();
+        let lv2_json: Vec<_> = lv2
+            .iter()
+            .take(60)
+            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports}))
+            .collect();
+        ok_json(json!({"clap": clap_json, "lv2_count": lv2.len(), "lv2": lv2_json}))
+    }
+
     /// Press a key.
     #[tool(name = "note_on", description = "Send a note-on (Command::NoteOn) to every instrument wired from the keys node that accepts the source. note 0..=127, velocity 0..1 (default 0.8), source default 'keys'.")]
     fn note_on(&self, Parameters(args): Parameters<NoteOnArgs>) -> Result<CallToolResult, McpError> {

@@ -816,6 +816,46 @@ fn discover_surge() -> Result<(PluginEntry, CString)> {
     chosen.ok_or_else(|| anyhow!("Surge XT (instrument) not found in {}", dir.display()))
 }
 
+/// Metadata for an installed CLAP plugin (for the plugin browser).
+#[derive(Debug, Clone)]
+pub struct ClapPluginInfo {
+    pub id: String,
+    pub name: String,
+    pub vendor: String,
+    pub features: Vec<String>,
+}
+
+/// Enumerate all CLAP plugins in ~/.clap (id, name, vendor, features).
+pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
+    let mut out = Vec::new();
+    let Ok(home) = std::env::var("HOME") else { return out };
+    let dir = PathBuf::from(home).join(".clap");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "clap").unwrap_or(false))
+        .collect();
+    paths.sort();
+    for path in paths {
+        // SAFETY: loading a CLAP bundle runs its init code; only ~/.clap bundles.
+        let entry = match unsafe { PluginEntry::load(&path) } {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let Some(factory) = entry.get_plugin_factory() else { continue };
+        for d in factory.plugin_descriptors() {
+            out.push(ClapPluginInfo {
+                id: d.id().unwrap_or(c"?").to_string_lossy().into_owned(),
+                name: d.name().unwrap_or(c"?").to_string_lossy().into_owned(),
+                vendor: d.vendor().unwrap_or(c"?").to_string_lossy().into_owned(),
+                features: d.features().map(|f| f.to_string_lossy().into_owned()).collect(),
+            });
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Params / ports inspection
 // ---------------------------------------------------------------------------

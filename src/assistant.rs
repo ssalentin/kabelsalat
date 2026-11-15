@@ -211,6 +211,11 @@ fn tools() -> Value {
             "name":"set_rig_device",
             "description":"Select which hardware MIDI device feeds a rig (AUM: a different keyboard per rig). node 1=Surge A, 4=Surge B. device is a device index (see get_status / hw list); omit device (null) for any device.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"device":{"type":"integer"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_plugins",
+            "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
+            "parameters":{"type":"object","properties":{}}
         }}
     ])
 }

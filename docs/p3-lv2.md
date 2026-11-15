@@ -1,6 +1,7 @@
 # LV2 hosting — P3
 
-Status: **discovery landed** (commit `7aaff11`); audio hosting is the next step.
+Status: **discovery + audio hosting landed** (commits `7aaff11`, `db53b84`);
+engine/UI integration is the next step.
 
 ## What works
 
@@ -20,19 +21,33 @@ lilv node ownership differs by function: `lilv_plugin_get_uri` returns a
 **owned** node that MUST be freed. Freeing the shared URI node segfaults.
 `node_borrowed` vs `node_owned` handle this correctly.
 
-## Next: audio hosting
+## Audio hosting — LANDED (commit db53b84)
 
-Build on the discovery path to actually run LV2 plugins:
-1. `lilv_plugin_instantiate(plugin, sample_rate, features)` — needs a features
-   array; audio-only plugins need none, atom/MIDI plugins need a URID map
-   (`LV2_URID__map`) implemented host-side.
-2. Enumerate ports (`lilv_plugin_get_port_by_index`, class audio/control/atom),
-   connect buffers (`lilv_instance_connect_port`).
-3. `lilv_instance_activate` → `lilv_instance_run(handle, n_frames)` per block →
-   `lilv_instance_deactivate`.
-4. Integrate as a control-plane node kind (`NodeKind::Lv2 { uri }`) alongside
-   CLAP, with the same RT discipline (instantiate off-thread, run in the engine).
-5. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
+`kabelsalat lv2-host-test` instantiates a real plugin and runs it on audio,
+end to end. **Verified: hosted an LSP plugin, ran 256 frames, output peak
+0.5000 for a 0.5 input (unity) — the audio path works.**
+
+Key implementation points:
+- `lilv_instance_activate/run/deactivate/connect_port` are **inline wrappers**
+  in lilv.h, NOT exported symbols. We call the **LV2 descriptor function
+  pointers** directly via the exposed `LilvInstance { lv2_descriptor,
+  lv2_handle }` struct (`Lv2Descriptor` mirrors lv2/core/lv2.h; activate/
+  deactivate may be NULL).
+- Most plugins require the **URID-map feature**. We implement a host-side
+  `UridMap` (HashMap URI→u32) with an `extern "C"` map callback, passed as a
+  NULL-terminated `LV2_Feature` array to `lilv_plugin_instantiate`. (Carla
+  plugins also want the `options` feature; LSP plugins work with urid-map alone.)
+- Ports are classified via `lilv_port_is_a` against lv2core AudioPort/
+  ControlPort/InputPort nodes; audio ports get buffers, control inputs are set
+  to their `lilv_port_get_range` default.
+
+## Next: engine + UI integration
+
+1. Add `NodeKind::Lv2 { uri }` to the control plane; an LV2 voice slot in the
+   engine mirroring the CLAP `ClapVoice` (instantiate off-thread, run in render).
+2. Provide the `options` feature too (sample rate etc.) so Carla plugins load.
+3. MIDI/atom ports via the URID map + an event buffer (for LV2 instruments).
+4. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
 
 The CLAP hosting (`host.rs`) is the template for the engine integration; LV2
 mirrors it with lilv instead of clack.

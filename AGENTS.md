@@ -143,6 +143,13 @@ Learned so far (2026-11-15, UI polish pass):
     frame only animates it (`fire_keys_with(.., send=false)`). Throttling
     repaints must never add input latency. Live check:
     `KABELSALAT_MIDI_THROUGH=1` + `aseqsend -p 14:0 90 3C 64`.
+32. **No physics on unlaid geometry:** `build_rack` resets unit rects to
+    `Rect::NOTHING` (infinite); a key handler that rebuilds the rack runs
+    AFTER the frame's `layout`, so the same frame's spring step seeded NaN
+    control points and every cable of an F4/F5–F8 load was invisible on the
+    back (headless tests loaded outside a frame and missed it). Skip
+    non-finite endpoints, heal non-finite springs, and test loads through
+    the real key path (`frame(.., key(Key::F4))`).
 
 ## Ground rules
 

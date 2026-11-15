@@ -15,11 +15,16 @@ flip.
   **number keys 1–9 + arrow keys** to switch the big view (visual only), big view = the
   active rig's rack. Held keys must remember rig+pitch so switching doesn't orphan
   note-offs (see docs/vibez-notes.md).
-- **Signal visual redesign** — spec in docs/design-language.md (dark layered glass,
-  cyan/blue audio, amber MIDI, violet selection, green active, red clip; theme.rs +
-  restyle). Do before/with the multi-rig UI so it isn't styled twice.
-
 ## Recently landed
+
+- **Signal visual redesign** (docs/design-language.md): `src/theme.rs` palette +
+  glass_panel/glow_rect/aurora_bg/value_arc/gradient helpers; rack front/back, toolbar,
+  keyboard, meters, knobs (live drag value chip), cables (3-layer glow, violet
+  selection), help scrim, all egui panels/windows restyled; Noto Sans + JetBrains Mono
+  with bold unit names; glowing-green transport play; meter gradient + peak hold.
+  Verified: 107 tests + self-tests + pixel-analysis of front/back/transport/help
+  screenshots (docs/shots/). Remaining motion polish: staged fade-in on template
+  load, ~120ms hover easing on custom-painted controls.
 
 - **Native egui plugin param editor — NO X11** (double-click a unit; 775 Surge params
   grouped into modules, searchable, RT-safe sliders). X11 embedding removed entirely.

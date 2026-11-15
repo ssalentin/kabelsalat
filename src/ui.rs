@@ -496,6 +496,10 @@ struct DemoApp {
     hw_queue: Arc<Mutex<VecDeque<NoteEvent>>>,
     _hw_conns: Vec<midir::MidiInputConnection<()>>,
     hw_status: String,
+    /// Connected hardware MIDI device names, indexed by device id.
+    hw_devices: Vec<String>,
+    /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
+    rig_device: [Option<u32>; 2],
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -631,6 +635,8 @@ impl DemoApp {
             hw_queue: Arc::new(Mutex::new(VecDeque::new())),
             _hw_conns: Vec::new(),
             hw_status: String::new(),
+            hw_devices: Vec::new(),
+            rig_device: [None, None],
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             _audio_stream: None,
@@ -649,6 +655,8 @@ impl DemoApp {
         // on the UI thread through fire_keys, so sound and cable animation stay
         // in sync.
         let mut hw_names = Vec::new();
+        let mut hw_devices: Vec<String> = Vec::new();
+        let mut dev_idx = 0u32;
         if let Ok(probe) = MidiInput::new("kabelsalat-probe") {
             for port in probe.ports() {
                 let name = probe.port_name(&port).unwrap_or_default();
@@ -661,6 +669,7 @@ impl DemoApp {
                 }
                 if let Ok(mi) = MidiInput::new("kabelsalat-hw") {
                     let q = app.hw_queue.clone();
+                    let dev = dev_idx;
                     if let Ok(conn) = mi.connect(
                         &port,
                         "kabelsalat-hw",
@@ -670,7 +679,7 @@ impl DemoApp {
                                 if st == 0x90 || st == 0x80 {
                                     let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
                                     if let Ok(mut q) = q.lock() {
-                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(0) });
+                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev) });
                                         while q.len() > 256 {
                                             q.pop_front();
                                         }
@@ -681,11 +690,14 @@ impl DemoApp {
                         (),
                     ) {
                         app._hw_conns.push(conn);
-                        hw_names.push(name);
+                        hw_names.push(name.clone());
+                        hw_devices.push(name);
+                        dev_idx += 1;
                     }
                 }
             }
         }
+        app.hw_devices = hw_devices;
         app.hw_status = if hw_names.is_empty() {
             "no hardware MIDI — laptop keys live".into()
         } else {
@@ -1188,6 +1200,19 @@ impl DemoApp {
                 }
                 format!("file player gain {gain:.2}")
             }
+            "set_rig_device" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let device = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32);
+                let rig = if node == 1 { 0 } else { 1 };
+                self.rig_device[rig] = device;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+                }
+                match device {
+                    Some(d) => format!("rig {node} now listens only to hardware device {d}"),
+                    None => format!("rig {node} listens to any hardware device"),
+                }
+            }
             _ => format!("unknown tool: {name}"),
         }
     }
@@ -1356,6 +1381,28 @@ impl DemoApp {
                                     _ => s.2 = !s.2,
                                 }
                                 self.send_rig_source(node);
+                            }
+                        }
+                        // Per-rig hardware device selector (AUM: a keyboard per rig).
+                        if !self.hw_devices.is_empty() {
+                            let cur = self.rig_device[rig];
+                            let label = match cur {
+                                None => "HW: All".to_string(),
+                                Some(d) => format!("HW: {}", self.hw_devices.get(d as usize).map(|s| s.as_str()).unwrap_or("?")),
+                            };
+                            let dbtn = egui::Button::new(egui::RichText::new(label).small().color(SUBTEXT))
+                                .fill(Color32::from_rgb(0x26, 0x28, 0x38))
+                                .corner_radius(4.0);
+                            if ui.add(dbtn).on_hover_text("cycle which hardware device feeds this rig").clicked() {
+                                let n = self.hw_devices.len() as u32;
+                                let next = match cur {
+                                    None => Some(0),
+                                    Some(d) => if d + 1 >= n { None } else { Some(d + 1) },
+                                };
+                                self.rig_device[rig] = next;
+                                if let Some(bus) = &self.bus {
+                                    let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: next });
+                                }
                             }
                         }
                         // Embedded Surge editor toggle (task-15): opens the

@@ -22,6 +22,9 @@ use crate::matrix::{Matrix, MidiMsg, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
 
+/// Max hardware MIDI device ids pre-routed in the matrix (per-rig filter selects).
+pub const MAX_HW_DEVICES: u32 = 16;
+
 // Engine-level param ids (what the UI/assistant send). Translated to each
 // processor's native param ids in `dsp_native_param`.
 pub const P_LEVEL: ParamId = 0; // instrument output level
@@ -54,6 +57,9 @@ struct VoiceSlot {
     src_keys: bool,
     src_laptop: bool,
     src_hw: bool,
+    // Which hardware device feeds this rig: None = any, Some(id) = only that
+    // device (per-device routing, AUM's "different keyboard per rig").
+    rig_device: Option<u32>,
 }
 
 /// Does this rig accept notes from the given source? (The MIDI cable gate is
@@ -62,9 +68,14 @@ fn source_accepted(s: &VoiceSlot, source: SourceId) -> bool {
     match source {
         SourceId::Keys => s.src_keys,
         SourceId::LaptopKeys => s.src_laptop,
-        SourceId::Hardware(_) => s.src_hw,
+        SourceId::Hardware(id) => s.src_hw && hw_device_allowed(s.rig_device, id),
         _ => true,
     }
+}
+
+/// Per-rig hardware device filter: None accepts any device, Some(d) only d.
+fn hw_device_allowed(rig_device: Option<u32>, id: u32) -> bool {
+    rig_device.is_none() || rig_device == Some(id)
 }
 
 struct DspSlot {
@@ -117,6 +128,7 @@ impl GraphEngine {
                 src_keys: true,
                 src_laptop: true,
                 src_hw: true,
+                rig_device: None,
             })
             .collect();
         let dsp = graph
@@ -139,7 +151,11 @@ impl GraphEngine {
         for v in &voices {
             matrix.connect(SourceId::Keys, v.node);
             matrix.connect(SourceId::LaptopKeys, v.node);
-            matrix.connect(SourceId::Hardware(0), v.node);
+            // Cover hardware device ids 0..MAX so any connected device routes;
+            // the per-rig `rig_device` filter then selects which one is heard.
+            for dev in 0..MAX_HW_DEVICES {
+                matrix.connect(SourceId::Hardware(dev), v.node);
+            }
         }
         Self {
             graph,
@@ -251,6 +267,11 @@ impl GraphEngine {
                     s.src_keys = keys;
                     s.src_laptop = laptop;
                     s.src_hw = hardware;
+                }
+            }
+            Command::SetRigDevice { node, device } => {
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                    s.rig_device = device;
                 }
             }
             Command::SetSplit { point } => {
@@ -429,5 +450,32 @@ mod tests {
         // Laptop keys split identically.
         assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 48, 100)), vec![1]);
         assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 72, 100)), vec![4]);
+    }
+
+    #[test]
+    fn device_filter_selects_one_keyboard() {
+        use super::hw_device_allowed;
+        assert!(hw_device_allowed(None, 0)); // any device
+        assert!(hw_device_allowed(None, 7));
+        assert!(hw_device_allowed(Some(2), 2)); // only device 2
+        assert!(!hw_device_allowed(Some(2), 0));
+        assert!(!hw_device_allowed(Some(2), 3));
+    }
+
+    #[test]
+    fn matrix_routes_each_hardware_device() {
+        // Mirror the engine's default matrix: Keys/Laptop + Hardware(0..MAX).
+        let mut m = Matrix::new();
+        for node in [1u32, 4u32] {
+            m.connect(SourceId::Keys, node);
+            m.connect(SourceId::LaptopKeys, node);
+            for dev in 0..super::MAX_HW_DEVICES {
+                m.connect(SourceId::Hardware(dev), node);
+            }
+        }
+        // Every device id routes to both rigs (the per-rig filter then selects).
+        assert_eq!(dests(&m, SourceId::Hardware(0), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
+        assert_eq!(dests(&m, SourceId::Hardware(3), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
+        assert_eq!(dests(&m, SourceId::Hardware(15), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
     }
 }

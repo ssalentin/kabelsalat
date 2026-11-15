@@ -174,6 +174,15 @@ struct SetPlayerArgs {
     gain: f32,
 }
 
+/// Arguments for `set_rig_device`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetRigDeviceArgs {
+    /// Instrument node id (1 = Surge A, 4 = Surge B).
+    node: NodeId,
+    /// Hardware device index, or null for any device.
+    device: Option<u32>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -578,6 +587,19 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"gain": gain}))
+    }
+
+    /// Select which hardware device feeds a rig.
+    #[tool(name = "set_rig_device", description = "Select which hardware MIDI device feeds a rig (Command::SetRigDevice) — AUM's 'different keyboard per rig'. node 1=Surge A, 4=Surge B. device is a device index; omit (null) for any device.")]
+    fn set_rig_device(&self, Parameters(args): Parameters<SetRigDeviceArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("node {} does not exist", args.node));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetRigDevice { node: args.node, device: args.device }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "device": args.device}))
     }
 
     /// Press a key.

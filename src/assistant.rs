@@ -206,6 +206,11 @@ fn tools() -> Value {
             "name":"set_player",
             "description":"Set the file-player mix gain (0..1, 0 mutes) without changing what's playing.",
             "parameters":{"type":"object","properties":{"gain":{"type":"number"}},"required":["gain"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_rig_device",
+            "description":"Select which hardware MIDI device feeds a rig (AUM: a different keyboard per rig). node 1=Surge A, 4=Surge B. device is a device index (see get_status / hw list); omit device (null) for any device.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"device":{"type":"integer"}},"required":["node"]}
         }}
     ])
 }

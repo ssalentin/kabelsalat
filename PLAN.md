@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign + multi-rig backend landed; multi-rig UI is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) multi-rig UI, (2) hot-wire MIDI matrix view, (3) design polish (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
+Status: **core app complete + Hurricane redesign + multi-rig (backend & UI) landed; hot-wire MIDI matrix is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). 112 unit tests + many CLI self-tests pass. Next: (1) hot-wire MIDI matrix view, (2) design polish, (3) MCP→UI live sync (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (112). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -83,15 +83,29 @@ Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `play
   DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000). Verify with ImageMagick histograms/token counts.
   Dribbble is bot-walled: fetch shot pages via `https://r.jina.ai/<url>`, images from
   `cdn.dribbble.com/userupload/...` (strip resize params for full res).
+- **XTEST keysym gotchas:** F4 = 0xffc1 (NOT 0xffc3 = F6 — cost an hour once). winit
+  maps F-keys by evdev scancode, not the X keymap; `scripts/xtest_key.py` therefore
+  uses standard scancode keycodes for F-keys/arrows and resolves everything else via
+  XGetKeyboardMapping incl. the modifier level.
 
 **Next builds (in order):**
-1. **Multi-rig UI** — backend is DONE (`LoadRigs`, `rig_snapshot`, `get_rigs`). Build an always-visible
-   overview strip (rig name + MIDI device + active highlight + level), number keys 1–9 + arrow keys to
-   switch the big view (visual only; all rigs sound), big view = active rig's rack. **Held keys must
-   remember their rig+pitch** so switching doesn't orphan note-offs (vibez lesson, docs/vibez-notes.md).
-   Style it with the Hurricane theme (`src/theme.rs`) from the start.
-2. **Hot-wire MIDI matrix view** — AUM-style MIDI-in vs sink patching surface (§13).
-3. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
+1. **Hot-wire MIDI matrix view** — AUM-style MIDI-in vs sink patching surface (§13).
+2. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
+3. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
+   rack only rebuilds from UI-side loads; add a bridge notification/poll so remote
+   loads refresh the rack (found during multi-rig UI work).
+
+**Multi-rig UI — LANDED 2026-11-15.** Overview strip (rig name + bound MIDI device +
+live level + tomato active underline) appears above the rack when >1 rig is loaded;
+**1–9 / ←→ / click** switch the big view (VISUAL ONLY — all rigs keep sounding; the
+engine matrix routes by source, never by UI selection). `Unit.rig` tags from
+`merge_rigs`; `compute_groups`/layout/draw/hit-test filter to the active rig; hidden
+units keep `Rect::NOTHING`; cables of all rigs stay live. Held laptop keys drain on
+focus loss (vibez lesson). **F4 / Sessions / assistant `load_template multi_rig`** load
+a two-rig demo (LoadRigs). `set_active_rig` keeps `rig_snapshot.active` in sync for
+`get_rigs`. Verified: 112 tests (5 new multi-rig UI tests) + multi-rig engine
+self-tests + live key-driven switching (frame-diff + exact restore). Screenshots:
+docs/shots/multirig-{a,b}.png.
 
 **Hurricane redesign — LANDED 2026-11-15** (agent team: design-analyst → implementer → lead).
 History: the earlier "Signal" dark-glass pass was built from a spec written WITHOUT seeing the
@@ -463,17 +477,12 @@ Everything queued lives here; update this section as work lands.
 
 ### In progress / next
 
-1. **Multi-rig UI** (the big one). Backend is **DONE**: Rig model + merge + `LoadRigs`
-   + per-rig device binding + rig snapshot exposed to UI/MCP (`get_rigs`/`load_rigs`).
-   Each rig is a full rack bound to its own MIDI input (organ / keyboard / EWI / synth
-   controllers); all rigs sound simultaneously, mixed to master. **Remaining: the UI** —
-   an always-visible overview strip (rig name + device + active highlight + level),
-   **number keys 1–9 + arrow keys** to switch the big view (visual only), big view = the
-   active rig's rack. Held keys must remember rig+pitch so switching doesn't orphan
-   note-offs (docs/vibez-notes.md). Style with the Hurricane theme from the start.
-2. **Hot-wire MIDI channels on the go** — an AUM-style **MIDI-in vs sink matrix view**
+1. **Hot-wire MIDI channels on the go** — an AUM-style **MIDI-in vs sink matrix view**
    to patch any MIDI input (device + channel) to any accepting rig live. Prereq: the
-   multi-rig overview. This is the defining AUM routing surface (docs/midi-matrix.md).
+   multi-rig overview (DONE). This is the defining AUM routing surface (docs/midi-matrix.md).
+2. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` commands drive the engine but the
+   UI rack only rebuilds from UI-side loads; add a bridge notification or snapshot poll
+   so remote loads refresh the rack + overview.
 3. **Hurricane design polish** — DeepSeek-vision review (2026-11-15) verdict "close in
    spirit"; remaining gaps, prioritized:
    - Shadows: reference is rigorously shadowless — drop the soft shadows under the rack
@@ -488,6 +497,19 @@ Everything queued lives here; update this section as work lands.
    - NOTE: the teal/blue/red semantic expansion is deliberate (audio≠MIDI≠clip for live
      use, brief §3) — do NOT collapse it to monochrome to match the reference literally.
    - Motion: staged fade-in on template load; ~120ms hover easing on painted controls.
+
+### Recently landed
+
+- **Multi-rig UI** (2026-11-15): overview strip (name/device/level/active underline),
+  1–9/←→/click view switching (visual only, all rigs sound), per-rig grouping +
+  draw/hit filtering, held-key drain on focus loss, F4 two-rig demo (LoadRigs),
+  assistant `multi_rig` template, `rig_snapshot.active` sync. 112 tests.
+- **Hurricane visual redesign** (2026-11-15): see §0.1 + docs/design-reference-analysis.md.
+- **Native egui plugin param editor — NO X11** (double-click a unit; 775 Surge params
+  grouped into modules, searchable, RT-safe sliders).
+- **Multi-rig backend** (Rig/merge/LoadRigs/per-rig device binding/rig snapshot).
+- **Metronome as a normal rack node** · **Ctrl+drag rack rearrange** · **MIDI latency
+  reporting** · **Master MONO input** · LV2 instrument hosting + plugin browser.
 
 ### Backlog (after the above)
 

@@ -30,10 +30,13 @@ use eframe::egui::{
 use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
-use crate::control::{Command, CommandBus, Graph, PortKind as CPortKind, PortRef};
+use crate::control::{
+    name_str, Command, CommandBus, DspKind, Graph, Node, NodeKind, PortKind as CPortKind, PortRef,
+};
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 use crate::host::{ClapVoice, ClapVoiceMain, EditorRect, EditorStatus, EmbeddedEditor};
 use crate::matrix::SourceId;
+use crate::session::Template;
 
 // ---------------------------------------------------------------------------
 // Palette (assets/logo.svg + Omarchy/Tokyo-night accents)
@@ -54,23 +57,9 @@ const RING: Color32 = Color32::from_rgb(0x4a, 0x4e, 0x69);
 const PLUG: Color32 = Color32::from_rgb(0x41, 0x44, 0x59);
 const TEXT: Color32 = Color32::from_rgb(0xec, 0xee, 0xf6);
 const SUBTEXT: Color32 = Color32::from_rgb(0x8f, 0x95, 0xad);
-
-/// (node, engine param, unit index, knob index) — the knob↔param mapping used
-/// by per-frame publishing, session capture, and session restore.
-const PARAM_MAP: [(u32, u32, usize, usize); 8] = [
-    (1, P_LEVEL, 1, 1),
-    (2, P_TIME, 2, 0),
-    (2, P_MIX, 2, 1),
-    (3, P_VOL, 3, 0),
-    (3, P_WARM, 3, 1),
-    (4, P_LEVEL, 4, 1),
-    (5, P_TIME, 5, 0),
-    (5, P_MIX, 5, 1),
-];
 const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 
-const N_UNITS: usize = 6;
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
 const MAX_CABLES: usize = 64;
@@ -221,6 +210,8 @@ struct Knob {
     label: &'static str,
     value: f32,
     default: f32,
+    /// Engine param id this knob publishes (None = visual-only knob).
+    param: Option<u32>,
     label_g: Option<Arc<Galley>>,
 }
 
@@ -233,13 +224,25 @@ struct Jack {
     label_g: Option<Arc<Galley>>,
 }
 
+/// What a rack unit IS — drives its face, knobs, and layout grouping.
+#[derive(Clone)]
+enum UnitKind {
+    Keys,
+    Clap,
+    Dsp(crate::control::DspKind),
+    Master,
+}
+
 struct Unit {
-    name: &'static str,
-    sub: &'static str,
+    /// Engine node id (control-plane Graph). Unit index ≠ node id in general.
+    node_id: u32,
+    node_kind: UnitKind,
+    name: String,
+    sub: String,
     accent: Color32,
     ins: [PortKind; 2],
     outs: [PortKind; 2],
-    knobs: [Knob; 2],
+    knobs: Vec<Knob>,
     jacks: Vec<Jack>,
     led: f32,
     name_g: Option<Arc<Galley>>,
@@ -257,6 +260,128 @@ impl Unit {
     }
     fn kind(&self, dir: Dir, port: usize) -> PortKind {
         if dir == Dir::In { self.ins[port] } else { self.outs[port] }
+    }
+}
+
+/// Build a knob. `param` = engine param id it publishes (None = visual-only).
+fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
+    Knob { label, value: default, default, param, label_g: None }
+}
+
+/// Value of the knob bound to `param`, or `default` if the unit has no such knob.
+fn knob_val(u: &Unit, param: u32, default: f32) -> f32 {
+    u.knobs.iter().find(|k| k.param == Some(param)).map(|k| k.value).unwrap_or(default)
+}
+
+/// Visual breathing factor for audio leaving a unit (the engine does the real
+/// audio; this only drives the cable glow). Clap → LEVEL, Delay → MIX, other
+/// DSP → its first knob, everything else → 1.
+fn unit_out_gain(u: &Unit) -> f32 {
+    match &u.node_kind {
+        UnitKind::Clap => 0.25 + knob_val(u, P_LEVEL, 0.85) * 0.75,
+        UnitKind::Dsp(DspKind::Delay) => 0.15 + knob_val(u, P_MIX, 0.5) * 0.85,
+        UnitKind::Dsp(_) => 0.15 + knob_val(u, 0, 0.5) * 0.85,
+        _ => 1.0,
+    }
+}
+
+/// Pulse-speed factor for cables leaving a unit (Delay TIME slows/quickens).
+fn unit_time_mul(u: &Unit) -> f32 {
+    match &u.node_kind {
+        UnitKind::Dsp(DspKind::Delay) => 0.55 + knob_val(u, P_TIME, 0.4) * 1.3,
+        _ => 1.0,
+    }
+}
+
+/// Accent color for a built-in DSP kind (generic faces).
+fn dsp_accent(kind: &DspKind) -> Color32 {
+    match kind {
+        DspKind::Delay => PURPLE,
+        DspKind::Reverb => Color32::from_rgb(0x7d, 0xcf, 0xff), // sky
+        DspKind::Gain => GREEN,
+        DspKind::Filter => PURPLE,
+        DspKind::Eq3 => BLUE,
+        DspKind::Limiter => ORANGE,
+        DspKind::Saturation => Color32::from_rgb(0xf7, 0x76, 0x8e), // red
+        DspKind::Pan => YELLOW,
+    }
+}
+
+/// Build a rack unit from a control-plane node. The face (jacks + knobs) is
+/// chosen by node kind; known kinds keep their bespoke faces, other DSP kinds
+/// get a generic labeled box with 1–2 knobs bound to engine params 0/1.
+fn make_unit(node: &Node) -> Unit {
+    let name = name_str(&node.name).to_string();
+    let (node_kind, sub, accent, ins, outs, knobs, jacks): (
+        UnitKind, String, Color32, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
+    ) = match &node.kind {
+        NodeKind::Keys => (
+            UnitKind::Keys, "midi source · click the keys".into(), YELLOW,
+            vec![], vec![PortKind::Midi],
+            vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
+            vec![(Dir::Out, 0, 0.62, "MIDI OUT")],
+        ),
+        NodeKind::Clap { .. } => (
+            UnitKind::Clap, "synth · clap".into(), BLUE,
+            vec![PortKind::Midi], vec![PortKind::Audio],
+            vec![knob("TONE", 0.35, None), knob("LEVEL", 0.85, Some(P_LEVEL))],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
+        ),
+        NodeKind::MasterOut => (
+            UnitKind::Master, "stereo bus".into(), ORANGE,
+            vec![PortKind::Audio, PortKind::Audio], vec![],
+            vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
+            vec![(Dir::In, 0, 0.36, "L"), (Dir::In, 1, 0.64, "R")],
+        ),
+        NodeKind::Dsp(DspKind::Delay) => (
+            UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(), PURPLE,
+            vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
+            vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
+            vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.44, "MIDI"), (Dir::Out, 0, 0.76, "OUT")],
+        ),
+        NodeKind::Dsp(kind) => {
+            // Generic DSP face: 1–2 knobs on engine params 0/1.
+            let (knobs, sub): (Vec<Knob>, String) = match kind {
+                DspKind::Reverb => (vec![knob("MIX", 0.35, Some(0)), knob("SIZE", 0.5, Some(1))], "reverb".into()),
+                DspKind::Gain => (vec![knob("GAIN", 0.9, Some(0))], "gain".into()),
+                DspKind::Filter => (vec![knob("CUTOFF", 0.45, Some(0)), knob("RESO", 0.2, Some(1))], "filter".into()),
+                DspKind::Eq3 => (vec![knob("LOW", 0.5, Some(0)), knob("HIGH", 0.5, Some(1))], "3-band eq".into()),
+                DspKind::Limiter => (vec![knob("CEIL", 0.8, Some(0)), knob("DRIVE", 0.2, Some(1))], "limiter".into()),
+                DspKind::Saturation => (vec![knob("DRIVE", 0.4, Some(0)), knob("MIX", 0.5, Some(1))], "saturation".into()),
+                DspKind::Pan => (vec![knob("PAN", 0.5, Some(0))], "panner".into()),
+                DspKind::Delay => unreachable!(),
+            };
+            (
+                UnitKind::Dsp(kind.clone()), sub, dsp_accent(kind),
+                vec![PortKind::Audio], vec![PortKind::Audio],
+                knobs,
+                vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
+            )
+        }
+        NodeKind::SystemAudio => (
+            UnitKind::Dsp(DspKind::Gain), "system audio".into(), GREEN,
+            vec![], vec![PortKind::Audio],
+            vec![knob("GAIN", 0.5, Some(0))],
+            vec![(Dir::Out, 0, 0.62, "OUT")],
+        ),
+    };
+
+    let mut ins_arr = [PortKind::Audio; 2];
+    let mut outs_arr = [PortKind::Audio; 2];
+    for (i, k) in ins.iter().take(2).enumerate() { ins_arr[i] = *k; }
+    for (i, k) in outs.iter().take(2).enumerate() { outs_arr[i] = *k; }
+    Unit {
+        node_id: node.id,
+        node_kind,
+        name,
+        sub,
+        accent,
+        ins: ins_arr,
+        outs: outs_arr,
+        knobs,
+        jacks: jacks.iter().map(|&(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None }).collect(),
+        led: 0.0,
+        name_g: None, sub_g: None, back_g: None,
     }
 }
 
@@ -452,7 +577,15 @@ struct DemoApp {
     rack_w: f32,
     rack_h: f32,
     unit_h: f32,
-    unit_rects: [Rect; N_UNITS], // rack-local
+    unit_rects: Vec<Rect>, // rack-local, indexed by unit
+    /// Rack structure derived from the loaded graph (stable while patching).
+    keys_unit: Option<usize>,
+    master_unit: Option<usize>,
+    /// Middle columns, each a top→bottom list of unit indices (instrument+FX).
+    stack_cols: Vec<Vec<usize>>,
+    layout_rows: usize,
+    /// The loaded graph's nodes (edges are mirrored from the living cables).
+    base_graph: Graph,
     xf: Xform,
     text_alpha: f32,
 
@@ -528,57 +661,8 @@ struct DemoApp {
 
 impl DemoApp {
     fn new_with_sink(note_sink: Option<NoteSink>) -> Self {
-        let knob = |label: &'static str, default: f32| Knob {
-            label, value: default, default, label_g: None,
-        };
-
-        let mk_unit = |name: &'static str, sub: &'static str, accent: Color32,
-                       ins: &[PortKind], outs: &[PortKind],
-                       knobs: [Knob; 2],
-                       jacks: &[(Dir, usize, f32, &'static str)]| -> Unit {
-            let mut ins_arr = [PortKind::Audio; 2];
-            let mut outs_arr = [PortKind::Audio; 2];
-            ins_arr[..ins.len()].copy_from_slice(ins);
-            outs_arr[..outs.len()].copy_from_slice(outs);
-            Unit {
-                name, sub, accent,
-                ins: ins_arr,
-                outs: outs_arr,
-                knobs,
-                jacks: jacks.iter().map(|&(dir, port, xf, label)| Jack {
-                    dir, port, xf, label, label_g: None,
-                }).collect(),
-                led: 0.0,
-                name_g: None, sub_g: None, back_g: None,
-            }
-        };
-
-        use PortKind::{Audio, Midi};
-        // Node ids match the engine contract: 0=KEYS, 1=SURGE A, 2=DELAY A,
-        // 3=MASTER, 4=SURGE B, 5=DELAY B.
-        let units = vec![
-            mk_unit("KEYS", "midi source · click the keys", YELLOW, &[], &[Midi],
-                [knob("RATE", 0.5), knob("VEL", 0.8)],
-                &[(Dir::Out, 0, 0.62, "MIDI OUT")]),
-            mk_unit("SURGE A", "synth · clap", BLUE, &[Midi], &[Audio],
-                [knob("TONE", 0.35), knob("LEVEL", 0.85)],
-                &[(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")]),
-            mk_unit("DELAY A", "insert fx · midi tap", PURPLE, &[Audio, Midi], &[Audio],
-                [knob("TIME", 0.4), knob("MIX", 0.5)],
-                &[(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.44, "MIDI"), (Dir::Out, 0, 0.76, "OUT")]),
-            mk_unit("MASTER OUT", "stereo bus · both stacks", ORANGE, &[Audio, Audio], &[],
-                [knob("VOLUME", 0.8), knob("WARM", 0.15)],
-                &[(Dir::In, 0, 0.36, "L"), (Dir::In, 1, 0.64, "R")]),
-            mk_unit("SURGE B", "synth · clap", BLUE, &[Midi], &[Audio],
-                [knob("TONE", 0.35), knob("LEVEL", 0.85)],
-                &[(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")]),
-            mk_unit("DELAY B", "insert fx", PURPLE, &[Audio], &[Audio],
-                [knob("TIME", 0.4), knob("MIX", 0.5)],
-                &[(Dir::In, 0, 0.26, "IN"), (Dir::Out, 0, 0.74, "OUT")]),
-        ];
-
         let mut app = Self {
-            units,
+            units: Vec::new(),
             cables: Vec::with_capacity(MAX_CABLES),
             next_id: 1,
             audio_color_idx: 0,
@@ -607,7 +691,12 @@ impl DemoApp {
             rack_w: 640.0,
             rack_h: 560.0,
             unit_h: 120.0,
-            unit_rects: [Rect::NOTHING; N_UNITS],
+            unit_rects: Vec::new(),
+            keys_unit: None,
+            master_unit: None,
+            stack_cols: Vec::new(),
+            layout_rows: 1,
+            base_graph: Graph::demo_patch(),
             xf: Xform { center: Pos2::ZERO, lc: Vec2::ZERO, sx: 1.0, sy: 1.0 },
             text_alpha: 1.0,
             wordmark_g: None,
@@ -704,40 +793,125 @@ impl DemoApp {
             format!("MIDI in: {}", hw_names.join(", "))
         };
 
-        // Demo patch — ids mirror Graph::demo_patch exactly (the engine
-        // pre-wires these; our per-frame Connect publishes are duplicates).
-        // Stack A: 1,3,4,5 · Stack B: 6,7,8,9. Master inputs fan in.
-        app.add_cable_id(1, 0, 0, 1, 0, Midi);  // Keys → Surge A
-        app.add_cable_id(3, 1, 0, 2, 0, Audio); // Surge A → Delay A
-        app.add_cable_id(4, 2, 0, 3, 0, Audio); // Delay A → Master L
-        app.add_cable_id(5, 1, 0, 3, 1, Audio); // Surge A → Master R (dry)
-        app.add_cable_id(6, 0, 0, 4, 0, Midi);  // Keys → Surge B
-        app.add_cable_id(7, 4, 0, 5, 0, Audio); // Surge B → Delay B
-        app.add_cable_id(8, 5, 0, 3, 0, Audio); // Delay B → Master L
-        app.add_cable_id(9, 4, 0, 3, 1, Audio); // Surge B → Master R (dry)
-        app.next_id = 10; // engine's next_edge
+        // Default rack = the engine's demo patch (2 stacks). build_rack mirrors
+        // its nodes/edges into units/cables; ids match so per-frame Connect
+        // publishes are engine-side duplicates.
+        app.build_rack(&Graph::demo_patch(), &[]);
         app
+    }
+
+    /// Rebuild units + cables + rack structure from a control-plane graph, then
+    /// apply default knob values. This is the single path used by the demo,
+    /// starter templates, and saved sessions.
+    fn build_rack(&mut self, graph: &Graph, params: &[crate::session::ParamValue]) {
+        self.units.clear();
+        self.cables.clear();
+        self.base_graph = graph.clone();
+        for node in &graph.nodes {
+            self.units.push(make_unit(node));
+        }
+        // Size the rect slots before adding cables (add_cable_id reads them to
+        // seed the spring rest shape; layout() fills real rects on frame 1).
+        self.unit_rects = vec![Rect::NOTHING; self.units.len()];
+        // node id → unit index (units are built in graph.nodes order).
+        let mut max_id = 0u32;
+        for e in &graph.edges {
+            let s = self.units.iter().position(|u| u.node_id == e.from.node);
+            let d = self.units.iter().position(|u| u.node_id == e.to.node);
+            if let (Some(s), Some(d)) = (s, d) {
+                let kind = match e.kind {
+                    CPortKind::Midi => PortKind::Midi,
+                    CPortKind::Audio => PortKind::Audio,
+                };
+                self.add_cable_id(e.id, s, e.from.port as usize, d, e.to.port as usize, kind);
+                max_id = max_id.max(e.id);
+            }
+        }
+        self.next_id = max_id + 1;
+        // Apply default params to the matching knobs.
+        for p in params {
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
+                if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(p.param)) {
+                    k.value = p.value as f32;
+                    k.default = p.value as f32;
+                }
+            }
+        }
+        self.compute_groups();
+        // Reset interaction state that referenced the old rack.
+        self.selected = None;
+        self.pending = None;
+        self.drag = Drag::None;
+        self.press = None;
+        self.hover = None;
+        self.graph_sig.clear(); // force shared-graph re-mirror
+    }
+
+    /// Derive rack structure: Keys (left), Master (right), and one middle
+    /// column per instrument (Clap) followed by its downstream DSP chain.
+    fn compute_groups(&mut self) {
+        self.keys_unit = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Keys));
+        self.master_unit = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master));
+        let mut claimed = vec![false; self.units.len()];
+        if let Some(k) = self.keys_unit { claimed[k] = true; }
+        if let Some(m) = self.master_unit { claimed[m] = true; }
+        let mut cols: Vec<Vec<usize>> = Vec::new();
+        for i in 0..self.units.len() {
+            if !matches!(self.units[i].node_kind, UnitKind::Clap) { continue; }
+            let mut col = vec![i];
+            claimed[i] = true;
+            let mut cur = i;
+            // Follow the audio chain instrument → DSP → DSP …
+            loop {
+                let next = self.cables.iter().find(|c| {
+                    c.dying < 0.0 && c.kind == PortKind::Audio && c.src == cur
+                        && !claimed[c.dst]
+                        && matches!(self.units[c.dst].node_kind, UnitKind::Dsp(_))
+                }).map(|c| c.dst);
+                match next {
+                    Some(d) => { claimed[d] = true; col.push(d); cur = d; }
+                    None => break,
+                }
+            }
+            cols.push(col);
+        }
+        // Any DSP not claimed by an instrument gets its own column.
+        for i in 0..self.units.len() {
+            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_)) {
+                claimed[i] = true;
+                cols.push(vec![i]);
+            }
+        }
+        self.layout_rows = cols.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+        self.stack_cols = cols;
     }
 
     /// Galleys are laid out on the first frame: egui loads fonts only once
     /// `Context::run` has started, so the app creator cannot do this.
     fn ensure_galleys(&mut self, ctx: &egui::Context) {
-        if self.wordmark_g.is_some() { return; }
         let layout = |text: &str, font: FontId, color: Color32, wrap: f32| -> Arc<Galley> {
             ctx.fonts_mut(|f| f.layout(text.to_owned(), font, color, wrap))
         };
         let label_font = FontId::proportional(9.5);
+        // Unit galleys: (re)fill any that are missing — templates rebuild units.
         for u in &mut self.units {
-            u.name_g = Some(layout(u.name, FontId::proportional(16.0), TEXT, f32::INFINITY));
-            u.sub_g = Some(layout(u.sub, FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
-            u.back_g = Some(layout(u.name, FontId::proportional(11.0), SUBTEXT, f32::INFINITY));
+            if u.name_g.is_none() {
+                u.name_g = Some(layout(&u.name, FontId::proportional(16.0), TEXT, f32::INFINITY));
+                u.sub_g = Some(layout(&u.sub, FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
+                u.back_g = Some(layout(&u.name, FontId::proportional(11.0), SUBTEXT, f32::INFINITY));
+            }
             for k in &mut u.knobs {
-                k.label_g = Some(layout(k.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                if k.label_g.is_none() {
+                    k.label_g = Some(layout(k.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                }
             }
             for j in &mut u.jacks {
-                j.label_g = Some(layout(j.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                if j.label_g.is_none() {
+                    j.label_g = Some(layout(j.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                }
             }
         }
+        if self.wordmark_g.is_some() { return; }
         self.wordmark_g = Some(layout("kabelsalat", FontId::proportional(14.5), TEXT, f32::INFINITY));
         self.state_play_g = Some(layout("96 bpm · playing", FontId::proportional(10.5), GREEN, f32::INFINITY));
         self.state_pause_g = Some(layout("96 bpm · paused", FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
@@ -753,11 +927,12 @@ impl DemoApp {
             FontId::proportional(12.0), YELLOW, f32::INFINITY));
         self.help_title_g = Some(layout("kabelsalat — the cables are the show", FontId::proportional(17.0), TEXT, f32::INFINITY));
         self.help_body_g = Some(layout(
-            "two stacks A/B share KEYS and MASTER — play both at once\n\
+            "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
+             F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
              Tab                flip the rack · front = perform, back = patch\n\
              F2 / F3            embed the Surge A / B editor in this window\n\
              drag knobs         shape the sound · right-click resets\n\
-             click the keys     play Keys — pulses run down both stacks\n\
+             click the keys     play Keys — pulses run down the cables\n\
              laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
              drag jack to jack  patch a cable (back) · master jacks fan in\n\
              grab a cable       shake it — watch it swing and settle (back)\n\
@@ -771,33 +946,48 @@ impl DemoApp {
     // -- layout -----------------------------------------------------------
 
     fn layout(&mut self, rect: Rect) {
-        // Two channel stacks side by side, shared KEYS (left) and MASTER
-        // (right), both full height. Columns: KEYS | A | B | MASTER.
+        // Adaptive rack: KEYS (left, full height) | one column per instrument
+        // stack (instrument + its FX chain) | MASTER (right, full height).
+        let rows = self.layout_rows.max(1);
+        let n_mid = self.stack_cols.len();
         self.rack_w = (rect.width() - 60.0).clamp(560.0, 1240.0);
-        self.unit_h = ((rect.height() - 210.0) / 2.0).clamp(96.0, 190.0);
+        self.unit_h = ((rect.height() - 210.0) / rows as f32).clamp(84.0, 190.0);
         let gap = 10.0;
         let pad = 16.0;
         let rail = 14.0;
-        self.rack_h = pad * 2.0 + 2.0 * self.unit_h + gap;
+        self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
         let inner_w = self.rack_w - 2.0 * (pad + rail);
-        let usable = inner_w - 3.0 * gap;
-        let cw = [usable * 0.26, usable * 0.24, usable * 0.24, usable * 0.26];
-        let x0 = pad + rail;
-        let xs = [
-            x0,
-            x0 + cw[0] + gap,
-            x0 + cw[0] + cw[1] + 2.0 * gap,
-            x0 + cw[0] + cw[1] + cw[2] + 3.0 * gap,
-        ];
-        let tall_h = 2.0 * self.unit_h + gap;
-        let row1_y = pad + self.unit_h + gap;
+        let n_cols = n_mid + 2; // keys + stacks + master
+        let usable = inner_w - (n_cols as f32 - 1.0) * gap;
+        let side_frac = if n_mid == 0 { 0.5 } else if n_mid <= 2 { 0.26 } else { 0.20 };
+        let mid_frac = if n_mid == 0 { 0.0 } else { (1.0 - 2.0 * side_frac) / n_mid as f32 };
+        let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
+        widths.push(usable * side_frac); // keys
+        for _ in 0..n_mid { widths.push(usable * mid_frac); }
+        widths.push(usable * side_frac); // master
+        let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
+        let mut x = pad + rail;
+        for w in &widths { xs.push(x); x += w + gap; }
+        let tall_h = rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
         let mk = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
-        self.unit_rects[0] = mk(xs[0], pad, cw[0], tall_h);          // KEYS
-        self.unit_rects[1] = mk(xs[1], pad, cw[1], self.unit_h);     // SURGE A
-        self.unit_rects[2] = mk(xs[1], row1_y, cw[1], self.unit_h);  // DELAY A
-        self.unit_rects[3] = mk(xs[3], pad, cw[3], tall_h);          // MASTER
-        self.unit_rects[4] = mk(xs[2], pad, cw[2], self.unit_h);     // SURGE B
-        self.unit_rects[5] = mk(xs[2], row1_y, cw[2], self.unit_h);  // DELAY B
+        if self.unit_rects.len() != self.units.len() {
+            self.unit_rects = vec![Rect::NOTHING; self.units.len()];
+        }
+        if let Some(k) = self.keys_unit {
+            self.unit_rects[k] = mk(xs[0], pad, widths[0], tall_h);
+        }
+        if let Some(m) = self.master_unit {
+            self.unit_rects[m] = mk(xs[n_cols - 1], pad, widths[n_cols - 1], tall_h);
+        }
+        for j in 0..n_mid {
+            let cx = xs[j + 1];
+            let cw = widths[j + 1];
+            for r in 0..self.stack_cols[j].len() {
+                let u = self.stack_cols[j][r];
+                let y = pad + r as f32 * (self.unit_h + gap);
+                self.unit_rects[u] = mk(cx, y, cw, self.unit_h);
+            }
+        }
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0,
             rect.center().y - self.rack_h / 2.0 + 16.0,
@@ -995,65 +1185,111 @@ impl DemoApp {
 
     /// Snapshot the current patch + knobs + plugin state into a Session.
     fn capture_session(&mut self, name: &str) -> anyhow::Result<crate::session::Session> {
-        let mut graph = Graph::demo_patch();
+        // Nodes come from the loaded graph; edges from the living cables.
+        let mut graph = self.base_graph.clone();
         graph.edges.clear();
         for c in &self.cables {
-            if c.dying >= 0.0 {
-                continue;
-            }
+            if c.dying >= 0.0 { continue; }
             let kind = match c.kind {
                 PortKind::Midi => CPortKind::Midi,
                 PortKind::Audio => CPortKind::Audio,
             };
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
             graph.connect_with_id(
                 c.id,
-                PortRef { node: c.src as u32, port: c.src_port as u8 },
-                PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                PortRef { node: sn, port: c.src_port as u8 },
+                PortRef { node: dn, port: c.dst_port as u8 },
                 kind,
             );
         }
         let mut s = crate::session::Session::new(name, graph);
-        for &(node, param, unit, knob) in &PARAM_MAP {
-            s.set_param(node, param, self.units[unit].knobs[knob].value as f64);
-        }
-        let surge_id = "org.surge-synth-team.surge-xt";
-        if let Some(m) = self._surge_main.get_mut(0) {
-            if let Ok(blob) = m.save_state() {
-                s.set_plugin_state(1, surge_id, blob);
+        for u in &self.units {
+            for k in &u.knobs {
+                if let Some(p) = k.param {
+                    s.set_param(u.node_id, p, k.value as f64);
+                }
             }
         }
-        if let Some(m) = self._surge_main.get_mut(1) {
-            if let Ok(blob) = m.save_state() {
-                s.set_plugin_state(4, surge_id, blob);
+        let surge_id = "org.surge-synth-team.surge-xt";
+        let mut rig = 0;
+        for u in &self.units {
+            if matches!(u.node_kind, UnitKind::Clap) {
+                if let Some(m) = self._surge_main.get_mut(rig) {
+                    if let Ok(blob) = m.save_state() {
+                        s.set_plugin_state(u.node_id, surge_id, blob);
+                    }
+                }
+                rig += 1;
             }
         }
         Ok(s)
     }
 
-    /// Restore knobs + plugin state from a Session (same-topology recall).
+    /// Load a Session: rebuild the rack from its graph + params, restore plugin
+    /// state, and rewire the engine. Works for any topology (templates, saved
+    /// sessions, the demo patch).
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
-        for &(node, param, unit, knob) in &PARAM_MAP {
-            if let Some(v) = s.param(node, param) {
-                self.units[unit].knobs[knob].value = v as f32;
+        self.build_rack(&s.graph, s.params());
+        // Restore plugin state into the remapped voices (rig order).
+        let clap_nodes: Vec<u32> = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
+            .map(|u| u.node_id).collect();
+        for (rig, node) in clap_nodes.iter().enumerate() {
+            if let Some(st) = s.plugin_state(*node) {
+                if let Some(m) = self._surge_main.get_mut(rig) {
+                    let _ = m.load_state(&st.data);
+                }
             }
         }
+        // Rewire the engine, then publish every knob value.
+        self.load_graph_into_engine(&s.graph);
+        // The editor referenced the old voice mapping; close it.
+        self.close_editor();
+        self.editor_status = "editor closed (rack reloaded)".into();
+        // Reset per-rig filters / split for the new graph.
+        self.rig_sources = [(true, true, true); 2];
+        self.rig_device = [None, None];
+        self.split_on = false;
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
-            for &(node, param, unit, knob) in &PARAM_MAP {
-                let _ = b.send(Command::SetParam { node, param, value: self.units[unit].knobs[knob].value as f64 });
-            }
-        }
-        if let Some(st) = s.plugin_state(1) {
-            if let Some(m) = self._surge_main.get_mut(0) {
-                let _ = m.load_state(&st.data);
-            }
-        }
-        if let Some(st) = s.plugin_state(4) {
-            if let Some(m) = self._surge_main.get_mut(1) {
-                let _ = m.load_state(&st.data);
+            let _ = b.send(Command::SetSplit { point: None });
+            for u in &self.units {
+                for k in &u.knobs {
+                    if let Some(p) = k.param {
+                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// Send the engine a full graph replacement (voices remap, DSP rebuild).
+    fn load_graph_into_engine(&mut self, graph: &Graph) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::LoadGraph { graph: graph.clone() });
+        }
+    }
+
+    /// Load a starter template (playable pre-wired rack + default knobs).
+    fn load_template(&mut self, t: Template) {
+        let s = t.session();
+        match self.apply_session(&s) {
+            Ok(_) => self.session_msg = format!("Loaded template '{}'", t.title()),
+            Err(e) => self.session_msg = format!("Template failed: {e}"),
+        }
+    }
+
+    /// Reload the default two-stack demo patch.
+    fn load_demo_patch(&mut self) {
+        let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
+        match self.apply_session(&s) {
+            Ok(_) => self.session_msg = "Loaded demo patch".into(),
+            Err(e) => self.session_msg = format!("Demo failed: {e}"),
+        }
     }
 
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
@@ -1203,7 +1439,7 @@ impl DemoApp {
             "set_rig_device" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 let device = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32);
-                let rig = if node == 1 { 0 } else { 1 };
+                let rig = self.rig_of_node(node);
                 self.rig_device[rig] = device;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
@@ -1218,7 +1454,7 @@ impl DemoApp {
     }
 
     fn send_rig_source(&self, node: u32) {
-        let rig = if node == 1 { 0 } else { 1 };
+        let rig = self.rig_of_node(node);
         let (keys, laptop, hardware) = self.rig_sources[rig];
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keys, laptop, hardware });
@@ -1307,7 +1543,11 @@ impl DemoApp {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.add_space(12.0);
-                        let name = if rig == 0 { "SURGE A" } else { "SURGE B" };
+                        let name = self.units.iter()
+                            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
+                            .nth(rig)
+                            .map(|u| u.name.clone())
+                            .unwrap_or_else(|| if rig == 0 { "SURGE A".to_string() } else { "SURGE B".to_string() });
                         ui.label(
                             egui::RichText::new(format!("{name} — embedded editor"))
                                 .small().strong().color(BLUE),
@@ -1351,6 +1591,7 @@ impl DemoApp {
 
     /// AUM-style per-rig input selection: which sources feed each rig.
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
+        let rigs = self.clap_rigs();
         egui::Panel::top("rig_inputs")
             .default_size(36.0)
             .resizable(false)
@@ -1363,7 +1604,8 @@ impl DemoApp {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("RIG INPUTS").small().strong().color(SUBTEXT));
                     ui.add_space(10.0);
-                    for (rig, node, accent) in [(0usize, 1u32, BLUE), (1usize, 4u32, GREEN)] {
+                    for (rig, node) in rigs {
+                        let accent = if rig == 0 { BLUE } else { GREEN };
                         let label = if rig == 0 { "A" } else { "B" };
                         ui.label(egui::RichText::new(format!("RIG {label}")).small().strong().color(accent));
                         let (k, l, h) = self.rig_sources[rig];
@@ -1462,6 +1704,18 @@ impl DemoApp {
             .resizable(false)
             .default_width(320.0)
             .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Starter templates").small().strong());
+                ui.horizontal(|ui| {
+                    for t in Template::ALL {
+                        if ui.button(t.title()).on_hover_text("load a playable pre-wired rack").clicked() {
+                            self.load_template(t);
+                        }
+                    }
+                });
+                if ui.button("Demo patch (2 stacks)").clicked() {
+                    self.load_demo_patch();
+                }
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.label("Name:");
                     ui.text_edit_singleline(&mut self.session_name);
@@ -1616,14 +1870,42 @@ impl DemoApp {
             });
     }
 
+    /// Unit index of the Keys source (fallback 0 for a degenerate graph).
+    fn keys_idx(&self) -> usize {
+        self.keys_unit.unwrap_or(0)
+    }
+
+    /// Unit index of the Master bus, if present.
+    fn master_idx(&self) -> Option<usize> {
+        self.master_unit
+    }
+
+    /// The instrument rigs (Clap units) in voice order: (rig index, node id).
+    /// At most two — the engine owns two CLAP voices.
+    fn clap_rigs(&self) -> Vec<(usize, u32)> {
+        self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
+            .take(2)
+            .enumerate()
+            .map(|(rig, u)| (rig, u.node_id))
+            .collect()
+    }
+
+    /// Rig index (voice slot) for a node id; 0 if not a rig.
+    fn rig_of_node(&self, node: u32) -> usize {
+        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).unwrap_or(0)
+    }
+
     fn fire_keys(&mut self, semitone: usize, amp: f32) {
         // VEL knob scales keyboard velocity (note-offs pass through at 0).
-        let amp = amp * (0.35 + self.units[0].knobs[1].value * 0.65);
+        let ki = self.keys_idx();
+        let vel = self.units.get(ki).and_then(|u| u.knobs.get(1)).map(|k| k.value).unwrap_or(0.8);
+        let amp = amp * (0.35 + vel * 0.65);
         self.key_leds[semitone % 12] = 1.0;
-        self.units[0].led = 1.0;
+        if let Some(u) = self.units.get_mut(ki) { u.led = 1.0; }
         for ci in 0..self.cables.len() {
             let c = &mut self.cables[ci];
-            if c.src == 0 && c.kind == PortKind::Midi && c.dying < 0.0 {
+            if c.src == ki && c.kind == PortKind::Midi && c.dying < 0.0 {
                 c.spawn_pulse(0.0, amp);
             }
         }
@@ -1633,11 +1915,13 @@ impl DemoApp {
     }
 
     fn ping_unit(&mut self, idx: usize) {
-        self.units[idx].led = 1.0;
-        if idx == 0 {
+        if let Some(u) = self.units.get_mut(idx) { u.led = 1.0; }
+        let is_keys = self.units.get(idx).map(|u| matches!(u.node_kind, UnitKind::Keys)).unwrap_or(false);
+        if is_keys {
             let amps = [1.0, 0.8, 0.9, 0.7];
+            let ki = self.keys_idx();
             for ci in 0..self.cables.len() {
-                if self.cables[ci].src == 0 && self.cables[ci].kind == PortKind::Midi && self.cables[ci].dying < 0.0 {
+                if self.cables[ci].src == ki && self.cables[ci].kind == PortKind::Midi && self.cables[ci].dying < 0.0 {
                     for (k, amp) in amps.iter().enumerate() {
                         self.cables[ci].spawn_pulse(-(k as f32) * 0.07, *amp);
                     }
@@ -1744,20 +2028,6 @@ impl DemoApp {
         for u in &mut self.units { u.led *= (-dt / 0.20).exp(); }
         for k in &mut self.key_leds { *k *= (-dt / 0.22).exp(); }
 
-        // Knob → simulation mapping, per stack (A: units 1/2, B: units 4/5).
-        let surge_level = [
-            0.25 + self.units[1].knobs[1].value * 0.75,
-            0.25 + self.units[4].knobs[1].value * 0.75,
-        ];
-        let delay_time = [
-            0.55 + self.units[2].knobs[0].value * 1.3,
-            0.55 + self.units[5].knobs[0].value * 1.3,
-        ];
-        let delay_mix = [
-            0.15 + self.units[2].knobs[1].value * 0.85,
-            0.15 + self.units[5].knobs[1].value * 0.85,
-        ];
-
         let mut n_arrivals = 0usize;
         for ci in 0..self.cables.len() {
             let ea = self.endpoint(&self.cables[ci], Dir::Out);
@@ -1814,7 +2084,7 @@ impl DemoApp {
             // (fire_keys), so the rack shows exactly what is being played.
 
             // Pulses travel; arrivals excite the destination.
-            let speed_mul = match c.src { 2 => delay_time[0], 5 => delay_time[1], _ => 1.0 };
+            let speed_mul = self.units.get(c.src).map(unit_time_mul).unwrap_or(1.0);
             for p in &mut c.pulses {
                 if !p.active { continue; }
                 p.t += p.speed * speed_mul * dt;
@@ -1834,18 +2104,11 @@ impl DemoApp {
         }
 
         for &(unit, amp) in &self.arrivals[..n_arrivals] {
-            self.units[unit].led = self.units[unit].led.max(amp);
+            let gain = self.units.get(unit).map(unit_out_gain).unwrap_or(1.0);
+            if let Some(u) = self.units.get_mut(unit) { u.led = u.led.max(amp); }
             for c in &mut self.cables {
                 if c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0 {
-                    let mut a = amp * 0.95;
-                    match unit {
-                        1 => a *= surge_level[0],
-                        4 => a *= surge_level[1],
-                        2 => a *= delay_mix[0],
-                        5 => a *= delay_mix[1],
-                        _ => {}
-                    }
-                    c.env = c.env.max(a);
+                    c.env = c.env.max(amp * 0.95 * gain);
                 }
             }
         }
@@ -1918,7 +2181,10 @@ impl DemoApp {
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
-        if unit == 0 || unit == 3 {
+        let tall = self.units.get(unit)
+            .map(|u| matches!(u.node_kind, UnitKind::Keys | UnitKind::Master))
+            .unwrap_or(false);
+        if tall {
             // Tall shared units: knobs along the bottom.
             let fx = if idx == 0 { 0.32 } else { 0.68 };
             Vec2::new(r.left() + r.width() * fx, r.bottom() - 40.0)
@@ -1937,14 +2203,15 @@ impl DemoApp {
     }
 
     fn key_w(&self) -> f32 {
-        let r = self.unit_rects[0];
+        let Some(k) = self.keys_unit else { return 0.0 };
+        let r = self.unit_rects[k];
         let avail = r.width() - 40.0;
         if avail < 96.0 { return 0.0; } // too narrow: hide the keyboard
         (avail / 8.0).clamp(12.0, 30.0)
     }
 
     fn key_rect(&self, white_idx: usize) -> Rect {
-        let r = self.unit_rects[0];
+        let r = self.unit_rects[self.keys_idx()];
         let kw = self.key_w();
         let x0 = r.center().x - kw * 4.0;
         Rect::from_min_size(
@@ -1965,14 +2232,13 @@ impl DemoApp {
         match self.side {
             Side::Front => {
                 for (ui, u) in self.units.iter().enumerate() {
-                    for ki in 0..2 {
+                    for ki in 0..u.knobs.len() {
                         if (l - self.knob_center(ui, ki)).length() < 23.0 {
                             return Hit::Knob { unit: ui, idx: ki };
                         }
                     }
-                    let _ = u;
                 }
-                // Keys keyboard (unit 0).
+                // Keys keyboard.
                 for wi in 0..8 {
                     if self.key_rect(wi).contains(lp) { return Hit::Key(WHITE_SEMI[wi]); }
                 }
@@ -2018,6 +2284,8 @@ impl DemoApp {
         let mut toggle_play = false;
         let mut flip = false;
         let mut reset_knobs = false;
+        let mut load_tpl: Option<Template> = None;
+        let mut load_demo = false;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
@@ -2026,6 +2294,11 @@ impl DemoApp {
             // Embedded Surge editors: F2 = rig A, F3 = rig B (task-15).
             if i.consume_key(Modifiers::NONE, Key::F2) { self.editor_toggle = Some(0); }
             if i.consume_key(Modifiers::NONE, Key::F3) { self.editor_toggle = Some(1); }
+            // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
+            if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
+            if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
+            if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
+            if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
             }
@@ -2045,6 +2318,8 @@ impl DemoApp {
         });
         if toggle_play { self.toggle_play(); }
         if flip { self.start_flip(); }
+        if let Some(t) = load_tpl { self.load_template(t); }
+        if load_demo { self.load_demo_patch(); }
         if reset_knobs {
             for u in &mut self.units {
                 for k in &mut u.knobs { k.value = k.default; }
@@ -2292,7 +2567,7 @@ impl DemoApp {
             painter.rect_filled(xf.rect(rail), 6.0, RAIL);
         }
         // Screws at the row boundaries.
-        for i in 0..=2 {
+        for i in 0..=self.layout_rows {
             let y = 16.0 + i as f32 * (self.unit_h + 10.0) - 5.0;
             for x in [15.0, self.rack_w - 15.0] {
                 let c = xf.p(Vec2::new(x, y));
@@ -2341,18 +2616,33 @@ impl DemoApp {
             if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(u.accent, 0.30 * u.led), Stroke::NONE); }
             self.ell(painter, led, 3.2, alpha(u.accent, 0.25 + 0.75 * u.led), Stroke::NONE);
 
-            match ui {
-                0 => self.draw_keyboard(painter),
-                1 | 4 => self.draw_surge_display(painter, ui),
-                2 | 5 => self.draw_delay_display(painter, ui),
-                3 => self.draw_meter(painter, r),
-                _ => {}
+            match &u.node_kind {
+                UnitKind::Keys => self.draw_keyboard(painter),
+                UnitKind::Clap => self.draw_surge_display(painter, ui),
+                UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
+                UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
+                UnitKind::Master => self.draw_meter(painter, r),
             }
 
-            for ki in 0..2 {
+            for ki in 0..u.knobs.len() {
                 self.draw_knob(painter, ui, ki);
             }
         }
+    }
+
+    /// Generic DSP face: a small activity bar that breathes with the unit's LED.
+    fn draw_dsp_display(&self, painter: &egui::Painter, unit: usize) {
+        let r = self.unit_rects[unit];
+        let u = &self.units[unit];
+        let (start, width) = self.display_area(unit);
+        if width < 40.0 { return; }
+        let level = u.led.clamp(0.0, 1.0);
+        let bar_w = width * 0.8;
+        let y = r.center().y + 16.0;
+        let track = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w, 8.0));
+        painter.rect_filled(self.xf.rect(track), 4.0, Color32::from_rgb(0x26, 0x28, 0x38));
+        let fill = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w * (0.15 + 0.85 * level), 8.0));
+        painter.rect_filled(self.xf.rect(fill), 4.0, alpha(u.accent, 0.5 + 0.5 * level));
     }
 
     fn draw_keyboard(&self, painter: &egui::Painter) {
@@ -2539,20 +2829,29 @@ impl DemoApp {
     fn cable_color(&self, c: &Cable) -> Color32 {
         let mut col = c.color;
         if c.kind == PortKind::Audio {
-            if c.src == 1 || c.src == 4 { col = mix(col, ORANGE, self.units[c.src].knobs[0].value * 0.45); }
-            col = mix(col, ORANGE, self.units[3].knobs[1].value * 0.30);
+            // Clap sources warm their cable with the TONE knob.
+            if let Some(su) = self.units.get(c.src) {
+                if matches!(su.node_kind, UnitKind::Clap) {
+                    let tone = su.knobs.first().map(|k| k.value).unwrap_or(0.35);
+                    col = mix(col, ORANGE, tone * 0.45);
+                }
+            }
+            let warm = self.master_idx().map(|m| knob_val(&self.units[m], P_WARM, 0.15)).unwrap_or(0.15);
+            col = mix(col, ORANGE, warm * 0.30);
         }
         col
     }
 
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
+        let volume = self.master_idx()
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.8) * 0.85)
+            .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             let a = Self::cable_alpha(c, has_sel, hl[ci]);
             if a <= 0.01 { continue; }
             let hovered = matches!(self.hover, Some(Hit::Cable(i, _)) if i == ci);
             let grabbed = matches!(self.drag, Drag::Cable { ci: i, .. } if i == ci);
-            let volume = 0.15 + self.units[3].knobs[0].value * 0.85;
             let level = if c.kind == PortKind::Audio {
                 ((c.level + 0.05 + 0.035 * (self.ui_time * 1.4 + c.phase).sin()) * volume).clamp(0.0, 1.0)
             } else { 0.0 };
@@ -2932,36 +3231,38 @@ impl eframe::App for DemoApp {
 
         // Publish the patch through the control plane: cables become Connect
         // commands (duplicates rejected by the model), knobs become SetParam.
+        // Node ids come from the units (unit index ≠ node id in general).
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
             for c in &self.cables {
-                if c.dying >= 0.0 {
-                    continue;
-                }
+                if c.dying >= 0.0 { continue; }
+                let (Some(sn), Some(dn)) = (
+                    self.units.get(c.src).map(|u| u.node_id),
+                    self.units.get(c.dst).map(|u| u.node_id),
+                ) else { continue };
                 let kind = match c.kind {
                     PortKind::Midi => CPortKind::Midi,
                     PortKind::Audio => CPortKind::Audio,
                 };
                 let _ = b.send(Command::Connect {
                     id: c.id,
-                    from: PortRef { node: c.src as u32, port: c.src_port as u8 },
-                    to: PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                    from: PortRef { node: sn, port: c.src_port as u8 },
+                    to: PortRef { node: dn, port: c.dst_port as u8 },
                     kind,
                 });
             }
-            let _ = b.send(Command::SetParam { node: 1, param: P_LEVEL, value: self.units[1].knobs[1].value as f64 });
-            let _ = b.send(Command::SetParam { node: 2, param: P_TIME, value: self.units[2].knobs[0].value as f64 });
-            let _ = b.send(Command::SetParam { node: 2, param: P_MIX, value: self.units[2].knobs[1].value as f64 });
-            let _ = b.send(Command::SetParam { node: 3, param: P_VOL, value: self.units[3].knobs[0].value as f64 });
-            let _ = b.send(Command::SetParam { node: 3, param: P_WARM, value: self.units[3].knobs[1].value as f64 });
-            let _ = b.send(Command::SetParam { node: 4, param: P_LEVEL, value: self.units[4].knobs[1].value as f64 });
-            let _ = b.send(Command::SetParam { node: 5, param: P_TIME, value: self.units[5].knobs[0].value as f64 });
-            let _ = b.send(Command::SetParam { node: 5, param: P_MIX, value: self.units[5].knobs[1].value as f64 });
+            for u in &self.units {
+                for k in &u.knobs {
+                    if let Some(p) = k.param {
+                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+                    }
+                }
+            }
         }
 
         // Mirror the live patch into the shared graph for bridge queries
-        // (task-16). Same model as capture_session: demo nodes, living cables
-        // as edges. Rebuild only when the cable set changes — cheap per frame.
+        // (task-16): loaded-graph nodes + living cables as edges. Rebuild only
+        // when the cable set changes — cheap per frame.
         let sig: Vec<(u32, u32, u8, u32, u8, CPortKind)> = self
             .cables
             .iter()
@@ -2971,24 +3272,28 @@ impl eframe::App for DemoApp {
                     PortKind::Midi => CPortKind::Midi,
                     PortKind::Audio => CPortKind::Audio,
                 };
-                (c.id, c.src as u32, c.src_port as u8, c.dst as u32, c.dst_port as u8, kind)
+                let sn = self.units.get(c.src).map(|u| u.node_id).unwrap_or(c.src as u32);
+                let dn = self.units.get(c.dst).map(|u| u.node_id).unwrap_or(c.dst as u32);
+                (c.id, sn, c.src_port as u8, dn, c.dst_port as u8, kind)
             })
             .collect();
         if sig != self.graph_sig {
-            let mut g = Graph::demo_patch();
+            let mut g = self.base_graph.clone();
             g.edges.clear();
             for c in &self.cables {
-                if c.dying >= 0.0 {
-                    continue;
-                }
+                if c.dying >= 0.0 { continue; }
+                let (Some(sn), Some(dn)) = (
+                    self.units.get(c.src).map(|u| u.node_id),
+                    self.units.get(c.dst).map(|u| u.node_id),
+                ) else { continue };
                 let kind = match c.kind {
                     PortKind::Midi => CPortKind::Midi,
                     PortKind::Audio => CPortKind::Audio,
                 };
                 g.connect_with_id(
                     c.id,
-                    PortRef { node: c.src as u32, port: c.src_port as u8 },
-                    PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                    PortRef { node: sn, port: c.src_port as u8 },
+                    PortRef { node: dn, port: c.dst_port as u8 },
                     kind,
                 );
             }
@@ -3050,8 +3355,38 @@ pub fn run_session_test() -> anyhow::Result<()> {
     anyhow::ensure!((app.units[5].knobs[1].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
     anyhow::ensure!(loaded.graph.edges.len() == edges, "edge count changed across round-trip");
 
+    // --- Starter templates: each must rebuild a correct, playable rack ---
+    // (units, cables, Keys/Master present, default params applied, layout grouped)
+    let expect = [
+        (Template::LeadReverb, 4usize, 4usize, 1usize, 2usize),
+        (Template::DrumsBass, 6, 6, 2, 2),
+        (Template::AmbientPad, 5, 5, 1, 3),
+    ];
+    for (t, n_units, n_cables, n_cols, n_rows) in expect {
+        let s = t.session();
+        app.apply_session(&s)?;
+        anyhow::ensure!(app.units.len() == n_units, "{}: unit count {} != {}", t.title(), app.units.len(), n_units);
+        anyhow::ensure!(app.cables.len() == n_cables, "{}: cable count {} != {}", t.title(), app.cables.len(), n_cables);
+        anyhow::ensure!(app.keys_unit.is_some(), "{}: missing Keys", t.title());
+        anyhow::ensure!(app.master_unit.is_some(), "{}: missing Master", t.title());
+        anyhow::ensure!(app.stack_cols.len() == n_cols, "{}: stack columns {} != {}", t.title(), app.stack_cols.len(), n_cols);
+        anyhow::ensure!(app.layout_rows == n_rows, "{}: rows {} != {}", t.title(), app.layout_rows, n_rows);
+        for p in s.params() {
+            let u = app.units.iter().find(|u| u.node_id == p.node)
+                .ok_or_else(|| anyhow::anyhow!("{}: param node {} missing", t.title(), p.node))?;
+            let k = u.knobs.iter().find(|k| k.param == Some(p.param))
+                .ok_or_else(|| anyhow::anyhow!("{}: knob for param {} missing", t.title(), p.param))?;
+            anyhow::ensure!((k.value as f64 - p.value).abs() < 1e-6, "{}: default param not applied", t.title());
+        }
+        println!("  template '{}': {} units, {} cables, {} stack col(s), {} row(s) — OK",
+            t.title(), app.units.len(), app.cables.len(), app.stack_cols.len(), app.layout_rows);
+    }
+    // Demo patch must still load after the templates.
+    app.load_demo_patch();
+    anyhow::ensure!(app.units.len() == 6 && app.cables.len() == 8, "demo patch not restored after templates");
+
     let _ = std::fs::remove_dir_all(&dir);
-    println!("session-test: OK — capture→save→load→restore verified ({edges} edges, 3 knobs restored)");
+    println!("session-test: OK — capture→save→load→restore ({edges} edges, 3 knobs) + 3 templates + demo restore");
     Ok(())
 }
 

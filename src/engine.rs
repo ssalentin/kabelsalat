@@ -105,6 +105,15 @@ fn hw_device_allowed(rig_device: Option<u32>, id: u32) -> bool {
     rig_device.is_none() || rig_device == Some(id)
 }
 
+/// Per-rig metadata retained from the last `Command::LoadRigs` — the rig
+/// list frontends (UI/bridge) can query. Empty after a plain `LoadGraph`.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // public query API for the UI (task-22 integration)
+pub struct RigMeta {
+    pub name: String,
+    pub midi_device: Option<u32>,
+}
+
 struct DspSlot {
     node: NodeId,
     kind: DspKind,
@@ -158,6 +167,9 @@ pub struct GraphEngine {
     // mirror "every source plays every rig"; SetSplit edits key ranges in place.
     matrix: Matrix,
     route_out: Vec<(NodeId, MidiMsg)>,
+    // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
+    rig_meta: Vec<RigMeta>,
+    active_rig: usize,
     // System-audio capture (e.g. YouTube) mixed into the master.
     system_capture: Option<SystemCapture>,
     system_gain: f32,
@@ -246,6 +258,8 @@ impl GraphEngine {
             out_peak: Arc::new(AtomicU32::new(0)),
             matrix,
             route_out: Vec::with_capacity(64),
+            rig_meta: Vec::new(),
+            active_rig: 0,
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
@@ -269,6 +283,18 @@ impl GraphEngine {
         &self.graph
     }
 
+    /// Rig list from the last `LoadRigs` (empty for single-graph loads).
+    #[allow(dead_code)] // public query API for the UI (task-22 integration)
+    pub fn rig_meta(&self) -> &[RigMeta] {
+        &self.rig_meta
+    }
+
+    /// The UI-selected rig index from the last `LoadRigs` (0 otherwise).
+    #[allow(dead_code)] // public query API for the UI (task-22 integration)
+    pub fn active_rig(&self) -> usize {
+        self.active_rig
+    }
+
     pub fn level_handle(&self) -> Arc<AtomicU32> {
         self.out_peak.clone()
     }
@@ -276,6 +302,22 @@ impl GraphEngine {
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
+    }
+
+    /// MIDI-cable gate: a note reaches `dest` if ANY Keys node has a MIDI
+    /// cable to it. Each rig carries its own Keys node after LoadRigs; a
+    /// single-graph patch has exactly one, so behavior is unchanged there.
+    fn keys_gate(&self, dest: NodeId) -> bool {
+        if let Some(k) = self.keys_node {
+            if self.graph.has_route(k, dest, PortKind::Midi) {
+                return true;
+            }
+        }
+        self.graph.nodes.iter().any(|n| {
+            matches!(n.kind, NodeKind::Keys)
+                && Some(n.id) != self.keys_node
+                && self.graph.has_route(n.id, dest, PortKind::Midi)
+        })
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -409,14 +451,68 @@ impl GraphEngine {
                     .iter()
                     .find(|n| matches!(n.kind, NodeKind::Keys))
                     .map(|n| n.id);
+                self.rig_meta.clear();
+                self.active_rig = 0;
+            }
+            Command::LoadRigs { rigs, active } => {
+                // Rare structural op: merge the rig graphs into one patch and
+                // reuse the LoadGraph rebuild (DSP, LV2, CLAP voice remap in
+                // node-id order, matrix, keys_node), then bind each rig's
+                // instruments to its MIDI device. Allocates — off the hot path.
+                let merged = crate::control::merge_rigs(&rigs);
+                self.apply(Command::LoadGraph { graph: merged });
+                for (i, rig) in rigs.iter().enumerate() {
+                    let tag = i.min(u8::MAX as usize) as u8;
+                    if let Some(dev) = rig.midi_device {
+                        // Some(dev): ONLY that hardware device feeds this rig.
+                        // Drop the rig's default rules, then wire exactly one
+                        // Hardware(dev) rule per instrument (Clap + LV2 inst) —
+                        // works for device ids beyond the pre-routed range too.
+                        // None rigs keep the full default routing from LoadGraph.
+                        self.matrix.rules.retain(|r| {
+                            !self.graph.node(r.dest).map(|n| n.rig == tag).unwrap_or(false)
+                        });
+                        let mut insts: Vec<NodeId> = self
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|n| n.rig == tag && matches!(n.kind, NodeKind::Clap { .. }))
+                            .map(|n| n.id)
+                            .collect();
+                        for s in &self.lv2 {
+                            if s.plugin.is_instrument()
+                                && self.graph.node(s.node).map(|n| n.rig == tag).unwrap_or(false)
+                            {
+                                insts.push(s.node);
+                            }
+                        }
+                        for id in insts {
+                            self.matrix.connect(SourceId::Hardware(dev), id);
+                        }
+                    }
+                    // Keep the voice-level source filter consistent with the
+                    // matrix (a second gate on top of the cable + matrix).
+                    for s in self.voices.iter_mut() {
+                        if self.graph.node(s.node).map(|n| n.rig == tag).unwrap_or(false) {
+                            s.src_keys = rig.midi_device.is_none();
+                            s.src_laptop = rig.midi_device.is_none();
+                            s.src_hw = true;
+                            s.rig_device = rig.midi_device;
+                        }
+                    }
+                }
+                self.rig_meta = rigs
+                    .iter()
+                    .map(|r| RigMeta { name: r.name.clone(), midi_device: r.midi_device })
+                    .collect();
+                self.active_rig = active.min(rigs.len().saturating_sub(1));
             }
             Command::NoteOn { note, velocity, source } => {
                 let msg = MidiMsg::note_on(0, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                 self.matrix.route_into(source, msg, &mut self.route_out);
-                let keys = self.keys_node;
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let gate = keys.map(|k| self.graph.has_route(k, dest, PortKind::Midi)).unwrap_or(false);
+                    let gate = self.keys_gate(dest);
                     if !gate {
                         continue;
                     }
@@ -435,10 +531,9 @@ impl GraphEngine {
             Command::NoteOff { note, source } => {
                 let msg = MidiMsg::note_off(0, note, 0);
                 self.matrix.route_into(source, msg, &mut self.route_out);
-                let keys = self.keys_node;
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let gate = keys.map(|k| self.graph.has_route(k, dest, PortKind::Midi)).unwrap_or(false);
+                    let gate = self.keys_gate(dest);
                     if !gate {
                         continue;
                     }
@@ -754,6 +849,107 @@ mod tests {
         assert_eq!(dests(&m, SourceId::Hardware(15), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
     }
 
+    // --- Multi-rig load (task-22) -------------------------------------------
+    // CLAP voices are main-thread-only, so these run the REAL engine without
+    // audio (empty voice pool): merge, rebuild, and per-rig device routing.
+    // The with-audio proof is the `multi-rig-load-test` CLI mode below.
+
+    use crate::control::{command_bus, name_bytes, Command, NodeKind, PortKind, PortRef, Rig};
+
+    /// One rig: Keys(0) → Clap(1) → Master(2), cables 1 (MIDI) and 2 (audio).
+    fn rig_graph() -> crate::control::Graph {
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SURGE"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        assert!(g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi));
+        assert!(g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio));
+        g
+    }
+
+    /// Send LoadRigs through the bus and drain it at a block boundary.
+    fn load_two_rigs(
+        dev_a: Option<u32>,
+        dev_b: Option<u32>,
+    ) -> (super::GraphEngine, crate::control::CommandBus) {
+        let (mut bus, drain) = command_bus();
+        let mut engine =
+            super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadRigs {
+            rigs: vec![Rig::new("A", rig_graph(), dev_a), Rig::new("B", rig_graph(), dev_b)],
+            active: 1,
+        });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        (engine, bus)
+    }
+
+    #[test]
+    fn load_rigs_merges_masters_and_routes_per_device() {
+        let (engine, _bus) = load_two_rigs(Some(2), None);
+        let g = engine.graph();
+        // Both masters present, one per rig, tagged with the rig index.
+        let masters: Vec<u32> = g.nodes.iter()
+            .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
+        assert_eq!(masters, vec![2, 5]);
+        assert_eq!(g.node(2).unwrap().rig, 0);
+        assert_eq!(g.node(5).unwrap().rig, 1);
+        // Per-rig device routing: rig A = only Hardware(2); rig B = everything.
+        let on = MidiMsg::note_on(0, 60, 100);
+        // Device 2 plays rig A (bound) AND rig B (None accepts every device).
+        let mut d = dests(&engine.matrix, SourceId::Hardware(2), on);
+        d.sort_unstable();
+        assert_eq!(d, vec![1, 4]);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(3), on), vec![4]);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(0), on), vec![4]);
+        assert_eq!(dests(&engine.matrix, SourceId::Keys, on), vec![4]);
+        assert_eq!(dests(&engine.matrix, SourceId::LaptopKeys, on), vec![4]);
+        // Each rig's OWN Keys node gates its synth (multi-rig cable gate).
+        assert!(engine.keys_gate(1));
+        assert!(engine.keys_gate(4));
+        assert_eq!(engine.keys_node, Some(0));
+        // Rig list + active index are queryable.
+        assert_eq!(engine.rig_meta().len(), 2);
+        assert_eq!(engine.rig_meta()[0].name, "A");
+        assert_eq!(engine.rig_meta()[0].midi_device, Some(2));
+        assert_eq!(engine.rig_meta()[1].name, "B");
+        assert_eq!(engine.rig_meta()[1].midi_device, None);
+        assert_eq!(engine.active_rig(), 1);
+    }
+
+    #[test]
+    fn load_rigs_both_bound_devices_are_isolated() {
+        let (engine, _bus) = load_two_rigs(Some(2), Some(7));
+        let on = MidiMsg::note_on(0, 60, 100);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(2), on), vec![1]);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(7), on), vec![4]);
+        assert!(dests(&engine.matrix, SourceId::Hardware(3), on).is_empty());
+        assert!(dests(&engine.matrix, SourceId::Keys, on).is_empty());
+        assert!(dests(&engine.matrix, SourceId::LaptopKeys, on).is_empty());
+    }
+
+    #[test]
+    fn load_rigs_device_beyond_prerouted_range() {
+        // Device ids >= MAX_HW_DEVICES are wired explicitly, not pre-routed.
+        let (engine, _bus) = load_two_rigs(Some(20), None);
+        let on = MidiMsg::note_on(0, 60, 100);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(20), on), vec![1]);
+        assert_eq!(dests(&engine.matrix, SourceId::Hardware(2), on), vec![4]);
+    }
+
+    #[test]
+    fn load_graph_after_rigs_resets_meta() {
+        let (mut engine, mut bus) = load_two_rigs(Some(2), None);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        assert!(engine.rig_meta().is_empty());
+        assert_eq!(engine.active_rig(), 0);
+    }
+
     #[test]
     fn dsp_param_maps_for_templates() {
         use super::dsp_native_param;
@@ -993,5 +1189,85 @@ pub fn multi_rig_test() -> anyhow::Result<()> {
     let one = measure(&mut engine, &mut buf);
     anyhow::ensure!(both > one * 1.2, "rigs not summing (both {both} vs one {one})");
     println!("multi-rig-test: OK — two rigs sum to output (both {both:.4} > one {one:.4})");
+    Ok(())
+}
+
+/// Multi-rig LOAD test (task-22): two independent rigs loaded via
+/// `Command::LoadRigs`, each Keys→Surge→its OWN Master. Rig A is bound to
+/// hardware device 2, rig B accepts any source. Keys must play only rig B;
+/// device 2 adds rig A; both masters sum to the physical output.
+/// CLI mode (CLAP voices are main-thread-only): `kabelsalat multi-rig-load-test`.
+pub fn multi_rig_load_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef, Rig};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (va, _ma) = ClapVoice::new(sr)?;
+    let (vb, _mb) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, va), (4, vb)]);
+
+    let rig_graph = || -> Graph {
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SURGE"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g
+    };
+    bus.send(Command::LoadRigs {
+        rigs: vec![Rig::new("A", rig_graph(), Some(2)), Rig::new("B", rig_graph(), None)],
+        active: 0,
+    });
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    engine.render(&mut buf, 2); // drain LoadRigs before inspecting the graph
+    let measure = |e: &mut GraphEngine, buf: &mut [f32]| -> f32 {
+        let mut peak = 0.0f32;
+        for _ in 0..30 {
+            e.render(buf, 2);
+            peak = peak.max(buf.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+        }
+        peak
+    };
+
+    // Merged layout: rig A nodes 0,1,2 (cables 1,2); rig B nodes 3,4,5
+    // (cables 4,5). Rig B's master cable is edge 5 (synth 4 → master 5).
+    anyhow::ensure!(
+        engine.graph().nodes.iter().filter(|n| matches!(n.kind, NodeKind::MasterOut)).count() == 2,
+        "merged graph must keep both rig masters"
+    );
+
+    // 1. Keys play ONLY rig B (rig A is bound to device 2).
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let b_only = measure(&mut engine, &mut buf);
+    anyhow::ensure!(b_only > 1e-3, "rig B produced no output from keys (peak {b_only})");
+
+    // 2. Unplug rig B's master: rig A must stay silent on keys (device-bound).
+    bus.send(Command::Disconnect(5));
+    let a_on_keys = measure(&mut engine, &mut buf);
+    anyhow::ensure!(
+        a_on_keys < b_only * 0.1,
+        "device-bound rig A leaked keys audio (peak {a_on_keys} vs {b_only})"
+    );
+
+    // 3. Replug rig B, add device 2 → rig A joins; both masters must sum.
+    bus.send(Command::Connect {
+        id: 5,
+        from: PortRef { node: 4, port: 0 },
+        to: PortRef { node: 5, port: 0 },
+        kind: PortKind::Audio,
+    });
+    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Hardware(2) });
+    let both = measure(&mut engine, &mut buf);
+    anyhow::ensure!(both > b_only * 1.2, "rigs not summing (both {both} vs b_only {b_only})");
+    println!(
+        "multi-rig-load-test: OK — LoadRigs: keys→rig B only ({b_only:.4}), device 2 adds rig A (both {both:.4})"
+    );
     Ok(())
 }

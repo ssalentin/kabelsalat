@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::control::{
-    name_bytes, name_str, DspKind, EdgeId, Graph, NodeId, NodeKind, ParamId, PortKind, PortRef,
+    name_bytes, name_str, DspKind, EdgeId, Graph, NodeId, NodeKind, ParamId, PortKind, PortRef, Rig,
 };
 // Param ids are per-node; these mirror the engine's current knob table
 // (task-10 generalizes it — the session stores opaque (node, param, value)
@@ -303,33 +303,9 @@ impl Session {
         fs::create_dir(&staging)
             .with_context(|| format!("Could not stage the session at {}.", staging.display()))?;
 
-        let result = self.write_package(&staging).and_then(|()| {
-            if package.exists() {
-                let backup = parent.join(format!(".{basename}.old-{}", unique_suffix()));
-                fs::rename(package, &backup).with_context(|| {
-                    format!("Could not move the old session aside ({}).", package.display())
-                })?;
-                match fs::rename(&staging, package) {
-                    Ok(()) => {
-                        // The new package is live; old-copy cleanup is best-effort.
-                        let _ = fs::remove_dir_all(&backup);
-                    }
-                    Err(e) => {
-                        // Put the original back before reporting the failure.
-                        let _ = fs::rename(&backup, package);
-                        return Err(e).with_context(|| {
-                            format!("Could not put the new session at {}.", package.display())
-                        });
-                    }
-                }
-            } else {
-                fs::rename(&staging, package).with_context(|| {
-                    format!("Could not put the new session at {}.", package.display())
-                })?;
-            }
-            sync_dir(parent);
-            Ok(())
-        });
+        let result = self
+            .write_package(&staging)
+            .and_then(|()| swap_package(package, &staging));
         if result.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -501,6 +477,200 @@ fn sync_dir(dir: &Path) {
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
     }
+}
+
+/// Swap a fully written staging package into place. The previous package, if
+/// any, is moved aside first and only removed once the new one is live; on a
+/// failed swap the original is restored. Shared by [`Session::save`] and
+/// [`MultiRigSession::save`].
+fn swap_package(package: &Path, staging: &Path) -> Result<()> {
+    let basename = package
+        .file_name()
+        .and_then(|s| s.to_str())
+        .context("The session package path has no usable directory name.")?;
+    let parent = package.parent().unwrap_or(Path::new(""));
+    if package.exists() {
+        let backup = parent.join(format!(".{basename}.old-{}", unique_suffix()));
+        fs::rename(package, &backup).with_context(|| {
+            format!("Could not move the old session aside ({}).", package.display())
+        })?;
+        match fs::rename(staging, package) {
+            Ok(()) => {
+                // The new package is live; old-copy cleanup is best-effort.
+                let _ = fs::remove_dir_all(&backup);
+            }
+            Err(e) => {
+                // Put the original back before reporting the failure.
+                let _ = fs::rename(&backup, package);
+                return Err(e).with_context(|| {
+                    format!("Could not put the new session at {}.", package.display())
+                });
+            }
+        }
+    } else {
+        fs::rename(staging, package).with_context(|| {
+            format!("Could not put the new session at {}.", package.display())
+        })?;
+    }
+    sync_dir(parent);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multi-rig sessions (task-22): Vec<Rig> + active, same atomic package I/O
+// ---------------------------------------------------------------------------
+
+/// The manifest inside a multi-rig package.
+pub const MULTI_RIG_FILE: &str = "rigs.json";
+/// On-disk format version for multi-rig manifests.
+pub const MULTI_RIG_FORMAT_VERSION: u32 = 1;
+
+/// A multi-rig session: several independent rigs (each a full rack graph bound
+/// to a hardware MIDI device) plus the UI-selected rig index. Persists as a
+/// `name.ksalat/` package with a `rigs.json` manifest, atomically like
+/// [`Session`]. Single-graph [`Session`] packages keep working unchanged;
+/// [`MultiRigSession::load`] falls back to wrapping one as a single rig.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiRigSession {
+    pub name: String,
+    pub rigs: Vec<Rig>,
+    #[serde(default)]
+    pub active: usize,
+}
+
+impl MultiRigSession {
+    pub fn new(name: impl Into<String>, rigs: Vec<Rig>, active: usize) -> Self {
+        Self { name: name.into(), rigs, active }
+    }
+
+    /// The merged patch the engine plays (`Command::LoadRigs` does this too).
+    pub fn merged_graph(&self) -> Graph {
+        crate::control::merge_rigs(&self.rigs)
+    }
+
+    /// Plain-language integrity check, run on save and load.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("The session needs a name before it can be saved.");
+        }
+        if self.rigs.is_empty() {
+            bail!("A multi-rig session needs at least one rig.");
+        }
+        if self.active >= self.rigs.len() {
+            bail!(
+                "The active rig index {} is out of range ({} rigs).",
+                self.active,
+                self.rigs.len()
+            );
+        }
+        for (i, rig) in self.rigs.iter().enumerate() {
+            if rig.name.trim().is_empty() {
+                bail!("Rig {} needs a name before the session can be saved.", i + 1);
+            }
+            let g = &rig.graph;
+            let mut node_ids: Vec<NodeId> = g.nodes.iter().map(|n| n.id).collect();
+            node_ids.sort_unstable();
+            if node_ids.windows(2).any(|w| w[0] == w[1]) {
+                bail!("Rig '{}' contains duplicate node ids.", rig.name);
+            }
+            let mut edge_ids: Vec<EdgeId> = g.edges.iter().map(|e| e.id).collect();
+            edge_ids.sort_unstable();
+            if edge_ids.windows(2).any(|w| w[0] == w[1]) {
+                bail!("Rig '{}' contains duplicate cable ids.", rig.name);
+            }
+            for e in &g.edges {
+                if e.from.node == e.to.node {
+                    bail!("Rig '{}': a cable plugs a node into itself.", rig.name);
+                }
+                if g.node(e.from.node).is_none() || g.node(e.to.node).is_none() {
+                    bail!(
+                        "Rig '{}': cable {} references a node that no longer exists.",
+                        rig.name,
+                        e.id
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Atomically save into the package directory `package`, mirroring
+    /// [`Session::save`]: staged in a hidden sibling, swapped by rename, the
+    /// previous package untouched on any error.
+    pub fn save(&self, package: &Path) -> Result<()> {
+        self.validate()?;
+        let basename = package
+            .file_name()
+            .and_then(|s| s.to_str())
+            .context("The session package path has no usable directory name.")?;
+        let parent = package.parent().unwrap_or(Path::new(""));
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create the folder {}.", parent.display()))?;
+        if package.exists() && !package.is_dir() {
+            bail!(
+                "{} already exists and is not a session package — choose another name.",
+                package.display()
+            );
+        }
+        let staging = parent.join(format!(".{basename}.staging-{}", unique_suffix()));
+        fs::create_dir(&staging)
+            .with_context(|| format!("Could not stage the session at {}.", staging.display()))?;
+        let result = (|| -> Result<()> {
+            let manifest = MultiRigFile {
+                format: MULTI_RIG_FORMAT_VERSION,
+                session: self.clone(),
+            };
+            let json = serde_json::to_vec_pretty(&manifest)?;
+            write_atomic(&staging.join(MULTI_RIG_FILE), &json)?;
+            swap_package(package, &staging)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        result
+    }
+
+    /// Load a multi-rig package. Falls back to a single-graph [`Session`]
+    /// package (wrapped as one rig with no device binding) so old sessions
+    /// open in multi-rig mode.
+    pub fn load(package: &Path) -> Result<MultiRigSession> {
+        let manifest_path = package.join(MULTI_RIG_FILE);
+        if !manifest_path.exists() {
+            let s = Session::load(package)?;
+            return Ok(MultiRigSession {
+                name: s.name,
+                rigs: vec![Rig::new("Rig 1", s.graph, None)],
+                active: 0,
+            });
+        }
+        let text = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "Could not read {} — is this a kabelsalat multi-rig package?",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: MultiRigFile = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid multi-rig JSON.", manifest_path.display()))?;
+        if manifest.format != MULTI_RIG_FORMAT_VERSION {
+            bail!(
+                "This multi-rig session uses format version {} but this build understands \
+                 version {}. It may have been written by a newer kabelsalat.",
+                manifest.format,
+                MULTI_RIG_FORMAT_VERSION
+            );
+        }
+        manifest.session.validate()?;
+        Ok(manifest.session)
+    }
+}
+
+/// On-disk multi-rig manifest (rig graphs are self-contained; plugin state
+/// blobs are captured per rig by the caller, like single-graph sessions).
+#[derive(Serialize, Deserialize)]
+struct MultiRigFile {
+    format: u32,
+    #[serde(flatten)]
+    session: MultiRigSession,
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1205,134 @@ mod tests {
             assert_eq!(content(&s), content(&loaded));
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    // --- Multi-rig sessions (task-22) ---------------------------------------
+
+    /// One rig: Keys(0) → Surge(1) → Master(2), cables 1 and 2.
+    fn mini_rig(name: &str, dev: Option<u32>) -> Rig {
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SYNTH"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        assert!(g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi));
+        assert!(g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio));
+        Rig::new(name, g, dev)
+    }
+
+    fn rig_content(s: &MultiRigSession) -> Value {
+        json!({
+            "name": s.name,
+            "active": s.active,
+            "rigs": s.rigs.iter().map(|r| json!({
+                "name": r.name,
+                "midi_device": r.midi_device,
+                "graph": serde_json::to_value(&r.graph).unwrap(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn multi_rig_save_load_round_trip() {
+        let dir = test_dir("multi-rig-roundtrip");
+        let pkg = dir.join("Two Rigs.ksalat");
+        let original = MultiRigSession::new(
+            "Two Rigs",
+            vec![mini_rig("A", Some(2)), mini_rig("B", None)],
+            1,
+        );
+        original.save(&pkg).unwrap();
+        assert!(pkg.join(MULTI_RIG_FILE).is_file());
+
+        let loaded = MultiRigSession::load(&pkg).unwrap();
+        assert_eq!(rig_content(&original), rig_content(&loaded));
+        // The merged graph matches the control-plane merge exactly.
+        assert_eq!(
+            serde_json::to_value(loaded.merged_graph()).unwrap(),
+            serde_json::to_value(crate::control::merge_rigs(&original.rigs)).unwrap()
+        );
+        // Overwrite: change active + device, no stale manifest content.
+        let mut edited = loaded;
+        edited.active = 0;
+        edited.rigs[1].midi_device = Some(7);
+        edited.save(&pkg).unwrap();
+        let reloaded = MultiRigSession::load(&pkg).unwrap();
+        assert_eq!(reloaded.active, 0);
+        assert_eq!(reloaded.rigs[1].midi_device, Some(7));
+        let litter: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(litter.is_empty(), "staging/backup dirs left behind: {litter:?}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_rig_failed_save_keeps_original() {
+        let dir = test_dir("multi-rig-failed-save");
+        let pkg = dir.join("Precious Rigs.ksalat");
+        let good = MultiRigSession::new("Good", vec![mini_rig("A", Some(2))], 0);
+        good.save(&pkg).unwrap();
+        let before = fs::read(pkg.join(MULTI_RIG_FILE)).unwrap();
+
+        // Out-of-range active index → validation fails → original untouched.
+        let mut bad = good.clone();
+        bad.active = 5;
+        assert!(bad.save(&pkg).is_err());
+        assert_eq!(fs::read(pkg.join(MULTI_RIG_FILE)).unwrap(), before);
+        // Empty rig list and empty names are rejected too.
+        assert!(MultiRigSession::new("X", vec![], 0).save(&pkg).is_err());
+        assert!(MultiRigSession::new("X", vec![mini_rig("  ", None)], 0).save(&pkg).is_err());
+        let litter: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(litter.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_rig_load_wraps_single_graph_session() {
+        // Old single-graph packages open in multi-rig mode as one rig.
+        let dir = test_dir("multi-rig-fallback");
+        let pkg = dir.join("Old Song.ksalat");
+        let single = sample_session();
+        single.save(&pkg).unwrap();
+        let multi = MultiRigSession::load(&pkg).unwrap();
+        assert_eq!(multi.name, single.name);
+        assert_eq!(multi.rigs.len(), 1);
+        assert_eq!(multi.active, 0);
+        assert_eq!(multi.rigs[0].midi_device, None);
+        assert_eq!(
+            serde_json::to_value(&multi.rigs[0].graph).unwrap(),
+            serde_json::to_value(&single.graph).unwrap()
+        );
+        // Single-graph Session::load still works on the same package.
+        assert!(Session::load(&pkg).is_ok());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_rig_load_rejects_future_versions() {
+        let dir = test_dir("multi-rig-bad-load");
+        let pkg = dir.join("Future Rigs.ksalat");
+        fs::create_dir_all(&pkg).unwrap();
+        let manifest = json!({
+            "format": MULTI_RIG_FORMAT_VERSION + 1,
+            "name": "Future",
+            "rigs": [],
+            "active": 0,
+        });
+        fs::write(pkg.join(MULTI_RIG_FILE), manifest.to_string()).unwrap();
+        let err = MultiRigSession::load(&pkg).unwrap_err().to_string();
+        assert!(err.contains("newer kabelsalat"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

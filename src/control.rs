@@ -103,6 +103,10 @@ pub struct Node {
     pub id: NodeId,
     pub kind: NodeKind,
     pub name: Name,
+    /// Which rig this node belongs to (multi-rig). Single-graph patches are
+    /// rig 0; sessions saved before multi-rig load as rig 0 too.
+    #[serde(default)]
+    pub rig: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,8 +148,21 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name });
+        self.nodes.push(Node { id, kind, name, rig: 0 });
         id
+    }
+
+    /// Tag a node with its rig index (multi-rig). Returns false if the node
+    /// is unknown. [`merge_rigs`] tags whole rig graphs in one pass instead.
+    #[allow(dead_code)] // public API for the UI (task-22 integration)
+    pub fn set_rig(&mut self, id: NodeId, rig: u8) -> bool {
+        match self.nodes.iter_mut().find(|n| n.id == id) {
+            Some(n) => {
+                n.rig = rig;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn remove_node(&mut self, id: NodeId) {
@@ -225,6 +242,66 @@ impl Graph {
     }
 }
 
+/// One independent rig: a full rack graph bound to a hardware MIDI device
+/// (AUM operating model — a different keyboard per rig). `midi_device`:
+/// `None` = any source (on-screen keys, laptop keys, every hardware device);
+/// `Some(id)` = only that hardware device. Each rig carries its own MasterOut;
+/// the engine sums them all to the physical output.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rig {
+    pub name: String,
+    pub graph: Graph,
+    #[serde(default)]
+    pub midi_device: Option<u32>,
+}
+
+impl Rig {
+    pub fn new(name: impl Into<String>, graph: Graph, midi_device: Option<u32>) -> Self {
+        Self { name: name.into(), graph, midi_device }
+    }
+}
+
+/// Merge independent rig graphs into ONE patch (multi-rig load).
+///
+/// Node ids are offset by a cumulative base per rig (edge ids likewise), edge
+/// endpoints are rewritten to the offset ids, and every node is tagged with
+/// its rig index (`Node::rig`, saturating at 255). Each rig keeps its own
+/// MasterOut. The merged id counters continue past every id the rigs used
+/// (counters survive removals), so later edits never collide.
+/// Rare structural op: allocates by design, like `Command::LoadGraph`.
+pub fn merge_rigs(rigs: &[Rig]) -> Graph {
+    let mut merged = Graph::default();
+    let nodes: usize = rigs.iter().map(|r| r.graph.nodes.len()).sum();
+    let edges: usize = rigs.iter().map(|r| r.graph.edges.len()).sum();
+    merged.reserve(nodes + 8, edges + 16);
+    let mut node_base: NodeId = 0;
+    let mut edge_base: EdgeId = 0;
+    for (i, rig) in rigs.iter().enumerate() {
+        let tag = i.min(u8::MAX as usize) as u8;
+        for n in &rig.graph.nodes {
+            let mut n = n.clone();
+            n.id = n.id.saturating_add(node_base);
+            n.rig = tag;
+            merged.nodes.push(n);
+        }
+        for e in &rig.graph.edges {
+            let mut e = e.clone();
+            e.id = e.id.saturating_add(edge_base);
+            e.from.node = e.from.node.saturating_add(node_base);
+            e.to.node = e.to.node.saturating_add(node_base);
+            merged.edges.push(e);
+        }
+        // Advance past every id the rig ever used, not just its live nodes.
+        let max_node = rig.graph.nodes.iter().map(|n| n.id).max().map_or(0, |m| m + 1);
+        let max_edge = rig.graph.edges.iter().map(|e| e.id).max().map_or(0, |m| m + 1);
+        node_base = node_base.saturating_add(rig.graph.next_node.max(max_node));
+        edge_base = edge_base.saturating_add(rig.graph.next_edge.max(max_edge));
+    }
+    merged.next_node = node_base;
+    merged.next_edge = edge_base;
+    merged
+}
+
 /// Everything a frontend can ask the engine to do. Fixed-size: no heap.
 /// Serde is for off-thread frontends only (bridge socket, sessions); the RT
 /// bus still moves plain fixed-size values — no allocation on the audio path.
@@ -248,6 +325,13 @@ pub enum Command {
     /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
     /// matrix. Rare structural op: allocates (bends RT discipline by design).
     LoadGraph { graph: Graph },
+    /// Load several independent rigs at once: their graphs are merged
+    /// ([`merge_rigs`]), DSP/LV2 rebuilt, the existing CLAP voices remapped to
+    /// Clap nodes in node-id order, and each rig's instruments driven by that
+    /// rig's `midi_device` (None = keys + laptop + all hardware devices).
+    /// `active` is the UI-selected rig index (engine keeps it for queries).
+    /// Rare structural op: allocates (bends RT discipline by design).
+    LoadRigs { rigs: Vec<Rig>, active: usize },
     /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
     /// notes at/above → rig B (node 4). `None` disables the split (both full range).
     SetSplit { point: Option<u8> },
@@ -371,5 +455,125 @@ mod tests {
         // The exact shape the CLI/bridge accepts.
         let c: Command = serde_json::from_str(r#"{"SetSystemAudio":{"gain":0.5}}"#).unwrap();
         assert!(matches!(c, Command::SetSystemAudio { gain } if (gain - 0.5).abs() < 1e-6));
+    }
+
+    /// A minimal rig patch: Keys(0) → Clap(1) → Master(2), cables 1 and 2.
+    fn mini_rig_graph() -> Graph {
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SYNTH"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        assert!(g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi));
+        assert!(g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio));
+        g
+    }
+
+    #[test]
+    fn node_rig_defaults_and_set_rig() {
+        let mut g = Graph::demo_patch();
+        assert!(g.nodes.iter().all(|n| n.rig == 0));
+        assert!(g.set_rig(4, 1));
+        assert_eq!(g.node(4).unwrap().rig, 1);
+        assert!(!g.set_rig(999, 2)); // unknown node
+    }
+
+    #[test]
+    fn node_without_rig_field_loads_as_rig0() {
+        // Backward compat: sessions saved before multi-rig have no `rig`.
+        let json = r#"{"id":7,"kind":"MasterOut","name":[77,65,83,84,69,82,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(n.id, 7);
+        assert_eq!(n.rig, 0);
+    }
+
+    #[test]
+    fn merge_rigs_offsets_tags_and_keeps_masters() {
+        // Both rigs use the SAME local ids (0,1,2 / cables 1,2) — the merge
+        // must offset them, not collide.
+        let rigs = vec![
+            Rig::new("A", mini_rig_graph(), Some(2)),
+            Rig::new("B", mini_rig_graph(), None),
+        ];
+        let g = merge_rigs(&rigs);
+        assert_eq!(g.nodes.len(), 6);
+        assert_eq!(g.edges.len(), 4);
+        // Rig A keeps ids 0..2; rig B is offset to 3..5.
+        let ids: Vec<NodeId> = g.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(g.node(1).unwrap().rig, 0);
+        assert_eq!(g.node(4).unwrap().rig, 1);
+        // Both masters present, one per rig.
+        let masters: Vec<NodeId> = g.nodes.iter()
+            .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
+        assert_eq!(masters, vec![2, 5]);
+        // Edge endpoints rewritten to the offset ids; edge ids offset too.
+        assert!(g.has_route(0, 1, PortKind::Midi));
+        assert!(g.has_route(1, 2, PortKind::Audio));
+        assert!(g.has_route(3, 4, PortKind::Midi));
+        assert!(g.has_route(4, 5, PortKind::Audio));
+        // Edge base advances past rig A's highest cable id (2) → rig B: 4, 5.
+        let eids: Vec<EdgeId> = g.edges.iter().map(|e| e.id).collect();
+        assert_eq!(eids, vec![1, 2, 4, 5]);
+        // Counters continue past the merged ids: later edits never collide.
+        let mut g = g;
+        let late = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("LATE"));
+        assert!(!ids.contains(&late));
+        assert!(g.connect_with_id(
+            g.edges.iter().map(|e| e.id).max().unwrap() + 1,
+            PortRef { node: late, port: 0 },
+            PortRef { node: 5, port: 0 },
+            PortKind::Audio,
+        ));
+    }
+
+    #[test]
+    fn merge_rigs_respects_counters_after_removals() {
+        // A rig whose counters outrun its live nodes (node 1 was removed):
+        // the next rig must still start past id 3, not past len()==2.
+        let mut a = mini_rig_graph();
+        a.remove_node(1);
+        let rigs = vec![Rig::new("A", a, None), Rig::new("B", mini_rig_graph(), None)];
+        let g = merge_rigs(&rigs);
+        let ids: Vec<NodeId> = g.nodes.iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![0, 2, 3, 4, 5]);
+        assert!(g.has_route(3, 4, PortKind::Midi));
+        assert!(g.has_route(4, 5, PortKind::Audio));
+        // Empty input merges to an empty, usable graph.
+        let empty = merge_rigs(&[]);
+        assert!(empty.nodes.is_empty() && empty.edges.is_empty());
+    }
+
+    #[test]
+    fn rig_and_load_rigs_json_roundtrip() {
+        let cmd = Command::LoadRigs {
+            rigs: vec![
+                Rig::new("A", mini_rig_graph(), Some(2)),
+                Rig::new("B", mini_rig_graph(), None),
+            ],
+            active: 1,
+        };
+        let s = serde_json::to_string(&cmd).unwrap();
+        let back: Command = serde_json::from_str(&s).unwrap();
+        assert_eq!(format!("{cmd:?}"), format!("{back:?}"));
+        // The exact wire shape the bridge accepts.
+        let c: Command = serde_json::from_str(
+            r#"{"LoadRigs":{"rigs":[{"name":"A","graph":{"nodes":[],"edges":[],"next_node":0,"next_edge":0},"midi_device":2}],"active":0}}"#,
+        ).unwrap();
+        match c {
+            Command::LoadRigs { rigs, active } => {
+                assert_eq!(rigs.len(), 1);
+                assert_eq!(rigs[0].midi_device, Some(2));
+                assert_eq!(active, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // midi_device is optional on the wire (defaults to None).
+        let r: Rig = serde_json::from_str(
+            r#"{"name":"X","graph":{"nodes":[],"edges":[],"next_node":0,"next_edge":0}}"#,
+        ).unwrap();
+        assert_eq!(r.midi_device, None);
     }
 }

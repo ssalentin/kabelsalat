@@ -608,6 +608,10 @@ struct DemoApp {
     /// The loaded graph's nodes (edges are mirrored from the living cables).
     base_graph: Graph,
     xf: Xform,
+    /// Y origin of the central rack area (below the top menu panel); the
+    /// floating toolbar pill is positioned relative to it so it never overlaps
+    /// the rig-inputs menu.
+    toolbar_top: f32,
     text_alpha: f32,
 
     // Cached text.
@@ -727,6 +731,7 @@ impl DemoApp {
             layout_rows: 1,
             base_graph: Graph::demo_patch(),
             xf: Xform { center: Pos2::ZERO, lc: Vec2::ZERO, sx: 1.0, sy: 1.0 },
+            toolbar_top: 0.0,
             text_alpha: 1.0,
             wordmark_g: None,
             state_play_g: None,
@@ -977,6 +982,7 @@ impl DemoApp {
     // -- layout -----------------------------------------------------------
 
     fn layout(&mut self, rect: Rect) {
+        self.toolbar_top = rect.top();
         // Adaptive rack: KEYS (left, full height) | one column per instrument
         // stack (instrument + its FX chain) | MASTER (right, full height).
         let rows = self.layout_rows.max(1);
@@ -2598,8 +2604,8 @@ impl DemoApp {
     }
 
     fn hit_test(&self, s: Pos2) -> Hit {
-        if (s - Pos2::new(40.0, 40.0)).length() < 19.0 { return Hit::Play; }
-        if Rect::from_min_size(Pos2::new(246.0, 24.0), Vec2::new(126.0, 32.0)).contains(s) {
+        if (s - Pos2::new(40.0, self.toolbar_top + 40.0)).length() < 19.0 { return Hit::Play; }
+        if Rect::from_min_size(Pos2::new(246.0, self.toolbar_top + 24.0), Vec2::new(126.0, 32.0)).contains(s) {
             return Hit::Flip;
         }
         if self.flipping || self.xf.sy < 0.9 { return Hit::Background; }
@@ -2924,7 +2930,7 @@ impl DemoApp {
             }
         }
 
-        self.draw_toolbar(&painter);
+        self.draw_toolbar(&painter, self.toolbar_top);
         self.draw_hint(&painter, rect);
         if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
@@ -3387,47 +3393,47 @@ impl DemoApp {
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
     }
 
-    fn draw_toolbar(&self, painter: &egui::Painter) {
-        let bar = Rect::from_min_size(Pos2::new(16.0, 16.0), Vec2::new(376.0, 48.0));
+    fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
+        let bar = Rect::from_min_size(Pos2::new(16.0, top + 16.0), Vec2::new(376.0, 48.0));
         painter.rect_filled(bar, 24.0, alpha(Color32::from_rgb(0x1d, 0x1f, 0x2e), 0.94));
         painter.rect_stroke(bar, 24.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
 
-        let c = Pos2::new(40.0, 40.0);
+        let c = Pos2::new(40.0, top + 40.0);
         let hovered = matches!(self.hover, Some(Hit::Play));
         painter.circle_filled(c, 15.0, if hovered { mix(YELLOW, WHITE, 0.2) } else { YELLOW });
         let ink = BG;
         if self.playing {
             // Stop square (transport is Play/Stop, not play/pause).
-            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, 34.5), Vec2::new(11.0, 11.0)), 1.6, ink);
+            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 34.5), Vec2::new(11.0, 11.0)), 1.6, ink);
         } else {
             painter.add(Shape::convex_polygon(
-                vec![Pos2::new(36.5, 32.5), Pos2::new(36.5, 47.5), Pos2::new(48.5, 40.0)],
+                vec![Pos2::new(36.5, top + 32.5), Pos2::new(36.5, top + 47.5), Pos2::new(48.5, top + 40.0)],
                 ink, Stroke::NONE));
         }
 
         let beat = 60.0 / self.bpm.max(1.0) as f64;
         let beat_phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
-        painter.circle_filled(Pos2::new(66.0, 40.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
+        painter.circle_filled(Pos2::new(66.0, top + 40.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
-        if let Some(g) = &self.wordmark_g { painter.galley(Pos2::new(80.0, 24.0), g.clone(), TEXT); }
+        if let Some(g) = &self.wordmark_g { painter.galley(Pos2::new(80.0, top + 24.0), g.clone(), TEXT); }
         let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
-        if let Some(g) = state_g { painter.galley(Pos2::new(80.0, 42.0), g.clone(), SUBTEXT); }
+        if let Some(g) = state_g { painter.galley(Pos2::new(80.0, top + 42.0), g.clone(), SUBTEXT); }
 
         // Flip button.
-        let fb = Rect::from_min_size(Pos2::new(246.0, 24.0), Vec2::new(126.0, 32.0));
+        let fb = Rect::from_min_size(Pos2::new(246.0, top + 24.0), Vec2::new(126.0, 32.0));
         let fhover = matches!(self.hover, Some(Hit::Flip));
         painter.rect_filled(fb, 16.0, if fhover { Color32::from_rgb(0x2c, 0x2f, 0x44) } else { Color32::from_rgb(0x26, 0x28, 0x3a) });
         painter.rect_stroke(fb, 16.0, Stroke::new(1.0, if fhover { mix(BORDER, YELLOW, 0.5) } else { BORDER }), egui::StrokeKind::Inside);
         // ⇄ arrows drawn as shapes (font-independent).
         let ax = 260.0;
-        painter.line_segment([Pos2::new(ax, 34.0), Pos2::new(ax + 12.0, 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 8.0, 30.5), Pos2::new(ax + 12.0, 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 8.0, 37.5), Pos2::new(ax + 12.0, 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax, 46.0), Pos2::new(ax + 12.0, 46.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 4.0, 42.5), Pos2::new(ax, 46.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 4.0, 49.5), Pos2::new(ax, 46.0)], Stroke::new(1.8, TEXT));
-        if let Some(g) = &self.flip_label_g { painter.galley(Pos2::new(280.0, 33.0), g.clone(), TEXT); }
+        painter.line_segment([Pos2::new(ax, top + 34.0), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
+        painter.line_segment([Pos2::new(ax + 8.0, top + 30.5), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
+        painter.line_segment([Pos2::new(ax + 8.0, top + 37.5), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
+        painter.line_segment([Pos2::new(ax, top + 46.0), Pos2::new(ax + 12.0, top + 46.0)], Stroke::new(1.8, TEXT));
+        painter.line_segment([Pos2::new(ax + 4.0, top + 42.5), Pos2::new(ax, top + 46.0)], Stroke::new(1.8, TEXT));
+        painter.line_segment([Pos2::new(ax + 4.0, top + 49.5), Pos2::new(ax, top + 46.0)], Stroke::new(1.8, TEXT));
+        if let Some(g) = &self.flip_label_g { painter.galley(Pos2::new(280.0, top + 33.0), g.clone(), TEXT); }
     }
 
     fn draw_hint(&self, painter: &egui::Painter, rect: Rect) {

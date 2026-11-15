@@ -34,6 +34,23 @@ pub fn build_processor(kind: &DspKind, sample_rate: f64) -> Box<dyn Processor> {
         DspKind::Saturation => Box::new(Saturation::new(sample_rate)),
         DspKind::Delay => Box::new(Delay::new(sample_rate)),
         DspKind::Reverb => Box::new(Reverb::new(sample_rate)),
+        DspKind::Metronome => Box::new(Metronome),
+    }
+}
+
+/// Unity pass-through placeholder for the metronome node. The engine drives
+/// click generation directly into the node's buffer (transport state), so
+/// this processor only satisfies the `Processor` contract. No native params.
+pub struct Metronome;
+
+impl Processor for Metronome {
+    fn process(&mut self, _io: &mut [f32], _frames: usize) {}
+    fn set_param(&mut self, _id: u32, _value: f32) {}
+    fn param_count(&self) -> u32 {
+        0
+    }
+    fn param_name(&self, _id: u32) -> &'static str {
+        "unknown"
     }
 }
 
@@ -1440,6 +1457,7 @@ mod tests {
             (DspKind::Saturation, 3),
             (DspKind::Delay, 5),
             (DspKind::Reverb, 4),
+            (DspKind::Metronome, 0),
         ];
         for (kind, count) in kinds {
             let mut p = build_processor(&kind, SR);
@@ -1520,6 +1538,7 @@ mod tests {
             DspKind::Saturation,
             DspKind::Delay,
             DspKind::Reverb,
+            DspKind::Metronome,
         ];
         // Everything (nodes + buffers) is built before the measurement window.
         let mut nodes: Vec<Box<dyn Processor>> =

@@ -72,6 +72,8 @@ fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
             0 => Some(0),
             _ => None,
         },
+        // Metronome has no native params: tempo comes from transport SetBpm.
+        DspKind::Metronome => None,
     }
 }
 
@@ -625,6 +627,9 @@ impl GraphEngine {
 
         // 2. Each DSP node sums the instruments wired into it, then processes.
         for d in &mut self.dsp {
+            if d.kind == DspKind::Metronome {
+                continue; // generated below from transport state, no inputs
+            }
             for x in d.buf[..n2].iter_mut() {
                 *x = 0.0;
             }
@@ -636,6 +641,18 @@ impl GraphEngine {
                 }
             }
             d.proc.process(&mut d.buf[..n2], frames);
+        }
+
+        // 2a. Metronome nodes: transport-driven click generators. Their output
+        // reaches the master via normal audio routing like any DSP node.
+        for i in 0..self.dsp.len() {
+            if self.dsp[i].kind == DspKind::Metronome {
+                // Take the buffer out so the helper can borrow engine state;
+                // mem::take on a Vec is allocation-free (RT-safe).
+                let mut buf = std::mem::take(&mut self.dsp[i].buf);
+                self.render_metronome(&mut buf[..n2], frames);
+                self.dsp[i].buf = buf;
+            }
         }
 
         // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
@@ -729,28 +746,6 @@ impl GraphEngine {
                     l += self.player_buf[i * 2] * self.player_gain;
                     r += self.player_buf[i * 2 + 1] * self.player_gain;
                 }
-                // Metronome: a decaying 1 kHz burst on each beat while playing.
-                if self.transport_playing {
-                    let spb = self.sample_rate * 60.0 / self.bpm as f64;
-                    self.metro_phase += 1.0;
-                    if self.metro_phase >= spb {
-                        self.metro_phase -= spb;
-                        self.click_remaining = 2400;
-                        self.click_phase = 0.0;
-                    }
-                }
-                if self.click_remaining > 0 {
-                    let env = self.click_remaining as f32 / 2400.0;
-                    let click = (2.0 * std::f32::consts::PI * 1000.0 * self.click_phase
-                        / self.sample_rate as f32)
-                        .sin()
-                        * env
-                        * 0.4;
-                    l += click;
-                    r += click;
-                    self.click_phase += 1.0;
-                    self.click_remaining -= 1;
-                }
                 l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
                 r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
                 peak = peak.max(l.abs()).max(r.abs());
@@ -764,6 +759,40 @@ impl GraphEngine {
             }
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Generate the metronome click into `buf` (stereo-interleaved): a
+    /// decaying 1 kHz burst on each beat while the transport plays. Driven by
+    /// TransportPlay/TransportStop/SetBpm; allocation-free.
+    fn render_metronome(&mut self, buf: &mut [f32], frames: usize) {
+        let frames = frames.min(buf.len() / 2);
+        let n2 = frames * 2;
+        for x in buf[..n2].iter_mut() {
+            *x = 0.0;
+        }
+        for i in 0..frames {
+            if self.transport_playing {
+                let spb = self.sample_rate * 60.0 / self.bpm as f64;
+                self.metro_phase += 1.0;
+                if self.metro_phase >= spb {
+                    self.metro_phase -= spb;
+                    self.click_remaining = 2400;
+                    self.click_phase = 0.0;
+                }
+            }
+            if self.click_remaining > 0 {
+                let env = self.click_remaining as f32 / 2400.0;
+                let click = (2.0 * std::f32::consts::PI * 1000.0 * self.click_phase
+                    / self.sample_rate as f32)
+                    .sin()
+                    * env
+                    * 0.4;
+                buf[i * 2] = click;
+                buf[i * 2 + 1] = click;
+                self.click_phase += 1.0;
+                self.click_remaining -= 1;
+            }
+        }
     }
 }
 
@@ -963,6 +992,10 @@ mod tests {
         // Delay keeps its time/mix mapping.
         assert_eq!(dsp_native_param(&DspKind::Delay, super::P_TIME), Some(0));
         assert_eq!(dsp_native_param(&DspKind::Delay, super::P_MIX), Some(2));
+        // Metronome has no native params (tempo is transport SetBpm).
+        assert_eq!(dsp_native_param(&DspKind::Metronome, 0), None);
+        assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_TIME), None);
+        assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_MIX), None);
     }
 }
 
@@ -1010,14 +1043,20 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Metronome self-test: enable the transport and verify clicks are generated.
+/// Metronome self-test: a Metronome rack node wired Metronome→Master must
+/// click on TransportPlay and fall silent on TransportStop. Also verifies a
+/// patch WITHOUT a metronome node stays silent while playing (the click is no
+/// longer hardcoded into the master bus).
 pub fn metro_test() -> anyhow::Result<()> {
-    use crate::control::{command_bus, Command, Graph};
-    use crate::host::ClapVoice;
+    use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, NodeKind, PortKind, PortRef};
     let sr = 48000.0;
-    let (voice, _main) = ClapVoice::new(sr)?;
     let (mut bus, drain) = command_bus();
-    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, voice)]);
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![]);
     bus.send(Command::SetBpm { bpm: 120.0 });
     bus.send(Command::TransportPlay);
     let mut buf = vec![0.0f32; 512 * 2];
@@ -1029,7 +1068,7 @@ pub fn metro_test() -> anyhow::Result<()> {
             click_blocks += 1;
         }
     }
-    anyhow::ensure!(click_blocks > 0, "metronome produced no clicks");
+    anyhow::ensure!(click_blocks > 0, "metronome node produced no clicks");
     // Stop and confirm silence returns.
     bus.send(Command::TransportStop);
     for _ in 0..10 {
@@ -1037,7 +1076,16 @@ pub fn metro_test() -> anyhow::Result<()> {
     }
     let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     anyhow::ensure!(peak < 0.05, "metronome did not stop (peak {peak})");
-    println!("metro-test: OK — {click_blocks} click-blocks in 1s @120bpm, silent after stop");
+    // No metronome node in the patch → playing transport must stay silent.
+    bus.send(Command::LoadGraph { graph: Graph::demo_patch() });
+    bus.send(Command::TransportPlay);
+    let mut peak = 0.0f32;
+    for _ in 0..(48000 / 512) {
+        engine.render(&mut buf, 2);
+        peak = peak.max(buf.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    }
+    anyhow::ensure!(peak < 0.05, "click leaked into master without a metronome node (peak {peak})");
+    println!("metro-test: OK — {click_blocks} click-blocks in 1s @120bpm via Metronome→Master, silent after stop and without node");
     Ok(())
 }
 

@@ -283,6 +283,7 @@ fn dsp_kind_str(k: &DspKind) -> &'static str {
         DspKind::Saturation => "saturation",
         DspKind::Delay => "delay",
         DspKind::Reverb => "reverb",
+        DspKind::Metronome => "metronome",
     }
 }
 
@@ -296,6 +297,7 @@ fn parse_dsp_kind(s: &str) -> Result<DspKind, String> {
         "saturation" => Ok(DspKind::Saturation),
         "delay" => Ok(DspKind::Delay),
         "reverb" => Ok(DspKind::Reverb),
+        "metronome" => Ok(DspKind::Metronome),
         other => Err(format!("unknown dsp kind '{other}'")),
     }
 }

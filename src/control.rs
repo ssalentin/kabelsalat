@@ -80,6 +80,10 @@ pub enum DspKind {
     Saturation,
     Delay,
     Reverb,
+    /// Transport-driven click generator. A normal rack node: wire its audio
+    /// output to a master to hear it. No native params (BPM comes from the
+    /// transport's SetBpm command).
+    Metronome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

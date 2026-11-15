@@ -1517,6 +1517,64 @@ impl DemoApp {
                 self.set_bpm(bpm);
                 format!("tempo set to {bpm:.0} BPM")
             }
+            "load_template" => {
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("demo").to_lowercase();
+                match name.as_str() {
+                    "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); "Loaded template 'Lead + Reverb'".into() }
+                    "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); "Loaded template 'Drums + Bass'".into() }
+                    "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); "Loaded template 'Ambient Pad'".into() }
+                    "demo" => { self.load_demo_patch(); "Loaded the demo patch".into() }
+                    _ => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo)"),
+                }
+            }
+            "add_node" => {
+                let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let name = name_bytes(args.get("name").and_then(|v| v.as_str()).unwrap_or(&kind_str));
+                let kind = match kind_str.as_str() {
+                    "keys" => Some(NodeKind::Keys),
+                    "clap" => Some(NodeKind::Clap { plugin_id: name_bytes(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
+                    "dsp" => match args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().as_str() {
+                        "gain" => Some(NodeKind::Dsp(DspKind::Gain)),
+                        "pan" => Some(NodeKind::Dsp(DspKind::Pan)),
+                        "eq3" => Some(NodeKind::Dsp(DspKind::Eq3)),
+                        "filter" => Some(NodeKind::Dsp(DspKind::Filter)),
+                        "limiter" => Some(NodeKind::Dsp(DspKind::Limiter)),
+                        "saturation" => Some(NodeKind::Dsp(DspKind::Saturation)),
+                        "delay" => Some(NodeKind::Dsp(DspKind::Delay)),
+                        "reverb" => Some(NodeKind::Dsp(DspKind::Reverb)),
+                        _ => None,
+                    },
+                    "lv2" => args.get("uri").and_then(|v| v.as_str()).map(|u| NodeKind::Lv2 { uri: Lv2Uri::new(u) }),
+                    "system_audio" => Some(NodeKind::SystemAudio),
+                    "master_out" => Some(NodeKind::MasterOut),
+                    _ => None,
+                };
+                match kind {
+                    Some(k) => {
+                        if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name }); }
+                        format!("added {kind_str} node (wire it with connect)")
+                    }
+                    None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
+                }
+            }
+            "connect" => {
+                let from_node = args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let to_node = args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let from_port = args.get("from_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let to_port = args.get("to_port").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let midi = args.get("kind").and_then(|v| v.as_str()).unwrap_or("audio").eq_ignore_ascii_case("midi");
+                let kind = if midi { CPortKind::Midi } else { CPortKind::Audio };
+                let id = self.shared_graph.lock().map(|g| g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1).unwrap_or(1);
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::Connect { id, from: PortRef { node: from_node, port: from_port }, to: PortRef { node: to_node, port: to_port }, kind });
+                }
+                format!("connected {from_node} -> {to_node} ({})", if midi { "midi" } else { "audio" })
+            }
+            "disconnect" => {
+                let id = args.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::Disconnect(id)); }
+                format!("disconnected cable {id}")
+            }
             _ => format!("unknown tool: {name}"),
         }
     }

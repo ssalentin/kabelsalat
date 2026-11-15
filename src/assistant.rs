@@ -145,6 +145,9 @@ fn system_prompt() -> String {
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
      (backing tracks), transport_play/transport_stop/set_bpm (metronome).\n\
      - Sessions: save_session/load_session/list_sessions.\n\
+     - Patching: load_template (starter patches), add_node/connect/disconnect \
+     (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
+     sound once wired.\n\
      UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
      Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\
@@ -247,6 +250,26 @@ fn tools() -> Value {
             "name":"set_bpm",
             "description":"Set the metronome tempo in BPM (20..300).",
             "parameters":{"type":"object","properties":{"bpm":{"type":"number"}},"required":["bpm"]}
+        }},
+        {"type":"function","function":{
+            "name":"load_template",
+            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | demo.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","demo"]}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"add_node",
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id. Added dsp/lv2 nodes sound once wired with connect. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"name":{"type":"string"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"connect",
+            "description":"Wire a cable between two nodes. kind: audio (default) | midi. Ports default to 0.",
+            "parameters":{"type":"object","properties":{"from_node":{"type":"integer"},"to_node":{"type":"integer"},"from_port":{"type":"integer"},"to_port":{"type":"integer"},"kind":{"type":"string","enum":["audio","midi"]}},"required":["from_node","to_node"]}
+        }},
+        {"type":"function","function":{
+            "name":"disconnect",
+            "description":"Remove a cable by its id (see get_graph).",
+            "parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}
         }}
     ])
 }

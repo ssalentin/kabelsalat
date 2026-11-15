@@ -1967,6 +1967,30 @@ impl DemoApp {
         }
     }
 
+    /// The LV2 instrument rig: Keys → <lv2 instrument> → Master. Mirrors
+    /// engine::lv2_instrument_engine_test (MIDI to the instrument, audio out).
+    fn build_lv2_instrument_graph(uri: &str, name: &str) -> Graph {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let inst = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes(name));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g
+    }
+
+    /// Add an LV2 instrument as a rig: rebuild the rack as Keys→LV2→Master and
+    /// rewire the engine (same apply_session path as add-effect).
+    fn add_lv2_instrument(&mut self, uri: &str, name: &str) {
+        let g = Self::build_lv2_instrument_graph(uri, name);
+        let s = crate::session::Session::new(format!("LV2 inst: {name}"), g);
+        match self.apply_session(&s) {
+            Ok(_) => self.plugin_msg = format!("Added '{name}' as instrument — Keys→{name}→Master"),
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
     /// Start a fresh single-Surge rig (the only CLAP instrument the engine loads).
     fn add_surge_rig(&mut self) {
         let mut g = Graph::default();
@@ -1992,7 +2016,7 @@ impl DemoApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(420.0)
+            .default_width(520.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
@@ -2002,18 +2026,35 @@ impl DemoApp {
                 ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").small().italics().color(SUBTEXT));
                 let filter = self.plugin_filter.to_lowercase();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new(format!("LV2 effects ({})", self.plugins_lv2.len())).small().strong());
-                    let mut added: Option<(String, String)> = None;
+                    ui.label(egui::RichText::new(format!("LV2 plugins ({})", self.plugins_lv2.len())).small().strong());
+                    let mut added: Option<(String, String, bool)> = None;
                     for p in &self.plugins_lv2 {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(&p.name).small());
-                            if ui.small_button("Add effect").on_hover_text(&p.uri).clicked() {
-                                added = Some((p.uri.clone(), p.name.clone()));
+                            if p.is_instrument {
+                                ui.label(egui::RichText::new("inst").small().italics().color(GREEN));
+                            }
+                            // Offer BOTH roles; emphasize the likely one (the
+                            // is_instrument hint is permissive, not authoritative).
+                            let base = Color32::from_rgb(0x26, 0x28, 0x38);
+                            let inst_fill = if p.is_instrument { alpha(BLUE, 0.35) } else { base };
+                            let fx_fill = if p.is_instrument { base } else { alpha(BLUE, 0.35) };
+                            let ib = egui::Button::new(egui::RichText::new("Add instrument").small().color(TEXT))
+                                .fill(inst_fill).corner_radius(4.0);
+                            if ui.add(ib).on_hover_text(&p.uri).clicked() {
+                                added = Some((p.uri.clone(), p.name.clone(), true));
+                            }
+                            let fb = egui::Button::new(egui::RichText::new("Add effect").small().color(TEXT))
+                                .fill(fx_fill).corner_radius(4.0);
+                            if ui.add(fb).on_hover_text(&p.uri).clicked() {
+                                added = Some((p.uri.clone(), p.name.clone(), false));
                             }
                         });
                     }
-                    if let Some((uri, name)) = added { self.add_lv2_effect(&uri, &name); }
+                    if let Some((uri, name, as_inst)) = added {
+                        if as_inst { self.add_lv2_instrument(&uri, &name); } else { self.add_lv2_effect(&uri, &name); }
+                    }
                     ui.separator();
                     ui.label(egui::RichText::new(format!("CLAP instruments ({})", self.plugins_clap.len())).small().strong());
                     let mut add_surge = false;
@@ -3669,12 +3710,27 @@ pub fn run_session_test() -> anyhow::Result<()> {
         println!("  template '{}': {} units, {} cables, {} stack col(s), {} row(s) — OK",
             t.title(), app.units.len(), app.cables.len(), app.stack_cols.len(), app.layout_rows);
     }
+    // --- LV2 plugin-browser graphs (task-18 effect / task-20 instrument) ---
+    // Effect chain: Keys→Surge→LV2→Master (+dry) = 4 units, 4 cables.
+    app.add_lv2_effect("http://example.org/lv2/gain", "TEST GAIN");
+    anyhow::ensure!(app.units.len() == 4, "lv2 effect unit count");
+    anyhow::ensure!(app.cables.len() == 4, "lv2 effect cable count");
+    // Instrument rig: Keys→LV2→Master = 3 units, 2 cables (1 MIDI + 1 audio).
+    app.add_lv2_instrument("http://example.org/lv2/osc", "TEST OSC");
+    anyhow::ensure!(app.units.len() == 3, "lv2 instrument unit count");
+    anyhow::ensure!(app.cables.len() == 2, "lv2 instrument cable count");
+    anyhow::ensure!(app.keys_unit.is_some() && app.master_unit.is_some(), "lv2 instrument keys/master");
+    let n_midi = app.cables.iter().filter(|c| c.kind == PortKind::Midi).count();
+    let n_audio = app.cables.iter().filter(|c| c.kind == PortKind::Audio).count();
+    anyhow::ensure!(n_midi == 1 && n_audio == 1, "lv2 instrument cable kinds (midi={n_midi} audio={n_audio})");
+    println!("  lv2 browser: effect 4u/4c, instrument 3u/2c (1 MIDI + 1 audio) — OK");
+
     // Demo patch must still load after the templates.
     app.load_demo_patch();
     anyhow::ensure!(app.units.len() == 6 && app.cables.len() == 8, "demo patch not restored after templates");
 
     let _ = std::fs::remove_dir_all(&dir);
-    println!("session-test: OK — capture→save→load→restore ({edges} edges, 3 knobs) + 3 templates + demo restore");
+    println!("session-test: OK — capture→save→load→restore ({edges} edges, 3 knobs) + 3 templates + lv2 browser + demo restore");
     Ok(())
 }
 

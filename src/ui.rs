@@ -936,6 +936,8 @@ struct DemoApp {
     /// bus → Master out. Owns the per-rig vol/pan/mute/solo (2026-11-15, user:
     /// "volume of the rigs at the top doesn't make sense").
     show_mixer: bool,
+    /// Last frame's MIDI-matrix block width (table + legend), for centering.
+    matrix_block_w: f32,
     /// Last frame's stage rect (rack/matrix/mixer area) and assistant panel
     /// rect — the hint and the rack must stay inside the stage.
     stage_rect: Rect,
@@ -1114,6 +1116,7 @@ impl DemoApp {
             rig_levels: Vec::new(),
             show_matrix: false,
             show_mixer: false,
+            matrix_block_w: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
             assistant_input_h: 56.0,
@@ -5138,11 +5141,14 @@ impl DemoApp {
                             .show(ui, |ui| {
                                 // Center the table in the sheet while it fits
                                 // (a top-left huddle left the sheet empty — review).
-                                let cols = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst).count();
-                                let table_w = 150.0 + cols as f32 * 140.0;
+                                // Centered on the block's MEASURED width (table +
+                                // legend, last frame) — an estimate of the table
+                                // alone left the block visibly right of center.
+                                let block_w = if self.matrix_block_w > 0.0 { self.matrix_block_w } else { 600.0 };
                                 ui.horizontal_top(|ui| {
-                                    ui.add_space(((grid_w - table_w) / 2.0).max(0.0));
-                                    ui.vertical(|ui| { ui.add_space(12.0); self.matrix_grid_ui(ui); });
+                                    ui.add_space(((grid_w - block_w) / 2.0).max(0.0));
+                                    let r = ui.vertical(|ui| { ui.add_space(12.0); self.matrix_grid_ui(ui); }).response.rect;
+                                    self.matrix_block_w = r.width();
                                 });
                             });
                     });
@@ -7814,6 +7820,24 @@ mod rig_switch_tests {
         assert!(app.playing, "Space is still master play");
         assert!(app.stage_rect.top() + 40.0 <= app.xf.rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(app.rack_w, app.rack_h))).top() + 0.5,
             "the rack sits below the stage margin, no masthead gap needed");
+    }
+
+    #[test]
+    fn matrix_block_is_centered_in_its_sheet() {
+        let (mut app, ctx) = two_rigs();
+        app.show_matrix = true;
+        for _ in 0..4 { frame(&mut app, &ctx, vec![]); }
+        // The grid's widgets (cells) and the measured block: equal margins.
+        let block_w = app.matrix_block_w;
+        assert!(block_w > 200.0, "measured: {block_w}");
+        let cells: Vec<Rect> = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+            .filter(|w| w.sense.senses_click() && (w.rect.width() - 68.0).abs() < 1.0 && (w.rect.height() - 32.0).abs() < 1.0)
+            .map(|w| w.rect).collect());
+        assert!(!cells.is_empty(), "matrix cells found");
+        let sheet_mid = app.stage_rect.center().x;
+        let block_left = cells.iter().map(|r| r.left()).fold(f32::MAX, f32::min) - 120.0 - 20.0; // label col + spacing
+        let block_mid = block_left + block_w / 2.0;
+        assert!((block_mid - sheet_mid).abs() < 60.0, "block centered: mid {block_mid} vs sheet {sheet_mid}");
     }
 
     #[test]

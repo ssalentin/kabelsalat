@@ -2886,7 +2886,7 @@ impl DemoApp {
     fn matrix_rows(&self) -> Vec<(MatrixRow, String, f32)> {
         let mut rows: Vec<(MatrixRow, String, f32)> = vec![
             (MatrixRow::Keys, "Keyboard".into(), self.keyboard_led()),
-            (MatrixRow::HwAll, "All hardware".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
+            (MatrixRow::HwAll, "All Hardware".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
         ];
         for (d, name) in self.hw_devices.iter().enumerate() {
             rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
@@ -3306,10 +3306,18 @@ impl DemoApp {
                                         ui.add_space(2.0);
                                         // A quiet close glyph (tab-close idiom), not a second
                                         // chip: frameless, dim, full-size hit area (rule 7).
-                                        let del = egui::Button::new(egui::RichText::new("×").size(14.0).color(theme::INK_2))
-                                            .frame(false)
-                                            .min_size(egui::vec2(22.0, 22.0));
-                                        if ui.add(del).on_hover_text(format!("Delete {name}… (asks first)")).clicked() {
+                                        // Icon button: quiet at rest; on hover a filled hit
+                                        // area + danger-tinted glyph (clear remove affordance).
+                                        let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                                        let hov = dresp.hovered();
+                                        if hov {
+                                            ui.painter().rect_filled(dr, 3.0, theme::DARK_PANEL_HI);
+                                            ui.painter().rect_stroke(dr, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        ui.painter().text(dr.center(), egui::Align2::CENTER_CENTER, "×", FontId::proportional(15.0),
+                                            if hov { theme::CLIP_BRIGHT } else { theme::INK_2 });
+                                        if dresp.on_hover_text(format!("Delete {name}… (asks first)")).clicked() {
                                             self.confirm_delete_rig = Some(rig);
                                         }
                                     }
@@ -4971,7 +4979,9 @@ impl DemoApp {
                         }
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
-                        && self.split_rects(ui).map_or(false, |(chip, _)| chip.contains(l.to_pos2())) => {
+                        && self.split_rects(ui).map_or(false, |(chip, field)| chip.contains(l.to_pos2())
+                            // Unsplit, "SPLIT · OFF" is ONE control: the OFF part toggles too.
+                            || (self.shown_split(ui).is_none() && field.contains(l.to_pos2()))) => {
                         // Keys-face SPLIT chip: split at C4 / unsplit.
                         let next = if self.units[ui].split.is_some() { None } else { Some(DEFAULT_SPLIT) };
                         self.set_keys_split(ui, next);
@@ -5521,12 +5531,17 @@ impl DemoApp {
         let Some((chip, readout)) = self.split_rects(unit) else { return };
         let point = self.shown_split(unit);
         let hov_chip = self.face_hovered(painter, unit, chip);
-        self.paint_face_chip(painter, chip, "SPLIT", point.is_some(), hov_chip);
-        // One control: a shared hairline frame around chip + state field.
+        // Unsplit: ONE chip "SPLIT · OFF" across both slots (click = split).
+        // Split: the lit SPLIT chip + the draggable note field, in a shared frame.
+        if point.is_none() {
+            let whole = chip.union(readout);
+            let hov = hov_chip || self.face_hovered(painter, unit, readout);
+            self.paint_face_chip(painter, whole, "SPLIT · OFF", false, hov);
+            return;
+        }
+        self.paint_face_chip(painter, chip, "SPLIT", true, hov_chip);
         let frame = chip.union(readout).expand(2.0);
         painter.rect_stroke(self.xf.rect(frame), 3.0, Stroke::new(1.0, theme::HAIRLINE_DARK), egui::StrokeKind::Inside);
-        // The readout always shows the state (vision review: a lone chip
-        // left "is it split?" ambiguous): the split note, or a dim "off".
         match point {
             Some(p) => {
                 let dragging = matches!(self.drag, Drag::Split { unit: du, .. } if du == unit);
@@ -6212,13 +6227,13 @@ fn typing(ctx: &egui::Context) -> bool {
 /// focus (rule 12), so rig shortcuts keep working after a drag.
 /// Pan readout: "C" at center, else the side and amount ("L 0.30").
 fn pan_text(v: f32) -> String {
-    if v.abs() < 0.005 { "C".into() } else if v < 0.0 { format!("L {:.2}", -v) } else { format!("R {:.2}", v) }
+    if v.abs() < 0.005 { "C 0.00".into() } else if v < 0.0 { format!("L {:.2}", -v) } else { format!("R {:.2}", v) }
 }
 
 /// Inverse of [`pan_text`] (also accepts plain numbers).
 fn parse_pan(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.eq_ignore_ascii_case("c") { return Some(0.0); }
+    if t.eq_ignore_ascii_case("c") || t.to_ascii_lowercase().starts_with("c ") { return Some(0.0); }
     if let Some(r) = t.strip_prefix(['L', 'l']) { return r.trim().parse::<f64>().ok().map(|v| -v.abs()); }
     if let Some(r) = t.strip_prefix(['R', 'r']) { return r.trim().parse::<f64>().ok().map(f64::abs); }
     t.parse().ok()
@@ -7748,7 +7763,7 @@ mod rig_switch_tests {
 
     #[test]
     fn pan_reads_as_a_side_and_round_trips() {
-        assert_eq!(pan_text(0.0), "C");
+        assert_eq!(pan_text(0.0), "C 0.00");
         assert_eq!(pan_text(-0.3), "L 0.30");
         assert_eq!(pan_text(1.0), "R 1.00");
         for v in [-1.0f32, -0.3, 0.0, 0.42, 1.0] {
@@ -8566,6 +8581,20 @@ mod split_bpm_tests {
         assert!(app.cables.iter().any(|c| c.src == k && c.src_port == 0 && c.dying < 0.0), "LOW cable kept");
         assert!(app.patch_notice.as_ref().map_or(false, |(m, _)| m.contains("HIGH")), "notice explains the unplug");
         frame(&mut app, &ctx, vec![]); // dying HIGH cable still animates without its jack
+    }
+
+    #[test]
+    fn unsplit_off_half_is_part_of_the_one_split_control() {
+        let (mut app, ctx) = demo();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        frame(&mut app, &ctx, vec![]);
+        let (_, off_half) = app.split_rects(keys(&app)).unwrap();
+        { let p = screen(&app, off_half); click(&mut app, &ctx, p); }
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        assert!(sent.iter().any(|c| matches!(c, Command::SetNodeSplit { node: 0, point: Some(60) })),
+            "clicking the OFF half of \"SPLIT · OFF\" splits: {sent:?}");
     }
 
     #[test]

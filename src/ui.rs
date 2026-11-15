@@ -210,6 +210,8 @@ struct Unit {
     /// Rig tag from the control-plane node (merge_rigs). The big view shows
     /// one rig at a time; single-graph mode is all-rig-0.
     rig: u8,
+    /// LV2 instrument (vs effect) — matrix sink column. Classified in build_rack.
+    lv2_inst: bool,
     node_kind: UnitKind,
     name: String,
     sub: String,
@@ -267,6 +269,23 @@ fn unit_time_mul(u: &Unit) -> f32 {
     match &u.node_kind {
         UnitKind::Dsp(DspKind::Delay) => 0.55 + knob_val(u, P_TIME, 0.4) * 1.3,
         _ => 1.0,
+    }
+}
+
+/// One row of the hot-wire MIDI matrix (PLAN §13): a MIDI source that can
+/// feed any instrument rig. `HwAll` = any hardware device (omni).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MatrixRow { Keys, Laptop, HwAll, HwDev(u32) }
+
+/// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
+/// filter/device binding (mirrors engine::source_accepted + keys_gate).
+fn clap_cell(src: (bool, bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
+    if !gate { return false; }
+    match row {
+        MatrixRow::Keys => src.0,
+        MatrixRow::Laptop => src.1,
+        MatrixRow::HwAll => src.2 && dev.is_none(),
+        MatrixRow::HwDev(d) => src.2 && dev == Some(d),
     }
 }
 
@@ -407,6 +426,7 @@ fn make_unit(node: &Node) -> Unit {
     Unit {
         node_id: node.id,
         rig: node.rig,
+        lv2_inst: false,
         node_kind,
         name,
         sub,
@@ -671,6 +691,10 @@ struct DemoApp {
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
     rig_levels: Vec<f32>,
+    /// Hot-wire MIDI matrix window (PLAN §13).
+    show_matrix: bool,
+    /// Per-hardware-device activity LEDs for the matrix row headers.
+    hw_leds: Vec<f32>,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
@@ -798,6 +822,8 @@ impl DemoApp {
             current_source: SourceId::Keys,
             active_rig: 0,
             rig_levels: Vec::new(),
+            show_matrix: false,
+            hw_leds: Vec::new(),
             had_kb_focus: true,
             rig_sources: [(true, true, true); 2],
             split_on: false,
@@ -900,6 +926,16 @@ impl DemoApp {
         self.base_graph = graph.clone();
         for node in &graph.nodes {
             self.units.push(make_unit(node));
+        }
+        // Classify LV2 instruments (hot-wire matrix sink columns). Rare
+        // structural op: the discovery scan runs only when LV2 nodes exist.
+        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
+            let infos = lv2_discover();
+            for u in &mut self.units {
+                if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
+                    u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+                }
+            }
         }
         // Size the rect slots before adding cables (add_cable_id reads them to
         // seed the spring rest shape; layout() fills real rects on frame 1).
@@ -1160,7 +1196,7 @@ impl DemoApp {
         // dark-panel "orange highlighted phrases" (§4.16).
         let body = "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
              F7 Ambient Pad / F8 demo / F4 multi-rig — each loads a playable rack\n\
-             F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
+             F9 Plugins · F11 MIDI matrix — browse plugins / hot-wire sources→rigs\n\
              Space / F10        metronome Play·Stop · Transport window sets BPM\n\
              Tab                flip the rack · front = perform, back = patch\n\
              double-click synth open its embedded editor inline · × closes\n\
@@ -1762,6 +1798,53 @@ impl DemoApp {
                     None => format!("rig {node} listens to any hardware device"),
                 }
             }
+            "get_matrix" => {
+                let sinks: Vec<serde_json::Value> = self.matrix_sinks().iter().map(|&s| {
+                    let u = &self.units[s];
+                    let gate = self.midi_cable_to(s).is_some();
+                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
+                    let rig = self.rig_of_unit(s).unwrap_or(0);
+                    let src = self.rig_sources.get(rig).copied().unwrap_or((true, true, true));
+                    let dev = self.rig_device.get(rig).copied().flatten();
+                    let cell = |row: MatrixRow| if is_clap { clap_cell(src, dev, gate, row) } else { gate };
+                    serde_json::json!({
+                        "node": u.node_id, "name": u.name, "rig": u.rig,
+                        "kind": if is_clap { "clap" } else { "lv2" },
+                        "midi_cable": gate,
+                        "keys": cell(MatrixRow::Keys),
+                        "laptop": cell(MatrixRow::Laptop),
+                        "hw_all": cell(MatrixRow::HwAll),
+                        "hw_devices": (0..self.hw_devices.len())
+                            .map(|d| cell(MatrixRow::HwDev(d as u32))).collect::<Vec<_>>(),
+                    })
+                }).collect();
+                serde_json::json!({
+                    "sources": ["keys", "laptop", "hw_all", "hw:<device index>"],
+                    "hw_devices": self.hw_devices,
+                    "split": self.split_on,
+                    "sinks": sinks,
+                }).to_string()
+            }
+            "set_matrix_cell" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("keys");
+                let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+                let Some(inst) = self.units.iter().position(|u| u.node_id == node) else {
+                    return format!("no unit with node id {node}");
+                };
+                let row = match source {
+                    "keys" => MatrixRow::Keys,
+                    "laptop" => MatrixRow::Laptop,
+                    "hw_all" => MatrixRow::HwAll,
+                    s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
+                        Ok(d) => MatrixRow::HwDev(d),
+                        Err(_) => return format!("bad source '{source}'"),
+                    },
+                    _ => return format!("unknown source '{source}' (keys|laptop|hw_all|hw:<d>)"),
+                };
+                self.matrix_toggle(inst, row, on);
+                format!("matrix cell {source} → node {node} = {on}")
+            }
             "list_plugins" => {
                 let clap = crate::host::list_clap_plugins();
                 let lv2 = crate::lv2::discover();
@@ -2015,6 +2098,174 @@ impl DemoApp {
         }
     }
 
+    // -- hot-wire MIDI matrix (PLAN §13) ------------------------------------
+
+    /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments).
+    fn matrix_sinks(&self) -> Vec<usize> {
+        self.units.iter().enumerate()
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The Keys unit belonging to a rig tag (each rig carries its own Keys
+    /// after LoadRigs; single-graph patches have exactly one).
+    fn keys_unit_for_rig(&self, tag: u8) -> Option<usize> {
+        self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Keys) && u.rig == tag)
+    }
+
+    /// Live MIDI cable from any Keys unit into this instrument's MIDI in.
+    fn midi_cable_to(&self, inst: usize) -> Option<usize> {
+        self.cables.iter().position(|c| {
+            c.dying < 0.0 && c.kind == PortKind::Midi && c.dst == inst
+                && matches!(self.units.get(c.src).map(|u| &u.node_kind), Some(UnitKind::Keys))
+        })
+    }
+
+    /// Hot-wire: plug the rig's Keys → instrument MIDI cable if missing.
+    fn ensure_midi_cable(&mut self, inst: usize) {
+        if self.midi_cable_to(inst).is_some() { return; }
+        let tag = self.units.get(inst).map(|u| u.rig).unwrap_or(0);
+        if let Some(k) = self.keys_unit_for_rig(tag) {
+            self.add_cable(k, 0, inst, 0, PortKind::Midi, 0);
+        }
+    }
+
+    /// Toggle one matrix cell live. CLAP columns map to the engine's source
+    /// filters + device binding (SetRigSource/SetRigDevice); LV2 instrument
+    /// columns are gated by the MIDI cable alone. Turning a cell ON also
+    /// hot-wires the MIDI cable if it was unplugged.
+    fn matrix_toggle(&mut self, inst: usize, row: MatrixRow, on: bool) {
+        let is_clap = matches!(self.units.get(inst).map(|u| &u.node_kind), Some(UnitKind::Clap));
+        if !is_clap {
+            // LV2 instrument: the cable IS the route.
+            if on { self.ensure_midi_cable(inst); }
+            else if let Some(ci) = self.midi_cable_to(inst) { self.unplug_cable(ci, true); }
+            return;
+        }
+        let Some(rig) = self.rig_of_unit(inst) else { return };
+        if rig >= self.rig_sources.len() { return; } // beyond the voice pool
+        if on { self.ensure_midi_cable(inst); }
+        let node = self.units[inst].node_id;
+        {
+            let s = &mut self.rig_sources[rig];
+            let d = &mut self.rig_device[rig];
+            match row {
+                MatrixRow::Keys => s.0 = on,
+                MatrixRow::Laptop => s.1 = on,
+                MatrixRow::HwAll => { s.2 = on; if on { *d = None; } }
+                MatrixRow::HwDev(dev) => {
+                    if on { s.2 = true; *d = Some(dev); }
+                    else if *d == Some(dev) { s.2 = false; }
+                }
+            }
+        }
+        self.send_rig_source(node);
+        if matches!(row, MatrixRow::HwAll | MatrixRow::HwDev(_)) {
+            let device = self.rig_device[rig];
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+            }
+        }
+    }
+
+    /// The hot-wire MIDI matrix window: sources × instrument rigs, live.
+    /// Hurricane language: paper sheet, hairline grid, teal = routed.
+    fn matrix_window(&mut self, ctx: &egui::Context) {
+        if !self.show_matrix { return; }
+        let mut open = self.show_matrix;
+        let sinks = self.matrix_sinks();
+        let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
+        egui::Window::new(egui::RichText::new("MIDI matrix").font(theme::medium_font(16.0)).color(theme::INK))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.set_min_width(560.0);
+                ui.label(egui::RichText::new("any source → any rig · cells hot-wire live (MIDI cable + source filter)")
+                    .size(12.0).color(theme::INK_2));
+                ui.add_space(6.0);
+                if sinks.is_empty() {
+                    ui.label(egui::RichText::new("no instruments in the patch — add a rig first").size(12.0).color(theme::INK_2));
+                    return;
+                }
+                let mut rows: Vec<(MatrixRow, String, f32)> = vec![
+                    (MatrixRow::Keys, "On-screen keys".into(), self.key_leds.iter().cloned().fold(0.0f32, f32::max)),
+                    (MatrixRow::Laptop, "Laptop keys".into(), self.key_leds.iter().cloned().fold(0.0f32, f32::max)),
+                    (MatrixRow::HwAll, "Hardware: all".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
+                ];
+                for (d, name) in self.hw_devices.iter().enumerate() {
+                    rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
+                        self.hw_leds.get(d).copied().unwrap_or(0.0)));
+                }
+                egui::Grid::new("midi_matrix_grid").num_columns(sinks.len() + 1).spacing([10.0, 6.0]).show(ui, |ui| {
+                    // Header: sink names + rig tags + cable state.
+                    theme::section_label(ui, "Source");
+                    for &s in &sinks {
+                        let u = &self.units[s];
+                        let gate = self.midi_cable_to(s).is_some();
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new(sentence_case(&u.name)).font(theme::medium_font(13.0)).color(theme::INK));
+                            ui.label(egui::RichText::new(format!("rig {} · midi {}", (b'A' + u.rig.min(25)) as char, if gate { "in ✓" } else { "unplugged" }))
+                                .size(10.0).color(if gate { theme::LIVE_TEAL_DEEP } else { theme::INK_2 }));
+                        });
+                    }
+                    ui.end_row();
+                    for (row, label, led) in &rows {
+                        // Row header with activity dot.
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                            ui.painter().circle_filled(r.center(), 3.0,
+                                theme::alpha(theme::LIVE_TEAL, 0.25 + 0.75 * led.clamp(0.0, 1.0)));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
+                        });
+                        for &s in &sinks {
+                            let u = &self.units[s];
+                            let is_clap = matches!(u.node_kind, UnitKind::Clap);
+                            let gate = self.midi_cable_to(s).is_some();
+                            let on = if is_clap {
+                                let rig = self.rig_of_unit(s).unwrap_or(0);
+                                let src = self.rig_sources.get(rig).copied().unwrap_or((true, true, true));
+                                let dev = self.rig_device.get(rig).copied().flatten();
+                                clap_cell(src, dev, gate, *row)
+                            } else {
+                                gate // LV2: the cable is the route (all sources)
+                            };
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 22.0), egui::Sense::click());
+                            let p = ui.painter();
+                            let cell = rect.shrink(3.0);
+                            if on {
+                                p.rect_filled(cell, 4.0, theme::LIVE_TEAL);
+                            } else {
+                                p.rect_stroke(cell, 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                            }
+                            if resp.hovered() {
+                                p.rect_stroke(rect.shrink(1.0), 5.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() { toggles.push((s, *row, !on)); }
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                let split_txt = if self.split_on {
+                    "Split @ C4 active — low zone → first rig, high zone → second (toggle in the top strip)"
+                } else {
+                    "Full keyboard to every routed rig · split toggle in the top strip"
+                };
+                ui.label(egui::RichText::new(split_txt).size(11.0).color(theme::INK_2));
+                if !self.hw_devices.is_empty() {
+                    ui.label(egui::RichText::new("Hardware rows are a radio group per rig: one device, all devices, or off.")
+                        .size(11.0).color(theme::INK_2));
+                }
+            });
+        self.show_matrix = open;
+        for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
+    }
+
     /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
     /// when >1 rig is loaded. Per rig: number-key hint, name, bound MIDI device,
     /// live level; the active rig gets the reference's tomato underline. Click
@@ -2179,6 +2430,12 @@ impl DemoApp {
                     ui.add_space(6.0);
                     if nav_button(ui, "Transport", self.show_transport || self.playing) {
                         self.show_transport = !self.show_transport;
+                    }
+                    ui.add_space(6.0);
+                    nav_separator(ui);
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Matrix", self.show_matrix) {
+                        self.show_matrix = !self.show_matrix;
                     }
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("which sources feed each rig").size(12.0).color(theme::INK_2));
@@ -2799,6 +3056,9 @@ impl DemoApp {
             let cur = self.rig_levels[r];
             self.rig_levels[r] = if target > cur { target } else { cur + (target - cur) * (1.0 - (-dt / 0.25).exp()) };
         }
+        // Matrix row activity: per-hardware-device LEDs, fast decay.
+        if self.hw_leds.len() != self.hw_devices.len() { self.hw_leds.resize(self.hw_devices.len(), 0.0); }
+        for l in &mut self.hw_leds { *l *= (-dt / 0.18).exp(); }
 
         let mut n_arrivals = 0usize;
         for ci in 0..self.cables.len() {
@@ -3099,6 +3359,10 @@ impl DemoApp {
             // Transport / metronome popover (task-19).
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.show_transport = !self.show_transport;
+            }
+            // Hot-wire MIDI matrix (PLAN §13).
+            if i.consume_key(Modifiers::NONE, Key::F11) {
+                self.show_matrix = !self.show_matrix;
             }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
@@ -4117,6 +4381,9 @@ impl eframe::App for DemoApp {
         for ev in hw {
             // Hardware input latency: arrival (midir callback) → UI drain (task-23).
             crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
+            if let SourceId::Hardware(d) = ev.source {
+                if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
+            }
             let semi = ev.note as usize;
             self.current_source = ev.source;
             self.fire_keys(semi, ev.velocity);
@@ -4211,6 +4478,7 @@ impl eframe::App for DemoApp {
         self.sessions_window(&ctx);
         self.plugins_window(&ctx);
         self.transport_window(&ctx);
+        self.matrix_window(&ctx);
         self.param_editor_window(&ctx);
 
         ctx.request_repaint();
@@ -4613,5 +4881,107 @@ mod multi_rig_ui_tests {
         let held: Vec<_> = app.held_keys.drain(..).collect();
         for (_, semi) in held { app.fire_keys(semi, 0.0); }
         assert!(app.held_keys.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod matrix_ui_tests {
+    use super::*;
+
+    #[test]
+    fn clap_cell_state_table() {
+        let all = (true, true, true);
+        // Cable gate dominates everything.
+        for row in [MatrixRow::Keys, MatrixRow::Laptop, MatrixRow::HwAll, MatrixRow::HwDev(0)] {
+            assert!(!clap_cell(all, None, false, row));
+        }
+        // Defaults: keys/laptop/omni-hw on, specific device off.
+        assert!(clap_cell(all, None, true, MatrixRow::Keys));
+        assert!(clap_cell(all, None, true, MatrixRow::Laptop));
+        assert!(clap_cell(all, None, true, MatrixRow::HwAll));
+        assert!(!clap_cell(all, None, true, MatrixRow::HwDev(0)));
+        // Device-bound rig: only that device.
+        assert!(!clap_cell(all, Some(1), true, MatrixRow::HwAll));
+        assert!(clap_cell(all, Some(1), true, MatrixRow::HwDev(1)));
+        assert!(!clap_cell(all, Some(1), true, MatrixRow::HwDev(0)));
+        // Hardware off.
+        assert!(!clap_cell((true, true, false), None, true, MatrixRow::HwAll));
+        assert!(!clap_cell((true, true, false), Some(0), true, MatrixRow::HwDev(0)));
+        // Source flags independent.
+        assert!(!clap_cell((false, true, true), None, true, MatrixRow::Keys));
+        assert!(clap_cell((false, true, true), None, true, MatrixRow::Laptop));
+    }
+
+    fn demo_app() -> DemoApp {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        app
+    }
+
+    #[test]
+    fn matrix_sinks_are_the_instruments() {
+        let app = demo_app();
+        let sinks = app.matrix_sinks();
+        assert_eq!(sinks.len(), 2); // one Surge per rig
+        for s in sinks {
+            assert!(matches!(app.units[s].node_kind, UnitKind::Clap));
+        }
+    }
+
+    #[test]
+    fn each_rig_has_its_own_keys_unit() {
+        let app = demo_app();
+        let k0 = app.keys_unit_for_rig(0).unwrap();
+        let k1 = app.keys_unit_for_rig(1).unwrap();
+        assert_ne!(k0, k1);
+    }
+
+    #[test]
+    fn toggling_cell_on_hot_wires_missing_cable() {
+        let mut app = demo_app();
+        let inst = app.matrix_sinks()[0];
+        // Unplug the rig's MIDI cable, then route Keys via the matrix.
+        let ci = app.midi_cable_to(inst).expect("demo wires Keys→Surge");
+        app.unplug_cable(ci, true);
+        assert!(app.midi_cable_to(inst).is_none());
+        app.matrix_toggle(inst, MatrixRow::Keys, true);
+        assert!(app.midi_cable_to(inst).is_some(), "cell-on must hot-wire the cable");
+        assert!(app.rig_sources[0].0);
+    }
+
+    #[test]
+    fn hardware_rows_are_a_radio_group() {
+        let mut app = demo_app();
+        let inst = app.matrix_sinks()[0];
+        // Bind device 0.
+        app.matrix_toggle(inst, MatrixRow::HwDev(0), true);
+        assert_eq!(app.rig_device[0], Some(0));
+        assert!(app.rig_sources[0].2);
+        // Switch to omni.
+        app.matrix_toggle(inst, MatrixRow::HwAll, true);
+        assert_eq!(app.rig_device[0], None);
+        assert!(app.rig_sources[0].2);
+        // Bind device 1, then click it off → hardware off.
+        app.matrix_toggle(inst, MatrixRow::HwDev(1), true);
+        assert_eq!(app.rig_device[0], Some(1));
+        app.matrix_toggle(inst, MatrixRow::HwDev(1), false);
+        assert!(!app.rig_sources[0].2);
+        // Keys/laptop untouched by the hw radio.
+        assert!(app.rig_sources[0].0 && app.rig_sources[0].1);
+    }
+
+    #[test]
+    fn get_matrix_tool_reports_state() {
+        let mut app = demo_app();
+        let out = app.exec_tool("get_matrix", &serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["sinks"].as_array().unwrap().len(), 2);
+        assert_eq!(v["sinks"][0]["keys"], serde_json::json!(true));
+        // Hot-wire a cell through the assistant tool.
+        let node = v["sinks"][1]["node"].as_u64().unwrap();
+        let out = app.exec_tool("set_matrix_cell", &serde_json::json!({"node": node, "source": "laptop", "on": false}));
+        assert!(out.contains("= false"));
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
+        assert_eq!(v["sinks"][1]["laptop"], serde_json::json!(false));
     }
 }

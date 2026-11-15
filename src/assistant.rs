@@ -232,6 +232,16 @@ fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"device":{"type":"integer"}},"required":["node"]}
         }},
         {"type":"function","function":{
+            "name":"get_matrix",
+            "description":"Read the hot-wire MIDI matrix: sources (keys, laptop, hw_all, hw:<device index>) x instrument sinks, with per-cell routing state, MIDI cable gate, hardware device list and split state.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_matrix_cell",
+            "description":"Hot-wire one MIDI matrix cell live: route a source to an instrument rig (or unroute). Turning on also plugs the MIDI cable if missing. source: keys | laptop | hw_all | hw:<device index>. Hardware rows are a radio group per rig (one device, all, or off).",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"on":{"type":"boolean"}},"required":["node","source","on"]}
+        }},
+        {"type":"function","function":{
             "name":"list_plugins",
             "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
             "parameters":{"type":"object","properties":{}}

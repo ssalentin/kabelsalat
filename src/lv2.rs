@@ -71,6 +71,17 @@ struct Lv2UridMap {
     map: extern "C" fn(*mut c_void, *const c_char) -> u32,
 }
 
+/// LV2_OPTIONS__options entry (lv2/ext/options). Array is zero-terminated.
+#[repr(C)]
+struct Lv2Option {
+    context: u32,
+    subject: u32,
+    key: u32,
+    size: u32,
+    ty: u32,
+    value: *const c_void,
+}
+
 /// Host-side URID map: assigns a stable u32 to each URI string.
 struct UridMap {
     map: std::collections::HashMap<String, u32>,
@@ -232,15 +243,31 @@ pub fn host_test() -> anyhow::Result<()> {
 
         // Host URID-map feature (most plugins require it for atom/option URIs).
         let mut urid = UridMap { map: std::collections::HashMap::new(), next: 1 };
-        let map_data = Lv2UridMap {
-            handle: &mut urid as *mut UridMap as *mut c_void,
-            map: urid_map_cb,
-        };
+        let handle = &mut urid as *mut UridMap as *mut c_void;
+        let map_data = Lv2UridMap { handle, map: urid_map_cb };
         let map_feature = Lv2Feature {
             uri: b"http://lv2plug.in/ns/ext/urid#map\0".as_ptr() as *const c_char,
             data: &map_data as *const Lv2UridMap as *mut c_void,
         };
-        let features: [*const Lv2Feature; 2] = [&map_feature, std::ptr::null()];
+
+        // Options feature: sampleRate + maxBlockLength (Carla et al. require it).
+        let map_uri = |s: &[u8]| urid_map_cb(handle, s.as_ptr() as *const c_char);
+        let sr_key = map_uri(b"http://lv2plug.in/ns/lv2core#sampleRate\0");
+        let bl_key = map_uri(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0");
+        let float_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Float\0");
+        let int_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Int\0");
+        let sample_rate_val: f32 = 48000.0;
+        let block_len_val: i32 = 256;
+        let options = [
+            Lv2Option { context: 0, subject: 0, key: sr_key, size: 4, ty: float_ty, value: &sample_rate_val as *const f32 as *const c_void },
+            Lv2Option { context: 0, subject: 0, key: bl_key, size: 4, ty: int_ty, value: &block_len_val as *const i32 as *const c_void },
+            Lv2Option { context: 0, subject: 0, key: 0, size: 0, ty: 0, value: std::ptr::null() },
+        ];
+        let options_feature = Lv2Feature {
+            uri: b"http://lv2plug.in/ns/ext/options#options\0".as_ptr() as *const c_char,
+            data: options.as_ptr() as *mut c_void,
+        };
+        let features: [*const Lv2Feature; 3] = [&map_feature, &options_feature, std::ptr::null()];
 
         // Try several simple audio plugins until one instantiates.
         let candidates = ["audiogain_s", "audiogain", "amp", "gx_amp", "fluida", "simple"];

@@ -32,6 +32,44 @@ pub fn name_str(n: &Name) -> &str {
     std::str::from_utf8(&n[..end]).unwrap_or("?")
 }
 
+/// An LV2 plugin URI — longer than `Name`, stored in a fixed 128-byte buffer
+/// and (de)serialized as a string so graphs/sessions stay self-contained.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Lv2Uri(pub [u8; 128]);
+
+impl Lv2Uri {
+    pub fn new(s: &str) -> Self {
+        let mut b = [0u8; 128];
+        let bytes = s.as_bytes();
+        let len = bytes.len().min(127);
+        b[..len].copy_from_slice(&bytes[..len]);
+        Self(b)
+    }
+    pub fn as_str(&self) -> &str {
+        let end = self.0.iter().position(|&c| c == 0).unwrap_or(self.0.len());
+        std::str::from_utf8(&self.0[..end]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Debug for Lv2Uri {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lv2Uri({})", self.as_str())
+    }
+}
+
+impl Serialize for Lv2Uri {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Lv2Uri {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Ok(Lv2Uri::new(&s))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DspKind {
     Gain,
@@ -52,6 +90,8 @@ pub enum NodeKind {
     Clap { plugin_id: Name },
     /// Built-in processing node.
     Dsp(DspKind),
+    /// Hosted LV2 plugin (audio effect), identified by URI.
+    Lv2 { uri: Lv2Uri },
     /// Desktop playback capture (P2).
     SystemAudio,
     /// Stereo output bus.

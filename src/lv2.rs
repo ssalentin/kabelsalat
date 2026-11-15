@@ -377,6 +377,11 @@ pub struct Lv2Plugin {
     uri: String,
 }
 
+// SAFETY: the lilv world/instance raw pointers are created on the main thread
+// (load) and thereafter only touched on the audio thread (process/Drop), never
+// concurrently. This is the standard plugin-host pattern (cf. ClapVoice).
+unsafe impl Send for Lv2Plugin {}
+
 impl Lv2Plugin {
     /// Load the first plugin whose URI contains `needle`, instantiate it with
     /// urid-map + options features, classify ports, and connect buffers.

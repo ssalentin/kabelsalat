@@ -93,6 +93,8 @@ struct AddNodeArgs {
     dsp: Option<String>,
     /// For kind "clap": CLAP plugin id (defaults to Surge XT).
     plugin_id: Option<String>,
+    /// For kind "lv2": the LV2 plugin URI (see list_plugins).
+    uri: Option<String>,
 }
 
 /// Arguments for `remove_node`.
@@ -306,6 +308,13 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
         }
         "system_audio" => Ok(NodeKind::SystemAudio),
         "master_out" => Ok(NodeKind::MasterOut),
+        "lv2" => {
+            let uri = args
+                .uri
+                .as_deref()
+                .ok_or_else(|| "kind 'lv2' requires the 'uri' field".to_string())?;
+            Ok(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(uri) })
+        }
         other => Err(format!("unknown node kind '{other}'")),
     }
 }
@@ -351,6 +360,7 @@ fn graph_json(g: &Graph) -> Value {
                     json!({"type": "clap", "plugin_id": name_str(plugin_id)})
                 }
                 NodeKind::Dsp(k) => json!({"type": "dsp", "dsp": dsp_kind_str(k)}),
+                NodeKind::Lv2 { uri } => json!({"type": "lv2", "uri": uri.as_str()}),
                 NodeKind::SystemAudio => json!({"type": "system_audio"}),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
             };
@@ -448,6 +458,12 @@ impl McpServer {
             NodeKind::Keys => "KEYS".into(),
             NodeKind::Clap { .. } => "CLAP".into(),
             NodeKind::Dsp(k) => dsp_kind_str(k).to_ascii_uppercase(),
+            NodeKind::Lv2 { uri } => uri
+                .as_str()
+                .rsplit(['/', '#'])
+                .next()
+                .unwrap_or("LV2")
+                .to_ascii_uppercase(),
             NodeKind::SystemAudio => "SYSTEM AUDIO".into(),
             NodeKind::MasterOut => "MASTER OUT".into(),
         });

@@ -358,6 +358,12 @@ fn make_unit(node: &Node) -> Unit {
                 vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
             )
         }
+        NodeKind::Lv2 { .. } => (
+            UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(), GREEN,
+            vec![PortKind::Audio], vec![PortKind::Audio],
+            vec![knob("GAIN", 0.9, Some(0))],
+            vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
+        ),
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(), GREEN,
             vec![], vec![PortKind::Audio],

@@ -112,12 +112,38 @@ struct DspSlot {
     buf: Vec<f32>,
 }
 
+struct Lv2Slot {
+    node: NodeId,
+    plugin: crate::lv2::Lv2Plugin,
+    buf: Vec<f32>,
+}
+
+/// Load an LV2 plugin instance for every Lv2 node (rare structural op).
+fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sample_rate, 8192) {
+                Ok(plugin) => Some(Lv2Slot { node: n.id, plugin, buf: vec![0.0; 8192 * 2] }),
+                Err(e) => {
+                    eprintln!("lv2 node {}: {e}", n.id);
+                    None
+                }
+            },
+            _ => None,
+        })
+        .collect()
+}
+
 pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
     sample_rate: f64,
     voices: Vec<VoiceSlot>,
     dsp: Vec<DspSlot>,
+    lv2: Vec<Lv2Slot>,
+    lv2_in: Vec<f32>,
     keys_node: Option<NodeId>,
     master_vol: f32,
     master_warm: f32,
@@ -172,6 +198,7 @@ impl GraphEngine {
                 _ => None,
             })
             .collect();
+        let lv2 = build_lv2_slots(&graph, sample_rate);
         // Default routing: every source class feeds every rig (full range).
         // SetSplit later narrows key ranges per rig, in place (RT-safe).
         let mut matrix = Matrix::new();
@@ -191,6 +218,8 @@ impl GraphEngine {
             sample_rate,
             voices,
             dsp,
+            lv2,
+            lv2_in: vec![0.0; 8192 * 2],
             keys_node,
             master_vol: 0.8,
             master_warm: 0.15,
@@ -283,6 +312,7 @@ impl GraphEngine {
                         _ => None,
                     })
                     .collect();
+                self.lv2 = build_lv2_slots(&self.graph, sr);
                 // Remap existing CLAP voices onto the new Clap nodes in id order;
                 // surplus voices go idle (sentinel node id, never routed).
                 let clap_ids: Vec<NodeId> = self
@@ -424,6 +454,21 @@ impl GraphEngine {
             d.proc.process(&mut d.buf[..n2], frames);
         }
 
+        // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
+        for slot in &mut self.lv2 {
+            for x in self.lv2_in[..n2].iter_mut() {
+                *x = 0.0;
+            }
+            for v in &self.voices {
+                if self.graph.has_route(v.node, slot.node, PortKind::Audio) {
+                    for i in 0..n2 {
+                        self.lv2_in[i] += v.scratch[i];
+                    }
+                }
+            }
+            slot.plugin.process(&self.lv2_in[..n2], &mut slot.buf[..n2], frames);
+        }
+
         // 3. Master sums everything wired to it.
         // Pull system-audio capture once per block (RT-safe ring pop).
         let sys = self.system_gain > 0.0 && self.system_capture.is_some();
@@ -454,6 +499,12 @@ impl GraphEngine {
                     if self.graph.has_route(d.node, master, PortKind::Audio) {
                         l += d.buf[i * 2];
                         r += d.buf[i * 2 + 1];
+                    }
+                }
+                for slot in &self.lv2 {
+                    if self.graph.has_route(slot.node, master, PortKind::Audio) {
+                        l += slot.buf[i * 2];
+                        r += slot.buf[i * 2 + 1];
                     }
                 }
                 if sys {
@@ -576,4 +627,48 @@ mod tests {
         assert_eq!(dsp_native_param(&DspKind::Delay, super::P_TIME), Some(0));
         assert_eq!(dsp_native_param(&DspKind::Delay, super::P_MIX), Some(2));
     }
+}
+
+/// End-to-end LV2 engine test: Keys → Surge → LV2 effect → Master, render and
+/// verify audio flows through the hosted LV2 node.
+pub fn lv2_engine_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, voice)]);
+
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(
+        NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+        name_bytes("SYNTH"),
+    );
+    let lv2 = g.add_node(
+        NodeKind::Lv2 { uri: Lv2Uri::new("http://kxstudio.sf.net/carla/plugins/audiogain_s") },
+        name_bytes("LV2 GAIN"),
+    );
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: lv2, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: lv2, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+    bus.send(Command::LoadGraph { graph: g });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut peak = 0.0f32;
+    for _ in 0..30 {
+        engine.render(&mut buf, 2);
+        for &s in &buf {
+            peak = peak.max(s.abs());
+        }
+    }
+    anyhow::ensure!(peak > 1e-4, "no audio through the LV2 engine path (peak {peak})");
+    println!("lv2-engine-test: OK — Keys→Surge→LV2→Master rendered 30 blocks, peak {peak:.4}");
+    Ok(())
 }

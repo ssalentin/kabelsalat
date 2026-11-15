@@ -373,6 +373,11 @@ pub struct Lv2Plugin {
     audio_out: Vec<usize>,
     control_in: Vec<usize>,
     control_ranges: Vec<(f32, f32)>,
+    // MIDI/atom instrument support.
+    atom_in: Option<usize>,
+    atom_buf: Vec<u8>,
+    urid_sequence: u32,
+    urid_midi: u32,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
     block: usize,
@@ -427,12 +432,17 @@ impl Lv2Plugin {
             let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
             let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
             let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
+            let atom_class = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+            let urid_sequence = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/atom#Sequence\0".as_ptr() as *const c_char);
+            let urid_midi = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/midi#MidiEvent\0".as_ptr() as *const c_char);
             let nports = lilv_plugin_get_num_ports(plugin);
             let mut buffers: Vec<Vec<f32>> = (0..nports).map(|_| vec![0.0f32; block]).collect();
             let mut audio_in = Vec::new();
             let mut audio_out = Vec::new();
             let mut control_in = Vec::new();
             let mut control_ranges = Vec::new();
+            let mut atom_in: Option<usize> = None;
+            let mut atom_buf = vec![0u8; 4096];
             let desc = &*(*instance).lv2_descriptor;
             let h = (*instance).lv2_handle;
             let connect_port = desc.connect_port.expect("no connect_port");
@@ -440,7 +450,14 @@ impl Lv2Plugin {
                 let port = lilv_plugin_get_port_by_index(plugin, i);
                 let is_audio = lilv_port_is_a(plugin, port, audio);
                 let is_control = lilv_port_is_a(plugin, port, control);
+                let is_atom = lilv_port_is_a(plugin, port, atom_class);
                 let is_in = lilv_port_is_a(plugin, port, input);
+                if is_atom && is_in {
+                    atom_in = Some(i as usize);
+                    init_atom_sequence(&mut atom_buf, urid_sequence);
+                    connect_port(h, i, atom_buf.as_mut_ptr() as *mut c_void);
+                    continue;
+                }
                 if is_audio && is_in {
                     audio_in.push(i as usize);
                 } else if is_audio && !is_in {
@@ -462,11 +479,13 @@ impl Lv2Plugin {
             lilv_node_free(audio);
             lilv_node_free(control);
             lilv_node_free(input);
-            anyhow::ensure!(!audio_in.is_empty() && !audio_out.is_empty(), "{uri} has no audio in/out");
+            lilv_node_free(atom_class);
+            anyhow::ensure!(!audio_out.is_empty(), "{uri} has no audio output");
+            anyhow::ensure!(!audio_in.is_empty() || atom_in.is_some(), "{uri} has no audio/atom input");
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, _urid: urid, _map_data: map_data, block, uri })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, atom_in, atom_buf, urid_sequence, urid_midi, _urid: urid, _map_data: map_data, block, uri })
         }
     }
 
@@ -485,6 +504,25 @@ impl Lv2Plugin {
         if let (Some(&port), Some(&(lo, hi))) = (self.control_in.get(nth), self.control_ranges.get(nth)) {
             let v = lo + (hi - lo) * value.clamp(0.0, 1.0);
             self.buffers[port][0] = v;
+        }
+    }
+
+    /// True if this is an instrument (atom/MIDI input + audio output).
+    pub fn is_instrument(&self) -> bool {
+        self.atom_in.is_some() && !self.audio_out.is_empty()
+    }
+
+    /// Send a MIDI note-on to the atom input (frame 0 of the next block).
+    pub fn note_on(&mut self, note: u8, velocity: u8) {
+        if self.atom_in.is_some() {
+            write_midi_event(&mut self.atom_buf, self.urid_sequence, self.urid_midi, 0, &[0x90, note, velocity]);
+        }
+    }
+
+    /// Send a MIDI note-off to the atom input.
+    pub fn note_off(&mut self, note: u8) {
+        if self.atom_in.is_some() {
+            write_midi_event(&mut self.atom_buf, self.urid_sequence, self.urid_midi, 0, &[0x80, note, 0]);
         }
     }
 
@@ -557,5 +595,83 @@ pub fn voice_test() -> anyhow::Result<()> {
         println!("lv2-voice-test: knob control verified (control sweep {peak_min:.4} ↔ {peak_max:.4})");
     }
     println!("lv2-voice-test: OK — reusable Lv2Plugin '{}' processed 256 frames, peak {peak:.4}", plugin.uri());
+    Ok(())
+}
+
+/// Initialize an atom:Sequence buffer as empty (time unit = audio frames).
+fn init_atom_sequence(buf: &mut [u8], seq_urid: u32) {
+    buf[0..4].copy_from_slice(&8u32.to_le_bytes()); // atom.size = unit+pad only
+    buf[4..8].copy_from_slice(&seq_urid.to_le_bytes()); // atom.type = Sequence
+    buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // body.unit = 0 (frames)
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // body.pad
+}
+
+/// Write a single MIDI event into an atom:Sequence at `frame` (8-byte aligned,
+/// per the LV2 atom spec). Resets the sequence to hold just this event.
+fn write_midi_event(buf: &mut [u8], seq_urid: u32, midi_urid: u32, frame: i64, midi: &[u8]) {
+    let data_len = midi.len();
+    let padded = (16 + data_len + 7) & !7; // event header(16) + data, padded
+    buf[0..4].copy_from_slice(&(8 + padded as u32).to_le_bytes()); // atom.size
+    buf[4..8].copy_from_slice(&seq_urid.to_le_bytes());
+    buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
+    let e = 16;
+    for b in &mut buf[e..e + padded] {
+        *b = 0;
+    }
+    buf[e..e + 8].copy_from_slice(&frame.to_le_bytes()); // time.frames
+    buf[e + 8..e + 12].copy_from_slice(&(data_len as u32).to_le_bytes()); // body.size
+    buf[e + 12..e + 16].copy_from_slice(&midi_urid.to_le_bytes()); // body.type
+    buf[e + 16..e + 16 + data_len].copy_from_slice(midi); // MIDI bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atom_midi_event_format() {
+        let mut buf = vec![0u8; 256];
+        let (seq, midi) = (42u32, 43u32);
+        init_atom_sequence(&mut buf, seq);
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 8); // empty
+        write_midi_event(&mut buf, seq, midi, 0, &[0x90, 60, 100]);
+        // atom.size = 8 + pad(16+3=19 → 24) = 32
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 32);
+        assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), seq);
+        // event at offset 16: time.frames = 0
+        assert_eq!(i64::from_le_bytes(buf[16..24].try_into().unwrap()), 0);
+        // body.size = 3, body.type = MidiEvent URID
+        assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(buf[28..32].try_into().unwrap()), midi);
+        // MIDI payload
+        assert_eq!(&buf[32..35], &[0x90, 60, 100]);
+    }
+}
+
+/// Instrument-detection self-test: load LV2 instruments and confirm atom-port
+/// classification (is_instrument) and MIDI write path.
+pub fn instrument_test() -> anyhow::Result<()> {
+    let candidates = ["multisampler_x12", "multisampler", "oscillator", "synth"];
+    let mut found = 0;
+    for c in candidates {
+        match Lv2Plugin::load(c, 48000.0, 256) {
+            Ok(p) => {
+                println!(
+                    "  {} — instrument={} controls={} atom={}",
+                    p.uri(),
+                    p.is_instrument(),
+                    p.control_count(),
+                    p.atom_in.is_some()
+                );
+                if p.is_instrument() {
+                    found += 1;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    anyhow::ensure!(found > 0, "no LV2 instrument detected among candidates");
+    println!("lv2-instrument-test: OK — {found} LV2 instrument(s) detected with atom/MIDI input");
     Ok(())
 }

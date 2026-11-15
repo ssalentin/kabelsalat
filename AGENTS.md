@@ -138,6 +138,11 @@ Learned so far (2026-11-15, UI polish pass):
     `render_max_us`/`render_late` before touching BUFFER_FRAMES (now 256).
 30. **Meters have a noise floor:** smoothed levels never reach 0 — light
     segments via `lit_segments` (< 0.001 = dark), never a raw `ceil`.
+31. **Sound never waits for a UI frame:** input that makes sound (hardware
+    MIDI) goes to the engine bus from its own thread (`HwDirect`); the UI
+    frame only animates it (`fire_keys_with(.., send=false)`). Throttling
+    repaints must never add input latency. Live check:
+    `KABELSALAT_MIDI_THROUGH=1` + `aseqsend -p 14:0 90 3C 64`.
 
 ## Ground rules
 

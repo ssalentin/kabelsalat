@@ -198,6 +198,41 @@ pub struct NoteEvent {
     pub created: std::time::Instant,
 }
 
+/// Hardware MIDI → engine from the midir thread (see `DemoApp::hw_direct`).
+/// Same mapping as the note sink: velocity scaled by the Keys VEL knob
+/// (published lock-free by the UI), velocity 0 = NoteOff.
+struct HwDirect {
+    bus: Mutex<Option<Arc<Mutex<CommandBus>>>>,
+    /// Keys VEL knob as f32 bits (starts at the knob's 0.8 default).
+    keys_vel: std::sync::atomic::AtomicU32,
+}
+
+impl Default for HwDirect {
+    fn default() -> Self {
+        Self { bus: Mutex::new(None), keys_vel: std::sync::atomic::AtomicU32::new(0.8f32.to_bits()) }
+    }
+}
+
+impl HwDirect {
+    fn set_keys_vel(&self, v: f32) { self.keys_vel.store(v.to_bits(), Ordering::Relaxed); }
+
+    /// Send one hardware note to the engine. False when no engine is attached
+    /// (the UI frame then sounds it through the note sink).
+    fn send(&self, ev: &NoteEvent) -> bool {
+        let Ok(guard) = self.bus.lock() else { return false };
+        let Some(bus) = guard.as_ref() else { return false };
+        let kv = f32::from_bits(self.keys_vel.load(Ordering::Relaxed));
+        let cmd = if ev.velocity > 0.0 {
+            Command::NoteOn { note: ev.note, velocity: (ev.velocity * (0.35 + kv * 0.65)).clamp(0.0, 1.0), source: ev.source }
+        } else {
+            Command::NoteOff { note: ev.note, source: ev.source }
+        };
+        let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
+        crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
+        ok
+    }
+}
+
 /// Sink for [`NoteEvent`]s. `Send` so the engine can move it to its own thread.
 pub type NoteSink = Box<dyn FnMut(NoteEvent) + Send>;
 
@@ -928,7 +963,13 @@ struct DemoApp {
     octave: u8,
     held_keys: Vec<(Key, usize)>,
     note_offs: Vec<(std::time::Instant, usize)>,
-    hw_queue: Arc<Mutex<VecDeque<NoteEvent>>>,
+    /// Hardware notes for the UI (key LEDs, cable pulses). `true` = the MIDI
+    /// thread already sent it to the engine (`hw_direct`), so the frame only
+    /// animates it.
+    hw_queue: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    /// Hardware MIDI → engine straight from the midir thread: sound never
+    /// waits for a UI frame (16 ms focused, 33 ms when throttled unfocused).
+    hw_direct: Arc<HwDirect>,
     _hw_conns: Vec<midir::MidiInputConnection<()>>,
     hw_status: String,
     /// Connected hardware MIDI device names, indexed by device id.
@@ -1073,6 +1114,7 @@ impl DemoApp {
             held_keys: Vec::new(),
             note_offs: Vec::new(),
             hw_queue: Arc::new(Mutex::new(VecDeque::new())),
+            hw_direct: Arc::new(HwDirect::default()),
             _hw_conns: Vec::new(),
             hw_status: String::new(),
             hw_devices: Vec::new(),
@@ -1108,8 +1150,11 @@ impl DemoApp {
         if let Ok(probe) = MidiInput::new("kabelsalat-probe") {
             for port in probe.ports() {
                 let name = probe.port_name(&port).unwrap_or_default();
+                // KABELSALAT_MIDI_THROUGH=1 accepts the kernel's Midi Through
+                // port — a hardware-path self-test feed (aseqsend -p 14:0).
+                let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
                 if name.contains("kabelsalat")
-                    || name.contains("Midi Through")
+                    || (name.contains("Midi Through") && !through_ok)
                     || name == "System"
                     || name == "Announce"
                 {
@@ -1117,6 +1162,7 @@ impl DemoApp {
                 }
                 if let Ok(mi) = MidiInput::new("kabelsalat-hw") {
                     let q = app.hw_queue.clone();
+                    let direct = app.hw_direct.clone();
                     let dev = dev_idx;
                     if let Ok(conn) = mi.connect(
                         &port,
@@ -1126,8 +1172,10 @@ impl DemoApp {
                                 let st = msg[0] & 0xF0;
                                 if st == 0x90 || st == 0x80 {
                                     let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
+                                    let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
+                                    let sounded = direct.send(&ev);
                                     if let Ok(mut q) = q.lock() {
-                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() });
+                                        q.push_back((ev, sounded));
                                         while q.len() > 256 {
                                             q.pop_front();
                                         }
@@ -1794,6 +1842,7 @@ impl DemoApp {
         self._surge_main = mains;
         self.surge_controllers = controllers;
         self._audio_stream = Some(stream);
+        if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         self.bus = Some(bus);
         self.out_level = Some(level);
         self.surge_status = "Surge XT loaded — play!".into();
@@ -3763,7 +3812,10 @@ impl DemoApp {
         self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).unwrap_or(0)
     }
 
-    fn fire_keys(&mut self, semitone: usize, amp: f32) {
+    fn fire_keys(&mut self, semitone: usize, amp: f32) { self.fire_keys_with(semitone, amp, true); }
+
+    /// `send = false`: visuals only (the note already reached the engine).
+    fn fire_keys_with(&mut self, semitone: usize, amp: f32, send: bool) {
         // VEL knob scales keyboard velocity (note-offs pass through at 0).
         let ki = self.keys_idx();
         let vel = self.units.get(ki).and_then(|u| u.knobs.get(1)).map(|k| k.value).unwrap_or(0.8);
@@ -3781,6 +3833,7 @@ impl DemoApp {
                 c.spawn_pulse(0.0, amp);
             }
         }
+        if !send { return; }
         if let Some(sink) = &mut self.note_sink {
             sink(NoteEvent { note: semitone.min(127) as u8, velocity: amp.clamp(0.0, 1.0), source: self.current_source, created: std::time::Instant::now() });
         }
@@ -6234,21 +6287,25 @@ impl DemoApp {
             }
         }
 
-        // Hardware MIDI → fire_keys (sound + cable animation in sync).
-        let hw: Vec<NoteEvent> = self
+        // Hardware MIDI: the midir thread already sounded it (hw_direct);
+        // the frame animates keys + cables. Publish the VEL knob it scales by.
+        self.hw_direct.set_keys_vel(self.units.get(self.keys_idx()).and_then(|u| u.knobs.get(1)).map(|k| k.value).unwrap_or(0.8));
+        let hw: Vec<(NoteEvent, bool)> = self
             .hw_queue
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
-        for ev in hw {
-            // Hardware input latency: arrival (midir callback) → UI drain (task-23).
-            crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
+        for (ev, sounded) in hw {
+            if !sounded {
+                // No engine on the direct path: arrival → UI drain is the latency.
+                crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
+            }
             if let SourceId::Hardware(d) = ev.source {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             let semi = ev.note as usize;
             self.current_source = ev.source;
-            self.fire_keys(semi, ev.velocity);
+            self.fire_keys_with(semi, ev.velocity, !sounded);
         }
 
         let rect = ui.available_rect_before_wrap();
@@ -7565,6 +7622,36 @@ mod rig_switch_tests {
         assert_eq!(lit_segments(0.01, 14), 1, "real signal lights the first segment");
         assert_eq!(lit_segments(0.5, 14), 7);
         assert_eq!(lit_segments(3.0, 14), 14, "clipped input stays in range");
+    }
+
+    #[test]
+    fn hardware_notes_reach_the_engine_without_a_ui_frame() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (tx, mut drain) = crate::control::command_bus();
+        let bus = Arc::new(Mutex::new(tx));
+        if let Ok(mut b) = app.hw_direct.bus.lock() { *b = Some(bus.clone()); }
+        app.hw_direct.set_keys_vel(0.0); // a real 0.0 knob, not "unset"
+        let on = NoteEvent { note: 60, velocity: 1.0, source: SourceId::Hardware(2), created: std::time::Instant::now() };
+        assert!(app.hw_direct.send(&on), "sounded on the MIDI thread");
+        let off = NoteEvent { velocity: 0.0, ..on };
+        assert!(app.hw_direct.send(&off));
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        assert!(matches!(sent[0], Command::NoteOn { note: 60, source: SourceId::Hardware(2), velocity } if (velocity - 0.35).abs() < 1e-6),
+            "VEL 0.0 scales to 0.35 like the UI path: {:?}", sent[0]);
+        assert!(matches!(sent[1], Command::NoteOff { note: 60, .. }));
+        // The UI frame then only animates it — no second NoteOn.
+        app.bus = Some(bus);
+        app.hw_queue.lock().unwrap().push_back((on, true));
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let mut again = Vec::new();
+        drain.drain(|c| again.push(c));
+        assert!(!again.iter().any(|c| matches!(c, Command::NoteOn { .. })), "not sounded twice: {again:?}");
+        assert!(app.key_leds[0] > 0.3, "but the key still lights (after one frame of decay): {}", app.key_leds[0]);
     }
 
     #[test]

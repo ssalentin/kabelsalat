@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{
-    split_port, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind,
-    RigSnapshot,
+    name_str, split_port, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId,
+    PortKind, RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
@@ -333,6 +333,9 @@ pub struct GraphEngine {
     player_sink: Option<PlayerSink>,
     player_gain: f32,
     player_buf: Vec<f32>,
+    // Runtime CLAP voice delivery + retirement side channels (UI <-> audio).
+    voice_rx: Option<rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>>,
+    voice_retire_tx: Option<rtrb::Producer<ClapVoice>>,
 }
 
 impl GraphEngine {
@@ -342,20 +345,22 @@ impl GraphEngine {
         graph: Graph,
         drain: CommandDrain,
         sample_rate: f64,
-        voices: Vec<(NodeId, ClapVoice)>,
+        voices_in: Vec<(NodeId, ClapVoice)>,
     ) -> Self {
-        let voices: Vec<VoiceSlot> = voices
-            .into_iter()
-            .map(|(node, voice)| VoiceSlot {
-                node,
-                voice,
-                level: 0.85,
-                scratch: vec![0.0; 8192 * 2],
-                src_keys: true,
-                src_hw: true,
-                rig_device: None,
-            })
-            .collect();
+        let mut voices: Vec<VoiceSlot> = Vec::with_capacity(32);
+        voices.extend(
+            voices_in
+                .into_iter()
+                .map(|(node, voice)| VoiceSlot {
+                    node,
+                    voice,
+                    level: 0.85,
+                    scratch: vec![0.0; 8192 * 2],
+                    src_keys: true,
+                    src_hw: true,
+                    rig_device: None,
+                }),
+        );
         let dsp = graph
             .nodes
             .iter()
@@ -413,7 +418,19 @@ impl GraphEngine {
             player_sink: None,
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
+            voice_rx: None,
+            voice_retire_tx: None,
         }
+    }
+
+    /// Attach runtime CLAP voice delivery + retirement ring buffers.
+    pub fn set_voice_channels(
+        &mut self,
+        rx: rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>,
+        retire_tx: rtrb::Producer<ClapVoice>,
+    ) {
+        self.voice_rx = Some(rx);
+        self.voice_retire_tx = Some(retire_tx);
     }
 
     /// Attach a system-audio capture source (started off the audio thread).
@@ -583,8 +600,20 @@ impl GraphEngine {
                         }
                         Err(e) => eprintln!("lv2 node {id}: {e}"),
                     },
-                    // CLAP voices are main-thread-only; added clap nodes join the
-                    // graph but sound via LoadGraph's voice remap, not here.
+                    NodeKind::Clap { plugin_id } => {
+                        self.matrix.connect(SourceId::Keys, id);
+                        for dev in 0..MAX_HW_DEVICES {
+                            self.matrix.connect(SourceId::Hardware(dev), id);
+                        }
+                        let pid = name_str(plugin_id);
+                        if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX && v.voice.plugin_id() == pid) {
+                            v.node = id;
+                        } else if pid.is_empty() || pid == "Surge XT" {
+                            if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX) {
+                                v.node = id;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 self.publish_graph();
@@ -593,6 +622,11 @@ impl GraphEngine {
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
                 self.lv2.retain(|s| s.node != id);
+                for s in &mut self.voices {
+                    if s.node == id {
+                        s.node = u32::MAX;
+                    }
+                }
                 self.publish_graph();
             }
             Command::Connect { id, from, to, kind } => {
@@ -639,6 +673,16 @@ impl GraphEngine {
                     }
                 }
             }
+            Command::LoadLv2Preset { node, preset_uri } => {
+                if let Some(NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
+                    let presets = crate::lv2::discover_presets(uri.as_str());
+                    if let Some(preset) = presets.iter().find(|p| p.uri == preset_uri) {
+                        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                            s.plugin.apply_preset(preset);
+                        }
+                    }
+                }
+            }
             Command::LoadGraph { graph } => {
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
@@ -655,18 +699,31 @@ impl GraphEngine {
                     })
                     .collect();
                 self.lv2 = build_lv2_slots(&self.graph, sr);
-                // Remap existing CLAP voices onto the new Clap nodes in id order;
-                // surplus voices go idle (sentinel node id, never routed).
-                let clap_ids: Vec<NodeId> = self
+                // Remap existing CLAP voices onto the new Clap nodes by matching
+                // plugin_id (falling back to any idle Surge voice for legacy
+                // "Surge XT" / empty ids); unmatched voices go idle (u32::MAX).
+                let clap_nodes: Vec<(NodeId, String)> = self
                     .graph
                     .nodes
                     .iter()
-                    .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
-                    .map(|n| n.id)
+                    .filter_map(|n| match &n.kind {
+                        NodeKind::Clap { plugin_id } => Some((n.id, name_str(plugin_id).to_string())),
+                        _ => None,
+                    })
                     .collect();
-                for (i, v) in self.voices.iter_mut().enumerate() {
-                    v.node = clap_ids.get(i).copied().unwrap_or(u32::MAX);
+                for v in &mut self.voices {
+                    v.node = u32::MAX;
                 }
+                for (id, pid) in &clap_nodes {
+                    if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX && v.voice.plugin_id() == pid) {
+                        v.node = *id;
+                    } else if pid.is_empty() || pid == "Surge XT" {
+                        if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX) {
+                            v.node = *id;
+                        }
+                    }
+                }
+                let clap_ids: Vec<NodeId> = clap_nodes.iter().map(|(id, _)| *id).collect();
                 self.matrix = Matrix::new();
                 self.matrix.reserve(64);
                 for &id in &clap_ids {
@@ -904,6 +961,38 @@ impl GraphEngine {
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
         }
+        // Attach any runtime-loaded CLAP voices delivered from the UI thread.
+        while let Some(rx) = self.voice_rx.as_mut() {
+            let Ok((node, voice, scratch)) = rx.pop() else { break };
+            if let Some(slot) = self.voices.iter_mut().find(|s| s.node == node) {
+                let old = std::mem::replace(&mut slot.voice, voice);
+                if let Some(tx) = self.voice_retire_tx.as_mut() {
+                    let _ = tx.push(old);
+                }
+            } else if self.voices.len() < self.voices.capacity() {
+                self.voices.push(VoiceSlot {
+                    node,
+                    voice,
+                    level: 0.85,
+                    scratch,
+                    src_keys: true,
+                    src_hw: true,
+                    rig_device: None,
+                });
+            } else if let Some(slot) = self.voices.iter_mut().find(|s| s.node == u32::MAX) {
+                slot.node = node;
+                slot.level = 0.85;
+                slot.src_keys = true;
+                slot.src_hw = true;
+                slot.rig_device = None;
+                let old = std::mem::replace(&mut slot.voice, voice);
+                if let Some(tx) = self.voice_retire_tx.as_mut() {
+                    let _ = tx.push(old);
+                }
+            } else if let Some(tx) = self.voice_retire_tx.as_mut() {
+                let _ = tx.push(voice);
+            }
+        }
         // Mixer publication: a fixed-size copy under a NON-blocking lock
         // (never waits on the UI; retried next block if it is busy).
         if self.mix_dirty {
@@ -1017,64 +1106,85 @@ impl GraphEngine {
                 let g = if m.mute || (any_solo && !m.solo) { 0.0 } else { m.vol };
                 gains[mi] = (g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt());
             }
+            // Reuse `lv2_in` (unused after step 2b) as the stereo mix bus so
+            // route checks happen once per node per block, not per sample.
+            let acc = &mut self.lv2_in[..n2];
+            for x in acc.iter_mut() {
+                *x = 0.0;
+            }
+            for mi in 0..n_masters {
+                let master = masters[mi];
+                let (gl, gr) = gains[mi];
+                if gl == 0.0 && gr == 0.0 { continue; } // muted: skip the work
+                for v in &self.voices {
+                    if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
+                        continue;
+                    }
+                    if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
+                        for i in 0..frames {
+                            let m = v.scratch[i * 2]; // mono in: center to both
+                            acc[i * 2] += m * gl;
+                            acc[i * 2 + 1] += m * gr;
+                        }
+                    } else {
+                        for i in 0..frames {
+                            acc[i * 2] += v.scratch[i * 2] * gl;
+                            acc[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
+                        }
+                    }
+                }
+                for d in &self.dsp {
+                    if !self.graph.has_route(d.node, master, PortKind::Audio) {
+                        continue;
+                    }
+                    if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
+                        for i in 0..frames {
+                            let m = d.buf[i * 2];
+                            acc[i * 2] += m * gl;
+                            acc[i * 2 + 1] += m * gr;
+                        }
+                    } else {
+                        for i in 0..frames {
+                            acc[i * 2] += d.buf[i * 2] * gl;
+                            acc[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
+                        }
+                    }
+                }
+                for slot in &self.lv2 {
+                    if !self.graph.has_route(slot.node, master, PortKind::Audio) {
+                        continue;
+                    }
+                    if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
+                        for i in 0..frames {
+                            let m = slot.buf[i * 2];
+                            acc[i * 2] += m * gl;
+                            acc[i * 2 + 1] += m * gr;
+                        }
+                    } else {
+                        for i in 0..frames {
+                            acc[i * 2] += slot.buf[i * 2] * gl;
+                            acc[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
+                        }
+                    }
+                }
+            }
+            if sys {
+                let g = self.system_gain;
+                for i in 0..n2 {
+                    acc[i] += self.system_buf[i] * g;
+                }
+            }
+            if ply {
+                let g = self.player_gain;
+                for i in 0..n2 {
+                    acc[i] += self.player_buf[i] * g;
+                }
+            }
+            let drive = 1.0 + self.master_warm * 3.0;
+            let vol = self.master_vol;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
-                let mut l = 0.0f32;
-                let mut r = 0.0f32;
-                for mi in 0..n_masters {
-                    let master = masters[mi];
-                    let (gl, gr) = gains[mi];
-                    if gl == 0.0 && gr == 0.0 { continue; } // muted: skip the work
-                    let mut ml = 0.0f32;
-                    let mut mr = 0.0f32;
-                    for v in &self.voices {
-                        if self.graph.has_route(v.node, master, PortKind::Audio) {
-                            if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
-                                let m = v.scratch[i * 2]; // mono in: center to both
-                                ml += m;
-                                mr += m;
-                            } else {
-                                ml += v.scratch[i * 2];
-                                mr += v.scratch[i * 2 + 1];
-                            }
-                        }
-                    }
-                    for d in &self.dsp {
-                        if self.graph.has_route(d.node, master, PortKind::Audio) {
-                            if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
-                                let m = d.buf[i * 2];
-                                ml += m;
-                                mr += m;
-                            } else {
-                                ml += d.buf[i * 2];
-                                mr += d.buf[i * 2 + 1];
-                            }
-                        }
-                    }
-                    for slot in &self.lv2 {
-                        if self.graph.has_route(slot.node, master, PortKind::Audio) {
-                            if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
-                                let m = slot.buf[i * 2];
-                                ml += m;
-                                mr += m;
-                            } else {
-                                ml += slot.buf[i * 2];
-                                mr += slot.buf[i * 2 + 1];
-                            }
-                        }
-                    }
-                    l += ml * gl;
-                    r += mr * gr;
-                }
-                if sys {
-                    l += self.system_buf[i * 2] * self.system_gain;
-                    r += self.system_buf[i * 2 + 1] * self.system_gain;
-                }
-                if ply {
-                    l += self.player_buf[i * 2] * self.player_gain;
-                    r += self.player_buf[i * 2 + 1] * self.player_gain;
-                }
-                l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
-                r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
+                let l = (acc[i * 2] * drive).tanh() * vol;
+                let r = (acc[i * 2 + 1] * drive).tanh() * vol;
                 peak = peak.max(l.abs()).max(r.abs());
                 frame[0] = l;
                 if ch > 1 {

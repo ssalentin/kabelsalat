@@ -19,6 +19,9 @@ pub fn config_path() -> std::path::PathBuf {
 }
 
 pub fn load_key() -> Option<String> {
+    // Tests never read the user's key: every DemoApp would start a worker
+    // that calls the real API (and its threads aborted the test binary at exit).
+    if cfg!(test) { return None; }
     let s = std::fs::read_to_string(config_path()).ok()?;
     let v: Value = serde_json::from_str(&s).ok()?;
     v.get("deepseek_api_key")?
@@ -28,14 +31,35 @@ pub fn load_key() -> Option<String> {
 }
 
 pub fn save_key(key: &str) -> std::io::Result<()> {
+    save_config_field("deepseek_api_key", key)
+}
+
+/// Default chat model when none is stored.
+pub const DEFAULT_MODEL: &str = "deepseek-chat";
+
+/// The stored assistant model (config `assistant_model`), else the default.
+pub fn load_model() -> String {
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("assistant_model").and_then(|m| m.as_str()).map(str::to_string))
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| DEFAULT_MODEL.into())
+}
+
+/// Merge one string field into config.json (mode 0600) — never drops the
+/// other fields (writing the key used to overwrite the whole file).
+pub fn save_config_field(field: &str, value: &str) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); } // tests never touch the user's real config
     let p = config_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(
-        &p,
-        serde_json::to_string_pretty(&json!({ "deepseek_api_key": key })).unwrap(),
-    )?;
+    let mut v: Value = std::fs::read_to_string(&p).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|v: &Value| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    v[field] = json!(value);
+    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -56,6 +80,8 @@ pub enum ToWorker {
 }
 
 pub enum FromWorker {
+    /// Chat models the API key can use (GET /models), fetched once at start.
+    Models(Vec<String>),
     Text(String),
     ToolCall { id: String, name: String, args: Value },
     Done,
@@ -66,6 +92,12 @@ pub struct Assistant {
     pub history: Vec<ChatLine>,
     pub busy: bool,
     pub key_set: bool,
+    /// Current chat model, read by the worker on every request — switching
+    /// takes effect with the next message, the conversation is kept.
+    model: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Models offered by the API (filled by the worker; a sane default list
+    /// until it answers).
+    pub models: Vec<String>,
     tx: Option<Sender<ToWorker>>,
     rx: Option<Receiver<FromWorker>>,
 }
@@ -77,6 +109,8 @@ impl Assistant {
             history: Vec::new(),
             busy: false,
             key_set: key.is_some(),
+            model: std::sync::Arc::new(std::sync::Mutex::new(load_model())),
+            models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
             tx: None,
             rx: None,
         };
@@ -96,7 +130,18 @@ impl Assistant {
         let (tx_out, rx_out) = channel::<FromWorker>();
         self.tx = Some(tx_in);
         self.rx = Some(rx_out);
-        std::thread::spawn(move || worker(key, rx_in, tx_out));
+        let model = self.model.clone();
+        std::thread::spawn(move || worker(key, model, rx_in, tx_out));
+    }
+
+    pub fn model(&self) -> String {
+        self.model.lock().map(|m| m.clone()).unwrap_or_else(|_| DEFAULT_MODEL.into())
+    }
+
+    /// Switch the chat model (persisted; applies from the next request).
+    pub fn set_model(&mut self, m: &str) {
+        if let Ok(mut cur) = self.model.lock() { *cur = m.to_string(); }
+        let _ = save_config_field("assistant_model", m);
     }
 
     pub fn send_user(&mut self, text: String) {
@@ -107,6 +152,16 @@ impl Assistant {
         self.busy = true;
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::User(text));
+        }
+    }
+
+    /// Show `shown` in the transcript but send `sent` (e.g. with a state
+    /// header) to the model.
+    pub fn send_user_display(&mut self, shown: String, sent: String) {
+        self.history.push(ChatLine { role: "user".into(), text: shown });
+        self.busy = true;
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(ToWorker::User(sent));
         }
     }
 
@@ -164,6 +219,19 @@ fn system_prompt() -> String {
      UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
      Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\
+     WHERE TO WORK: every user message starts with a [context: …] line naming \
+     the rig in view and its units. When the user does not name a rig, act on \
+     the rig IN VIEW (load_sound/add_node default to it) — never on another rig, \
+     never ask which rig unless the request is truly ambiguous. Use node ids \
+     from the context or get_graph; do not create a new rig unless asked.\n\
+     STYLE: answer in at most 2-3 short sentences (or a short list) — no \
+     preamble, no recap. Name rigs and units EXACTLY as the app shows them \
+     (e.g. Rig A, Surge B, Delay, Reverb, Master) so the UI can highlight them; \
+     do not use markdown headings.\n\
+     SOUNDS: a new rig or synth starts on Surge's init patch — when the user asks \
+     for an instrument or character (flute, warm pad, 808 bass…), call \
+     load_sound(rig, query) (or add_rig with sound=…); list_sounds(query) browses \
+     the ~3000 installed Surge patches by category/name.\n\
      Be concise and practical. When something is broken, diagnose step by step starting \
      with get_status. Notes: loading a template or adding a plugin rebuilds the current \
      patch; only Surge XT is loadable as a CLAP instrument so far (other CLAP and LV2 \
@@ -305,14 +373,24 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
         }},
         {"type":"function","function":{
+            "name":"list_sounds",
+            "description":"Search the installed Surge patches (factory + 3rd-party, ~3000) by words in category/name, e.g. 'flute', 'pad warm', 'bass'. Returns up to 25 'Category/Name' entries.",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+        }},
+        {"type":"function","function":{
+            "name":"load_sound",
+            "description":"Load a Surge patch into a rig's synth so it really sounds like that instrument (a rig's Surge otherwise plays the init patch). query: words or 'Category/Name' from list_sounds; rig: index from get_rigs (default: the rig in view). Returns the patch that was loaded.",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"}},"required":["query"]}
+        }},
+        {"type":"function","function":{
             "name":"get_rigs",
             "description":"List every rig (all of them, not just the one in view): index, name, MIDI device, units (node ids), mixer vol/pan/mute/solo, plus which rig is in view. Every rig sounds at once; get_graph nodes carry their rig index too.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"add_rig",
-            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. Returns get_rigs.",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C…)"}}}
+            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional patch query loaded into the new rig's Surge (e.g. 'flute'). Returns get_rigs.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C…)"},"sound":{"type":"string","description":"Optional Surge patch query, e.g. 'flute'"}}}
         }},
         {"type":"function","function":{
             "name":"delete_rig",
@@ -342,7 +420,7 @@ pub(crate) fn tools() -> Value {
     ])
 }
 
-fn worker(key: String, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
+fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
@@ -353,6 +431,15 @@ fn worker(key: String, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
             return;
         }
     };
+    // Which models can this key use? (once; the UI falls back to defaults)
+    if let Ok(r) = client.get("https://api.deepseek.com/models").bearer_auth(&key).send() {
+        if let Ok(v) = r.json::<Value>() {
+            let ids: Vec<String> = v.get("data").and_then(|d| d.as_array())
+                .map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect())
+                .unwrap_or_default();
+            if !ids.is_empty() { let _ = tx.send(FromWorker::Models(ids)); }
+        }
+    }
     let mut msgs: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt() })];
     loop {
         let user_text = match rx.recv() {
@@ -362,7 +449,7 @@ fn worker(key: String, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
         msgs.push(json!({ "role": "user", "content": user_text }));
         loop {
             let body = json!({
-                "model": "deepseek-chat",
+                "model": model.lock().map(|m| m.clone()).unwrap_or_else(|_| DEFAULT_MODEL.into()),
                 "messages": msgs,
                 "tools": tools(),
                 "tool_choice": "auto",

@@ -591,6 +591,8 @@ pub enum Command {
     SetNodePlaying { node: NodeId, playing: bool },
     /// Set the metronome tempo (BPM).
     SetBpm { bpm: f32 },
+    /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
+    LoadLv2Preset { node: NodeId, preset_uri: String },
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).

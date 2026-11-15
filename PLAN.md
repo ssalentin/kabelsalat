@@ -549,10 +549,18 @@ Everything queued lives here; update this section as work lands.
 
 ### In progress / next
 
-1. **Dynamic non-Surge CLAP loading** — GitHub #2. Load arbitrary CLAP instruments
-   (today the engine remaps its two startup Surge voices; other CLAP shows "coming
-   soon"). Main-thread instantiation + voice-delivery side channel; design notes in
-   the issue and §0.1.
+1. **Dynamic non-Surge CLAP loading & runtime lifecycle** — GitHub #2. Load arbitrary
+   CLAP instruments and effects (beyond the startup Surge pool):
+   - Two-phase runtime loader (bg `PluginEntry::load` → UI/main-thread `new` +
+     optional pre-`activate` `load_state` + `activate` → command-ring handoff to
+     `GraphEngine::voices`), scanning `CLAP_PATH` + `/usr/lib/clap` + `~/.clap`.
+   - Safe main-thread retirement: audio thread calls `stop_processing()` and
+     returns removed voices via a bounded retirement ring for `deactivate()`/`destroy()`.
+   - Sandboxed out-of-process plugin scanning (`--scan-clap` with timeout).
+   - Audio-thread hardening: `SIGXCPU` overrun guard (`guard_current_thread` +
+     `OVERRUN_REST`), `catch_unwind` around `process()`, `restart_requested`
+     reconfiguration, `clap_event_transport` (BPM/play state) + sorted timestamps,
+     and main-thread `on_main_thread` callback pumping.
 2. **Backing tracks** — GitHub #1. Deck UI + YouTube/URL sources (see backlog).
 
 ### Recently landed

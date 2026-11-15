@@ -2,7 +2,7 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip with vol/pan/mute/solo + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 125 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading, (2) backing tracks (GitHub #1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap; GitHub issues only when explicitly requested (backing tracks = #1).**
+Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip with vol/pan/mute/solo + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 125 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading (#2), (2) backing tracks (#1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap, mirrored as GitHub feature issues #1–#8 (user request 2026-11-15).**
 
 ## 0.1 Session handoff (read me first in a new session)
 
@@ -494,12 +494,11 @@ Everything queued lives here; update this section as work lands.
 
 ### In progress / next
 
-1. **Dynamic non-Surge CLAP loading** — load arbitrary CLAP instruments (today the
-   engine remaps its two startup Surge voices; other CLAP shows "coming soon").
-   Needs main-thread instantiation + a voice-delivery side channel. Dedicated round:
-   parameterize ClapVoice::new by plugin id, async voice delivery to the engine,
-   LoadGraph remap by plugin identity.
-2. **Backing tracks** (GitHub #1) — deck UI + YouTube/URL sources (see backlog).
+1. **Dynamic non-Surge CLAP loading** — GitHub #2. Load arbitrary CLAP instruments
+   (today the engine remaps its two startup Surge voices; other CLAP shows "coming
+   soon"). Main-thread instantiation + voice-delivery side channel; design notes in
+   the issue and §0.1.
+2. **Backing tracks** — GitHub #1. Deck UI + YouTube/URL sources (see backlog).
 
 ### Recently landed
 
@@ -556,21 +555,20 @@ Everything queued lives here; update this section as work lands.
 
 ### Backlog (after the above)
 
-- **Backing tracks: local files, YouTube, URL sources + deck UI** — GitHub issue #1
-  (https://github.com/ssalentin/kabelsalat/issues/1). Engine player exists
-  (src/player.rs, assistant play_file only); needs a deck UI (portal file picker,
-  seek/loop/gain, drag-drop), yt-dlp-backed YouTube/URL audio (optional dependency,
-  ToS posture documented), and a wireable source node. RT discipline: workers +
-  lock-free rings, the existing player is the template.
-- **LV2 instrument audible playback** — routing is verified; confirm sound with a real
-  MIDI synth (installed LV2 instruments are samplers/generators).
-- **MIDI matrix rules: CC maps + MIDI-learn** — cc_map whitelist/bindings exist in the
-  engine; expose them in the rule editor with a learn mode.
-- **Sends / aux buses** — dedicated send controls (free wiring already works).
-- **Recording** — synchronized capture of the master (and per-rig stems).
-- **Tap tempo + count-in** for the metronome.
-- **P4 packaging** — PKGBUILD + `.desktop` + icon, `?` overlay polish, README screenshot
-  (use docs/shots/hurricane-*.png), Omarchy theme accent following.
+- **Backing tracks: local files, YouTube, URL sources + deck UI** — GitHub #1.
+  Engine player exists (src/player.rs, assistant play_file only); needs a deck UI
+  (portal file picker, seek/loop/gain, drag-drop), yt-dlp-backed YouTube/URL audio
+  (optional dependency, ToS posture documented), and a wireable source node. RT
+  discipline: workers + lock-free rings, the existing player is the template.
+- **LV2 instrument audible playback** — GitHub #3. Routing verified; confirm sound
+  with a real MIDI synth; fix the permissive port-based classification if needed.
+- **MIDI matrix: CC maps + MIDI-learn** — GitHub #4. Engine cc_map exists; expose in
+  the rule editor with learn mode; fixed-size/side-channel command design.
+- **Sends / aux buses** — GitHub #5. Dedicated send controls (free wiring already works).
+- **Recording** — GitHub #6. Synchronized master capture (and per-rig stems).
+- **Tap tempo + count-in** — GitHub #7.
+- **P4 packaging** — GitHub #8. PKGBUILD + `.desktop` + icon, README screenshot
+  (docs/shots/hurricane-*.png), first-run polish, Omarchy theme accent following.
 
 ### Known limits / caveats
 

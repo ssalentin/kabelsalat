@@ -61,6 +61,8 @@ const RING: Color32 = theme::CREAM_DIM;
 const PLUG: Color32 = theme::DARK_PANEL_HI;
 const TEXT: Color32 = theme::CREAM;
 const SUBTEXT: Color32 = theme::CREAM_MID;
+/// Knob radius on unit faces (labels and display captions share its baseline).
+const KNOB_R: f32 = 17.0;
 const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
 const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fills
 
@@ -888,6 +890,10 @@ struct DemoApp {
     // Cached text.
     wordmark_g: Option<Arc<theme::TrackedLabel>>,
     state_play_g: Option<Arc<theme::TrackedLabel>>,
+    /// Captions for the face activity displays (Surge output bars, Delay
+    /// echo dots) — unlabeled they read as broken meters (vision review).
+    caption_output_g: Option<Arc<theme::TrackedLabel>>,
+    caption_echoes_g: Option<Arc<theme::TrackedLabel>>,
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
@@ -1076,6 +1082,8 @@ impl DemoApp {
             text_alpha: 1.0,
             wordmark_g: None,
             state_play_g: None,
+            caption_output_g: None,
+            caption_echoes_g: None,
             state_pause_g: None,
             hint_front_g: None,
             hint_back_g: None,
@@ -1489,6 +1497,8 @@ impl DemoApp {
             theme::layout_tracked(f, "kabelsalat", theme::medium_font(30.0), -0.03)
         })));
         self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
+        self.caption_output_g = Some(tracked("OUTPUT", 10.0, 0.14));
+        self.caption_echoes_g = Some(tracked("ECHOES", 10.0, 0.14));
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
         // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
@@ -2879,7 +2889,10 @@ impl DemoApp {
                 let gate = self.midi_cable_to(s).is_some();
                 ui.vertical(|ui| {
                     ui.set_min_width(90.0);
-                    no_wrap(ui, egui::RichText::new(sentence_case(&u.name)).font(theme::medium_font(13.0)).color(theme::INK));
+                    // Multi-rig: "2 · Surge" like the RIG INPUTS labels — two
+                    // columns both headed "Surge" were indistinguishable.
+                    let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
+                    no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(13.0)).color(theme::INK));
                     // Single-graph mode: all nodes share rig 0 — don't label
                     // every column "rig A" (user report 2026-11-15).
                     // Same rig naming as the RIGS strip, same "MIDI" casing as everywhere.
@@ -3250,11 +3263,12 @@ impl DemoApp {
                                     let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), active);
                                     if n > 1 {
                                         ui.add_space(2.0);
-                                        let del = egui::Button::new(egui::RichText::new("×").size(13.0).color(theme::INK_2))
-                                            .fill(theme::PAPER_SINK)
-                                            .corner_radius(2.0)
-                                            .min_size(egui::vec2(22.0, 20.0));
-                                        if ui.add(del).on_hover_text(format!("delete {name}…")).clicked() {
+                                        // A quiet close glyph (tab-close idiom), not a second
+                                        // chip: frameless, dim, full-size hit area (rule 7).
+                                        let del = egui::Button::new(egui::RichText::new("×").size(14.0).color(theme::INK_2))
+                                            .frame(false)
+                                            .min_size(egui::vec2(22.0, 22.0));
+                                        if ui.add(del).on_hover_text(format!("Delete {name}… (asks first)")).clicked() {
                                             self.confirm_delete_rig = Some(rig);
                                         }
                                     }
@@ -4289,6 +4303,19 @@ impl DemoApp {
             let c = &mut self.cables[ci];
             c.age += dt;
             if c.dying >= 0.0 { c.dying += dt; }
+            // Endpoints without a laid-out rect (a hidden rig's units, or a
+            // rack rebuilt by a key handler AFTER this frame's layout) are
+            // infinite: simulating them seeds NaN control points, and NaN
+            // never recovers — every cable of a keyboard-loaded rig was
+            // invisible on the back. Skip until laid out; heal any NaN.
+            if !(ea.x.is_finite() && ea.y.is_finite() && eb.x.is_finite() && eb.y.is_finite()) { continue; }
+            if !(c.c1.x.is_finite() && c.c1.y.is_finite() && c.c2.x.is_finite() && c.c2.y.is_finite()
+                && c.v1.x.is_finite() && c.v1.y.is_finite() && c.v2.x.is_finite() && c.v2.y.is_finite()) {
+                c.c1 = Vec2::ZERO; c.c2 = Vec2::ZERO; c.v1 = Vec2::ZERO; c.v2 = Vec2::ZERO;
+            }
+            if !(c.prev_a.x.is_finite() && c.prev_a.y.is_finite() && c.prev_b.x.is_finite() && c.prev_b.y.is_finite()) {
+                c.prev_a = ea; c.prev_b = eb;
+            }
 
             let mut a = c.over_a.unwrap_or(ea);
             let mut b = c.over_b.unwrap_or(eb);
@@ -5598,6 +5625,16 @@ impl DemoApp {
             let col = if i % 2 == 0 { TEXT } else { SUBTEXT };
             painter.rect_filled(self.xf.rect(bar), 2.0, alpha(col, 0.5 + 0.5 * vis));
         }
+        // Caption on the knob-label baseline: the bars are the synth's output.
+        self.display_caption(painter, unit, start + pitch * 5.5, &self.caption_output_g);
+    }
+
+    /// A tracked micro-caps caption under a face display, centered at
+    /// rack-local `cx`, on the same baseline as the unit's knob labels.
+    fn display_caption(&self, painter: &egui::Painter, unit: usize, cx: f32, g: &Option<Arc<theme::TrackedLabel>>) {
+        let w = g.as_ref().map_or(0.0, |g| g.size.x);
+        let y = self.knob_center(unit, 0).y + KNOB_R + 10.0;
+        self.text_tracked(painter, Vec2::new(cx - w / 2.0, y), g, SUBTEXT);
     }
 
     fn draw_delay_display(&self, painter: &egui::Painter, unit: usize) {
@@ -5615,6 +5652,7 @@ impl DemoApp {
             let c = Vec2::new(start + pitch * 0.5, r.center().y + 16.0);
             self.ell(painter, c, 10.0 + (1.0 - led) * 14.0, alpha(theme::ACCENT, 0.25 * led), Stroke::NONE);
         }
+        self.display_caption(painter, unit, start + pitch * 2.0, &self.caption_echoes_g);
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
@@ -5644,6 +5682,10 @@ impl DemoApp {
             let col = if self.meter_peak >= 0.9 { theme::CLIP_RED } else { theme::ACCENT };
             painter.rect_filled(self.xf.rect(tick), 0.8, col);
         }
+        // Caption under the stack (vision review: an unlabeled segment strip
+        // read as decoration).
+        let w = self.caption_output_g.as_ref().map_or(0.0, |g| g.size.x);
+        self.text_tracked(painter, Vec2::new(x + 11.0 - w / 2.0, bottom + 8.0), &self.caption_output_g, SUBTEXT);
     }
 
     fn draw_knob(&self, painter: &egui::Painter, ui: usize, ki: usize) {
@@ -5651,7 +5693,7 @@ impl DemoApp {
         let u = &self.units[ui];
         let k = &u.knobs[ki];
         let c = self.knob_center(ui, ki);
-        let r = 17.0;
+        let r = KNOB_R;
         let hovered = matches!(self.hover, Some(Hit::Knob { unit, idx }) if unit == ui && idx == ki);
         let dragging = matches!(self.drag, Drag::Knob { unit, idx, .. } if unit == ui && idx == ki);
 
@@ -7652,6 +7694,26 @@ mod rig_switch_tests {
         drain.drain(|c| again.push(c));
         assert!(!again.iter().any(|c| matches!(c, Command::NoteOn { .. })), "not sounded twice: {again:?}");
         assert!(app.key_leds[0] > 0.3, "but the key still lights (after one frame of decay): {}", app.key_leds[0]);
+    }
+
+    #[test]
+    fn keyboard_loaded_rigs_keep_finite_visible_cables() {
+        // F4 runs in handle_input AFTER this frame's layout: build_rack's
+        // unlaid rects must not poison the cable springs with NaN.
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        frame(&mut app, &ctx, key(Key::F4));
+        assert_eq!(app.rig_count(), 2, "F4 loaded the two-rig demo");
+        app.side = Side::Back;
+        let finite = |c: &Cable| c.curve.iter().all(|p| p.x.is_finite() && p.y.is_finite());
+        for rig in [0usize, 1, 0] {
+            app.set_active_rig(rig);
+            for _ in 0..6 { frame(&mut app, &ctx, vec![]); }
+            let vis: Vec<&Cable> = app.cables.iter().filter(|c| app.visible(c.src) && app.visible(c.dst)).collect();
+            assert!(!vis.is_empty(), "rig {rig} has cables");
+            for c in vis { assert!(finite(c), "rig {rig} cable {} curve {:?}", c.id, c.curve); }
+        }
     }
 
     #[test]

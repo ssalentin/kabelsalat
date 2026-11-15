@@ -500,6 +500,12 @@ struct DemoApp {
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
 
+    /// Live patch mirrored for the control bridge (task-16): MCP/CLI queries
+    /// read this snapshot. Rebuilt from the living cables whenever they change.
+    shared_graph: Arc<Mutex<Graph>>,
+    /// Signature of the living cable set behind `shared_graph` (change detect).
+    graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
+
     // --- Embedded Surge editor (task-15): ONE window, X11 child of the main
     // window, positioned into a reserved bottom region. One pane at a time.
     editor: Option<EmbeddedEditor>,
@@ -622,6 +628,8 @@ impl DemoApp {
             _audio_stream: None,
             bus: None,
             out_level: None,
+            shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
+            graph_sig: Vec::new(),
             editor: None,
             editor_rig: 0,
             editor_toggle: None,
@@ -2779,6 +2787,45 @@ impl eframe::App for DemoApp {
             let _ = b.send(Command::SetParam { node: 5, param: P_MIX, value: self.units[5].knobs[1].value as f64 });
         }
 
+        // Mirror the live patch into the shared graph for bridge queries
+        // (task-16). Same model as capture_session: demo nodes, living cables
+        // as edges. Rebuild only when the cable set changes — cheap per frame.
+        let sig: Vec<(u32, u32, u8, u32, u8, CPortKind)> = self
+            .cables
+            .iter()
+            .filter(|c| c.dying < 0.0)
+            .map(|c| {
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                (c.id, c.src as u32, c.src_port as u8, c.dst as u32, c.dst_port as u8, kind)
+            })
+            .collect();
+        if sig != self.graph_sig {
+            let mut g = Graph::demo_patch();
+            g.edges.clear();
+            for c in &self.cables {
+                if c.dying >= 0.0 {
+                    continue;
+                }
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                g.connect_with_id(
+                    c.id,
+                    PortRef { node: c.src as u32, port: c.src_port as u8 },
+                    PortRef { node: c.dst as u32, port: c.dst_port as u8 },
+                    kind,
+                );
+            }
+            if let Ok(mut shared) = self.shared_graph.lock() {
+                *shared = g;
+            }
+            self.graph_sig = sig;
+        }
+
         self.tessellate();
         self.draw(ui);
 
@@ -2868,7 +2915,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -2919,7 +2966,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         None,
     )?;
     stream.play()?;
-    Ok((vec![main_a, main_b], stream, bus, level))
+    Ok((vec![main_a, main_b], stream, bus, level, sample_rate))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -2976,8 +3023,20 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, stream, bus, level)) => {
+                    Ok((mains, stream, bus, level, sample_rate)) => {
                         let bus = Arc::new(Mutex::new(bus));
+                        // Control bridge (task-16): MCP/CLI drive THIS app via
+                        // the same bus + a live graph mirror. Additive — if the
+                        // socket is unavailable the app just runs without it.
+                        let shared_graph = Arc::new(Mutex::new(Graph::demo_patch()));
+                        if let Err(e) = crate::bridge::spawn(
+                            bus.clone(),
+                            shared_graph.clone(),
+                            level.clone(),
+                            sample_rate,
+                        ) {
+                            eprintln!("bridge: control socket unavailable: {e:#}");
+                        }
                         let b = bus.clone();
                         sink = Some(Box::new(move |ev: NoteEvent| {
                             // Notes flow through the control plane; the engine
@@ -2990,14 +3049,17 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, stream, bus, level));
+                        audio = Some((mains, stream, bus, level, shared_graph));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
-            let app = DemoApp::new_with_sink(sink);
+            let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, stream, bus, level)) => app.with_audio(mains, stream, bus, level),
+                Some((mains, stream, bus, level, shared_graph)) => {
+                    app.shared_graph = shared_graph;
+                    app.with_audio(mains, stream, bus, level)
+                }
                 None => app,
             };
             Ok(Box::new(app))

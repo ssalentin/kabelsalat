@@ -1,14 +1,21 @@
-//! Headless MCP server — `kabelsalat mcp` (PLAN §2c, task-14).
+//! MCP server — `kabelsalat mcp` (PLAN §2c, task-14) and `kabelsalat mcp
+//! --attach` (task-16).
 //!
 //! A sibling frontend to the one typed control plane (`control.rs`), giving
-//! agents 1:1 access to the graph engine without any GUI. Architecture:
+//! agents 1:1 access to the graph engine. ONE set of 14 tool definitions
+//! serves two backends ([`Backend`]):
 //!
-//! - This process owns a local [`Graph`] model (started from `demo_patch`)
-//!   AND a running [`GraphEngine`] fed by the same lock-free command bus the
-//!   UI uses. Mutating tools validate + update the local model and send the
-//!   matching [`Command`] to the engine; query tools read the local model
-//!   plus engine status (output peak via `level_handle`). No shared state
-//!   ever touches the audio thread.
+//! - **Local (headless):** this process owns a local [`Graph`] model (started
+//!   from `demo_patch`) AND a running [`GraphEngine`] fed by the same
+//!   lock-free command bus the UI uses. Mutating tools validate + update the
+//!   local model and send the matching [`Command`] to the engine; query tools
+//!   read the local model plus engine status (output peak via `level_handle`).
+//!   No shared state ever touches the audio thread.
+//! - **Remote (attach):** no engine here — every command/query is proxied to
+//!   the RUNNING GUI app over the unix-socket bridge (`bridge.rs`), so agents
+//!   control exactly what the user sees. The local graph is kept as a mirror
+//!   (refreshed from the app before queries/validation) so tool semantics,
+//!   ids and schemas stay identical to headless mode.
 //! - Audio: a cpal output stream renders `GraphEngine::render` in its
 //!   callback (same pattern as the app, minus egui). Two Surge XT voices
 //!   serve nodes 1 and 4; their `ClapVoiceMain` halves stay on the main
@@ -32,6 +39,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::bridge;
 use crate::control::{
     self, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId, NodeKind,
     PortKind, PortRef,
@@ -43,12 +51,21 @@ use crate::matrix::SourceId;
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 
 // ---------------------------------------------------------------------------
-// Shared state: local model + bus + engine status (never the engine itself)
+// Shared state: model mirror + backend + engine status (never the engine itself)
 // ---------------------------------------------------------------------------
+
+/// Where commands go and queries come from. The tool definitions below are
+/// backend-agnostic: they build the same typed [`Command`]s either way.
+enum Backend {
+    /// Headless: our own engine, fed through the local lock-free bus.
+    Local(CommandBus),
+    /// Attach: the running GUI app, via the unix-socket control bridge.
+    Remote,
+}
 
 struct State {
     graph: Graph,
-    bus: CommandBus,
+    backend: Backend,
     level: Arc<AtomicU32>,
     sample_rate: f64,
     audio_live: bool,
@@ -186,11 +203,49 @@ fn tool_err(msg: impl Into<String>) -> Result<CallToolResult, McpError> {
 }
 
 fn send_cmd(st: &mut State, cmd: Command) -> Result<(), String> {
-    if st.bus.send(cmd) {
-        Ok(())
-    } else {
-        Err("command bus full — try again".into())
+    match &mut st.backend {
+        Backend::Local(bus) => {
+            if bus.send(cmd) {
+                Ok(())
+            } else {
+                Err("command bus full — try again".into())
+            }
+        }
+        Backend::Remote => {
+            let reply = bridge::request(&json!({"op": "cmd", "cmd": cmd}))
+                .map_err(|e| format!("{e:#}"))?;
+            if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+                Ok(())
+            } else {
+                Err(reply
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("bridge rejected the command")
+                    .to_string())
+            }
+        }
     }
+}
+
+/// Attach mode: pull the LIVE graph from the GUI app so queries and
+/// validation see what the user sees (the user may have re-patched since our
+/// last call). No-op for the headless backend, which owns its model.
+fn refresh_remote(st: &mut State) -> Result<(), String> {
+    if !matches!(st.backend, Backend::Remote) {
+        return Ok(());
+    }
+    let reply = bridge::request(&json!({"op": "query", "name": "get_graph"}))
+        .map_err(|e| format!("{e:#}"))?;
+    if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("bridge query failed")
+            .to_string());
+    }
+    let data = reply.get("data").cloned().unwrap_or(Value::Null);
+    st.graph = serde_json::from_value(data).map_err(|e| format!("bad graph from bridge: {e}"))?;
+    Ok(())
 }
 
 fn dsp_kind_str(k: &DspKind) -> &'static str {
@@ -331,7 +386,10 @@ impl McpServer {
     /// The current patch: all nodes and cables.
     #[tool(name = "get_graph", description = "Query the full patch graph: nodes (id, name, kind) and edges/cables (id, from/to port, midi|audio).")]
     fn get_graph(&self) -> Result<CallToolResult, McpError> {
-        let st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         ok_json(graph_json(&st.graph))
     }
 
@@ -339,6 +397,19 @@ impl McpServer {
     #[tool(name = "get_status", description = "Query engine status: node/edge counts, sample rate, whether live audio output is running, current output peak level (0..1) and transport state.")]
     fn get_status(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            // The app reports its own live status (peak, rate, counts).
+            let reply = match bridge::request(&json!({"op": "query", "name": "get_status"})) {
+                Ok(r) => r,
+                Err(e) => return tool_err(format!("{e:#}")),
+            };
+            if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                return tool_err(
+                    reply.get("error").and_then(Value::as_str).unwrap_or("bridge query failed"),
+                );
+            }
+            return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
+        }
         let level = f32::from_bits(st.level.load(Ordering::Relaxed));
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
@@ -366,6 +437,9 @@ impl McpServer {
         });
         let name = name_bytes(&label);
         let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         // Send first, then mirror into the local model: both id counters
         // advance exactly once per accepted command and stay in sync.
         if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name }) {
@@ -379,6 +453,9 @@ impl McpServer {
     #[tool(name = "remove_node", description = "Remove a node by id (Command::RemoveNode); all cables touching it are removed too.")]
     fn remove_node(&self, Parameters(args): Parameters<RemoveNodeArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         if st.graph.node(args.node).is_none() {
             return tool_err(format!("node {} does not exist", args.node));
         }
@@ -399,6 +476,9 @@ impl McpServer {
         let from = PortRef { node: args.from_node, port: args.from_port.unwrap_or(0) };
         let to = PortRef { node: args.to_node, port: args.to_port.unwrap_or(0) };
         let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         let id = match args.id {
             Some(id) => id,
             None => st.graph.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1,
@@ -428,6 +508,9 @@ impl McpServer {
     #[tool(name = "set_param", description = "Set a parameter (Command::SetParam). Param ids: 0=instrument level, 1=delay time, 2=delay mix, 3=master volume, 4=master warmth. Values are plain units (levels/mix 0..1).")]
     fn set_param(&self, Parameters(args): Parameters<SetParamArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         if st.graph.node(args.node).is_none() {
             return tool_err(format!("node {} does not exist", args.node));
         }
@@ -441,6 +524,9 @@ impl McpServer {
     #[tool(name = "set_rig_source", description = "Select which source classes feed an instrument node (Command::SetRigSource): keys, laptop, hardware. The MIDI cable still gates routing; this filters by source on top.")]
     fn set_rig_source(&self, Parameters(args): Parameters<SetRigSourceArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
         if st.graph.node(args.node).is_none() {
             return tool_err(format!("node {} does not exist", args.node));
         }
@@ -537,10 +623,11 @@ impl McpServer {
 #[tool_handler(
     router = self.tool_router,
     name = "kabelsalat",
-    instructions = "Headless control plane for the kabelsalat live audio/MIDI graph. \
-Mutating tools mirror control-plane commands into the running engine; get_graph/get_status \
-read the local model. Start from the demo patch: 0=KEYS, 1=SURGE A, 2=DELAY A, 3=MASTER OUT, \
-4=SURGE B, 5=DELAY B. Play notes with note_on/note_off; wire cables with connect/disconnect."
+    instructions = "Control plane for the kabelsalat live audio/MIDI graph — headless engine, \
+or attached to the RUNNING GUI app (--attach) so you control what the user sees. \
+Mutating tools issue control-plane commands; get_graph/get_status read the live patch. \
+Demo patch nodes: 0=KEYS, 1=SURGE A, 2=DELAY A, 3=MASTER OUT, 4=SURGE B, 5=DELAY B. \
+Play notes with note_on/note_off; wire cables with connect/disconnect."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
@@ -550,10 +637,9 @@ impl ServerHandler for McpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Headless control plane for the kabelsalat live audio/MIDI graph. \
-Mutating tools mirror control-plane commands into the running engine; get_graph/get_status \
-read the local model. Demo patch nodes: 0=KEYS, 1=SURGE A, 2=DELAY A, 3=MASTER OUT, \
-4=SURGE B, 5=DELAY B.",
+                "Control plane for the kabelsalat live audio/MIDI graph — headless engine, \
+or attached to the RUNNING GUI app (--attach) so you control what the user sees. \
+Demo patch nodes: 0=KEYS, 1=SURGE A, 2=DELAY A, 3=MASTER OUT, 4=SURGE B, 5=DELAY B.",
             )
     }
 }
@@ -668,11 +754,11 @@ fn build_audio() -> AudioHandles {
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn run() -> anyhow::Result<()> {
-    // stdout is the MCP JSON-RPC channel. The CLAP host logs to stdout while
-    // loading plugins, so route fd 1 → stderr for the whole process and
-    // serve MCP on a private duplicate of the original stdout.
-    let rpc_stdout = unsafe {
+/// stdout is the MCP JSON-RPC channel. The CLAP host logs to stdout while
+/// loading plugins, so route fd 1 → stderr for the whole process and serve
+/// MCP on a private duplicate of the original stdout.
+fn reroute_stdout() -> anyhow::Result<std::fs::File> {
+    unsafe {
         let saved = libc::dup(1);
         if saved < 0 {
             anyhow::bail!("dup(stdout) failed: {}", std::io::Error::last_os_error());
@@ -681,34 +767,71 @@ pub fn run() -> anyhow::Result<()> {
             libc::close(saved);
             anyhow::bail!("dup2(stderr, stdout) failed: {}", std::io::Error::last_os_error());
         }
-        std::fs::File::from_raw_fd(saved)
-    };
+        Ok(std::fs::File::from_raw_fd(saved))
+    }
+}
 
+/// Serve MCP over stdio on the private stdout duplicate (shared by both
+/// backends — the tool definitions are identical).
+fn serve_stdio(server: McpServer, rpc_stdout: std::fs::File) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(rpc_stdout));
+        let transport = (tokio::io::stdin(), writer);
+        let service = server.serve(transport).await?;
+        service.waiting().await?;
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+/// Headless mode: own engine + local model.
+pub fn run() -> anyhow::Result<()> {
+    let rpc_stdout = reroute_stdout()?;
     eprintln!("kabelsalat mcp: headless control-plane server (MCP over stdio)");
     let audio = build_audio();
     let state = Arc::new(Mutex::new(State {
         graph: Graph::demo_patch(),
-        bus: audio.bus,
+        backend: Backend::Local(audio.bus),
         level: audio.level,
         sample_rate: audio.sample_rate,
         audio_live: audio.live,
         playing: false,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
-
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    let result = rt.block_on(async move {
-        let writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(rpc_stdout));
-        let transport = (tokio::io::stdin(), writer);
-        let service = server.serve(transport).await?;
-        service.waiting().await?;
-        Ok::<(), anyhow::Error>(())
-    });
-    drop(rt);
+    let result = serve_stdio(server, rpc_stdout);
 
     // The stream and the CLAP main-thread handles stayed alive on this (the
     // creating) thread for the whole session; tear them down last.
     drop(audio.stream);
     drop(audio.mains);
     result
+}
+
+/// Attach mode (`kabelsalat mcp --attach`): no local engine — the SAME 14
+/// tools proxy to the running GUI app through the control bridge. Fails fast
+/// with a clear message when the app isn't running.
+pub fn run_attach() -> anyhow::Result<()> {
+    let rpc_stdout = reroute_stdout()?;
+    eprintln!("kabelsalat mcp: attaching to the running GUI app (control bridge)");
+    let mut state = State {
+        graph: Graph::default(),
+        backend: Backend::Remote,
+        level: Arc::new(AtomicU32::new(0)),
+        sample_rate: 0.0,
+        audio_live: true,
+        playing: false,
+    };
+    // Connect + pull the live graph before serving; a missing socket surfaces
+    // here as an actionable error ("start the app"), not mid-tool-call.
+    refresh_remote(&mut state).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Ok(reply) = bridge::request(&json!({"op": "query", "name": "get_status"})) {
+        if let Some(sr) = reply.pointer("/data/sample_rate").and_then(Value::as_f64) {
+            state.sample_rate = sr;
+        }
+    }
+    let server = McpServer {
+        state: Arc::new(Mutex::new(state)),
+        tool_router: McpServer::tool_router(),
+    };
+    serve_stdio(server, rpc_stdout)
 }

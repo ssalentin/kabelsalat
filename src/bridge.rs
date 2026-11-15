@@ -1,0 +1,332 @@
+//! Unix-socket control bridge (task-16): let the MCP server and a CLI drive
+//! the RUNNING GUI app through the one typed control plane (`control.rs`).
+//!
+//! The app spawns a listener thread ([`spawn`]) that owns clones of the same
+//! `Arc<Mutex<CommandBus>>` the UI publishes through and an `Arc<Mutex<Graph>>`
+//! the UI mirrors from its live cables each frame. Commands received here go
+//! onto the very bus the engine drains at block boundaries — agents control
+//! exactly what the user sees, not a parallel headless engine.
+//!
+//! Protocol: newline-delimited JSON, one request per line, one reply per line.
+//! - `{"op":"cmd","cmd":<Command JSON>}` → `{"ok":true}` (Command is serde,
+//!   externally tagged, e.g. `{"SetSystemAudio":{"gain":0.5}}`).
+//! - `{"op":"query","name":"get_graph"}` → `{"ok":true,"data":<Graph JSON>}`.
+//! - `{"op":"query","name":"get_status"}` → `{"ok":true,"data":{nodes, edges,
+//!   sample_rate, output_level, audio_live}}`.
+//! - Anything else → `{"ok":false,"error":"..."}`. Bad input never panics.
+//!
+//! Socket: `$XDG_RUNTIME_DIR/kabelsalat.sock`, fallback `~/.cache/kabelsalat.sock`.
+//! A stale socket file is removed on start; a LIVE one is never stolen.
+//!
+//! RT discipline: this thread is a plain frontend. It locks the bus only to
+//! push (non-blocking rtrb send) and the graph only to snapshot; the audio
+//! thread never touches either lock.
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use serde_json::{json, Value};
+
+use crate::control::{Command, CommandBus, Graph};
+
+/// Where the bridge listens (and where clients connect).
+pub fn socket_path() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("kabelsalat.sock");
+        }
+    }
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".cache").join("kabelsalat.sock")
+}
+
+/// Start the bridge thread for the running app. `bus` is the UI's shared
+/// command bus, `graph` the UI-mirrored live patch, `level` the engine's
+/// output-peak handle (f32 bits). Additive: on failure the app keeps running.
+pub fn spawn(
+    bus: Arc<Mutex<CommandBus>>,
+    graph: Arc<Mutex<Graph>>,
+    level: Arc<AtomicU32>,
+    sample_rate: f64,
+) -> anyhow::Result<()> {
+    spawn_at(socket_path(), bus, graph, level, sample_rate)
+}
+
+fn spawn_at(
+    path: PathBuf,
+    bus: Arc<Mutex<CommandBus>>,
+    graph: Arc<Mutex<Graph>>,
+    level: Arc<AtomicU32>,
+    sample_rate: f64,
+) -> anyhow::Result<()> {
+    if path.exists() {
+        // Refuse to steal the socket from a live instance; clean up stale ones.
+        if UnixStream::connect(&path).is_ok() {
+            anyhow::bail!(
+                "another kabelsalat instance already owns the bridge at {}",
+                path.display()
+            );
+        }
+        std::fs::remove_file(&path)
+            .map_err(|e| anyhow::anyhow!("removing stale socket {}: {e}", path.display()))?;
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let listener = UnixListener::bind(&path)
+        .map_err(|e| anyhow::anyhow!("binding bridge socket {}: {e}", path.display()))?;
+    eprintln!("bridge: listening on {}", path.display());
+    std::thread::Builder::new()
+        .name("kabelsalat-bridge".into())
+        .spawn(move || {
+            // Sequential connections: one client at a time, each may pipeline
+            // many request lines. Accept errors are logged, never fatal.
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => handle_conn(stream, &bus, &graph, &level, sample_rate),
+                    Err(e) => eprintln!("bridge: accept error: {e}"),
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("spawning bridge thread: {e}"))?;
+    Ok(())
+}
+
+fn handle_conn(
+    stream: UnixStream,
+    bus: &Arc<Mutex<CommandBus>>,
+    graph: &Arc<Mutex<Graph>>,
+    level: &AtomicU32,
+    sample_rate: f64,
+) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return, // client gone / timeout — drop the connection
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = handle_line(&line, bus, graph, level, sample_rate);
+        if writeln!(writer, "{reply}").is_err() || writer.flush().is_err() {
+            return;
+        }
+    }
+}
+
+fn err_reply(msg: impl Into<String>) -> Value {
+    json!({"ok": false, "error": msg.into()})
+}
+
+/// One request line → one reply value. Pure enough to unit-test; never panics
+/// on malformed input (every parse/lock failure becomes an error reply).
+fn handle_line(
+    line: &str,
+    bus: &Arc<Mutex<CommandBus>>,
+    graph: &Arc<Mutex<Graph>>,
+    level: &AtomicU32,
+    sample_rate: f64,
+) -> Value {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return err_reply(format!("invalid JSON: {e}")),
+    };
+    match req.get("op").and_then(Value::as_str) {
+        Some("cmd") => {
+            let Some(cmd_val) = req.get("cmd") else {
+                return err_reply("missing 'cmd' field");
+            };
+            let cmd: Command = match serde_json::from_value(cmd_val.clone()) {
+                Ok(c) => c,
+                Err(e) => return err_reply(format!("invalid Command: {e}")),
+            };
+            let mut b = match bus.lock() {
+                Ok(b) => b,
+                Err(_) => return err_reply("command bus lock poisoned"),
+            };
+            if b.send(cmd) {
+                json!({"ok": true})
+            } else {
+                err_reply("command bus full — try again")
+            }
+        }
+        Some("query") => match req.get("name").and_then(Value::as_str) {
+            Some("get_graph") => {
+                let g = match graph.lock() {
+                    Ok(g) => g,
+                    Err(_) => return err_reply("graph lock poisoned"),
+                };
+                match serde_json::to_value(&*g) {
+                    Ok(data) => json!({"ok": true, "data": data}),
+                    Err(e) => err_reply(format!("serializing graph: {e}")),
+                }
+            }
+            Some("get_status") => {
+                let g = match graph.lock() {
+                    Ok(g) => g,
+                    Err(_) => return err_reply("graph lock poisoned"),
+                };
+                json!({"ok": true, "data": {
+                    "nodes": g.nodes.len(),
+                    "edges": g.edges.len(),
+                    "sample_rate": sample_rate,
+                    "output_level": f32::from_bits(level.load(Ordering::Relaxed)),
+                    "audio_live": true,
+                }})
+            }
+            other => err_reply(format!(
+                "unknown query '{}' (use get_graph|get_status)",
+                other.unwrap_or("<missing>")
+            )),
+        },
+        other => err_reply(format!(
+            "unknown op '{}' (use cmd|query)",
+            other.unwrap_or("<missing>")
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client side (CLI `send`, MCP attach)
+// ---------------------------------------------------------------------------
+
+/// Connect to the running app's bridge, with an actionable error when the
+/// app isn't up.
+pub fn connect() -> anyhow::Result<UnixStream> {
+    let path = socket_path();
+    UnixStream::connect(&path).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot reach the kabelsalat bridge at {} ({e}). \
+             Is the GUI app running? Start it with `kabelsalat app`.",
+            path.display()
+        )
+    })
+}
+
+/// One-shot request: connect, write one JSON line, read one reply line.
+/// Tool calls are sequential, so a fresh connection per request is simple
+/// and robust (the server handles connections sequentially).
+pub fn request(req: &Value) -> anyhow::Result<Value> {
+    let stream = connect()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut writer = stream.try_clone()?;
+    writeln!(writer, "{}", serde_json::to_string(req)?)?;
+    writer.flush()?;
+    let mut line = String::new();
+    let n = BufReader::new(stream).read_line(&mut line)?;
+    if n == 0 {
+        anyhow::bail!("bridge closed the connection without a reply");
+    }
+    Ok(serde_json::from_str(&line)?)
+}
+
+/// `kabelsalat send '<json>'`: forward one request, print the reply, exit.
+pub fn cli_send(payload: &str) -> anyhow::Result<()> {
+    let req: Value = serde_json::from_str(payload)
+        .map_err(|e| anyhow::anyhow!("argument is not valid JSON: {e}"))?;
+    let reply = request(&req)?;
+    println!("{}", serde_json::to_string(&reply)?);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::{command_bus, CommandDrain};
+
+    fn fixtures() -> (Arc<Mutex<CommandBus>>, CommandDrain, Arc<Mutex<Graph>>, Arc<AtomicU32>) {
+        let (bus, drain) = command_bus();
+        (
+            Arc::new(Mutex::new(bus)),
+            drain,
+            Arc::new(Mutex::new(Graph::demo_patch())),
+            Arc::new(AtomicU32::new(0.25f32.to_bits())),
+        )
+    }
+
+    #[test]
+    fn cmd_forwarded_to_bus() {
+        let (bus, mut drain, graph, level) = fixtures();
+        let reply = handle_line(
+            r#"{"op":"cmd","cmd":{"SetSystemAudio":{"gain":0.5}}}"#,
+            &bus, &graph, &level, 48000.0,
+        );
+        assert_eq!(reply, json!({"ok": true}));
+        let cmd = drain.pop().expect("command on the bus");
+        assert!(matches!(cmd, Command::SetSystemAudio { gain } if (gain - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn queries_return_live_snapshot() {
+        let (bus, _drain, graph, level) = fixtures();
+        let reply = handle_line(r#"{"op":"query","name":"get_graph"}"#, &bus, &graph, &level, 48000.0);
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["data"]["nodes"].as_array().unwrap().len(), 6);
+        assert_eq!(reply["data"]["edges"].as_array().unwrap().len(), 8);
+
+        let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0);
+        assert_eq!(reply["data"]["nodes"], json!(6));
+        assert_eq!(reply["data"]["edges"], json!(8));
+        assert_eq!(reply["data"]["sample_rate"], json!(48000.0));
+        assert_eq!(reply["data"]["audio_live"], json!(true));
+        assert_eq!(reply["data"]["output_level"], json!(0.25));
+    }
+
+    #[test]
+    fn bad_input_is_an_error_not_a_panic() {
+        let (bus, _drain, graph, level) = fixtures();
+        for bad in [
+            "not json at all",
+            "{}",
+            r#"{"op":"frobnicate"}"#,
+            r#"{"op":"cmd"}"#,
+            r#"{"op":"cmd","cmd":{"NoSuchVariant":{}}}"#,
+            r#"{"op":"query","name":"nope"}"#,
+            r#"{"op":"query"}"#,
+        ] {
+            let reply = handle_line(bad, &bus, &graph, &level, 48000.0);
+            assert_eq!(reply["ok"], json!(false), "input: {bad}");
+            assert!(reply["error"].is_string());
+        }
+    }
+
+    #[test]
+    fn socket_roundtrip_and_stale_cleanup() {
+        let (bus, mut drain, graph, level) = fixtures();
+        let path = std::env::temp_dir().join(format!("ksalat-bridge-test-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A stale (unbound) socket file must be replaced, not fatal.
+        std::fs::write(&path, b"").unwrap();
+        spawn_at(path.clone(), bus.clone(), graph.clone(), level.clone(), 44100.0).unwrap();
+
+        let mut stream = UnixStream::connect(&path).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        writeln!(stream, r#"{{"op":"cmd","cmd":"TransportPlay"}}"#).unwrap();
+        writeln!(stream, r#"{{"op":"query","name":"get_status"}}"#).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut l1 = String::new();
+        reader.read_line(&mut l1).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&l1).unwrap(), json!({"ok": true}));
+        assert!(matches!(drain.pop(), Some(Command::TransportPlay)));
+        let mut l2 = String::new();
+        reader.read_line(&mut l2).unwrap();
+        let v: Value = serde_json::from_str(&l2).unwrap();
+        assert_eq!(v["data"]["sample_rate"], json!(44100.0));
+
+        // A second spawn while the first is live must fail, not steal.
+        let (bus2, _d2, g2, lv2) = fixtures();
+        assert!(spawn_at(path.clone(), bus2, g2, lv2, 48000.0).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+}

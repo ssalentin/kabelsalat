@@ -6,6 +6,7 @@
 
 mod assistant;
 mod audio;
+mod bridge;
 mod capture;
 mod control;
 mod dsp;
@@ -27,11 +28,28 @@ fn main() -> anyhow::Result<()> {
         "midi-test" => midi::run_test(),
         "host-test" => host::run_test(),
         "ui-demo" => ui::run_demo(),
-        "mcp" => mcp::run(),
+        "mcp" => {
+            // --attach (or KABELSALAT_ATTACH): proxy the same tools to the
+            // RUNNING GUI app via the control bridge instead of a local engine.
+            if std::env::args().any(|a| a == "--attach")
+                || std::env::var_os("KABELSALAT_ATTACH").is_some()
+            {
+                mcp::run_attach()
+            } else {
+                mcp::run()
+            }
+        }
+        // One-shot control-bridge client: kabelsalat send '<json request>'.
+        "send" => {
+            let payload = std::env::args()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: kabelsalat send '<json>' (e.g. '{{\"op\":\"query\",\"name\":\"get_graph\"}}')"))?;
+            bridge::cli_send(&payload)
+        }
         "session-test" => ui::run_session_test(),
         "capture-test" => capture::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp, session-test, capture-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test");
             std::process::exit(1);
         }
     }

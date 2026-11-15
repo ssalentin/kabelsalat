@@ -179,7 +179,9 @@ impl Graph {
 }
 
 /// Everything a frontend can ask the engine to do. Fixed-size: no heap.
-#[derive(Clone, Debug)]
+/// Serde is for off-thread frontends only (bridge socket, sessions); the RT
+/// bus still moves plain fixed-size values — no allocation on the audio path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     AddNode { kind: NodeKind, name: Name },
     RemoveNode(NodeId),
@@ -282,5 +284,33 @@ mod tests {
     fn names_roundtrip() {
         let n = name_bytes("SURGE XT");
         assert_eq!(name_str(&n), "SURGE XT");
+    }
+
+    #[test]
+    fn command_json_roundtrip() {
+        // The bridge wire format: externally tagged JSON, one line per command.
+        let cmds = vec![
+            Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X") },
+            Command::RemoveNode(3),
+            Command::Connect { id: 12, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi },
+            Command::Disconnect(12),
+            Command::SetParam { node: 3, param: 3, value: 0.75 },
+            Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys },
+            Command::NoteOff { note: 60, source: SourceId::Hardware(20) },
+            Command::SetRigSource { node: 1, keys: true, laptop: false, hardware: true },
+            Command::SetSplit { point: Some(60) },
+            Command::SetSplit { point: None },
+            Command::SetSystemAudio { gain: 0.5 },
+            Command::TransportPlay,
+            Command::TransportStop,
+        ];
+        for cmd in cmds {
+            let s = serde_json::to_string(&cmd).unwrap();
+            let back: Command = serde_json::from_str(&s).unwrap();
+            assert_eq!(format!("{cmd:?}"), format!("{back:?}"));
+        }
+        // The exact shape the CLI/bridge accepts.
+        let c: Command = serde_json::from_str(r#"{"SetSystemAudio":{"gain":0.5}}"#).unwrap();
+        assert!(matches!(c, Command::SetSystemAudio { gain } if (gain - 0.5).abs() < 1e-6));
     }
 }

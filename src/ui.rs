@@ -3328,7 +3328,7 @@ impl DemoApp {
                     }
                     if n > 1 {
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("1–9 / ←→ switch view · all rigs keep sounding")
+                        ui.label(egui::RichText::new("keys 1–9 or arrow keys switch the view · all rigs keep sounding")
                             .size(11.0).color(theme::INK_2));
                     }
                     }); });

@@ -207,6 +207,9 @@ enum UnitKind {
 struct Unit {
     /// Engine node id (control-plane Graph). Unit index ≠ node id in general.
     node_id: u32,
+    /// Rig tag from the control-plane node (merge_rigs). The big view shows
+    /// one rig at a time; single-graph mode is all-rig-0.
+    rig: u8,
     node_kind: UnitKind,
     name: String,
     sub: String,
@@ -403,6 +406,7 @@ fn make_unit(node: &Node) -> Unit {
     for (i, k) in outs.iter().take(3).enumerate() { outs_arr[i] = *k; }
     Unit {
         node_id: node.id,
+        rig: node.rig,
         node_kind,
         name,
         sub,
@@ -662,6 +666,14 @@ struct DemoApp {
 
     /// Source tag applied to the next fire_keys (set by each input path).
     current_source: SourceId,
+    /// Multi-rig UI (PLAN §13.1): the rig shown in the big view. Visual only —
+    /// every rig keeps sounding; switching never touches the audio path.
+    active_rig: usize,
+    /// Smoothed per-rig activity for the overview strip (max unit LED).
+    rig_levels: Vec<f32>,
+    /// Previous frame's keyboard-focus state: losing focus drains held keys
+    /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
+    had_kb_focus: bool,
 
     /// Per-rig input selection (keys, laptop, hardware) for rigs A=node1, B=node4.
     rig_sources: [(bool, bool, bool); 2],
@@ -784,6 +796,9 @@ impl DemoApp {
             note_sink,
             flip_requested: false,
             current_source: SourceId::Keys,
+            active_rig: 0,
+            rig_levels: Vec::new(),
+            had_kb_focus: true,
             rig_sources: [(true, true, true); 2],
             split_on: false,
             assistant: Assistant::new(),
@@ -913,6 +928,7 @@ impl DemoApp {
                 }
             }
         }
+        self.active_rig = 0;
         self.compute_groups();
         // Reset interaction state that referenced the old rack.
         self.selected = None;
@@ -923,12 +939,19 @@ impl DemoApp {
         self.graph_sig.clear(); // force shared-graph re-mirror
     }
 
-    /// Derive rack structure: Keys (left), Master (right), and one middle
-    /// column per instrument (Clap) followed by its downstream DSP chain.
+    /// Derive rack structure FOR THE ACTIVE RIG: Keys (left), Master (right),
+    /// and one middle column per instrument (Clap) followed by its downstream
+    /// DSP chain. Other rigs' units keep Rect::NOTHING (hidden, still sounding).
     fn compute_groups(&mut self) {
-        self.keys_unit = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Keys));
-        self.master_unit = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master));
+        let rig = self.active_rig as u8;
+        let multi = self.rig_count() > 1;
+        let in_rig = |u: &Unit| !multi || u.rig == rig;
+        self.keys_unit = self.units.iter().position(|u| in_rig(u) && matches!(u.node_kind, UnitKind::Keys));
+        self.master_unit = self.units.iter().position(|u| in_rig(u) && matches!(u.node_kind, UnitKind::Master));
         let mut claimed = vec![false; self.units.len()];
+        for (i, u) in self.units.iter().enumerate() {
+            if !in_rig(u) { claimed[i] = true; } // never group hidden units
+        }
         if let Some(k) = self.keys_unit { claimed[k] = true; }
         if let Some(m) = self.master_unit { claimed[m] = true; }
         let mut cols: Vec<Vec<usize>> = Vec::new();
@@ -960,6 +983,67 @@ impl DemoApp {
         }
         self.layout_rows = cols.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
         self.stack_cols = cols;
+        // Hidden units (other rigs) keep no rect: layout/draw/hit skip them.
+        for (i, u) in self.units.iter().enumerate() {
+            if !in_rig(u) {
+                if let Some(r) = self.unit_rects.get_mut(i) { *r = Rect::NOTHING; }
+            }
+        }
+    }
+
+    /// Number of rigs in the current rack (merge_rigs tags nodes). Single-graph
+    /// mode = 1. The overview strip and rig switching only appear above 1.
+    fn rig_count(&self) -> usize {
+        self.units.iter().map(|u| u.rig as usize).max().map_or(1, |m| m + 1)
+    }
+
+    /// Is this unit part of the big view (the active rig)?
+    fn visible(&self, unit: usize) -> bool {
+        self.rig_count() <= 1 || self.units.get(unit).map_or(false, |u| u.rig == self.active_rig as u8)
+    }
+
+    /// Switch the big view to another rig. VISUAL ONLY — all rigs keep sounding
+    /// (the engine matrix routes by source, never by UI selection; vibez lesson).
+    fn set_active_rig(&mut self, rig: usize) {
+        let n = self.rig_count();
+        let rig = rig.min(n.saturating_sub(1));
+        if rig == self.active_rig { return; }
+        self.active_rig = rig;
+        self.compute_groups();
+        // Interaction state referenced the old view's geometry.
+        self.selected = None;
+        self.pending = None;
+        self.drag = Drag::None;
+        self.press = None;
+        self.hover = None;
+        // Keep MCP/bridge get_rigs consistent with the UI selection (the audio
+        // render path never locks this snapshot).
+        if let Ok(mut s) = self.rig_snapshot.lock() {
+            if !s.rigs.is_empty() { s.active = rig; }
+        }
+    }
+
+    /// Display name for a rig: engine-published snapshot first, else Rig A/B/C.
+    fn rig_name(&self, rig: usize) -> String {
+        if let Ok(s) = self.rig_snapshot.lock() {
+            if let Some(m) = s.rigs.get(rig) {
+                if !m.name.is_empty() { return m.name.clone(); }
+            }
+        }
+        let letter = (b'A' + (rig.min(25)) as u8) as char;
+        format!("Rig {letter}")
+    }
+
+    /// Overview device line: the rig's bound hardware MIDI device, or ALL.
+    fn rig_device_label(&self, rig: usize) -> String {
+        let dev = self.rig_snapshot.lock().ok().and_then(|s| s.rigs.get(rig).and_then(|m| m.midi_device));
+        match dev {
+            None => "ALL SOURCES".into(),
+            Some(d) => match self.hw_devices.get(d as usize) {
+                Some(name) => format!("HW: {}", name.to_uppercase()),
+                None => format!("HW: DEV {d}"),
+            },
+        }
     }
 
     /// The movable (middle-stack) unit under a rack-local point, if any.
@@ -1075,7 +1159,7 @@ impl DemoApp {
         // key-name columns highlighted in ACCENT_BRIGHT — the reference's
         // dark-panel "orange highlighted phrases" (§4.16).
         let body = "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
-             F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
+             F7 Ambient Pad / F8 demo / F4 multi-rig — each loads a playable rack\n\
              F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
              Space / F10        metronome Play·Stop · Transport window sets BPM\n\
              Tab                flip the rack · front = perform, back = patch\n\
@@ -1088,7 +1172,7 @@ impl DemoApp {
              grab a cable       shake it — watch it swing and settle (back)\n\
              tug a plug         pull it out to unplug (back)\n\
              click a cable      highlight its whole signal path\n\
-             R reset knobs · D stats · ? help · esc cancel";
+             1–9/←→ rigs · R reset · D stats · ? help · esc cancel";
         let body_fmt = egui::epaint::text::TextFormat {
             font_id: FontId::proportional(14.0),
             color: TEXT,
@@ -1477,6 +1561,46 @@ impl DemoApp {
         }
     }
 
+    /// Load two independent rigs (PLAN §13.1, AUM operating model): each a
+    /// full rack with its own MasterOut, merged via merge_rigs and sent to the
+    /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
+    /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
+    fn load_multi_rig_demo(&mut self) {
+        fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
+            let mut g = Graph::default();
+            g.reserve(8, 8);
+            let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+            let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
+            if with_delay {
+                let fx = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+                g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(4, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+            } else {
+                g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+            }
+            crate::control::Rig::new(name, g, None)
+        }
+        let rigs = vec![mk_rig("Rig A", true), mk_rig("Rig B", false)];
+        let merged = crate::control::merge_rigs(&rigs);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
+        }
+        self.build_rack(&merged, &[]);
+        self.editor_open = false;
+        self.editor_params.clear();
+        self.rig_sources = [(true, true, true); 2];
+        self.rig_device = [None, None];
+        self.split_on = false;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetSplit { point: None });
+        }
+        self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
+    }
+
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
         match name {
             "get_status" => serde_json::json!({
@@ -1679,7 +1803,8 @@ impl DemoApp {
                     "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); "Loaded template 'Drums + Bass'".into() }
                     "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); "Loaded template 'Ambient Pad'".into() }
                     "demo" => { self.load_demo_patch(); "Loaded the demo patch".into() }
-                    _ => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo)"),
+                    "multi_rig" | "rigs" => { self.load_multi_rig_demo(); "Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".into() }
+                    _ => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
                 }
             }
             "add_node" => {
@@ -1890,6 +2015,75 @@ impl DemoApp {
         }
     }
 
+    /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
+    /// when >1 rig is loaded. Per rig: number-key hint, name, bound MIDI device,
+    /// live level; the active rig gets the reference's tomato underline. Click
+    /// or 1–9/←→ switches the BIG VIEW ONLY — every rig keeps sounding.
+    fn rig_overview_panel(&mut self, root: &mut egui::Ui) {
+        let n = self.rig_count();
+        if n <= 1 { return; }
+        let mut switch: Option<usize> = None;
+        egui::Panel::top("rig_overview")
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .inner_margin(egui::Margin::symmetric(10, 6)),
+            )
+            .show(root, |ui| {
+                ui.horizontal(|ui| {
+                    theme::section_label(ui, "Rigs");
+                    ui.add_space(6.0);
+                    for rig in 0..n.min(9) {
+                        let active = rig == self.active_rig;
+                        let name = self.rig_name(rig);
+                        let dev = self.rig_device_label(rig);
+                        let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
+                        let name_col = if active { theme::INK } else { theme::INK_2 };
+                        let inner = egui::Frame::new()
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("{}", rig + 1))
+                                        .monospace().size(11.0)
+                                        .color(if active { theme::ACCENT_DEEP } else { theme::INK_2 }));
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(name_col));
+                                });
+                                ui.horizontal(|ui| {
+                                    theme::tracked_label(ui, &dev, 9.0, 0.14, theme::INK_2);
+                                    ui.add_space(6.0);
+                                    // Live level: flat teal bar on a hairline track.
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(36.0, 3.0), egui::Sense::hover());
+                                    let p = ui.painter();
+                                    p.rect_filled(r, 1.0, theme::HAIRLINE);
+                                    let w = 36.0 * level.clamp(0.0, 1.0);
+                                    if w > 0.5 {
+                                        p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
+                                    }
+                                });
+                            });
+                        let resp = inner.response.interact(egui::Sense::click());
+                        if active {
+                            let r = inner.response.rect;
+                            ui.painter().line_segment(
+                                [Pos2::new(r.left() + 8.0, r.bottom() + 1.0), Pos2::new(r.right() - 8.0, r.bottom() + 1.0)],
+                                Stroke::new(2.0, theme::ACCENT),
+                            );
+                        }
+                        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                        if resp.clicked() { switch = Some(rig); }
+                        ui.add_space(4.0);
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("1–9 / ←→ switch view · all rigs keep sounding")
+                        .size(11.0).color(theme::INK_2));
+                });
+            });
+        if let Some(r) = switch { self.set_active_rig(r); }
+    }
+
     /// AUM-style per-rig input selection: which sources feed each rig.
     /// Hurricane top strip (§4.14): paper, plain-text toggles, hairline nav.
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
@@ -2090,6 +2284,12 @@ impl DemoApp {
                 });
                 if ui.button("Demo patch (2 stacks)").clicked() {
                     self.load_demo_patch();
+                }
+                if ui.button("Multi-rig demo (2 rigs)")
+                    .on_hover_text("two independent rigs, both sounding — switch the view with 1–9 / ←→ (F4)")
+                    .clicked()
+                {
+                    self.load_multi_rig_demo();
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2591,6 +2791,14 @@ impl DemoApp {
 
         for u in &mut self.units { u.led *= (-dt / 0.20).exp(); }
         for k in &mut self.key_leds { *k *= (-dt / 0.22).exp(); }
+        // Per-rig activity for the overview strip: instant attack, slow release.
+        let n_rigs = self.rig_count();
+        if self.rig_levels.len() != n_rigs { self.rig_levels.resize(n_rigs, 0.0); }
+        for r in 0..n_rigs {
+            let target = self.units.iter().filter(|u| u.rig == r as u8).map(|u| u.led).fold(0.0f32, f32::max);
+            let cur = self.rig_levels[r];
+            self.rig_levels[r] = if target > cur { target } else { cur + (target - cur) * (1.0 - (-dt / 0.25).exp()) };
+        }
 
         let mut n_arrivals = 0usize;
         for ci in 0..self.cables.len() {
@@ -2802,15 +3010,18 @@ impl DemoApp {
         match self.side {
             Side::Front => {
                 for (ui, u) in self.units.iter().enumerate() {
+                    if !self.visible(ui) { continue; }
                     for ki in 0..u.knobs.len() {
                         if (l - self.knob_center(ui, ki)).length() < 23.0 {
                             return Hit::Knob { unit: ui, idx: ki };
                         }
                     }
                 }
-                // Keys keyboard.
-                for wi in 0..8 {
-                    if self.key_rect(wi).contains(lp) { return Hit::Key(WHITE_SEMI[wi]); }
+                // Keys keyboard (only when the active rig has a Keys unit).
+                if self.keys_unit.map_or(false, |k| self.visible(k)) {
+                    for wi in 0..8 {
+                        if self.key_rect(wi).contains(lp) { return Hit::Key(WHITE_SEMI[wi]); }
+                    }
                 }
                 for (ui, _) in self.units.iter().enumerate() {
                     if self.unit_rects[ui].contains(lp) { return Hit::Unit(ui); }
@@ -2818,6 +3029,7 @@ impl DemoApp {
             }
             Side::Back => {
                 for (ui, u) in self.units.iter().enumerate() {
+                    if !self.visible(ui) { continue; }
                     for ji in 0..u.jacks.len() {
                         if (l - self.jack_pos(ui, ji)).length() < 15.0 {
                             return Hit::Jack { unit: ui, jack: ji };
@@ -2827,6 +3039,7 @@ impl DemoApp {
                 let mut best: Option<(usize, f32, f32)> = None;
                 for (ci, c) in self.cables.iter().enumerate() {
                     if c.dying >= 0.0 { continue; }
+                    if !self.visible(c.src) || !self.visible(c.dst) { continue; }
                     let thresh = 8.0 + c.level * 3.0;
                     for i in 0..c.n.saturating_sub(1) {
                         let d = dist_sq_to_segment(lp, c.pts[i], c.pts[i + 1]);
@@ -2856,11 +3069,23 @@ impl DemoApp {
         let mut reset_knobs = false;
         let mut load_tpl: Option<Template> = None;
         let mut load_demo = false;
+        let mut load_multi = false;
+        let mut rig_switch: Option<usize> = None;
+        let mut rig_cycle: i8 = 0;
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
             if i.consume_key(Modifiers::NONE, Key::D) { self.show_stats = !self.show_stats; }
+            // Multi-rig big-view switching (visual only): 1–9 select, ←→ cycle.
+            let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+            for (d, k) in digits.iter().enumerate() {
+                if i.consume_key(Modifiers::NONE, *k) { rig_switch = Some(d); }
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowLeft) { rig_cycle = -1; }
+            if i.consume_key(Modifiers::NONE, Key::ArrowRight) { rig_cycle = 1; }
+            // Multi-rig demo (two independent rigs), F4.
+            if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
@@ -2896,6 +3121,15 @@ impl DemoApp {
         if flip { self.start_flip(); }
         if let Some(t) = load_tpl { self.load_template(t); }
         if load_demo { self.load_demo_patch(); }
+        if load_multi { self.load_multi_rig_demo(); }
+        if let Some(r) = rig_switch { self.set_active_rig(r); }
+        if rig_cycle != 0 {
+            let n = self.rig_count();
+            if n > 1 {
+                let next = (self.active_rig as i8 + rig_cycle).rem_euclid(n as i8) as usize;
+                self.set_active_rig(next);
+            }
+        }
         if reset_knobs {
             for u in &mut self.units {
                 for k in &mut u.knobs { k.value = k.default; }
@@ -3205,6 +3439,7 @@ impl DemoApp {
     fn draw_front(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
+            if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
@@ -3409,6 +3644,7 @@ impl DemoApp {
     fn draw_back(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
+            if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
@@ -3467,6 +3703,7 @@ impl DemoApp {
         // Paint order fix (§4.4): unit titles + jack labels LAST, so cables
         // never cross them.
         for (ui, u) in self.units.iter().enumerate() {
+            if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             for (ji, j) in u.jacks.iter().enumerate() {
@@ -3510,6 +3747,7 @@ impl DemoApp {
             .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.8) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
+            if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, has_sel, hl[ci]);
             if a <= 0.01 { continue; }
             let hovered = matches!(self.hover, Some(Hit::Cable(i, _)) if i == ci);
@@ -3541,6 +3779,7 @@ impl DemoApp {
     fn draw_jacks(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
+            if !self.visible(ui) { continue; }
             for (ji, j) in u.jacks.iter().enumerate() {
                 let c = self.jack_pos(ui, ji);
                 let kind = u.kind(j.dir, j.port);
@@ -3590,6 +3829,7 @@ impl DemoApp {
         let xf = &self.xf;
         for (ci, c) in self.cables.iter().enumerate() {
             if c.dying >= 0.0 { continue; }
+            if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, false, true);
             for end in [Dir::Out, Dir::In] {
                 let over = if end == Dir::Out { c.over_a } else { c.over_b };
@@ -3625,6 +3865,7 @@ impl DemoApp {
     fn draw_pulses(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         for (ci, c) in self.cables.iter().enumerate() {
+            if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, has_sel, hl[ci]);
             if a <= 0.02 { continue; }
             // Single flat dot (§4.11): cable color mixed 0.5 toward cream-
@@ -3823,6 +4064,7 @@ impl eframe::App for DemoApp {
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
         self.rig_inputs_panel(ui);
+        self.rig_overview_panel(ui);
         self.assistant_panel_ui(ui);
 
         // Native rig editor (task-26): handle open/close requests from unit
@@ -3832,6 +4074,17 @@ impl eframe::App for DemoApp {
         }
 
         // Laptop keys (disabled while the assistant text field has focus).
+        // Losing keyboard focus drains held keys so note-offs can't orphan
+        // (vibez lesson, docs/vibez-notes.md). held_keys are laptop keys, so
+        // the drain fires under the LaptopKeys source regardless of the last
+        // hardware event.
+        let kb_focus = !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.focused);
+        if !kb_focus && self.had_kb_focus && !self.held_keys.is_empty() {
+            self.current_source = SourceId::LaptopKeys;
+            let held: Vec<_> = self.held_keys.drain(..).collect();
+            for (_, semi) in held { self.fire_keys(semi, 0.0); }
+        }
+        self.had_kb_focus = kb_focus;
         if !ctx.egui_wants_keyboard_input() {
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
@@ -4283,4 +4536,82 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
         }),
     )
     .map_err(|e| anyhow::anyhow!("eframe failed: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-rig UI tests (PLAN §13.1): view switching is visual only — the merged
+// graph, cables, and per-rig grouping must stay intact across switches.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod multi_rig_ui_tests {
+    use super::*;
+
+    fn two_rig_app() -> DemoApp {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        app
+    }
+
+    #[test]
+    fn multi_rig_demo_builds_two_tagged_rigs() {
+        let app = two_rig_app();
+        assert_eq!(app.rig_count(), 2);
+        // Rig A: Keys, Surge, Delay, Master. Rig B: Keys, Surge, Master.
+        assert_eq!(app.units.iter().filter(|u| u.rig == 0).count(), 4);
+        assert_eq!(app.units.iter().filter(|u| u.rig == 1).count(), 3);
+        assert_eq!(app.active_rig, 0);
+        assert!(app.keys_unit.is_some() && app.master_unit.is_some());
+    }
+
+    #[test]
+    fn switching_rig_regroups_view_without_touching_cables() {
+        let mut app = two_rig_app();
+        let cables_before = app.cables.len();
+        let keys0 = app.keys_unit.unwrap();
+        let master0 = app.master_unit.unwrap();
+        app.set_active_rig(1);
+        assert_eq!(app.active_rig, 1);
+        let keys1 = app.keys_unit.unwrap();
+        assert_ne!(keys1, keys0); // rig B has its own Keys anchor
+        assert!(app.visible(keys1));
+        assert!(!app.visible(keys0));
+        assert!(!app.visible(master0));
+        // Hidden units keep no rect; all cables survive (every rig sounds on).
+        assert_eq!(app.unit_rects[keys0], Rect::NOTHING);
+        assert_eq!(app.cables.len(), cables_before);
+        // Interaction state referencing the old view is cleared.
+        assert!(app.selected.is_none() && app.pending.is_none());
+    }
+
+    #[test]
+    fn rig_switch_clamps_to_range() {
+        let mut app = two_rig_app();
+        app.set_active_rig(99);
+        assert_eq!(app.active_rig, 1);
+        app.set_active_rig(0);
+        assert_eq!(app.active_rig, 0);
+    }
+
+    #[test]
+    fn single_graph_mode_shows_every_unit() {
+        let app = DemoApp::new_with_sink(None); // default demo patch, all rig 0
+        assert_eq!(app.rig_count(), 1);
+        for ui in 0..app.units.len() {
+            assert!(app.visible(ui));
+        }
+    }
+
+    #[test]
+    fn held_keys_drain_on_focus_loss() {
+        let mut app = two_rig_app();
+        // Simulate a held laptop key, then focus loss (had_kb_focus true →
+        // the ui() drain path fires note-offs and empties the held set).
+        app.handle_laptop_key(Key::A, true, false);
+        assert_eq!(app.held_keys.len(), 1);
+        app.current_source = SourceId::LaptopKeys;
+        let held: Vec<_> = app.held_keys.drain(..).collect();
+        for (_, semi) in held { app.fire_keys(semi, 0.0); }
+        assert!(app.held_keys.is_empty());
+    }
 }

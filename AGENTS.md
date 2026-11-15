@@ -166,6 +166,24 @@ Learned so far (2026-11-15, UI polish pass):
     row count (`stack_columns` per rig) and stretch shorter stacks to the
     column height — sizing per rig made Rig B visibly smaller than Rig A
     and the rack jumped on every switch.
+37. **Tests never touch the network or the user's config:** `load_key()` and
+    `save_config_field()` are no-ops under `cfg(test)`. The assistant's
+    startup `/models` fetch ran once per test DemoApp with the real key, and
+    the leftover reqwest/tokio threads aborted the test binary at exit.
+38. **`RLIMIT_RTTIME` must allow plugin state loads:** pass `sample_rate`
+    (clamped by `rtkit` to 200 ms) rather than `BUFFER_FRAMES` (~5.3 ms) to
+    `promote_current_thread_to_real_time`; Surge XT applies `load_state` inside
+    `process()`, which exceeds 5.3 ms and triggers `SIGXCPU` on `SCHED_RR`.
+39. **Share one patch-search helper with alias fallback:** `ui.rs` and `mcp.rs`
+    both call `host::search_surge_patches`; `find_surge_patch` and
+    `search_surge_patches` try literal matches first, then instrument aliases
+    (`wurlitzer` → `wurli`, `rhodes` → `suitcase`/`ep`, etc.) so common
+    queries don't miss and leave Surge on the init saw patch.
+40. **`AddNode` for `Clap` must wire matrix + bind idle voices:** adding a
+    CLAP node (`Command::AddNode`) left it disconnected in `Matrix` and
+    unbound in `voices`, and `sync_from_engine` skipped `sync_clap_slots` when
+    `mirror == g.graph` — connect `Keys`/`Hardware` and bind idle matching
+    voices in `AddNode`, and run `sync_clap_slots` even on `same` syncs.
 
 ## Ground rules
 

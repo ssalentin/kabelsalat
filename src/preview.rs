@@ -664,6 +664,7 @@ impl eframe::App for PreviewApp {
         // Assistant events (tool calls execute here, on the UI thread).
         for ev in self.assistant.poll() {
             match ev {
+                assistant::FromWorker::Models(_) => {}
                 assistant::FromWorker::Text(t) => self
                     .assistant
                     .history

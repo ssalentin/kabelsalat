@@ -263,6 +263,8 @@ macro_rules! out_port {
 /// side and must NOT be called from the render thread — use a
 /// [`VoiceController`] from the UI thread instead.
 pub struct ClapVoice {
+    voice_id: u64,
+    plugin_id: String,
     processor: StartedPluginAudioProcessor<TestHost>,
     cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
     cmds_rx: rtrb::Consumer<VoiceCmd>,
@@ -285,11 +287,28 @@ pub struct ClapVoice {
 }
 
 impl ClapVoice {
-    /// Load Surge XT from `~/.clap`, instantiate, activate and start processing
-    /// at `sample_rate`. Returns the audio-side voice and the main-thread
-    /// handle (state/GUI/deactivation). Call on the main thread.
+    /// Load Surge XT from the CLAP search paths, instantiate, activate and start
+    /// processing at `sample_rate`. Returns the audio-side voice and the
+    /// main-thread handle (state/GUI/deactivation). Call on the main thread.
     pub fn new(sample_rate: f64) -> Result<(ClapVoice, ClapVoiceMain)> {
         let (entry, plugin_id) = discover_surge()?;
+        Self::instantiate_entry(entry, plugin_id, sample_rate)
+    }
+
+    /// Load any CLAP plugin by `plugin_id` from the CLAP search paths,
+    /// instantiate, activate and start processing at `sample_rate`.
+    pub fn new_plugin(sample_rate: f64, plugin_id: &str) -> Result<(ClapVoice, ClapVoiceMain)> {
+        let (entry, cid) = discover_plugin(plugin_id)?;
+        Self::instantiate_entry(entry, cid, sample_rate)
+    }
+
+    fn instantiate_entry(
+        entry: PluginEntry,
+        plugin_id: CString,
+        sample_rate: f64,
+    ) -> Result<(ClapVoice, ClapVoiceMain)> {
+        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id_str = plugin_id.to_string_lossy().into_owned();
         let host_info = HostInfo::new(
             "kabelsalat",
             "kabelsalat",
@@ -303,8 +322,8 @@ impl ClapVoice {
             &plugin_id,
             &host_info,
         )
-        .context("instantiating Surge XT")?;
-        println!("instantiated: {}", plugin_id.to_string_lossy());
+        .with_context(|| format!("instantiating {id_str}"))?;
+        println!("instantiated: {id_str}");
 
         let exts = plugin.access_shared_handler(|h| Exts {
             params: h.params.get().copied().flatten(),
@@ -343,6 +362,8 @@ impl ClapVoice {
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
         let n_out = out_chs.len();
         let voice = ClapVoice {
+            voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            plugin_id: id_str,
             processor,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
@@ -373,6 +394,16 @@ impl ClapVoice {
             _entry: entry,
         };
         Ok((voice, main))
+    }
+
+    /// Unique id for pairing with `ClapVoiceMain` on retirement.
+    pub fn voice_id(&self) -> u64 {
+        self.voice_id
+    }
+
+    /// CLAP plugin id string for this voice.
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
     }
 
     /// A `Send` controller for UI threads; grab it before moving the voice.
@@ -569,6 +600,12 @@ impl ClapVoiceMain {
     /// `ClapVoice::stop`. Consumes both sides (CLAP lifecycle rule).
     pub fn deactivate(mut self, stopped: StoppedPluginAudioProcessor<TestHost>) {
         self.instance.deactivate(stopped);
+    }
+
+    /// Stop `voice` and deactivate both halves (main thread only).
+    pub fn retire(self, voice: ClapVoice) {
+        let stopped = voice.stop();
+        self.deactivate(stopped);
     }
 
     /// Enumerate all plugin parameters for the native (egui) editor. Main thread
@@ -817,24 +854,83 @@ pub fn run_test() -> Result<()> {
 // Discovery
 // ---------------------------------------------------------------------------
 
-fn discover_surge() -> Result<(PluginEntry, CString)> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let dir = PathBuf::from(home).join(".clap");
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .with_context(|| format!("reading {} (install Surge XT.clap there)", dir.display()))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "clap").unwrap_or(false))
-        .collect();
-    paths.sort();
+/// Standard CLAP search directories: `~/.clap`, `/usr/lib/clap`,
+/// `/usr/local/lib/clap`, and `$CLAP_PATH` entries, deduplicated in order.
+pub fn clap_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !p.as_os_str().is_empty() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    };
+    if let Ok(home) = std::env::var("HOME") {
+        push_unique(PathBuf::from(home).join(".clap"));
+    }
+    push_unique(PathBuf::from("/usr/lib/clap"));
+    push_unique(PathBuf::from("/usr/local/lib/clap"));
+    if let Ok(extra) = std::env::var("CLAP_PATH") {
+        for part in extra.split(':') {
+            if !part.is_empty() {
+                push_unique(PathBuf::from(part));
+            }
+        }
+    }
+    dirs
+}
+
+fn clap_bundle_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for dir in clap_search_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let mut dir_paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "clap").unwrap_or(false))
+            .collect();
+        dir_paths.sort();
+        paths.extend(dir_paths);
+    }
+    paths
+}
+
+fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
+    let paths = clap_bundle_paths();
     if paths.is_empty() {
-        bail!("no .clap bundles found in {}", dir.display());
+        bail!("no .clap bundles found in CLAP search paths");
+    }
+    for path in &paths {
+        // SAFETY: loading a CLAP bundle executes its init code; only standard
+        // CLAP directories and CLAP_PATH are scanned.
+        let entry = match unsafe { PluginEntry::load(path) } {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        let found = entry.get_plugin_factory().and_then(|factory| {
+            factory.plugin_descriptors().find_map(|d| {
+                let id = d.id()?;
+                (id.to_string_lossy() == target_id).then(|| id.to_owned())
+            })
+        });
+        if let Some(id) = found {
+            return Ok((entry, id));
+        }
+    }
+    bail!("CLAP plugin '{target_id}' not found in CLAP search paths")
+}
+
+fn discover_surge() -> Result<(PluginEntry, CString)> {
+    let paths = clap_bundle_paths();
+    if paths.is_empty() {
+        bail!("no .clap bundles found in CLAP search paths");
     }
 
     let mut chosen: Option<(PluginEntry, CString)> = None;
     for path in &paths {
-        // SAFETY: loading a CLAP bundle executes its init code; we only load
-        // bundles from the user's own ~/.clap directory.
+        // SAFETY: loading a CLAP bundle executes its init code; only standard
+        // CLAP directories and CLAP_PATH are scanned.
         let entry = match unsafe { PluginEntry::load(path) } {
             Ok(e) => e,
             Err(e) => {
@@ -872,7 +968,7 @@ fn discover_surge() -> Result<(PluginEntry, CString)> {
             }
         }
     }
-    chosen.ok_or_else(|| anyhow!("Surge XT (instrument) not found in {}", dir.display()))
+    chosen.ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))
 }
 
 /// Metadata for an installed CLAP plugin (for the plugin browser).
@@ -885,27 +981,417 @@ pub struct ClapPluginInfo {
 }
 
 /// Enumerate all CLAP plugins in ~/.clap (id, name, vendor, features).
+/// One Surge patch on disk (factory / 3rd-party / user library).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SurgePatch {
+    pub name: String,
+    pub category: String,
+    pub path: std::path::PathBuf,
+}
+
+/// Every Surge patch installed (factory, 3rd-party, user dir), sorted by
+/// category then name. Rare + allocating (a directory walk) — call off the
+/// audio thread; the UI caches it.
+pub fn list_surge_patches() -> Vec<SurgePatch> {
+    let mut roots: Vec<std::path::PathBuf> = vec![
+        "/usr/share/surge-xt/patches_factory".into(),
+        "/usr/share/surge-xt/patches_3rdparty".into(),
+    ];
+    if let Some(h) = std::env::var_os("HOME") {
+        let h = std::path::PathBuf::from(h);
+        roots.push(h.join("Documents/Surge XT/Patches"));
+        roots.push(h.join(".local/share/surge-xt/patches_user"));
+    }
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<SurgePatch>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, base, out); continue; }
+            if p.extension().and_then(|x| x.to_str()) != Some("fxp") { continue; }
+            let name = p.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+            let category = p.parent().and_then(|d| d.strip_prefix(base).ok())
+                .map(|r| r.to_string_lossy().to_string()).unwrap_or_default();
+            out.push(SurgePatch { name, category, path: p });
+        }
+    }
+    for r in &roots { walk(r, r, &mut out); }
+    out.sort_by(|a, b| (a.category.to_lowercase(), a.name.to_lowercase()).cmp(&(b.category.to_lowercase(), b.name.to_lowercase())));
+    out
+}
+
+fn word_alternatives(w: &str) -> &'static [&'static str] {
+    match w {
+        "wurlitzer" | "wurli" => &["wurlitzer", "wurli"],
+        "rhodes" => &["rhodes", "suitcase", "ep"],
+        "ep" => &["ep", "electric piano", "suitcase", "wurli", "rhodes"],
+        "electric" => &["electric", "ep", "suitcase", "wurli", "rhodes"],
+        "piano" => &["piano", "ep", "suitcase", "wurli", "keys"],
+        "harpsichord" | "harpsi" => &["harpsichord", "harpsi"],
+        "saxophone" | "sax" => &["saxophone", "sax"],
+        "synthesizer" | "synth" => &["synthesizer", "synth"],
+        "vibraphone" | "vibes" => &["vibraphone", "vibes"],
+        "glockenspiel" | "glock" => &["glockenspiel", "glock"],
+        "clavinet" | "clav" => &["clavinet", "clav"],
+        "percussion" | "perc" => &["percussion", "perc"],
+        "reverb" | "verb" => &["reverb", "verb"],
+        "atmospheric" | "atmosphere" | "atmos" => &["atmospheric", "atmosphere", "atmos", "ambient", "pad"],
+        "spooky" | "creepy" | "eerie" => &["spooky", "creepy", "eerie", "dark", "haunt"],
+        _ => &[],
+    }
+}
+
+fn word_matches_alias(haystack: &str, w: &str) -> bool {
+    haystack.contains(w) || word_alternatives(w).iter().any(|alt| haystack.contains(alt))
+}
+
+/// Search `patches` by words in `"Category/Name"`, preferring literal matches
+/// first and falling back to common instrument aliases (`wurlitzer` -> `wurli`,
+/// `rhodes` -> `suitcase`/`ep`, etc.).
+pub fn search_surge_patches(patches: &[SurgePatch], query: &str, limit: usize) -> Vec<String> {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut out = Vec::new();
+    for alias in [false, true] {
+        for p in patches {
+            if out.len() >= limit { return out; }
+            let f = format!("{}/{}", p.category, p.name).to_lowercase();
+            let ok = if alias {
+                words.iter().all(|w| word_matches_alias(&f, w))
+            } else {
+                words.iter().all(|w| f.contains(w))
+            };
+            if ok {
+                let label = format!("{}/{}", p.category, p.name);
+                if !out.contains(&label) {
+                    out.push(label);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Best patch for a free-text query ("flute", "warm pad", "Winds/Flute 2"):
+/// exact name > name contains every word > category+name contains every
+/// word > alias-expanded match; factory before 3rd-party on ties (list order).
+pub fn find_surge_patch<'a>(patches: &'a [SurgePatch], query: &str) -> Option<&'a SurgePatch> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() { return None; }
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let full = |p: &SurgePatch| format!("{}/{}", p.category, p.name).to_lowercase();
+    let is_factory = |p: &SurgePatch| p.path.to_string_lossy().contains("patches_factory");
+    let tiers: [&dyn Fn(&SurgePatch) -> bool; 7] = [
+        &|p| p.name.to_lowercase() == q || full(p) == q,
+        &|p| p.name.to_lowercase().starts_with(&q),
+        &|p| words.iter().all(|w| p.name.to_lowercase().contains(w)),
+        &|p| words.iter().all(|w| full(p).contains(w)),
+        &|p| words.iter().all(|w| word_matches_alias(&p.name.to_lowercase(), w)),
+        &|p| words.iter().all(|w| word_matches_alias(&full(p), w)),
+        &|p| words.iter().any(|w| w.len() > 2 && word_matches_alias(&full(p), w)),
+    ];
+    // The curated factory library wins at every tier; 3rd-party is the fallback.
+    for factory_only in [true, false] {
+        for t in tiers.iter() {
+            if let Some(p) = patches.iter().find(|p| (!factory_only || is_factory(p)) && t(p)) { return Some(p); }
+        }
+    }
+    None
+}
+
+/// The patch name inside a Surge state blob (`<meta name="…" …>` in the
+/// sub3 XML). Surge's init patch is named "Init Saw" / "Init" etc.
+pub fn patch_name_from_state(state: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(state);
+    let i = text.find("<meta name=\"")? + "<meta name=\"".len();
+    let end = text[i..].find('"')?;
+    let name = text[i..i + end].trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Surge `.fxp` → the CLAP state blob `ClapVoiceMain::load_state` takes: an
+/// fxp is a 60-byte VST2 fxChunkSet header ("CcnK"… "FPCh"… chunk size)
+/// followed by the same `sub3` chunk Surge saves as its CLAP state.
+pub fn fxp_to_state(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 64 || &bytes[0..4] != b"CcnK" || &bytes[8..12] != b"FPCh" {
+        return Err(anyhow!("not a Surge .fxp (bad header)"));
+    }
+    let size = u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]) as usize;
+    let chunk = &bytes[60..];
+    if &chunk[0..4] != b"sub3" { return Err(anyhow!("fxp chunk is not a Surge sub3 patch")); }
+    Ok(chunk[..size.min(chunk.len())].to_vec())
+}
+
+/// `preset-test`: load a factory patch into a real Surge instance and prove
+/// (a) the state took (the saved state names the patch) and (b) the sound
+/// changed (same note, different spectrum than the init patch).
+pub fn run_preset_test() -> Result<()> {
+    let patches = list_surge_patches();
+    anyhow::ensure!(!patches.is_empty(), "no Surge patches installed");
+    let flute = find_surge_patch(&patches, "flute").ok_or_else(|| anyhow!("no flute patch found"))?;
+    let sr = 48_000.0;
+    let (mut voice, mut main) = ClapVoice::new(sr)?;
+    let ctl = voice.controller();
+    // Zero-crossing rate + RMS of 0.4 s of note 60 — a cheap timbre fingerprint.
+    let mut measure = |voice: &mut ClapVoice| -> (f32, f32) {
+        let mut buf = vec![0.0f32; 512 * 2];
+        for _ in 0..20 { voice.render(&mut buf); } // settle
+        ctl.note_on(60, 0.9);
+        let (mut zc, mut sq, mut n, mut prev) = (0usize, 0.0f64, 0usize, 0.0f32);
+        for _ in 0..(sr as usize * 4 / 10 / 512) {
+            voice.render(&mut buf);
+            for f in buf.chunks(2) {
+                let x = f[0];
+                if (x > 0.0) != (prev > 0.0) { zc += 1; }
+                prev = x; sq += (x * x) as f64; n += 1;
+            }
+        }
+        ctl.note_off(60);
+        for _ in 0..60 { voice.render(&mut buf); } // release tail
+        (zc as f32 / n as f32 * sr as f32 / 2.0, (sq / n as f64).sqrt() as f32)
+    };
+    let (zc_a, rms_a) = measure(&mut voice);
+    let init_state = main.save_state()?;
+    let data = std::fs::read(&flute.path)?;
+    main.load_state(&fxp_to_state(&data)?)?;
+    let mut buf = vec![0.0f32; 512 * 2];
+    for _ in 0..20 { voice.render(&mut buf); } // Surge applies state on the audio thread
+    let saved = main.save_state()?;
+    // The plugin now reports a different patch than the init one.
+    let named = saved != init_state;
+    let (zc_b, rms_b) = measure(&mut voice);
+    println!("patches: {} · picked '{}/{}' · plugin state changed: {named}", patches.len(), flute.category, flute.name);
+    println!("init: ~{zc_a:.0} Hz zero-cross, rms {rms_a:.4} · flute: ~{zc_b:.0} Hz, rms {rms_b:.4}");
+    anyhow::ensure!(named, "plugin state unchanged after loading the patch");
+    anyhow::ensure!(rms_b > 1e-4, "flute patch is silent");
+    let diff = (zc_a - zc_b).abs() / zc_a.max(1.0) + (rms_a - rms_b).abs() / rms_a.max(1e-6);
+    anyhow::ensure!(diff > 0.15, "sound did not change (diff {diff:.3})");
+    println!("preset-test: OK — '{}' loaded, timbre changed (diff {diff:.2})", flute.name);
+    Ok(())
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DexedPatch {
+    pub bank: String,
+    pub program: usize,
+    pub name: String,
+    pub syx_path: std::path::PathBuf,
+}
+
+/// Parse a standard 4104-byte 32-voice DX7 SysEx bank (`F0 43 00 09 20 00`
+/// header, 32 x 128-byte packed voices, 10-byte ASCII name at bytes 118..128).
+pub fn parse_dx7_bank(bank: &str, path: &std::path::Path, bytes: &[u8]) -> Vec<DexedPatch> {
+    const HEADER: [u8; 6] = [0xF0, 0x43, 0x00, 0x09, 0x20, 0x00];
+    if bytes.len() != 4104 || !bytes.starts_with(&HEADER) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(32);
+    for program in 0..32 {
+        let start = 6 + program * 128;
+        let voice = &bytes[start..start + 128];
+        let name: String = voice[118..128]
+            .iter()
+            .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { ' ' })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        out.push(DexedPatch {
+            bank: bank.to_string(),
+            program,
+            name,
+            syx_path: path.to_path_buf(),
+        });
+    }
+    out
+}
+
+/// Discover all DX7 `.syx` cartridge patches in
+/// `~/.local/share/DigitalSuburban/Dexed/Cartridges` recursively.
+pub fn discover_dexed_patches() -> Vec<DexedPatch> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let root = std::path::PathBuf::from(home).join(".local/share/DigitalSuburban/Dexed/Cartridges");
+    let mut out = Vec::new();
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<DexedPatch>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, base, out);
+                continue;
+            }
+            if !p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("syx")) {
+                continue;
+            }
+            let bank = p
+                .strip_prefix(base)
+                .ok()
+                .map(|r| r.with_extension("").to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    p.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string()
+                });
+            if let Ok(bytes) = std::fs::read(&p) {
+                out.extend(parse_dx7_bank(&bank, &p, &bytes));
+            }
+        }
+    }
+    walk(&root, &root, &mut out);
+    out.sort_by(|a, b| (a.bank.to_lowercase(), a.program).cmp(&(b.bank.to_lowercase(), b.program)));
+    out
+}
+
+/// Search Dexed patches by words in `"{bank}/{name}"`, preferring literal
+/// matches first and falling back to common instrument aliases.
+pub fn search_dexed_patches(patches: &[DexedPatch], query: &str, limit: usize) -> Vec<String> {
+    let q = query.trim().to_lowercase();
+    let words: Vec<&str> = q.split_whitespace().collect();
+    let mut out = Vec::new();
+    for alias in [false, true] {
+        for p in patches {
+            if out.len() >= limit {
+                return out;
+            }
+            let f = format!("{}/{}", p.bank, p.name).to_lowercase();
+            let ok = if alias {
+                words.iter().all(|w| word_matches_alias(&f, w))
+            } else {
+                words.iter().all(|w| f.contains(w))
+            };
+            if ok {
+                let label = format!("{}/{:02} {}", p.bank, p.program + 1, p.name);
+                if !out.contains(&label) {
+                    out.push(label);
+                }
+            }
+        }
+    }
+    out
+}
+
+const JUCE_B64_ALPHABET: &[u8; 64] =
+    b".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
+
+/// Encode bytes using JUCE's `MemoryBlock::toBase64Encoding()` format:
+/// `"<len>.<custom-base64>"`.
+fn juce_b64_encode(bytes: &[u8]) -> String {
+    let mut out = format!("{}.", bytes.len());
+    out.reserve((bytes.len() * 4).div_ceil(3));
+    for chunk in bytes.chunks(3) {
+        let mut v: u32 = chunk[0] as u32;
+        if chunk.len() > 1 {
+            v |= (chunk[1] as u32) << 8;
+        }
+        if chunk.len() > 2 {
+            v |= (chunk[2] as u32) << 16;
+        }
+        let nchars = chunk.len() + 1;
+        for i in 0..nchars {
+            let idx = ((v >> (6 * i)) & 0x3F) as usize;
+            out.push(JUCE_B64_ALPHABET[idx] as char);
+        }
+    }
+    out
+}
+
+/// Unpack a 128-byte packed DX7 SysEx voice into Dexed's 161-byte `program` blob
+/// (155-byte unpacked DX7 voice + 6 zeroed Dexed extension bytes).
+fn unpack_dx7_voice(packed: &[u8]) -> [u8; 161] {
+    let mut out = [0u8; 161];
+    if packed.len() < 128 {
+        return out;
+    }
+    for op in 0..6 {
+        let p = &packed[op * 17..op * 17 + 17];
+        let u = &mut out[op * 21..op * 21 + 21];
+        u[0..11].copy_from_slice(&p[0..11]);
+        u[11] = p[11] & 0x03;
+        u[12] = (p[11] >> 2) & 0x03;
+        u[13] = p[12] & 0x07;
+        u[14] = p[13] & 0x03;
+        u[15] = (p[13] >> 2) & 0x07;
+        u[16] = p[14];
+        u[17] = p[15] & 0x01;
+        u[18] = (p[15] >> 1) & 0x1F;
+        u[19] = p[16];
+        u[20] = (p[12] >> 3) & 0x0F;
+    }
+    out[126..134].copy_from_slice(&packed[102..110]);
+    out[134] = packed[110] & 0x1F;
+    out[135] = packed[111] & 0x07;
+    out[136] = (packed[111] >> 3) & 0x01;
+    out[137..141].copy_from_slice(&packed[112..116]);
+    out[141] = packed[116] & 0x01;
+    out[142] = (packed[116] >> 1) & 0x07;
+    out[143] = (packed[116] >> 4) & 0x07;
+    out[144] = packed[117];
+    out[145..155].copy_from_slice(&packed[118..128]);
+    out
+}
+
+fn replace_xml_attr(xml: &str, attr: &str, value: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = xml.find(&needle)? + needle.len();
+    let end = start + xml[start..].find('"')?;
+    let mut out = String::with_capacity(xml.len() + value.len());
+    out.push_str(&xml[..start]);
+    out.push_str(value);
+    out.push_str(&xml[end..]);
+    Some(out)
+}
+
+/// Load a DX7 cartridge patch into a Dexed CLAP instance.
+pub fn load_dexed_patch(main: &mut ClapVoiceMain, patch: &DexedPatch) -> Result<()> {
+    let syx = std::fs::read(&patch.syx_path)?;
+    anyhow::ensure!(
+        syx.len() == 4104 && syx.starts_with(&[0xF0, 0x43, 0x00, 0x09, 0x20, 0x00]),
+        "invalid DX7 .syx bank: {}",
+        patch.syx_path.display()
+    );
+    anyhow::ensure!(patch.program < 32, "program index {} out of range", patch.program);
+    let voice_start = 6 + patch.program * 128;
+    let unpacked = unpack_dx7_voice(&syx[voice_start..voice_start + 128]);
+    let sysex_b64 = juce_b64_encode(&syx);
+    let prog_b64 = juce_b64_encode(&unpacked);
+
+    let state = main.save_state()?;
+    let xml_start = state
+        .windows(5)
+        .position(|w| w == b"<?xml")
+        .ok_or_else(|| anyhow!("Dexed state missing <?xml header"))?;
+    let prefix = &state[..xml_start];
+    let mut xml = std::str::from_utf8(&state[xml_start..])
+        .map_err(|e| anyhow!("Dexed state not UTF-8: {e}"))?
+        .to_string();
+    xml = replace_xml_attr(&xml, "currentProgram", &patch.program.to_string())
+        .ok_or_else(|| anyhow!("Dexed state missing currentProgram"))?;
+    xml = replace_xml_attr(&xml, "base64:sysex", &sysex_b64)
+        .ok_or_else(|| anyhow!("Dexed state missing base64:sysex"))?;
+    xml = replace_xml_attr(&xml, "base64:program", &prog_b64)
+        .ok_or_else(|| anyhow!("Dexed state missing base64:program"))?;
+
+    let mut new_state = Vec::with_capacity(prefix.len() + xml.len());
+    new_state.extend_from_slice(prefix);
+    new_state.extend_from_slice(xml.as_bytes());
+    main.load_state(&new_state)
+}
+
 pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
     let mut out = Vec::new();
-    let Ok(home) = std::env::var("HOME") else { return out };
-    let dir = PathBuf::from(home).join(".clap");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return out };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == "clap").unwrap_or(false))
-        .collect();
-    paths.sort();
-    for path in paths {
-        // SAFETY: loading a CLAP bundle runs its init code; only ~/.clap bundles.
+    let mut seen = std::collections::HashSet::new();
+    for path in clap_bundle_paths() {
+        // SAFETY: loading a CLAP bundle runs its init code; only standard
+        // CLAP directories and CLAP_PATH are scanned.
         let entry = match unsafe { PluginEntry::load(&path) } {
             Ok(e) => e,
             Err(_) => continue,
         };
         let Some(factory) = entry.get_plugin_factory() else { continue };
         for d in factory.plugin_descriptors() {
+            let id = d.id().unwrap_or(c"?").to_string_lossy().into_owned();
+            if !seen.insert(id.clone()) { continue; }
             out.push(ClapPluginInfo {
-                id: d.id().unwrap_or(c"?").to_string_lossy().into_owned(),
+                id,
                 name: d.name().unwrap_or(c"?").to_string_lossy().into_owned(),
                 vendor: d.vendor().unwrap_or(c"?").to_string_lossy().into_owned(),
                 features: d.features().map(|f| f.to_string_lossy().into_owned()).collect(),
@@ -1802,5 +2288,89 @@ fn clamp_size(size: GuiSize, rect: EditorRect) -> GuiSize {
     GuiSize {
         width: size.width.min(rect.w as u32).max(1),
         height: size.height.min(rect.h as u32).max(1),
+    }
+}
+
+#[cfg(test)]
+mod patch_search_tests {
+    use super::*;
+
+    fn patch(cat: &str, name: &str, factory: bool) -> SurgePatch {
+        let root = if factory { "/usr/share/surge-xt/patches_factory" } else { "/usr/share/surge-xt/patches_3rdparty" };
+        SurgePatch {
+            name: name.into(),
+            category: cat.into(),
+            path: std::path::PathBuf::from(format!("{root}/{cat}/{name}.fxp")),
+        }
+    }
+
+    #[test]
+    fn wurlitzer_alias_finds_wurli_and_factory_wins_on_exact() {
+        let patches = vec![
+            patch("Cybersoda/Keys", "Wurli", false),
+            patch("3rd/Winds", "Jazz Flute", false),
+            patch("Keys", "EP 1", true),
+            patch("Winds", "Flute 1", true),
+        ];
+        assert_eq!(find_surge_patch(&patches, "wurlitzer").map(|p| p.name.as_str()), Some("Wurli"));
+        assert!(search_surge_patches(&patches, "wurlitzer", 10).contains(&"Cybersoda/Keys/Wurli".to_string()));
+        assert_eq!(find_surge_patch(&patches, "flute").map(|p| p.name.as_str()), Some("Flute 1"));
+    }
+
+    #[test]
+    fn non_surge_clap_discovers_and_renders_when_installed() {
+        let plugins = list_clap_plugins();
+        let Some(dexed) = plugins.iter().find(|p| p.name.to_lowercase().contains("dexed")) else {
+            return; // skip cleanly on machines without dexed-clap
+        };
+        let (mut voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate");
+        assert!(!main.param_list().is_empty(), "Dexed should expose parameters");
+        voice.note_on(60, 0.8);
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            voice.render(&mut buf);
+            for &s in &buf {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(peak > 1e-4, "Dexed should render non-zero audio (peak={peak})");
+        let state = main.save_state().expect("Dexed save_state");
+        println!("DEXED STATE ({} bytes): {}", state.len(), String::from_utf8_lossy(&state));
+        main.retire(voice);
+    }
+
+    #[test]
+    fn dexed_load_patch_changes_state_and_renders() {
+        let plugins = list_clap_plugins();
+        let Some(dexed) = plugins.iter().find(|p| p.id == "com.digital-suburban.dexed") else {
+            return;
+        };
+        let patches = discover_dexed_patches();
+        if patches.is_empty() {
+            return;
+        }
+        let target = patches.iter().find(|p| p.program != 0).unwrap_or(&patches[0]);
+        let (mut voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate");
+        let before = main.save_state().expect("save before");
+        load_dexed_patch(&mut main, target).expect("load_dexed_patch");
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..4 {
+            voice.render(&mut buf);
+        }
+        let after = main.save_state().expect("save after");
+        assert_ne!(before, after, "Dexed state should change after loading patch");
+        voice.note_on(60, 0.9);
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            voice.render(&mut buf);
+            for &s in &buf {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(peak > 1e-4, "Dexed should render non-zero audio after patch load (peak={peak})");
+        main.retire(voice);
     }
 }

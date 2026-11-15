@@ -1,3 +1,4 @@
+#![recursion_limit = "512"]
 //! kabelsalat — live audio/MIDI wiring, alive.
 //!
 //! P0 spike entry point. Each subsystem has a standalone test mode so the team
@@ -30,6 +31,7 @@ fn main() -> anyhow::Result<()> {
         "audio-test" => audio::run_test(),
         "midi-test" => midi::run_test(),
         "host-test" => host::run_test(),
+        "preset-test" => host::run_preset_test(),
         "ui-demo" => ui::run_demo(),
         "mcp" => {
             // --attach (or KABELSALAT_ATTACH): proxy the same tools to the

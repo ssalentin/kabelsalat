@@ -69,6 +69,7 @@ const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fi
 /// The reference CLAP instrument (PLAN §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
+const DEXED_ID: &str = "com.digital-suburban.dexed";
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
@@ -258,13 +259,22 @@ impl PortKind {
 enum Side { Front, Back }
 
 struct Knob {
-    label: &'static str,
+    label: String,
     value: f32,
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
+    /// A Surge parameter pinned from the synth editor: the knob drives the
+    /// PLUGIN parameter (0..1 mapped onto min..max), sent only on change.
+    clap: Option<ClapPin>,
     label_g: Option<Arc<theme::TrackedLabel>>,
 }
+
+#[derive(Clone, Copy)]
+struct ClapPin { id: u32, min: f64, max: f64, sent: f32 }
+
+/// Most Surge parameters pinnable to one synth face (2 built-in + 4).
+const MAX_PINS: usize = 4;
 
 /// A jack on the back panel: direction, port index, x fraction of the unit.
 struct Jack {
@@ -337,7 +347,7 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label, value: default, default, param, label_g: None }
+    Knob { label: label.to_string(), value: default, default, param, clap: None, label_g: None }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -507,7 +517,10 @@ fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
 use crate::control::VOICE_POOL;
 
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
-    theme::chip_button(ui, name, active).clicked()
+    // Hover names the letter shortcut (M / N / C / B).
+    let key = match name { "Mixer" => Some("M"), "Matrix" => Some("N"), "Assistant" => Some("C"), "Plugins" => Some("B"), _ => None };
+    let r = theme::chip_button(ui, name, active);
+    match key { Some(k) => r.on_hover_text(format!("{name} · key {k}")).clicked(), None => r.clicked() }
 }
 
 /// 1px hairline vertical rule between nav items (§4.14).
@@ -546,13 +559,15 @@ fn make_unit(node: &Node) -> Unit {
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             // L · R as a stereo pair, MONO apart (between them it read as a
             // center channel — vision review).
-            vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "MONO IN")],
+            vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
             vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
-            vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.46, "MIDI IN"), (Dir::Out, 0, 0.76, "OUT")],
+            // IN sits under Surge's OUT (right) and MIDI IN faces Keys (left):
+            // the audio cable no longer crosses the MIDI jack (vision review).
+            vec![(Dir::In, 1, 0.22, "MIDI IN"), (Dir::Out, 0, 0.48, "OUT"), (Dir::In, 0, 0.74, "IN")],
         ),
         NodeKind::Dsp(kind) => {
             // Generic DSP face: 1–2 knobs on engine params 0/1.
@@ -870,7 +885,7 @@ struct DemoApp {
     plugin_msg: String,
     fps: f32,
     stats_timer: f32,
-    stats_g: Option<Arc<Galley>>,
+    stats_line: String,
 
     // Per-frame layout / transform.
     rack_w: f32,
@@ -938,6 +953,20 @@ struct DemoApp {
     /// bus → Master out. Owns the per-rig vol/pan/mute/solo (2026-11-15, user:
     /// "volume of the rigs at the top doesn't make sense").
     show_mixer: bool,
+    /// Ctrl-drag of a unit: last rack-local cursor (drives the live layout
+    /// preview) and the slot rect the dragged unit would land in.
+    drag_cursor: Option<Vec2>,
+    drop_ghost: Option<Rect>,
+    /// Committed mid-column centers + stack height (drop-target geometry).
+    col_x: Vec<f32>,
+    stack_tall_h: f32,
+    /// Installed Surge patches, scanned on first use (load_sound/list_sounds).
+    surge_patch_cache: Option<Vec<crate::host::SurgePatch>>,
+    dexed_patch_cache: Option<Vec<crate::host::DexedPatch>>,
+    /// Current patch per synth voice slot (None = Surge's init patch).
+    patch_names: [Option<String>; VOICE_POOL],
+    /// Sound browser search text (synth editor).
+    sound_filter: String,
     /// Last frame's MIDI-matrix block width (table + legend), for centering.
     matrix_block_w: f32,
     matrix_block_h: f32,
@@ -1004,9 +1033,15 @@ struct DemoApp {
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
-    /// RT-safe parameter setters, one per hosted voice (rig A/B). Grabbed
+    /// RT-safe parameter setters, one per hosted voice. Grabbed
     /// before the voices move into the engine; used by the native editor.
     surge_controllers: Vec<VoiceController>,
+    clap_plugin_ids: Vec<String>,
+    clap_voice_ids: Vec<u64>,
+    clap_slot_map: Vec<Option<usize>>,
+    sample_rate: f64,
+    voice_tx: Option<rtrb::Producer<(u32, ClapVoice, Vec<f32>)>>,
+    voice_retire_rx: Option<rtrb::Consumer<ClapVoice>>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1041,6 +1076,13 @@ struct DemoApp {
     editor_filter: String,
     /// Pending open/close request from a unit double-click (task-26).
     editor_request: Option<usize>,
+    /// Open/pending LV2 plugin editor (node id, name, controls, presets).
+    lv2_editor_node: Option<u32>,
+    lv2_editor_name: String,
+    lv2_editor_controls: Vec<crate::lv2::Lv2ControlDesc>,
+    lv2_editor_presets: Vec<crate::lv2::Lv2Preset>,
+    lv2_preset_name: Option<String>,
+    lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
     /// Last single click on a unit (unit, time) for double-click detection.
     last_unit_click: Option<(usize, std::time::Instant)>,
@@ -1083,7 +1125,7 @@ impl DemoApp {
             plugin_msg: String::new(),
             fps: 60.0,
             stats_timer: 0.0,
-            stats_g: None,
+            stats_line: String::new(),
             rack_w: 640.0,
             rack_overflow: Vec2::ZERO,
             rack_pan: Vec2::ZERO,
@@ -1119,6 +1161,14 @@ impl DemoApp {
             rig_levels: Vec::new(),
             show_matrix: false,
             show_mixer: false,
+            drag_cursor: None,
+            drop_ghost: None,
+            col_x: Vec::new(),
+            stack_tall_h: 0.0,
+            surge_patch_cache: None,
+            dexed_patch_cache: None,
+            patch_names: Default::default(),
+            sound_filter: String::new(),
             matrix_block_w: 0.0,
             matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
@@ -1153,6 +1203,12 @@ impl DemoApp {
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
+            clap_plugin_ids: Vec::new(),
+            clap_voice_ids: Vec::new(),
+            clap_slot_map: Vec::new(),
+            sample_rate: 48000.0,
+            voice_tx: None,
+            voice_retire_rx: None,
             _audio_stream: None,
             bus: None,
             out_level: None,
@@ -1168,6 +1224,12 @@ impl DemoApp {
             editor_params: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
+            lv2_editor_node: None,
+            lv2_editor_name: String::new(),
+            lv2_editor_controls: Vec::new(),
+            lv2_editor_presets: Vec::new(),
+            lv2_preset_name: None,
+            lv2_editor_request: None,
             editor_status: String::new(),
             last_unit_click: None,
         };
@@ -1256,6 +1318,10 @@ impl DemoApp {
             for u in &mut self.units {
                 if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
                     u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+                    if u.lv2_inst {
+                        u.sub = "lv2 synth".into();
+                        u.sub_g = None;
+                    }
                 }
             }
         }
@@ -1446,39 +1512,39 @@ impl DemoApp {
         None
     }
 
-    /// Ctrl+drag release (task-21): move `unit` to the slot nearest the drop
-    /// point by reordering `stack_cols`; layout() then reflows with no overlaps.
-    /// Unit indices — and therefore cable endpoints — are untouched.
-    fn drop_unit(&mut self, unit: usize, drop: Vec2) {
-        if self.keys_unit == Some(unit) || self.master_unit == Some(unit) { return; }
-        let src = self.stack_cols.iter().enumerate()
-            .find_map(|(j, col)| col.iter().position(|&u| u == unit).map(|r| (j, r)));
-        let Some((sj, sr)) = src else { return };
-
-        // Target column = nearest column x-center, judged from the OTHER units
-        // (the dragged unit's rect is currently at the cursor, so skip it).
-        let mut tj = sj;
-        let mut best_dx = f32::INFINITY;
-        for (j, col) in self.stack_cols.iter().enumerate() {
-            if let Some(r) = col.iter().find(|&&u| u != unit).copied() {
-                let dx = (drop.x - self.unit_rects[r].center().x).abs();
-                if dx < best_dx { best_dx = dx; tj = j; }
-            }
-        }
-        // Target row from the drop height.
-        let gap = 12.0;
+    /// Where a Ctrl-dragged `unit` would land at rack-local `drop`:
+    /// (target column, target row). Columns are judged from the COMMITTED
+    /// layout's centers (`col_x`), rows from the drop height.
+    fn drop_target(&self, unit: usize, drop: Vec2) -> Option<(usize, usize)> {
+        if self.keys_unit == Some(unit) || self.master_unit == Some(unit) { return None; }
+        self.stack_cols.iter().flatten().position(|&u| u == unit)?;
+        let tj = self.col_x.iter().enumerate()
+            .min_by(|a, b| (drop.x - a.1).abs().total_cmp(&(drop.x - b.1).abs()))
+            .map(|(j, _)| j)?;
+        let others = self.stack_cols.get(tj)?.iter().filter(|&&u| u != unit).count();
         let pad = 20.0;
-        let len = self.stack_cols[tj].len() as i32;
-        let tr = (((drop.y - pad) / (self.unit_h + gap)).floor() as i32).clamp(0, len);
+        let slot = self.stack_tall_h / (others + 1) as f32;
+        let tr = (((drop.y - pad) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
+        Some((tj, tr))
+    }
 
-        // Remove from source, then insert at target (adjust for same-column shift).
-        self.stack_cols[sj].remove(sr);
-        let mut tr = tr as usize;
-        if sj == tj && sr < tr { tr -= 1; }
-        let tr = tr.min(self.stack_cols[tj].len());
-        self.stack_cols[tj].insert(tr, unit);
-        self.stack_cols.retain(|c| !c.is_empty());
-        self.layout_rows = self.stack_cols.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+    /// The stack columns after moving `unit` to `(tj, tr)` — empty columns
+    /// are KEPT (stable geometry while previewing); `drop_unit` prunes them.
+    fn cols_after(&self, unit: usize, (tj, tr): (usize, usize)) -> Vec<Vec<usize>> {
+        let mut cols = self.stack_cols.clone();
+        for c in cols.iter_mut() { c.retain(|&u| u != unit); }
+        if let Some(c) = cols.get_mut(tj) { let tr = tr.min(c.len()); c.insert(tr, unit); }
+        cols
+    }
+
+    /// Ctrl+drag release (task-21): commit exactly the previewed order;
+    /// layout() then reflows. Unit indices (cable endpoints) are untouched.
+    fn drop_unit(&mut self, unit: usize, drop: Vec2) {
+        let Some(t) = self.drop_target(unit, drop) else { return };
+        let mut cols = self.cols_after(unit, t);
+        cols.retain(|c| !c.is_empty());
+        self.stack_cols = cols;
+        self.layout_rows = self.layout_rows.max(self.stack_cols.iter().map(|c| c.len()).max().unwrap_or(1)).max(1);
     }
 
     /// Galleys are laid out on the first frame: egui loads fonts only once
@@ -1519,7 +1585,7 @@ impl DemoApp {
             }
             for k in &mut u.knobs {
                 if k.label_g.is_none() {
-                    k.label_g = Some(tracked(k.label, 10.0, 0.14));
+                    k.label_g = Some(tracked(&k.label, 10.0, 0.14));
                 }
             }
             for j in &mut u.jacks {
@@ -1585,7 +1651,10 @@ impl DemoApp {
                 (&["click"], "a cable to select its path"),
                 (&["Del"], "remove the selected cable"),
                 (&["F9"], "plugin browser"),
-                (&["F10"], "mixer view (sources → rig bus → master)"),
+                (&["M", "F10"], "mixer view (sources → rig bus → master)"),
+                (&["N"], "MIDI matrix view (also F11)"),
+                (&["C"], "chat with the assistant (also F12)"),
+                (&["B"], "plugin browser (also F9)"),
                 (&["F11"], "MIDI matrix view"),
                 (&["F12"], "assistant"),
                 (&["D"], "stats"),
@@ -1661,17 +1730,35 @@ impl DemoApp {
         if let Some(m) = self.master_unit {
             self.unit_rects[m] = mk(xs[n_cols - 1], pad, widths[n_cols - 1], tall_h);
         }
-        for j in 0..n_mid {
+        // Column centers of the COMMITTED layout: the drop target is judged
+        // from these, so the live preview below cannot feed back into it.
+        self.col_x = (0..n_mid).map(|j| xs[j + 1] + widths[j + 1] / 2.0).collect();
+        self.stack_tall_h = tall_h;
+        // While Ctrl-dragging a unit, lay the others out AS IF it were
+        // released here (user: show the layout before release); the ghost
+        // rect marks where the dragged unit lands.
+        let preview = match (&self.drag, self.drag_cursor) {
+            (&Drag::Unit { unit, .. }, Some(at)) => self.drop_target(unit, at).map(|t| (unit, self.cols_after(unit, t))),
+            _ => None,
+        };
+        let cols = preview.as_ref().map(|(_, c)| c.clone()).unwrap_or_else(|| self.stack_cols.clone());
+        self.drop_ghost = None;
+        for j in 0..n_mid.min(cols.len()) {
             let cx = xs[j + 1];
             let cw = widths[j + 1];
             // A shorter stack stretches its units to the full column height
             // (one rack size for every rig, no empty rows).
-            let len = self.stack_cols[j].len().max(1);
+            let len = cols[j].len().max(1);
             let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
-            for r in 0..self.stack_cols[j].len() {
-                let u = self.stack_cols[j][r];
+            for r in 0..cols[j].len() {
+                let u = cols[j][r];
                 let y = pad + r as f32 * (uh + gap);
-                self.unit_rects[u] = mk(cx, y, cw, uh);
+                let rr = mk(cx, y, cw, uh);
+                if preview.as_ref().map_or(false, |(d, _)| *d == u) {
+                    self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
+                } else {
+                    self.unit_rects[u] = rr;
+                }
             }
         }
         // Stage view for the rack: below the masthead, above the hint line.
@@ -1892,12 +1979,22 @@ impl DemoApp {
         mut self,
         mains: Vec<ClapVoiceMain>,
         controllers: Vec<VoiceController>,
+        voice_ids: Vec<u64>,
+        sample_rate: f64,
+        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
+        voice_retire_rx: rtrb::Consumer<ClapVoice>,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
+        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
+        self.clap_voice_ids = voice_ids;
+        self.clap_slot_map = (0..mains.len()).map(Some).collect();
         self._surge_main = mains;
         self.surge_controllers = controllers;
+        self.sample_rate = sample_rate;
+        self.voice_tx = Some(voice_tx);
+        self.voice_retire_rx = Some(voice_retire_rx);
         self._audio_stream = Some(stream);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         self.bus = Some(bus);
@@ -2029,11 +2126,17 @@ impl DemoApp {
         // Full structural comparison (rare path — only when the rev changed).
         let same = serde_json::to_value(&mirror.nodes).ok() == serde_json::to_value(&g.graph.nodes).ok()
             && serde_json::to_value(&mirror.edges).ok() == serde_json::to_value(&g.graph.edges).ok();
-        if same { return; }
+        if same {
+            let adopted = g.graph.clone();
+            drop(g);
+            self.sync_clap_slots(&adopted);
+            return;
+        }
         let adopted = g.graph.clone();
         let mix = g.mix;
         drop(g);
         self.build_rack(&adopted, &[]);
+        self.sync_clap_slots(&adopted);
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
         self.rig_sources = [(true, true); VOICE_POOL];
@@ -2058,6 +2161,11 @@ impl DemoApp {
                 FromWorker::ToolCall { id, name, args } => {
                     let result = self.exec_tool(&name, &args);
                     self.assistant.send_tool_result(id, result);
+                }
+                FromWorker::Models(list) => {
+                    // Chat-capable models only (embedding ids etc. stay out).
+                    let chat: Vec<String> = list.into_iter().filter(|m| m.contains("chat") || m.contains("reason") || m.contains("flash") || m.contains("v3") || m.contains("v4")).collect();
+                    if !chat.is_empty() { self.assistant.models = chat; }
                 }
                 FromWorker::Done => self.assistant.busy = false,
                 FromWorker::Error(e) => {
@@ -2107,13 +2215,15 @@ impl DemoApp {
                 }
             }
         }
-        let surge_id = "org.surge-synth-team.surge-xt";
         let mut rig = 0;
         for u in &self.units {
             if matches!(u.node_kind, UnitKind::Clap) {
-                if let Some(m) = self._surge_main.get_mut(rig) {
-                    if let Ok(blob) = m.save_state() {
-                        s.set_plugin_state(u.node_id, surge_id, blob);
+                if let Some(idx) = self.clap_pool_idx(rig) {
+                    let pid = self.clap_plugin_ids.get(idx).cloned().unwrap_or_else(|| SURGE_ID.to_string());
+                    if let Some(m) = self._surge_main.get_mut(idx) {
+                        if let Ok(blob) = m.save_state() {
+                            s.set_plugin_state(u.node_id, &pid, blob);
+                        }
                     }
                 }
                 rig += 1;
@@ -2122,20 +2232,99 @@ impl DemoApp {
         Ok(s)
     }
 
+    /// Pool index in `_surge_main` / `surge_controllers` for CLAP rig slot `rig`.
+    fn clap_pool_idx(&self, rig: usize) -> Option<usize> {
+        self.clap_slot_map.get(rig).copied().flatten()
+    }
+
+    /// Drain retired CLAP voices and match every `UnitKind::Clap` in `self.units`
+    /// to a `ClapVoiceMain` of matching `plugin_id`, instantiating new CLAP
+    /// plugins (e.g. Dexed) on the UI thread and delivering them to the engine.
+    fn sync_clap_slots(&mut self, graph: &Graph) {
+        while let Some(rx) = self.voice_retire_rx.as_mut() {
+            let Ok(voice) = rx.pop() else { break };
+            if let Some(pos) = self.clap_voice_ids.iter().position(|&id| id == voice.voice_id()) {
+                let main = self._surge_main.remove(pos);
+                self.surge_controllers.remove(pos);
+                self.clap_plugin_ids.remove(pos);
+                self.clap_voice_ids.remove(pos);
+                main.retire(voice);
+            }
+        }
+        let clap_nodes: Vec<(u32, String)> = self
+            .units
+            .iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
+            .map(|u| {
+                let pid = graph
+                    .node(u.node_id)
+                    .and_then(|n| match &n.kind {
+                        NodeKind::Clap { plugin_id } => Some(crate::control::name_str(plugin_id).to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| SURGE_ID.to_string());
+                (u.node_id, pid)
+            })
+            .collect();
+        let mut used = vec![false; self._surge_main.len()];
+        let mut new_map = Vec::with_capacity(clap_nodes.len());
+        for (node_id, pid) in clap_nodes {
+            let found = (0..self._surge_main.len()).find(|&i| {
+                !used[i]
+                    && (self.clap_plugin_ids[i] == pid
+                        || ((pid.is_empty() || pid == "Surge XT") && self.clap_plugin_ids[i] == SURGE_ID))
+            });
+            if let Some(i) = found {
+                used[i] = true;
+                new_map.push(Some(i));
+            } else if self.voice_tx.is_some() {
+                match ClapVoice::new_plugin(self.sample_rate, &pid) {
+                    Ok((voice, main)) => {
+                        let ctrl = voice.controller();
+                        let vid = voice.voice_id();
+                        if let Some(tx) = self.voice_tx.as_mut() {
+                            if tx.push((node_id, voice, vec![0.0; 8192 * 2])).is_err() {
+                                self.plugin_msg = format!("Voice channel full for {pid}");
+                                new_map.push(None);
+                                continue;
+                            }
+                        }
+                        self._surge_main.push(main);
+                        self.surge_controllers.push(ctrl);
+                        self.clap_plugin_ids.push(pid);
+                        self.clap_voice_ids.push(vid);
+                        used.push(true);
+                        new_map.push(Some(self._surge_main.len() - 1));
+                    }
+                    Err(e) => {
+                        self.plugin_msg = format!("Load {pid} failed: {e}");
+                        new_map.push(None);
+                    }
+                }
+            } else {
+                new_map.push(None);
+            }
+        }
+        self.clap_slot_map = new_map;
+    }
+
     /// Load a Session: rebuild the rack from its graph + params, restore plugin
     /// state, and rewire the engine. Works for any topology (templates, saved
     /// sessions, the demo patch).
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
+        self.sync_clap_slots(&s.graph);
         // Restore plugin state into the remapped voices (rig order).
         let clap_nodes: Vec<u32> = self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
             .map(|u| u.node_id).collect();
         for (rig, node) in clap_nodes.iter().enumerate() {
             if let Some(st) = s.plugin_state(*node) {
-                if let Some(m) = self._surge_main.get_mut(rig) {
-                    let _ = m.load_state(&st.data);
+                if let Some(idx) = self.clap_pool_idx(rig) {
+                    if let Some(m) = self._surge_main.get_mut(idx) {
+                        let _ = m.load_state(&st.data);
+                    }
                 }
             }
         }
@@ -2609,12 +2798,41 @@ impl DemoApp {
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
+            "list_sounds" => {
+                let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let is_dexed = self.clap_pool_idx(self.active_rig)
+                    .and_then(|i| self.clap_plugin_ids.get(i))
+                    .map(|id| id == DEXED_ID)
+                    .unwrap_or(false);
+                if is_dexed {
+                    let hits = crate::host::search_dexed_patches(self.dexed_patches(), q, 25);
+                    if hits.is_empty() { format!("no Dexed patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
+                } else {
+                    let hits = crate::host::search_surge_patches(self.surge_patches(), q, 25);
+                    if hits.is_empty() { format!("no Surge patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
+                }
+            }
+            "load_sound" => {
+                let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                match self.load_sound(rig, q) {
+                    Ok(p) => format!("loaded '{p}' into rig {rig} '{}'", self.rig_name(rig)),
+                    Err(e) => format!("load_sound failed: {e}"),
+                }
+            }
             "add_rig" => {
                 let n = self.rig_count();
                 if n >= Self::MAX_RIGS { return format!("at most {} rigs", Self::MAX_RIGS); }
                 self.edit_rigs_named(None, args.get("name").and_then(|v| v.as_str()));
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
-                format!("{} — now in view. {}", self.session_msg, self.rigs_json())
+                let sound = match args.get("sound").and_then(|v| v.as_str()) {
+                    Some(q) => match self.load_sound(self.active_rig, q) {
+                        Ok(p) => format!(" Sound: {p}."),
+                        Err(e) => format!(" Sound not loaded: {e}."),
+                    },
+                    None => String::new(),
+                };
+                format!("{} — now in view.{sound} {}", self.session_msg, self.rigs_json())
             }
             "delete_rig" => {
                 let n = self.rig_count();
@@ -2695,15 +2913,33 @@ impl DemoApp {
     /// Open/close a rig's native parameter editor. Double-clicking the same
     /// unit again closes it; opening another rig's editor replaces it.
     fn toggle_param_editor(&mut self, rig: usize) {
-        if self.editor_open && self.editor_rig == rig {
+        if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == rig {
             self.editor_open = false;
             return;
         }
+        self.lv2_editor_node = None;
         self.editor_rig = rig;
         self.editor_filter.clear();
-        self.editor_params = self._surge_main.get_mut(rig)
+        let pool_idx = self.clap_pool_idx(rig);
+        self.editor_params = pool_idx
+            .and_then(|i| self._surge_main.get_mut(i))
             .map(|m| m.param_list())
             .unwrap_or_default();
+        // Current sound = the patch named IN the synth's own state (correct
+        // across rig edits and session loads, unlike a slot-keyed memo).
+        let is_surge = pool_idx
+            .and_then(|i| self.clap_plugin_ids.get(i))
+            .map(|id| id == SURGE_ID)
+            .unwrap_or(false);
+        if is_surge {
+            if let Some(name) = pool_idx
+                .and_then(|i| self._surge_main.get_mut(i))
+                .and_then(|m| m.save_state().ok())
+                .and_then(|st| crate::host::patch_name_from_state(&st))
+            {
+                if let Some(n) = self.patch_names.get_mut(rig) { *n = Some(name); }
+            }
+        }
         self.editor_open = !self.editor_params.is_empty();
         self.editor_status = if self.editor_open {
             String::new()
@@ -2712,11 +2948,31 @@ impl DemoApp {
         };
     }
 
+    /// Open or close the native parameter & preset editor for an LV2 unit.
+    fn toggle_lv2_editor(&mut self, node_id: u32, uri: &str, name: &str) {
+        if self.editor_open && self.lv2_editor_node == Some(node_id) {
+            self.editor_open = false;
+            self.lv2_editor_node = None;
+            return;
+        }
+        self.lv2_editor_node = Some(node_id);
+        self.lv2_editor_name = sentence_case(name);
+        self.lv2_editor_controls = crate::lv2::control_descs_for_uri(uri);
+        self.lv2_editor_presets = crate::lv2::discover_presets(uri);
+        self.lv2_preset_name = None;
+        self.editor_filter.clear();
+        self.sound_filter.clear();
+        self.editor_open = true;
+        self.editor_status.clear();
+    }
+
     /// Re-read the open rig's parameter list (on open / Refresh button).
     fn refresh_editor_params(&mut self) {
         let rig = self.editor_rig;
-        if let Some(main) = self._surge_main.get_mut(rig) {
-            self.editor_params = main.param_list();
+        if let Some(idx) = self.clap_pool_idx(rig) {
+            if let Some(main) = self._surge_main.get_mut(idx) {
+                self.editor_params = main.param_list();
+            }
         }
     }
 
@@ -2725,6 +2981,115 @@ impl DemoApp {
     /// cached list and the RT-safe controller stay in sync.
     fn param_editor_window(&mut self, ctx: &egui::Context) {
         if !self.editor_open {
+            return;
+        }
+        if let Some(lv2_node) = self.lv2_editor_node {
+            let mut open = self.editor_open;
+            let mut chosen_preset: Option<crate::lv2::Lv2Preset> = None;
+            let mut ctrl_changes: Vec<(usize, f32, f32)> = Vec::new();
+            egui::Window::new(egui::RichText::new(format!("{} — presets & parameters", self.lv2_editor_name))
+                    .font(theme::medium_font(16.0)).color(theme::INK))
+                .open(&mut open)
+                .collapsible(false)
+                .fixed_size([480.0, 700.0])
+                .show(ctx, |ui| {
+                    theme::section_label(ui, "Presets");
+                    let current = self.lv2_preset_name.clone().unwrap_or_else(|| "Default".into());
+                    ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
+                    ui.add_sized([ui.available_width(), 20.0],
+                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search presets…"));
+                    let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+                    egui::ScrollArea::vertical().id_salt("lv2_preset_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                        let mut shown = 0usize;
+                        for p in &self.lv2_editor_presets {
+                            let hay = p.name.to_lowercase();
+                            if !words.iter().all(|w| hay.contains(w.as_str())) {
+                                continue;
+                            }
+                            shown += 1;
+                            let selected = self.lv2_preset_name.as_deref() == Some(p.name.as_str());
+                            let resp = ui.selectable_label(selected, egui::RichText::new(&p.name).size(12.5).color(theme::CREAM));
+                            if resp.clicked() {
+                                chosen_preset = Some(p.clone());
+                            }
+                        }
+                        if shown == 0 {
+                            ui.label(egui::RichText::new("no matching preset").size(12.0).color(theme::INK_2));
+                        }
+                    });
+                    ui.separator();
+                    theme::section_label(ui, "Parameters");
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.add_sized([ui.available_width() - 10.0, 20.0],
+                            egui::TextEdit::singleline(&mut self.editor_filter).hint_text("search parameters…"));
+                    });
+                    ui.separator();
+                    let filter = self.editor_filter.to_lowercase();
+                    egui::ScrollArea::vertical().id_salt("lv2_param_list").auto_shrink([false, false]).show(ui, |ui| {
+                        let v = ui.visuals_mut();
+                        v.widgets.inactive.bg_fill = theme::HAIRLINE;
+                        v.widgets.inactive.fg_stroke = Stroke::new(1.0, theme::INK);
+                        v.widgets.hovered.bg_fill = theme::ACCENT;
+                        v.widgets.hovered.fg_stroke = Stroke::new(1.0, theme::INK);
+                        v.widgets.active.bg_fill = theme::ACCENT;
+                        v.widgets.active.fg_stroke = Stroke::new(1.0, theme::INK);
+                        v.selection.bg_fill = theme::ACCENT;
+                        let mut shown = 0usize;
+                        for (ci, c) in self.lv2_editor_controls.iter().enumerate() {
+                            if !filter.is_empty()
+                                && !c.name.to_lowercase().contains(&filter)
+                                && !c.symbol.to_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
+                            shown += 1;
+                            let mut val = c.value;
+                            let hi = if c.max > c.min { c.max } else { c.min + 1.0 };
+                            let resp = ui.add_sized(
+                                [ui.available_width() - 8.0, 18.0],
+                                egui::Slider::new(&mut val, c.min..=hi)
+                                    .text(egui::RichText::new(c.name.to_uppercase()).size(10.0).color(theme::INK_2)),
+                            );
+                            if resp.changed() {
+                                let norm = ((val - c.min) / (hi - c.min).max(1e-6)).clamp(0.0, 1.0);
+                                ctrl_changes.push((ci, val, norm));
+                            }
+                        }
+                        if shown == 0 {
+                            ui.label(egui::RichText::new("no matching parameters").size(12.0).color(theme::INK_2));
+                        }
+                    });
+                });
+            self.editor_open = open;
+            if !open {
+                self.lv2_editor_node = None;
+            }
+            if let Some(preset) = chosen_preset {
+                if let Some(bus) = &self.bus {
+                    bus.lock().unwrap().send(Command::LoadLv2Preset { node: lv2_node, preset_uri: preset.uri.clone() });
+                }
+                self.lv2_preset_name = Some(preset.name.clone());
+                self.editor_status = format!("loaded {}", preset.name);
+                for (sym, val) in &preset.values {
+                    if let Some(c) = self.lv2_editor_controls.iter_mut().find(|c| &c.symbol == sym) {
+                        let hi = if c.max > c.min { c.max } else { c.min + 1.0 };
+                        c.value = val.clamp(c.min, hi);
+                    }
+                }
+            }
+            for (ci, val, norm) in ctrl_changes {
+                if let Some(c) = self.lv2_editor_controls.get_mut(ci) {
+                    c.value = val;
+                    if let Some(bus) = &self.bus {
+                        bus.lock().unwrap().send(Command::SetParam {
+                            node: lv2_node,
+                            param: c.index as u32,
+                            value: norm as f64,
+                        });
+                    }
+                }
+            }
             return;
         }
         let rig = self.editor_rig;
@@ -2736,12 +3101,82 @@ impl DemoApp {
         let mut open = self.editor_open;
         let mut refresh = false;
         let mut changes: Vec<(u32, f64)> = Vec::new();
-        egui::Window::new(egui::RichText::new(format!("{name} — parameters"))
+        let mut pin_req: Option<crate::host::ParamDesc> = None;
+        egui::Window::new(egui::RichText::new(format!("{name} — sound & parameters"))
                 .font(theme::medium_font(16.0)).color(theme::INK))
             .open(&mut open)
             .collapsible(false)
-            .fixed_size([480.0, 560.0])
+            .fixed_size([480.0, 700.0])
             .show(ctx, |ui| {
+                let pool_idx = self.clap_pool_idx(rig);
+                let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
+                let is_surge = plugin_id == Some(SURGE_ID);
+                let is_dexed = plugin_id == Some(DEXED_ID);
+                if is_surge {
+                    // Sound: exchange the instrument (Surge patch) of THIS synth.
+                    theme::section_label(ui, "Sound");
+                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Surge default)".into());
+                    ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
+                    ui.add_sized([ui.available_width(), 20.0],
+                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search sounds… e.g. flute, warm pad, bass"));
+                    let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+                    let mut chosen: Option<crate::host::SurgePatch> = None;
+                    {
+                        let patches = self.surge_patches().to_vec();
+                        egui::ScrollArea::vertical().id_salt("sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                            let mut shown = 0;
+                            for p in patches.iter().filter(|p| {
+                                let f = format!("{}/{}", p.category, p.name).to_lowercase();
+                                words.iter().all(|w| f.contains(w.as_str()))
+                            }) {
+                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
+                                shown += 1;
+                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {}", p.category, p.name)).size(12.5).color(theme::CREAM));
+                                if resp.clicked() { chosen = Some(p.clone()); }
+                            }
+                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
+                        });
+                    }
+                    if let Some(p) = chosen {
+                        match self.load_patch_into_slot(rig, &p) {
+                            Ok(n) => self.editor_status = format!("loaded {n}"),
+                            Err(e) => self.editor_status = format!("sound failed: {e}"),
+                        }
+                    }
+                    ui.separator();
+                } else if is_dexed {
+                    theme::section_label(ui, "Sound");
+                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Dexed default)".into());
+                    ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
+                    ui.add_sized([ui.available_width(), 20.0],
+                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search DX7 sounds… e.g. piano, bass, brass"));
+                    let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+                    let mut chosen: Option<crate::host::DexedPatch> = None;
+                    {
+                        let patches = self.dexed_patches().to_vec();
+                        egui::ScrollArea::vertical().id_salt("dexed_sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                            let mut shown = 0usize;
+                            for p in patches.iter().filter(|p| {
+                                let f = format!("{}/{}", p.bank, p.name).to_lowercase();
+                                words.iter().all(|w| f.contains(w.as_str()))
+                            }) {
+                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
+                                shown += 1;
+                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {:02} {}", p.bank, p.program + 1, p.name)).size(12.5).color(theme::CREAM));
+                                if resp.clicked() { chosen = Some(p.clone()); }
+                            }
+                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
+                        });
+                    }
+                    if let Some(p) = chosen {
+                        match self.load_dexed_patch_into_slot(rig, &p) {
+                            Ok(n) => self.editor_status = format!("loaded {n}"),
+                            Err(e) => self.editor_status = format!("sound failed: {e}"),
+                        }
+                    }
+                    ui.separator();
+                }
+                theme::section_label(ui, "Parameters");
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add_sized([ui.available_width() - 70.0, 20.0],
@@ -2752,8 +3187,13 @@ impl DemoApp {
                 });
                 ui.separator();
                 let filter = self.editor_filter.to_lowercase();
+                // Which params are pinned on this synth's face (for the toggles).
+                let pin_node = self.clap_rigs().into_iter().find(|(s, _)| *s == rig).map(|(_, n)| n);
+                let pinned: Vec<u32> = self.units.iter().find(|u| Some(u.node_id) == pin_node)
+                    .map(|u| u.knobs.iter().filter_map(|k| k.clap.map(|c| c.id)).collect()).unwrap_or_default();
                 // Split borrows: cached params (read) vs voice mains (param_text).
                 let params = &self.editor_params;
+                let pool_idx = self.clap_pool_idx(rig);
                 let mains = &mut self._surge_main;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     // Sliders: accent fill on a hairline track (§4.18). Scoped
@@ -2803,11 +3243,17 @@ impl DemoApp {
                                         if resp.changed() {
                                             changes.push((p.id, value));
                                         }
-                                        let text = mains.get_mut(rig)
+                                        let text = pool_idx
+                                            .and_then(|i| mains.get_mut(i))
                                             .map(|m| m.param_text(p.id, value))
                                             .unwrap_or_default();
                                         ui.label(egui::RichText::new(text)
                                             .font(theme::medium_font(13.0)).color(theme::INK));
+                                        // Pin this parameter as a knob on the synth's face.
+                                        let is_pinned = pinned.contains(&p.id);
+                                        if theme::chip_button(ui, if is_pinned { "− knob" } else { "+ knob" }, is_pinned)
+                                            .on_hover_text(if is_pinned { "remove this knob from the Surge face" } else { "put this parameter as a knob on the Surge face" })
+                                            .clicked() { pin_req = Some(p.clone()); }
                                     });
                                 }
                             });
@@ -2818,12 +3264,13 @@ impl DemoApp {
                 });
             });
         self.editor_open = open;
+        if let Some(p) = pin_req { self.editor_status = self.toggle_pin(rig, &p); }
         // Apply slider changes: update the cache + schedule RT-safe param events.
         for (id, value) in changes {
             if let Some(p) = self.editor_params.iter_mut().find(|p| p.id == id) {
                 p.value = value;
             }
-            if let Some(ctrl) = self.surge_controllers.get(rig) {
+            if let Some(ctrl) = self.clap_pool_idx(rig).and_then(|i| self.surge_controllers.get(i)) {
                 ctrl.set_param(ClapId::new(id), value);
             }
         }
@@ -3131,6 +3578,137 @@ impl DemoApp {
         }
     }
 
+    /// Answer bridge/MCP requests for UI-owned tools (load_sound, …) with the
+    /// SAME exec_tool the in-app agent uses (rule 6 parity).
+    fn serve_ui_inbox(&mut self) {
+        if self.bus.is_none() { return; }
+        crate::bridge::UI_ATTACHED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
+        for (tool, args, reply) in reqs {
+            let out = match tool.as_str() {
+                "load_sound" | "list_sounds" => self.exec_tool(&tool, &args),
+                other => format!("tool '{other}' is not served over the UI bridge"),
+            };
+            let _ = reply.send(out);
+        }
+    }
+
+    /// Installed Surge patches (scanned once, cached).
+    fn surge_patches(&mut self) -> &[crate::host::SurgePatch] {
+        if self.surge_patch_cache.is_none() { self.surge_patch_cache = Some(crate::host::list_surge_patches()); }
+        self.surge_patch_cache.as_deref().unwrap_or(&[])
+    }
+
+    /// Installed Dexed DX7 `.syx` cartridge patches (scanned once, cached).
+    fn dexed_patches(&mut self) -> &[crate::host::DexedPatch] {
+        if self.dexed_patch_cache.is_none() { self.dexed_patch_cache = Some(crate::host::discover_dexed_patches()); }
+        self.dexed_patch_cache.as_deref().unwrap_or(&[])
+    }
+
+    /// Load the best-matching Surge or Dexed patch into `rig`'s (first) synth.
+    fn load_sound(&mut self, rig: usize, query: &str) -> Result<String, String> {
+        if rig >= self.rig_count() { return Err(format!("no rig {rig}")); }
+        let multi = self.rig_count() > 1;
+        let node = self.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
+            .map(|u| u.node_id).ok_or_else(|| format!("rig {rig} has no CLAP synth"))?;
+        let slot = self.clap_rigs().into_iter().find(|(_, n)| *n == node).map(|(s, _)| s)
+            .ok_or_else(|| "that synth has no voice slot".to_string())?;
+        let is_dexed = self.clap_pool_idx(slot)
+            .and_then(|i| self.clap_plugin_ids.get(i))
+            .map(|id| id == DEXED_ID)
+            .unwrap_or(false);
+        if is_dexed {
+            let words: Vec<String> = query.trim().to_lowercase().split_whitespace().map(str::to_string).collect();
+            let patch = self.dexed_patches().iter().find(|p| {
+                let hay = format!("{}/{}", p.bank, p.name).to_lowercase();
+                words.iter().all(|w| hay.contains(w.as_str()))
+            }).cloned().ok_or_else(|| format!("no Dexed patch matches '{query}'"))?;
+            return self.load_dexed_patch_into_slot(slot, &patch);
+        }
+        let patch = {
+            let ps = self.surge_patches();
+            crate::host::find_surge_patch(ps, query).cloned().ok_or_else(|| format!("no Surge patch matches '{query}'"))?
+        };
+        self.load_patch_into_slot(slot, &patch)
+    }
+
+    /// Load one patch file into voice `slot` (agent load_sound and the synth
+    /// editor's Sound browser share this). Records the patch name and, if
+    /// that synth's editor is open, re-reads its parameters.
+    fn load_patch_into_slot(&mut self, slot: usize, patch: &crate::host::SurgePatch) -> Result<String, String> {
+        let data = std::fs::read(&patch.path).map_err(|e| format!("reading patch: {e}"))?;
+        let state = crate::host::fxp_to_state(&data).map_err(|e| e.to_string())?;
+        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
+        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
+        main.load_state(&state).map_err(|e| e.to_string())?;
+        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
+        if self.editor_open && self.editor_rig == slot { self.refresh_editor_params(); }
+        Ok(format!("{}/{}", patch.category, patch.name))
+    }
+
+    /// Load a DX7 `.syx` cartridge patch into a Dexed voice slot.
+    fn load_dexed_patch_into_slot(&mut self, slot: usize, patch: &crate::host::DexedPatch) -> Result<String, String> {
+        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
+        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
+        crate::host::load_dexed_patch(main, patch).map_err(|e| e.to_string())?;
+        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
+        if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot {
+            self.refresh_editor_params();
+        }
+        Ok(format!("{}/{}", patch.bank, patch.name))
+    }
+
+    /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
+    /// "Rack 1"), units ("Surge B", "Delay"), and effect kinds.
+    fn chat_entities(&self) -> Vec<String> {
+        let mut e: Vec<String> = Vec::new();
+        for r in 0..self.rig_count() {
+            e.push(self.rig_name(r));
+            e.push(format!("Rig {}", r + 1));
+            e.push(format!("Rack {}", r + 1));
+        }
+        for u in &self.units { e.push(sentence_case(&u.name)); }
+        for w in ["Surge", "Reverb", "Delay", "Filter", "Gain", "EQ", "Limiter", "Saturation", "Panner", "Metronome", "Master", "Keys", "Keyboard"] {
+            e.push(w.into());
+        }
+        e.retain(|s| s.chars().count() >= 2);
+        e.sort_by(|a, b| b.len().cmp(&a.len())); // longest first
+        e.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        e
+    }
+
+    /// Short state header prepended to each chat message so the agent works
+    /// where the user is (the rig in view) without asking.
+    fn chat_context(&self) -> String {
+        let n = self.rig_count();
+        let units: Vec<String> = self.units.iter().filter(|u| n <= 1 || u.rig as usize == self.active_rig)
+            .map(|u| format!("{} (node {})", sentence_case(&u.name), u.node_id)).collect();
+        let rigs: Vec<String> = (0..n).map(|r| format!("{} · {}", r + 1, self.rig_name(r))).collect();
+        format!("[context: rig in view = {} · {} (index {}), units: {} · all rigs: {}]",
+            self.active_rig + 1, self.rig_name(self.active_rig), self.active_rig, units.join(", "), rigs.join(", "))
+    }
+
+    /// Chat submit: `/model` commands stay local; everything else goes to the
+    /// agent with the state header.
+    fn submit_chat(&mut self, t: String) {
+        if let Some(rest) = t.strip_prefix("/model") {
+            let m = rest.trim();
+            let line = if m.is_empty() {
+                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
+            } else { self.switch_model(m) };
+            self.assistant.history.push(ChatLine { role: "system".into(), text: line });
+            return;
+        }
+        let msg = format!("{}\n{}", self.chat_context(), t);
+        self.assistant.send_user_display(t, msg);
+    }
+
+    fn switch_model(&mut self, m: &str) -> String {
+        self.assistant.set_model(m);
+        let line = format!("model switched to {m} (the conversation continues)");
+        line
+    }
+
     /// Every rig for the agent: index, name, device, units (node ids), mix.
     fn rigs_json(&self) -> serde_json::Value {
         let rigs: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| {
@@ -3394,12 +3972,20 @@ impl DemoApp {
                     // without the play button). Per-synth Keyboard/Hardware
                     // routing lives in the MIDI matrix (same toggles).
                     ui.add_space(4.0);
-                    let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 22.0), egui::Sense::hover());
-                    theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
-                    ui.add_space(6.0);
+                    let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
+                    ui.add_space(4.0);
                     if let Some(g) = self.topbar_word_g.clone() {
                         let (r, _) = ui.allocate_exact_size(g.size, egui::Sense::hover());
                         theme::paint_tracked(ui.painter(), r.min, &g, theme::INK);
+                        // Optical alignment: center the mark on the wordmark's
+                        // LETTER BODY (baseline − half the cap height), not on
+                        // the galley box — the box includes line spacing, which
+                        // left the mark ~2px high (user: "not properly aligned").
+                        let base = g.chars.first()
+                            .and_then(|(c, _)| c.rows.first().and_then(|row| row.glyphs.first().map(|gl| row.pos.y + gl.pos.y)))
+                            .unwrap_or(g.size.y * 0.8);
+                        let body_mid = r.top() + base - 20.0 * 0.36;
+                        theme::crossed_wires(ui.painter(), Pos2::new(mark.center().x, body_mid), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                     }
                     ui.add_space(14.0);
                     ui.add_space(6.0);
@@ -3432,6 +4018,15 @@ impl DemoApp {
                     ui.add_space(6.0);
                     if nav_button(ui, "Assistant", self.show_assistant) {
                         self.show_assistant = !self.show_assistant;
+                    }
+                    // Telemetry IN the page (D toggles): right-aligned bar text.
+                    if self.show_stats {
+                        let line = self.stats_text();
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(line).monospace().size(11.0).color(theme::INK_2))
+                                .on_hover_text("audio · frame rate · patch · MIDI input latency (D hides)");
+                        });
                     }
                 });
             });
@@ -3596,21 +4191,27 @@ impl DemoApp {
         }
     }
 
-    /// Start a fresh single-Surge rig (the only CLAP instrument the engine loads).
-    fn add_surge_rig(&mut self) {
+    /// Start a fresh single-instrument CLAP rig for any CLAP plugin.
+    fn add_clap_rig(&mut self, plugin_id: &str, name: &str) {
         let mut g = Graph::default();
         g.reserve(16, 16);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let label = name.to_uppercase();
+        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name_bytes(&label));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
         g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
-        let s = crate::session::Session::new("Surge rig", g);
+        let s = crate::session::Session::new(&format!("{name} rig"), g);
         match self.apply_session(&s) {
-            Ok(_) => self.plugin_msg = "New Surge rig — Keys→Surge→Master".into(),
+            Ok(_) => self.plugin_msg = format!("New {name} rig — Keys→{name}→Master"),
             Err(e) => self.plugin_msg = format!("Add failed: {e}"),
         }
+    }
+
+    /// Start a fresh single-Surge rig.
+    fn add_surge_rig(&mut self) {
+        self.add_clap_rig(SURGE_ID, "Surge");
     }
 
     /// Browse installed plugins and add them to a rig (no assistant needed).
@@ -3668,24 +4269,23 @@ impl DemoApp {
                     }
                     ui.separator();
                     theme::section_label(ui, &format!("CLAP instruments ({})", self.plugins_clap.len()));
-                    let mut add_surge = false;
+                    let mut add_clap: Option<(String, String)> = None;
                     let mut first_row = true;
                     for p in &self.plugins_clap {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
                         if !first_row { ui.separator(); }
                         first_row = false;
-                        let is_surge = p.id == SURGE_ID;
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(&p.name).size(13.0));
-                            if is_surge {
-                                if theme::primary_button(ui, "New rig").clicked() { add_surge = true; }
-                            } else {
-                                ui.add_enabled(false, egui::Button::new(egui::RichText::new("coming soon").small()))
-                                    .on_hover_text("only Surge loads for now — other CLAP instruments are not wired yet");
+                            if !p.vendor.is_empty() && p.vendor != "?" {
+                                ui.label(egui::RichText::new(&p.vendor).size(11.0).color(theme::INK_2));
+                            }
+                            if theme::primary_button(ui, "New rig").on_hover_text(&p.id).clicked() {
+                                add_clap = Some((p.id.clone(), p.name.clone()));
                             }
                         });
                     }
-                    if add_surge { self.add_surge_rig(); }
+                    if let Some((id, name)) = add_clap { self.add_clap_rig(&id, &name); }
                 });
                 if !self.plugin_msg.is_empty() {
                     ui.separator();
@@ -3724,6 +4324,18 @@ impl DemoApp {
                         if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
                             self.show_assistant = false;
                         }
+                        ui.add_space(10.0);
+                        // Model switch right in the dialogue (also: /model <name>).
+                        let cur = self.assistant.model();
+                        let mut pick: Option<String> = None;
+                        egui::ComboBox::from_id_salt("assistant_model")
+                            .selected_text(egui::RichText::new(format!("model: {cur}")).size(12.0).color(theme::CREAM))
+                            .show_ui(ui, |ui| {
+                                for m in self.assistant.models.clone() {
+                                    if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
+                                }
+                            }).response.on_hover_text("chat model — switch any time, the conversation stays");
+                        if let Some(m) = pick { self.switch_model(&m); }
                         ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(format!("{} · {} · octave C{}", self.surge_status, self.hw_status, self.octave))
@@ -3768,6 +4380,7 @@ impl DemoApp {
                     }
                 } else {
                     let avail = ui.available_height();
+                    let entities = self.chat_entities();
                     // Exactly the height left above the input row: egui's
                     // default min_scrolled_height (64px) would overflow a
                     // short panel past its top edge.
@@ -3794,7 +4407,19 @@ impl DemoApp {
                                 // inline, text flows across the full width.
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(egui::RichText::new(label).size(13.0).strong().color(color));
-                                    ui.label(egui::RichText::new(&line.text).size(13.0).color(theme::INK));
+                                    // **bold** renders bold (never raw asterisks); rigs, units
+                                    // and effects named in the reply are highlighted.
+                                    for (k, part) in line.text.split("**").enumerate() {
+                                        if part.is_empty() { continue; }
+                                        for (seg, is_entity) in highlight_segments(part, &entities) {
+                                            let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
+                                            if k % 2 == 1 { t = t.strong(); }
+                                            if is_entity {
+                                                t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
+                                            }
+                                            ui.label(t);
+                                        }
+                                    }
                                 });
                                 ui.add_space(6.0);
                             }
@@ -3826,7 +4451,7 @@ impl DemoApp {
                         {
                             let t = self.chat_input.trim().to_string();
                             self.chat_input.clear();
-                            self.assistant.send_user(t);
+                            self.submit_chat(t);
                         }
                     });
                     // 6px gap + the row as laid out (+ spacing) → next frame's reserve.
@@ -3851,7 +4476,6 @@ impl DemoApp {
     fn clap_rigs(&self) -> Vec<(usize, u32)> {
         self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
-            .take(VOICE_POOL)
             .enumerate()
             .map(|(rig, u)| (rig, u.node_id))
             .collect()
@@ -3922,6 +4546,45 @@ impl DemoApp {
     /// Connect commands (the engine rejects duplicates), knobs SetParam, and
     /// the shared graph mirror is rebuilt when the cable set changed. Runs
     /// once per frame after input, so a re-plug's Disconnect precedes it.
+    /// Pinned Surge parameters: send changed knob values to the plugin.
+    fn publish_pins(&mut self) {
+        let slots = self.clap_rigs();
+        for u in self.units.iter_mut() {
+            let Some(slot) = slots.iter().find(|(_, n)| *n == u.node_id).map(|(s, _)| *s) else { continue };
+            let Some(idx) = self.clap_slot_map.get(slot).copied().flatten() else { continue };
+            let Some(ctl) = self.surge_controllers.get(idx) else { continue };
+            for k in u.knobs.iter_mut() {
+                if let Some(pin) = k.clap.as_mut() {
+                    if (k.value - pin.sent).abs() > 1e-4 {
+                        ctl.set_param(ClapId::new(pin.id), pin.min + k.value as f64 * (pin.max - pin.min));
+                        pin.sent = k.value;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pin (or unpin) a Surge parameter of voice `slot` as a face knob.
+    fn toggle_pin(&mut self, slot: usize, p: &crate::host::ParamDesc) -> String {
+        let Some(node) = self.clap_rigs().into_iter().find(|(s, _)| *s == slot).map(|(_, n)| n) else { return "no synth".into() };
+        let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) else { return "no synth".into() };
+        if let Some(i) = u.knobs.iter().position(|k| k.clap.map_or(false, |c| c.id == p.id)) {
+            u.knobs.remove(i);
+            return format!("unpinned {}", p.name);
+        }
+        if u.knobs.iter().filter(|k| k.clap.is_some()).count() >= MAX_PINS {
+            return format!("at most {MAX_PINS} pinned knobs per synth");
+        }
+        let span = (p.max - p.min).max(1e-9);
+        let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
+        let label: String = p.name.to_uppercase().chars().take(9).collect();
+        u.knobs.push(Knob {
+            label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
+            param: None, clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
+        });
+        format!("pinned {} to the face", p.name)
+    }
+
     fn publish_patch(&mut self) {
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
@@ -4541,8 +5204,9 @@ impl DemoApp {
             let fx = if idx == 0 { 0.32 } else { 0.68 };
             Vec2::new(r.left() + r.width() * fx, r.bottom() - 40.0)
         } else {
-            // Stack units: knob column on the right.
-            Vec2::new(r.right() - 86.0 + idx as f32 * 56.0, r.center().y + 14.0)
+            // Stack units: knob pairs on the right; pinned knobs add pairs
+            // to the LEFT (idx 2,3 → one pair left, …).
+            Vec2::new(r.right() - 86.0 + (idx % 2) as f32 * 56.0 - (idx / 2) as f32 * 112.0, r.center().y + 14.0)
         }
     }
 
@@ -4550,7 +5214,8 @@ impl DemoApp {
     fn display_area(&self, unit: usize) -> (f32, f32) {
         let r = self.unit_rects[unit];
         let start = r.left() + 20.0;
-        let width = (r.right() - 112.0 - start).max(0.0);
+        let pairs = self.units.get(unit).map_or(1, |u| u.knobs.len().div_ceil(2).max(1));
+        let width = (r.right() - 112.0 * pairs as f32 - start).max(0.0);
         (start, width)
     }
 
@@ -4709,6 +5374,21 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F11) {
                 self.show_matrix = !self.show_matrix;
                 if self.show_matrix { self.show_mixer = false; }
+            }
+            // Letter shortcuts to the views (user 2026-11-15) — letters the
+            // laptop piano does not use: M mixer · N matrix · C chat · B browser.
+            if i.consume_key(Modifiers::NONE, Key::M) {
+                self.show_mixer = !self.show_mixer;
+                if self.show_mixer { self.show_matrix = false; }
+            }
+            if i.consume_key(Modifiers::NONE, Key::N) {
+                self.show_matrix = !self.show_matrix;
+                if self.show_matrix { self.show_mixer = false; }
+            }
+            if i.consume_key(Modifiers::NONE, Key::C) { self.show_assistant = !self.show_assistant; }
+            if i.consume_key(Modifiers::NONE, Key::B) {
+                self.show_plugins = !self.show_plugins;
+                if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
             }
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.show_mixer = !self.show_mixer;
@@ -4914,6 +5594,7 @@ impl DemoApp {
                 Drag::Unit { unit, grab } => {
                     // Track the cursor in rack-local space; cable endpoints read
                     // unit_rects, so they stay attached while the box moves.
+                    self.drag_cursor = Some(l);
                     let size = self.unit_rects[unit].size();
                     self.unit_rects[unit] = Rect::from_min_size((l - grab).to_pos2(), size);
                 }
@@ -4956,6 +5637,8 @@ impl DemoApp {
             let plug_info = if let Drag::Plug { id, end } = self.drag { Some((id, end)) } else { None };
             let unit_drag = if let Drag::Unit { unit, .. } = self.drag { Some(unit) } else { None };
             self.drag = Drag::None;
+            self.drag_cursor = None;
+            self.drop_ghost = None;
 
             // Ctrl+drag release (task-21): reorder the stacks, then auto-layout
             // reflows. Only when actually moved, so a Ctrl+click is a no-op.
@@ -5031,20 +5714,31 @@ impl DemoApp {
                         self.set_node_playing(node, !playing);
                     }
                     Some(Hit::Unit(ui)) => {
-                        // Double-click a synth unit → toggle its inline editor
-                        // (task-26). A single click still pings the unit.
-                        let is_synth = self.units.get(ui).map_or(false, |u| matches!(u.node_kind, UnitKind::Clap));
+                        // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
+                        // A single click still pings the unit.
+                        let lv2_info = self.units.get(ui).and_then(|u| {
+                            self.base_graph.nodes.iter().find(|n| n.id == u.node_id).and_then(|n| match &n.kind {
+                                NodeKind::Lv2 { uri } => Some((u.node_id, uri.as_str().to_string(), u.name.clone())),
+                                _ => None,
+                            })
+                        });
+                        let is_clap = self.units.get(ui).map_or(false, |u| matches!(u.node_kind, UnitKind::Clap));
+                        let has_editor = is_clap || lv2_info.is_some();
                         let now = std::time::Instant::now();
-                        let double = is_synth && self.last_unit_click
+                        let double = has_editor && self.last_unit_click
                             .map_or(false, |(pu, pt)| pu == ui && now.duration_since(pt).as_millis() < 400);
                         if double {
                             self.last_unit_click = None;
-                            match self.rig_of_unit(ui) {
-                                Some(rig) => self.editor_request = Some(rig),
-                                None => self.editor_status = "no hosted synth voice for this unit".into(),
+                            if let Some(info) = lv2_info {
+                                self.lv2_editor_request = Some(info);
+                            } else {
+                                match self.rig_of_unit(ui) {
+                                    Some(rig) => self.editor_request = Some(rig),
+                                    None => self.editor_status = "no hosted synth voice for this unit".into(),
+                                }
                             }
                         } else {
-                            if is_synth { self.last_unit_click = Some((ui, now)); }
+                            if has_editor { self.last_unit_click = Some((ui, now)); }
                             self.ping_unit(ui);
                         }
                     }
@@ -5112,7 +5806,6 @@ impl DemoApp {
 
         self.draw_pan_bars(&painter);
         self.draw_hint(&painter, rect);
-        if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
@@ -5208,7 +5901,6 @@ impl DemoApp {
             });
         });
 
-        if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
@@ -5225,7 +5917,7 @@ impl DemoApp {
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })
             .map(|(i, u)| (i, u.knobs.iter().position(|k| k.param.is_some()
-                && matches!(k.label, "LEVEL" | "GAIN" | "VOLUME" | "VOL"))))
+                && matches!(k.label.as_str(), "LEVEL" | "GAIN" | "VOLUME" | "VOL"))))
             .collect()
     }
 
@@ -5294,18 +5986,19 @@ impl DemoApp {
                                         // filter/tab while every rig is shown (vision review).
                                         // The rig in the rack view gets an "IN VIEW" tag.
                                         let group_w = (self.mixer_sources(rig as u8).len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
-                                        ui.allocate_ui_with_layout(egui::vec2(group_w, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                            // Heading centered over ITS strips (sources + bus).
-                                            let tag_w = if rig == self.active_rig && n > 1 { 96.0 } else { 0.0 };
-                                            ui.add_space(((group_w - 80.0 - tag_w) / 2.0).max(0.0));
+                                        // Heading truly centered over ITS strips; the "shown in
+                                        // rack" tag sits on a subline reserved for every rig, so
+                                        // headings stay centered and strips stay aligned.
+                                        ui.allocate_ui_with_layout(egui::vec2(group_w, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                                             let head = ui.add(egui::Label::new(egui::RichText::new(format!("{} · {}", rig + 1, name))
                                                 .font(theme::medium_font(14.0)).color(theme::INK)).sense(egui::Sense::click()))
                                                 .on_hover_text("show this rig in the rack view");
                                             if head.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                                             if head.clicked() { switch = Some(rig); }
                                             if rig == self.active_rig && n > 1 {
-                                                ui.add_space(6.0);
                                                 theme::tracked_label(ui, "SHOWN IN RACK", 9.0, 0.14, theme::CREAM_DIM); // neutral: teal = live
+                                            } else {
+                                                ui.add_space(12.0);
                                             }
                                         });
                                         // Group rule: the heading spans its sources + bus.
@@ -5406,7 +6099,6 @@ impl DemoApp {
             });
         });
         if let Some(r) = switch { self.set_active_rig(r); }
-        if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
@@ -6149,26 +6841,23 @@ impl DemoApp {
         painter.galley(pos, g.clone(), theme::INK_2);
     }
 
-    fn draw_stats(&mut self, painter: &egui::Painter, rect: Rect) {
+    /// Telemetry line for the top bar (user: in the page, not an overlay;
+    /// with the sample rate). Refreshed 4x/s so the numbers stay readable.
+    fn stats_text(&mut self) -> String {
         self.stats_timer -= 1.0 / 60.0;
-        if self.stats_timer <= 0.0 || self.stats_g.is_none() {
+        if self.stats_timer <= 0.0 || self.stats_line.is_empty() {
             self.stats_timer = 0.25;
             let pulses: usize = self.cables.iter().map(|c| c.pulses.iter().filter(|p| p.active).count()).sum();
             let midi_ms = crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            let text = format!(
-                "{:.0} fps · {} cables · {} pulses · midi {:.1}ms · {}",
-                self.fps, self.cables.len(), pulses, midi_ms,
-                if self.side == Side::Front { "front" } else { "back" });
-            // Telemetry is the only mono left in the app (§4.15).
-            self.stats_g = Some(painter.layout(text, FontId::monospace(11.0), theme::INK_2, f32::INFINITY));
+            let sr = crate::bridge::SAMPLE_RATE.load(std::sync::atomic::Ordering::Relaxed);
+            let audio = if sr > 0 {
+                let frames = crate::bridge::BUFFER_FRAMES;
+                format!("{:.1} kHz · {frames} fr ({:.1} ms)", sr as f64 / 1000.0, frames as f64 / sr as f64 * 1000.0)
+            } else { "no audio".into() };
+            self.stats_line = format!("{audio} · {:.0} fps · {} cables · {} pulses · midi {:.1} ms",
+                self.fps, self.cables.len(), pulses, midi_ms);
         }
-        if let Some(g) = &self.stats_g {
-            let w = g.size().x + 24.0;
-            let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 28.0));
-            painter.rect_filled(bar, 2.0, theme::PAPER_SINK);
-            painter.rect_stroke(bar, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-            painter.galley(bar.min + Vec2::new(12.0, 7.0), g.clone(), theme::INK_2);
-        }
+        self.stats_line.clone()
     }
 
     fn draw_help(&self, painter: &egui::Painter, rect: Rect) {
@@ -6258,6 +6947,41 @@ fn typing(ctx: &egui::Context) -> bool {
 /// `value` None = a source without a level knob (meter only). Returns the
 /// fader rect. The fader is a custom drag widget: it never takes keyboard
 /// focus (rule 12), so rig shortcuts keep working after a drag.
+/// Split `text` into (segment, is_entity) runs: case-insensitive matches of
+/// `entities` (longest first) on word boundaries are highlighted.
+fn highlight_segments(text: &str, entities: &[String]) -> Vec<(String, bool)> {
+    let lower = text.to_lowercase();
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    let boundary = |p: usize| p == 0 || p >= bytes.len() || !(bytes[p].is_ascii_alphanumeric());
+    let mut plain = String::new();
+    while i < text.len() {
+        if !text.is_char_boundary(i) { i += 1; continue; }
+        let hit = entities.iter().find(|e| {
+            let el = e.to_lowercase();
+            lower[i..].starts_with(&el) && boundary(if i == 0 { 0 } else { i - 1 }).then_some(()).is_some()
+                && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+                && boundary(i + el.len())
+        });
+        match hit {
+            Some(e) => {
+                if !plain.is_empty() { out.push((std::mem::take(&mut plain), false)); }
+                let n = e.len();
+                out.push((text[i..i + n].to_string(), true));
+                i += n;
+            }
+            None => {
+                let ch = text[i..].chars().next().unwrap();
+                plain.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if !plain.is_empty() { out.push((plain, false)); }
+    out
+}
+
 /// Pan readout: "C" at center, else the side and amount ("L 0.30").
 fn pan_text(v: f32) -> String {
     if v.abs() < 0.005 { "C 0.00".into() } else if v < 0.0 { format!("L {:.2}", -v) } else { format!("R {:.2}", v) }
@@ -6391,6 +7115,9 @@ impl DemoApp {
         if let Some(rig) = self.editor_request.take() {
             self.toggle_param_editor(rig);
         }
+        if let Some((node_id, uri, name)) = self.lv2_editor_request.take() {
+            self.toggle_lv2_editor(node_id, &uri, &name);
+        }
 
         // Laptop keys (disabled while the assistant text field has focus).
         // Losing keyboard focus drains held keys so note-offs can't orphan
@@ -6413,6 +7140,7 @@ impl DemoApp {
             }
         }
         self.poll_assistant();
+        self.serve_ui_inbox();
         self.sync_from_engine();
 
         // Scheduled note-offs (assistant play_note tool).
@@ -6460,6 +7188,7 @@ impl DemoApp {
         self.update(dt);
 
         self.publish_patch();
+        self.publish_pins();
 
         self.tessellate();
         if self.show_matrix { self.matrix_stage(ui); }
@@ -6678,16 +7407,65 @@ fn preferred_host() -> cpal::Host {
     cpal::default_host()
 }
 
+/// Pin the current (audio render) thread to the fastest CPU cores on
+/// heterogeneous systems (e.g. Apple M1 Firestorm P-cores vs Icestorm E-cores).
+/// SCHED_RR otherwise happily parks the audio callback on a slower E-core.
+fn pin_current_thread_to_p_cores() {
+    #[cfg(target_os = "linux")]
+    {
+        let mut freqs: Vec<(usize, u64)> = Vec::new();
+        for cpu in 0..libc::CPU_SETSIZE as usize {
+            let p = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
+            let Ok(s) = std::fs::read_to_string(&p) else { continue };
+            if let Ok(f) = s.trim().parse::<u64>() {
+                freqs.push((cpu, f));
+            }
+        }
+        let Some(max_f) = freqs.iter().map(|&(_, f)| f).max() else { return };
+        let Some(min_f) = freqs.iter().map(|&(_, f)| f).min() else { return };
+        if max_f <= min_f { return; } // homogeneous CPU
+        let p_cores: Vec<usize> = freqs.iter().filter(|&&(_, f)| f == max_f).map(|&(c, _)| c).collect();
+        if p_cores.is_empty() { return; }
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut set);
+            for &c in &p_cores {
+                libc::CPU_SET(c, &mut set);
+            }
+            if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 {
+                eprintln!("audio: pinned render thread to P-cores {p_cores:?} ({} MHz)", max_f / 1000);
+            }
+        }
+    }
+}
+
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>, Arc<Mutex<crate::engine::GraphPub>>, Arc<EdgeLevels>)> {
+struct BuiltAudio {
+    mains: Vec<ClapVoiceMain>,
+    controllers: Vec<VoiceController>,
+    voice_ids: Vec<u64>,
+    voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
+    voice_retire_rx: rtrb::Consumer<ClapVoice>,
+    stream: cpal::Stream,
+    bus: CommandBus,
+    level: Arc<std::sync::atomic::AtomicU32>,
+    sample_rate: f64,
+    player_ctrl: crate::player::PlayerControl,
+    rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
+    graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
+    edge_levels: Arc<EdgeLevels>,
+}
+
+fn build_audio() -> anyhow::Result<BuiltAudio> {
     let host = preferred_host();
     let device = host
         .default_output_device()
         .ok_or_else(|| anyhow::anyhow!("no output device"))?;
     let cfg = device.default_output_config()?;
     let sample_rate = cfg.sample_rate() as f64;
+    crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let ch = cfg.channels() as usize;
     // Instrument voice pool: the demo's two stacks (nodes 1 and 4) plus
     // spares for added rigs. Idle voices (unmapped) are not rendered.
@@ -6701,6 +7479,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     }
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
+    let voice_ids: Vec<u64> = voices.iter().map(|(_, v)| v.voice_id()).collect();
     let mut config: cpal::StreamConfig = cfg.into();
     // 256 frames @48k = 5.3 ms. Holds under full CPU load (all cores busy:
     // 0 xruns, worst render 1.0 ms) because the render thread is promoted to
@@ -6743,9 +7522,12 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
             Err(e) => eprintln!("system audio: capture unavailable: {e}"),
         }
     }
-    // File player (backing tracks): decode thread + ring; UI holds the control.
+    // File player (backing track): decode thread + ring; UI holds the control.
     let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
     engine.set_player_sink(player_sink);
+    let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
+    let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
+    engine.set_voice_channels(voice_rx, voice_retire_tx);
     let mut rt_tried = false;
     let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
     let stream = device.build_output_stream(
@@ -6758,9 +7540,13 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
             // UI for up to 26 ms (> the 10.7 ms buffer) → xruns.
             if !rt_tried {
                 rt_tried = true;
+                pin_current_thread_to_p_cores();
                 if std::env::var_os("KABELSALAT_NO_RT").is_none() {
-                    let frames = (data.len() / ch.max(1)) as u32;
-                    match audio_thread_priority::promote_current_thread_to_real_time(frames, sample_rate as u32) {
+                    // Request 1s (clamped to rtkit's RTTimeUSecMax = 200ms) rather
+                    // than one buffer (~5.3ms at 256/48kHz): Surge XT applies
+                    // load_state inside process(), which exceeds 5.3ms and
+                    // otherwise kills the SCHED_RR thread with SIGXCPU.
+                    match audio_thread_priority::promote_current_thread_to_real_time(sample_rate as u32, sample_rate as u32) {
                         Ok(h) => { _rt_handle = Some(h); eprintln!("audio: render thread promoted to realtime (rtkit)"); }
                         Err(e) => eprintln!("audio: realtime promotion unavailable ({e}); running at normal priority"),
                     }
@@ -6777,7 +7563,21 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
         None,
     )?;
     stream.play()?;
-    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub, edge_levels))
+    Ok(BuiltAudio {
+        mains,
+        controllers,
+        voice_ids,
+        voice_tx,
+        voice_retire_rx,
+        stream,
+        bus,
+        level,
+        sample_rate,
+        player_ctrl,
+        rig_snapshot,
+        graph_pub,
+        edge_levels,
+    })
 }
 
 /// UI scale (egui pixels_per_point): KABELSALAT_UI_SCALE overrides; else the
@@ -6865,7 +7665,22 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub, edge_levels)) => {
+                    Ok(ba) => {
+                        let BuiltAudio {
+                            mains,
+                            controllers,
+                            voice_ids,
+                            voice_tx,
+                            voice_retire_rx,
+                            stream,
+                            bus,
+                            level,
+                            sample_rate,
+                            player_ctrl,
+                            rig_snapshot,
+                            graph_pub,
+                            edge_levels,
+                        } = ba;
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
@@ -6893,20 +7708,60 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub, edge_levels));
+                        audio = Some((
+                            mains,
+                            controllers,
+                            voice_ids,
+                            sample_rate,
+                            voice_tx,
+                            voice_retire_rx,
+                            stream,
+                            bus,
+                            level,
+                            shared_graph,
+                            player_ctrl,
+                            rig_snapshot,
+                            graph_pub,
+                            edge_levels,
+                        ));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub, edge_levels)) => {
+                Some((
+                    mains,
+                    controllers,
+                    voice_ids,
+                    sample_rate,
+                    voice_tx,
+                    voice_retire_rx,
+                    stream,
+                    bus,
+                    level,
+                    shared_graph,
+                    player_ctrl,
+                    rig_snapshot,
+                    graph_pub,
+                    edge_levels,
+                )) => {
                     app.shared_graph = shared_graph;
                     app.edge_levels = Some(edge_levels);
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
-                    app.with_audio(mains, controllers, stream, bus, level)
+                    app.with_audio(
+                        mains,
+                        controllers,
+                        voice_ids,
+                        sample_rate,
+                        voice_tx,
+                        voice_retire_rx,
+                        stream,
+                        bus,
+                        level,
+                    )
                 }
                 None => app,
             };
@@ -7906,6 +8761,82 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn chat_highlights_entities_on_word_boundaries() {
+        let ents = vec!["Surge B".to_string(), "Rig B".to_string(), "Reverb".to_string(), "Surge".to_string()];
+        let segs = highlight_segments("Loaded a flute on Rig B: Surge B now feeds the reverb (not Surgery).", &ents);
+        let hits: Vec<&str> = segs.iter().filter(|(_, e)| *e).map(|(t, _)| t.as_str()).collect();
+        assert_eq!(hits, vec!["Rig B", "Surge B", "reverb"], "{segs:?}");
+        let joined: String = segs.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, "Loaded a flute on Rig B: Surge B now feeds the reverb (not Surgery).", "text preserved");
+    }
+
+    #[test]
+    fn model_switch_and_context_header() {
+        let (mut app, _ctx) = two_rigs();
+        let before = app.assistant.history.len();
+        app.submit_chat("/model deepseek-reasoner".into());
+        assert_eq!(app.assistant.model(), "deepseek-reasoner");
+        assert!(!app.assistant.busy, "a /model command is local, nothing sent");
+        assert_eq!(app.assistant.history.len(), before + 1);
+        app.set_active_rig(1);
+        let ctx = app.chat_context();
+        assert!(ctx.contains("rig in view = 2 · Rig B (index 1)"), "{ctx}");
+        assert!(ctx.contains("Surge (node"), "units of the rig in view are listed: {ctx}");
+    }
+
+    #[test]
+    fn letter_shortcuts_open_the_views() {
+        let (mut app, ctx) = two_rigs();
+        frame(&mut app, &ctx, key(Key::M));
+        assert!(app.show_mixer && !app.show_matrix);
+        frame(&mut app, &ctx, key(Key::N));
+        assert!(app.show_matrix && !app.show_mixer);
+        frame(&mut app, &ctx, key(Key::C));
+        assert!(app.show_assistant);
+    }
+
+    #[test]
+    fn pin_a_surge_parameter_as_a_face_knob() {
+        let mut app = DemoApp::new_with_sink(None);
+        let p = crate::host::ParamDesc { id: 42, name: "Filter 1 Cutoff".into(), module: "A/Filter".into(),
+            min: -60.0, max: 70.0, value: 5.0, default: 3.0, automatable: true, hidden: false, readonly: false };
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let before = app.units[surge].knobs.len();
+        let msg = app.toggle_pin(0, &p);
+        assert!(msg.starts_with("pinned"), "{msg}");
+        let k = app.units[surge].knobs.last().unwrap();
+        assert_eq!(k.label, "FILTER 1 ");
+        assert!((k.value - 0.5).abs() < 1e-6, "65/130 of the range: {}", k.value);
+        assert_eq!(app.units[surge].knobs.len(), before + 1);
+        app.publish_pins(); // no controllers headless: must not panic
+        assert!(app.toggle_pin(0, &p).starts_with("unpinned"));
+        assert_eq!(app.units[surge].knobs.len(), before);
+    }
+
+    #[test]
+    fn dragging_a_unit_previews_the_layout_and_release_commits_it() {
+        let mut app = DemoApp::new_with_sink(None); // stacks: [Surge A, Delay A] [Surge B, Delay B]
+        let ctx = egui::Context::default();
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let delay_a = app.stack_cols[0][1];
+        let delay_b = app.stack_cols[1][1];
+        let before_b = app.unit_rects[delay_b];
+        // Drag Delay A into the 2nd column, below Surge B, Delay B.
+        let target = Vec2::new(app.col_x[1], app.stack_tall_h - 10.0);
+        app.drag = Drag::Unit { unit: delay_a, grab: Vec2::ZERO };
+        app.drag_cursor = Some(target);
+        app.layout(app.stage_rect);
+        let ghost = app.drop_ghost.expect("a landing slot is previewed");
+        assert!((ghost.center().x - app.col_x[1]).abs() < 1.0, "ghost in column 2");
+        assert!(app.unit_rects[delay_b].height() < before_b.height() - 1.0, "column 2 already reflowed for 3 units");
+        assert_eq!(app.stack_cols[0].len(), 2, "nothing committed before release");
+        // Release where previewed: the committed order equals the preview.
+        app.drop_unit(delay_a, target);
+        app.drag = Drag::None; app.drag_cursor = None;
+        assert_eq!(app.stack_cols[1].last(), Some(&delay_a), "landed as previewed: {:?}", app.stack_cols);
+    }
+
+    #[test]
     fn plus_rig_grows_a_single_rig_rack() {
         let mut app = DemoApp::new_with_sink(None);
         let ctx = egui::Context::default();
@@ -8114,6 +9045,7 @@ mod rig_switch_tests {
     #[test]
     fn a_focused_text_field_still_gets_the_keys() {
         let (mut app, ctx) = two_rigs();
+        app.assistant.key_set = true; // chat field (tests never load the real key)
         app.show_assistant = true;
         frame(&mut app, &ctx, vec![]);
         // The chat/API-key field: the widest focusable text widget low on
@@ -8872,5 +9804,27 @@ mod split_bpm_tests {
                 assert!(app.unit_rects[u].contains_rect(rr), "w={w}: leaves the face");
             }
         }
+    }
+
+    #[test]
+    fn vitalium_and_dexed_editor_support() {
+        if !lv2_discover().iter().any(|p| p.uri == "urn:distrho:vitalium") {
+            return;
+        }
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.add_lv2_instrument("urn:distrho:vitalium", "Vitalium");
+        frame(&mut app, &ctx, vec![]);
+        let u = app.units.iter().find(|u| u.lv2_inst).expect("Vitalium unit");
+        assert!(u.lv2_inst, "Vitalium must be classified as lv2_inst");
+        assert_eq!(u.sub, "lv2 synth", "Vitalium subtitle must be lv2 synth");
+        let node_id = u.node_id;
+        app.toggle_lv2_editor(node_id, "urn:distrho:vitalium", "VITALIUM");
+        assert!(app.editor_open);
+        assert_eq!(app.lv2_editor_node, Some(node_id));
+        assert!(!app.lv2_editor_controls.is_empty(), "Vitalium controls should populate");
+        assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
     }
 }

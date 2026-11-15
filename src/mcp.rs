@@ -199,6 +199,22 @@ struct SetNodePlayingArgs {
     playing: bool,
 }
 
+/// Arguments for `list_sounds`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListSoundsArgs {
+    /// Words matched against "Category/Name", e.g. "flute" or "pad warm".
+    query: String,
+}
+
+/// Arguments for `load_sound`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadSoundArgs {
+    /// Patch query (words or "Category/Name" from list_sounds).
+    query: String,
+    /// Rig index (default: the rig in view).
+    rig: Option<usize>,
+}
+
 /// Arguments for `set_split`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetSplitArgs {
@@ -995,6 +1011,26 @@ impl McpServer {
     }
 
     /// Query the multi-rig state.
+    /// Search installed Surge patches.
+    #[tool(name = "list_sounds", description = "Search the installed Surge patches (factory + 3rd-party, ~3000) by words in 'Category/Name', e.g. 'flute', 'pad warm'. Returns up to 25 entries.")]
+    fn list_sounds(&self, Parameters(args): Parameters<ListSoundsArgs>) -> Result<CallToolResult, McpError> {
+        let hits = crate::host::search_surge_patches(&crate::host::list_surge_patches(), &args.query, 25);
+        ok_json(json!({"patches": hits}))
+    }
+
+    /// Load a Surge patch into a rig's synth (needs the running app).
+    #[tool(name = "load_sound", description = "Load a Surge patch into a rig's synth so it sounds like that instrument (a new rig plays the init patch otherwise). query: words or 'Category/Name' from list_sounds; rig: index (default: the rig in view). Needs the running app (kabelsalat mcp --attach): the synths live on its UI thread.")]
+    fn load_sound(&self, Parameters(args): Parameters<LoadSoundArgs>) -> Result<CallToolResult, McpError> {
+        let mut a = json!({"query": args.query});
+        if let Some(r) = args.rig { a["rig"] = json!(r); }
+        match bridge::request(&json!({"op": "ui", "tool": "load_sound", "args": a})) {
+            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) =>
+                ok_json(reply.get("data").cloned().unwrap_or(Value::Null)),
+            Ok(reply) => tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("load_sound failed").to_string()),
+            Err(e) => tool_err(format!("load_sound needs the running app (attach): {e:#}")),
+        }
+    }
+
     #[tool(name = "get_rigs", description = "Query the multi-rig state: {rigs:[{name, midi_device}], active}. Empty rigs means single-graph mode (a plain graph load clears it). midi_device null = any source; a number = only that hardware MIDI device.")]
     fn get_rigs(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();

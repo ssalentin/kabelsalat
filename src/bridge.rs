@@ -36,10 +36,28 @@ use serde_json::{json, Value};
 
 use crate::control::{Command, CommandBus, Graph, RigSnapshot};
 
+/// One UI-owned tool call queued for the app frame: (tool, args, reply).
+pub type UiRequest = (String, Value, std::sync::mpsc::Sender<String>);
+
+/// Requests the running app executes on its UI thread (`DemoApp::exec_tool`)
+/// — e.g. load_sound, whose synth state only the app's main thread owns.
+pub static UI_INBOX: Mutex<Vec<UiRequest>> = Mutex::new(Vec::new());
+/// Set once a UI frame loop drains `UI_INBOX` (headless MCP has none).
+pub static UI_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn ui_call(tool: String, args: Value) -> Result<String, String> {
+    if !UI_ATTACHED.load(Ordering::Relaxed) { return Err("no app UI attached".into()); }
+    let (tx, rx) = std::sync::mpsc::channel();
+    UI_INBOX.lock().map_err(|_| "ui inbox poisoned".to_string())?.push((tool, args, tx));
+    rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|_| "the app did not answer in 5 s".to_string())
+}
+
 /// Output buffer size in frames (shared with the audio setup in `ui`).
 pub const BUFFER_FRAMES: u32 = 256;
 /// Count of audio stream errors / xruns reported by cpal since startup.
 pub static XRUNS: AtomicU32 = AtomicU32::new(0);
+/// The output stream's sample rate in Hz (0 = no audio yet).
+pub static SAMPLE_RATE: AtomicU32 = AtomicU32::new(0);
 /// Audio callback timing (lock-free, written by the audio thread): worst
 /// render time, the callback's frame count, and how many callbacks used
 /// more than 80% of their buffer's real-time budget.
@@ -217,6 +235,16 @@ fn handle_line(
                 json!({"ok": true})
             } else {
                 err_reply("command bus full — try again")
+            }
+        }
+        // UI-owned tools (synth patches live on the app's main thread):
+        // queued for the app frame, answered within 5 s.
+        Some("ui") => {
+            let tool = req.get("tool").and_then(Value::as_str).unwrap_or("").to_string();
+            let args = req.get("args").cloned().unwrap_or(json!({}));
+            match ui_call(tool, args) {
+                Ok(text) => json!({"ok": true, "data": text}),
+                Err(e) => err_reply(e),
             }
         }
         Some("query") => match req.get("name").and_then(Value::as_str) {

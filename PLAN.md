@@ -2,7 +2,76 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **P1 live core largely landed** — P0 complete (docs/p0-report.md). Done: two-stack rack UI (Tab flip), multi-voice engine + 8-node DSP, per-rig input selection + keyboard splits (MIDI matrix wired), session save/load (self-test passing), **embedded Surge editor in the main window** (docs/p1-editor.md), **system-audio capture** (docs/p2-system-audio.md), **file player** (docs/p2-file-player.md), MCP server (16 tools, headless + live-app attach, docs/p3-mcp.md), LV2 discovery + hosting + engine integration (docs/p3-lv2.md), **dynamic rack + starter templates** (F5/F6/F7). Next: LV2 instruments (MIDI/atom), dynamic non-Surge CLAP loading, visual transport, polish. · Name: `kabelsalat` (binary = package = `.desktop` = icon = Wayland app id) · Location: `~/Work/kabelsalat`
+Status: **core app complete + multi-rig backend landed; UI redesign + multi-rig UI are next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) Signal visual redesign (docs/design-language.md), (2) multi-rig UI, (3) hot-wire MIDI matrix view. · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below.
+
+## 0.1 Session handoff (read me first in a new session)
+
+**Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
+Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
+`WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+`metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
+`lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
+`lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
+`kabelsalat mcp --attach` (drive the running app); one-shot CLI: `kabelsalat send '<json>'`.
+
+**Architecture (src/):**
+- `control.rs` — typed control plane: `Command`, `Graph`/`Node`/`Edge` (Node has `rig:u8`),
+  `NodeKind`, `DspKind` (incl. `Metronome`), `Rig`, `RigSnapshot`/`RigMeta`, `merge_rigs`,
+  lock-free `command_bus()` (rtrb). One API for UI/assistant/CLI/MCP.
+- `engine.rs` — `GraphEngine`: voices→DSP→LV2→master. Sums **all** MasterOut nodes (multi-rig).
+  Master has stereo (ports 0/1) + MONO (port 2, centered). Metronome is a DSP node driven by
+  transport. `LoadGraph`/`LoadRigs` rebuild slots + matrix; `set_rig_snapshot` publishes rig state.
+  RT discipline: render path is allocation-free; structural ops may allocate at block boundary.
+- `host.rs` — CLAP via clack-host: `ClapVoice` (audio, Send) + `ClapVoiceMain` (main-thread, !Send),
+  `VoiceController` (RT-safe note/param), `param_list()`/`param_text()` for the native editor.
+  **2 Surge voices** created at startup (main-thread-only); LoadGraph remaps them in node-id order.
+- `lv2.rs` — hand-written lilv FFI (no bindgen/clang). `Lv2Plugin` (effects + instruments via
+  atom/MIDI), `discover()` (classifies instruments), `merge`-friendly.
+- `dsp.rs` — 8 allocation-proven processors + Metronome placeholder.
+- `matrix.rs` — MIDI routing: `SourceId::{Keys,LaptopKeys,Hardware(dev),...}`, per-rig rules,
+  splits/transpose/filters. Allocation-free `route_into`.
+- `ui.rs` — eframe/egui. Data-driven rack (`build_rack`), Tab flip, animated cables, Ctrl+drag
+  rearrange, **native egui param editor (double-click a Clap unit; NO X11)**, plugin browser (F9),
+  templates (F5/F6/F7, F8 demo), sessions, transport popover (F10/Space), stats (fps/cables/midi ms).
+  Holds `shared_graph`, `rig_snapshot`, `surge_controllers`.
+- `bridge.rs` — unix socket `$XDG_RUNTIME_DIR/kabelsalat.sock`; `spawn_with_rigs`; queries
+  `get_graph`/`get_status`/`get_rigs`; `BUFFER_FRAMES=512`, `XRUNS`, `MIDI_LATENCY_US` statics.
+- `mcp.rs` — rmcp server, ~19 tools incl. `load_rigs`/`get_rigs`/`add_node`/`connect`/`list_plugins`.
+- `assistant.rs` — DeepSeek BYOK (key at `~/.config/kabelsalat/config.json`, 0600, NEVER commit).
+- `session.rs` — `Session` + `MultiRigSession` atomic save/load; templates.
+- `capture.rs`/`player.rs`/`midi.rs` — system-audio monitor capture, WAV file player, midir I/O.
+
+**Hard-won conventions / gotchas:**
+- **No X11 child window** (user requirement). The plugin editor is native egui, not reparented.
+  The app still runs under XWayland for fractional HiDPI (run_inner hides WAYLAND_DISPLAY); ppp≈2.33.
+- Notes are **absolute MIDI** through `fire_keys`/the sink (a +60/-60 clamp bug was fixed).
+- CLAP voice pool = 2 Surge voices; >2 CLAP synths needs dynamic loading (backlog). LV2 instruments
+  can extend. LV2 instrument classification is a permissive port hint (class is a blank node).
+- Tab is stripped in `raw_input_hook` (flip only, never moves focus). Laptop keys don't fire when
+  the assistant text field has focus (`egui_wants_keyboard_input`).
+- System-audio monitor capture can feed back if playing to the same sink (muted by default).
+- **Hyprland window-mapping glitch:** app process can run while its window stops listing; relaunch
+  cleanly (`pkill -x kabelsalat; rm -f /run/user/1000/kabelsalat.sock; relaunch`). Focus via
+  `hyprctl` (signature dir: `/run/user/1000/hypr/<sig>`).
+- Lead owns git commits + Cargo.toml; subagents use `CARGO_TARGET_DIR=$HOME/.cache/ksalat-*-target`,
+  never /tmp (tmpfs). Verify before committing; keep the running app on the old binary until approved.
+- This DSH session's only authorized subagent model is qwen4-max-preview (no image input); the
+  `deepseek` provider is not allowed here. Screenshot review needs an image-capable model/profile.
+
+**Next builds (in order):**
+1. **Signal visual redesign** — spec in `docs/design-language.md`; create `src/theme.rs` (palette +
+   glass_panel/glow_stroke/aurora_bg/value_arc helpers), restyle rack front/back, toolbar, keyboard,
+   panels. Dark layered glass, cyan/blue audio, amber MIDI, violet selection, green active, red clip.
+2. **Multi-rig UI** — backend is DONE (`LoadRigs`, `rig_snapshot`, `get_rigs`). Build an always-visible
+   overview strip (rig name + MIDI device + active highlight + level), number keys 1–9 + arrow keys to
+   switch the big view (visual only; all rigs sound), big view = active rig's rack. **Held keys must
+   remember their rig+pitch** so switching doesn't orphan note-offs (vibez lesson, docs/vibez-notes.md).
+3. **Hot-wire MIDI matrix view** (backlog) — AUM-style MIDI-in vs sink patching surface.
+
+**Docs:** `docs/BACKLOG.md` (queue), `docs/design-language.md` (redesign spec), `docs/vibez-notes.md`
+(reference-app lessons), `docs/p0-report.md` (latency/go-no-go), `docs/p3-lv2.md`, `docs/p3-mcp.md`,
+`docs/control-plane.md`, `docs/p2-transport.md`, and per-feature p1/p2 docs.
 
 ## 0. Decision log
 

@@ -5,20 +5,28 @@ rigs, each bound to its own MIDI device or audio source, all sounding at once,
 freely wired and mixed** — with GarageBand approachability and Reason's rack
 flip.
 
-## In progress
+## In progress / next
 
-- **Multi-rig sessions** (the big one). Each rig is a full rack
-  (keys→synths→FX→master) bound to its own MIDI input (organ / keyboard / EWI /
-  synth controllers). All rigs sound simultaneously, mixed to master. An
-  always-visible **overview** of every rig; **number keys 1–9 and arrow keys**
-  switch which rig the big view shows (visual only — audio keeps running).
-  - Engine: sum all rig masters — **landed** (`multi-rig-test`).
-  - Backend: Rig model + merge + `LoadRigs` + per-rig device routing — in work.
-  - UI: overview strip + switching + big active-rig view — queued.
-- **Ctrl+drag to rearrange rack units** with auto-layout reflow — in work.
+- **Multi-rig UI** (the big one). Backend is **DONE**: Rig model + merge + `LoadRigs`
+  + per-rig device binding + rig snapshot exposed to UI/MCP (`get_rigs`/`load_rigs`).
+  Each rig is a full rack bound to its own MIDI input (organ / keyboard / EWI / synth
+  controllers); all rigs sound simultaneously, mixed to master. **Remaining: the UI** —
+  an always-visible overview strip (rig name + device + active highlight + level),
+  **number keys 1–9 + arrow keys** to switch the big view (visual only), big view = the
+  active rig's rack. Held keys must remember rig+pitch so switching doesn't orphan
+  note-offs (see docs/vibez-notes.md).
+- **Signal visual redesign** — spec in docs/design-language.md (dark layered glass,
+  cyan/blue audio, amber MIDI, violet selection, green active, red clip; theme.rs +
+  restyle). Do before/with the multi-rig UI so it isn't styled twice.
 
 ## Recently landed
 
+- **Native egui plugin param editor — NO X11** (double-click a unit; 775 Surge params
+  grouped into modules, searchable, RT-safe sliders). X11 embedding removed entirely.
+- **Multi-rig backend** (Rig/merge/LoadRigs/per-rig device binding/rig snapshot; 107 tests).
+- **Metronome as a normal rack node** (DspKind::Metronome wired to master; transport-driven).
+- **Ctrl+drag rack rearrange** with auto-reflow (cables stay attached).
+- **MIDI latency** in the stats bar + `get_status` (rolling-avg hw input delay).
 - Fix unplayable low notes (absolute MIDI notes through the key path).
 - Toolbar pill no longer overlaps the top menu.
 - Master out: **MONO input** (port 2) centered to L/R (`mono-master-test`).

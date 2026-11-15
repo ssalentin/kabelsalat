@@ -167,6 +167,13 @@ struct SetSystemAudioArgs {
     gain: f32,
 }
 
+/// Arguments for `set_player`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetPlayerArgs {
+    /// Mix level 0..1 for the file player (0 mutes).
+    gain: f32,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -557,6 +564,17 @@ impl McpServer {
         let mut st = self.state.lock().unwrap();
         let gain = args.gain.clamp(0.0, 1.0);
         if let Err(e) = send_cmd(&mut st, Command::SetSystemAudio { gain }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"gain": gain}))
+    }
+
+    /// Set the file-player mix gain.
+    #[tool(name = "set_player", description = "Set the backing-track file player's mix gain (Command::SetPlayer), 0..1, 0 mutes. Loading a file is done in the GUI app (play_file assistant tool) since paths can't cross the fixed-size command bus.")]
+    fn set_player(&self, Parameters(args): Parameters<SetPlayerArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let gain = args.gain.clamp(0.0, 1.0);
+        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain }) {
             return tool_err(e);
         }
         ok_json(json!({"gain": gain}))

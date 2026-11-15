@@ -20,6 +20,7 @@ use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, SourceId};
 use crate::capture::SystemCapture;
+use crate::player::PlayerSink;
 
 // Engine-level param ids (what the UI/assistant send). Translated to each
 // processor's native param ids in `dsp_native_param`.
@@ -90,6 +91,10 @@ pub struct GraphEngine {
     system_capture: Option<SystemCapture>,
     system_gain: f32,
     system_buf: Vec<f32>,
+    // File player (backing track) mixed into the master.
+    player_sink: Option<PlayerSink>,
+    player_gain: f32,
+    player_buf: Vec<f32>,
 }
 
 impl GraphEngine {
@@ -150,12 +155,20 @@ impl GraphEngine {
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
+            player_sink: None,
+            player_gain: 0.0,
+            player_buf: vec![0.0; 8192 * 2],
         }
     }
 
     /// Attach a system-audio capture source (started off the audio thread).
     pub fn set_system_capture(&mut self, cap: SystemCapture) {
         self.system_capture = Some(cap);
+    }
+
+    /// Attach the file-player ring consumer (decode thread started elsewhere).
+    pub fn set_player_sink(&mut self, sink: PlayerSink) {
+        self.player_sink = Some(sink);
     }
 
     pub fn graph(&self) -> &Graph {
@@ -261,6 +274,9 @@ impl GraphEngine {
             Command::SetSystemAudio { gain } => {
                 self.system_gain = gain.clamp(0.0, 1.0);
             }
+            Command::SetPlayer { gain } => {
+                self.player_gain = gain.clamp(0.0, 1.0);
+            }
             Command::TransportPlay | Command::TransportStop => {} // P2
         }
     }
@@ -312,6 +328,12 @@ impl GraphEngine {
                 cap.read(&mut self.system_buf[..n2]);
             }
         }
+        let ply = self.player_gain > 0.0 && self.player_sink.is_some();
+        if ply {
+            if let Some(sink) = &mut self.player_sink {
+                sink.read(&mut self.player_buf[..n2]);
+            }
+        }
         let mut peak = 0.0f32;
         let master = self.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id);
         if let Some(master) = master {
@@ -333,6 +355,10 @@ impl GraphEngine {
                 if sys {
                     l += self.system_buf[i * 2] * self.system_gain;
                     r += self.system_buf[i * 2 + 1] * self.system_gain;
+                }
+                if ply {
+                    l += self.player_buf[i * 2] * self.player_gain;
+                    r += self.player_buf[i * 2 + 1] * self.player_gain;
                 }
                 l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
                 r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;

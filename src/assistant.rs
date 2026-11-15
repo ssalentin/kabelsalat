@@ -191,6 +191,21 @@ fn tools() -> Value {
             "name":"system_audio",
             "description":"Mix system audio (e.g. YouTube/browser playback) into the master. gain 0..1 (0 mutes, default). Captures the default output's monitor source. Warn the user about feedback if kabelsalat plays to the same output.",
             "parameters":{"type":"object","properties":{"gain":{"type":"number","description":"0..1 mix level; 0 mutes"}},"required":["gain"]}
+        }},
+        {"type":"function","function":{
+            "name":"play_file",
+            "description":"Play a backing-track audio file (16-bit WAV) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"}},"required":["path"]}
+        }},
+        {"type":"function","function":{
+            "name":"stop_file",
+            "description":"Stop the backing-track file player.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_player",
+            "description":"Set the file-player mix gain (0..1, 0 mutes) without changing what's playing.",
+            "parameters":{"type":"object","properties":{"gain":{"type":"number"}},"required":["gain"]}
         }}
     ])
 }

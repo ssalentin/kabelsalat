@@ -503,6 +503,8 @@ struct DemoApp {
     /// Live patch mirrored for the control bridge (task-16): MCP/CLI queries
     /// read this snapshot. Rebuilt from the living cables whenever they change.
     shared_graph: Arc<Mutex<Graph>>,
+    /// File-player control (decode thread); engine owns the ring consumer.
+    player_ctrl: Option<crate::player::PlayerControl>,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
 
@@ -629,6 +631,7 @@ impl DemoApp {
             bus: None,
             out_level: None,
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
+            player_ctrl: None,
             graph_sig: Vec::new(),
             editor: None,
             editor_rig: 0,
@@ -1146,6 +1149,38 @@ impl DemoApp {
                 } else {
                     "system audio muted".into()
                 }
+            }
+            "play_file" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.8).clamp(0.0, 1.0) as f32;
+                if path.is_empty() {
+                    return "play_file needs a path to a 16-bit WAV file".into();
+                }
+                if let Some(pc) = &self.player_ctrl {
+                    pc.play(path);
+                    if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                    }
+                    format!("playing '{path}' at gain {gain:.2} (backing track mixed to master)")
+                } else {
+                    "file player unavailable (no audio)".into()
+                }
+            }
+            "stop_file" => {
+                if let Some(pc) = &self.player_ctrl {
+                    pc.stop();
+                }
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain: 0.0 });
+                }
+                "file player stopped".into()
+            }
+            "set_player" => {
+                let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                }
+                format!("file player gain {gain:.2}")
             }
             _ => format!("unknown tool: {name}"),
         }
@@ -2915,7 +2950,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -2957,6 +2992,9 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
             Err(e) => eprintln!("system audio: capture unavailable: {e}"),
         }
     }
+    // File player (backing tracks): decode thread + ring; UI holds the control.
+    let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
+    engine.set_player_sink(player_sink);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
@@ -2966,7 +3004,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         None,
     )?;
     stream.play()?;
-    Ok((vec![main_a, main_b], stream, bus, level, sample_rate))
+    Ok((vec![main_a, main_b], stream, bus, level, sample_rate, player_ctrl))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -3023,7 +3061,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, stream, bus, level, sample_rate)) => {
+                    Ok((mains, stream, bus, level, sample_rate, player_ctrl)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
@@ -3049,15 +3087,16 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, stream, bus, level, shared_graph));
+                        audio = Some((mains, stream, bus, level, shared_graph, player_ctrl));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, stream, bus, level, shared_graph)) => {
+                Some((mains, stream, bus, level, shared_graph, player_ctrl)) => {
                     app.shared_graph = shared_graph;
+                    app.player_ctrl = Some(player_ctrl);
                     app.with_audio(mains, stream, bus, level)
                 }
                 None => app,

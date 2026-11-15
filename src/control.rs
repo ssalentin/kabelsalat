@@ -200,6 +200,9 @@ pub enum Command {
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
     SetSystemAudio { gain: f32 },
+    /// Mix the file player (backing track) into the master at `gain` (0..1).
+    /// Loading/stopping a file is done off-bus (variable-length path).
+    SetPlayer { gain: f32 },
     TransportPlay,
     TransportStop,
 }

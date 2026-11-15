@@ -15,6 +15,7 @@ mod host;
 mod matrix;
 mod mcp;
 mod midi;
+mod player;
 mod preview;
 mod session;
 mod ui;
@@ -48,8 +49,9 @@ fn main() -> anyhow::Result<()> {
         }
         "session-test" => ui::run_session_test(),
         "capture-test" => capture::run_test(),
+        "player-test" => player::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test");
             std::process::exit(1);
         }
     }

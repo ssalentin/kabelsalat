@@ -259,19 +259,28 @@ impl RigMix {
     pub const DEFAULT: Self = Self { vol: 1.0, pan: 0.0, mute: false, solo: false };
 }
 
+impl Default for RigMix {
+    fn default() -> Self { Self::DEFAULT }
+}
+
 /// Shared graph publication for frontends (MCP→UI live sync, PLAN §13).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
 /// the steady render path never locks it. `rev` lets the UI skip unchanged
 /// snapshots cheaply; duplicate Connects (the UI's per-frame mirror) do NOT
 /// bump it, so UI-originated edits never trigger a rebuild feedback loop.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct GraphPub {
     pub rev: u64,
     pub graph: Graph,
     /// Matrix rules at publication time — lets frontends mirror remote rule
     /// edits (MCP set_matrix_rule) as well as graph changes.
     pub rules: Vec<Rule>,
+    /// Per-rig mixer state, bumped by `mix_rev` on every SetRigMix (a plain
+    /// array copy — never a graph clone on the audio thread). Lets the UI
+    /// mixer mirror remote (MCP/CLI/agent) mix changes.
+    pub mix: [RigMix; 8],
+    pub mix_rev: u64,
 }
 
 pub struct GraphEngine {
@@ -306,6 +315,9 @@ pub struct GraphEngine {
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
     // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
     rig_mix: [RigMix; 8],
+    /// A SetRigMix awaits publication to `graph_pub` (retried each block:
+    /// the audio thread only ever `try_lock`s the publication).
+    mix_dirty: bool,
     // Shared frontend snapshot (UI/MCP/bridge). Written ONLY on the rare
     // LoadRigs/LoadGraph structural ops at block boundaries — the per-block
     // render path never locks it. None until a frontend attaches a handle.
@@ -392,6 +404,7 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
+            mix_dirty: false,
             rig_snapshot: None,
             graph_pub: None,
             system_capture: None,
@@ -463,6 +476,8 @@ impl GraphEngine {
                 g.rev = g.rev.wrapping_add(1);
                 g.graph = self.graph.clone();
                 g.rules = self.matrix.rules.clone();
+                g.mix = self.rig_mix;
+                g.mix_rev = g.mix_rev.wrapping_add(1);
             }
         }
     }
@@ -788,6 +803,7 @@ impl GraphEngine {
                 if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
                 if let Some(b) = mute { m.mute = b; }
                 if let Some(b) = solo { m.solo = b; }
+                self.mix_dirty = true;
             }
             Command::SetNodeSplit { node, point } => {
                 // A Keys-node property: only a real change on a Keys node acts.
@@ -887,6 +903,18 @@ impl GraphEngine {
     pub fn render(&mut self, data: &mut [f32], ch: usize) {
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
+        }
+        // Mixer publication: a fixed-size copy under a NON-blocking lock
+        // (never waits on the UI; retried next block if it is busy).
+        if self.mix_dirty {
+            match &self.graph_pub {
+                Some(p) => if let Ok(mut g) = p.try_lock() {
+                    g.mix = self.rig_mix;
+                    g.mix_rev = g.mix_rev.wrapping_add(1);
+                    self.mix_dirty = false;
+                },
+                None => self.mix_dirty = false,
+            }
         }
 
         let frames = data.len() / ch;
@@ -1331,7 +1359,7 @@ mod tests {
         let (mut bus, drain) = command_bus();
         let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
         let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
-            rev: 0, graph: crate::control::Graph::default(), rules: Vec::new(),
+            rev: 0, graph: crate::control::Graph::default(), rules: Vec::new(), ..Default::default()
         }));
         engine.set_graph_pub(pub_.clone());
         let mut buf = vec![0.0f32; 64 * 2];
@@ -1367,7 +1395,7 @@ mod tests {
         let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
             rev: 0,
             graph: crate::control::Graph::default(),
-            rules: Vec::new(),
+            rules: Vec::new(), ..Default::default()
         }));
         engine.set_graph_pub(pub_.clone());
         (engine, bus, m1, m2, pub_)
@@ -1506,7 +1534,7 @@ mod tests {
         let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
             rev: 0,
             graph: crate::control::Graph::default(),
-            rules: Vec::new(),
+            rules: Vec::new(), ..Default::default()
         }));
         engine.set_graph_pub(pub_.clone());
         let mut buf = vec![0.0f32; 64 * 2];

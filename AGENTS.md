@@ -150,6 +150,14 @@ Learned so far (2026-11-15, UI polish pass):
     back (headless tests loaded outside a frame and missed it). Skip
     non-finite endpoints, heal non-finite springs, and test loads through
     the real key path (`frame(.., key(Key::F4))`).
+33. **Every engine state the UI shows is published back:** the mixer showed
+    stale vol/pan after an MCP/CLI SetRigMix because only the graph and rules
+    were published. The engine publishes the mix into `GraphPub` (`mix` +
+    `mix_rev`) via a non-blocking `try_lock` (retried next block — never a
+    graph clone on the audio thread); `sync_from_engine` adopts it.
+34. **Hit-test in paint order, topmost first:** black keys lie on the whites —
+    test them first (`black_key_rect`), or clicks on a black key play the
+    white underneath. Share one rect function between draw and hit-test.
 
 ## Ground rules
 

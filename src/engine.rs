@@ -20,7 +20,7 @@ use crate::control::{
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
-use crate::matrix::{Matrix, MidiMsg, SourceId};
+use crate::matrix::{Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
 
@@ -651,6 +651,38 @@ impl GraphEngine {
                     };
                 }
             }
+            Command::MatrixRule { source, dest, channel, transpose, key_lo, key_hi, vel_lo, vel_hi, enabled } => {
+                // Live per-cell rule edit (hot-wire matrix). In-place when the
+                // rule exists; otherwise create it (reserved capacity; rare op).
+                let (kl, kh) = (key_lo.min(key_hi), key_lo.max(key_hi));
+                let (vl, vh) = (vel_lo.min(vel_hi), vel_lo.max(vel_hi));
+                match self.matrix.rules.iter_mut().find(|r| r.source == source && r.dest == dest) {
+                    Some(r) => {
+                        r.channel = channel;
+                        r.transpose = transpose;
+                        r.key_range = (kl, kh);
+                        r.vel_range = (vl, vh);
+                        r.enabled = enabled;
+                    }
+                    None => {
+                        let mut r = Rule::new(source, dest);
+                        r.channel = channel;
+                        r.transpose = transpose;
+                        r.key_range = (kl, kh);
+                        r.vel_range = (vl, vh);
+                        r.enabled = enabled;
+                        self.matrix.add_rule(r);
+                    }
+                }
+                // Stateless-matrix safety: release held notes on the destination
+                // so a range/transpose edit can't orphan a release (rare op).
+                if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
+                    for n in 0..128u16 { s.voice.note_off(n); }
+                }
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                    for n in 0..128u8 { s.plugin.note_off(n); }
+                }
+            }
             Command::SetSystemAudio { gain } => {
                 self.system_gain = gain.clamp(0.0, 1.0);
             }
@@ -984,6 +1016,46 @@ mod tests {
         let mut buf = vec![0.0f32; 64 * 2];
         engine.render(&mut buf, 2);
         (engine, bus)
+    }
+
+    #[test]
+    fn matrix_rule_edits_in_place_and_creates_missing() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
+        let mut buf = vec![0.0f32; 64 * 2];
+        // Edit the existing Keys→1 rule: bass zone, octave down, channel 2.
+        bus.send(Command::MatrixRule {
+            source: SourceId::Keys, dest: 1,
+            channel: Some(2), transpose: -12,
+            key_lo: 59, key_hi: 0, // reversed on purpose → normalized
+            vel_lo: 64, vel_hi: 127, enabled: true,
+        });
+        engine.render(&mut buf, 2);
+        let r = engine.matrix.rules.iter().find(|r| r.source == SourceId::Keys && r.dest == 1).unwrap();
+        assert_eq!(r.channel, Some(2));
+        assert_eq!(r.transpose, -12);
+        assert_eq!(r.key_range, (0, 59));
+        assert_eq!(r.vel_range, (64, 127));
+        // Routing honors the edit: note 48 (in zone) transposes to 36.
+        let mut out = Vec::new();
+        engine.matrix.route_into(SourceId::Keys, MidiMsg::note_on(2, 48, 100), &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1.note(), 36);
+        // Note 60 is outside the zone → filtered.
+        engine.matrix.route_into(SourceId::Keys, MidiMsg::note_on(2, 60, 100), &mut out);
+        assert!(out.is_empty());
+        // Unknown pair (device 9 → node 2) creates a rule.
+        let before = engine.matrix.rules.len();
+        bus.send(Command::MatrixRule {
+            source: SourceId::Hardware(9), dest: 2,
+            channel: None, transpose: 5,
+            key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: false,
+        });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.matrix.rules.len(), before + 1);
+        let r = engine.matrix.rules.iter().find(|r| r.source == SourceId::Hardware(9) && r.dest == 2).unwrap();
+        assert_eq!(r.transpose, 5);
+        assert!(!r.enabled);
     }
 
     #[test]

@@ -275,6 +275,74 @@ fn unit_time_mul(u: &Unit) -> f32 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MatrixRow { Keys, Laptop, HwAll, HwDev(u32) }
 
+impl MatrixRow {
+    /// The concrete source a row edits (HwAll is an aggregate — no single rule).
+    fn source(self) -> Option<SourceId> {
+        match self {
+            MatrixRow::Keys => Some(SourceId::Keys),
+            MatrixRow::Laptop => Some(SourceId::LaptopKeys),
+            MatrixRow::HwAll => None,
+            MatrixRow::HwDev(d) => Some(SourceId::Hardware(d)),
+        }
+    }
+    fn label(self) -> String {
+        match self {
+            MatrixRow::Keys => "Keys".into(),
+            MatrixRow::Laptop => "Laptop".into(),
+            MatrixRow::HwAll => "HW all".into(),
+            MatrixRow::HwDev(d) => format!("HW {d}"),
+        }
+    }
+}
+
+/// UI-side mirror of one matrix rule's editable fields (Command::MatrixRule).
+/// The engine owns the truth; this drives the editor + cell indicators.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RuleEdit {
+    channel: Option<u8>,
+    transpose: i8,
+    key_lo: u8,
+    key_hi: u8,
+    vel_lo: u8,
+    vel_hi: u8,
+    enabled: bool,
+}
+
+impl Default for RuleEdit {
+    fn default() -> Self {
+        Self { channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true }
+    }
+}
+
+impl RuleEdit {
+    fn is_default(&self) -> bool { *self == Self::default() }
+    fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(ch) = self.channel { parts.push(format!("ch {}", ch + 1)); }
+        if self.transpose != 0 { parts.push(format!("{:+} st", self.transpose)); }
+        if (self.key_lo, self.key_hi) != (0, 127) { parts.push(format!("keys {}–{}", self.key_lo, self.key_hi)); }
+        if (self.vel_lo, self.vel_hi) != (0, 127) { parts.push(format!("vel {}–{}", self.vel_lo, self.vel_hi)); }
+        if !self.enabled { parts.push("muted".into()); }
+        if parts.is_empty() { "transparent".into() } else { parts.join(" · ") }
+    }
+    fn to_command(&self, source: SourceId, dest: u32) -> Command {
+        Command::MatrixRule {
+            source, dest,
+            channel: self.channel,
+            transpose: self.transpose,
+            key_lo: self.key_lo, key_hi: self.key_hi,
+            vel_lo: self.vel_lo, vel_hi: self.vel_hi,
+            enabled: self.enabled,
+        }
+    }
+}
+
+/// MIDI note name for editor readouts (60 = C4).
+fn note_name(n: u8) -> String {
+    const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
+}
+
 /// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
 fn clap_cell(src: (bool, bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
@@ -698,6 +766,11 @@ struct DemoApp {
     /// Toolbar hover easing (~120ms).
     play_hover_t: f32,
     flip_hover_t: f32,
+    /// Matrix rule edits keyed by (source, dest node) — UI mirror of the
+    /// engine's rules, drives the editor + cell indicators.
+    rule_edits: std::collections::HashMap<(SourceId, u32), RuleEdit>,
+    /// The matrix cell whose rule editor is open: (sink unit, row).
+    rule_editor: Option<(usize, MatrixRow)>,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
@@ -835,6 +908,8 @@ impl DemoApp {
             unit_hover: Vec::new(),
             play_hover_t: 0.0,
             flip_hover_t: 0.0,
+            rule_edits: std::collections::HashMap::new(),
+            rule_editor: None,
             had_kb_focus: true,
             rig_sources: [(true, true, true); 2],
             split_on: false,
@@ -989,6 +1064,9 @@ impl DemoApp {
         // Motion: staged fade-in for the new rack.
         self.load_fade = 0.0;
         self.unit_hover = vec![0.0; self.units.len()];
+        // The engine rebuilds its matrix on loads — rule edits start fresh.
+        self.rule_edits.clear();
+        self.rule_editor = None;
     }
 
     /// Derive rack structure FOR THE ACTIVE RIG: Keys (left), Master (right),
@@ -1893,6 +1971,14 @@ impl DemoApp {
                     "hw_devices": self.hw_devices,
                     "split": self.split_on,
                     "sinks": sinks,
+                    "rule_edits": self.rule_edits.iter().map(|((src, node), e)| {
+                        serde_json::json!({
+                            "source": format!("{src:?}"), "node": node,
+                            "channel": e.channel, "transpose": e.transpose,
+                            "key_range": [e.key_lo, e.key_hi], "vel_range": [e.vel_lo, e.vel_hi],
+                            "enabled": e.enabled,
+                        })
+                    }).collect::<Vec<_>>(),
                 }).to_string()
             }
             "set_matrix_cell" => {
@@ -1914,6 +2000,37 @@ impl DemoApp {
                 };
                 self.matrix_toggle(inst, row, on);
                 format!("matrix cell {source} → node {node} = {on}")
+            }
+            "set_matrix_rule" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("keys");
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node}");
+                }
+                let row = match source {
+                    "keys" => MatrixRow::Keys,
+                    "laptop" => MatrixRow::Laptop,
+                    s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
+                        Ok(d) => MatrixRow::HwDev(d),
+                        Err(_) => return format!("bad source '{source}'"),
+                    },
+                    _ => return format!("unknown source '{source}' (keys|laptop|hw:<d>)"),
+                };
+                let Some(src) = row.source() else { return "hw:all has no single rule — use hw:<d>".into() };
+                let mut e = RuleEdit::default();
+                if let Some(ch) = args.get("channel").and_then(|v| v.as_u64()) { e.channel = Some(ch.min(15) as u8); }
+                if let Some(t) = args.get("transpose").and_then(|v| v.as_i64()) { e.transpose = t.clamp(-24, 24) as i8; }
+                if let Some(v) = args.get("key_lo").and_then(|v| v.as_u64()) { e.key_lo = v.min(127) as u8; }
+                if let Some(v) = args.get("key_hi").and_then(|v| v.as_u64()) { e.key_hi = v.min(127) as u8; }
+                if let Some(v) = args.get("vel_lo").and_then(|v| v.as_u64()) { e.vel_lo = v.min(127) as u8; }
+                if let Some(v) = args.get("vel_hi").and_then(|v| v.as_u64()) { e.vel_hi = v.min(127) as u8; }
+                if let Some(v) = args.get("enabled").and_then(|v| v.as_bool()) { e.enabled = v; }
+                if e.is_default() { self.rule_edits.remove(&(src, node)); }
+                else { self.rule_edits.insert((src, node), e); }
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(e.to_command(src, node));
+                }
+                format!("rule {source} → node {node}: {}", e.summary())
             }
             "list_plugins" => {
                 let clap = crate::host::list_clap_plugins();
@@ -2246,6 +2363,7 @@ impl DemoApp {
         let mut open = self.show_matrix;
         let sinks = self.matrix_sinks();
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
+        let mut edit_requests: Vec<(usize, MatrixRow)> = Vec::new();
         egui::Window::new(egui::RichText::new("MIDI matrix").font(theme::medium_font(16.0)).color(theme::INK))
             .open(&mut open)
             .collapsible(false)
@@ -2253,7 +2371,7 @@ impl DemoApp {
             .default_width(620.0)
             .show(ctx, |ui| {
                 ui.set_min_width(560.0);
-                ui.label(egui::RichText::new("any source → any rig · cells hot-wire live (MIDI cable + source filter)")
+                ui.label(egui::RichText::new("any source → any rig · click: route · right-click: shape the rule (channel, transpose, ranges)")
                     .size(12.0).color(theme::INK_2));
                 ui.add_space(6.0);
                 if sinks.is_empty() {
@@ -2311,11 +2429,25 @@ impl DemoApp {
                             } else {
                                 p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                             }
+                            // Non-default rule: tomato corner dot + summary.
+                            let node = self.units[s].node_id;
+                            let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
+                            let resp = if let Some(e) = edit.filter(|e| !e.is_default()) {
+                                p.circle_filled(Pos2::new(cell.right() - 2.0, cell.top() + 2.0), 2.0, theme::ACCENT);
+                                resp.on_hover_text(format!("rule: {}\nright-click to edit", e.summary()))
+                            } else if row.source().is_some() {
+                                resp.on_hover_text("click: route on/off · right-click: edit rule")
+                            } else {
+                                resp
+                            };
                             if resp.hovered() {
                                 p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
                                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                             }
                             if resp.clicked() { toggles.push((s, *row, !on)); }
+                            if resp.secondary_clicked() && row.source().is_some() {
+                                edit_requests.push((s, *row));
+                            }
                         }
                         ui.end_row();
                     }
@@ -2334,6 +2466,85 @@ impl DemoApp {
             });
         self.show_matrix = open;
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
+        if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
+    }
+
+    /// Per-cell rule editor (right-click a matrix cell): channel filter,
+    /// transpose, key/velocity ranges, enabled — sent live as MatrixRule.
+    fn rule_editor_window(&mut self, ctx: &egui::Context) {
+        let Some((unit, row)) = self.rule_editor else { return };
+        let Some(src) = row.source() else { self.rule_editor = None; return };
+        let Some(u) = self.units.get(unit) else { self.rule_editor = None; return };
+        let node = u.node_id;
+        let title = format!("{} → {}", row.label(), sentence_case(&u.name));
+        let mut edit = self.rule_edits.get(&(src, node)).copied().unwrap_or_default();
+        let mut open = true;
+        let mut changed = false;
+        let mut reset = false;
+        egui::Window::new(egui::RichText::new(title).font(theme::medium_font(15.0)).color(theme::INK))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("shapes this route live · releases held notes on change")
+                    .size(11.0).color(theme::INK_2));
+                ui.add_space(4.0);
+                let mut en = edit.enabled;
+                if ui.checkbox(&mut en, "Route enabled").changed() { edit.enabled = en; changed = true; }
+                let mut omni = edit.channel.is_none();
+                if ui.checkbox(&mut omni, "Omni (any MIDI channel)").changed() {
+                    edit.channel = if omni { None } else { Some(0) };
+                    changed = true;
+                }
+                if let Some(ch) = edit.channel {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Channel").size(12.0));
+                        let mut c = ch as i32 + 1;
+                        if ui.add(egui::DragValue::new(&mut c).range(1..=16)).changed() {
+                            edit.channel = Some((c - 1).clamp(0, 15) as u8);
+                            changed = true;
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Transpose").size(12.0));
+                    let mut t = edit.transpose as i32;
+                    if ui.add(egui::DragValue::new(&mut t).range(-24..=24).suffix(" st")).changed() {
+                        edit.transpose = t.clamp(-24, 24) as i8;
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Key range").size(12.0));
+                    let mut lo = edit.key_lo as i32;
+                    let mut hi = edit.key_hi as i32;
+                    if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.key_lo = lo as u8; changed = true; }
+                    ui.label(egui::RichText::new("–").size(12.0));
+                    if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.key_hi = hi as u8; changed = true; }
+                    ui.label(egui::RichText::new(format!("{} – {}", note_name(edit.key_lo), note_name(edit.key_hi)))
+                        .size(11.0).color(theme::INK_2));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Velocity").size(12.0));
+                    let mut lo = edit.vel_lo as i32;
+                    let mut hi = edit.vel_hi as i32;
+                    if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.vel_lo = lo as u8; changed = true; }
+                    ui.label(egui::RichText::new("–").size(12.0));
+                    if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.vel_hi = hi as u8; changed = true; }
+                });
+                ui.add_space(4.0);
+                if ui.button("Reset rule").clicked() { reset = true; }
+            });
+        if !open { self.rule_editor = None; }
+        if reset { edit = RuleEdit::default(); changed = true; }
+        if changed {
+            if edit.is_default() { self.rule_edits.remove(&(src, node)); }
+            else { self.rule_edits.insert((src, node), edit); }
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(edit.to_command(src, node));
+            }
+        }
     }
 
     /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
@@ -4575,6 +4786,7 @@ impl eframe::App for DemoApp {
         self.plugins_window(&ctx);
         self.transport_window(&ctx);
         self.matrix_window(&ctx);
+        self.rule_editor_window(&ctx);
         self.param_editor_window(&ctx);
 
         ctx.request_repaint();
@@ -5108,6 +5320,22 @@ mod matrix_ui_tests {
         assert_eq!(app.units.len(), 2);
         assert_eq!(app.session_msg, "Patch updated from MCP/CLI");
         assert_eq!(app.last_graph_rev, 2);
+    }
+
+    #[test]
+    fn set_matrix_rule_tool_shapes_route() {
+        let mut app = demo_app();
+        let out = app.exec_tool("set_matrix_rule", &serde_json::json!({"node": 1, "source": "keys", "key_hi": 59, "transpose": -12}));
+        assert!(out.contains("-12 st"), "{out}");
+        let e = app.rule_edits[&(SourceId::Keys, 1)];
+        assert_eq!(e.key_hi, 59);
+        assert_eq!(e.transpose, -12);
+        // get_matrix reports the edit.
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
+        assert_eq!(v["rule_edits"].as_array().unwrap().len(), 1);
+        // All-default values reset (remove) the edit.
+        app.exec_tool("set_matrix_rule", &serde_json::json!({"node": 1, "source": "keys"}));
+        assert!(!app.rule_edits.contains_key(&(SourceId::Keys, 1)));
     }
 
     #[test]

@@ -196,6 +196,29 @@ struct SetRigDeviceArgs {
     device: Option<u32>,
 }
 
+/// Arguments for `set_matrix_rule`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetMatrixRuleArgs {
+    /// Destination instrument node id.
+    node: NodeId,
+    /// Source: "keys", "laptop", or "hw:<device index>".
+    source: String,
+    /// MIDI channel filter 0..=15; omit for omni (any channel).
+    channel: Option<u8>,
+    /// Semitones added to notes (-24..=24, clamped; default 0).
+    transpose: Option<i8>,
+    /// Inclusive played-key range low (default 0).
+    key_lo: Option<u8>,
+    /// Inclusive played-key range high (default 127).
+    key_hi: Option<u8>,
+    /// Inclusive velocity range low for sounding note-ons (default 0).
+    vel_lo: Option<u8>,
+    /// Inclusive velocity range high (default 127).
+    vel_hi: Option<u8>,
+    /// Mute/unmute this route (default true).
+    enabled: Option<bool>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -712,6 +735,39 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "device": args.device}))
+    }
+
+    /// Edit one matrix rule live (the hot-wire matrix's per-cell shaping).
+    #[tool(name = "set_matrix_rule", description = "Edit ONE MIDI routing rule live (Command::MatrixRule): source ('keys', 'laptop', 'hw:<device index>') → instrument node. Optional channel filter (0..15, omit = omni), transpose (-24..24 semitones), key_lo/key_hi (inclusive played-note split zone), vel_lo/vel_hi (velocity layer), enabled (mute). The engine releases held notes on the destination when the rule changes. Example: {node:1, source:'keys', key_lo:0, key_hi:59, transpose:-12} = bass zone an octave down.")]
+    fn set_matrix_rule(&self, Parameters(args): Parameters<SetMatrixRuleArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("node {} does not exist", args.node));
+        }
+        let source = match args.source.as_str() {
+            "keys" => crate::matrix::SourceId::Keys,
+            "laptop" => crate::matrix::SourceId::LaptopKeys,
+            s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
+                Ok(d) => crate::matrix::SourceId::Hardware(d),
+                Err(_) => return tool_err(format!("bad source '{s}'")),
+            },
+            s => return tool_err(format!("unknown source '{s}' (keys|laptop|hw:<d>)")),
+        };
+        let cmd = Command::MatrixRule {
+            source,
+            dest: args.node,
+            channel: args.channel.map(|c| c.min(15)),
+            transpose: args.transpose.unwrap_or(0).clamp(-24, 24),
+            key_lo: args.key_lo.unwrap_or(0).min(127),
+            key_hi: args.key_hi.unwrap_or(127).min(127),
+            vel_lo: args.vel_lo.unwrap_or(0).min(127),
+            vel_hi: args.vel_hi.unwrap_or(127).min(127),
+            enabled: args.enabled.unwrap_or(true),
+        };
+        if let Err(e) = send_cmd(&mut st, cmd) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "source": args.source}))
     }
 
     /// Load several independent rigs at once.

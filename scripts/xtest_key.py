@@ -28,8 +28,10 @@ def main():
     first, last = 8, 255
     # winit maps F-keys/navigation by evdev scancode, NOT the X keymap — on
     # keymaps with a non-standard F-row the mapping lookup sends the wrong
-    # key (F4 at kc 72 arrives as F6). Use the standard evdev+8 codes.
-    overrides = {0xFFBE + i: 67 + i for i in range(12)}  # F1..F12 -> 67..78
+    # key. Use the standard evdev+8 codes. NOTE: the evdev F-row is NOT
+    # contiguous: F1..F10 = 59..68 (X 67..76), F11/F12 = 87/88 (X 95/96).
+    overrides = {0xFFBE + i: 67 + i for i in range(10)}  # F1..F10
+    overrides.update({0xFFC8: 95, 0xFFC9: 96})           # F11, F12
     overrides.update({0xFF51: 113, 0xFF52: 111, 0xFF53: 114, 0xFF54: 116})  # arrows
     if ks in overrides:
         kc, level = overrides[ks], 0

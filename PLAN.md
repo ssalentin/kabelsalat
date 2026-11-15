@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign + multi-rig (backend & UI) landed; hot-wire MIDI matrix is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). 112 unit tests + many CLI self-tests pass. Next: (1) hot-wire MIDI matrix view, (2) design polish, (3) MCP→UI live sync (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
+Status: **core app complete + Hurricane redesign + multi-rig (backend & UI) + hot-wire MIDI matrix landed; design polish & MCP→UI sync next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live**. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). 118 unit tests + many CLI self-tests pass. Next: (1) design polish, (2) MCP→UI live sync, (3) matrix rule editing (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (112). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (118). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -84,16 +84,33 @@ Tests: `cargo test` (112). CLI self-tests: `session-test`, `capture-test`, `play
   Dribbble is bot-walled: fetch shot pages via `https://r.jina.ai/<url>`, images from
   `cdn.dribbble.com/userupload/...` (strip resize params for full res).
 - **XTEST keysym gotchas:** F4 = 0xffc1 (NOT 0xffc3 = F6 — cost an hour once). winit
-  maps F-keys by evdev scancode, not the X keymap; `scripts/xtest_key.py` therefore
-  uses standard scancode keycodes for F-keys/arrows and resolves everything else via
-  XGetKeyboardMapping incl. the modifier level.
+  maps F-keys by evdev scancode, not the X keymap; the evdev F-row is NOT contiguous:
+  F1–F10 = X keycodes 67–76, **F11/F12 = 95/96**. `scripts/xtest_key.py` handles this.
+  Mouse clicks: XTestFakeMotionEvent + XTestFakeButtonEvent (screen-native coords).
+  egui window rects are WINDOW-relative — add the app window's screen origin
+  (hyprctl `at:` × monitor scale) before clicking. Hyprland 0.56 Lua dispatch:
+  `hyprctl dispatch 'hl.dsp.window.fullscreen({window="address:0x…", mode="fullscreen"})'`
+  (mode is a STRING; the demo tiles next to the running app otherwise).
 
 **Next builds (in order):**
-1. **Hot-wire MIDI matrix view** — AUM-style MIDI-in vs sink patching surface (§13).
-2. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
-3. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
+1. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
+2. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
    rack only rebuilds from UI-side loads; add a bridge notification/poll so remote
    loads refresh the rack (found during multi-rig UI work).
+3. **Matrix rule editing** — per-cell channel/transpose/key-range/velocity/CC-map
+   editors (engine primitives exist; the matrix view currently toggles routes).
+
+**Hot-wire MIDI matrix — LANDED 2026-11-15.** F11 / top-strip "Matrix" opens the
+sources × instrument-rigs grid (Hurricane: paper sheet, hairline cells, teal = routed).
+Rows: on-screen keys, laptop keys, Hardware-all + one row per detected device (radio
+group per rig: one device / all / off). Columns: CLAP voices + LV2 instruments
+(classified at build_rack). Cells reflect the engine's real gates (MIDI cable +
+source filter + device binding); clicking hot-wires live — turning a cell ON also
+plugs a missing Keys→instrument MIDI cable; LV2 columns toggle the cable itself.
+Row activity LEDs, split-state footer, per-rig cable indicators. Assistant parity:
+`get_matrix` / `set_matrix_cell` tools (MCP already had set_rig_source/device/split).
+Verified: 118 tests (6 new matrix tests) + live mouse-click on a cell toggled exactly
+one route (pixel-verified). Screenshot: docs/shots/midi-matrix.png.
 
 **Multi-rig UI — LANDED 2026-11-15.** Overview strip (rig name + bound MIDI device +
 live level + tomato active underline) appears above the rack when >1 rig is loaded;
@@ -477,12 +494,12 @@ Everything queued lives here; update this section as work lands.
 
 ### In progress / next
 
-1. **Hot-wire MIDI channels on the go** — an AUM-style **MIDI-in vs sink matrix view**
-   to patch any MIDI input (device + channel) to any accepting rig live. Prereq: the
-   multi-rig overview (DONE). This is the defining AUM routing surface (docs/midi-matrix.md).
-2. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` commands drive the engine but the
+1. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` commands drive the engine but the
    UI rack only rebuilds from UI-side loads; add a bridge notification or snapshot poll
    so remote loads refresh the rack + overview.
+2. **Matrix rule editing** — per-cell channel filter / transpose / key-range /
+   velocity-range / CC-map editors in the matrix view (engine Rule primitives exist;
+   docs/midi-matrix.md). Includes MIDI-learn for the CC bindings.
 3. **Hurricane design polish** — DeepSeek-vision review (2026-11-15) verdict "close in
    spirit"; remaining gaps, prioritized:
    - Shadows: reference is rigorously shadowless — drop the soft shadows under the rack
@@ -500,6 +517,9 @@ Everything queued lives here; update this section as work lands.
 
 ### Recently landed
 
+- **Hot-wire MIDI matrix** (2026-11-15): F11 sources×rigs grid, live cell toggling
+  (cable + source filter + device radio), LV2 instrument columns, assistant
+  get_matrix/set_matrix_cell. 118 tests. See §0.1.
 - **Multi-rig UI** (2026-11-15): overview strip (name/device/level/active underline),
   1–9/←→/click view switching (visual only, all rigs sound), per-rig grouping +
   draw/hit filtering, held-key drain on focus loss, F4 two-rig demo (LoadRigs),

@@ -5246,7 +5246,7 @@ impl DemoApp {
                                             if head.clicked() { switch = Some(rig); }
                                             if rig == self.active_rig && n > 1 {
                                                 ui.add_space(6.0);
-                                                theme::tracked_label(ui, "SHOWN IN RACK", 9.0, 0.14, theme::LIVE_TEAL);
+                                                theme::tracked_label(ui, "SHOWN IN RACK", 9.0, 0.14, theme::CREAM_DIM); // neutral: teal = live
                                             }
                                         });
                                         ui.add_space(8.0);
@@ -5853,7 +5853,13 @@ impl DemoApp {
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             for (ji, j) in u.jacks.iter().enumerate() {
                 let c = self.jack_pos(ui, ji);
-                let jw = j.label_g.as_ref().map_or(0.0, |g| g.size.x);
+                let (jw, jh) = j.label_g.as_ref().map_or((0.0, 0.0), |g| (g.size.x, g.size.y));
+                // Plate-colored backing: a cable may pass BEHIND a jack label,
+                // never through its glyphs ("L" read as "WARM" in review).
+                if jw > 0.0 && self.text_alpha > 0.01 {
+                    let plate = Rect::from_min_size((c + Vec2::new(-jw / 2.0 - 3.0, 16.0)).to_pos2(), Vec2::new(jw + 6.0, jh + 2.0));
+                    painter.rect_filled(self.xf.rect(plate), 2.0, alpha(CHASSIS, self.text_alpha));
+                }
                 self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
             }
         }

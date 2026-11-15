@@ -158,6 +158,9 @@ Learned so far (2026-11-15, UI polish pass):
 34. **Hit-test in paint order, topmost first:** black keys lie on the whites —
     test them first (`black_key_rect`), or clicks on a black key play the
     white underneath. Share one rect function between draw and hit-test.
+35. **Labels that cables can cross get a plate:** paint order alone is not
+    enough — a stroke running through glyphs makes "L" unreadable. Jack labels
+    sit on a CHASSIS-colored backing so cables pass visibly behind them.
 
 ## Ground rules
 

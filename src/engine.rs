@@ -580,20 +580,38 @@ impl GraphEngine {
                 let mut r = 0.0f32;
                 for v in &self.voices {
                     if self.graph.has_route(v.node, master, PortKind::Audio) {
-                        l += v.scratch[i * 2];
-                        r += v.scratch[i * 2 + 1];
+                        if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
+                            let m = v.scratch[i * 2]; // mono in: center to both
+                            l += m;
+                            r += m;
+                        } else {
+                            l += v.scratch[i * 2];
+                            r += v.scratch[i * 2 + 1];
+                        }
                     }
                 }
                 for d in &self.dsp {
                     if self.graph.has_route(d.node, master, PortKind::Audio) {
-                        l += d.buf[i * 2];
-                        r += d.buf[i * 2 + 1];
+                        if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
+                            let m = d.buf[i * 2];
+                            l += m;
+                            r += m;
+                        } else {
+                            l += d.buf[i * 2];
+                            r += d.buf[i * 2 + 1];
+                        }
                     }
                 }
                 for slot in &self.lv2 {
                     if self.graph.has_route(slot.node, master, PortKind::Audio) {
-                        l += slot.buf[i * 2];
-                        r += slot.buf[i * 2 + 1];
+                        if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
+                            let m = slot.buf[i * 2];
+                            l += m;
+                            r += m;
+                        } else {
+                            l += slot.buf[i * 2];
+                            r += slot.buf[i * 2 + 1];
+                        }
                     }
                 }
                 if sys {
@@ -884,5 +902,41 @@ pub fn add_node_test() -> anyhow::Result<()> {
     }
     anyhow::ensure!(peak > 1e-3, "dynamically added DSP node did not sound (peak {peak})");
     println!("add-node-test: OK — dynamically added DSP gain node sounds (peak {peak:.4})");
+    Ok(())
+}
+
+/// Mono-master test: a source wired to the master's MONO input (port 2) must be
+/// centered (L == R) and audible.
+pub fn mono_master_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 2 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(surge, voice)]);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut peak = 0.0f32;
+    let mut centered = true;
+    for _ in 0..30 {
+        engine.render(&mut buf, 2);
+        for frame in buf.chunks(2) {
+            peak = peak.max(frame[0].abs()).max(frame[1].abs());
+            if (frame[0] - frame[1]).abs() > 1e-5 {
+                centered = false;
+            }
+        }
+    }
+    anyhow::ensure!(peak > 1e-3, "mono master produced no output (peak {peak})");
+    anyhow::ensure!(centered, "mono master not centered (L != R)");
+    println!("mono-master-test: OK — mono input centered to L=R (peak {peak:.4})");
     Ok(())
 }

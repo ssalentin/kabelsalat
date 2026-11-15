@@ -185,6 +185,13 @@ impl Graph {
             .any(|e| e.from.node == from && e.to.node == to && e.kind == kind)
     }
 
+    /// Like [`has_route`] but matches a specific destination port.
+    pub fn has_route_port(&self, from: NodeId, to: NodeId, port: u8, kind: PortKind) -> bool {
+        self.edges
+            .iter()
+            .any(|e| e.from.node == from && e.to.node == to && e.to.port == port && e.kind == kind)
+    }
+
     /// The starter patch: TWO channel stacks mixed to a shared master.
     /// Stack A: Keys→Surge A→Delay A→Master (+dry). Stack B: Keys→Surge B→
     /// Delay B→Master (+dry). Edge ids match the UI's cable ids; node ids

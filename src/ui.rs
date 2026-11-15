@@ -334,10 +334,10 @@ fn make_unit(node: &Node) -> Unit {
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::MasterOut => (
-            UnitKind::Master, "stereo bus".into(), ORANGE,
-            vec![PortKind::Audio, PortKind::Audio], vec![],
+            UnitKind::Master, "stereo + mono bus".into(), ORANGE,
+            vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
-            vec![(Dir::In, 0, 0.36, "L"), (Dir::In, 1, 0.64, "R")],
+            vec![(Dir::In, 0, 0.30, "L"), (Dir::In, 2, 0.50, "MONO"), (Dir::In, 1, 0.70, "R")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(), PURPLE,

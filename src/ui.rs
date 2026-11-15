@@ -1172,7 +1172,7 @@ impl DemoApp {
             }
         }
         let Some(off) = Self::laptop_key_offset(key) else { return };
-        let semi = (off as i16 + (self.octave as i16 - 4) * 12).max(0) as usize;
+        let semi = (off as i16 + 12 * (self.octave as i16 + 1)).clamp(0, 127) as usize;
         if pressed {
             if repeat || self.held_keys.iter().any(|(k, _)| *k == key) {
                 return;
@@ -1341,7 +1341,7 @@ impl DemoApp {
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127);
                 let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).min(10000);
-                let semi = (note as i16 - 60).max(0) as usize;
+                let semi = note as usize;
                 self.current_source = SourceId::Keys;
                 self.fire_keys(semi, 0.8);
                 self.note_offs.push((
@@ -2748,7 +2748,7 @@ impl DemoApp {
                 }
                 Hit::Key(semi) => {
                     self.current_source = SourceId::Keys;
-                    self.fire_keys(semi, 0.95);
+                    self.fire_keys(60 + semi, 0.95);
                 }
                 Hit::Jack { unit, jack } if self.side == Side::Back => {
                     let j = &self.units[unit].jacks[jack];
@@ -3602,7 +3602,7 @@ impl eframe::App for DemoApp {
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
         for ev in hw {
-            let semi = (ev.note as i16 - 60).max(0) as usize;
+            let semi = ev.note as usize;
             self.current_source = ev.source;
             self.fire_keys(semi, ev.velocity);
         }
@@ -3960,7 +3960,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                         sink = Some(Box::new(move |ev: NoteEvent| {
                             // Notes flow through the control plane; the engine
                             // gates them on the Keys→Surge cable being plugged.
-                            let note = 60 + ev.note;
+                            // ev.note is an absolute MIDI note (0..127).
+                            let note = ev.note;
                             let cmd = if ev.velocity > 0.0 {
                                 Command::NoteOn { note, velocity: ev.velocity, source: ev.source }
                             } else {

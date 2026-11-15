@@ -654,24 +654,42 @@ mod tests {
 pub fn instrument_test() -> anyhow::Result<()> {
     let candidates = ["multisampler_x12", "multisampler", "oscillator", "synth"];
     let mut found = 0;
+    let mut sounding = 0;
     for c in candidates {
         match Lv2Plugin::load(c, 48000.0, 256) {
-            Ok(p) => {
+            Ok(mut p) => {
+                let is_inst = p.is_instrument();
+                // Probe MIDI→audio: send a note and measure output.
+                let mut peak = 0.0f32;
+                if is_inst {
+                    p.note_on(60, 100);
+                    let input = vec![0.0f32; 256 * 2];
+                    let mut output = vec![0.0f32; 256 * 2];
+                    for _ in 0..20 {
+                        p.process(&input, &mut output, 256);
+                        peak = peak.max(output.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+                    }
+                    p.note_off(60);
+                }
                 println!(
-                    "  {} — instrument={} controls={} atom={}",
+                    "  {} — instrument={} controls={} atom={} note_peak={:.4}",
                     p.uri(),
-                    p.is_instrument(),
+                    is_inst,
                     p.control_count(),
-                    p.atom_in.is_some()
+                    p.atom_in.is_some(),
+                    peak
                 );
-                if p.is_instrument() {
+                if is_inst {
                     found += 1;
+                    if peak > 1e-4 {
+                        sounding += 1;
+                    }
                 }
             }
             Err(_) => continue,
         }
     }
     anyhow::ensure!(found > 0, "no LV2 instrument detected among candidates");
-    println!("lv2-instrument-test: OK — {found} LV2 instrument(s) detected with atom/MIDI input");
+    println!("lv2-instrument-test: OK — {found} instrument(s) detected, {sounding} produced audio from a MIDI note");
     Ok(())
 }

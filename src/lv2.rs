@@ -115,7 +115,9 @@ extern "C" {
     fn lilv_plugin_get_uri(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_name(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_num_ports(plugin: *const LilvPlugin) -> c_uint;
+    fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvNode;
     fn lilv_node_as_string(value: *const LilvNode) -> *const c_char;
+    fn lilv_node_as_uri(value: *const LilvNode) -> *const c_char;
     fn lilv_node_free(val: *mut LilvNode);
     fn lilv_new_uri(world: *mut LilvWorld, uri: *const c_char) -> *mut LilvNode;
     fn lilv_node_as_float(value: *const LilvNode) -> f32;
@@ -144,27 +146,35 @@ pub struct Lv2PluginInfo {
     pub is_instrument: bool,
 }
 
-/// Classify a plugin as an instrument (atom/MIDI input + audio output) by port
-/// classes — no instantiation required.
-unsafe fn classify_instrument(
-    plugin: *const LilvPlugin,
-    audio: *const LilvNode,
-    atom: *const LilvNode,
-    input: *const LilvNode,
-) -> bool {
+/// Classify a plugin as an instrument by its LV2 plugin class
+/// (lv2core#InstrumentPlugin) — the authoritative designation, not a port
+/// heuristic (effects can have atom control ports; instruments can have audio
+/// inputs for modulation).
+unsafe fn classify_instrument(world: *mut LilvWorld, plugin: *const LilvPlugin) -> bool {
+    let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+    let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+    let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
     let n = lilv_plugin_get_num_ports(plugin);
-    let (mut has_atom_in, mut has_audio_out) = (false, false);
+    let (mut atom_in, mut audio_out, mut audio_in) = (false, 0u32, 0u32);
     for i in 0..n {
         let port = lilv_plugin_get_port_by_index(plugin, i);
         let is_in = lilv_port_is_a(plugin, port, input);
         if lilv_port_is_a(plugin, port, atom) && is_in {
-            has_atom_in = true;
+            atom_in = true;
         }
-        if lilv_port_is_a(plugin, port, audio) && !is_in {
-            has_audio_out = true;
+        if lilv_port_is_a(plugin, port, audio) {
+            if is_in { audio_in += 1; } else { audio_out += 1; }
         }
     }
-    has_atom_in && has_audio_out
+    lilv_node_free(audio);
+    lilv_node_free(atom);
+    lilv_node_free(input);
+    // Instrument hint: MIDI/atom input + audio output. Permissive by design —
+    // some effects also accept atom control, so the browser offers both add
+    // roles; the LV2 plugin class would be authoritative but LSP exposes it as
+    // a blank node lilv can't resolve to a URI here.
+    let _ = audio_in;
+    atom_in && audio_out > 0
 }
 
 /// Read a borrowed node (owned by the plugin, e.g. get_uri) — do NOT free.
@@ -211,7 +221,7 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
                         uri: node_borrowed(lilv_plugin_get_uri(plugin)),
                         name: node_owned(lilv_plugin_get_name(plugin)),
                         num_ports: lilv_plugin_get_num_ports(plugin),
-                        is_instrument: classify_instrument(plugin, audio, atom, input),
+                        is_instrument: classify_instrument(world, plugin),
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
@@ -232,6 +242,11 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("{} plugins installed", plugins.len());
     for p in plugins.iter().take(40) {
         println!("  {} ({} ports) — {}", p.name, p.num_ports, p.uri);
+    }
+    let instruments: Vec<&Lv2PluginInfo> = plugins.iter().filter(|p| p.is_instrument).collect();
+    println!("{} instruments (atom input + audio output):", instruments.len());
+    for p in instruments.iter().take(20) {
+        println!("  [inst] {} — {}", p.name, p.uri);
     }
     anyhow::ensure!(!plugins.is_empty(), "no LV2 plugins discovered");
     println!("lv2-test: OK — lilv linkage + discovery verified");
@@ -409,6 +424,7 @@ pub struct Lv2Plugin {
     atom_buf: Vec<u8>,
     urid_sequence: u32,
     urid_midi: u32,
+    is_inst: bool,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
     block: usize,
@@ -516,7 +532,7 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, atom_in, atom_buf, urid_sequence, urid_midi, _urid: urid, _map_data: map_data, block, uri })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, block, uri })
         }
     }
 
@@ -540,7 +556,7 @@ impl Lv2Plugin {
 
     /// True if this is an instrument (atom/MIDI input + audio output).
     pub fn is_instrument(&self) -> bool {
-        self.atom_in.is_some() && !self.audio_out.is_empty()
+        self.is_inst
     }
 
     /// Send a MIDI note-on to the atom input (frame 0 of the next block).

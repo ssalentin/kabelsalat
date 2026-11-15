@@ -1128,6 +1128,17 @@ impl DemoApp {
                     format!("sessions: {}", names.join(", "))
                 }
             }
+            "system_audio" => {
+                let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetSystemAudio { gain });
+                }
+                if gain > 0.0 {
+                    format!("system audio mixed in at gain {gain:.2} — captures the default output monitor (e.g. YouTube). Beware feedback if kabelsalat plays to the same output.")
+                } else {
+                    "system audio muted".into()
+                }
+            }
             _ => format!("unknown tool: {name}"),
         }
     }
@@ -2888,6 +2899,17 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         vec![(1, voice_a), (4, voice_b)],
     );
     let level = engine.level_handle();
+    // System-audio capture: stream the default sink's monitor (e.g. YouTube)
+    // into the engine, muted by default (gain 0). Started off the audio thread.
+    if let Some(source) = crate::capture::SystemCapture::default_monitor() {
+        match crate::capture::SystemCapture::start(&source, sample_rate as u32, ch) {
+            Ok(cap) => {
+                eprintln!("system audio: capturing {source} (muted; raise gain to mix in)");
+                engine.set_system_capture(cap);
+            }
+            Err(e) => eprintln!("system audio: capture unavailable: {e}"),
+        }
+    }
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {

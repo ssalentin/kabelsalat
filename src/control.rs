@@ -195,6 +195,9 @@ pub enum Command {
     /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
     /// notes at/above → rig B (node 4). `None` disables the split (both full range).
     SetSplit { point: Option<u8> },
+    /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
+    /// 0 mutes it. The capture source is started at app startup.
+    SetSystemAudio { gain: f32 },
     TransportPlay,
     TransportStop,
 }

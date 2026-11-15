@@ -19,6 +19,7 @@ use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, Pa
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, SourceId};
+use crate::capture::SystemCapture;
 
 // Engine-level param ids (what the UI/assistant send). Translated to each
 // processor's native param ids in `dsp_native_param`.
@@ -85,6 +86,10 @@ pub struct GraphEngine {
     // mirror "every source plays every rig"; SetSplit edits key ranges in place.
     matrix: Matrix,
     route_out: Vec<(NodeId, MidiMsg)>,
+    // System-audio capture (e.g. YouTube) mixed into the master.
+    system_capture: Option<SystemCapture>,
+    system_gain: f32,
+    system_buf: Vec<f32>,
 }
 
 impl GraphEngine {
@@ -142,7 +147,15 @@ impl GraphEngine {
             out_peak: Arc::new(AtomicU32::new(0)),
             matrix,
             route_out: Vec::with_capacity(64),
+            system_capture: None,
+            system_gain: 0.0,
+            system_buf: vec![0.0; 8192 * 2],
         }
+    }
+
+    /// Attach a system-audio capture source (started off the audio thread).
+    pub fn set_system_capture(&mut self, cap: SystemCapture) {
+        self.system_capture = Some(cap);
     }
 
     pub fn graph(&self) -> &Graph {
@@ -245,6 +258,9 @@ impl GraphEngine {
                     };
                 }
             }
+            Command::SetSystemAudio { gain } => {
+                self.system_gain = gain.clamp(0.0, 1.0);
+            }
             Command::TransportPlay | Command::TransportStop => {} // P2
         }
     }
@@ -289,6 +305,13 @@ impl GraphEngine {
         }
 
         // 3. Master sums everything wired to it.
+        // Pull system-audio capture once per block (RT-safe ring pop).
+        let sys = self.system_gain > 0.0 && self.system_capture.is_some();
+        if sys {
+            if let Some(cap) = &mut self.system_capture {
+                cap.read(&mut self.system_buf[..n2]);
+            }
+        }
         let mut peak = 0.0f32;
         let master = self.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id);
         if let Some(master) = master {
@@ -306,6 +329,10 @@ impl GraphEngine {
                         l += d.buf[i * 2];
                         r += d.buf[i * 2 + 1];
                     }
+                }
+                if sys {
+                    l += self.system_buf[i * 2] * self.system_gain;
+                    r += self.system_buf[i * 2 + 1] * self.system_gain;
                 }
                 l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
                 r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;

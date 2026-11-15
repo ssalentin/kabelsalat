@@ -142,6 +142,14 @@ struct SetSplitArgs {
     point: Option<u8>,
 }
 
+/// Arguments for `set_system_audio`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetSystemAudioArgs {
+    /// Mix level 0..1 for system-audio capture (0 mutes). Headless mode has no
+    /// capture source, so this only sets the gain.
+    gain: f32,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -455,6 +463,17 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"point": args.point, "split": args.point.is_some()}))
+    }
+
+    /// Mix system audio into the master.
+    #[tool(name = "set_system_audio", description = "Mix system-audio capture (e.g. YouTube) into the master (Command::SetSystemAudio). gain 0..1, 0 mutes. In the GUI app this captures the default output's monitor; headless mode has no capture source so it only stores the gain.")]
+    fn set_system_audio(&self, Parameters(args): Parameters<SetSystemAudioArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let gain = args.gain.clamp(0.0, 1.0);
+        if let Err(e) = send_cmd(&mut st, Command::SetSystemAudio { gain }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"gain": gain}))
     }
 
     /// Press a key.

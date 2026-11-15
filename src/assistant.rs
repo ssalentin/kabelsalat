@@ -186,6 +186,11 @@ fn tools() -> Value {
             "name":"list_sessions",
             "description":"List saved session names in ~/kabelsalat-sessions.",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"system_audio",
+            "description":"Mix system audio (e.g. YouTube/browser playback) into the master. gain 0..1 (0 mutes, default). Captures the default output's monitor source. Warn the user about feedback if kabelsalat plays to the same output.",
+            "parameters":{"type":"object","properties":{"gain":{"type":"number","description":"0..1 mix level; 0 mutes"}},"required":["gain"]}
         }}
     ])
 }

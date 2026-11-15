@@ -6,6 +6,7 @@
 
 mod assistant;
 mod audio;
+mod capture;
 mod control;
 mod dsp;
 mod engine;
@@ -28,8 +29,9 @@ fn main() -> anyhow::Result<()> {
         "ui-demo" => ui::run_demo(),
         "mcp" => mcp::run(),
         "session-test" => ui::run_session_test(),
+        "capture-test" => capture::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp, session-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp, session-test, capture-test");
             std::process::exit(1);
         }
     }

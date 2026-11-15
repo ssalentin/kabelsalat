@@ -737,6 +737,10 @@ struct DemoApp {
     shared_graph: Arc<Mutex<Graph>>,
     /// Multi-rig list/active published by the engine (for the rig overview UI).
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
+    /// Engine graph publication (MCP→UI live sync). None in silent/demo mode.
+    graph_pub: Option<Arc<Mutex<crate::engine::GraphPub>>>,
+    /// Last engine graph revision the UI has seen/adopted.
+    last_graph_rev: u64,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
     /// Signature of the living cable set behind `shared_graph` (change detect).
@@ -853,6 +857,8 @@ impl DemoApp {
             out_level: None,
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
+            graph_pub: None,
+            last_graph_rev: 0,
             player_ctrl: None,
             graph_sig: Vec::new(),
             editor_open: false,
@@ -1466,6 +1472,60 @@ impl DemoApp {
             let (_, semi) = self.held_keys.remove(pos);
             self.fire_keys(semi, 0.0);
         }
+    }
+
+    /// MCP→UI live sync (PLAN §13): adopt the engine's graph when a remote
+    /// structural change (MCP/CLI load_graph/load_rigs/add_node/connect/…)
+    /// diverges from the UI's own mirror. UI-originated edits converge (the
+    /// per-frame Connect mirror is idempotent engine-side), so they never
+    /// trigger a rebuild — animations and interaction state survive.
+    fn sync_from_engine(&mut self) {
+        let Some(pub_) = &self.graph_pub else { return };
+        let Ok(g) = pub_.lock() else { return };
+        if g.rev == self.last_graph_rev { return; }
+        self.last_graph_rev = g.rev;
+        // Build the UI's current mirror: base nodes + living cables.
+        let mut mirror = self.base_graph.clone();
+        mirror.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind {
+                PortKind::Midi => CPortKind::Midi,
+                PortKind::Audio => CPortKind::Audio,
+            };
+            mirror.connect_with_id(
+                c.id,
+                PortRef { node: sn, port: c.src_port as u8 },
+                PortRef { node: dn, port: c.dst_port as u8 },
+                kind,
+            );
+        }
+        // Full structural comparison (rare path — only when the rev changed).
+        let same = serde_json::to_value(&mirror.nodes).ok() == serde_json::to_value(&g.graph.nodes).ok()
+            && serde_json::to_value(&mirror.edges).ok() == serde_json::to_value(&g.graph.edges).ok();
+        if same { return; }
+        let adopted = g.graph.clone();
+        drop(g);
+        self.build_rack(&adopted, &[]);
+        // Reset per-rig source filters to the engine's rig bindings.
+        self.rig_sources = [(true, true, true); 2];
+        self.rig_device = [None, None];
+        if let Ok(s) = self.rig_snapshot.lock() {
+            for (i, m) in s.rigs.iter().enumerate().take(2) {
+                if let Some(d) = m.midi_device {
+                    self.rig_sources[i] = (false, false, true);
+                    self.rig_device[i] = Some(d);
+                }
+            }
+        }
+        self.split_on = false;
+        self.editor_open = false;
+        self.editor_params.clear();
+        self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
     fn poll_assistant(&mut self) {
@@ -4393,6 +4453,7 @@ impl eframe::App for DemoApp {
             }
         }
         self.poll_assistant();
+        self.sync_from_engine();
 
         // Scheduled note-offs (assistant play_note tool).
         let now = std::time::Instant::now();
@@ -4675,7 +4736,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>, Arc<Mutex<crate::engine::GraphPub>>)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -4712,6 +4773,10 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     // bridge + UI read it (the audio render path never locks it).
     let rig_snapshot = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
     engine.set_rig_snapshot(rig_snapshot.clone());
+    // Graph publication (MCP→UI live sync): the engine publishes the graph on
+    // structural changes; the UI adopts it when it diverges from its mirror.
+    let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch() }));
+    engine.set_graph_pub(graph_pub.clone());
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
     if let Some(source) = crate::capture::SystemCapture::default_monitor() {
@@ -4738,7 +4803,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
         None,
     )?;
     stream.play()?;
-    Ok((vec![main_a, main_b], controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot))
+    Ok((vec![main_a, main_b], controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -4792,7 +4857,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot)) => {
+                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
@@ -4820,16 +4885,17 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot));
+                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot)) => {
+                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub)) => {
                     app.shared_graph = shared_graph;
                     app.rig_snapshot = rig_snapshot;
+                    app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
                     app.with_audio(mains, controllers, stream, bus, level)
                 }
@@ -5014,6 +5080,34 @@ mod matrix_ui_tests {
         assert!(!app.rig_sources[0].2);
         // Keys/laptop untouched by the hw radio.
         assert!(app.rig_sources[0].0 && app.rig_sources[0].1);
+    }
+
+    #[test]
+    fn sync_adopts_remote_graph_and_skips_converged() {
+        let mut app = DemoApp::new_with_sink(None);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 1, graph: app.base_graph.clone() }));
+        app.graph_pub = Some(pub_.clone());
+        // Engine graph == UI mirror → no rebuild (UI-originated edits converge).
+        let units_before = app.units.len();
+        app.sync_from_engine();
+        assert_eq!(app.units.len(), units_before);
+        assert_eq!(app.last_graph_rev, 1);
+        assert_ne!(app.session_msg, "Patch updated from MCP/CLI");
+        // Remote load: a different graph → adopt it.
+        let mut remote = Graph::default();
+        remote.reserve(4, 4);
+        let k = remote.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let m = remote.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        remote.connect_with_id(1, PortRef { node: k, port: 0 }, PortRef { node: m, port: 0 }, CPortKind::Audio);
+        {
+            let mut p = pub_.lock().unwrap();
+            p.rev = 2;
+            p.graph = remote;
+        }
+        app.sync_from_engine();
+        assert_eq!(app.units.len(), 2);
+        assert_eq!(app.session_msg, "Patch updated from MCP/CLI");
+        assert_eq!(app.last_graph_rev, 2);
     }
 
     #[test]

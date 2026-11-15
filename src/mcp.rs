@@ -176,6 +176,13 @@ struct SetPlayerArgs {
     gain: f32,
 }
 
+/// Arguments for `set_bpm`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetBpmArgs {
+    /// Metronome tempo in BPM (20..300).
+    bpm: f32,
+}
+
 /// Arguments for `set_rig_device`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRigDeviceArgs {
@@ -690,6 +697,17 @@ impl McpServer {
         }
         st.playing = false;
         ok_json(json!({"playing": false}))
+    }
+
+    /// Set the metronome tempo.
+    #[tool(name = "set_bpm", description = "Set the metronome tempo in BPM (Command::SetBpm), 20..300. Start the metronome with transport_play.")]
+    fn set_bpm(&self, Parameters(args): Parameters<SetBpmArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let bpm = args.bpm.clamp(20.0, 300.0);
+        if let Err(e) = send_cmd(&mut st, Command::SetBpm { bpm }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"bpm": bpm}))
     }
 }
 

@@ -147,6 +147,12 @@ pub struct GraphEngine {
     keys_node: Option<NodeId>,
     master_vol: f32,
     master_warm: f32,
+    // Metronome / transport.
+    transport_playing: bool,
+    bpm: f32,
+    metro_phase: f64,
+    click_remaining: usize,
+    click_phase: f32,
     out_peak: Arc<AtomicU32>,
     // MIDI routing matrix (source → rig, with key-range splits). Default rules
     // mirror "every source plays every rig"; SetSplit edits key ranges in place.
@@ -223,6 +229,11 @@ impl GraphEngine {
             keys_node,
             master_vol: 0.8,
             master_warm: 0.15,
+            transport_playing: false,
+            bpm: 96.0,
+            metro_phase: 0.0,
+            click_remaining: 0,
+            click_phase: 0.0,
             out_peak: Arc::new(AtomicU32::new(0)),
             matrix,
             route_out: Vec::with_capacity(64),
@@ -416,7 +427,17 @@ impl GraphEngine {
             Command::SetPlayer { gain } => {
                 self.player_gain = gain.clamp(0.0, 1.0);
             }
-            Command::TransportPlay | Command::TransportStop => {} // P2
+            Command::TransportPlay => {
+                self.transport_playing = true;
+                self.metro_phase = 0.0;
+            }
+            Command::TransportStop => {
+                self.transport_playing = false;
+                self.click_remaining = 0;
+            }
+            Command::SetBpm { bpm } => {
+                self.bpm = bpm.clamp(20.0, 300.0);
+            }
         }
     }
 
@@ -519,6 +540,28 @@ impl GraphEngine {
                 if ply {
                     l += self.player_buf[i * 2] * self.player_gain;
                     r += self.player_buf[i * 2 + 1] * self.player_gain;
+                }
+                // Metronome: a decaying 1 kHz burst on each beat while playing.
+                if self.transport_playing {
+                    let spb = self.sample_rate * 60.0 / self.bpm as f64;
+                    self.metro_phase += 1.0;
+                    if self.metro_phase >= spb {
+                        self.metro_phase -= spb;
+                        self.click_remaining = 2400;
+                        self.click_phase = 0.0;
+                    }
+                }
+                if self.click_remaining > 0 {
+                    let env = self.click_remaining as f32 / 2400.0;
+                    let click = (2.0 * std::f32::consts::PI * 1000.0 * self.click_phase
+                        / self.sample_rate as f32)
+                        .sin()
+                        * env
+                        * 0.4;
+                    l += click;
+                    r += click;
+                    self.click_phase += 1.0;
+                    self.click_remaining -= 1;
                 }
                 l = (l * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
                 r = (r * (1.0 + self.master_warm * 3.0)).tanh() * self.master_vol;
@@ -675,5 +718,36 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     }
     anyhow::ensure!(peak > 1e-4, "no audio through the LV2 engine path (peak {peak})");
     println!("lv2-engine-test: OK — Keys→Surge→LV2→Master rendered 30 blocks, peak {peak:.4}");
+    Ok(())
+}
+
+/// Metronome self-test: enable the transport and verify clicks are generated.
+pub fn metro_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, Command, Graph};
+    use crate::host::ClapVoice;
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, voice)]);
+    bus.send(Command::SetBpm { bpm: 120.0 });
+    bus.send(Command::TransportPlay);
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut click_blocks = 0;
+    for _ in 0..(48000 / 512) {
+        engine.render(&mut buf, 2);
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        if peak > 0.05 {
+            click_blocks += 1;
+        }
+    }
+    anyhow::ensure!(click_blocks > 0, "metronome produced no clicks");
+    // Stop and confirm silence returns.
+    bus.send(Command::TransportStop);
+    for _ in 0..10 {
+        engine.render(&mut buf, 2);
+    }
+    let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    anyhow::ensure!(peak < 0.05, "metronome did not stop (peak {peak})");
+    println!("metro-test: OK — {click_blocks} click-blocks in 1s @120bpm, silent after stop");
     Ok(())
 }

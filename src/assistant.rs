@@ -216,6 +216,21 @@ fn tools() -> Value {
             "name":"list_plugins",
             "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"transport_play",
+            "description":"Start the metronome/transport.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"transport_stop",
+            "description":"Stop the metronome/transport.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_bpm",
+            "description":"Set the metronome tempo in BPM (20..300).",
+            "parameters":{"type":"object","properties":{"bpm":{"type":"number"}},"required":["bpm"]}
         }}
     ])
 }

@@ -1491,6 +1491,25 @@ impl DemoApp {
                 }
                 s
             }
+            "transport_play" => {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::TransportPlay);
+                }
+                "metronome started".into()
+            }
+            "transport_stop" => {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::TransportStop);
+                }
+                "metronome stopped".into()
+            }
+            "set_bpm" => {
+                let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(96.0).clamp(20.0, 300.0) as f32;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetBpm { bpm });
+                }
+                format!("tempo set to {bpm:.0} BPM")
+            }
             _ => format!("unknown tool: {name}"),
         }
     }

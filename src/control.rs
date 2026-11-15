@@ -252,6 +252,8 @@ pub enum Command {
     SetPlayer { gain: f32 },
     TransportPlay,
     TransportStop,
+    /// Set the metronome tempo (BPM).
+    SetBpm { bpm: f32 },
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).

@@ -82,9 +82,6 @@ const EDITOR_HEADER_H: f32 = 28.0;
 const SPRING_K: f32 = 130.0;
 const SPRING_D: f32 = 6.8;
 
-const BPM: f64 = 96.0;
-const BEAT: f64 = 60.0 / BPM;
-
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 const BLACK_SEMI: [usize; 5] = [1, 3, 6, 8, 10];
 const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black key follows
@@ -568,7 +565,8 @@ struct DemoApp {
 
     time: f64,    // musical clock (pausable)
     ui_time: f32, // wall clock for idle breathing / affordances
-    playing: bool,
+    playing: bool, // transport state: engine metronome running
+    bpm: f32,      // metronome tempo (20..=300), mirrors Command::SetBpm
 
     drag: Drag,
     press: Option<(Hit, Pos2)>,
@@ -591,6 +589,7 @@ struct DemoApp {
     plugins_lv2: Vec<Lv2PluginInfo>,
     plugin_filter: String,
     plugin_msg: String,
+    show_transport: bool,
     fps: f32,
     stats_timer: f32,
     stats_g: Option<Arc<Galley>>,
@@ -694,7 +693,8 @@ impl DemoApp {
             flip_to: Side::Front,
             time: 0.0,
             ui_time: 0.0,
-            playing: true,
+            playing: false,
+            bpm: 96.0,
             drag: Drag::None,
             press: None,
             pending: None,
@@ -713,6 +713,7 @@ impl DemoApp {
             plugins_lv2: Vec::new(),
             plugin_filter: String::new(),
             plugin_msg: String::new(),
+            show_transport: false,
             fps: 60.0,
             stats_timer: 0.0,
             stats_g: None,
@@ -941,8 +942,8 @@ impl DemoApp {
         }
         if self.wordmark_g.is_some() { return; }
         self.wordmark_g = Some(layout("kabelsalat", FontId::proportional(14.5), TEXT, f32::INFINITY));
-        self.state_play_g = Some(layout("96 bpm · playing", FontId::proportional(10.5), GREEN, f32::INFINITY));
-        self.state_pause_g = Some(layout("96 bpm · paused", FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
+        self.state_play_g = Some(layout("metronome · playing", FontId::proportional(10.5), GREEN, f32::INFINITY));
+        self.state_pause_g = Some(layout("metronome · stopped", FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
         self.flip_label_g = Some(layout("flip rack · Tab", FontId::proportional(11.0), TEXT, f32::INFINITY));
         self.hint_front_g = Some(layout(
             "perform: drag knobs · click the keys · press Tab to flip the rack and patch",
@@ -958,6 +959,7 @@ impl DemoApp {
             "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
              F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
              F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
+             Space / F10        metronome Play·Stop · Transport window sets BPM\n\
              Tab                flip the rack · front = perform, back = patch\n\
              F2 / F3            embed the Surge A / B editor in this window\n\
              drag knobs         shape the sound · right-click resets\n\
@@ -1492,12 +1494,15 @@ impl DemoApp {
                 s
             }
             "transport_play" => {
+                self.playing = true;
+                self.time = 0.0;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::TransportPlay);
                 }
                 "metronome started".into()
             }
             "transport_stop" => {
+                self.playing = false;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::TransportStop);
                 }
@@ -1505,9 +1510,7 @@ impl DemoApp {
             }
             "set_bpm" => {
                 let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(96.0).clamp(20.0, 300.0) as f32;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetBpm { bpm });
-                }
+                self.set_bpm(bpm);
                 format!("tempo set to {bpm:.0} BPM")
             }
             _ => format!("unknown tool: {name}"),
@@ -1757,10 +1760,84 @@ impl DemoApp {
                             self.refresh_plugins();
                         }
                     }
+                    ui.add_space(6.0);
+                    let tr_fill = if self.playing { alpha(GREEN, 0.30) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                    let tr_btn = egui::Button::new(egui::RichText::new("Transport").small().color(TEXT))
+                        .fill(tr_fill)
+                        .corner_radius(4.0);
+                    if ui.add(tr_btn).on_hover_text("metronome: Play/Stop + BPM (F10)").clicked() {
+                        self.show_transport = !self.show_transport;
+                    }
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
                 });
             });
+    }
+
+    /// Compact transport / metronome popover (task-19). A small window (like
+    /// Sessions/Plugins) so it never collides with the custom rack drawing:
+    /// Play/Stop toggle + BPM stepper. The toolbar Play button and Space drive
+    /// the same transport.
+    fn transport_window(&mut self, ctx: &egui::Context) {
+        if !self.show_transport {
+            return;
+        }
+        let mut open = self.show_transport;
+        egui::Window::new("Transport")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    // Play/Stop toggle — reflects transport state, drives the engine.
+                    let (label, fill, ink) = if self.playing {
+                        ("Stop", Color32::from_rgb(0x5a, 0x24, 0x28), Color32::from_rgb(0xff, 0x9a, 0x9a))
+                    } else {
+                        ("Play", Color32::from_rgb(0x1f, 0x3a, 0x26), Color32::from_rgb(0x9a, 0xff, 0xb0))
+                    };
+                    let btn = egui::Button::new(egui::RichText::new(label).small().strong().color(ink))
+                        .fill(fill)
+                        .corner_radius(4.0)
+                        .min_size(egui::vec2(56.0, 20.0));
+                    if ui.add(btn).on_hover_text("start / stop the metronome (Space)").clicked() {
+                        self.toggle_play();
+                    }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("BPM").small().color(SUBTEXT));
+                    if ui.small_button("−").on_hover_text("slower").clicked() {
+                        self.set_bpm(self.bpm - 1.0);
+                    }
+                    let mut bpm = self.bpm;
+                    let dv = egui::DragValue::new(&mut bpm)
+                        .range(20.0..=300.0)
+                        .speed(1.0)
+                        .fixed_decimals(0);
+                    if ui.add(dv).on_hover_text("metronome tempo (20–300)").changed() {
+                        self.set_bpm(bpm);
+                    }
+                    if ui.small_button("+").on_hover_text("faster").clicked() {
+                        self.set_bpm(self.bpm + 1.0);
+                    }
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    // Live beat indicator: thumps at the current tempo while playing.
+                    let beat = 60.0 / self.bpm.max(1.0) as f64;
+                    let phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
+                    let thump = if self.playing { (1.0 - phase).powi(3) } else { 0.0 };
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                    ui.painter().circle_filled(
+                        rect.center(),
+                        3.0 + 3.0 * thump,
+                        alpha(GREEN, 0.30 + 0.70 * thump),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(if self.playing { "metronome on" } else { "metronome off" })
+                        .small().italics().color(SUBTEXT));
+                });
+            });
+        self.show_transport = open;
     }
 
     /// Visual save/load for sessions (no assistant needed).
@@ -2166,11 +2243,27 @@ impl DemoApp {
 
     fn toggle_play(&mut self) {
         self.playing = !self.playing;
+        // Drive the engine metronome (task-19): the transport toggle is the
+        // single source of truth for Play/Stop.
+        if let Some(bus) = &self.bus {
+            let cmd = if self.playing { Command::TransportPlay } else { Command::TransportStop };
+            let _ = bus.lock().unwrap().send(cmd);
+        }
         if self.playing {
+            self.time = 0.0; // restart the visual beat phase on Play
             for c in &mut self.cables {
                 c.next_event = self.time + 0.08;
                 c.pat_idx = 0;
             }
+        }
+    }
+
+    /// Set the metronome tempo, clamped to the engine's 20..=300 range, and
+    /// notify the engine. Used by the transport stepper and the assistant tool.
+    fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(20.0, 300.0);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetBpm { bpm: self.bpm });
         }
     }
 
@@ -2484,6 +2577,10 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F9) {
                 self.show_plugins = !self.show_plugins;
                 if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
+            }
+            // Transport / metronome popover (task-19).
+            if i.consume_key(Modifiers::NONE, Key::F10) {
+                self.show_transport = !self.show_transport;
             }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
@@ -3197,15 +3294,16 @@ impl DemoApp {
         painter.circle_filled(c, 15.0, if hovered { mix(YELLOW, WHITE, 0.2) } else { YELLOW });
         let ink = BG;
         if self.playing {
-            painter.rect_filled(Rect::from_min_size(Pos2::new(35.0, 33.5), Vec2::new(3.6, 13.0)), 1.2, ink);
-            painter.rect_filled(Rect::from_min_size(Pos2::new(41.4, 33.5), Vec2::new(3.6, 13.0)), 1.2, ink);
+            // Stop square (transport is Play/Stop, not play/pause).
+            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, 34.5), Vec2::new(11.0, 11.0)), 1.6, ink);
         } else {
             painter.add(Shape::convex_polygon(
                 vec![Pos2::new(36.5, 32.5), Pos2::new(36.5, 47.5), Pos2::new(48.5, 40.0)],
                 ink, Stroke::NONE));
         }
 
-        let beat_phase = ((self.time / BEAT).fract() as f32).clamp(0.0, 1.0);
+        let beat = 60.0 / self.bpm.max(1.0) as f64;
+        let beat_phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
         painter.circle_filled(Pos2::new(66.0, 40.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
@@ -3353,7 +3451,8 @@ impl eframe::App for DemoApp {
             self.start_flip();
         }
 
-        // Per-rig input selection strip (top), then assistant (right), then rack.
+        // Per-rig input selection strip (top, includes the transport row), then
+        // assistant (right), then rack.
         self.rig_inputs_panel(ui);
         self.assistant_panel_ui(ui);
 
@@ -3493,6 +3592,7 @@ impl eframe::App for DemoApp {
         self.draw(ui);
         self.sessions_window(&ctx);
         self.plugins_window(&ctx);
+        self.transport_window(&ctx);
 
         // Keep the embedded editor alive: X events, CLAP gui requests, and
         // child geometry in the reserved region (physical pixels).

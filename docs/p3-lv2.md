@@ -95,7 +95,12 @@ add-effect rebuilds the rack and plays; demo/templates/flip/sessions unaffected.
   LSP multisampler_x12 and oscillator_mono classify as instruments (atom=true).
 - `lv2-instrument-test` detects instruments and probes MIDI→audio. A unit test
   verifies the atom-sequence byte layout.
-- **Limitation:** the installed LV2 instruments are samplers (need samples) or
-  free-running generators (no MIDI note→pitch), so MIDI→audio output couldn't be
-  confirmed with them. The write path is format-verified; full playback needs a
-  MIDI synth + engine note-routing to Lv2 instrument nodes (next step).
+- **Engine integration — LANDED (commit ff3c4c6):** the matrix routes Keys/
+  Laptop/Hardware to Lv2 instrument nodes, and NoteOn/NoteOff deliver MIDI to the
+  instrument's atom input. **Verified:** `lv2-instrument-engine-test` sends a note
+  through the control plane and reads it back at the instrument (event
+  `[0x90,60,114]`); the effect path still passes (no regression).
+- **Remaining limit:** the installed LV2 instruments are samplers (need samples)
+  or free-running generators, so audible MIDI→audio output couldn't be confirmed
+  with them. Note routing + delivery is verified; audible playback awaits a
+  suitable MIDI synth (and a UI to add LV2 instruments as rigs).

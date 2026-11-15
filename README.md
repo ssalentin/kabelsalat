@@ -45,28 +45,37 @@ No timeline, no arranger. The graph is the instrument.
 
 ## What works today
 
-- **Two channel stacks** (Surge A + Delay A, Surge B + Delay B) mixed to a shared
-  master, on a four-column rack: KEYS | stack A | stack B | MASTER. **Tab** flips
-  front↔back; the back is a live patch bay with physical, animated cables.
+- **Data-driven rack** — a graph of nodes wired by physical, animated cables.
+  **Tab** flips front (perform) ↔ back (patch bay). Starts as two channel stacks
+  (Surge + Delay each) mixed to a shared master; the layout adapts to any patch.
+- **Starter templates** — **F5** Lead+Reverb, **F6** Drums+Bass, **F7** Ambient
+  Pad, **F8** demo. Instant, playable starting points (GarageBand-style).
 - **Play immediately** — laptop keyboard (A W S E D… row), on-screen keys, or a
-  hardware MIDI keyboard (auto-connected). Two native Surge XT voices.
-- **Per-rig inputs + keyboard splits** — choose which sources (keys/laptop/hardware)
-  feed each rig; split the keyboard at C4 (or any note) across the two rigs.
-- **Embedded Surge editor** — press **F2** / **F3** to open Surge A/B's editor
-  *inside* the main window (X11 reparenting), not a floating window.
+  hardware MIDI keyboard (auto-connected). Native Surge XT voices.
+- **Per-rig MIDI routing** — choose which sources (keys/laptop/hardware) and which
+  specific device feed each rig; split the keyboard across rigs; the MIDI matrix
+  handles filters/transpose.
+- **CLAP + LV2 hosting** — Surge XT (CLAP) plus LV2 effects in the live mix, with
+  knob control. **F9** opens a plugin browser to add them; **F2/F3** embed the
+  Surge editor *inside* the main window (X11 reparenting), not a floating window.
 - **Real built-in DSP** — 8 allocation-proven nodes (gain, pan, 3-band EQ, resonant
   filter, lookahead limiter, saturation, delay, reverb).
-- **System audio in the mix** — capture your output's monitor (YouTube/browser)
-  and mix it in (`system_audio`), muted by default.
-- **Sessions** — save/load your patch + knobs + plugin state (`save_session` /
-  `load_session`), with a passing round-trip self-test.
+- **System audio + backing tracks** — capture your output's monitor (YouTube/
+  browser) into the mix, and play WAV file players.
+- **Metronome** — BPM click track with play/stop/tempo control.
+- **Sessions** — save/load patch + knobs + plugin state, with a passing round-trip
+  self-test; full-topology recall.
 - **Built-in assistant** — DeepSeek, bring-your-own-key (stored locally `0600`),
-  with tool access to play, rewire, split, save, and capture system audio.
-- **MCP server** — `kabelsalat mcp` exposes 14 tools, 1:1 with the control plane.
+  with tool access to play, route, split, save, capture audio, and more.
+- **MCP server** — `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
+  the running app) exposes 17 tools, 1:1 with the control plane; `kabelsalat send`
+  is a one-shot CLI client.
 - Low-latency audio (PipeWire, 512-frame buffer ≈ 10.7 ms), native fractional-HiDPI.
 
 Self-tests: `cargo run -- session-test`, `cargo run -- capture-test`,
-`cargo run -- audio-test`, `cargo run -- host-test`.
+`cargo run -- player-test`, `cargo run -- metro-test`, `cargo run -- lv2-test`,
+`cargo run -- lv2-host-test`, `cargo run -- lv2-voice-test`,
+`cargo run -- lv2-engine-test`, `cargo run -- audio-test`, `cargo run -- host-test`.
 
 ## Build & run
 

@@ -3333,7 +3333,9 @@ impl DemoApp {
                     }
                     if n > 1 {
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("keys 1–9 or arrow keys switch the view · all rigs keep sounding")
+                        // The real key range, not a fixed "1–9" (vision review).
+                        let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
+                        ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
                             .size(11.0).color(theme::INK_2));
                     }
                     }); });
@@ -3744,7 +3746,7 @@ impl DemoApp {
                             // Empty state: an open chat must read as a chat, not a status bar.
                             if self.assistant.history.is_empty() && !self.assistant.busy {
                                 ui.label(egui::RichText::new(
-                                    "No messages yet — ask about routing, sounds or rigs, e.g. \"add a rig with a reverb\" or \"why is rig B silent?\"")
+                                    "No messages yet — ask about routing, sounds or rigs, e.g. \"add a Rig with a reverb\" or \"why is Rig B silent?\"")
                                     .size(13.0).color(theme::INK_2));
                             }
                             for line in &self.assistant.history {

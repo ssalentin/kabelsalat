@@ -550,7 +550,7 @@ fn make_unit(node: &Node) -> Unit {
             UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
             vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
-            vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.44, "MIDI"), (Dir::Out, 0, 0.76, "OUT")],
+            vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.46, "MIDI IN"), (Dir::Out, 0, 0.76, "OUT")],
         ),
         NodeKind::Dsp(kind) => {
             // Generic DSP face: 1–2 knobs on engine params 0/1.
@@ -1493,7 +1493,8 @@ impl DemoApp {
                 u.label_fit_w = fit_w;
             }
             if u.back_g.is_none() {
-                u.back_g = Some(tracked(&u.name.to_uppercase(), 10.0, 0.14));
+                // Same display name as the front (rule 28), still small + tracked.
+                u.back_g = Some(tracked(&sentence_case(&u.name), 11.0, 0.06));
             }
             for k in &mut u.knobs {
                 if k.label_g.is_none() {
@@ -2924,7 +2925,7 @@ impl DemoApp {
                     // every column "rig A" (user report 2026-11-15).
                     // Same rig naming as the RIGS strip, same "MIDI" casing as everywhere.
                     let rig_txt = if self.rig_count() > 1 { format!("{} · ", self.rig_name(u.rig as usize)) } else { String::new() };
-                    no_wrap(ui, egui::RichText::new(format!("{rig_txt}MIDI {}", if gate { "in ✓" } else { "unplugged" }))
+                    no_wrap(ui, egui::RichText::new(format!("{rig_txt}MIDI {}", if gate { "IN ✓" } else { "unplugged" }))
                         .size(11.5).color(if gate { theme::LIVE_TEAL } else { theme::INK_2 }));
                 });
             }
@@ -5238,7 +5239,11 @@ impl DemoApp {
                                         // A group HEADING, not a chip: a filled chip read as a
                                         // filter/tab while every rig is shown (vision review).
                                         // The rig in the rack view gets an "IN VIEW" tag.
-                                        ui.horizontal(|ui| {
+                                        let group_w = (self.mixer_sources(rig as u8).len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
+                                        ui.allocate_ui_with_layout(egui::vec2(group_w, 22.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            // Heading centered over ITS strips (sources + bus).
+                                            let tag_w = if rig == self.active_rig && n > 1 { 96.0 } else { 0.0 };
+                                            ui.add_space(((group_w - 80.0 - tag_w) / 2.0).max(0.0));
                                             let head = ui.add(egui::Label::new(egui::RichText::new(format!("{} · {}", rig + 1, name))
                                                 .font(theme::medium_font(14.0)).color(theme::INK)).sense(egui::Sense::click()))
                                                 .on_hover_text("show this rig in the rack view");
@@ -5249,7 +5254,10 @@ impl DemoApp {
                                                 theme::tracked_label(ui, "SHOWN IN RACK", 9.0, 0.14, theme::CREAM_DIM); // neutral: teal = live
                                             }
                                         });
-                                        ui.add_space(8.0);
+                                        // Group rule: the heading spans its sources + bus.
+                                        let (rule, _) = ui.allocate_exact_size(egui::vec2(group_w, 5.0), egui::Sense::hover());
+                                        ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+                                        ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
                                             for (unit, knob) in self.mixer_sources(rig as u8) {
                                                 let (uname, sub, level) = {
@@ -5501,11 +5509,19 @@ impl DemoApp {
         let point = self.shown_split(unit);
         let hov_chip = self.face_hovered(painter, unit, chip);
         self.paint_face_chip(painter, chip, "SPLIT", point.is_some(), hov_chip);
-        if let Some(p) = point {
-            let dragging = matches!(self.drag, Drag::Split { unit: du, .. } if du == unit);
-            let active = dragging || self.face_hovered(painter, unit, readout);
-            self.paint_face_field(painter, readout, active);
-            self.face_text(painter, readout.center(), &note_name(p), theme::medium_font(12.0), TEXT);
+        // The readout always shows the state (vision review: a lone chip
+        // left "is it split?" ambiguous): the split note, or a dim "off".
+        match point {
+            Some(p) => {
+                let dragging = matches!(self.drag, Drag::Split { unit: du, .. } if du == unit);
+                let active = dragging || self.face_hovered(painter, unit, readout);
+                self.paint_face_field(painter, readout, active);
+                self.face_text(painter, readout.center(), &note_name(p), theme::medium_font(12.0), TEXT);
+            }
+            None => {
+                self.paint_face_field(painter, readout, false);
+                self.face_text(painter, readout.center(), "OFF", FontId::proportional(11.0), SUBTEXT);
+            }
         }
     }
 
@@ -5730,10 +5746,10 @@ impl DemoApp {
             let col = if self.meter_peak >= 0.9 { theme::CLIP_RED } else { theme::ACCENT };
             painter.rect_filled(self.xf.rect(tick), 0.8, col);
         }
-        // Caption under the stack (vision review: an unlabeled segment strip
-        // read as decoration).
-        let w = self.caption_output_g.as_ref().map_or(0.0, |g| g.size.x);
-        self.text_tracked(painter, Vec2::new(x + 11.0 - w / 2.0, bottom + 8.0), &self.caption_output_g, SUBTEXT);
+        // Caption ON the meter column (above its top segment): attached to
+        // the meter, not floating on the knob-label row (vision review).
+        let top = bottom - n as f32 * pitch;
+        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
     }
 
     fn draw_knob(&self, painter: &egui::Painter, ui: usize, ki: usize) {

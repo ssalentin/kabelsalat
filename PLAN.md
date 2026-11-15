@@ -2,7 +2,7 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + multi-rig backend landed; UI redesign + multi-rig UI are next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) Signal visual redesign (docs/design-language.md), (2) multi-rig UI, (3) hot-wire MIDI matrix view. · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below.
+Status: **core app complete + Signal redesign + multi-rig backend landed; multi-rig UI is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Signal visual redesign landed** (src/theme.rs: dark layered glass, cyan/blue audio, amber MIDI, violet selection, green active, red clip — docs/design-language.md). **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) multi-rig UI, (2) hot-wire MIDI matrix view. · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below.
 
 ## 0.1 Session handoff (read me first in a new session)
 
@@ -31,9 +31,16 @@ Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `play
 - `dsp.rs` — 8 allocation-proven processors + Metronome placeholder.
 - `matrix.rs` — MIDI routing: `SourceId::{Keys,LaptopKeys,Hardware(dev),...}`, per-rig rules,
   splits/transpose/filters. Allocation-free `route_into`.
+- `theme.rs` — **Signal design language** (docs/design-language.md): palette consts
+  (BG_DEEP/SURFACE/HAIRLINE, AUDIO_CYAN/BLUE, MIDI_AMBER, ACCENT_VIOLET/MAGENTA,
+  LIVE_GREEN, CLIP_RED, WARN_AMBER), `glass_panel`/`gradient_rect`/`glow_rect`/
+  `aurora_bg`/`value_arc`/`meter_color` painters, `visuals()` for the egui chrome,
+  `install_fonts` (Noto Sans reg/med/bold + JetBrains Mono, graceful fallback).
 - `ui.rs` — eframe/egui. Data-driven rack (`build_rack`), Tab flip, animated cables, Ctrl+drag
   rearrange, **native egui param editor (double-click a Clap unit; NO X11)**, plugin browser (F9),
   templates (F5/F6/F7, F8 demo), sessions, transport popover (F10/Space), stats (fps/cables/midi ms).
+  All painting goes through the Signal theme (glass units, 3-layer cable glow, violet
+  selection, glowing-green play, meter gradient + peak hold, knob drag value chip).
   Holds `shared_graph`, `rig_snapshot`, `surge_controllers`.
 - `bridge.rs` — unix socket `$XDG_RUNTIME_DIR/kabelsalat.sock`; `spawn_with_rigs`; queries
   `get_graph`/`get_status`/`get_rigs`; `BUFFER_FRAMES=512`, `XRUNS`, `MIDI_LATENCY_US` statics.
@@ -60,14 +67,20 @@ Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `play
   `deepseek` provider is not allowed here. Screenshot review needs an image-capable model/profile.
 
 **Next builds (in order):**
-1. **Signal visual redesign** — spec in `docs/design-language.md`; create `src/theme.rs` (palette +
-   glass_panel/glow_stroke/aurora_bg/value_arc helpers), restyle rack front/back, toolbar, keyboard,
-   panels. Dark layered glass, cyan/blue audio, amber MIDI, violet selection, green active, red clip.
-2. **Multi-rig UI** — backend is DONE (`LoadRigs`, `rig_snapshot`, `get_rigs`). Build an always-visible
+1. **Multi-rig UI** — backend is DONE (`LoadRigs`, `rig_snapshot`, `get_rigs`). Build an always-visible
    overview strip (rig name + MIDI device + active highlight + level), number keys 1–9 + arrow keys to
    switch the big view (visual only; all rigs sound), big view = active rig's rack. **Held keys must
    remember their rig+pitch** so switching doesn't orphan note-offs (vibez lesson, docs/vibez-notes.md).
-3. **Hot-wire MIDI matrix view** (backlog) — AUM-style MIDI-in vs sink patching surface.
+   Style it with the Signal theme (`src/theme.rs`) from the start.
+2. **Hot-wire MIDI matrix view** (backlog) — AUM-style MIDI-in vs sink patching surface.
+
+**Signal redesign — LANDED 2026-11-15.** Verified via 107 unit tests + session/multi-rig/metro/
+mono/add-node self-tests + pixel-analysis of screenshots (docs/shots/signal-{front,back}.png):
+palette dominance, glass gradients, all accents present, old palette gone, flip/transport/help
+all functional. Screenshot review is programmatic — the session model has no image input;
+use ImageMagick histograms/region counts (grim needs WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR;
+key injection into the XWayland window works via python ctypes XTEST with proper restype/argtypes).
+Minor motion polish left: staged fade-in on template load, ~120ms hover easing on painted controls.
 
 **Docs:** `docs/BACKLOG.md` (queue), `docs/design-language.md` (redesign spec), `docs/vibez-notes.md`
 (reference-app lessons), `docs/p0-report.md` (latency/go-no-go), `docs/p3-lv2.md`, `docs/p3-mcp.md`,

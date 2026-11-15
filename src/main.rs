@@ -19,6 +19,7 @@ mod midi;
 mod player;
 mod preview;
 mod session;
+mod theme;
 mod ui;
 
 fn main() -> anyhow::Result<()> {

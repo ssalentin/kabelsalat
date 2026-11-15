@@ -42,26 +42,29 @@ use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::SourceId;
 use crate::session::Template;
+use crate::theme;
 
 // ---------------------------------------------------------------------------
-// Palette (assets/logo.svg + Omarchy/Tokyo-night accents)
+// Palette — Signal design language (src/theme.rs, docs/design-language.md).
+// The legacy names stay as aliases so the drawing code reads naturally;
+// all values come from the single theme source.
 // ---------------------------------------------------------------------------
 
-const BG: Color32 = Color32::from_rgb(0x15, 0x16, 0x1e);
-const YELLOW: Color32 = Color32::from_rgb(0xFF, 0xD6, 0x0A); // MIDI
-const BLUE: Color32 = Color32::from_rgb(0x7a, 0xa2, 0xf7); // audio A
-const GREEN: Color32 = Color32::from_rgb(0x9e, 0xce, 0x6a); // audio B
-const PURPLE: Color32 = Color32::from_rgb(0xbb, 0x9a, 0xf7);
-const ORANGE: Color32 = Color32::from_rgb(0xff, 0x9e, 0x64);
-const CHASSIS: Color32 = Color32::from_rgb(0x19, 0x1b, 0x26);
-const RAIL: Color32 = Color32::from_rgb(0x26, 0x28, 0x38);
-const PLATE_FRONT: Color32 = Color32::from_rgb(0x23, 0x25, 0x38);
-const PLATE_BACK: Color32 = Color32::from_rgb(0x1b, 0x1d, 0x29);
-const BORDER: Color32 = Color32::from_rgb(0x34, 0x37, 0x4d);
-const RING: Color32 = Color32::from_rgb(0x4a, 0x4e, 0x69);
-const PLUG: Color32 = Color32::from_rgb(0x41, 0x44, 0x59);
-const TEXT: Color32 = Color32::from_rgb(0xec, 0xee, 0xf6);
-const SUBTEXT: Color32 = Color32::from_rgb(0x8f, 0x95, 0xad);
+const BG: Color32 = theme::BG_DEEP;
+const YELLOW: Color32 = theme::MIDI_AMBER; // MIDI
+const BLUE: Color32 = theme::AUDIO_CYAN; // audio A
+const GREEN: Color32 = theme::LIVE_GREEN; // active / playing / sources
+const PURPLE: Color32 = theme::ACCENT_VIOLET; // selection
+const ORANGE: Color32 = theme::WARN_AMBER;
+const CHASSIS: Color32 = theme::BG_RAISED;
+const RAIL: Color32 = theme::SURFACE;
+const PLATE_FRONT: Color32 = theme::SURFACE;
+const PLATE_BACK: Color32 = Color32::from_rgb(0x0d, 0x12, 0x21); // SURFACE → BG_DEEP 45%
+const BORDER: Color32 = theme::HAIRLINE;
+const RING: Color32 = Color32::from_rgb(0x42, 0x4f, 0x6b); // HAIRLINE → TEXT_DIM 35%
+const PLUG: Color32 = theme::SURFACE_HI;
+const TEXT: Color32 = theme::TEXT;
+const SUBTEXT: Color32 = theme::TEXT_DIM;
 const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
 
@@ -86,20 +89,8 @@ const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black k
 // Small helpers (no allocation)
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn alpha(c: Color32, a: f32) -> Color32 {
-    let [r, g, b, _] = c.to_array();
-    Color32::from_rgba_unmultiplied(r, g, b, (a.clamp(0.0, 1.0) * 255.0) as u8)
-}
-
-#[inline]
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let [ar, ag, ab, _] = a.to_array();
-    let [br, bg, bb, _] = b.to_array();
-    let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgb(l(ar, br), l(ag, bg), l(ab, bb))
-}
+// alpha/mix live in the theme module (single source for the Signal palette).
+use crate::theme::{alpha, mix};
 
 #[inline]
 fn clamp_len(v: Vec2, max: f32) -> Vec2 {
@@ -305,12 +296,12 @@ fn unit_time_mul(u: &Unit) -> f32 {
 fn dsp_accent(kind: &DspKind) -> Color32 {
     match kind {
         DspKind::Delay => PURPLE,
-        DspKind::Reverb => Color32::from_rgb(0x7d, 0xcf, 0xff), // sky
+        DspKind::Reverb => theme::AUDIO_BLUE,
         DspKind::Gain => GREEN,
         DspKind::Filter => PURPLE,
         DspKind::Eq3 => BLUE,
         DspKind::Limiter => ORANGE,
-        DspKind::Saturation => Color32::from_rgb(0xf7, 0x76, 0x8e), // red
+        DspKind::Saturation => theme::ACCENT_MAGENTA,
         DspKind::Pan => YELLOW,
         DspKind::Metronome => YELLOW,
     }
@@ -337,7 +328,7 @@ fn make_unit(node: &Node) -> Unit {
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::MasterOut => (
-            UnitKind::Master, "stereo + mono bus".into(), ORANGE,
+            UnitKind::Master, "stereo + mono bus".into(), theme::ACCENT_MAGENTA,
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             vec![(Dir::In, 0, 0.30, "L"), (Dir::In, 2, 0.50, "MONO"), (Dir::In, 1, 0.70, "R")],
@@ -369,7 +360,7 @@ fn make_unit(node: &Node) -> Unit {
             )
         }
         NodeKind::Lv2 { .. } => (
-            UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(), GREEN,
+            UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(), theme::AUDIO_BLUE,
             vec![PortKind::Audio], vec![PortKind::Audio],
             vec![knob("GAIN", 0.9, Some(0))],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
@@ -583,6 +574,8 @@ struct DemoApp {
 
     key_leds: [f32; 13],
     meter: f32,
+    /// Peak-hold for the master meter (slow release, Signal design language).
+    meter_peak: f32,
 
     show_help: bool,
     show_stats: bool,
@@ -724,6 +717,7 @@ impl DemoApp {
             hover: None,
             key_leds: [0.0; 13],
             meter: 0.0,
+            meter_peak: 0.0,
             show_help: false,
             show_stats: false,
             show_sessions: false,
@@ -995,11 +989,11 @@ impl DemoApp {
         let layout = |text: &str, font: FontId, color: Color32, wrap: f32| -> Arc<Galley> {
             ctx.fonts_mut(|f| f.layout(text.to_owned(), font, color, wrap))
         };
-        let label_font = FontId::proportional(9.5);
+        let label_font = FontId::proportional(10.0);
         // Unit galleys: (re)fill any that are missing — templates rebuild units.
         for u in &mut self.units {
             if u.name_g.is_none() {
-                u.name_g = Some(layout(&u.name, FontId::proportional(16.0), TEXT, f32::INFINITY));
+                u.name_g = Some(layout(&u.name, theme::bold_font(16.0), TEXT, f32::INFINITY));
                 u.sub_g = Some(layout(&u.sub, FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
                 u.back_g = Some(layout(&u.name, FontId::proportional(11.0), SUBTEXT, f32::INFINITY));
             }
@@ -1015,7 +1009,7 @@ impl DemoApp {
             }
         }
         if self.wordmark_g.is_some() { return; }
-        self.wordmark_g = Some(layout("kabelsalat", FontId::proportional(14.5), TEXT, f32::INFINITY));
+        self.wordmark_g = Some(layout("kabelsalat", theme::bold_font(14.5), TEXT, f32::INFINITY));
         self.state_play_g = Some(layout("metronome · playing", FontId::proportional(10.5), GREEN, f32::INFINITY));
         self.state_pause_g = Some(layout("metronome · stopped", FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
         self.flip_label_g = Some(layout("flip rack · Tab", FontId::proportional(11.0), TEXT, f32::INFINITY));
@@ -1028,7 +1022,7 @@ impl DemoApp {
         self.hint_wire_g = Some(layout(
             "now click a glowing jack to connect · esc or right-click cancels",
             FontId::proportional(12.0), YELLOW, f32::INFINITY));
-        self.help_title_g = Some(layout("kabelsalat — the cables are the show", FontId::proportional(17.0), TEXT, f32::INFINITY));
+        self.help_title_g = Some(layout("kabelsalat — the cables are the show", theme::bold_font(17.0), TEXT, f32::INFINITY));
         self.help_body_g = Some(layout(
             "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
              F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
@@ -1045,7 +1039,7 @@ impl DemoApp {
              tug a plug         pull it out to unplug (back)\n\
              click a cable      highlight its whole signal path\n\
              R reset knobs · D stats · ? help · esc cancel",
-            FontId::monospace(12.5), Color32::from_rgb(0xc6, 0xca, 0xde), 560.0));
+            FontId::monospace(12.5), TEXT, 560.0));
         self.help_foot_g = Some(layout("esc or ? to close", FontId::proportional(11.5), SUBTEXT, f32::INFINITY));
     }
 
@@ -1808,24 +1802,26 @@ impl DemoApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(0x1e, 0x20, 0x2e))
+                    .fill(theme::BG_RAISED)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
                     .inner_margin(egui::Margin::same(6)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("RIG INPUTS").small().strong().color(SUBTEXT));
+                    ui.label(theme::section_label("Rig inputs"));
                     ui.add_space(10.0);
                     for (rig, node) in rigs {
-                        let accent = if rig == 0 { BLUE } else { GREEN };
+                        let accent = if rig == 0 { BLUE } else { theme::AUDIO_BLUE };
                         let label = if rig == 0 { "A" } else { "B" };
                         ui.label(egui::RichText::new(format!("RIG {label}")).small().strong().color(accent));
                         let (k, l, h) = self.rig_sources[rig];
                         for (name, on, idx) in [("Keys", k, 0usize), ("Laptop", l, 1), ("HW", h, 2)] {
-                            let fill = if on { alpha(accent, 0.35) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                            let fill = if on { alpha(accent, 0.30) } else { theme::SURFACE_HI };
                             let txt = if on { TEXT } else { SUBTEXT };
-                            let btn = egui::Button::new(egui::RichText::new(name).small().color(txt))
+                            let mut btn = egui::Button::new(egui::RichText::new(name).small().color(txt))
                                 .fill(fill)
-                                .corner_radius(4.0);
+                                .corner_radius(8.0);
+                            if on { btn = btn.stroke(Stroke::new(1.0, alpha(accent, 0.6))); }
                             if ui.add(btn).clicked() {
                                 let s = &mut self.rig_sources[rig];
                                 match idx {
@@ -1844,8 +1840,8 @@ impl DemoApp {
                                 Some(d) => format!("HW: {}", self.hw_devices.get(d as usize).map(|s| s.as_str()).unwrap_or("?")),
                             };
                             let dbtn = egui::Button::new(egui::RichText::new(label).small().color(SUBTEXT))
-                                .fill(Color32::from_rgb(0x26, 0x28, 0x38))
-                                .corner_radius(4.0);
+                                .fill(theme::SURFACE_HI)
+                                .corner_radius(8.0);
                             if ui.add(dbtn).on_hover_text("cycle which hardware device feeds this rig").clicked() {
                                 let n = self.hw_devices.len() as u32;
                                 let next = match cur {
@@ -1863,11 +1859,12 @@ impl DemoApp {
                     }
                     ui.add_space(4.0);
                     let split_txt = if self.split_on { "Split @ C4: ON" } else { "Split @ C4: off" };
-                    let split_fill = if self.split_on { alpha(YELLOW, 0.35) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+                    let split_fill = if self.split_on { alpha(YELLOW, 0.30) } else { theme::SURFACE_HI };
                     let split_col = if self.split_on { TEXT } else { SUBTEXT };
-                    let btn = egui::Button::new(egui::RichText::new(split_txt).small().color(split_col))
+                    let mut btn = egui::Button::new(egui::RichText::new(split_txt).small().color(split_col))
                         .fill(split_fill)
-                        .corner_radius(4.0);
+                        .corner_radius(8.0);
+                    if self.split_on { btn = btn.stroke(Stroke::new(1.0, alpha(YELLOW, 0.6))); }
                     if ui.add(btn).clicked() {
                         self.split_on = !self.split_on;
                         let point = if self.split_on { Some(60) } else { None };
@@ -1881,15 +1878,15 @@ impl DemoApp {
                         ui.add_space(8.0);
                     }
                     let sess_btn = egui::Button::new(egui::RichText::new("Sessions").small().color(TEXT))
-                        .fill(Color32::from_rgb(0x26, 0x28, 0x38))
-                        .corner_radius(4.0);
+                        .fill(theme::SURFACE_HI)
+                        .corner_radius(8.0);
                     if ui.add(sess_btn).clicked() {
                         self.show_sessions = !self.show_sessions;
                     }
                     ui.add_space(6.0);
                     let plug_btn = egui::Button::new(egui::RichText::new("Plugins").small().color(TEXT))
-                        .fill(Color32::from_rgb(0x26, 0x28, 0x38))
-                        .corner_radius(4.0);
+                        .fill(theme::SURFACE_HI)
+                        .corner_radius(8.0);
                     if ui.add(plug_btn).on_hover_text("browse installed LV2 / CLAP plugins and add them to a rig").clicked() {
                         self.show_plugins = !self.show_plugins;
                         if self.show_plugins && !self.plugins_loaded {
@@ -1897,10 +1894,11 @@ impl DemoApp {
                         }
                     }
                     ui.add_space(6.0);
-                    let tr_fill = if self.playing { alpha(GREEN, 0.30) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
-                    let tr_btn = egui::Button::new(egui::RichText::new("Transport").small().color(TEXT))
+                    let tr_fill = if self.playing { alpha(GREEN, 0.30) } else { theme::SURFACE_HI };
+                    let mut tr_btn = egui::Button::new(egui::RichText::new("Transport").small().color(TEXT))
                         .fill(tr_fill)
-                        .corner_radius(4.0);
+                        .corner_radius(8.0);
+                    if self.playing { tr_btn = tr_btn.stroke(Stroke::new(1.0, alpha(GREEN, 0.6))); }
                     if ui.add(tr_btn).on_hover_text("metronome: Play/Stop + BPM (F10)").clicked() {
                         self.show_transport = !self.show_transport;
                     }
@@ -1927,14 +1925,11 @@ impl DemoApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     // Play/Stop toggle — reflects transport state, drives the engine.
-                    let (label, fill, ink) = if self.playing {
-                        ("Stop", Color32::from_rgb(0x5a, 0x24, 0x28), Color32::from_rgb(0xff, 0x9a, 0x9a))
-                    } else {
-                        ("Play", Color32::from_rgb(0x1f, 0x3a, 0x26), Color32::from_rgb(0x9a, 0xff, 0xb0))
-                    };
-                    let btn = egui::Button::new(egui::RichText::new(label).small().strong().color(ink))
-                        .fill(fill)
-                        .corner_radius(4.0)
+                    let (label, accent) = if self.playing { ("Stop", theme::CLIP_RED) } else { ("Play", GREEN) };
+                    let btn = egui::Button::new(egui::RichText::new(label).small().strong().color(accent))
+                        .fill(alpha(accent, 0.18))
+                        .stroke(Stroke::new(1.0, alpha(accent, 0.55)))
+                        .corner_radius(8.0)
                         .min_size(egui::vec2(56.0, 20.0));
                     if ui.add(btn).on_hover_text("start / stop the metronome (Space)").clicked() {
                         self.toggle_play();
@@ -1988,7 +1983,7 @@ impl DemoApp {
             .resizable(false)
             .default_width(320.0)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new("Starter templates").small().strong());
+                ui.label(theme::section_label("Starter templates"));
                 ui.horizontal(|ui| {
                     for t in Template::ALL {
                         if ui.button(t.title()).on_hover_text("load a playable pre-wired rack").clicked() {
@@ -2022,7 +2017,7 @@ impl DemoApp {
                     }
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("Saved sessions").small().strong());
+                ui.label(theme::section_label("Saved sessions"));
                 let dir = Self::sessions_dir();
                 let mut names: Vec<String> = std::fs::read_dir(&dir)
                     .map(|rd| {
@@ -2161,7 +2156,7 @@ impl DemoApp {
                 ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").small().italics().color(SUBTEXT));
                 let filter = self.plugin_filter.to_lowercase();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    ui.label(egui::RichText::new(format!("LV2 plugins ({})", self.plugins_lv2.len())).small().strong());
+                    ui.label(theme::section_label(&format!("LV2 plugins ({})", self.plugins_lv2.len())));
                     let mut added: Option<(String, String, bool)> = None;
                     for p in &self.plugins_lv2 {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
@@ -2172,16 +2167,16 @@ impl DemoApp {
                             }
                             // Offer BOTH roles; emphasize the likely one (the
                             // is_instrument hint is permissive, not authoritative).
-                            let base = Color32::from_rgb(0x26, 0x28, 0x38);
+                            let base = theme::SURFACE_HI;
                             let inst_fill = if p.is_instrument { alpha(BLUE, 0.35) } else { base };
                             let fx_fill = if p.is_instrument { base } else { alpha(BLUE, 0.35) };
                             let ib = egui::Button::new(egui::RichText::new("Add instrument").small().color(TEXT))
-                                .fill(inst_fill).corner_radius(4.0);
+                                .fill(inst_fill).corner_radius(8.0);
                             if ui.add(ib).on_hover_text(&p.uri).clicked() {
                                 added = Some((p.uri.clone(), p.name.clone(), true));
                             }
                             let fb = egui::Button::new(egui::RichText::new("Add effect").small().color(TEXT))
-                                .fill(fx_fill).corner_radius(4.0);
+                                .fill(fx_fill).corner_radius(8.0);
                             if ui.add(fb).on_hover_text(&p.uri).clicked() {
                                 added = Some((p.uri.clone(), p.name.clone(), false));
                             }
@@ -2191,7 +2186,7 @@ impl DemoApp {
                         if as_inst { self.add_lv2_instrument(&uri, &name); } else { self.add_lv2_effect(&uri, &name); }
                     }
                     ui.separator();
-                    ui.label(egui::RichText::new(format!("CLAP instruments ({})", self.plugins_clap.len())).small().strong());
+                    ui.label(theme::section_label(&format!("CLAP instruments ({})", self.plugins_clap.len())));
                     let mut add_surge = false;
                     for p in &self.plugins_clap {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
@@ -2222,7 +2217,8 @@ impl DemoApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(0x1e, 0x20, 0x2e))
+                    .fill(theme::BG_RAISED)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
                     .inner_margin(egui::Margin::same(10)),
             )
             .show(root, |ui| {
@@ -2266,7 +2262,7 @@ impl DemoApp {
                                 let (label, color) = match line.role.as_str() {
                                     "user" => ("You", YELLOW),
                                     "assistant" => ("Assistant", GREEN),
-                                    _ => ("Error", Color32::from_rgb(0xf7, 0x76, 0x8e)),
+                                    _ => ("Error", theme::CLIP_RED),
                                 };
                                 ui.label(egui::RichText::new(label).small().strong().color(color));
                                 ui.label(&line.text);
@@ -2576,6 +2572,12 @@ impl DemoApp {
             .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
             .unwrap_or(0.0);
         self.meter += (target - self.meter) * (1.0 - (-dt / 0.08).exp());
+        // Peak hold: instant attack, slow release (~0.25/s).
+        if self.meter >= self.meter_peak {
+            self.meter_peak = self.meter;
+        } else {
+            self.meter_peak = (self.meter_peak - dt * 0.25).max(self.meter);
+        }
 
         let selected = self.selected;
         self.cables.retain(|c| c.dying < 0.55);
@@ -3030,16 +3032,16 @@ impl DemoApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, BG);
-        self.draw_grid(&painter, rect);
+        theme::aurora_bg(&painter, rect);
 
-        // Rack shadow + chassis (through the flip transform).
+        // Rack shadow + glass chassis (through the flip transform). The
+        // chassis sits a layer darker than the units so they pop off it.
         let rack_local = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.rack_w, self.rack_h));
         let rack = self.xf.rect(rack_local);
-        let shadow = rack.translate(Vec2::new(0.0, 10.0 * self.xf.sy));
-        painter.rect_filled(shadow, 20.0, alpha(BLACK, 0.35));
-        painter.rect_filled(rack, 18.0, CHASSIS);
-        painter.rect_stroke(rack, 18.0, Stroke::new(1.2, BORDER), egui::StrokeKind::Inside);
+        theme::drop_shadow(&painter, rack, 18.0);
+        theme::gradient_rect(&painter, rack, 18.0, theme::SURFACE, CHASSIS);
+        painter.rect_stroke(rack, 18.0, Stroke::new(1.2, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
+        theme::top_highlight(&painter, rack, 18.0);
 
         if self.xf.sy > 0.04 {
             self.draw_rails(&painter);
@@ -3053,22 +3055,6 @@ impl DemoApp {
         self.draw_hint(&painter, rect);
         if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
-    }
-
-    fn draw_grid(&self, painter: &egui::Painter, rect: Rect) {
-        let spacing = 44.0;
-        let dot = alpha(WHITE, 0.045);
-        let mut count = 0;
-        let mut y = rect.top();
-        while y <= rect.bottom() && count < 2200 {
-            let mut x = rect.left();
-            while x <= rect.right() && count < 2200 {
-                painter.rect_filled(Rect::from_center_size(Pos2::new(x, y), Vec2::splat(1.6)), 0.8, dot);
-                x += spacing;
-                count += 1;
-            }
-            y += spacing;
-        }
     }
 
     fn draw_rails(&self, painter: &egui::Painter) {
@@ -3113,10 +3099,19 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
-            let fill = if dragging { mix(PLATE_FRONT, YELLOW, 0.10) } else if hovered { mix(PLATE_FRONT, WHITE, 0.03) } else { PLATE_FRONT };
-            painter.rect_filled(xf.rect(r), 10.0, fill);
-            let (bw, bc) = if dragging { (2.0, YELLOW) } else { (1.0, BORDER) };
-            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
+            let sr = xf.rect(r);
+            // Glass plate: gradient brightens on hover; violet edge while
+            // dragging (selection color); accent-tinted border otherwise.
+            let top = if dragging { mix(theme::SURFACE_HI, PURPLE, 0.14) }
+                else if hovered { mix(theme::SURFACE_HI, WHITE, 0.05) }
+                else { theme::SURFACE_HI };
+            theme::gradient_rect(painter, sr, 10.0, top, PLATE_FRONT);
+            let (bw, bc) = if dragging { (1.6, alpha(PURPLE, 0.85)) } else { (1.0, alpha(u.accent, 0.35)) };
+            painter.rect_stroke(sr, 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
+            theme::top_highlight(painter, sr, 10.0);
+            // Active unit: accent edge glow breathing with the signal LED.
+            if u.led > 0.05 { theme::glow_rect(painter, sr, 10.0, u.accent, u.led * 0.8); }
+            if dragging { theme::glow_rect(painter, sr, 10.0, PURPLE, 0.9); }
 
             // Colored label strip.
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
@@ -3154,7 +3149,7 @@ impl DemoApp {
         let bar_w = width * 0.8;
         let y = r.center().y + 16.0;
         let track = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w, 8.0));
-        painter.rect_filled(self.xf.rect(track), 4.0, Color32::from_rgb(0x26, 0x28, 0x38));
+        painter.rect_filled(self.xf.rect(track), 4.0, BG);
         let fill = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w * (0.15 + 0.85 * level), 8.0));
         painter.rect_filled(self.xf.rect(fill), 4.0, alpha(u.accent, 0.5 + 0.5 * level));
     }
@@ -3167,7 +3162,7 @@ impl DemoApp {
             let semi = WHITE_SEMI[wi];
             let lit = self.key_leds[semi];
             let hovered = matches!(self.hover, Some(Hit::Key(s)) if s == semi);
-            let fill = mix(Color32::from_rgb(0xe8, 0xea, 0xf2), YELLOW, lit * 0.85);
+            let fill = mix(Color32::from_rgb(0xe6, 0xed, 0xf7), YELLOW, lit * 0.85);
             painter.rect_filled(xf.rect(kr), 3.0, if hovered { mix(fill, WHITE, 0.3) } else { fill });
             painter.rect_stroke(xf.rect(kr), 3.0, Stroke::new(1.0, alpha(BLACK, 0.4)), egui::StrokeKind::Inside);
         }
@@ -3180,7 +3175,7 @@ impl DemoApp {
                 Vec2::new(bw, 38.0),
             );
             let lit = self.key_leds[BLACK_SEMI[bi]];
-            painter.rect_filled(xf.rect(kr), 2.5, mix(Color32::from_rgb(0x1a, 0x1b, 0x24), YELLOW, lit * 0.7));
+            painter.rect_filled(xf.rect(kr), 2.5, mix(theme::BG_RAISED, YELLOW, lit * 0.7));
         }
     }
 
@@ -3197,7 +3192,8 @@ impl DemoApp {
                 Pos2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0),
                 Vec2::new(pitch * 0.45, h.max(2.0)),
             );
-            painter.rect_filled(self.xf.rect(bar), 2.0, alpha(BLUE, 0.5 + 0.5 * vis));
+            let col = if i % 2 == 0 { BLUE } else { theme::AUDIO_BLUE };
+            painter.rect_filled(self.xf.rect(bar), 2.0, alpha(col, 0.5 + 0.5 * vis));
         }
     }
 
@@ -3219,6 +3215,7 @@ impl DemoApp {
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
+    /// Gradient green→amber→red with a slow-release peak-hold tick.
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
         let lit = (self.meter * n as f32).ceil() as usize;
@@ -3230,9 +3227,18 @@ impl DemoApp {
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
                 Vec2::new(22.0, pitch * 0.72),
             );
-            let col = if i < 8 { GREEN } else if i < 11 { YELLOW } else { ORANGE };
-            let fill = if i < lit { col } else { Color32::from_rgb(0x26, 0x28, 0x38) };
+            let col = theme::meter_color(i as f32 / (n - 1) as f32);
+            let fill = if i < lit { col } else { BG };
             painter.rect_filled(self.xf.rect(seg), 2.5, fill);
+        }
+        // Peak-hold tick.
+        if self.meter_peak > 0.02 {
+            let i = ((self.meter_peak * n as f32).ceil() as usize).clamp(1, n) - 1;
+            let tick = Rect::from_min_size(
+                Pos2::new(x, bottom - (i + 1) as f32 * pitch - 2.0),
+                Vec2::new(22.0, 1.6),
+            );
+            painter.rect_filled(self.xf.rect(tick), 0.8, theme::meter_color(self.meter_peak));
         }
     }
 
@@ -3248,37 +3254,33 @@ impl DemoApp {
         if hovered || dragging {
             self.ell(painter, c, r + 5.0, alpha(u.accent, 0.15), Stroke::NONE);
         }
-        self.ell(painter, c, r, Color32::from_rgb(0x2a, 0x2d, 0x40),
+        self.ell(painter, c, r, mix(theme::SURFACE_HI, theme::SURFACE, 0.5),
             Stroke::new(1.4, if hovered || dragging { mix(RING, u.accent, 0.6) } else { RING }));
 
-        // Value arc: 270° sweep from bottom-left to bottom-right.
+        // Value arc: HAIRLINE track + glowing accent arc + indicator dot
+        // (theme helper; the closure carries the flip transform).
+        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, u.accent);
+
+        // Pointer.
         let a0 = 135.0f32.to_radians();
         let sweep = 270.0f32.to_radians();
-        let arc_r = r + 4.5;
-        let segs = 16;
-        let mut prev_track: Option<Pos2> = None;
-        let mut prev_val: Option<Pos2> = None;
-        for i in 0..=segs {
-            let f = i as f32 / segs as f32;
-            let ang = a0 + sweep * f;
-            let p = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * arc_r);
-            if let Some(pp) = prev_track {
-                painter.line_segment([pp, p], Stroke::new(2.0, alpha(RING, 0.55)));
-            }
-            prev_track = Some(p);
-            if f <= k.value {
-                if let Some(pp) = prev_val {
-                    painter.line_segment([pp, p], Stroke::new(2.4, u.accent));
-                }
-                prev_val = Some(p);
-            }
-        }
-        // Pointer.
         let ang = a0 + sweep * k.value;
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
         painter.line_segment([xf.p(c), tip], Stroke::new(2.4, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size().x);
         self.text(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
+
+        // Live monospace value chip while dragging (Signal design language).
+        if dragging {
+            let g = painter.layout(format!("{:.2}", k.value), FontId::monospace(11.0), theme::AUDIO_CYAN, f32::INFINITY);
+            let chip = Rect::from_min_size(
+                xf.p(c + Vec2::new(-g.size().x / 2.0 - 6.0, -r - 28.0)),
+                g.size() + Vec2::new(12.0, 6.0),
+            );
+            painter.rect_filled(chip, 6.0, alpha(BG, 0.92));
+            painter.rect_stroke(chip, 6.0, Stroke::new(1.0, alpha(u.accent, 0.5)), egui::StrokeKind::Inside);
+            painter.galley(chip.min + Vec2::new(6.0, 3.0), g, theme::AUDIO_CYAN);
+        }
     }
 
     fn draw_back(&self, painter: &egui::Painter) {
@@ -3286,10 +3288,13 @@ impl DemoApp {
         for (ui, u) in self.units.iter().enumerate() {
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
-            let fill = if dragging { mix(PLATE_BACK, YELLOW, 0.10) } else { PLATE_BACK };
-            painter.rect_filled(xf.rect(r), 10.0, fill);
-            let (bw, bc) = if dragging { (2.0, YELLOW) } else { (1.0, BORDER) };
-            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
+            let sr = xf.rect(r);
+            let top = if dragging { mix(theme::SURFACE, PURPLE, 0.14) } else { theme::SURFACE };
+            theme::gradient_rect(painter, sr, 10.0, top, PLATE_BACK);
+            let (bw, bc) = if dragging { (1.6, alpha(PURPLE, 0.85)) } else { (1.0, alpha(u.accent, 0.25)) };
+            painter.rect_stroke(sr, 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
+            theme::top_highlight(painter, sr, 10.0);
+            if dragging { theme::glow_rect(painter, sr, 10.0, PURPLE, 0.9); }
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
             painter.rect_filled(xf.rect(strip), 3.5, alpha(u.accent, 0.55));
             self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
@@ -3382,19 +3387,24 @@ impl DemoApp {
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
             let col = self.cable_color(c);
 
+            // Glow: 3 layered strokes, wide low-alpha → narrow full-color.
+            // Audio breathes with the live level; MIDI keeps a faint spark halo.
             if c.kind == PortKind::Audio {
-                let gw = width + 5.0 + 10.0 * level;
-                painter.add(bezier_shape(curve, gw, alpha(col, a * (0.05 + 0.22 * level))));
+                let gw = width + 6.0 + 11.0 * level;
+                painter.add(bezier_shape(curve, gw, alpha(col, a * (0.05 + 0.20 * level))));
+                painter.add(bezier_shape(curve, width + 2.5, alpha(col, a * (0.10 + 0.25 * level))));
+            } else {
+                painter.add(bezier_shape(curve, width + 4.0, alpha(col, a * 0.08)));
             }
             if has_sel && hl[ci] {
-                painter.add(bezier_shape(curve, width + 7.0, alpha(WHITE, 0.10 * a)));
+                painter.add(bezier_shape(curve, width + 7.0, alpha(PURPLE, 0.16 * a)));
             }
             let mut main_col = col;
             if c.kind == PortKind::Audio { main_col = mix(main_col, WHITE, 0.22 * level); }
             if hovered || grabbed { main_col = mix(main_col, WHITE, 0.18); }
             painter.add(bezier_shape(curve, width, alpha(main_col, a)));
             if self.selected == Some(c.id) {
-                painter.add(bezier_shape(curve, 1.1, alpha(WHITE, 0.55 * a)));
+                painter.add(bezier_shape(curve, 1.1, alpha(mix(PURPLE, WHITE, 0.5), 0.6 * a)));
             }
         }
     }
@@ -3408,7 +3418,7 @@ impl DemoApp {
                 let hovered = matches!(self.hover, Some(Hit::Jack { unit, jack }) if unit == ui && jack == ji);
                 let compat = self.compatible(ui, ji);
                 let socket = Rect::from_center_size(c.to_pos2(), Vec2::splat(24.0));
-                painter.rect_filled(xf.rect(socket), 5.0, Color32::from_rgb(0x10, 0x11, 0x1a));
+                painter.rect_filled(xf.rect(socket), 5.0, BG);
                 painter.rect_stroke(xf.rect(socket), 5.0, Stroke::new(1.2, RING), egui::StrokeKind::Inside);
                 if compat {
                     let pulse = 1.5 * (self.ui_time * 7.0).sin();
@@ -3520,13 +3530,24 @@ impl DemoApp {
 
     fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
         let bar = Rect::from_min_size(Pos2::new(16.0, top + 16.0), Vec2::new(376.0, 48.0));
-        painter.rect_filled(bar, 24.0, alpha(Color32::from_rgb(0x1d, 0x1f, 0x2e), 0.94));
-        painter.rect_stroke(bar, 24.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        theme::drop_shadow(painter, bar, 24.0);
+        theme::gradient_rect(painter, bar, 24.0, theme::SURFACE_HI, theme::SURFACE);
+        painter.rect_stroke(bar, 24.0, Stroke::new(1.0, alpha(BLUE, 0.25)), egui::StrokeKind::Inside);
+        theme::top_highlight(painter, bar, 24.0);
 
+        // Transport play: glowing green when running, glass + green ring idle.
         let c = Pos2::new(40.0, top + 40.0);
         let hovered = matches!(self.hover, Some(Hit::Play));
-        painter.circle_filled(c, 15.0, if hovered { mix(YELLOW, WHITE, 0.2) } else { YELLOW });
-        let ink = BG;
+        let ink;
+        if self.playing {
+            painter.circle_filled(c, 19.0, alpha(GREEN, 0.18));
+            painter.circle_filled(c, 15.0, if hovered { mix(GREEN, WHITE, 0.15) } else { GREEN });
+            ink = BG;
+        } else {
+            painter.circle_filled(c, 15.0, if hovered { mix(theme::SURFACE_HI, WHITE, 0.08) } else { theme::SURFACE_HI });
+            painter.circle_stroke(c, 15.0, Stroke::new(1.2, alpha(GREEN, if hovered { 0.8 } else { 0.45 })));
+            ink = GREEN;
+        }
         if self.playing {
             // Stop square (transport is Play/Stop, not play/pause).
             painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 34.5), Vec2::new(11.0, 11.0)), 1.6, ink);
@@ -3548,8 +3569,8 @@ impl DemoApp {
         // Flip button.
         let fb = Rect::from_min_size(Pos2::new(246.0, top + 24.0), Vec2::new(126.0, 32.0));
         let fhover = matches!(self.hover, Some(Hit::Flip));
-        painter.rect_filled(fb, 16.0, if fhover { Color32::from_rgb(0x2c, 0x2f, 0x44) } else { Color32::from_rgb(0x26, 0x28, 0x3a) });
-        painter.rect_stroke(fb, 16.0, Stroke::new(1.0, if fhover { mix(BORDER, YELLOW, 0.5) } else { BORDER }), egui::StrokeKind::Inside);
+        painter.rect_filled(fb, 16.0, if fhover { mix(theme::SURFACE_HI, BLUE, 0.12) } else { theme::BG_RAISED });
+        painter.rect_stroke(fb, 16.0, Stroke::new(1.0, if fhover { alpha(YELLOW, 0.5) } else { BORDER }), egui::StrokeKind::Inside);
         // ⇄ arrows drawn as shapes (font-independent).
         let ax = 260.0;
         painter.line_segment([Pos2::new(ax, top + 34.0), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
@@ -3568,7 +3589,8 @@ impl DemoApp {
         let Some(g) = g else { return };
         let w = g.size().x + 28.0;
         let bar = Rect::from_min_size(Pos2::new(16.0, rect.bottom() - 42.0), Vec2::new(w, 28.0));
-        painter.rect_filled(bar, 14.0, alpha(Color32::from_rgb(0x1d, 0x1f, 0x2e), 0.9));
+        painter.rect_filled(bar, 14.0, alpha(theme::BG_RAISED, 0.92));
+        painter.rect_stroke(bar, 14.0, Stroke::new(1.0, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
         painter.galley(bar.min + Vec2::new(14.0, 7.0), g.clone(), SUBTEXT);
     }
 
@@ -3587,16 +3609,16 @@ impl DemoApp {
         if let Some(g) = &self.stats_g {
             let w = g.size().x + 24.0;
             let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 26.0));
-            painter.rect_filled(bar, 13.0, alpha(Color32::from_rgb(0x1d, 0x1f, 0x2e), 0.9));
+            painter.rect_filled(bar, 13.0, alpha(theme::BG_RAISED, 0.92));
+            painter.rect_stroke(bar, 13.0, Stroke::new(1.0, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
             painter.galley(bar.min + Vec2::new(12.0, 6.0), g.clone(), SUBTEXT);
         }
     }
 
     fn draw_help(&self, painter: &egui::Painter, rect: Rect) {
-        painter.rect_filled(rect, 0.0, alpha(BLACK, 0.45));
+        painter.rect_filled(rect, 0.0, alpha(theme::SCRIM, 0.62));
         let card = Rect::from_center_size(rect.center(), Vec2::new(560.0, 352.0));
-        painter.rect_filled(card, 18.0, Color32::from_rgb(0x1c, 0x1e, 0x2c));
-        painter.rect_stroke(card, 18.0, Stroke::new(1.2, Color32::from_rgb(0x3a, 0x3e, 0x56)), egui::StrokeKind::Inside);
+        theme::glass_panel(painter, card, 18.0, PURPLE);
         if let Some(g) = &self.help_title_g { painter.galley(card.min + Vec2::new(28.0, 24.0), g.clone(), TEXT); }
         if let Some(g) = &self.help_body_g { painter.galley(card.min + Vec2::new(28.0, 62.0), g.clone(), TEXT); }
         if let Some(g) = &self.help_foot_g { painter.galley(card.min + Vec2::new(28.0, 318.0), g.clone(), SUBTEXT); }
@@ -4061,11 +4083,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                 "ui scale: detected={ppp:.2} used={:.2}",
                 cc.egui_ctx.pixels_per_point()
             );
-            let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = BG;
-            visuals.window_fill = BG;
-            visuals.override_text_color = Some(TEXT);
-            cc.egui_ctx.set_visuals(visuals);
+            cc.egui_ctx.set_visuals(theme::visuals());
+            theme::install_fonts(&cc.egui_ctx);
 
             let mut sink = sink;
             let mut audio = None;

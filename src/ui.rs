@@ -1580,7 +1580,7 @@ impl DemoApp {
     fn rack_need_h(&self) -> f32 {
         const COMFORT_UNIT_H: f32 = 150.0;
         let rows = self.layout_rows.max(1) as f32;
-        210.0 + rows * COMFORT_UNIT_H + (rows - 1.0) * 12.0
+        150.0 + rows * COMFORT_UNIT_H + (rows - 1.0) * 12.0
     }
 
     fn layout(&mut self, rect: Rect) {
@@ -1597,7 +1597,9 @@ impl DemoApp {
         // Caps sized for the 1.6x design scale (1600x1000 points): the rack
         // uses the stage instead of floating small in it.
         let fit_w = (rect.width() - 60.0).clamp(560.0, 1480.0);
-        self.unit_h = ((rect.height() - 210.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
+        // No masthead any more (user 2026-11-15: Play button removed, brand in
+        // the top bar) — the stage overhead is just margins + the hint line.
+        self.unit_h = ((rect.height() - 150.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
         let gap = 12.0;
         let pad = 20.0;
         let rail = 14.0;
@@ -1649,7 +1651,7 @@ impl DemoApp {
         }
         // Stage view for the rack: below the masthead, above the hint line.
         let view = Rect::from_min_max(
-            Pos2::new(rect.left() + 16.0, rect.top() + 100.0),
+            Pos2::new(rect.left() + 16.0, rect.top() + 40.0),
             Pos2::new(rect.right() - 16.0, rect.bottom() - 36.0),
         );
         let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
@@ -1666,7 +1668,7 @@ impl DemoApp {
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
             if ov.y > 0.0 { view.center().y - self.rack_h / 2.0 + self.rack_pan.y }
-            else { rect.center().y - self.rack_h / 2.0 + 16.0 },
+            else { rect.center().y - self.rack_h / 2.0 - 8.0 },
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -4540,7 +4542,6 @@ impl DemoApp {
     }
 
     fn hit_test(&self, s: Pos2) -> Hit {
-        if (s - Pos2::new(40.0, self.toolbar_top + 44.0)).length() < 19.0 { return Hit::Play; }
         if self.flipping || self.xf.sy < 0.9 { return Hit::Background; }
         // Panned-away rack parts are clipped: never hit what isn't drawn.
         if self.rack_clip.is_some_and(|c| !c.contains(s)) { return Hit::Background; }
@@ -5061,7 +5062,6 @@ impl DemoApp {
         }
 
         self.draw_pan_bars(&painter);
-        self.draw_toolbar(&painter, self.toolbar_top);
         self.draw_hint(&painter, rect);
         if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
@@ -5100,9 +5100,8 @@ impl DemoApp {
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
-        self.draw_toolbar(&painter, self.toolbar_top);
 
-        let top = self.toolbar_top + 80.0;
+        let top = self.toolbar_top + 20.0;
         let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
         let sheet = Rect::from_min_max(
             Pos2::new(rect.center().x - w / 2.0, top),
@@ -5192,8 +5191,7 @@ impl DemoApp {
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
-        self.draw_toolbar(&painter, self.toolbar_top);
-        let top = self.toolbar_top + 80.0;
+        let top = self.toolbar_top + 20.0;
         let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
         let sheet = Rect::from_min_max(
             Pos2::new(rect.center().x - w / 2.0, top),
@@ -6064,50 +6062,6 @@ impl DemoApp {
         let cursor = xf.p(p.cursor);
         painter.circle_filled(cursor, 6.5, alpha(col, 0.95));
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
-    }
-
-    fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
-        // Open masthead (§2.4: structure with rules, not boxes): the wordmark
-        // sits directly on the paper — the reference's display moment. The
-        // play circle is the only object here (Tab flips; no flip pill).
-        let c = Pos2::new(40.0, top + 44.0);
-        let ht = self.play_hover_t;
-        // Idle = dark disc + cream ring/glyph; playing = teal + dark glyph.
-        let glyph = if self.playing { BLACK } else { theme::INK };
-        if self.playing {
-            painter.circle_filled(c, 15.0, mix(GREEN, BLACK, 0.08 * ht));
-        } else {
-            painter.circle_filled(c, 15.0, mix(theme::PAPER, theme::PAPER_SINK, ht));
-            painter.circle_stroke(c, 15.0, Stroke::new(1.5, glyph));
-        }
-        if self.playing {
-            // Stop square (transport is Play/Stop, not play/pause).
-            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 38.5), Vec2::new(11.0, 11.0)), 1.6, glyph);
-        } else {
-            painter.add(Shape::convex_polygon(
-                vec![Pos2::new(36.5, top + 36.5), Pos2::new(36.5, top + 51.5), Pos2::new(48.5, top + 44.0)],
-                glyph, Stroke::NONE));
-        }
-
-        // Beat dot: teal thump, no glow ring.
-        let beat = 60.0 / self.bpm.max(1.0) as f64;
-        let beat_phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
-        let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
-        painter.circle_filled(Pos2::new(66.0, top + 44.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
-
-        // The wordmark + brand mark live in the top bar now (user
-        // 2026-11-15); the masthead keeps the play circle, beat dot and the
-        // state line beside them.
-        let word_x = 80.0;
-        // State line: tracked micro-caps; a 6px teal dot precedes "playing".
-        let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
-        let state_x = if self.playing {
-            painter.circle_filled(Pos2::new(word_x + 3.0, top + 44.0), 3.0, GREEN);
-            word_x + 10.0
-        } else { word_x };
-        if let Some(g) = state_g {
-            theme::paint_tracked(painter, Pos2::new(state_x, top + 39.0), g, theme::INK_2);
-        }
     }
 
     fn draw_hint(&self, painter: &egui::Painter, rect: Rect) {
@@ -7835,6 +7789,20 @@ mod rig_switch_tests {
         let low = app.key_rect(0);
         let below_black = Pos2::new(low.right() - 2.0, low.bottom() - 4.0);
         assert!(matches!(app.hit_test(app.xf.p(below_black.to_vec2())), Hit::Key(0)), "white below the black stays white");
+    }
+
+    #[test]
+    fn no_play_button_on_the_stage() {
+        // User 2026-11-15: the Play button is gone (Space + unit chips remain).
+        let (mut app, ctx) = two_rigs();
+        let old_play = Pos2::new(40.0, app.toolbar_top + 44.0);
+        assert!(!matches!(app.hit_test(old_play), Hit::Play));
+        for ev in click(old_play) { frame(&mut app, &ctx, ev); }
+        assert!(!app.playing, "clicking the old spot starts nothing");
+        frame(&mut app, &ctx, key(Key::Space));
+        assert!(app.playing, "Space is still master play");
+        assert!(app.stage_rect.top() + 40.0 <= app.xf.rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(app.rack_w, app.rack_h))).top() + 0.5,
+            "the rack sits below the stage margin, no masthead gap needed");
     }
 
     #[test]

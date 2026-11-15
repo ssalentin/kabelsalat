@@ -33,6 +33,11 @@ use serde_json::{json, Value};
 
 use crate::control::{Command, CommandBus, Graph};
 
+/// Output buffer size in frames (shared with the audio setup in `ui`).
+pub const BUFFER_FRAMES: u32 = 512;
+/// Count of audio stream errors / xruns reported by cpal since startup.
+pub static XRUNS: AtomicU32 = AtomicU32::new(0);
+
 /// Where the bridge listens (and where clients connect).
 pub fn socket_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -182,6 +187,9 @@ fn handle_line(
                     "sample_rate": sample_rate,
                     "output_level": f32::from_bits(level.load(Ordering::Relaxed)),
                     "audio_live": true,
+                    "buffer_frames": BUFFER_FRAMES,
+                    "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
+                    "xruns": XRUNS.load(Ordering::Relaxed),
                 }})
             }
             other => err_reply(format!(

@@ -451,6 +451,9 @@ impl McpServer {
             "audio_live": st.audio_live,
             "output_level": level,
             "transport_playing": st.playing,
+            "buffer_frames": bridge::BUFFER_FRAMES,
+            "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,
+            "xruns": bridge::XRUNS.load(Ordering::Relaxed),
         }))
     }
 

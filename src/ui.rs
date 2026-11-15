@@ -1333,6 +1333,9 @@ impl DemoApp {
                 "playing": self.playing,
                 "cables": self.cables.len(),
                 "fps": self.fps,
+                "buffer_frames": crate::bridge::BUFFER_FRAMES,
+                "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
+                "xruns": crate::bridge::XRUNS.load(std::sync::atomic::Ordering::Relaxed),
             })
             .to_string(),
             "play_note" => {
@@ -3781,7 +3784,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
     let mut config: cpal::StreamConfig = cfg.into();
     // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
     // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
-    config.buffer_size = cpal::BufferSize::Fixed(512);
+    config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
     eprintln!(
         "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms) voices=2",
         host.id().name(),
@@ -3817,7 +3820,10 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         move |data: &mut [f32], _| {
             engine.render(data, ch);
         },
-        |e| eprintln!("audio stream error: {e}"),
+        |e| {
+            crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("audio stream error: {e}");
+        },
         None,
     )?;
     stream.play()?;

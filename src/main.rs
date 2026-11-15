@@ -52,8 +52,9 @@ fn main() -> anyhow::Result<()> {
         "capture-test" => capture::run_test(),
         "player-test" => player::run_test(),
         "lv2-test" => lv2::run_test(),
+        "lv2-host-test" => lv2::host_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test");
             std::process::exit(1);
         }
     }

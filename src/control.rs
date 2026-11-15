@@ -197,6 +197,10 @@ pub enum Command {
     /// Per-rig hardware device selection: None = any device, Some(id) = only
     /// that device (AUM: a different keyboard per rig).
     SetRigDevice { node: NodeId, device: Option<u32> },
+    /// Replace the whole graph (template load). The engine rebuilds DSP, remaps
+    /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
+    /// matrix. Rare structural op: allocates (bends RT discipline by design).
+    LoadGraph { graph: Graph },
     /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
     /// notes at/above → rig B (node 4). `None` disables the split (both full range).
     SetSplit { point: Option<u8> },

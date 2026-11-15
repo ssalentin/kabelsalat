@@ -43,8 +43,35 @@ fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
             P_MIX => Some(2),
             _ => None,
         },
-        // Other kinds get their knob maps when the mixer UI exposes them.
-        _ => None,
+        // Generic knob maps for the other built-in nodes (template defaults).
+        DspKind::Reverb => match p {
+            0 => Some(2), // mix
+            1 => Some(0), // feedback / size
+            _ => None,
+        },
+        DspKind::Gain => match p {
+            0 => Some(0),
+            _ => None,
+        },
+        DspKind::Filter => match p {
+            0 => Some(0), // cutoff
+            1 => Some(1), // resonance
+            _ => None,
+        },
+        DspKind::Eq3 => match p {
+            0 => Some(0),
+            1 => Some(2),
+            _ => None,
+        },
+        DspKind::Limiter | DspKind::Saturation => match p {
+            0 => Some(0),
+            1 => Some(1),
+            _ => None,
+        },
+        DspKind::Pan => match p {
+            0 => Some(0),
+            _ => None,
+        },
     }
 }
 
@@ -88,6 +115,7 @@ struct DspSlot {
 pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
+    sample_rate: f64,
     voices: Vec<VoiceSlot>,
     dsp: Vec<DspSlot>,
     keys_node: Option<NodeId>,
@@ -160,6 +188,7 @@ impl GraphEngine {
         Self {
             graph,
             drain,
+            sample_rate,
             voices,
             dsp,
             keys_node,
@@ -212,13 +241,19 @@ impl GraphEngine {
             Command::SetParam { node, param, value } => {
                 let v = value as f32;
                 match param {
-                    P_LEVEL => {
-                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
-                            s.level = v;
-                        }
-                    }
                     P_VOL => self.master_vol = v,
                     P_WARM => self.master_warm = v,
+                    P_LEVEL => {
+                        // Voice level for instrument nodes; for DSP nodes param 0
+                        // is the node's first native knob (e.g. Reverb mix).
+                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                            s.level = v;
+                        } else if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+                            if let Some(native) = dsp_native_param(&s.kind, P_LEVEL) {
+                                s.proc.set_param(native, v);
+                            }
+                        }
+                    }
                     _ => {
                         if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
                             if let Some(native) = dsp_native_param(&s.kind, param) {
@@ -227,6 +262,54 @@ impl GraphEngine {
                         }
                     }
                 }
+            }
+            Command::LoadGraph { graph } => {
+                // Rare structural op (template load): rebuild graph, DSP, voice
+                // mapping, and MIDI matrix. Allocates — acceptable off the hot
+                // path; a future version can rebuild off-thread and swap.
+                self.graph = graph;
+                let sr = self.sample_rate;
+                self.dsp = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match &n.kind {
+                        NodeKind::Dsp(kind) => Some(DspSlot {
+                            node: n.id,
+                            kind: kind.clone(),
+                            proc: build_processor(kind, sr),
+                            buf: vec![0.0; 8192 * 2],
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                // Remap existing CLAP voices onto the new Clap nodes in id order;
+                // surplus voices go idle (sentinel node id, never routed).
+                let clap_ids: Vec<NodeId> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                    .map(|n| n.id)
+                    .collect();
+                for (i, v) in self.voices.iter_mut().enumerate() {
+                    v.node = clap_ids.get(i).copied().unwrap_or(u32::MAX);
+                }
+                self.matrix = Matrix::new();
+                self.matrix.reserve(64);
+                for &id in &clap_ids {
+                    self.matrix.connect(SourceId::Keys, id);
+                    self.matrix.connect(SourceId::LaptopKeys, id);
+                    for dev in 0..MAX_HW_DEVICES {
+                        self.matrix.connect(SourceId::Hardware(dev), id);
+                    }
+                }
+                self.keys_node = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .find(|n| matches!(n.kind, NodeKind::Keys))
+                    .map(|n| n.id);
             }
             Command::NoteOn { note, velocity, source } => {
                 let msg = MidiMsg::note_on(0, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);

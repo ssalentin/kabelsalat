@@ -35,6 +35,7 @@ pub const DARK_PANEL: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // rack cha
 pub const DARK_PANEL_HI: Color32 = Color32::from_rgb(0x23, 0x21, 0x20); // plates, rails, plugs
 pub const SCRIM: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // help backdrop (α 0.62)
 pub const CREAM: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9); // primary text on dark
+pub const CREAM_MID: Color32 = Color32::from_rgb(0xB4, 0xB4, 0xB0); // rack micro-labels (crisp on near-black)
 pub const CREAM_DIM: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x8C); // secondary text on dark
 pub const HAIRLINE_DARK: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x8C); // 1px rules on dark
 pub const METER_TRACK: Color32 = Color32::from_rgb(0x35, 0x35, 0x35); // unlit meter segments
@@ -101,16 +102,6 @@ pub fn paper_bg(painter: &egui::Painter, rect: Rect) {
 pub fn drop_shadow(painter: &egui::Painter, rect: Rect, radius: f32) {
     painter.rect_filled(rect.expand(4.0).translate(Vec2::new(0.0, 8.0)), radius + 4.0, alpha(INK, 0.08));
     painter.rect_filled(rect.expand(2.0).translate(Vec2::new(0.0, 5.0)), radius + 2.0, alpha(INK, 0.10));
-}
-
-/// Flat sheet: soft shadow + flat fill + optional 1px hairline. No gradients,
-/// no glass, no top highlight.
-pub fn flat_panel(painter: &egui::Painter, rect: Rect, radius: f32, fill: Color32, border: Option<Color32>) {
-    drop_shadow(painter, rect, radius);
-    painter.rect_filled(rect, radius, fill);
-    if let Some(c) = border {
-        painter.rect_stroke(rect, radius, Stroke::new(1.0, c), egui::StrokeKind::Inside);
-    }
 }
 
 /// The reference CTA's inner cream line — the universal focus/selection
@@ -250,14 +241,14 @@ pub fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// Primary action button (Send, Load, Add, Capture): ACCENT_DEEP fill,
-/// ON_ACCENT text (5.32:1), radius 8, no border; hover darkens toward ink.
+/// ON_ACCENT text (5.32:1), near-sharp sheet radius, no border; hover darkens.
 pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.scope(|ui| {
         let base = egui::style::WidgetVisuals {
             bg_fill: ACCENT_DEEP,
             weak_bg_fill: ACCENT_DEEP,
             bg_stroke: Stroke::NONE,
-            corner_radius: 8.0.into(),
+            corner_radius: 2.0.into(),
             fg_stroke: Stroke::new(1.0, ON_ACCENT),
             expansion: 0.0,
         };
@@ -271,7 +262,7 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         v.widgets.hovered = hot;
         v.widgets.active = hot;
         v.widgets.open = base;
-        ui.add(egui::Button::new(egui::RichText::new(text).color(ON_ACCENT)).corner_radius(8.0))
+        ui.add(egui::Button::new(egui::RichText::new(text).color(ON_ACCENT)).corner_radius(2.0))
     }).inner
 }
 
@@ -280,11 +271,14 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 // ---------------------------------------------------------------------------
 
 /// Hurricane visuals for the egui chrome around the custom rack painting.
+/// Shape scarcity (§2.3): page sheets & controls are essentially sharp (2–4px),
+/// the hero rack is the one generous radius, the flip CTA the one pill.
+/// Shadows only under floating sheets (windows) — never panels/controls.
 pub fn visuals() -> egui::Visuals {
     let mut v = egui::Visuals::light();
     v.panel_fill = PAPER;
     v.window_fill = PAPER;
-    v.window_corner_radius = 14.0.into();
+    v.window_corner_radius = 4.0.into();
     v.window_stroke = Stroke::new(1.0, HAIRLINE);
     v.window_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: alpha(INK, 0.10) };
     v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: alpha(INK, 0.10) };
@@ -297,7 +291,7 @@ pub fn visuals() -> egui::Visuals {
     v.warn_fg_color = ACCENT_DEEP;
     v.error_fg_color = CLIP_TEXT;
 
-    let r = 8.0;
+    let r = 2.0;
     v.widgets.noninteractive.bg_fill = PAPER;
     v.widgets.noninteractive.weak_bg_fill = PAPER;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);

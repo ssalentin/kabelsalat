@@ -242,6 +242,11 @@ fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"on":{"type":"boolean"}},"required":["node","source","on"]}
         }},
         {"type":"function","function":{
+            "name":"set_matrix_rule",
+            "description":"Shape ONE MIDI route live: channel filter (0-15, omit=omni), transpose (-24..24 semitones), key_lo/key_hi (split zone), vel_lo/vel_hi (velocity layer), enabled (mute). source: keys | laptop | hw:<device index>. Releases held notes on the destination. Example: node 1, source keys, key_hi 59, transpose -12 = bass zone an octave down.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"channel":{"type":"integer"},"transpose":{"type":"integer"},"key_lo":{"type":"integer"},"key_hi":{"type":"integer"},"vel_lo":{"type":"integer"},"vel_hi":{"type":"integer"},"enabled":{"type":"boolean"}},"required":["node","source"]}
+        }},
+        {"type":"function","function":{
             "name":"list_plugins",
             "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
             "parameters":{"type":"object","properties":{}}

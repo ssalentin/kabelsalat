@@ -357,6 +357,23 @@ pub enum Command {
     /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
     /// notes at/above → rig B (node 4). `None` disables the split (both full range).
     SetSplit { point: Option<u8> },
+    /// Live edit of ONE matrix rule (source → dest): channel filter, transpose,
+    /// key/velocity ranges, enabled. Fixed-size (CC maps arrive with MIDI-learn).
+    /// The engine applies it in place and releases held notes on the destination
+    /// — the matrix is stateless, so range/transpose edits can orphan releases
+    /// (docs/midi-matrix.md integration contract).
+    MatrixRule {
+        source: SourceId,
+        dest: NodeId,
+        /// None = omni; Some(ch) = that 0-based channel only.
+        channel: Option<u8>,
+        transpose: i8,
+        key_lo: u8,
+        key_hi: u8,
+        vel_lo: u8,
+        vel_hi: u8,
+        enabled: bool,
+    },
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
     SetSystemAudio { gain: f32 },

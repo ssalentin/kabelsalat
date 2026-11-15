@@ -100,7 +100,15 @@ add-effect rebuilds the rack and plays; demo/templates/flip/sessions unaffected.
   instrument's atom input. **Verified:** `lv2-instrument-engine-test` sends a note
   through the control plane and reads it back at the instrument (event
   `[0x90,60,114]`); the effect path still passes (no regression).
+- **Plugin browser — LANDED (commit fc5bc05):** the browser (F9) offers both
+  **Add instrument** (Keys→LV2→Master, MIDI + audio cables) and **Add effect**
+  for every LV2 plugin; `is_instrument` (atom input + audio output) emphasizes
+  the likely role. Verified live: add-instrument rebuilds the rack and routes
+  notes; session-test covers the instrument graph (3 units / 2 cables).
+- **Classification note:** the authoritative LV2 plugin class is exposed by LSP
+  as a blank node lilv can't resolve to a URI, so `is_instrument` is a permissive
+  port-based hint; both add roles stay available.
 - **Remaining limit:** the installed LV2 instruments are samplers (need samples)
   or free-running generators, so audible MIDI→audio output couldn't be confirmed
   with them. Note routing + delivery is verified; audible playback awaits a
-  suitable MIDI synth (and a UI to add LV2 instruments as rigs).
+  suitable MIDI synth.

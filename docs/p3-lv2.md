@@ -35,8 +35,12 @@ Key implementation points:
   deactivate may be NULL).
 - Most plugins require the **URID-map feature**. We implement a host-side
   `UridMap` (HashMap URI→u32) with an `extern "C"` map callback, passed as a
-  NULL-terminated `LV2_Feature` array to `lilv_plugin_instantiate`. (Carla
-  plugins also want the `options` feature; LSP plugins work with urid-map alone.)
+  NULL-terminated `LV2_Feature` array to `lilv_plugin_instantiate`.
+- The **options feature** (`LV2_OPTIONS__options`) is also provided: a
+  zero-terminated `LV2_Options_Option` array with `sampleRate` (float) and
+  `maxBlockLength` (int), keys/types mapped via the URID map. **Carla plugins
+  now host too** (commit `06ac691`): `lv2-host-test` runs Carla audiogain_s,
+  output 0.317 for a 0.5 input at the plugin's default gain.
 - Ports are classified via `lilv_port_is_a` against lv2core AudioPort/
   ControlPort/InputPort nodes; audio ports get buffers, control inputs are set
   to their `lilv_port_get_range` default.
@@ -45,7 +49,6 @@ Key implementation points:
 
 1. Add `NodeKind::Lv2 { uri }` to the control plane; an LV2 voice slot in the
    engine mirroring the CLAP `ClapVoice` (instantiate off-thread, run in render).
-2. Provide the `options` feature too (sample rate etc.) so Carla plugins load.
 3. MIDI/atom ports via the URID map + an event buffer (for LV2 instruments).
 4. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
 

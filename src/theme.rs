@@ -1,44 +1,60 @@
-//! Signal design language (docs/design-language.md) — "audio is light".
+//! Hurricane design language (docs/design-reference-analysis.md) — light,
+//! warm, editorial. One hero inversion: the rack is the reference's single
+//! near-black panel; all egui chrome lives on warm paper.
 //!
-//! Central palette + painter helpers for the luminous glass control surface.
-//! Everything here is paint-only: no audio state, no locks, no I/O on the
-//! frame path (font files are read once at startup). The rack, toolbar,
-//! keyboard, popovers and egui panels all draw through these tokens so the
-//! look stays consistent.
+//! Central palette + painter helpers. Everything here is paint-only: no audio
+//! state, no locks, no I/O on the frame path (font files are read once at
+//! startup). Flat fills, 1px hairlines, one tomato accent — no gradients, no
+//! glass, no glows. The only shadow is a soft ink one under floating sheets.
 //!
-//! Semantics: audio = cyan/blue · MIDI = amber · selection = violet ·
-//! active/playing = green · clip/danger = red · special/record = magenta.
+//! Semantics: audio = cream (round terminals) · MIDI = blue (square) ·
+//! selection/CTA = tomato · active/playing = teal · clip/danger = red.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Color32, FontFamily, FontId, Pos2, Rect, Shape, Stroke, Vec2,
+    self, Color32, FontFamily, FontId, Pos2, Rect, Stroke, Vec2,
 };
 
 // ---------------------------------------------------------------------------
-// Palette — commit to it (docs/design-language.md)
+// Palette — measured from the Hurricane reference (§2.1 / §3.1 of the brief)
 // ---------------------------------------------------------------------------
 
-// Background / neutrals: cool, layered — never flat gray.
-pub const BG_DEEP: Color32 = Color32::from_rgb(0x07, 0x0A, 0x12); // window base
-pub const BG_RAISED: Color32 = Color32::from_rgb(0x0C, 0x11, 0x20); // raised surface
-pub const SURFACE: Color32 = Color32::from_rgb(0x12, 0x1A, 0x2E); // glass panel base
-pub const SURFACE_HI: Color32 = Color32::from_rgb(0x1B, 0x27, 0x40); // gradient lighter end
-pub const SCRIM: Color32 = Color32::from_rgb(0x05, 0x07, 0x0D); // overlays / help backdrop
-pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xED, 0xF7); // primary
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0x7C, 0x8A, 0xA5); // secondary / labels
-pub const HAIRLINE: Color32 = Color32::from_rgb(0x23, 0x30, 0x4C); // default border
+// Paper & ink (light side).
+pub const PAPER: Color32 = Color32::from_rgb(0xF4, 0xF3, 0xEE); // window base / panels
+pub const PAPER_SINK: Color32 = Color32::from_rgb(0xEC, 0xEA, 0xE3); // recessed fields, chips
+pub const INK: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // primary text on paper
+pub const INK_2: Color32 = Color32::from_rgb(0x64, 0x64, 0x64); // secondary text on paper
+pub const HAIRLINE: Color32 = Color32::from_rgb(0xBE, 0xBE, 0xBE); // 1px rules on paper
+pub const MUTED: Color32 = Color32::from_rgb(0xA7, 0xA2, 0x9F); // decorative ONLY (2.27:1)
+pub const WATERMARK: Color32 = Color32::from_rgb(0xE7, 0xE5, 0xDF); // ambient signature
 
-// Signal accents: full chroma, separable by luminance too.
-pub const AUDIO_CYAN: Color32 = Color32::from_rgb(0x22, 0xD3, 0xEE); // audio A / primary
-pub const AUDIO_BLUE: Color32 = Color32::from_rgb(0x38, 0xBD, 0xF8); // audio B
-pub const MIDI_AMBER: Color32 = Color32::from_rgb(0xFB, 0xBF, 0x24); // MIDI (warm)
-pub const ACCENT_VIOLET: Color32 = Color32::from_rgb(0xA7, 0x8B, 0xFA); // selection
-pub const ACCENT_MAGENTA: Color32 = Color32::from_rgb(0xF4, 0x72, 0xB6); // special / record
-pub const LIVE_GREEN: Color32 = Color32::from_rgb(0x34, 0xD3, 0x99); // active / playing
-pub const CLIP_RED: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71); // overload / danger
-pub const WARN_AMBER: Color32 = Color32::from_rgb(0xF5, 0x9E, 0x0B); // warning
+// The inverted hero panel (dark side).
+pub const DARK_PANEL: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // rack chassis, help card
+pub const DARK_PANEL_HI: Color32 = Color32::from_rgb(0x23, 0x21, 0x20); // plates, rails, plugs
+pub const SCRIM: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // help backdrop (α 0.62)
+pub const CREAM: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9); // primary text on dark
+pub const CREAM_DIM: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x8C); // secondary text on dark
+pub const HAIRLINE_DARK: Color32 = Color32::from_rgb(0x8E, 0x8E, 0x8C); // 1px rules on dark
+pub const METER_TRACK: Color32 = Color32::from_rgb(0x35, 0x35, 0x35); // unlit meter segments
+
+// The one hot accent + its text-safe variants (§5 contrast table).
+pub const ACCENT: Color32 = Color32::from_rgb(0xEF, 0x48, 0x25); // graphics / fills / large text
+pub const ACCENT_DEEP: Color32 = Color32::from_rgb(0xC0, 0x39, 0x1B); // small filled buttons, warn text on paper
+pub const ACCENT_BRIGHT: Color32 = Color32::from_rgb(0xF1, 0x55, 0x2E); // small orange text on dark
+pub const ON_ACCENT: Color32 = Color32::from_rgb(0xFF, 0xFB, 0xFA); // text/glyphs on accent fills
+
+// Semantic expansion, sampled from the reference imagery (§3).
+pub const AUDIO_CREAM: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9); // audio cables/jacks
+pub const MIDI_BLUE: Color32 = Color32::from_rgb(0x5B, 0x8F, 0xD0); // MIDI on dark
+pub const MIDI_BLUE_DEEP: Color32 = Color32::from_rgb(0x1C, 0x5A, 0x8B); // MIDI on paper / links
+pub const LIVE_TEAL: Color32 = Color32::from_rgb(0x2E, 0x9E, 0x9B); // active / playing on dark
+pub const LIVE_TEAL_DEEP: Color32 = Color32::from_rgb(0x1F, 0x7A, 0x70); // active text on paper
+pub const CLIP_RED: Color32 = Color32::from_rgb(0xD9, 0x25, 0x1C); // clip graphics
+pub const CLIP_TEXT: Color32 = Color32::from_rgb(0xB9, 0x1C, 0x14); // danger text on paper
+#[allow(dead_code)] // reserved token (§3.1): danger text on dark, no call site yet
+pub const CLIP_BRIGHT: Color32 = Color32::from_rgb(0xF0, 0x55, 0x4A); // danger text on dark
 
 // ---------------------------------------------------------------------------
 // Color helpers (no allocation)
@@ -60,123 +76,58 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 // ---------------------------------------------------------------------------
-// Depth & atmosphere
+// Depth & atmosphere — flat fills, hairlines, one soft shadow (§2.4 / §4.1)
 // ---------------------------------------------------------------------------
 
-/// Vertical-gradient rounded rect as a triangle-fan mesh (one draw call).
-/// Perimeter vertices are colored by their y; the fan center takes the mid
-/// color. ~21 vertices — cheap enough for every panel, every frame.
-pub fn gradient_rect(painter: &egui::Painter, rect: Rect, radius: f32, top: Color32, bottom: Color32) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
-    let r = radius.clamp(0.0, rect.width().min(rect.height()) * 0.5);
-    let color_at = |y: f32| {
-        let t = ((y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-        mix(top, bottom, t)
-    };
-    let mut mesh = egui::Mesh::default();
-    let center = rect.center();
-    mesh.vertices.push(egui::epaint::Vertex::untextured(center, color_at(center.y)));
-    // Clockwise perimeter: TL → TR → BR → BL corner arcs.
-    let corners = [
-        (Pos2::new(rect.left() + r, rect.top() + r), std::f32::consts::PI),
-        (Pos2::new(rect.right() - r, rect.top() + r), 1.5 * std::f32::consts::PI),
-        (Pos2::new(rect.right() - r, rect.bottom() - r), 0.0),
-        (Pos2::new(rect.left() + r, rect.bottom() - r), 0.5 * std::f32::consts::PI),
-    ];
-    let segs = 4;
-    let mut first = 1usize;
-    for (cc, a0) in corners {
-        for i in 0..=segs {
-            let a = a0 + (std::f32::consts::FRAC_PI_2) * (i as f32 / segs as f32);
-            let p = cc + Vec2::new(a.cos(), a.sin()) * r;
-            let idx = mesh.vertices.len();
-            mesh.vertices.push(egui::epaint::Vertex::untextured(p, color_at(p.y)));
-            if idx > first {
-                mesh.indices.extend_from_slice(&[0, idx as u32 - 1, idx as u32]);
-            }
-            if i == 0 && first == 1 { first = idx; }
-        }
+/// The brand asterisk: 3 lines through a center at 0°/60°/120° (six spokes).
+pub fn asterisk(painter: &egui::Painter, center: Pos2, radius: f32, color: Color32, width: f32) {
+    for i in 0..3 {
+        let a = (i as f32) * std::f32::consts::PI / 3.0;
+        let d = Vec2::new(a.cos(), a.sin()) * radius;
+        painter.line_segment([center - d, center + d], Stroke::new(width, color));
     }
-    // Close the fan back to the first perimeter vertex.
-    let last = mesh.vertices.len() as u32 - 1;
-    mesh.indices.extend_from_slice(&[0, last, first as u32]);
-    painter.add(Shape::mesh(mesh));
 }
 
-/// Soft drop shadow: two stacked rounded rects approximating a blur
-/// (black ~35% total, offset y+6). Paint BEFORE the panel itself.
+/// Window background: flat warm paper + one oversized watermark asterisk
+/// bleeding off the bottom-right (purely decorative, behind everything).
+pub fn paper_bg(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect, 0.0, PAPER);
+    let center = Pos2::new(rect.right() - 60.0, rect.bottom() - 30.0);
+    asterisk(painter, center, 140.0, WATERMARK, 2.0);
+}
+
+/// The ONLY shadow: soft, large-blur, ink-based, under whole floating sheets.
+/// Two stacked rounded rects approximate the blur. Paint BEFORE the sheet.
 pub fn drop_shadow(painter: &egui::Painter, rect: Rect, radius: f32) {
-    painter.rect_filled(rect.expand(3.0).translate(Vec2::new(0.0, 7.0)), radius + 3.0, alpha(Color32::BLACK, 0.16));
-    painter.rect_filled(rect.expand(1.0).translate(Vec2::new(0.0, 5.0)), radius + 1.0, alpha(Color32::BLACK, 0.20));
+    painter.rect_filled(rect.expand(4.0).translate(Vec2::new(0.0, 8.0)), radius + 4.0, alpha(INK, 0.08));
+    painter.rect_filled(rect.expand(2.0).translate(Vec2::new(0.0, 5.0)), radius + 2.0, alpha(INK, 0.10));
 }
 
-/// The glass panel: vertical SURFACE_HI→SURFACE gradient, 1px accent-tinted
-/// border (~35%), 1px top inner highlight (white ~6%). Shadow included.
-pub fn glass_panel(painter: &egui::Painter, rect: Rect, radius: f32, accent: Color32) {
+/// Flat sheet: soft shadow + flat fill + optional 1px hairline. No gradients,
+/// no glass, no top highlight.
+pub fn flat_panel(painter: &egui::Painter, rect: Rect, radius: f32, fill: Color32, border: Option<Color32>) {
     drop_shadow(painter, rect, radius);
-    gradient_rect(painter, rect, radius, SURFACE_HI, SURFACE);
-    painter.rect_stroke(rect, radius, Stroke::new(1.0, alpha(accent, 0.35)), egui::StrokeKind::Inside);
-    top_highlight(painter, rect, radius);
-}
-
-/// 1px inner highlight along the top edge (the "glass rim light").
-pub fn top_highlight(painter: &egui::Painter, rect: Rect, radius: f32) {
-    let y = rect.top() + 1.0;
-    painter.line_segment(
-        [Pos2::new(rect.left() + radius, y), Pos2::new(rect.right() - radius, y)],
-        Stroke::new(1.0, alpha(Color32::WHITE, 0.06)),
-    );
-}
-
-/// Accent edge glow for active/selected units: 3 stacked strokes with
-/// decreasing width and alpha, drawn outside the rect.
-pub fn glow_rect(painter: &egui::Painter, rect: Rect, radius: f32, color: Color32, strength: f32) {
-    let s = strength.clamp(0.0, 1.0);
-    if s <= 0.01 { return; }
-    painter.rect_stroke(rect, radius, Stroke::new(6.0, alpha(color, 0.10 * s)), egui::StrokeKind::Outside);
-    painter.rect_stroke(rect, radius, Stroke::new(3.5, alpha(color, 0.20 * s)), egui::StrokeKind::Outside);
-    painter.rect_stroke(rect, radius, Stroke::new(1.5, alpha(color, 0.45 * s)), egui::StrokeKind::Outside);
-}
-
-/// Window atmosphere: BG_DEEP base + two very-low-alpha radial aurora glows
-/// (cyan top-left, violet bottom-right) + the faint dot grid. Stacked
-/// translucent circles approximate the radial falloff without textures.
-pub fn aurora_bg(painter: &egui::Painter, rect: Rect) {
-    painter.rect_filled(rect, 0.0, BG_DEEP);
-    let r = rect.width().max(rect.height()) * 0.55;
-    let glows = [
-        (Pos2::new(rect.left() + rect.width() * 0.16, rect.top() + rect.height() * 0.10), AUDIO_CYAN, 0.013),
-        (Pos2::new(rect.left() + rect.width() * 0.88, rect.top() + rect.height() * 0.92), ACCENT_VIOLET, 0.012),
-    ];
-    for (center, color, a) in glows {
-        for i in 0..12 {
-            let rad = r * (1.0 - i as f32 / 12.0);
-            painter.circle_filled(center, rad, alpha(color, a));
-        }
+    painter.rect_filled(rect, radius, fill);
+    if let Some(c) = border {
+        painter.rect_stroke(rect, radius, Stroke::new(1.0, c), egui::StrokeKind::Inside);
     }
-    // Faint dot grid (HAIRLINE family, ~4% perceived).
-    let spacing = 44.0;
-    let dot = alpha(mix(HAIRLINE, TEXT_DIM, 0.35), 0.30);
-    let mut count = 0;
-    let mut y = rect.top();
-    while y <= rect.bottom() && count < 2200 {
-        let mut x = rect.left();
-        while x <= rect.right() && count < 2200 {
-            painter.rect_filled(Rect::from_center_size(Pos2::new(x, y), Vec2::splat(1.6)), 0.8, dot);
-            x += spacing;
-            count += 1;
-        }
-        y += spacing;
-    }
+}
+
+/// The reference CTA's inner cream line — the universal focus/selection
+/// treatment on dark: a stroke inset a few px inside the rect edge.
+pub fn inset_keyline(painter: &egui::Painter, rect: Rect, radius: f32, color: Color32, width: f32, inset: f32) {
+    let r = rect.expand(-inset);
+    if r.width() <= 0.0 || r.height() <= 0.0 { return; }
+    painter.rect_stroke(r, (radius - inset).max(0.0), Stroke::new(width, color), egui::StrokeKind::Inside);
 }
 
 // ---------------------------------------------------------------------------
 // Controls
 // ---------------------------------------------------------------------------
 
-/// Knob value arc: HAIRLINE track, accent value arc with a soft glow pass,
-/// indicator dot at the value angle. 270° sweep from bottom-left. `map`
-/// converts unit-local offsets to screen space (the rack flip transform).
+/// Knob value arc, flat (§4.6): hairline track α 0.35 at 2px, solid accent
+/// value arc at 2.4px (no glow pass), flat end dot r 2.2. 270° sweep from
+/// bottom-left; geometry unchanged. `map` carries the rack flip transform.
 pub fn value_arc(
     painter: &egui::Painter,
     map: impl Fn(Vec2) -> Pos2,
@@ -191,99 +142,199 @@ pub fn value_arc(
     let segs = 20;
     let v = value.clamp(0.0, 1.0);
     let mut prev_track: Option<Pos2> = None;
-    let mut prev_glow: Option<Pos2> = None;
     let mut prev_val: Option<Pos2> = None;
     for i in 0..=segs {
         let f = i as f32 / segs as f32;
         let ang = a0 + sweep * f;
         let p = map(center + Vec2::new(ang.cos(), ang.sin()) * arc_r);
         if let Some(pp) = prev_track {
-            painter.line_segment([pp, p], Stroke::new(2.0, alpha(HAIRLINE, 0.9)));
+            painter.line_segment([pp, p], Stroke::new(2.0, alpha(HAIRLINE_DARK, 0.35)));
         }
         prev_track = Some(p);
         if f <= v {
-            if let Some(pp) = prev_glow {
-                painter.line_segment([pp, p], Stroke::new(5.5, alpha(accent, 0.18)));
-            }
-            prev_glow = Some(p);
             if let Some(pp) = prev_val {
                 painter.line_segment([pp, p], Stroke::new(2.4, accent));
             }
             prev_val = Some(p);
         }
     }
-    // Indicator dot at the value angle.
+    // Flat indicator dot at the value angle.
     let ang = a0 + sweep * v;
     let dot = map(center + Vec2::new(ang.cos(), ang.sin()) * arc_r);
-    painter.circle_filled(dot, 2.2, mix(accent, Color32::WHITE, 0.45));
+    painter.circle_filled(dot, 2.2, accent);
 }
 
-/// Meter gradient: green → amber → red across t ∈ [0,1].
+/// Meter color, stepped — not a gradient (§4.8): cream → tomato → clip red.
 pub fn meter_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    if t < 0.6 { mix(LIVE_GREEN, MIDI_AMBER, t / 0.6) } else { mix(MIDI_AMBER, CLIP_RED, (t - 0.6) / 0.4) }
-}
-
-/// Small uppercase letter-spaced section label (paint helper for galleys).
-pub fn section_label(text: &str) -> egui::RichText {
-    egui::RichText::new(text.to_uppercase()).small().strong().color(TEXT_DIM)
+    if t < 0.6 { CREAM } else if t < 0.9 { ACCENT } else { CLIP_RED }
 }
 
 // ---------------------------------------------------------------------------
-// egui shell (panels, windows, widgets)
+// Typography: tracked micro-caps (§4.5). egui has no letter-spacing API, so
+// tracked labels are laid out per character: advance = char_width + em·size.
+// Per-char galleys use delayed color (cached once, painted in any color).
 // ---------------------------------------------------------------------------
 
-/// Signal visuals for the egui chrome around the custom rack painting.
+/// A cached tracked label: per-character galleys + their x offsets.
+/// Built once (in `ensure_galleys` for rack labels); painting is RT-safe.
+pub struct TrackedLabel {
+    /// (galley, x offset of the character origin).
+    pub chars: Vec<(Arc<egui::Galley>, f32)>,
+    pub size: Vec2,
+}
+
+/// Lay out `text` with letter-spacing `tracking_em` (em fractions; negative
+/// for display type, clamped so advance ≥ 0.9·char_width). Color is applied
+/// at paint time via [`paint_tracked`].
+pub fn layout_tracked(fonts: &mut egui::epaint::FontsView<'_>, text: &str, font: FontId, tracking_em: f32) -> TrackedLabel {
+    let tracking = tracking_em * font.size;
+    let mut x = 0.0f32;
+    let mut h = 0.0f32;
+    let mut chars = Vec::with_capacity(text.chars().count());
+    for ch in text.chars() {
+        let g = fonts.layout_delayed_color(ch.to_string(), font.clone(), f32::INFINITY);
+        h = h.max(g.size().y);
+        chars.push((g, x));
+        let w = fonts.glyph_width(&font, ch);
+        let adv = if tracking_em < 0.0 { (w + tracking).max(w * 0.9) } else { w + tracking };
+        x += adv;
+    }
+    TrackedLabel { chars, size: Vec2::new(x, h) }
+}
+
+/// Paint a cached tracked label at `pos` (top-left of the first character).
+pub fn paint_tracked(painter: &egui::Painter, pos: Pos2, label: &TrackedLabel, color: Color32) {
+    for (g, dx) in &label.chars {
+        painter.galley(pos + Vec2::new(*dx, 0.0), g.clone(), color);
+    }
+}
+
+/// Tracked label as an egui widget (paper-side chrome). Per-character galleys
+/// hit egui's galley cache, so this stays allocation-light per frame.
+/// IMPORTANT: layout happens under the fonts lock, painting AFTER it is
+/// released — egui 0.37's Context is one RwLock, and Painter::add takes the
+/// same write lock (painting inside fonts_mut deadlocks).
+pub fn tracked_label(ui: &mut egui::Ui, text: &str, size: f32, tracking_em: f32, color: Color32) -> egui::Response {
+    let font = FontId::proportional(size);
+    let tracking = tracking_em * size;
+    let advance = |f: &mut egui::epaint::FontsView<'_>, ch: char| {
+        let w = f.glyph_width(&font, ch);
+        if tracking_em < 0.0 { (w + tracking).max(w * 0.9) } else { w + tracking }
+    };
+    let (width, height, galleys) = ui.fonts_mut(|f| {
+        let mut x = 0.0f32;
+        let mut h = 0.0f32;
+        let mut gs = Vec::with_capacity(text.chars().count());
+        for ch in text.chars() {
+            let g = f.layout_delayed_color(ch.to_string(), font.clone(), f32::INFINITY);
+            h = h.max(g.size().y);
+            gs.push((g, x));
+            x += advance(f, ch);
+        }
+        (x, h, gs)
+    });
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), egui::Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        for (g, dx) in galleys {
+            painter.galley(Pos2::new(rect.left() + dx, rect.top()), g, color);
+        }
+    }
+    resp
+}
+
+/// Section label for egui chrome: uppercase, 10px, tracked +0.14em, INK_2.
+pub fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    tracked_label(ui, &text.to_uppercase(), 10.0, 0.14, INK_2)
+}
+
+/// Primary action button (Send, Load, Add, Capture): ACCENT_DEEP fill,
+/// ON_ACCENT text (5.32:1), radius 8, no border; hover darkens toward ink.
+pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let base = egui::style::WidgetVisuals {
+            bg_fill: ACCENT_DEEP,
+            weak_bg_fill: ACCENT_DEEP,
+            bg_stroke: Stroke::NONE,
+            corner_radius: 8.0.into(),
+            fg_stroke: Stroke::new(1.0, ON_ACCENT),
+            expansion: 0.0,
+        };
+        let hot = egui::style::WidgetVisuals {
+            bg_fill: mix(ACCENT_DEEP, INK, 0.08),
+            weak_bg_fill: mix(ACCENT_DEEP, INK, 0.08),
+            ..base
+        };
+        let v = ui.visuals_mut();
+        v.widgets.inactive = base;
+        v.widgets.hovered = hot;
+        v.widgets.active = hot;
+        v.widgets.open = base;
+        ui.add(egui::Button::new(egui::RichText::new(text).color(ON_ACCENT)).corner_radius(8.0))
+    }).inner
+}
+
+// ---------------------------------------------------------------------------
+// egui shell (§4.17): light paper chrome around the dark rack hero.
+// ---------------------------------------------------------------------------
+
+/// Hurricane visuals for the egui chrome around the custom rack painting.
 pub fn visuals() -> egui::Visuals {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = BG_DEEP;
-    v.window_fill = SURFACE;
+    let mut v = egui::Visuals::light();
+    v.panel_fill = PAPER;
+    v.window_fill = PAPER;
     v.window_corner_radius = 14.0.into();
     v.window_stroke = Stroke::new(1.0, HAIRLINE);
-    v.window_shadow = egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: alpha(Color32::BLACK, 0.45) };
-    v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: alpha(Color32::BLACK, 0.40) };
-    v.override_text_color = Some(TEXT);
-    v.hyperlink_color = AUDIO_CYAN;
-    v.selection.bg_fill = alpha(ACCENT_VIOLET, 0.35);
-    v.selection.stroke = Stroke::new(1.0, ACCENT_VIOLET);
-    v.extreme_bg_color = BG_DEEP;
-    v.code_bg_color = BG_RAISED;
-    v.warn_fg_color = WARN_AMBER;
-    v.error_fg_color = CLIP_RED;
+    v.window_shadow = egui::Shadow { offset: [0, 8], blur: 24, spread: 0, color: alpha(INK, 0.10) };
+    v.popup_shadow = egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: alpha(INK, 0.10) };
+    v.override_text_color = Some(INK);
+    v.hyperlink_color = MIDI_BLUE_DEEP;
+    v.selection.bg_fill = alpha(ACCENT, 0.25);
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.extreme_bg_color = PAPER_SINK;
+    v.code_bg_color = PAPER_SINK;
+    v.warn_fg_color = ACCENT_DEEP;
+    v.error_fg_color = CLIP_TEXT;
 
     let r = 8.0;
-    v.widgets.noninteractive.bg_fill = SURFACE;
-    v.widgets.noninteractive.weak_bg_fill = SURFACE;
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+    v.widgets.noninteractive.bg_fill = PAPER;
+    v.widgets.noninteractive.weak_bg_fill = PAPER;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, INK_2);
     v.widgets.noninteractive.corner_radius = r.into();
-    v.widgets.inactive.bg_fill = SURFACE_HI;
-    v.widgets.inactive.weak_bg_fill = SURFACE;
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.inactive.bg_fill = PAPER;
+    v.widgets.inactive.weak_bg_fill = PAPER_SINK;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, INK);
     v.widgets.inactive.corner_radius = r.into();
-    v.widgets.hovered.bg_fill = mix(SURFACE_HI, AUDIO_CYAN, 0.14);
-    v.widgets.hovered.weak_bg_fill = mix(SURFACE, AUDIO_CYAN, 0.10);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, alpha(AUDIO_CYAN, 0.45));
+    v.widgets.hovered.bg_fill = PAPER_SINK;
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0xE4, 0xE2, 0xDA);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, MUTED);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, INK);
     v.widgets.hovered.corner_radius = r.into();
-    v.widgets.active.bg_fill = mix(SURFACE_HI, ACCENT_VIOLET, 0.25);
-    v.widgets.active.weak_bg_fill = mix(SURFACE, ACCENT_VIOLET, 0.18);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, alpha(ACCENT_VIOLET, 0.60));
+    v.widgets.active.bg_fill = alpha(ACCENT, 0.15);
+    v.widgets.active.weak_bg_fill = alpha(ACCENT, 0.10);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, INK);
     v.widgets.active.corner_radius = r.into();
-    v.widgets.open.bg_fill = SURFACE_HI;
-    v.widgets.open.weak_bg_fill = SURFACE_HI;
-    v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.open.bg_fill = PAPER_SINK;
+    v.widgets.open.weak_bg_fill = PAPER_SINK;
     v.widgets.open.bg_stroke = Stroke::new(1.0, HAIRLINE);
+    v.widgets.open.fg_stroke = Stroke::new(1.0, INK);
     v.widgets.open.corner_radius = r.into();
     v
 }
 
 // ---------------------------------------------------------------------------
-// Typography: Noto Sans (regular/medium/bold) + JetBrains Mono, with the
-// bundled egui fonts as fallback. Files are read once, at startup only.
+// Typography (§4.19): Noto Sans Regular/Medium/Bold + JetBrains Mono for
+// telemetry only, with the bundled egui fonts as fallback. Files are read
+// once, at startup only. Medium carries display/headings/unit names; Bold is
+// reserved for the flip-pill large label.
 // ---------------------------------------------------------------------------
 
 static BOLD_INSTALLED: AtomicBool = AtomicBool::new(false);
+static MEDIUM_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &str) -> bool {
     match std::fs::read(path) {
@@ -295,7 +346,7 @@ fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &str) -> bool 
     }
 }
 
-/// Install the Signal typefaces. Missing files degrade gracefully to the
+/// Install the Hurricane typefaces. Missing files degrade gracefully to the
 /// egui defaults (the app must never fail to start over a font).
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -319,15 +370,26 @@ pub fn install_fonts(ctx: &egui::Context) {
         let mut fam = vec!["noto-medium".to_owned()];
         if reg { fam.push("noto".into()); }
         fonts.families.insert(FontFamily::Name("medium".into()), fam);
+        MEDIUM_INSTALLED.store(true, Ordering::Relaxed);
     }
     ctx.set_fonts(fonts);
 }
 
-/// Bold proportional face for unit names / headings (falls back to the
-/// regular proportional face when the bold font file was unavailable).
+/// Bold proportional face — reserved for the flip-pill large label (falls
+/// back to the regular proportional face when the bold file was unavailable).
 pub fn bold_font(size: f32) -> FontId {
     if BOLD_INSTALLED.load(Ordering::Relaxed) {
         FontId::new(size, FontFamily::Name("bold".into()))
+    } else {
+        FontId::proportional(size)
+    }
+}
+
+/// Medium proportional face for display/headings/unit names (weight 500 ≈
+/// the reference's 400–550). Falls back to regular when unavailable.
+pub fn medium_font(size: f32) -> FontId {
+    if MEDIUM_INSTALLED.load(Ordering::Relaxed) {
+        FontId::new(size, FontFamily::Name("medium".into()))
     } else {
         FontId::proportional(size)
     }

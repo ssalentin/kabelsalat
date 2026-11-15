@@ -45,28 +45,26 @@ use crate::session::Template;
 use crate::theme;
 
 // ---------------------------------------------------------------------------
-// Palette — Signal design language (src/theme.rs, docs/design-language.md).
-// The legacy names stay as aliases so the drawing code reads naturally;
-// all values come from the single theme source.
+// Palette — Hurricane design language (src/theme.rs,
+// docs/design-reference-analysis.md §3.2). The legacy names stay as aliases
+// so the drawing code reads naturally; all values come from the single theme
+// source. Rack painting is on the dark hero panel; egui chrome is on paper.
 // ---------------------------------------------------------------------------
 
-const BG: Color32 = theme::BG_DEEP;
-const YELLOW: Color32 = theme::MIDI_AMBER; // MIDI
-const BLUE: Color32 = theme::AUDIO_CYAN; // audio A
-const GREEN: Color32 = theme::LIVE_GREEN; // active / playing / sources
-const PURPLE: Color32 = theme::ACCENT_VIOLET; // selection
-const ORANGE: Color32 = theme::WARN_AMBER;
-const CHASSIS: Color32 = theme::BG_RAISED;
-const RAIL: Color32 = theme::SURFACE;
-const PLATE_FRONT: Color32 = theme::SURFACE;
-const PLATE_BACK: Color32 = Color32::from_rgb(0x0d, 0x12, 0x21); // SURFACE → BG_DEEP 45%
-const BORDER: Color32 = theme::HAIRLINE;
-const RING: Color32 = Color32::from_rgb(0x42, 0x4f, 0x6b); // HAIRLINE → TEXT_DIM 35%
-const PLUG: Color32 = theme::SURFACE_HI;
-const TEXT: Color32 = theme::TEXT;
-const SUBTEXT: Color32 = theme::TEXT_DIM;
-const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
-const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
+const YELLOW: Color32 = theme::MIDI_BLUE; // MIDI
+const GREEN: Color32 = theme::LIVE_TEAL; // active / playing / sources
+const ORANGE: Color32 = theme::ACCENT; // cable warming
+const CHASSIS: Color32 = theme::DARK_PANEL;
+const RAIL: Color32 = theme::DARK_PANEL_HI;
+const PLATE_FRONT: Color32 = theme::DARK_PANEL_HI;
+const PLATE_BACK: Color32 = Color32::from_rgb(0x20, 0x1F, 0x1E); // one whisper darker
+const BORDER: Color32 = theme::HAIRLINE_DARK;
+const RING: Color32 = theme::CREAM_DIM;
+const PLUG: Color32 = theme::DARK_PANEL_HI;
+const TEXT: Color32 = theme::CREAM;
+const SUBTEXT: Color32 = theme::CREAM_DIM;
+const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
+const BLACK: Color32 = theme::INK; // #1C1C1C
 
 /// The reference CLAP instrument (PLAN §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
@@ -99,11 +97,6 @@ fn clamp_len(v: Vec2, max: f32) -> Vec2 {
 }
 
 #[inline]
-fn lerp_pos(a: Pos2, b: Pos2, t: f32) -> Pos2 {
-    Pos2::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
-}
-
-#[inline]
 fn cubic(p: &[Pos2; 4], t: f32) -> Pos2 {
     let u = 1.0 - t;
     let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
@@ -111,23 +104,6 @@ fn cubic(p: &[Pos2; 4], t: f32) -> Pos2 {
         w0 * p[0].x + w1 * p[1].x + w2 * p[2].x + w3 * p[3].x,
         w0 * p[0].y + w1 * p[1].y + w2 * p[2].y + w3 * p[3].y,
     )
-}
-
-fn split_cubic(p: &[Pos2; 4], t: f32) -> ([Pos2; 4], [Pos2; 4]) {
-    let a = lerp_pos(p[0], p[1], t);
-    let b = lerp_pos(p[1], p[2], t);
-    let c = lerp_pos(p[2], p[3], t);
-    let d = lerp_pos(a, b, t);
-    let e = lerp_pos(b, c, t);
-    let m = lerp_pos(d, e, t);
-    ([p[0], a, d, m], [m, e, c, p[3]])
-}
-
-/// Sub-curve between parameters t0..t1 (pulse trails).
-fn sub_cubic(p: &[Pos2; 4], t0: f32, t1: f32) -> [Pos2; 4] {
-    let (left, _) = split_cubic(p, t1);
-    let (_, right) = split_cubic(&left, (t0 / t1.max(1e-6)).clamp(0.0, 1.0));
-    right
 }
 
 fn bezier_shape(p: [Pos2; 4], width: f32, color: Color32) -> Shape {
@@ -194,7 +170,7 @@ enum Dir { In, Out }
 
 impl PortKind {
     fn color(self) -> Color32 {
-        match self { PortKind::Midi => YELLOW, PortKind::Audio => BLUE }
+        match self { PortKind::Midi => YELLOW, PortKind::Audio => theme::AUDIO_CREAM }
     }
 }
 
@@ -207,7 +183,7 @@ struct Knob {
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
-    label_g: Option<Arc<Galley>>,
+    label_g: Option<Arc<theme::TrackedLabel>>,
 }
 
 /// A jack on the back panel: direction, port index, x fraction of the unit.
@@ -216,7 +192,7 @@ struct Jack {
     port: usize,
     xf: f32,
     label: &'static str,
-    label_g: Option<Arc<Galley>>,
+    label_g: Option<Arc<theme::TrackedLabel>>,
 }
 
 /// What a rack unit IS — drives its face, knobs, and layout grouping.
@@ -234,15 +210,14 @@ struct Unit {
     node_kind: UnitKind,
     name: String,
     sub: String,
-    accent: Color32,
     ins: [PortKind; 3],
     outs: [PortKind; 3],
     knobs: Vec<Knob>,
     jacks: Vec<Jack>,
     led: f32,
     name_g: Option<Arc<Galley>>,
-    sub_g: Option<Arc<Galley>>,
-    back_g: Option<Arc<Galley>>,
+    sub_g: Option<Arc<theme::TrackedLabel>>,
+    back_g: Option<Arc<theme::TrackedLabel>>,
 }
 
 impl Unit {
@@ -273,8 +248,8 @@ fn knob_val(u: &Unit, param: u32, default: f32) -> f32 {
 }
 
 /// Visual breathing factor for audio leaving a unit (the engine does the real
-/// audio; this only drives the cable glow). Clap → LEVEL, Delay → MIX, other
-/// DSP → its first knob, everything else → 1.
+/// audio; this only drives the cable width breathing). Clap → LEVEL, Delay →
+/// MIX, other DSP → its first knob, everything else → 1.
 fn unit_out_gain(u: &Unit) -> f32 {
     match &u.node_kind {
         UnitKind::Clap => 0.25 + knob_val(u, P_LEVEL, 0.85) * 0.75,
@@ -292,49 +267,98 @@ fn unit_time_mul(u: &Unit) -> f32 {
     }
 }
 
-/// Accent color for a built-in DSP kind (generic faces).
-fn dsp_accent(kind: &DspKind) -> Color32 {
-    match kind {
-        DspKind::Delay => PURPLE,
-        DspKind::Reverb => theme::AUDIO_BLUE,
-        DspKind::Gain => GREEN,
-        DspKind::Filter => PURPLE,
-        DspKind::Eq3 => BLUE,
-        DspKind::Limiter => ORANGE,
-        DspKind::Saturation => theme::ACCENT_MAGENTA,
-        DspKind::Pan => YELLOW,
-        DspKind::Metronome => YELLOW,
+/// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
+/// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
+/// Runs once per unit at galley-build time, never on the frame path.
+fn sentence_case(s: &str) -> String {
+    s.split_whitespace()
+        .enumerate()
+        .map(|(i, w)| {
+            if w.chars().count() == 1 { return w.to_uppercase(); }
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) if i == 0 => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                _ => w.to_lowercase(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Plain-text toggle (§4.14): no chip, no box. On = ink text with a 6px
+/// accent dot before; off = secondary ink. Returns whether it was clicked.
+fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        if on {
+            let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+            ui.painter().circle_filled(r.center(), 3.0, theme::ACCENT);
+            ui.add_space(4.0);
+        }
+        let txt = egui::RichText::new(name).size(13.0)
+            .color(if on { theme::INK } else { theme::INK_2 });
+        let resp = ui.add(egui::Label::new(txt).sense(egui::Sense::click()));
+        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+        clicked = resp.clicked();
+    });
+    clicked
+}
+
+/// Nav item (§4.14): plain 13px ink text; active/open = deep-accent text +
+/// 2px accent underline (the reference's active-row logic). No rings/chips.
+fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
+    let color = if active { theme::ACCENT_DEEP } else { theme::INK };
+    let resp = ui.add(egui::Label::new(egui::RichText::new(name).size(13.0).color(color))
+        .sense(egui::Sense::click()));
+    if active {
+        let r = resp.rect;
+        ui.painter().line_segment(
+            [Pos2::new(r.left(), r.bottom() + 1.0), Pos2::new(r.right(), r.bottom() + 1.0)],
+            Stroke::new(2.0, theme::ACCENT),
+        );
     }
+    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+    resp.clicked()
+}
+
+/// 1px hairline vertical rule between nav items (§4.14).
+fn nav_separator(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
+    ui.painter().line_segment(
+        [Pos2::new(rect.center().x, rect.top()), Pos2::new(rect.center().x, rect.bottom())],
+        Stroke::new(1.0, theme::HAIRLINE),
+    );
 }
 
 /// Build a rack unit from a control-plane node. The face (jacks + knobs) is
 /// chosen by node kind; known kinds keep their bespoke faces, other DSP kinds
 /// get a generic labeled box with 1–2 knobs bound to engine params 0/1.
+/// Unit identity is carried by typography and position — no per-unit hues.
 fn make_unit(node: &Node) -> Unit {
     let name = name_str(&node.name).to_string();
-    let (node_kind, sub, accent, ins, outs, knobs, jacks): (
-        UnitKind, String, Color32, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
+    let (node_kind, sub, ins, outs, knobs, jacks): (
+        UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
     ) = match &node.kind {
         NodeKind::Keys => (
-            UnitKind::Keys, "midi source · click the keys".into(), YELLOW,
+            UnitKind::Keys, "midi source · click the keys".into(),
             vec![], vec![PortKind::Midi],
             vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
             vec![(Dir::Out, 0, 0.62, "MIDI OUT")],
         ),
         NodeKind::Clap { .. } => (
-            UnitKind::Clap, "synth · clap".into(), BLUE,
+            UnitKind::Clap, "synth · clap".into(),
             vec![PortKind::Midi], vec![PortKind::Audio],
             vec![knob("TONE", 0.35, None), knob("LEVEL", 0.85, Some(P_LEVEL))],
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::MasterOut => (
-            UnitKind::Master, "stereo + mono bus".into(), theme::ACCENT_MAGENTA,
+            UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             vec![(Dir::In, 0, 0.30, "L"), (Dir::In, 2, 0.50, "MONO"), (Dir::In, 1, 0.70, "R")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
-            UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(), PURPLE,
+            UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
             vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
             vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.44, "MIDI"), (Dir::Out, 0, 0.76, "OUT")],
@@ -353,20 +377,20 @@ fn make_unit(node: &Node) -> Unit {
                 DspKind::Delay => unreachable!(),
             };
             (
-                UnitKind::Dsp(kind.clone()), sub, dsp_accent(kind),
+                UnitKind::Dsp(kind.clone()), sub,
                 vec![PortKind::Audio], vec![PortKind::Audio],
                 knobs,
                 vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
             )
         }
         NodeKind::Lv2 { .. } => (
-            UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(), theme::AUDIO_BLUE,
+            UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(),
             vec![PortKind::Audio], vec![PortKind::Audio],
             vec![knob("GAIN", 0.9, Some(0))],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::SystemAudio => (
-            UnitKind::Dsp(DspKind::Gain), "system audio".into(), GREEN,
+            UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
             vec![knob("GAIN", 0.5, Some(0))],
             vec![(Dir::Out, 0, 0.62, "OUT")],
@@ -382,7 +406,6 @@ fn make_unit(node: &Node) -> Unit {
         node_kind,
         name,
         sub,
-        accent,
         ins: ins_arr,
         outs: outs_arr,
         knobs,
@@ -554,7 +577,6 @@ struct DemoApp {
     units: Vec<Unit>,
     cables: Vec<Cable>,
     next_id: u32,
-    audio_color_idx: usize,
 
     side: Side,
     flipping: bool,
@@ -574,7 +596,7 @@ struct DemoApp {
 
     key_leds: [f32; 13],
     meter: f32,
-    /// Peak-hold for the master meter (slow release, Signal design language).
+    /// Peak-hold for the master meter (slow release).
     meter_peak: f32,
 
     show_help: bool,
@@ -615,16 +637,19 @@ struct DemoApp {
     text_alpha: f32,
 
     // Cached text.
-    wordmark_g: Option<Arc<Galley>>,
-    state_play_g: Option<Arc<Galley>>,
-    state_pause_g: Option<Arc<Galley>>,
+    wordmark_g: Option<Arc<theme::TrackedLabel>>,
+    state_play_g: Option<Arc<theme::TrackedLabel>>,
+    state_pause_g: Option<Arc<theme::TrackedLabel>>,
     flip_label_g: Option<Arc<Galley>>,
+    /// Flip-pill width, derived from the measured label (§4.13); the rect is
+    /// right-anchored at x=376 and shared by draw_toolbar and hit_test.
+    flip_w: f32,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
     hint_wire_g: Option<Arc<Galley>>,
-    help_title_g: Option<Arc<Galley>>,
+    help_title_g: Option<Arc<theme::TrackedLabel>>,
     help_body_g: Option<Arc<Galley>>,
-    help_foot_g: Option<Arc<Galley>>,
+    help_foot_g: Option<Arc<theme::TrackedLabel>>,
 
     arrivals: [(usize, f32); 32],
 
@@ -701,7 +726,6 @@ impl DemoApp {
             units: Vec::new(),
             cables: Vec::with_capacity(MAX_CABLES),
             next_id: 1,
-            audio_color_idx: 0,
             side: Side::Front,
             flipping: false,
             flip_t: 1.0,
@@ -749,6 +773,7 @@ impl DemoApp {
             state_play_g: None,
             state_pause_g: None,
             flip_label_g: None,
+            flip_w: 150.0,
             hint_front_g: None,
             hint_back_g: None,
             hint_wire_g: None,
@@ -989,42 +1014,67 @@ impl DemoApp {
         let layout = |text: &str, font: FontId, color: Color32, wrap: f32| -> Arc<Galley> {
             ctx.fonts_mut(|f| f.layout(text.to_owned(), font, color, wrap))
         };
-        let label_font = FontId::proportional(10.0);
+        // Tracked micro-caps (§4.5): per-char galleys, cached like the rest.
+        let tracked = |text: &str, size: f32, tracking_em: f32| -> Arc<theme::TrackedLabel> {
+            let font = FontId::proportional(size);
+            Arc::new(ctx.fonts_mut(|f| theme::layout_tracked(f, text, font, tracking_em)))
+        };
         // Unit galleys: (re)fill any that are missing — templates rebuild units.
         for u in &mut self.units {
             if u.name_g.is_none() {
-                u.name_g = Some(layout(&u.name, theme::bold_font(16.0), TEXT, f32::INFINITY));
-                u.sub_g = Some(layout(&u.sub, FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
-                u.back_g = Some(layout(&u.name, FontId::proportional(11.0), SUBTEXT, f32::INFINITY));
+                // Name: Medium 15px, sentence case (§4.3). Subtitle + back
+                // label: tracked micro-caps 10px (+0.14em).
+                u.name_g = Some(layout(&sentence_case(&u.name), theme::medium_font(15.0), TEXT, f32::INFINITY));
+                u.sub_g = Some(tracked(&u.sub.to_uppercase(), 10.0, 0.14));
+                u.back_g = Some(tracked(&u.name.to_uppercase(), 10.0, 0.14));
             }
             for k in &mut u.knobs {
                 if k.label_g.is_none() {
-                    k.label_g = Some(layout(k.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                    k.label_g = Some(tracked(k.label, 10.0, 0.14));
                 }
             }
             for j in &mut u.jacks {
                 if j.label_g.is_none() {
-                    j.label_g = Some(layout(j.label, label_font.clone(), SUBTEXT, f32::INFINITY));
+                    j.label_g = Some(tracked(j.label, 9.0, 0.14));
                 }
             }
         }
         if self.wordmark_g.is_some() { return; }
-        self.wordmark_g = Some(layout("kabelsalat", theme::bold_font(14.5), TEXT, f32::INFINITY));
-        self.state_play_g = Some(layout("metronome · playing", FontId::proportional(10.5), GREEN, f32::INFINITY));
-        self.state_pause_g = Some(layout("metronome · stopped", FontId::proportional(10.5), SUBTEXT, f32::INFINITY));
-        self.flip_label_g = Some(layout("flip rack · Tab", FontId::proportional(11.0), TEXT, f32::INFINITY));
+        // Masthead (§4.13): Medium 22px wordmark, display tracking −0.03em;
+        // state line in tracked micro-caps.
+        self.wordmark_g = Some(Arc::new(ctx.fonts_mut(|f| {
+            theme::layout_tracked(f, "kabelsalat", theme::medium_font(22.0), -0.03)
+        })));
+        self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
+        self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
+        // Flip pill (§4.13): Bold 19px = WCAG large text, so ON_ACCENT on the
+        // vivid tomato passes (3.63 ≥ 3.0). Shorten the label if it outgrows
+        // the pill; the pill width follows the measured galley.
+        let mut flip_g = layout("flip rack · Tab", theme::bold_font(19.0), WHITE, f32::INFINITY);
+        if flip_g.size().x > 128.0 {
+            flip_g = layout("flip · Tab", theme::bold_font(19.0), WHITE, f32::INFINITY);
+        }
+        self.flip_w = (flip_g.size().x + 22.0).max(150.0).min(170.0);
+        self.flip_label_g = Some(flip_g);
+        // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
             "perform: drag knobs · click the keys · press Tab to flip the rack and patch",
-            FontId::proportional(12.0), SUBTEXT, f32::INFINITY));
+            FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
             "patch: drag jack to jack · grab a cable to shake it · tug a plug to unplug · Tab flips back",
-            FontId::proportional(12.0), SUBTEXT, f32::INFINITY));
+            FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_wire_g = Some(layout(
-            "now click a glowing jack to connect · esc or right-click cancels",
-            FontId::proportional(12.0), YELLOW, f32::INFINITY));
-        self.help_title_g = Some(layout("kabelsalat — the cables are the show", theme::bold_font(17.0), TEXT, f32::INFINITY));
-        self.help_body_g = Some(layout(
-            "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
+            "now click a highlighted jack to connect · esc or right-click cancels",
+            FontId::proportional(12.5), theme::ACCENT_DEEP, f32::INFINITY));
+        // Help card (§4.16): Medium 22px title, 14px body with tight leading
+        // so all 15 rows fit the 560×352 card, tracked micro-caps footer.
+        self.help_title_g = Some(Arc::new(ctx.fonts_mut(|f| {
+            theme::layout_tracked(f, "kabelsalat — the cables are the show", theme::medium_font(22.0), -0.03)
+        })));
+        // Body: 14px cream with tight leading (15 rows fit the 352px card);
+        // key-name columns highlighted in ACCENT_BRIGHT — the reference's
+        // dark-panel "orange highlighted phrases" (§4.16).
+        let body = "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
              F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
              F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
              Space / F10        metronome Play·Stop · Transport window sets BPM\n\
@@ -1038,9 +1088,43 @@ impl DemoApp {
              grab a cable       shake it — watch it swing and settle (back)\n\
              tug a plug         pull it out to unplug (back)\n\
              click a cable      highlight its whole signal path\n\
-             R reset knobs · D stats · ? help · esc cancel",
-            FontId::monospace(12.5), TEXT, 560.0));
-        self.help_foot_g = Some(layout("esc or ? to close", FontId::proportional(11.5), SUBTEXT, f32::INFINITY));
+             R reset knobs · D stats · ? help · esc cancel";
+        let body_fmt = egui::epaint::text::TextFormat {
+            font_id: FontId::proportional(14.0),
+            color: TEXT,
+            line_height: Some(16.5),
+            ..Default::default()
+        };
+        let mut body_job = egui::epaint::text::LayoutJob::simple(
+            body.to_owned(), FontId::proportional(14.0), TEXT, 504.0);
+        body_job.sections.clear();
+        let mut start = 0usize;
+        for line in body.split_inclusive('\n') {
+            let end = start + line.len();
+            let key_end = line.trim_end_matches('\n').find("  ").map(|p| start + p);
+            match key_end {
+                Some(ke) => {
+                    body_job.sections.push(egui::epaint::text::LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: egui::text::ByteIndex(start)..egui::text::ByteIndex(ke),
+                        format: egui::epaint::text::TextFormat { color: theme::ACCENT_BRIGHT, ..body_fmt.clone() },
+                    });
+                    body_job.sections.push(egui::epaint::text::LayoutSection {
+                        leading_space: 0.0,
+                        byte_range: egui::text::ByteIndex(ke)..egui::text::ByteIndex(end),
+                        format: body_fmt.clone(),
+                    });
+                }
+                None => body_job.sections.push(egui::epaint::text::LayoutSection {
+                    leading_space: 0.0,
+                    byte_range: egui::text::ByteIndex(start)..egui::text::ByteIndex(end),
+                    format: body_fmt.clone(),
+                }),
+            }
+            start = end;
+        }
+        self.help_body_g = Some(ctx.fonts_mut(|f| f.layout_job(body_job)));
+        self.help_foot_g = Some(tracked("ESC OR ? TO CLOSE", 10.0, 0.14));
     }
 
     // -- layout -----------------------------------------------------------
@@ -1136,13 +1220,10 @@ impl DemoApp {
         if self.cables.iter().any(|c| c.dying < 0.0 && c.src == src && c.src_port == src_port && c.dst == dst && c.dst_port == dst_port) {
             return;
         }
+        // Audio is one cream family now (§3); MIDI stays blue.
         let color = match kind {
             PortKind::Midi => YELLOW,
-            PortKind::Audio => {
-                let c = if self.audio_color_idx % 2 == 0 { BLUE } else { GREEN };
-                self.audio_color_idx += 1;
-                c
-            }
+            PortKind::Audio => theme::AUDIO_CREAM,
         };
         let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, 0, id * 7919 + 13);
         c.next_event = self.time + 0.2 + rng01(&mut c.rng) as f64 * 0.4;
@@ -1708,12 +1789,13 @@ impl DemoApp {
         let name = self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
             .nth(rig)
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| if rig == 0 { "SURGE A".to_string() } else { "SURGE B".to_string() });
+            .map(|u| sentence_case(&u.name))
+            .unwrap_or_else(|| if rig == 0 { "Surge A".to_string() } else { "Surge B".to_string() });
         let mut open = self.editor_open;
         let mut refresh = false;
         let mut changes: Vec<(u32, f64)> = Vec::new();
-        egui::Window::new(format!("{name} — parameters"))
+        egui::Window::new(egui::RichText::new(format!("{name} — parameters"))
+                .font(theme::medium_font(16.0)).color(theme::INK))
             .open(&mut open)
             .collapsible(false)
             .fixed_size([480.0, 560.0])
@@ -1732,6 +1814,16 @@ impl DemoApp {
                 let params = &self.editor_params;
                 let mains = &mut self._surge_main;
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    // Sliders: accent fill on a hairline track (§4.18). Scoped
+                    // once for the whole list, not per row.
+                    let v = ui.visuals_mut();
+                    v.widgets.inactive.bg_fill = theme::HAIRLINE;
+                    v.widgets.inactive.fg_stroke = Stroke::new(1.0, theme::INK);
+                    v.widgets.hovered.bg_fill = theme::ACCENT;
+                    v.widgets.hovered.fg_stroke = Stroke::new(1.0, theme::INK);
+                    v.widgets.active.bg_fill = theme::ACCENT;
+                    v.widgets.active.fg_stroke = Stroke::new(1.0, theme::INK);
+                    v.selection.bg_fill = theme::ACCENT;
                     let mut modules: Vec<&str> = Vec::new();
                     for p in params {
                         if !modules.contains(&p.module.as_str()) {
@@ -1759,9 +1851,12 @@ impl DemoApp {
                                     let mut value = p.value;
                                     ui.horizontal(|ui| {
                                         let w = ui.available_width();
+                                        // Param name: micro-caps INK_2 (§4.18).
                                         let resp = ui.add_sized(
                                             [(w - 96.0).max(120.0), 18.0],
-                                            egui::Slider::new(&mut value, p.min..=p.max).text(&p.name),
+                                            egui::Slider::new(&mut value, p.min..=p.max)
+                                                .text(egui::RichText::new(p.name.to_uppercase())
+                                                    .size(10.0).color(theme::INK_2)),
                                         );
                                         if resp.changed() {
                                             changes.push((p.id, value));
@@ -1769,13 +1864,14 @@ impl DemoApp {
                                         let text = mains.get_mut(rig)
                                             .map(|m| m.param_text(p.id, value))
                                             .unwrap_or_default();
-                                        ui.label(egui::RichText::new(text).small().color(SUBTEXT));
+                                        ui.label(egui::RichText::new(text)
+                                            .font(theme::medium_font(13.0)).color(theme::INK));
                                     });
                                 }
                             });
                     }
                     if shown == 0 {
-                        ui.label(egui::RichText::new("no matching parameters").italics().color(SUBTEXT));
+                        ui.label(egui::RichText::new("no matching parameters").size(12.0).color(theme::INK_2));
                     }
                 });
             });
@@ -1795,6 +1891,7 @@ impl DemoApp {
     }
 
     /// AUM-style per-rig input selection: which sources feed each rig.
+    /// Hurricane top strip (§4.14): paper, plain-text toggles, hairline nav.
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
         let rigs = self.clap_rigs();
         egui::Panel::top("rig_inputs")
@@ -1802,27 +1899,22 @@ impl DemoApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_RAISED)
+                    .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
                     .inner_margin(egui::Margin::same(6)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(theme::section_label("Rig inputs"));
+                    theme::section_label(ui, "Rig inputs");
                     ui.add_space(10.0);
                     for (rig, node) in rigs {
-                        let accent = if rig == 0 { BLUE } else { theme::AUDIO_BLUE };
+                        // Rigs stay distinguishable by label, not hue (§3).
                         let label = if rig == 0 { "A" } else { "B" };
-                        ui.label(egui::RichText::new(format!("RIG {label}")).small().strong().color(accent));
+                        ui.label(egui::RichText::new(format!("Rig {label}")).size(13.0).strong().color(theme::INK));
+                        ui.add_space(4.0);
                         let (k, l, h) = self.rig_sources[rig];
                         for (name, on, idx) in [("Keys", k, 0usize), ("Laptop", l, 1), ("HW", h, 2)] {
-                            let fill = if on { alpha(accent, 0.30) } else { theme::SURFACE_HI };
-                            let txt = if on { TEXT } else { SUBTEXT };
-                            let mut btn = egui::Button::new(egui::RichText::new(name).small().color(txt))
-                                .fill(fill)
-                                .corner_radius(8.0);
-                            if on { btn = btn.stroke(Stroke::new(1.0, alpha(accent, 0.6))); }
-                            if ui.add(btn).clicked() {
+                            if text_toggle(ui, name, on) {
                                 let s = &mut self.rig_sources[rig];
                                 match idx {
                                     0 => s.0 = !s.0,
@@ -1831,6 +1923,7 @@ impl DemoApp {
                                 }
                                 self.send_rig_source(node);
                             }
+                            ui.add_space(6.0);
                         }
                         // Per-rig hardware device selector (AUM: a keyboard per rig).
                         if !self.hw_devices.is_empty() {
@@ -1839,10 +1932,12 @@ impl DemoApp {
                                 None => "HW: All".to_string(),
                                 Some(d) => format!("HW: {}", self.hw_devices.get(d as usize).map(|s| s.as_str()).unwrap_or("?")),
                             };
-                            let dbtn = egui::Button::new(egui::RichText::new(label).small().color(SUBTEXT))
-                                .fill(theme::SURFACE_HI)
-                                .corner_radius(8.0);
-                            if ui.add(dbtn).on_hover_text("cycle which hardware device feeds this rig").clicked() {
+                            let resp = ui.add(egui::Label::new(
+                                egui::RichText::new(label).size(13.0).color(theme::INK_2))
+                                .sense(egui::Sense::click()))
+                                .on_hover_text("cycle which hardware device feeds this rig");
+                            if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                            if resp.clicked() {
                                 let n = self.hw_devices.len() as u32;
                                 let next = match cur {
                                     None => Some(0),
@@ -1853,19 +1948,13 @@ impl DemoApp {
                                     let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: next });
                                 }
                             }
+                            ui.add_space(6.0);
                         }
                         // Editor is opened inline by double-clicking the synth
                         // unit in the rack (task-26) — no per-rig button here.
+                        ui.add_space(4.0);
                     }
-                    ui.add_space(4.0);
-                    let split_txt = if self.split_on { "Split @ C4: ON" } else { "Split @ C4: off" };
-                    let split_fill = if self.split_on { alpha(YELLOW, 0.30) } else { theme::SURFACE_HI };
-                    let split_col = if self.split_on { TEXT } else { SUBTEXT };
-                    let mut btn = egui::Button::new(egui::RichText::new(split_txt).small().color(split_col))
-                        .fill(split_fill)
-                        .corner_radius(8.0);
-                    if self.split_on { btn = btn.stroke(Stroke::new(1.0, alpha(YELLOW, 0.6))); }
-                    if ui.add(btn).clicked() {
+                    if nav_button(ui, "Split @ C4", self.split_on) {
                         self.split_on = !self.split_on;
                         let point = if self.split_on { Some(60) } else { None };
                         if let Some(bus) = &self.bus {
@@ -1874,36 +1963,31 @@ impl DemoApp {
                     }
                     ui.add_space(10.0);
                     if !self.editor_open && !self.editor_status.is_empty() {
-                        ui.label(egui::RichText::new(&self.editor_status).small().italics().color(ORANGE));
+                        ui.label(egui::RichText::new(&self.editor_status).size(12.0).color(theme::ACCENT_DEEP));
                         ui.add_space(8.0);
                     }
-                    let sess_btn = egui::Button::new(egui::RichText::new("Sessions").small().color(TEXT))
-                        .fill(theme::SURFACE_HI)
-                        .corner_radius(8.0);
-                    if ui.add(sess_btn).clicked() {
+                    nav_separator(ui);
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Sessions", self.show_sessions) {
                         self.show_sessions = !self.show_sessions;
                     }
                     ui.add_space(6.0);
-                    let plug_btn = egui::Button::new(egui::RichText::new("Plugins").small().color(TEXT))
-                        .fill(theme::SURFACE_HI)
-                        .corner_radius(8.0);
-                    if ui.add(plug_btn).on_hover_text("browse installed LV2 / CLAP plugins and add them to a rig").clicked() {
+                    nav_separator(ui);
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Plugins", self.show_plugins) {
                         self.show_plugins = !self.show_plugins;
                         if self.show_plugins && !self.plugins_loaded {
                             self.refresh_plugins();
                         }
                     }
                     ui.add_space(6.0);
-                    let tr_fill = if self.playing { alpha(GREEN, 0.30) } else { theme::SURFACE_HI };
-                    let mut tr_btn = egui::Button::new(egui::RichText::new("Transport").small().color(TEXT))
-                        .fill(tr_fill)
-                        .corner_radius(8.0);
-                    if self.playing { tr_btn = tr_btn.stroke(Stroke::new(1.0, alpha(GREEN, 0.6))); }
-                    if ui.add(tr_btn).on_hover_text("metronome: Play/Stop + BPM (F10)").clicked() {
+                    nav_separator(ui);
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Transport", self.show_transport || self.playing) {
                         self.show_transport = !self.show_transport;
                     }
                     ui.add_space(10.0);
-                    ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
+                    ui.label(egui::RichText::new("which sources feed each rig").size(12.0).color(theme::INK_2));
                 });
             });
     }
@@ -1924,27 +2008,40 @@ impl DemoApp {
             .default_width(320.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Play/Stop toggle — reflects transport state, drives the engine.
-                    let (label, accent) = if self.playing { ("Stop", theme::CLIP_RED) } else { ("Play", GREEN) };
-                    let btn = egui::Button::new(egui::RichText::new(label).small().strong().color(accent))
-                        .fill(alpha(accent, 0.18))
-                        .stroke(Stroke::new(1.0, alpha(accent, 0.55)))
-                        .corner_radius(8.0)
-                        .min_size(egui::vec2(56.0, 20.0));
-                    if ui.add(btn).on_hover_text("start / stop the metronome (Space)").clicked() {
+                    // Play/Stop toggle (§4.13 rules, small version): idle =
+                    // paper + ink ring; running = teal fill + ink glyph.
+                    let btn = if self.playing {
+                        egui::Button::new(egui::RichText::new("Stop").color(theme::INK).strong())
+                            .fill(GREEN)
+                            .stroke(Stroke::NONE)
+                    } else {
+                        egui::Button::new(egui::RichText::new("Play").color(theme::INK).strong())
+                            .fill(theme::PAPER)
+                            .stroke(Stroke::new(1.5, theme::INK))
+                    };
+                    if ui.add(btn.corner_radius(8.0).min_size(egui::vec2(56.0, 20.0)))
+                        .on_hover_text("start / stop the metronome (Space)").clicked()
+                    {
                         self.toggle_play();
                     }
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("BPM").small().color(SUBTEXT));
+                    theme::tracked_label(ui, "BPM", 10.0, 0.14, theme::INK_2);
+                    ui.add_space(4.0);
                     if ui.small_button("−").on_hover_text("slower").clicked() {
                         self.set_bpm(self.bpm - 1.0);
                     }
+                    // BPM as a big number (§4.18): Medium 24px ink.
                     let mut bpm = self.bpm;
                     let dv = egui::DragValue::new(&mut bpm)
                         .range(20.0..=300.0)
                         .speed(1.0)
                         .fixed_decimals(0);
-                    if ui.add(dv).on_hover_text("metronome tempo (20–300)").changed() {
+                    let changed = ui.scope(|ui| {
+                        let ts = ui.style().drag_value_text_style.clone();
+                        ui.style_mut().text_styles.insert(ts, theme::medium_font(24.0));
+                        ui.add(dv).on_hover_text("metronome tempo (20–300)").changed()
+                    }).inner;
+                    if changed {
                         self.set_bpm(bpm);
                     }
                     if ui.small_button("+").on_hover_text("faster").clicked() {
@@ -1964,8 +2061,8 @@ impl DemoApp {
                         alpha(GREEN, 0.30 + 0.70 * thump),
                     );
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new(if self.playing { "metronome on" } else { "metronome off" })
-                        .small().italics().color(SUBTEXT));
+                    theme::tracked_label(ui, if self.playing { "PLAYING" } else { "STOPPED" },
+                        10.0, 0.14, theme::INK_2);
                 });
             });
         self.show_transport = open;
@@ -1983,7 +2080,7 @@ impl DemoApp {
             .resizable(false)
             .default_width(320.0)
             .show(ctx, |ui| {
-                ui.label(theme::section_label("Starter templates"));
+                theme::section_label(ui, "Starter templates");
                 ui.horizontal(|ui| {
                     for t in Template::ALL {
                         if ui.button(t.title()).on_hover_text("load a playable pre-wired rack").clicked() {
@@ -1999,7 +2096,7 @@ impl DemoApp {
                     ui.label("Name:");
                     ui.text_edit_singleline(&mut self.session_name);
                 });
-                if ui.button("Save current patch").clicked() {
+                if theme::primary_button(ui, "Save current patch").clicked() {
                     let name = if self.session_name.trim().is_empty() {
                         "Untitled".to_string()
                     } else {
@@ -2017,7 +2114,7 @@ impl DemoApp {
                     }
                 }
                 ui.separator();
-                ui.label(theme::section_label("Saved sessions"));
+                theme::section_label(ui, "Saved sessions");
                 let dir = Self::sessions_dir();
                 let mut names: Vec<String> = std::fs::read_dir(&dir)
                     .map(|rd| {
@@ -2035,13 +2132,15 @@ impl DemoApp {
                     .unwrap_or_default();
                 names.sort();
                 if names.is_empty() {
-                    ui.label(egui::RichText::new("none yet — save one above").small().italics());
+                    ui.label(egui::RichText::new("none yet — save one above").size(12.0).color(theme::INK_2));
                 }
-                for name in names {
+                // Service-list rows (§4.18): 1px hairline separators.
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 { ui.separator(); }
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(&name).small());
-                        if ui.small_button("Load").clicked() {
-                            let path = crate::session::Session::package_path(&dir, &name);
+                        ui.label(egui::RichText::new(name).size(13.0));
+                        if theme::primary_button(ui, "Load").clicked() {
+                            let path = crate::session::Session::package_path(&dir, name);
                             match path.and_then(|p| crate::session::Session::load(&p)) {
                                 Ok(s) => match self.apply_session(&s) {
                                     Ok(_) => self.session_msg = format!("Loaded '{name}'"),
@@ -2054,7 +2153,8 @@ impl DemoApp {
                 }
                 if !self.session_msg.is_empty() {
                     ui.separator();
-                    ui.label(egui::RichText::new(&self.session_msg).small().color(GREEN));
+                    let col = if self.session_msg.contains("failed") { theme::CLIP_TEXT } else { theme::LIVE_TEAL_DEEP };
+                    ui.label(egui::RichText::new(&self.session_msg).size(12.0).color(col));
                 }
             });
         self.show_sessions = open;
@@ -2153,31 +2253,37 @@ impl DemoApp {
                     ui.text_edit_singleline(&mut self.plugin_filter);
                     if ui.button("Refresh").clicked() { self.refresh_plugins(); }
                 });
-                ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").small().italics().color(SUBTEXT));
+                ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").size(12.0).color(theme::INK_2));
                 let filter = self.plugin_filter.to_lowercase();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    ui.label(theme::section_label(&format!("LV2 plugins ({})", self.plugins_lv2.len())));
+                    theme::section_label(ui, &format!("LV2 plugins ({})", self.plugins_lv2.len()));
                     let mut added: Option<(String, String, bool)> = None;
+                    let mut first_row = true;
                     for p in &self.plugins_lv2 {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
+                        if !first_row { ui.separator(); }
+                        first_row = false;
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&p.name).small());
+                            ui.label(egui::RichText::new(&p.name).size(13.0));
                             if p.is_instrument {
-                                ui.label(egui::RichText::new("inst").small().italics().color(GREEN));
+                                ui.label(egui::RichText::new("inst").size(11.0).color(theme::LIVE_TEAL_DEEP));
                             }
-                            // Offer BOTH roles; emphasize the likely one (the
-                            // is_instrument hint is permissive, not authoritative).
-                            let base = theme::SURFACE_HI;
-                            let inst_fill = if p.is_instrument { alpha(BLUE, 0.35) } else { base };
-                            let fx_fill = if p.is_instrument { base } else { alpha(BLUE, 0.35) };
-                            let ib = egui::Button::new(egui::RichText::new("Add instrument").small().color(TEXT))
-                                .fill(inst_fill).corner_radius(8.0);
-                            if ui.add(ib).on_hover_text(&p.uri).clicked() {
+                            // Offer BOTH roles; the likely one is the primary
+                            // action (the is_instrument hint is permissive).
+                            let inst_resp = if p.is_instrument {
+                                theme::primary_button(ui, "Add instrument")
+                            } else {
+                                ui.button("Add instrument")
+                            };
+                            if inst_resp.on_hover_text(&p.uri).clicked() {
                                 added = Some((p.uri.clone(), p.name.clone(), true));
                             }
-                            let fb = egui::Button::new(egui::RichText::new("Add effect").small().color(TEXT))
-                                .fill(fx_fill).corner_radius(8.0);
-                            if ui.add(fb).on_hover_text(&p.uri).clicked() {
+                            let fx_resp = if p.is_instrument {
+                                ui.button("Add effect")
+                            } else {
+                                theme::primary_button(ui, "Add effect")
+                            };
+                            if fx_resp.on_hover_text(&p.uri).clicked() {
                                 added = Some((p.uri.clone(), p.name.clone(), false));
                             }
                         });
@@ -2186,15 +2292,18 @@ impl DemoApp {
                         if as_inst { self.add_lv2_instrument(&uri, &name); } else { self.add_lv2_effect(&uri, &name); }
                     }
                     ui.separator();
-                    ui.label(theme::section_label(&format!("CLAP instruments ({})", self.plugins_clap.len())));
+                    theme::section_label(ui, &format!("CLAP instruments ({})", self.plugins_clap.len()));
                     let mut add_surge = false;
+                    let mut first_row = true;
                     for p in &self.plugins_clap {
                         if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
+                        if !first_row { ui.separator(); }
+                        first_row = false;
                         let is_surge = p.id == SURGE_ID;
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&p.name).small());
+                            ui.label(egui::RichText::new(&p.name).size(13.0));
                             if is_surge {
-                                if ui.small_button("New rig").clicked() { add_surge = true; }
+                                if theme::primary_button(ui, "New rig").clicked() { add_surge = true; }
                             } else {
                                 ui.add_enabled(false, egui::Button::new(egui::RichText::new("coming soon").small()))
                                     .on_hover_text("only Surge loads for now — other CLAP instruments are not wired yet");
@@ -2205,7 +2314,8 @@ impl DemoApp {
                 });
                 if !self.plugin_msg.is_empty() {
                     ui.separator();
-                    ui.label(egui::RichText::new(&self.plugin_msg).small().color(GREEN));
+                    let col = if self.plugin_msg.contains("failed") { theme::CLIP_TEXT } else { theme::LIVE_TEAL_DEEP };
+                    ui.label(egui::RichText::new(&self.plugin_msg).size(12.0).color(col));
                 }
             });
         self.show_plugins = open;
@@ -2217,13 +2327,13 @@ impl DemoApp {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_RAISED)
+                    .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
                     .inner_margin(egui::Margin::same(10)),
             )
             .show(root, |ui| {
-                ui.heading("Assistant");
-                ui.label(egui::RichText::new("DeepSeek · bring your own key").small());
+                ui.heading(egui::RichText::new("Assistant").font(theme::medium_font(16.0)).color(theme::INK));
+                ui.label(egui::RichText::new("DeepSeek · bring your own key").size(12.0).color(theme::INK_2));
                 ui.add_space(6.0);
                 if !self.assistant.key_set {
                     ui.label("Paste your DeepSeek API key:");
@@ -2232,7 +2342,7 @@ impl DemoApp {
                             .password(true)
                             .desired_width(f32::INFINITY),
                     );
-                    if ui.button("Save key").clicked() && !self.key_input.trim().is_empty() {
+                    if theme::primary_button(ui, "Save key").clicked() && !self.key_input.trim().is_empty() {
                         let k = self.key_input.trim().to_string();
                         match crate::assistant::save_key(&k) {
                             Ok(()) => {
@@ -2249,8 +2359,8 @@ impl DemoApp {
                         egui::RichText::new(
                             "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
                         )
-                        .small()
-                        .italics(),
+                        .size(12.0)
+                        .color(theme::INK_2),
                     );
                 } else {
                     let avail = ui.available_height();
@@ -2260,16 +2370,16 @@ impl DemoApp {
                         .show(ui, |ui| {
                             for line in &self.assistant.history {
                                 let (label, color) = match line.role.as_str() {
-                                    "user" => ("You", YELLOW),
-                                    "assistant" => ("Assistant", GREEN),
-                                    _ => ("Error", theme::CLIP_RED),
+                                    "user" => ("You", theme::INK),
+                                    "assistant" => ("Assistant", theme::LIVE_TEAL_DEEP),
+                                    _ => ("Error", theme::CLIP_TEXT),
                                 };
-                                ui.label(egui::RichText::new(label).small().strong().color(color));
+                                ui.label(egui::RichText::new(label).size(12.0).strong().color(color));
                                 ui.label(&line.text);
                                 ui.add_space(6.0);
                             }
                             if self.assistant.busy {
-                                ui.label(egui::RichText::new("thinking…").italics().small());
+                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::INK_2));
                             }
                         });
                     ui.add_space(6.0);
@@ -2281,7 +2391,7 @@ impl DemoApp {
                         );
                         let enter =
                             edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                        if (ui.button("Send").clicked() || enter)
+                        if (theme::primary_button(ui, "Send").clicked() || enter)
                             && !self.chat_input.trim().is_empty()
                             && !self.assistant.busy
                         {
@@ -2293,10 +2403,10 @@ impl DemoApp {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(format!("{} · octave C{}", self.surge_status, self.octave))
-                            .small()
-                            .italics(),
+                            .size(12.0)
+                            .color(theme::INK_2),
                     );
-                    ui.label(egui::RichText::new(&self.hw_status).small().italics());
+                    ui.label(egui::RichText::new(&self.hw_status).size(12.0).color(theme::INK_2));
                 }
             });
     }
@@ -2682,7 +2792,7 @@ impl DemoApp {
 
     fn hit_test(&self, s: Pos2) -> Hit {
         if (s - Pos2::new(40.0, self.toolbar_top + 40.0)).length() < 19.0 { return Hit::Play; }
-        if Rect::from_min_size(Pos2::new(246.0, self.toolbar_top + 24.0), Vec2::new(126.0, 32.0)).contains(s) {
+        if self.flip_rect().contains(s) {
             return Hit::Flip;
         }
         if self.flipping || self.xf.sy < 0.9 { return Hit::Background; }
@@ -3032,16 +3142,13 @@ impl DemoApp {
     fn draw(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter();
-        theme::aurora_bg(&painter, rect);
+        theme::paper_bg(&painter, rect);
 
-        // Rack shadow + glass chassis (through the flip transform). The
-        // chassis sits a layer darker than the units so they pop off it.
+        // The rack IS the reference's single inverted hero panel (§4.2):
+        // flat near-black, radius 36, no border, soft ink shadow underneath.
         let rack_local = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.rack_w, self.rack_h));
         let rack = self.xf.rect(rack_local);
-        theme::drop_shadow(&painter, rack, 18.0);
-        theme::gradient_rect(&painter, rack, 18.0, theme::SURFACE, CHASSIS);
-        painter.rect_stroke(rack, 18.0, Stroke::new(1.2, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
-        theme::top_highlight(&painter, rack, 18.0);
+        theme::flat_panel(&painter, rack, 36.0, CHASSIS, None);
 
         if self.xf.sy > 0.04 {
             self.draw_rails(&painter);
@@ -3061,19 +3168,9 @@ impl DemoApp {
         let xf = &self.xf;
         for side_x in [8.0, self.rack_w - 22.0] {
             let rail = Rect::from_min_size(Pos2::new(side_x, 8.0), Vec2::new(14.0, self.rack_h - 16.0));
-            painter.rect_filled(xf.rect(rail), 6.0, RAIL);
+            painter.rect_filled(xf.rect(rail), 4.0, RAIL);
         }
-        // Screws at the row boundaries.
-        for i in 0..=self.layout_rows {
-            let y = 16.0 + i as f32 * (self.unit_h + 10.0) - 5.0;
-            for x in [15.0, self.rack_w - 15.0] {
-                let c = xf.p(Vec2::new(x, y));
-                painter.add(Shape::Ellipse(egui::epaint::EllipseShape {
-                    center: c, radius: Vec2::new(2.6 * xf.sx, 2.6 * xf.sy),
-                    fill: RING, stroke: Stroke::NONE, angle: 0.0,
-                }));
-            }
-        }
+        // No screws — the editorial language has no hardware chrome (§4.2).
     }
 
     /// Text through the flip transform (fades while squashed).
@@ -3083,6 +3180,18 @@ impl DemoApp {
         let mut tp = painter.clone();
         tp.set_opacity(self.text_alpha);
         tp.galley(self.xf.p(local), g.clone(), color);
+    }
+
+    /// Tracked micro-caps through the flip transform: each cached per-char
+    /// galley is mapped individually, so letter spacing squashes with the rack.
+    fn text_tracked(&self, painter: &egui::Painter, local: Vec2, g: &Option<Arc<theme::TrackedLabel>>, color: Color32) {
+        if self.text_alpha <= 0.01 { return; }
+        let Some(g) = g else { return };
+        let mut tp = painter.clone();
+        tp.set_opacity(self.text_alpha);
+        for (cg, dx) in &g.chars {
+            tp.galley(self.xf.p(local + Vec2::new(*dx, 0.0)), cg.clone(), color);
+        }
     }
 
     fn ell(&self, painter: &egui::Painter, center: Vec2, r: f32, fill: Color32, stroke: Stroke) {
@@ -3100,30 +3209,30 @@ impl DemoApp {
             let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
-            // Glass plate: gradient brightens on hover; violet edge while
-            // dragging (selection color); accent-tinted border otherwise.
-            let top = if dragging { mix(theme::SURFACE_HI, PURPLE, 0.14) }
-                else if hovered { mix(theme::SURFACE_HI, WHITE, 0.05) }
-                else { theme::SURFACE_HI };
-            theme::gradient_rect(painter, sr, 10.0, top, PLATE_FRONT);
-            let (bw, bc) = if dragging { (1.6, alpha(PURPLE, 0.85)) } else { (1.0, alpha(u.accent, 0.35)) };
-            painter.rect_stroke(sr, 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
-            theme::top_highlight(painter, sr, 10.0);
-            // Active unit: accent edge glow breathing with the signal LED.
-            if u.led > 0.05 { theme::glow_rect(painter, sr, 10.0, u.accent, u.led * 0.8); }
-            if dragging { theme::glow_rect(painter, sr, 10.0, PURPLE, 0.9); }
+            // Flat plate (§4.3): the whisper tonal step separates it from the
+            // chassis. Hover = 1px hairline; drag = 2px accent inset keyline.
+            painter.rect_filled(sr, 8.0, PLATE_FRONT);
+            if dragging {
+                theme::inset_keyline(painter, sr, 8.0, theme::ACCENT, 2.0, 2.5);
+            } else if hovered {
+                painter.rect_stroke(sr, 8.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            }
 
-            // Colored label strip.
-            let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
-            painter.rect_filled(xf.rect(strip), 3.5, u.accent);
+            // Label strip: 2px rule, accent when active/dragged (§4.3 — the
+            // reference's active service row gets the orange rule).
+            let active = u.led > 0.05 || dragging;
+            let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
+            painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
 
             self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 16.0), &u.name_g, TEXT);
-            self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 40.0), &u.sub_g, SUBTEXT);
+            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 40.0), &u.sub_g, SUBTEXT);
 
-            // Activity LED.
+            // Activity LED: flat teal disc (+ optional flat halo), accent
+            // while dragged. No glow stack.
             let led = (r.right_top() + Vec2::new(-16.0, 16.0)).to_vec2();
-            if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(u.accent, 0.30 * u.led), Stroke::NONE); }
-            self.ell(painter, led, 3.2, alpha(u.accent, 0.25 + 0.75 * u.led), Stroke::NONE);
+            let led_col = if dragging { theme::ACCENT } else { GREEN };
+            if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(led_col, 0.15 * u.led), Stroke::NONE); }
+            self.ell(painter, led, 3.2, alpha(led_col, 0.25 + 0.75 * u.led), Stroke::NONE);
 
             match &u.node_kind {
                 UnitKind::Keys => self.draw_keyboard(painter),
@@ -3148,23 +3257,28 @@ impl DemoApp {
         let level = u.led.clamp(0.0, 1.0);
         let bar_w = width * 0.8;
         let y = r.center().y + 16.0;
+        // Generic DSP bar (§4.9): METER_TRACK track, flat accent fill.
         let track = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w, 8.0));
-        painter.rect_filled(self.xf.rect(track), 4.0, BG);
+        painter.rect_filled(self.xf.rect(track), 4.0, theme::METER_TRACK);
         let fill = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w * (0.15 + 0.85 * level), 8.0));
-        painter.rect_filled(self.xf.rect(fill), 4.0, alpha(u.accent, 0.5 + 0.5 * level));
+        painter.rect_filled(self.xf.rect(fill), 4.0, alpha(theme::ACCENT, 0.5 + 0.5 * level));
     }
 
     fn draw_keyboard(&self, painter: &egui::Painter) {
         if self.key_w() < 8.0 { return; }
         let xf = &self.xf;
+        // Flat keys (§4.7): cream whites with a 1px ink hairline gap, ink
+        // blacks with a dark hairline; lit keys go solid accent. No gloss.
         for wi in 0..8 {
             let kr = self.key_rect(wi);
             let semi = WHITE_SEMI[wi];
             let lit = self.key_leds[semi];
             let hovered = matches!(self.hover, Some(Hit::Key(s)) if s == semi);
-            let fill = mix(Color32::from_rgb(0xe6, 0xed, 0xf7), YELLOW, lit * 0.85);
-            painter.rect_filled(xf.rect(kr), 3.0, if hovered { mix(fill, WHITE, 0.3) } else { fill });
-            painter.rect_stroke(xf.rect(kr), 3.0, Stroke::new(1.0, alpha(BLACK, 0.4)), egui::StrokeKind::Inside);
+            let fill = if lit > 0.02 { theme::ACCENT }
+                else if hovered { Color32::from_rgb(0xF0, 0xED, 0xE6) }
+                else { WHITE };
+            painter.rect_filled(xf.rect(kr), 3.0, fill);
+            painter.rect_stroke(xf.rect(kr), 3.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
         }
         for bi in 0..5 {
             let after = BLACK_AFTER[bi];
@@ -3175,7 +3289,9 @@ impl DemoApp {
                 Vec2::new(bw, 38.0),
             );
             let lit = self.key_leds[BLACK_SEMI[bi]];
-            painter.rect_filled(xf.rect(kr), 2.5, mix(theme::BG_RAISED, YELLOW, lit * 0.7));
+            let fill = if lit > 0.02 { theme::ACCENT } else { BLACK };
+            painter.rect_filled(xf.rect(kr), 2.5, fill);
+            painter.rect_stroke(xf.rect(kr), 2.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
         }
     }
 
@@ -3192,7 +3308,8 @@ impl DemoApp {
                 Pos2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0),
                 Vec2::new(pitch * 0.45, h.max(2.0)),
             );
-            let col = if i % 2 == 0 { BLUE } else { theme::AUDIO_BLUE };
+            // Alternate cream / dim cream, flat (§4.9).
+            let col = if i % 2 == 0 { TEXT } else { SUBTEXT };
             painter.rect_filled(self.xf.rect(bar), 2.0, alpha(col, 0.5 + 0.5 * vis));
         }
     }
@@ -3206,16 +3323,16 @@ impl DemoApp {
         for i in 0..4 {
             let c = Vec2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0);
             let a = 0.15 + 0.85 * led * (1.0 - i as f32 * 0.2);
-            self.ell(painter, c, 6.0 - i as f32 * 1.1, alpha(PURPLE, a), Stroke::NONE);
+            self.ell(painter, c, 6.0 - i as f32 * 1.1, alpha(theme::ACCENT, a), Stroke::NONE);
         }
         if led > 0.05 {
             let c = Vec2::new(start + pitch * 0.5, r.center().y + 16.0);
-            self.ell(painter, c, 10.0 + (1.0 - led) * 14.0, alpha(PURPLE, 0.25 * led), Stroke::NONE);
+            self.ell(painter, c, 10.0 + (1.0 - led) * 14.0, alpha(theme::ACCENT, 0.25 * led), Stroke::NONE);
         }
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
-    /// Gradient green→amber→red with a slow-release peak-hold tick.
+    /// Stepped cream→tomato→red (§4.8) with a slow-release peak-hold tick.
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
         let lit = (self.meter * n as f32).ceil() as usize;
@@ -3228,17 +3345,18 @@ impl DemoApp {
                 Vec2::new(22.0, pitch * 0.72),
             );
             let col = theme::meter_color(i as f32 / (n - 1) as f32);
-            let fill = if i < lit { col } else { BG };
-            painter.rect_filled(self.xf.rect(seg), 2.5, fill);
+            let fill = if i < lit { col } else { theme::METER_TRACK };
+            painter.rect_filled(self.xf.rect(seg), 1.0, fill);
         }
-        // Peak-hold tick.
+        // Peak-hold tick: 2px, accent — clip red once the peak hits ≥ 0.9.
         if self.meter_peak > 0.02 {
             let i = ((self.meter_peak * n as f32).ceil() as usize).clamp(1, n) - 1;
             let tick = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch - 2.0),
-                Vec2::new(22.0, 1.6),
+                Vec2::new(22.0, 2.0),
             );
-            painter.rect_filled(self.xf.rect(tick), 0.8, theme::meter_color(self.meter_peak));
+            let col = if self.meter_peak >= 0.9 { theme::CLIP_RED } else { theme::ACCENT };
+            painter.rect_filled(self.xf.rect(tick), 0.8, col);
         }
     }
 
@@ -3251,35 +3369,40 @@ impl DemoApp {
         let hovered = matches!(self.hover, Some(Hit::Knob { unit, idx }) if unit == ui && idx == ki);
         let dragging = matches!(self.drag, Drag::Knob { unit, idx, .. } if unit == ui && idx == ki);
 
-        if hovered || dragging {
-            self.ell(painter, c, r + 5.0, alpha(u.accent, 0.15), Stroke::NONE);
-        }
-        self.ell(painter, c, r, mix(theme::SURFACE_HI, theme::SURFACE, 0.5),
-            Stroke::new(1.4, if hovered || dragging { mix(RING, u.accent, 0.6) } else { RING }));
+        // Unfilled disc (§4.6): 1.5px hairline ring, cream on hover. No fill
+        // bead, no gradient, no hover halo.
+        self.ell(painter, c, r, Color32::TRANSPARENT,
+            Stroke::new(1.5, if hovered || dragging { TEXT } else { BORDER }));
 
-        // Value arc: HAIRLINE track + glowing accent arc + indicator dot
+        // Flat value arc: hairline track + solid accent arc + flat end dot
         // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, u.accent);
+        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, theme::ACCENT);
 
-        // Pointer.
+        // Active/dragging knob: the CTA inset-keyline motif as focus state.
+        if dragging {
+            let disc = Rect::from_center_size(c.to_pos2(), Vec2::splat(2.0 * r));
+            theme::inset_keyline(painter, xf.rect(disc), r, theme::ACCENT, 2.0, 2.5);
+        }
+
+        // Pointer: center → 0.62r needle, 2px cream.
         let a0 = 135.0f32.to_radians();
         let sweep = 270.0f32.to_radians();
         let ang = a0 + sweep * k.value;
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
-        painter.line_segment([xf.p(c), tip], Stroke::new(2.4, TEXT));
-        let lw = k.label_g.as_ref().map_or(0.0, |g| g.size().x);
-        self.text(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
+        painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
+        let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
+        self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
 
-        // Live monospace value chip while dragging (Signal design language).
+        // Drag chip: a paper sticker with the value in Medium 13px ink.
         if dragging {
-            let g = painter.layout(format!("{:.2}", k.value), FontId::monospace(11.0), theme::AUDIO_CYAN, f32::INFINITY);
+            let g = painter.layout(format!("{:.2}", k.value), theme::medium_font(13.0), theme::INK, f32::INFINITY);
             let chip = Rect::from_min_size(
                 xf.p(c + Vec2::new(-g.size().x / 2.0 - 6.0, -r - 28.0)),
                 g.size() + Vec2::new(12.0, 6.0),
             );
-            painter.rect_filled(chip, 6.0, alpha(BG, 0.92));
-            painter.rect_stroke(chip, 6.0, Stroke::new(1.0, alpha(u.accent, 0.5)), egui::StrokeKind::Inside);
-            painter.galley(chip.min + Vec2::new(6.0, 3.0), g, theme::AUDIO_CYAN);
+            theme::drop_shadow(painter, chip, 6.0);
+            painter.rect_filled(chip, 6.0, theme::PAPER);
+            painter.galley(chip.min + Vec2::new(6.0, 3.0), g, theme::INK);
         }
     }
 
@@ -3287,17 +3410,19 @@ impl DemoApp {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
             let r = self.unit_rects[ui];
+            let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
-            let top = if dragging { mix(theme::SURFACE, PURPLE, 0.14) } else { theme::SURFACE };
-            theme::gradient_rect(painter, sr, 10.0, top, PLATE_BACK);
-            let (bw, bc) = if dragging { (1.6, alpha(PURPLE, 0.85)) } else { (1.0, alpha(u.accent, 0.25)) };
-            painter.rect_stroke(sr, 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
-            theme::top_highlight(painter, sr, 10.0);
-            if dragging { theme::glow_rect(painter, sr, 10.0, PURPLE, 0.9); }
-            let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
-            painter.rect_filled(xf.rect(strip), 3.5, alpha(u.accent, 0.55));
-            self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
+            // Same flat plate treatment as the front (§4.4).
+            painter.rect_filled(sr, 8.0, PLATE_BACK);
+            if dragging {
+                theme::inset_keyline(painter, sr, 8.0, theme::ACCENT, 2.0, 2.5);
+            } else if hovered {
+                painter.rect_stroke(sr, 8.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            }
+            let active = u.led > 0.05 || dragging;
+            let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
+            painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
         }
 
         // Selection path highlight set.
@@ -3338,6 +3463,18 @@ impl DemoApp {
         self.draw_plugs(painter);
         self.draw_pulses(painter, &hl, has_sel);
         self.draw_pending(painter);
+
+        // Paint order fix (§4.4): unit titles + jack labels LAST, so cables
+        // never cross them.
+        for (ui, u) in self.units.iter().enumerate() {
+            let r = self.unit_rects[ui];
+            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
+            for (ji, j) in u.jacks.iter().enumerate() {
+                let c = self.jack_pos(ui, ji);
+                let jw = j.label_g.as_ref().map_or(0.0, |g| g.size.x);
+                self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
+            }
+        }
     }
 
     fn cable_alpha(c: &Cable, has_sel: bool, highlighted: bool) -> f32 {
@@ -3351,15 +3488,18 @@ impl DemoApp {
     fn cable_color(&self, c: &Cable) -> Color32 {
         let mut col = c.color;
         if c.kind == PortKind::Audio {
-            // Clap sources warm their cable with the TONE knob.
+            // Subtle flat warm shift toward the accent (§4.10): TONE·0.20 +
+            // WARM·0.15 — keeps the knob feedback without a rainbow.
+            let mut t = 0.0;
             if let Some(su) = self.units.get(c.src) {
                 if matches!(su.node_kind, UnitKind::Clap) {
                     let tone = su.knobs.first().map(|k| k.value).unwrap_or(0.35);
-                    col = mix(col, ORANGE, tone * 0.45);
+                    t += tone * 0.20;
                 }
             }
             let warm = self.master_idx().map(|m| knob_val(&self.units[m], P_WARM, 0.15)).unwrap_or(0.15);
-            col = mix(col, ORANGE, warm * 0.30);
+            t += warm * 0.15;
+            col = mix(col, ORANGE, t);
         }
         col
     }
@@ -3379,33 +3519,22 @@ impl DemoApp {
             } else { 0.0 };
             let mut width = match c.kind {
                 PortKind::Midi => 2.8,
-                PortKind::Audio => 3.2 + 2.6 * level,
+                PortKind::Audio => 3.0 + 1.0 * level,
             };
             if hovered || grabbed { width += 0.8; }
 
             let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
-            let col = self.cable_color(c);
+            let mut col = self.cable_color(c);
 
-            // Glow: 3 layered strokes, wide low-alpha → narrow full-color.
-            // Audio breathes with the live level; MIDI keeps a faint spark halo.
-            if c.kind == PortKind::Audio {
-                let gw = width + 6.0 + 11.0 * level;
-                painter.add(bezier_shape(curve, gw, alpha(col, a * (0.05 + 0.20 * level))));
-                painter.add(bezier_shape(curve, width + 2.5, alpha(col, a * (0.10 + 0.25 * level))));
-            } else {
-                painter.add(bezier_shape(curve, width + 4.0, alpha(col, a * 0.08)));
-            }
+            // One flat stroke per cable, round caps (§4.10). Selection = the
+            // accent color swap + dimming the rest (cable_alpha) — no glow,
+            // no centerline.
             if has_sel && hl[ci] {
-                painter.add(bezier_shape(curve, width + 7.0, alpha(PURPLE, 0.16 * a)));
+                col = theme::ACCENT;
+                width += 0.5;
             }
-            let mut main_col = col;
-            if c.kind == PortKind::Audio { main_col = mix(main_col, WHITE, 0.22 * level); }
-            if hovered || grabbed { main_col = mix(main_col, WHITE, 0.18); }
-            painter.add(bezier_shape(curve, width, alpha(main_col, a)));
-            if self.selected == Some(c.id) {
-                painter.add(bezier_shape(curve, 1.1, alpha(mix(PURPLE, WHITE, 0.5), 0.6 * a)));
-            }
+            painter.add(bezier_shape(curve, width, alpha(col, a)));
         }
     }
 
@@ -3417,21 +3546,30 @@ impl DemoApp {
                 let kind = u.kind(j.dir, j.port);
                 let hovered = matches!(self.hover, Some(Hit::Jack { unit, jack }) if unit == ui && jack == ji);
                 let compat = self.compatible(ui, ji);
+                // Flat socket (§4.12): DARK_PANEL fill + 1.2px hairline.
                 let socket = Rect::from_center_size(c.to_pos2(), Vec2::splat(24.0));
-                painter.rect_filled(xf.rect(socket), 5.0, BG);
-                painter.rect_stroke(xf.rect(socket), 5.0, Stroke::new(1.2, RING), egui::StrokeKind::Inside);
+                painter.rect_filled(xf.rect(socket), 5.0, CHASSIS);
+                painter.rect_stroke(xf.rect(socket), 5.0, Stroke::new(1.2, BORDER), egui::StrokeKind::Inside);
                 if compat {
+                    // Compatible drop-target ring: the accent, ±1.5px pulse.
                     let pulse = 1.5 * (self.ui_time * 7.0).sin();
-                    self.ell(painter, c, 15.0 + pulse, alpha(kind.color(), 0.0), Stroke::new(1.8, alpha(kind.color(), 0.65)));
+                    self.ell(painter, c, 15.0 + pulse, Color32::TRANSPARENT, Stroke::new(1.8, alpha(theme::ACCENT, 0.65)));
                 }
                 if hovered || compat {
                     self.ell(painter, c, 16.0, alpha(kind.color(), 0.16), Stroke::NONE);
                 }
-                self.ell(painter, c, 6.5, Color32::from_rgb(0x0a, 0x0b, 0x10),
+                self.ell(painter, c, 6.5, Color32::from_rgb(0x10, 0x10, 0x10),
                     Stroke::new(1.4, if hovered { mix(RING, WHITE, 0.35) } else { RING }));
-                self.ell(painter, c, 2.5, alpha(kind.color(), if compat || hovered { 1.0 } else { 0.8 }), Stroke::NONE);
-                let jw = j.label_g.as_ref().map_or(0.0, |g| g.size().x);
-                self.text(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
+                // Center terminal: audio round, MIDI square (§3 separability).
+                let ta = alpha(kind.color(), if compat || hovered { 1.0 } else { 0.8 });
+                match kind {
+                    PortKind::Audio => self.ell(painter, c, 2.5, ta, Stroke::NONE),
+                    PortKind::Midi => {
+                        painter.rect_filled(
+                            xf.rect(Rect::from_center_size(c.to_pos2(), Vec2::splat(4.5))), 0.5, ta);
+                    }
+                }
+                // Jack labels are painted last, in draw_back (§4.4).
             }
         }
         // Plug-in flash rings on young cables.
@@ -3471,9 +3609,13 @@ impl DemoApp {
                     }
                     base + Vec2::new(0.0, (k - (n - 1.0) / 2.0) * 5.0)
                 };
+                // Flat plug (§4.12): DARK_PANEL_HI body + 1px hairline,
+                // cable-family band. Terminal shape separates families (§3):
+                // audio = round capsule, MIDI = square.
                 let body = Rect::from_center_size(p.to_pos2(), Vec2::new(20.0, 16.0));
-                painter.rect_filled(xf.rect(body), 3.5, alpha(PLUG, a));
-                painter.rect_stroke(xf.rect(body), 3.5, Stroke::new(1.0, alpha(mix(PLUG, WHITE, 0.25), a)), egui::StrokeKind::Inside);
+                let pr = match c.kind { PortKind::Audio => 8.0, PortKind::Midi => 1.0 };
+                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, a));
+                painter.rect_stroke(xf.rect(body), pr, Stroke::new(1.0, alpha(BORDER, a)), egui::StrokeKind::Inside);
                 let band = Rect::from_min_size(body.min + Vec2::new(2.0, 3.0), Vec2::new(16.0, 3.5));
                 painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), a));
             }
@@ -3485,30 +3627,17 @@ impl DemoApp {
         for (ci, c) in self.cables.iter().enumerate() {
             let a = Self::cable_alpha(c, has_sel, hl[ci]);
             if a <= 0.02 { continue; }
-            let base_w = match c.kind { PortKind::Midi => 2.8, PortKind::Audio => 3.2 };
-            let col = self.cable_color(c);
+            // Single flat dot (§4.11): cable color mixed 0.5 toward cream-
+            // white. No glow ellipse, no trail bezier — motion = information.
+            let col = mix(self.cable_color(c), WHITE, 0.5);
             for p in &c.pulses {
                 if !p.active || p.t < 0.0 { continue; }
                 let t = p.t.clamp(0.0, 1.0);
-                let trail = 0.05 + 0.06 * p.amp;
-                let u1 = c.arc_to_param(t);
-                let u0 = c.arc_to_param((t - trail).max(0.0));
-                if u1 > u0 + 1e-4 {
-                    let seg = sub_cubic(&c.curve, u0, u1);
-                    let seg = [xf.p(seg[0].to_vec2()), xf.p(seg[1].to_vec2()),
-                               xf.p(seg[2].to_vec2()), xf.p(seg[3].to_vec2())];
-                    painter.add(bezier_shape(seg, base_w + 1.2, alpha(mix(col, WHITE, 0.55), 0.9 * a)));
-                }
                 let pos = xf.p(c.point_at_arc(t).to_vec2());
-                let glow_r = (6.0 + 5.0 * p.amp) * xf.sy.max(0.5);
-                let core_r = (2.6 + 2.4 * p.amp) * xf.sy.max(0.5);
+                let r = (3.5 + 2.0 * p.amp) * xf.sy.max(0.5);
                 painter.add(Shape::Ellipse(egui::epaint::EllipseShape {
-                    center: pos, radius: Vec2::new(glow_r * xf.sx, glow_r * xf.sy),
-                    fill: alpha(col, 0.20 * a), stroke: Stroke::NONE, angle: 0.0,
-                }));
-                painter.add(Shape::Ellipse(egui::epaint::EllipseShape {
-                    center: pos, radius: Vec2::new(core_r * xf.sx, core_r * xf.sy),
-                    fill: alpha(mix(col, WHITE, 0.8), a), stroke: Stroke::NONE, angle: 0.0,
+                    center: pos, radius: Vec2::new(r * xf.sx, r * xf.sy),
+                    fill: alpha(col, a), stroke: Stroke::NONE, angle: 0.0,
                 }));
             }
         }
@@ -3521,32 +3650,34 @@ impl DemoApp {
         let (a, b) = if p.dir == Dir::Out { (origin, p.cursor) } else { (p.cursor, origin) };
         let curve = [xf.p(a), xf.p(a + p.c1), xf.p(b + p.c2), xf.p(b)];
         let col = p.kind.color();
-        painter.add(bezier_shape(curve, 6.5, alpha(col, 0.14)));
+        // Single flat stroke (§4.12) — no under-stroke.
         painter.add(bezier_shape(curve, 2.8, alpha(col, 0.85)));
         let cursor = xf.p(p.cursor);
         painter.circle_filled(cursor, 6.5, alpha(col, 0.95));
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
     }
 
-    fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
-        let bar = Rect::from_min_size(Pos2::new(16.0, top + 16.0), Vec2::new(376.0, 48.0));
-        theme::drop_shadow(painter, bar, 24.0);
-        theme::gradient_rect(painter, bar, 24.0, theme::SURFACE_HI, theme::SURFACE);
-        painter.rect_stroke(bar, 24.0, Stroke::new(1.0, alpha(BLUE, 0.25)), egui::StrokeKind::Inside);
-        theme::top_highlight(painter, bar, 24.0);
+    /// The flip pill rect (§4.13): right-anchored at x=376, width follows the
+    /// measured label. Shared by draw_toolbar and hit_test so they never drift.
+    fn flip_rect(&self) -> Rect {
+        Rect::from_min_size(Pos2::new(376.0 - self.flip_w, self.toolbar_top + 24.0), Vec2::new(self.flip_w, 32.0))
+    }
 
-        // Transport play: glowing green when running, glass + green ring idle.
+    fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
+        // Flat masthead card on paper (§4.13): same geometry, new language.
+        let bar = Rect::from_min_size(Pos2::new(16.0, top + 16.0), Vec2::new(376.0, 48.0));
+        theme::flat_panel(painter, bar, 14.0, theme::PAPER, Some(theme::HAIRLINE));
+
+        // Transport play (§4.13): idle = paper + ink ring + ink triangle;
+        // running = teal fill + ink stop square (ink-on-teal 5.26:1).
         let c = Pos2::new(40.0, top + 40.0);
         let hovered = matches!(self.hover, Some(Hit::Play));
-        let ink;
+        let ink = BLACK;
         if self.playing {
-            painter.circle_filled(c, 19.0, alpha(GREEN, 0.18));
-            painter.circle_filled(c, 15.0, if hovered { mix(GREEN, WHITE, 0.15) } else { GREEN });
-            ink = BG;
+            painter.circle_filled(c, 15.0, if hovered { mix(GREEN, BLACK, 0.08) } else { GREEN });
         } else {
-            painter.circle_filled(c, 15.0, if hovered { mix(theme::SURFACE_HI, WHITE, 0.08) } else { theme::SURFACE_HI });
-            painter.circle_stroke(c, 15.0, Stroke::new(1.2, alpha(GREEN, if hovered { 0.8 } else { 0.45 })));
-            ink = GREEN;
+            painter.circle_filled(c, 15.0, if hovered { theme::PAPER_SINK } else { theme::PAPER });
+            painter.circle_stroke(c, 15.0, Stroke::new(1.5, ink));
         }
         if self.playing {
             // Stop square (transport is Play/Stop, not play/pause).
@@ -3557,41 +3688,48 @@ impl DemoApp {
                 ink, Stroke::NONE));
         }
 
+        // Beat dot: teal thump, no glow ring.
         let beat = 60.0 / self.bpm.max(1.0) as f64;
         let beat_phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
         painter.circle_filled(Pos2::new(66.0, top + 40.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
-        if let Some(g) = &self.wordmark_g { painter.galley(Pos2::new(80.0, top + 24.0), g.clone(), TEXT); }
+        // Asterisk + wordmark — the editorial display moment. The asterisk
+        // sits before the wordmark (the brief's ≈(28, top+40) would overlap
+        // the play button, whose hit area must stay at (40, top+40)).
+        theme::asterisk(painter, Pos2::new(80.0, top + 35.0), 7.0, theme::ACCENT, 2.0);
+        if let Some(g) = &self.wordmark_g {
+            theme::paint_tracked(painter, Pos2::new(94.0, top + 20.0), g, theme::INK);
+        }
+        // State line: tracked micro-caps; a 6px teal dot precedes "playing".
         let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
-        if let Some(g) = state_g { painter.galley(Pos2::new(80.0, top + 42.0), g.clone(), SUBTEXT); }
+        let state_x = if self.playing {
+            painter.circle_filled(Pos2::new(97.0, top + 49.0), 3.0, GREEN);
+            104.0
+        } else { 94.0 };
+        if let Some(g) = state_g {
+            theme::paint_tracked(painter, Pos2::new(state_x, top + 44.0), g, theme::INK_2);
+        }
 
-        // Flip button.
-        let fb = Rect::from_min_size(Pos2::new(246.0, top + 24.0), Vec2::new(126.0, 32.0));
+        // Flip button = the app's single pill (§4.13): vivid accent fill,
+        // inset cream keyline, Bold 19px cream label (WCAG large text).
+        let fb = self.flip_rect();
         let fhover = matches!(self.hover, Some(Hit::Flip));
-        painter.rect_filled(fb, 16.0, if fhover { mix(theme::SURFACE_HI, BLUE, 0.12) } else { theme::BG_RAISED });
-        painter.rect_stroke(fb, 16.0, Stroke::new(1.0, if fhover { alpha(YELLOW, 0.5) } else { BORDER }), egui::StrokeKind::Inside);
-        // ⇄ arrows drawn as shapes (font-independent).
-        let ax = 260.0;
-        painter.line_segment([Pos2::new(ax, top + 34.0), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 8.0, top + 30.5), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 8.0, top + 37.5), Pos2::new(ax + 12.0, top + 34.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax, top + 46.0), Pos2::new(ax + 12.0, top + 46.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 4.0, top + 42.5), Pos2::new(ax, top + 46.0)], Stroke::new(1.8, TEXT));
-        painter.line_segment([Pos2::new(ax + 4.0, top + 49.5), Pos2::new(ax, top + 46.0)], Stroke::new(1.8, TEXT));
-        if let Some(g) = &self.flip_label_g { painter.galley(Pos2::new(280.0, top + 33.0), g.clone(), TEXT); }
+        painter.rect_filled(fb, 16.0, if fhover { mix(theme::ACCENT, BLACK, 0.08) } else { theme::ACCENT });
+        theme::inset_keyline(painter, fb, 16.0, alpha(theme::ON_ACCENT, 0.9), 1.5, 2.5);
+        if let Some(g) = &self.flip_label_g {
+            let pos = fb.center() - g.size() * 0.5;
+            painter.galley(pos, g.clone(), WHITE);
+        }
     }
 
     fn draw_hint(&self, painter: &egui::Painter, rect: Rect) {
+        // Plain caption line on paper (§4.15) — no pill container.
         let g = if self.pending.is_some() { &self.hint_wire_g }
             else if self.side == Side::Front { &self.hint_front_g }
             else { &self.hint_back_g };
         let Some(g) = g else { return };
-        let w = g.size().x + 28.0;
-        let bar = Rect::from_min_size(Pos2::new(16.0, rect.bottom() - 42.0), Vec2::new(w, 28.0));
-        painter.rect_filled(bar, 14.0, alpha(theme::BG_RAISED, 0.92));
-        painter.rect_stroke(bar, 14.0, Stroke::new(1.0, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
-        painter.galley(bar.min + Vec2::new(14.0, 7.0), g.clone(), SUBTEXT);
+        painter.galley(Pos2::new(16.0, rect.bottom() - 24.0), g.clone(), theme::INK_2);
     }
 
     fn draw_stats(&mut self, painter: &egui::Painter, rect: Rect) {
@@ -3604,24 +3742,32 @@ impl DemoApp {
                 "{:.0} fps · {} cables · {} pulses · midi {:.1}ms · {}",
                 self.fps, self.cables.len(), pulses, midi_ms,
                 if self.side == Side::Front { "front" } else { "back" });
-            self.stats_g = Some(painter.layout(text, FontId::monospace(11.0), SUBTEXT, f32::INFINITY));
+            // Telemetry is the only mono left in the app (§4.15).
+            self.stats_g = Some(painter.layout(text, FontId::monospace(11.0), theme::INK_2, f32::INFINITY));
         }
         if let Some(g) = &self.stats_g {
             let w = g.size().x + 24.0;
             let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 26.0));
-            painter.rect_filled(bar, 13.0, alpha(theme::BG_RAISED, 0.92));
-            painter.rect_stroke(bar, 13.0, Stroke::new(1.0, alpha(BORDER, 0.9)), egui::StrokeKind::Inside);
-            painter.galley(bar.min + Vec2::new(12.0, 6.0), g.clone(), SUBTEXT);
+            painter.rect_filled(bar, 8.0, theme::PAPER_SINK);
+            painter.rect_stroke(bar, 8.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            painter.galley(bar.min + Vec2::new(12.0, 6.0), g.clone(), theme::INK_2);
         }
     }
 
     fn draw_help(&self, painter: &egui::Painter, rect: Rect) {
+        // Help modal (§4.16): ink scrim over paper, a second appearance of
+        // the hero-panel motif — flat near-black card, radius 28, no border.
         painter.rect_filled(rect, 0.0, alpha(theme::SCRIM, 0.62));
         let card = Rect::from_center_size(rect.center(), Vec2::new(560.0, 352.0));
-        theme::glass_panel(painter, card, 18.0, PURPLE);
-        if let Some(g) = &self.help_title_g { painter.galley(card.min + Vec2::new(28.0, 24.0), g.clone(), TEXT); }
-        if let Some(g) = &self.help_body_g { painter.galley(card.min + Vec2::new(28.0, 62.0), g.clone(), TEXT); }
-        if let Some(g) = &self.help_foot_g { painter.galley(card.min + Vec2::new(28.0, 318.0), g.clone(), SUBTEXT); }
+        theme::flat_panel(painter, card, 28.0, theme::DARK_PANEL, None);
+        theme::asterisk(painter, card.min + Vec2::new(34.0, 36.0), 7.0, theme::ACCENT, 2.0);
+        if let Some(g) = &self.help_title_g {
+            theme::paint_tracked(painter, card.min + Vec2::new(48.0, 22.0), g, TEXT);
+        }
+        if let Some(g) = &self.help_body_g { painter.galley(card.min + Vec2::new(28.0, 58.0), g.clone(), TEXT); }
+        if let Some(g) = &self.help_foot_g {
+            theme::paint_tracked(painter, card.min + Vec2::new(28.0, 326.0), g, SUBTEXT);
+        }
     }
 }
 

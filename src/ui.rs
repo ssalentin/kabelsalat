@@ -36,9 +36,9 @@ use crate::control::{
 };
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 use crate::host::{
-    list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, EditorRect, EditorStatus,
-    EmbeddedEditor,
+    list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
 };
+use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::SourceId;
 use crate::session::Template;
@@ -73,10 +73,6 @@ const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
 const MAX_CABLES: usize = 64;
 const FLIP_SECS: f32 = 0.35;
-/// Header strip of the embedded-editor panel (egui points); the X11 child
-/// window occupies the panel area below it.
-const EDITOR_HEADER_H: f32 = 28.0;
-
 // Damped spring: omega ≈ 11.4 rad/s (~1.8 Hz), zeta ≈ 0.3 → a few visible
 // swings before settling. Semi-implicit Euler at ≤ 1/240 s substeps.
 const SPRING_K: f32 = 130.0;
@@ -672,6 +668,9 @@ struct DemoApp {
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
+    /// RT-safe parameter setters, one per hosted voice (rig A/B). Grabbed
+    /// before the voices move into the engine; used by the native editor.
+    surge_controllers: Vec<VoiceController>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -679,20 +678,28 @@ struct DemoApp {
     /// Live patch mirrored for the control bridge (task-16): MCP/CLI queries
     /// read this snapshot. Rebuilt from the living cables whenever they change.
     shared_graph: Arc<Mutex<Graph>>,
+    /// Multi-rig list/active published by the engine (for the rig overview UI).
+    rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
 
-    // --- Embedded Surge editor (task-15): ONE window, X11 child of the main
-    // window, positioned into a reserved bottom region. One pane at a time.
-    editor: Option<EmbeddedEditor>,
+    // --- Native egui parameter editor (task-26): NO X11 child window. Opens
+    // on double-click of a Clap unit; a scrollable, searchable, module-grouped
+    // slider pane driven by the voice's RT-safe controller. One at a time.
+    editor_open: bool,
     /// Which rig's editor is open: 0 = Surge A (unit 1), 1 = Surge B (unit 4).
     editor_rig: usize,
-    /// Pending open/close request (strip button or F2/F3); handled in ui()
-    /// where the eframe Frame (X11 handle) is available.
-    editor_toggle: Option<usize>,
+    /// Cached parameter list for the open editor (refreshed on open/Refresh).
+    editor_params: Vec<ParamDesc>,
+    /// Search/filter text for the parameter list.
+    editor_filter: String,
+    /// Pending open/close request from a unit double-click (task-26).
+    editor_request: Option<usize>,
     editor_status: String,
+    /// Last single click on a unit (unit, time) for double-click detection.
+    last_unit_click: Option<(usize, std::time::Instant)>,
 }
 
 impl DemoApp {
@@ -773,16 +780,21 @@ impl DemoApp {
             rig_device: [None, None],
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
+            surge_controllers: Vec::new(),
             _audio_stream: None,
             bus: None,
             out_level: None,
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
+            rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             player_ctrl: None,
             graph_sig: Vec::new(),
-            editor: None,
+            editor_open: false,
             editor_rig: 0,
-            editor_toggle: None,
+            editor_params: Vec::new(),
+            editor_filter: String::new(),
+            editor_request: None,
             editor_status: String::new(),
+            last_unit_click: None,
         };
 
         // Hardware MIDI auto-wire at startup: events queue here and are drained
@@ -1023,7 +1035,7 @@ impl DemoApp {
              F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
              Space / F10        metronome Play·Stop · Transport window sets BPM\n\
              Tab                flip the rack · front = perform, back = patch\n\
-             F2 / F3            embed the Surge A / B editor in this window\n\
+             double-click synth open its embedded editor inline · × closes\n\
              drag knobs         shape the sound · right-click resets\n\
              click the keys     play Keys — pulses run down the cables\n\
              laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
@@ -1193,11 +1205,13 @@ impl DemoApp {
     fn with_audio(
         mut self,
         mains: Vec<ClapVoiceMain>,
+        controllers: Vec<VoiceController>,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
         self._surge_main = mains;
+        self.surge_controllers = controllers;
         self._audio_stream = Some(stream);
         self.bus = Some(bus);
         self.out_level = Some(level);
@@ -1342,7 +1356,8 @@ impl DemoApp {
         // Rewire the engine, then publish every knob value.
         self.load_graph_into_engine(&s.graph);
         // The editor referenced the old voice mapping; close it.
-        self.close_editor();
+        self.editor_open = false;
+        self.editor_params.clear();
         self.editor_status = "editor closed (rack reloaded)".into();
         // Reset per-rig filters / split for the new graph.
         self.rig_sources = [(true, true, true); 2];
@@ -1653,131 +1668,135 @@ impl DemoApp {
         }
     }
 
-    // -- embedded Surge editor (task-15) -------------------------------------
+    // -- native egui parameter editor (task-26) ------------------------------
     //
-    // ONE window: the plugin GUI is created with set_parent(main window X11
-    // id) and lives as an X11 CHILD, positioned into a reserved bottom region
-    // (physical pixels = egui points × pixels_per_point). The region is fixed
-    // — the rack flip transform never touches it.
+    // NO X11 child window. Double-clicking a Clap unit opens a scrollable,
+    // searchable, module-grouped slider pane. Sliders drive the voice's
+    // RT-safe VoiceController (ParamValueEvent at the next block); values are
+    // formatted by the plugin itself via param_text. One pane at a time.
 
-    /// Reserved bottom region for the editor, in egui points.
-    fn editor_region(avail: Rect) -> Rect {
-        let h = (avail.height() * 0.55).clamp(220.0, 760.0);
-        Rect::from_min_size(
-            Pos2::new(avail.left(), avail.bottom() - h),
-            Vec2::new(avail.width(), h),
-        )
-    }
-
-    /// Open/close a rig's embedded editor. Needs the eframe Frame for the
-    /// main window's X11 handle. One editor pane at a time.
-    fn toggle_editor(&mut self, rig: usize, frame: &eframe::Frame, ui: &egui::Ui) {
-        if self.editor.is_some() && self.editor_rig == rig {
-            self.close_editor();
-            self.editor_status = "editor closed".into();
+    /// Open/close a rig's native parameter editor. Double-clicking the same
+    /// unit again closes it; opening another rig's editor replaces it.
+    fn toggle_param_editor(&mut self, rig: usize) {
+        if self.editor_open && self.editor_rig == rig {
+            self.editor_open = false;
             return;
         }
-        self.close_editor();
-        let Some(main) = self._surge_main.get_mut(rig) else {
-            self.editor_status = "no synth loaded — editor unavailable".into();
-            return;
+        self.editor_rig = rig;
+        self.editor_filter.clear();
+        self.editor_params = self._surge_main.get_mut(rig)
+            .map(|m| m.param_list())
+            .unwrap_or_default();
+        self.editor_open = !self.editor_params.is_empty();
+        self.editor_status = if self.editor_open {
+            String::new()
+        } else {
+            "no synth loaded — editor unavailable".into()
         };
-        let Some(x11) = main_window_x11(frame) else {
-            self.editor_status = "no X11 window handle (run under XWayland)".into();
-            return;
-        };
-        let region = Self::editor_region(ui.available_rect_before_wrap());
-        let rect = phys_editor_rect(region, ui.ctx().pixels_per_point());
-        match EmbeddedEditor::open(main, x11, rect) {
-            Ok(ed) => {
-                eprintln!(
-                    "editor: Surge {} opened inside main window {x11:#x}",
-                    if rig == 0 { "A" } else { "B" },
-                );
-                self.editor = Some(ed);
-                self.editor_rig = rig;
-                self.editor_status = "embedded — X11 child of this window".into();
-            }
-            Err(e) => {
-                eprintln!("editor: open failed: {e:#}");
-                self.editor_status = format!("editor failed: {e}");
-            }
-        }
     }
 
-    fn close_editor(&mut self) {
-        if let Some(ed) = self.editor.take() {
-            if let Some(main) = self._surge_main.get_mut(self.editor_rig) {
-                ed.close(main);
-            }
-        }
-    }
-
-    /// Allocate the editor's bottom panel (header + placeholder). The X11
-    /// child window composites OVER the placeholder area. Returns the panel
-    /// rect in egui points.
-    fn editor_panel(&mut self, ui: &mut egui::Ui) -> Rect {
-        let region = Self::editor_region(ui.available_rect_before_wrap());
+    /// Re-read the open rig's parameter list (on open / Refresh button).
+    fn refresh_editor_params(&mut self) {
         let rig = self.editor_rig;
-        let status = self.editor_status.clone();
-        let child = self.editor.as_ref().and_then(|e| e.child());
-        let resp = egui::Panel::bottom("surge_editor")
-            .exact_size(region.height())
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(Color32::from_rgb(0x10, 0x11, 0x18))
-                    .inner_margin(egui::Margin::same(0)),
-            )
-            .show(ui, |ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(ui.available_width(), EDITOR_HEADER_H),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add_space(12.0);
-                        let name = self.units.iter()
-                            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
-                            .nth(rig)
-                            .map(|u| u.name.clone())
-                            .unwrap_or_else(|| if rig == 0 { "SURGE A".to_string() } else { "SURGE B".to_string() });
-                        ui.label(
-                            egui::RichText::new(format!("{name} — embedded editor"))
-                                .small().strong().color(BLUE),
-                        );
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new(status).small().italics().color(SUBTEXT));
-                        if let Some(c) = child {
-                            ui.label(egui::RichText::new(format!("X11 child {c:#x}")).small().color(SUBTEXT));
+        if let Some(main) = self._surge_main.get_mut(rig) {
+            self.editor_params = main.param_list();
+        }
+    }
+
+    /// The native parameter editor window: search box + module-grouped
+    /// sliders. Changes are collected and applied after rendering so the
+    /// cached list and the RT-safe controller stay in sync.
+    fn param_editor_window(&mut self, ctx: &egui::Context) {
+        if !self.editor_open {
+            return;
+        }
+        let rig = self.editor_rig;
+        let name = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
+            .nth(rig)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| if rig == 0 { "SURGE A".to_string() } else { "SURGE B".to_string() });
+        let mut open = self.editor_open;
+        let mut refresh = false;
+        let mut changes: Vec<(u32, f64)> = Vec::new();
+        egui::Window::new(format!("{name} — parameters"))
+            .open(&mut open)
+            .collapsible(false)
+            .fixed_size([480.0, 560.0])
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.add_sized([ui.available_width() - 70.0, 20.0],
+                        egui::TextEdit::singleline(&mut self.editor_filter).hint_text("search parameters…"));
+                    if ui.button("Refresh").on_hover_text("re-read the plugin's parameters").clicked() {
+                        refresh = true;
+                    }
+                });
+                ui.separator();
+                let filter = self.editor_filter.to_lowercase();
+                // Split borrows: cached params (read) vs voice mains (param_text).
+                let params = &self.editor_params;
+                let mains = &mut self._surge_main;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    let mut modules: Vec<&str> = Vec::new();
+                    for p in params {
+                        if !modules.contains(&p.module.as_str()) {
+                            modules.push(p.module.as_str());
                         }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(8.0);
-                            if ui.button("Close").clicked() {
-                                self.editor_toggle = Some(rig);
-                            }
-                        });
-                    },
-                );
-                // Dark placeholder under the header — the plugin's X11 child
-                // covers this; any uncovered sliver matches the chassis.
-                let rest = ui.available_rect_before_wrap();
-                ui.painter().rect_filled(rest, 0.0, Color32::from_rgb(0x0b, 0x0c, 0x12));
+                    }
+                    let mut shown = 0usize;
+                    for module in modules {
+                        let group: Vec<&ParamDesc> = params.iter()
+                            .filter(|p| p.module == module && p.automatable && !p.hidden && !p.readonly
+                                && (filter.is_empty()
+                                    || p.name.to_lowercase().contains(&filter)
+                                    || p.module.to_lowercase().contains(&filter)))
+                            .collect();
+                        if group.is_empty() {
+                            continue;
+                        }
+                        // Force modules open while searching so matches show.
+                        let force_open = if filter.is_empty() { None } else { Some(true) };
+                        egui::CollapsingHeader::new(module)
+                            .open(force_open)
+                            .show(ui, |ui| {
+                                for p in group {
+                                    shown += 1;
+                                    let mut value = p.value;
+                                    ui.horizontal(|ui| {
+                                        let w = ui.available_width();
+                                        let resp = ui.add_sized(
+                                            [(w - 96.0).max(120.0), 18.0],
+                                            egui::Slider::new(&mut value, p.min..=p.max).text(&p.name),
+                                        );
+                                        if resp.changed() {
+                                            changes.push((p.id, value));
+                                        }
+                                        let text = mains.get_mut(rig)
+                                            .map(|m| m.param_text(p.id, value))
+                                            .unwrap_or_default();
+                                        ui.label(egui::RichText::new(text).small().color(SUBTEXT));
+                                    });
+                                }
+                            });
+                    }
+                    if shown == 0 {
+                        ui.label(egui::RichText::new("no matching parameters").italics().color(SUBTEXT));
+                    }
+                });
             });
-        resp.response.rect
-    }
-
-    /// Per-frame editor maintenance: X events, CLAP gui requests, geometry.
-    fn pump_editor(&mut self, region: Rect, ppp: f32) {
-        let rect = phys_editor_rect(region, ppp);
-        let rig = self.editor_rig;
-        let Some(main) = self._surge_main.get_mut(rig) else { return };
-        let Some(ed) = self.editor.as_mut() else { return };
-        if ed.pump(main, rect) == EditorStatus::Closed {
-            // Plugin closed its own GUI; drop the editor (close() skips the
-            // CLAP calls because gui_gone is set).
-            if let Some(ed) = self.editor.take() {
-                ed.close(main);
+        self.editor_open = open;
+        // Apply slider changes: update the cache + schedule RT-safe param events.
+        for (id, value) in changes {
+            if let Some(p) = self.editor_params.iter_mut().find(|p| p.id == id) {
+                p.value = value;
             }
-            self.editor_status = "editor closed by plugin".into();
+            if let Some(ctrl) = self.surge_controllers.get(rig) {
+                ctrl.set_param(ClapId::new(id), value);
+            }
+        }
+        if refresh {
+            self.refresh_editor_params();
         }
     }
 
@@ -1839,19 +1858,8 @@ impl DemoApp {
                                 }
                             }
                         }
-                        // Embedded Surge editor toggle (task-15): opens the
-                        // plugin GUI INSIDE this window (X11 child), not a
-                        // separate floating window. Handled in ui().
-                        let ed_on = self.editor.is_some() && self.editor_rig == rig;
-                        let ed_fill = if ed_on { alpha(accent, 0.55) } else { Color32::from_rgb(0x26, 0x28, 0x38) };
-                        let ed_txt = if ed_on { TEXT } else { SUBTEXT };
-                        let btn = egui::Button::new(egui::RichText::new("Editor").small().color(ed_txt))
-                            .fill(ed_fill)
-                            .corner_radius(4.0);
-                        if ui.add(btn).on_hover_text("embed the Surge editor in this window (F2/F3)").clicked() {
-                            self.editor_toggle = Some(rig);
-                        }
-                        ui.add_space(14.0);
+                        // Editor is opened inline by double-clicking the synth
+                        // unit in the rack (task-26) — no per-rig button here.
                     }
                     ui.add_space(4.0);
                     let split_txt = if self.split_on { "Split @ C4: ON" } else { "Split @ C4: off" };
@@ -1868,7 +1876,7 @@ impl DemoApp {
                         }
                     }
                     ui.add_space(10.0);
-                    if self.editor.is_none() && !self.editor_status.is_empty() {
+                    if !self.editor_open && !self.editor_status.is_empty() {
                         ui.label(egui::RichText::new(&self.editor_status).small().italics().color(ORANGE));
                         ui.add_space(8.0);
                     }
@@ -2318,6 +2326,13 @@ impl DemoApp {
             .collect()
     }
 
+    /// Voice index (0/1) for a Clap unit, for inline editing (task-26). None if
+    /// the unit is not one of the hosted synth voices.
+    fn rig_of_unit(&self, unit: usize) -> Option<usize> {
+        let node_id = self.units.get(unit)?.node_id;
+        self.clap_rigs().into_iter().find(|(_, nid)| *nid == node_id).map(|(rig, _)| rig)
+    }
+
     /// Rig index (voice slot) for a node id; 0 if not a rig.
     fn rig_of_node(&self, node: u32) -> usize {
         self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).unwrap_or(0)
@@ -2734,9 +2749,6 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
             if i.consume_key(Modifiers::NONE, Key::D) { self.show_stats = !self.show_stats; }
-            // Embedded Surge editors: F2 = rig A, F3 = rig B (task-15).
-            if i.consume_key(Modifiers::NONE, Key::F2) { self.editor_toggle = Some(0); }
-            if i.consume_key(Modifiers::NONE, Key::F3) { self.editor_toggle = Some(1); }
             // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
@@ -2965,7 +2977,24 @@ impl DemoApp {
                             self.selected = if self.selected == Some(id) { None } else { Some(id) };
                         }
                     }
-                    Some(Hit::Unit(ui)) => self.ping_unit(ui),
+                    Some(Hit::Unit(ui)) => {
+                        // Double-click a synth unit → toggle its inline editor
+                        // (task-26). A single click still pings the unit.
+                        let is_synth = self.units.get(ui).map_or(false, |u| matches!(u.node_kind, UnitKind::Clap));
+                        let now = std::time::Instant::now();
+                        let double = is_synth && self.last_unit_click
+                            .map_or(false, |(pu, pt)| pu == ui && now.duration_since(pt).as_millis() < 400);
+                        if double {
+                            self.last_unit_click = None;
+                            match self.rig_of_unit(ui) {
+                                Some(rig) => self.editor_request = Some(rig),
+                                None => self.editor_status = "no hosted synth voice for this unit".into(),
+                            }
+                        } else {
+                            if is_synth { self.last_unit_click = Some((ui, now)); }
+                            self.ping_unit(ui);
+                        }
+                    }
                     Some(Hit::Background) | None => {
                         if self.pending.is_some() { self.pending = None; }
                         else { self.selected = None; }
@@ -3578,40 +3607,6 @@ fn dt_of(ctx: &egui::Context) -> f32 {
     ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0)
 }
 
-/// The main window's X11 id, via eframe's raw-window-handle implementation.
-///
-/// eframe 0.37: `Frame: HasWindowHandle` (epi.rs). The trait and types live in
-/// raw-window-handle 0.6, re-exported as `eframe::wgpu::rwh` (wgpu is a default
-/// eframe feature) — no extra dependency. Under `WINIT_UNIX_BACKEND=x11`
-/// winit yields `RawWindowHandle::Xlib` (the Xlib `Window` id).
-fn main_window_x11(frame: &eframe::Frame) -> Option<u32> {
-    use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
-    let handle = frame.window_handle().ok()?;
-    match handle.as_raw() {
-        RawWindowHandle::Xlib(h) => Some(h.window as u32),
-        RawWindowHandle::Xcb(h) => Some(h.window.get()),
-        other => {
-            eprintln!("editor: unsupported raw window handle: {other:?}");
-            None
-        }
-    }
-}
-
-/// Editor panel rect (egui points) → X11 child rect (physical pixels),
-/// excluding the header strip. X11 coords are relative to the main window.
-fn phys_editor_rect(region: Rect, ppp: f32) -> EditorRect {
-    let x = (region.left() * ppp).round().max(0.0) as i32;
-    let y = ((region.top() + EDITOR_HEADER_H) * ppp).round().max(0.0) as i32;
-    let w = (region.width() * ppp).round().max(1.0) as i32;
-    let h = ((region.height() - EDITOR_HEADER_H) * ppp).round().max(1.0) as i32;
-    EditorRect {
-        x: x.min(i16::MAX as i32) as i16,
-        y: y.min(i16::MAX as i32) as i16,
-        w: w.min(u16::MAX as i32) as u16,
-        h: h.min(u16::MAX as i32) as u16,
-    }
-}
-
 fn p_side(unit: usize, app: &DemoApp) -> f32 {
     let x = app.jack_pos(unit, 0).x;
     if x < app.rack_w / 2.0 { -1.0 } else { 1.0 }
@@ -3636,7 +3631,7 @@ impl eframe::App for DemoApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.ensure_galleys(&ctx);
 
@@ -3662,17 +3657,11 @@ impl eframe::App for DemoApp {
         self.rig_inputs_panel(ui);
         self.assistant_panel_ui(ui);
 
-        // Embedded Surge editor (task-15): handle open/close requests here
-        // (the eframe Frame carries the main window's X11 handle), then
-        // reserve the bottom region. The rack lays out in what remains.
-        if let Some(rig) = self.editor_toggle.take() {
-            self.toggle_editor(rig, frame, ui);
+        // Native rig editor (task-26): handle open/close requests from unit
+        // double-clicks. No X11 — the editor is a plain egui window drawn below.
+        if let Some(rig) = self.editor_request.take() {
+            self.toggle_param_editor(rig);
         }
-        let editor_region = if self.editor.is_some() {
-            Some(self.editor_panel(ui))
-        } else {
-            None
-        };
 
         // Laptop keys (disabled while the assistant text field has focus).
         if !ctx.egui_wants_keyboard_input() {
@@ -3801,19 +3790,15 @@ impl eframe::App for DemoApp {
         self.sessions_window(&ctx);
         self.plugins_window(&ctx);
         self.transport_window(&ctx);
-
-        // Keep the embedded editor alive: X events, CLAP gui requests, and
-        // child geometry in the reserved region (physical pixels).
-        if let Some(region) = editor_region {
-            self.pump_editor(region, ctx.pixels_per_point());
-        }
+        self.param_editor_window(&ctx);
 
         ctx.request_repaint();
     }
 
     fn on_exit(&mut self) {
-        // Destroy the plugin GUI before the CLAP instances drop (CLAP rule).
-        self.close_editor();
+        // Native editor holds no plugin GUI; just drop its cached state.
+        self.editor_open = false;
+        self.editor_params.clear();
     }
 }
 
@@ -3966,7 +3951,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -3977,6 +3962,8 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
     // Two instrument voices — one per channel stack (nodes 1 and 4).
     let (voice_a, main_a) = ClapVoice::new(sample_rate)?;
     let (voice_b, main_b) = ClapVoice::new(sample_rate)?;
+    // Grab RT-safe param controllers BEFORE the voices move into the engine.
+    let controllers = vec![voice_a.controller(), voice_b.controller()];
     let mut config: cpal::StreamConfig = cfg.into();
     // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
     // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
@@ -3997,6 +3984,10 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         vec![(1, voice_a), (4, voice_b)],
     );
     let level = engine.level_handle();
+    // Multi-rig snapshot: engine publishes rig list/active on LoadRigs; the
+    // bridge + UI read it (the audio render path never locks it).
+    let rig_snapshot = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
+    engine.set_rig_snapshot(rig_snapshot.clone());
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
     if let Some(source) = crate::capture::SystemCapture::default_monitor() {
@@ -4023,7 +4014,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, cpal::Stream, CommandBus
         None,
     )?;
     stream.play()?;
-    Ok((vec![main_a, main_b], stream, bus, level, sample_rate, player_ctrl))
+    Ok((vec![main_a, main_b], controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot))
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -4080,17 +4071,18 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, stream, bus, level, sample_rate, player_ctrl)) => {
+                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
                         // socket is unavailable the app just runs without it.
                         let shared_graph = Arc::new(Mutex::new(Graph::demo_patch()));
-                        if let Err(e) = crate::bridge::spawn(
+                        if let Err(e) = crate::bridge::spawn_with_rigs(
                             bus.clone(),
                             shared_graph.clone(),
                             level.clone(),
                             sample_rate,
+                            rig_snapshot.clone(),
                         ) {
                             eprintln!("bridge: control socket unavailable: {e:#}");
                         }
@@ -4107,17 +4099,18 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, stream, bus, level, shared_graph, player_ctrl));
+                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, stream, bus, level, shared_graph, player_ctrl)) => {
+                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot)) => {
                     app.shared_graph = shared_graph;
+                    app.rig_snapshot = rig_snapshot;
                     app.player_ctrl = Some(player_ctrl);
-                    app.with_audio(mains, stream, bus, level)
+                    app.with_audio(mains, controllers, stream, bus, level)
                 }
                 None => app,
             };

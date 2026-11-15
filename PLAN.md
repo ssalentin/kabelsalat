@@ -2,7 +2,7 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Signal redesign + multi-rig backend landed; multi-rig UI is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Signal visual redesign landed** (src/theme.rs: dark layered glass, cyan/blue audio, amber MIDI, violet selection, green active, red clip — docs/design-language.md). **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) multi-rig UI, (2) hot-wire MIDI matrix view. · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below.
+Status: **core app complete + Hurricane redesign + multi-rig backend landed; multi-rig UI is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). **Multi-rig backend complete** (Rig model, merge, LoadRigs, per-rig device binding, rig snapshot exposed to UI/MCP) — the multi-rig *UI* (overview strip + number/arrow switching) is the next build. 107 unit tests + many CLI self-tests pass. Next: (1) multi-rig UI, (2) hot-wire MIDI matrix view, (3) design polish (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
 
 ## 0.1 Session handoff (read me first in a new session)
 
@@ -31,17 +31,22 @@ Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `play
 - `dsp.rs` — 8 allocation-proven processors + Metronome placeholder.
 - `matrix.rs` — MIDI routing: `SourceId::{Keys,LaptopKeys,Hardware(dev),...}`, per-rig rules,
   splits/transpose/filters. Allocation-free `route_into`.
-- `theme.rs` — **Signal design language** (docs/design-language.md): palette consts
-  (BG_DEEP/SURFACE/HAIRLINE, AUDIO_CYAN/BLUE, MIDI_AMBER, ACCENT_VIOLET/MAGENTA,
-  LIVE_GREEN, CLIP_RED, WARN_AMBER), `glass_panel`/`gradient_rect`/`glow_rect`/
-  `aurora_bg`/`value_arc`/`meter_color` painters, `visuals()` for the egui chrome,
-  `install_fonts` (Noto Sans reg/med/bold + JetBrains Mono, graceful fallback).
+- `theme.rs` — **Hurricane design language** (docs/design-reference-analysis.md): light
+  warm-paper chrome + one near-black hero panel (the rack). Tokens: PAPER/PAPER_SINK/INK/
+  INK_2/HAIRLINE, DARK_PANEL/DARK_PANEL_HI/CREAM/CREAM_DIM/HAIRLINE_DARK, ACCENT (tomato)
+  + text-safe variants, AUDIO_CREAM/MIDI_BLUE/LIVE_TEAL/CLIP_RED. Flat painters:
+  `paper_bg` (watermark asterisk), `flat_panel`, `drop_shadow` (floating sheets only),
+  `inset_keyline`, `asterisk`, flat `value_arc`, stepped `meter_color`; `TrackedLabel`
+  per-char galley machinery (letter-spacing), `tracked_label`/`section_label`/
+  `primary_button` widgets, `visuals()` (light), `install_fonts` (Noto Sans reg/med/bold
+  + JetBrains Mono; Medium = display, Bold = flip pill only).
 - `ui.rs` — eframe/egui. Data-driven rack (`build_rack`), Tab flip, animated cables, Ctrl+drag
   rearrange, **native egui param editor (double-click a Clap unit; NO X11)**, plugin browser (F9),
   templates (F5/F6/F7, F8 demo), sessions, transport popover (F10/Space), stats (fps/cables/midi ms).
-  All painting goes through the Signal theme (glass units, 3-layer cable glow, violet
-  selection, glowing-green play, meter gradient + peak hold, knob drag value chip).
-  Holds `shared_graph`, `rig_snapshot`, `surge_controllers`.
+  Hurricane painting: flat plates + 2px accent/hairline strips, teal LEDs, single-stroke cables
+  (audio cream/round terminals, MIDI blue/square), flat pulse dots, paper masthead toolbar with
+  the single tomato flip pill (`flip_rect()` shared with hit-test), tracked micro-caps labels,
+  sentence-case unit names, dark help card. Holds `shared_graph`, `rig_snapshot`, `surge_controllers`.
 - `bridge.rs` — unix socket `$XDG_RUNTIME_DIR/kabelsalat.sock`; `spawn_with_rigs`; queries
   `get_graph`/`get_status`/`get_rigs`; `BUFFER_FRAMES=512`, `XRUNS`, `MIDI_LATENCY_US` statics.
 - `mcp.rs` — rmcp server, ~19 tools incl. `load_rigs`/`get_rigs`/`add_node`/`connect`/`list_plugins`.
@@ -63,28 +68,50 @@ Tests: `cargo test` (107). CLI self-tests: `session-test`, `capture-test`, `play
   `hyprctl` (signature dir: `/run/user/1000/hypr/<sig>`).
 - Lead owns git commits + Cargo.toml; subagents use `CARGO_TARGET_DIR=$HOME/.cache/ksalat-*-target`,
   never /tmp (tmpfs). Verify before committing; keep the running app on the old binary until approved.
-- This DSH session's only authorized subagent model is qwen4-max-preview (no image input); the
-  `deepseek` provider is not allowed here. Screenshot review needs an image-capable model/profile.
+- **Visual review = DeepSeek vision via the app's BYOK key** (verified working): key at
+  `~/.config/kabelsalat/config.json` field `deepseek_api_key` (NEVER print/commit). POST
+  `https://api.deepseek.com/chat/completions`, model `deepseek-flash` (text+image;
+  `deepseek-v4-pro` is text-only), OpenAI-style `image_url` data-URL parts, **max_tokens ≥ 4000**
+  (reasoning eats small budgets → empty content). Downscale images first (magick). DSH subagents
+  here are qwen4-max-preview (no image input) — they drive the API via bash, they don't see images.
+- **egui 0.37 deadlock gotcha:** `Context` is ONE RwLock — never call `Painter::add/galley`
+  inside `ctx.fonts_mut`/`ui.fonts_mut` (re-entrant write → 10s-timeout panic). Layout under
+  the lock, paint after releasing it (see `theme::tracked_label`).
+- **Screenshot harness:** `scripts/capture.sh <outdir> [binary]` launches `ui-demo`, injects
+  Tab/Space/?/Esc/F10 via `scripts/xtest_key.py` (ctypes XTEST — needs proper restype/argtypes),
+  captures front/back/playing/help/transport with `grim -o eDP-1` (env: WAYLAND_DISPLAY=wayland-1
+  DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000). Verify with ImageMagick histograms/token counts.
+  Dribbble is bot-walled: fetch shot pages via `https://r.jina.ai/<url>`, images from
+  `cdn.dribbble.com/userupload/...` (strip resize params for full res).
 
 **Next builds (in order):**
 1. **Multi-rig UI** — backend is DONE (`LoadRigs`, `rig_snapshot`, `get_rigs`). Build an always-visible
    overview strip (rig name + MIDI device + active highlight + level), number keys 1–9 + arrow keys to
    switch the big view (visual only; all rigs sound), big view = active rig's rack. **Held keys must
    remember their rig+pitch** so switching doesn't orphan note-offs (vibez lesson, docs/vibez-notes.md).
-   Style it with the Signal theme (`src/theme.rs`) from the start.
-2. **Hot-wire MIDI matrix view** (backlog) — AUM-style MIDI-in vs sink patching surface.
+   Style it with the Hurricane theme (`src/theme.rs`) from the start.
+2. **Hot-wire MIDI matrix view** — AUM-style MIDI-in vs sink patching surface (§13).
+3. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
 
-**Signal redesign — LANDED 2026-11-15.** Verified via 107 unit tests + session/multi-rig/metro/
-mono/add-node self-tests + pixel-analysis of screenshots (docs/shots/signal-{front,back}.png):
-palette dominance, glass gradients, all accents present, old palette gone, flip/transport/help
-all functional. Screenshot review is programmatic — the session model has no image input;
-use ImageMagick histograms/region counts (grim needs WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR;
-key injection into the XWayland window works via python ctypes XTEST with proper restype/argtypes).
-Minor motion polish left: staged fade-in on template load, ~120ms hover easing on painted controls.
+**Hurricane redesign — LANDED 2026-11-15** (agent team: design-analyst → implementer → lead).
+History: the earlier "Signal" dark-glass pass was built from a spec written WITHOUT seeing the
+user's reference (Dribbble bot-blocked the fetch). The user's actual target is the
+[Hurricane Creative Agency landing page](https://dribbble.com/shots/19623638-Hurricane-Creative-Agency-Landing-page)
+(frames in `docs/design-ref/`). DeepSeek-V4.1-Flash vision analyzed the frames + pixel-measured
+the palette → `docs/design-reference-analysis.md` (the authoritative spec: tokens, per-component
+instructions, contrast table, keep-list). Implementation: light paper chrome, rack = the single
+near-black hero panel, flat fills/hairlines, one tomato accent, semantic cream/blue/teal/red from
+the reference imagery, tracked micro-caps + Medium display type, single flip pill. Verified:
+107 tests + session-test; pixel analysis (paper/dark/tomato dominance, MIDI blue on back, teal
+when playing, zero old-palette px); DeepSeek vision comparison verdict "close in spirit" with
+polish gaps recorded in §13. Fixed during integration: round/square terminal shapes (§3 vs §4.12
+brief inconsistency) and the fonts-lock deadlock (above).
 
-**Docs:** `docs/BACKLOG.md` (queue), `docs/design-language.md` (redesign spec), `docs/vibez-notes.md`
-(reference-app lessons), `docs/p0-report.md` (latency/go-no-go), `docs/p3-lv2.md`, `docs/p3-mcp.md`,
-`docs/control-plane.md`, `docs/p2-transport.md`, and per-feature p1/p2 docs.
+**Docs:** `docs/design-reference-analysis.md` (**current design spec**), `docs/design-language.md`
+(superseded Signal spec — history only), `docs/vibez-notes.md` (reference-app lessons),
+`docs/p0-report.md` (latency/go-no-go), `docs/p3-lv2.md`, `docs/p3-mcp.md`, `docs/control-plane.md`,
+`docs/p2-transport.md`, and per-feature p1/p2 docs. **Roadmap/queue: §13 of this file** (BACKLOG.md
+merged here 2026-11-15; no GitHub tickets).
 
 ## 0. Decision log
 
@@ -116,6 +143,15 @@ Minor motion polish left: staged fade-in on template load, ~120ms hover easing o
 - **2026-11-14** — **AUM operating model reaffirmed** (user): multiple independent
   rigs, each taking input from a different MIDI device or audio source, freely
   wired and mixed. Per-rig input selection is core (§1).
+- **2026-11-15** — **Design reference corrected to Hurricane** (user): the Signal
+  dark-glass pass had been specified without seeing the user's Dribbble link (bot
+  wall). User pointed at the Hurricane Creative Agency landing page; DeepSeek vision
+  analysis → light editorial language (§0.1, docs/design-reference-analysis.md).
+- **2026-11-15** — **Agent teams + DeepSeek vision adopted** (user request): work runs
+  as analyst → implementer → lead; visual facts come from DeepSeek-V4.1-Flash via the
+  app's BYOK key, not from guessing.
+- **2026-11-15** — **Single roadmap in PLAN.md** (user): all work tracking lives in §13
+  of this file — no GitHub tickets; BACKLOG.md merged here.
 
 ## 1. Goal
 
@@ -415,3 +451,70 @@ headless `--json` CLI · PKGBUILD → launcher.
 - cpal — https://github.com/RustAudio/cpal · midir — https://docs.rs/midir · fundsp — https://docs.rs/fundsp
 - egui — https://github.com/emilk/egui · rtrb — https://docs.rs/rtrb · ashpd — https://docs.rs/ashpd
 - rmcp (official Rust MCP SDK) — https://github.com/modelcontextprotocol/rust-sdk
+- Design reference — https://dribbble.com/shots/19623638-Hurricane-Creative-Agency-Landing-page
+  (frames: docs/design-ref/; analysis: docs/design-reference-analysis.md)
+
+## 13. Living roadmap (single source of truth — no GitHub tickets)
+
+The north star is AUM's operating model: **multiple independent rigs, each bound to its
+own MIDI device or audio source, all sounding at once, freely wired and mixed** — with
+GarageBand approachability and Reason's rack flip, in the Hurricane visual language.
+Everything queued lives here; update this section as work lands.
+
+### In progress / next
+
+1. **Multi-rig UI** (the big one). Backend is **DONE**: Rig model + merge + `LoadRigs`
+   + per-rig device binding + rig snapshot exposed to UI/MCP (`get_rigs`/`load_rigs`).
+   Each rig is a full rack bound to its own MIDI input (organ / keyboard / EWI / synth
+   controllers); all rigs sound simultaneously, mixed to master. **Remaining: the UI** —
+   an always-visible overview strip (rig name + device + active highlight + level),
+   **number keys 1–9 + arrow keys** to switch the big view (visual only), big view = the
+   active rig's rack. Held keys must remember rig+pitch so switching doesn't orphan
+   note-offs (docs/vibez-notes.md). Style with the Hurricane theme from the start.
+2. **Hot-wire MIDI channels on the go** — an AUM-style **MIDI-in vs sink matrix view**
+   to patch any MIDI input (device + channel) to any accepting rig live. Prereq: the
+   multi-rig overview. This is the defining AUM routing surface (docs/midi-matrix.md).
+3. **Hurricane design polish** — DeepSeek-vision review (2026-11-15) verdict "close in
+   spirit"; remaining gaps, prioritized:
+   - Shadows: reference is rigorously shadowless — drop the soft shadows under the rack
+     and masthead (keep them only where a sheet truly floats, e.g. windows/drag chip),
+     and remove any emboss/highlight on jack icons.
+   - Display-scale type: add one large-type moment (oversized wordmark or a big numeric
+     readout, e.g. BPM) against the 9–10px tracked caps — the editorial size contrast.
+   - Corner language: unify to either generous radius or true hairline squares (plates,
+     meter, keyboard, jack wells currently mix); Send-style controls follow the one-pill rule.
+   - Paper warmth: verify PAPER against the reference cream on real displays; plates
+     should read as one near-black family separated by hairlines, not lifted grey.
+   - NOTE: the teal/blue/red semantic expansion is deliberate (audio≠MIDI≠clip for live
+     use, brief §3) — do NOT collapse it to monochrome to match the reference literally.
+   - Motion: staged fade-in on template load; ~120ms hover easing on painted controls.
+
+### Backlog (after the above)
+
+- **Dynamic non-Surge CLAP loading** — load arbitrary CLAP instruments (today the engine
+  remaps its two startup Surge voices; other CLAP shows "coming soon"). Needs main-thread
+  instantiation + a voice-delivery side channel.
+- **LV2 instrument audible playback** — routing is verified; confirm sound with a real
+  MIDI synth (installed LV2 instruments are samplers/generators).
+- **Per-rig volume/pan/mute/solo** on the overview strip (AUM mixer feel).
+- **MIDI matrix rules in the UI** — transpose / key-range / velocity-range / CC maps
+  exist in the engine; expose them per rig.
+- **Sends / aux buses** — dedicated send controls (free wiring already works).
+- **Recording** — synchronized capture of the master (and per-rig stems).
+- **Tap tempo + count-in** for the metronome.
+- **P4 packaging** — PKGBUILD + `.desktop` + icon, `?` overlay polish, README screenshot
+  (use docs/shots/hurricane-*.png), Omarchy theme accent following.
+
+### Known limits / caveats
+
+- CLAP voice pool is 2 Surge voices (main-thread-only); >2 CLAP synths awaits dynamic
+  loading. LV2 instruments can extend this.
+- LV2 instrument classification is a permissive port-based hint (the authoritative LV2
+  class is a blank node lilv can't resolve here).
+- System-audio capture of the output monitor can feed back if kabelsalat plays to the
+  same sink (muted by default).
+
+### Research
+
+- **vibez** (`~/src/vibez`, Rust + iced) — study its multi-instrument / MIDI routing /
+  session approach and adapt what fits (docs/vibez-notes.md).

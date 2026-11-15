@@ -37,9 +37,30 @@ use serde_json::{json, Value};
 use crate::control::{Command, CommandBus, Graph, RigSnapshot};
 
 /// Output buffer size in frames (shared with the audio setup in `ui`).
-pub const BUFFER_FRAMES: u32 = 512;
+pub const BUFFER_FRAMES: u32 = 256;
 /// Count of audio stream errors / xruns reported by cpal since startup.
 pub static XRUNS: AtomicU32 = AtomicU32::new(0);
+/// Audio callback timing (lock-free, written by the audio thread): worst
+/// render time, the callback's frame count, and how many callbacks used
+/// more than 80% of their buffer's real-time budget.
+pub static RENDER_MAX_US: AtomicU32 = AtomicU32::new(0);
+pub static RENDER_LAST_FRAMES: AtomicU32 = AtomicU32::new(0);
+pub static RENDER_LATE: AtomicU32 = AtomicU32::new(0);
+/// Smoothed (EMA, 1/64) render time in microseconds.
+pub static RENDER_AVG_US: AtomicU32 = AtomicU32::new(0);
+
+/// Record one callback's render time (called from the audio thread; atomics only).
+pub fn note_render(elapsed: std::time::Duration, frames: usize, sample_rate: f64) {
+    let us = elapsed.as_micros().min(u32::MAX as u128) as u32;
+    RENDER_MAX_US.fetch_max(us, Ordering::Relaxed);
+    RENDER_LAST_FRAMES.store(frames as u32, Ordering::Relaxed);
+    let avg = RENDER_AVG_US.load(Ordering::Relaxed);
+    RENDER_AVG_US.store(avg - avg / 64 + us / 64, Ordering::Relaxed);
+    let budget_us = frames as f64 / sample_rate * 1e6;
+    if us as f64 > budget_us * 0.8 {
+        RENDER_LATE.fetch_add(1, Ordering::Relaxed);
+    }
+}
 /// Rolling average of the MIDI input→processing delay in microseconds (the
 /// hardware-MIDI queue wait; add the audio buffer for total input→sound latency).
 pub static MIDI_LATENCY_US: AtomicU32 = AtomicU32::new(0);
@@ -239,6 +260,10 @@ fn handle_line(
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
                     "xruns": XRUNS.load(Ordering::Relaxed),
+                    "render_max_us": RENDER_MAX_US.load(Ordering::Relaxed),
+                    "render_frames": RENDER_LAST_FRAMES.load(Ordering::Relaxed),
+                    "render_late": RENDER_LATE.load(Ordering::Relaxed),
+                    "render_avg_us": RENDER_AVG_US.load(Ordering::Relaxed),
                     "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
                     "rigs": rig_count,
                     "active_rig": active_rig,

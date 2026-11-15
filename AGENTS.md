@@ -130,6 +130,14 @@ Learned so far (2026-11-15, UI polish pass):
 28. **One display name per unit:** UI text shows `sentence_case(&u.name)`
     everywhere (face, mixer, rig inputs, matrix) — raw graph names are
     upper case.
+29. **The render thread must be realtime:** cpal does not promote
+    pipewire-alsa (IOPLUG) streams — the callback promotes itself once via
+    rtkit (`audio_thread_priority`). At normal priority the UI preempted it
+    for up to 26 ms (> the buffer) → xruns. Verify with
+    `ps -L -o cls,rtprio,comm` (cpal_alsa_out = RR) and get_status
+    `render_max_us`/`render_late` before touching BUFFER_FRAMES (now 256).
+30. **Meters have a noise floor:** smoothed levels never reach 0 — light
+    segments via `lit_segments` (< 0.001 = dark), never a raw `ceil`.
 
 ## Ground rules
 

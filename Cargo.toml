@@ -10,6 +10,9 @@ anyhow = "1.0.104"
 clack-extensions = { version = "0.2.0", features = ["all-extensions", "clack-host"] }
 clack-host = "0.2.0"
 cpal = "0.18.2"
+# rtkit (D-Bus) realtime promotion of the audio callback thread: cpal skips
+# RT for pipewire-alsa (IOPLUG) devices, so the app promotes it itself.
+audio_thread_priority = { version = "0.35.1", features = ["with_dbus"] }
 eframe = "0.37.0"
 egui = "0.37.0"
 libc = "0.2"
@@ -26,3 +29,12 @@ x11rb = "0.14.0"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The audio callback runs in debug builds too (the app is usually launched from
+# target/debug): unoptimized DSP + plugin hosting underran the 10.7 ms buffer.
+# Optimize the crate lightly and dependencies fully; debug info stays.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

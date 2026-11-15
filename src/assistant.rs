@@ -247,6 +247,11 @@ fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"channel":{"type":"integer"},"transpose":{"type":"integer"},"key_lo":{"type":"integer"},"key_hi":{"type":"integer"},"vel_lo":{"type":"integer"},"vel_hi":{"type":"integer"},"enabled":{"type":"boolean"}},"required":["node","source"]}
         }},
         {"type":"function","function":{
+            "name":"set_rig_mix",
+            "description":"Per-rig mixer: rig index (0-based), vol 0..1, pan -1..1, mute, solo (solo mutes other rigs). Omitted fields keep their value. Example: rig 1 mute true.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"vol":{"type":"number"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["rig"]}
+        }},
+        {"type":"function","function":{
             "name":"list_plugins",
             "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
             "parameters":{"type":"object","properties":{}}

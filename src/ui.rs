@@ -771,6 +771,8 @@ struct DemoApp {
     rule_edits: std::collections::HashMap<(SourceId, u32), RuleEdit>,
     /// The matrix cell whose rule editor is open: (sink unit, row).
     rule_editor: Option<(usize, MatrixRow)>,
+    /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
+    rig_mix: [crate::engine::RigMix; 8],
     /// Previous frame's keyboard-focus state: losing focus drains held keys
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
@@ -910,6 +912,7 @@ impl DemoApp {
             flip_hover_t: 0.0,
             rule_edits: std::collections::HashMap::new(),
             rule_editor: None,
+            rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             had_kb_focus: true,
             rig_sources: [(true, true, true); 2],
             split_on: false,
@@ -1067,6 +1070,7 @@ impl DemoApp {
         // The engine rebuilds its matrix on loads — rule edits start fresh.
         self.rule_edits.clear();
         self.rule_editor = None;
+        self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
     }
 
     /// Derive rack structure FOR THE ACTIVE RIG: Keys (left), Master (right),
@@ -1562,6 +1566,19 @@ impl DemoApp {
         let Ok(g) = pub_.lock() else { return };
         if g.rev == self.last_graph_rev { return; }
         self.last_graph_rev = g.rev;
+        // Mirror the engine's rules (covers remote MCP rule edits too).
+        let mut edits = std::collections::HashMap::new();
+        for r in &g.rules {
+            let e = RuleEdit {
+                channel: r.channel,
+                transpose: r.transpose,
+                key_lo: r.key_range.0, key_hi: r.key_range.1,
+                vel_lo: r.vel_range.0, vel_hi: r.vel_range.1,
+                enabled: r.enabled,
+            };
+            if !e.is_default() { edits.insert((r.source, r.dest), e); }
+        }
+        self.rule_edits = edits;
         // Build the UI's current mirror: base nodes + living cables.
         let mut mirror = self.base_graph.clone();
         mirror.edges.clear();
@@ -2031,6 +2048,18 @@ impl DemoApp {
                     let _ = bus.lock().unwrap().send(e.to_command(src, node));
                 }
                 format!("rule {source} → node {node}: {}", e.summary())
+            }
+            "set_rig_mix" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if rig >= self.rig_count() { return format!("rig {rig} out of range ({} rigs)", self.rig_count()); }
+                let m = &mut self.rig_mix[rig.min(7)];
+                if let Some(v) = args.get("vol").and_then(|v| v.as_f64()) { m.vol = v.clamp(0.0, 1.0) as f32; }
+                if let Some(v) = args.get("pan").and_then(|v| v.as_f64()) { m.pan = v.clamp(-1.0, 1.0) as f32; }
+                if let Some(v) = args.get("mute").and_then(|v| v.as_bool()) { m.mute = v; }
+                if let Some(v) = args.get("solo").and_then(|v| v.as_bool()) { m.solo = v; }
+                self.send_rig_mix(rig);
+                let m = self.rig_mix[rig.min(7)];
+                format!("rig {rig}: vol {:.2} pan {:.2} mute {} solo {}", m.vol, m.pan, m.mute, m.solo)
             }
             "list_plugins" => {
                 let clap = crate::host::list_clap_plugins();
@@ -2547,6 +2576,17 @@ impl DemoApp {
         }
     }
 
+    /// Publish the full per-rig mixer state to the engine (idempotent).
+    fn send_rig_mix(&self, rig: usize) {
+        let m = self.rig_mix[rig.min(7)];
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetRigMix {
+                rig: rig as u8,
+                vol: Some(m.vol), pan: Some(m.pan), mute: Some(m.mute), solo: Some(m.solo),
+            });
+        }
+    }
+
     /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
     /// when >1 rig is loaded. Per rig: number-key hint, name, bound MIDI device,
     /// live level; the active rig gets the reference's tomato underline. Click
@@ -2576,13 +2616,16 @@ impl DemoApp {
                         let inner = egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(8, 4))
                             .show(ui, |ui| {
-                                ui.horizontal(|ui| {
+                                let name_resp = ui.horizontal(|ui| {
                                     ui.label(egui::RichText::new(format!("{}", rig + 1))
                                         .monospace().size(11.0)
                                         .color(if active { theme::ACCENT_DEEP } else { theme::INK_2 }));
                                     ui.add_space(4.0);
-                                    ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(name_col));
-                                });
+                                    ui.add(egui::Label::new(egui::RichText::new(name).font(theme::medium_font(14.0)).color(name_col))
+                                        .sense(egui::Sense::click()))
+                                }).inner;
+                                if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                if name_resp.clicked() { switch = Some(rig); }
                                 ui.horizontal(|ui| {
                                     theme::tracked_label(ui, &dev, 9.0, 0.14, theme::INK_2);
                                     ui.add_space(6.0);
@@ -2595,8 +2638,32 @@ impl DemoApp {
                                         p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
                                     }
                                 });
+                                // Per-rig mixer (AUM feel): vol / pan / mute / solo.
+                                let mut mix_changed = false;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    let m = &mut self.rig_mix[rig.min(7)];
+                                    ui.label(egui::RichText::new("vol").size(9.0).color(theme::INK_2));
+                                    let mut v = m.vol;
+                                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=1.0).speed(0.01).fixed_decimals(2))
+                                        .on_hover_text("rig volume").changed() { m.vol = v; mix_changed = true; }
+                                    ui.label(egui::RichText::new("pan").size(9.0).color(theme::INK_2));
+                                    let mut p = m.pan;
+                                    if ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2))
+                                        .on_hover_text("rig pan (L −1 … +1 R)").changed() { m.pan = p; mix_changed = true; }
+                                    let mb = egui::Button::new(egui::RichText::new("M").size(10.0)
+                                            .color(if m.mute { theme::PAPER } else { theme::INK_2 }))
+                                        .fill(if m.mute { theme::INK } else { theme::PAPER_SINK })
+                                        .corner_radius(2.0).min_size(egui::vec2(18.0, 16.0));
+                                    if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; mix_changed = true; }
+                                    let sb = egui::Button::new(egui::RichText::new("S").size(10.0)
+                                            .color(if m.solo { theme::INK } else { theme::INK_2 }))
+                                        .fill(if m.solo { theme::LIVE_TEAL } else { theme::PAPER_SINK })
+                                        .corner_radius(2.0).min_size(egui::vec2(18.0, 16.0));
+                                    if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; mix_changed = true; }
+                                });
+                                if mix_changed { self.send_rig_mix(rig); }
                             });
-                        let resp = inner.response.interact(egui::Sense::click());
                         if active {
                             let r = inner.response.rect;
                             ui.painter().line_segment(
@@ -2604,8 +2671,6 @@ impl DemoApp {
                                 Stroke::new(2.0, theme::ACCENT),
                             );
                         }
-                        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                        if resp.clicked() { switch = Some(rig); }
                         ui.add_space(4.0);
                     }
                     ui.add_space(8.0);
@@ -4987,7 +5052,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     engine.set_rig_snapshot(rig_snapshot.clone());
     // Graph publication (MCP→UI live sync): the engine publishes the graph on
     // structural changes; the UI adopts it when it diverges from its mirror.
-    let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch() }));
+    let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch(), rules: Vec::new() }));
     engine.set_graph_pub(graph_pub.clone());
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
@@ -5297,7 +5362,7 @@ mod matrix_ui_tests {
     #[test]
     fn sync_adopts_remote_graph_and_skips_converged() {
         let mut app = DemoApp::new_with_sink(None);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 1, graph: app.base_graph.clone() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 1, graph: app.base_graph.clone(), rules: Vec::new() }));
         app.graph_pub = Some(pub_.clone());
         // Engine graph == UI mirror → no rebuild (UI-originated edits converge).
         let units_before = app.units.len();
@@ -5320,6 +5385,22 @@ mod matrix_ui_tests {
         assert_eq!(app.units.len(), 2);
         assert_eq!(app.session_msg, "Patch updated from MCP/CLI");
         assert_eq!(app.last_graph_rev, 2);
+    }
+
+    #[test]
+    fn sync_mirrors_remote_rule_edits() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut remote_rule = crate::matrix::Rule::new(SourceId::Keys, 1);
+        remote_rule.transpose = -12;
+        remote_rule.key_range = (0, 59);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub {
+            rev: 1, graph: app.base_graph.clone(), rules: vec![remote_rule],
+        }));
+        app.graph_pub = Some(pub_);
+        app.sync_from_engine();
+        let e = app.rule_edits.get(&(SourceId::Keys, 1)).expect("remote rule mirrored");
+        assert_eq!(e.transpose, -12);
+        assert_eq!(e.key_hi, 59);
     }
 
     #[test]

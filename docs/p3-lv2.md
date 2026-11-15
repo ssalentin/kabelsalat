@@ -71,9 +71,17 @@ rack's generic LV2 face knobs control the plugin. Verified deterministically in
 ## Remaining polish
 
 1. LV2 instrument (MIDI/atom) support — needs an event buffer + URID atom map.
-2. A plugin-browser UI to add LV2/CLAP plugins to a rig (discovery exists).
 3. MIDI/atom ports via the URID map + an event buffer (for LV2 instruments).
 4. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
 
 The CLAP hosting (`host.rs`) is the template for the engine integration; LV2
 mirrors it with lilv instead of clack.
+## Plugin-browser UI — LANDED (commit 0c7755a)
+
+A **Plugins** window (top-strip button or **F9**) lists installed LV2 and CLAP
+plugins with a live filter + Refresh. **Add effect** (LV2) builds
+Keys→Surge→<lv2>→Master (+ dry) and `LoadGraph`s it; Surge gets **New rig**.
+Non-Surge CLAP is listed but disabled "coming soon" (the engine remaps its two
+Surge voices, so other CLAP instruments don't load yet). Adding replaces the
+current patch (LoadGraph semantics, noted in the UI). Verified live (XTest):
+add-effect rebuilds the rack and plays; demo/templates/flip/sessions unaffected.

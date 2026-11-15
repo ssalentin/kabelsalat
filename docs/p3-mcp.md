@@ -79,3 +79,12 @@ engine — true 1:1 access to what the user sees.
 - Attach `get_status` omits `transport_playing` (bridge doesn't expose it yet).
 - MCP-added nodes reach the engine but the GUI mirror shows its fixed 6 units
   (dynamic-node rendering is the dynamic-rack follow-up).
+
+## Dynamic patching sounds (commit b599259)
+
+`add_node` now builds the processor for added **dsp** and **lv2** nodes, so they
+sound immediately once wired with `connect` (previously they joined the graph
+silently). `remove_node` cleans up the corresponding slots. CLAP voices remain
+main-thread-only, so new clap nodes sound via `load_graph`'s voice remap.
+**Verified:** `kabelsalat add-node-test` (dynamically added gain node, peak
+0.665); MCP `add_node` grows the graph (6→7 nodes); 89 unit tests pass.

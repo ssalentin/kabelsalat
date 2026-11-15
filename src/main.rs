@@ -57,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         "lv2-voice-test" => lv2::voice_test(),
         "lv2-engine-test" => engine::lv2_engine_test(),
         "metro-test" => engine::metro_test(),
+        "edge-level-test" => engine::edge_level_test(),
         "lv2-instrument-test" => lv2::instrument_test(),
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
         "add-node-test" => engine::add_node_test(),
@@ -65,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         "rig-mix-test" => engine::rig_mix_test(),
         "multi-rig-load-test" => engine::multi_rig_load_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, lv2-instrument-test, lv2-instrument-engine-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
             std::process::exit(1);
         }
     }

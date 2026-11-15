@@ -29,9 +29,8 @@ sleep 1
 grim -o eDP-1 "$OUT/help.png"
 python3 "$HERE/xtest_key.py" 0xff1b            # Esc -> close help
 sleep 0.5
-python3 "$HERE/xtest_key.py" 0xffc7            # F10 -> transport window
-sleep 1
-grim -o eDP-1 "$OUT/transport.png"
+# Transport window removed (2026-11-15): BPM lives on the metronome face.
+# The old F10 transport shot is dropped; front/back/playing/help remain.
 
 echo "--- demo log ---"; cat "$OUT/demo.log"
 echo "captured: $(ls "$OUT"/*.png | wc -l) frames in $OUT"

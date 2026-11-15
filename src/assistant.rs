@@ -138,16 +138,29 @@ fn system_prompt() -> String {
      filter/limiter/etc.), LV2 effects, system-audio capture, file player, Master — wired \
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
-     - Inspect: get_status, list_plugins.\n\
+     - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     get_status, list_plugins.\n\
      - Play: play_note, set_octave.\n\
-     - Routing: set_rig_source (which source classes feed a rig), set_rig_device (which \
-     hardware keyboard), set_split (split the keyboard across rigs), flip_rack.\n\
+     - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
+     hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
+     LOW below the point, port 1 = HIGH at/above; wire each to a rig with connect \
+     from_port 0/1 — there is no automatic rig split), flip_rack.\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
-     (backing tracks), transport_play/transport_stop/set_bpm (metronome).\n\
+     (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome; \
+     the user drags it on any metronome's face).\n\
+     - Transport: start/stop is a property of each rack instrument that supports it \
+     (metronome today; get_graph marks them transport=true with their playing state). \
+     set_node_playing(node, playing) starts/stops ONE instrument; transport_play/\
+     transport_stop are the master and start/stop ALL of them.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
-     - Patching: load_template (starter patches), add_node/connect/disconnect \
-     (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
+     - Patching: load_template (starter patches), add_node/connect/disconnect/\
+     remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
+     - Rigs (you operate on ALL of them, not only the one in view): get_rigs lists every \
+     rig; add_rig creates a new playable rig (Keys -> Surge -> Master); delete_rig removes \
+     one (ask the user first, then confirm=true); select_rig changes the view; add_node \
+     takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo. Wire only nodes of the \
+     same rig. Every rig sounds at once.\n\
      UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
      Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\
@@ -159,8 +172,13 @@ fn system_prompt() -> String {
         .into()
 }
 
-fn tools() -> Value {
+pub(crate) fn tools() -> Value {
     json!([
+        {"type":"function","function":{
+            "name":"get_graph",
+            "description":"The current patch as JSON: nodes (id, kind, name, rig, playing — the per-instrument transport state of metronomes, split — a Keys node's split point or null) and edges/cables (id, from/to node+port, kind). ALWAYS call this first to find node and cable ids for connect/disconnect.",
+            "parameters":{"type":"object","properties":{}}
+        }},
         {"type":"function","function":{
             "name":"get_status",
             "description":"Get current audio/MIDI/UI status of the app, including recent MIDI events",
@@ -173,7 +191,7 @@ fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_octave",
-            "description":"Set the laptop-keyboard base octave (1-7)",
+            "description":"Set the computer-keyboard (laptop typing) base octave (1-7)",
             "parameters":{"type":"object","properties":{"octave":{"type":"integer"}},"required":["octave"]}
         }},
         {"type":"function","function":{
@@ -183,13 +201,13 @@ fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_rig_source",
-            "description":"Select which input sources feed a rig (AUM per-rig input). node 1=Surge A, 4=Surge B. Toggle keys (on-screen keyboard), laptop (laptop keyboard), hardware (MIDI devices). Omitted flags default to true.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"keys":{"type":"boolean"},"laptop":{"type":"boolean"},"hardware":{"type":"boolean"}},"required":["node"]}
+            "description":"Select which input sources feed a rig (AUM per-rig input). node 1=Surge A, 4=Surge B. Toggle keyboard (the computer keyboard: on-screen keys and laptop typing are one source) and hardware (MIDI devices). Omitted flags default to true.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"keyboard":{"type":"boolean"},"hardware":{"type":"boolean"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"set_split",
-            "description":"Split the keyboard across the two rigs at a MIDI note: rig A plays below, rig B at/above. Omit point (or null) to disable the split so both rigs play the full keyboard. Example: point 60 splits at C4.",
-            "parameters":{"type":"object","properties":{"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit to disable"}}}
+            "description":"Split a Keys node's keyboard at a MIDI note (a property of the Keys node). Played notes below the point leave on its port 0 (LOW), notes at/above on port 1 (HIGH). point null/omitted = unsplit (one MIDI OUT; HIGH cables are removed). Routing is plain wiring: after splitting, connect from_port 1 of the Keys node to the rig that should play the high zone (existing cables stay on LOW). Example: {point: 60} splits at C4.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit = unsplit"}}}
         }},
         {"type":"function","function":{
             "name":"save_session",
@@ -233,17 +251,17 @@ fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"get_matrix",
-            "description":"Read the hot-wire MIDI matrix: sources (keys, laptop, hw_all, hw:<device index>) x instrument sinks, with per-cell routing state, MIDI cable gate, hardware device list and split state.",
+            "description":"Read the hot-wire MIDI matrix: sources (keys = the computer keyboard, on-screen + laptop; hw_all; hw:<device index>) x instrument sinks, with per-cell routing state, MIDI cable gate, hardware device list and split state.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_matrix_cell",
-            "description":"Hot-wire one MIDI matrix cell live: route a source to an instrument rig (or unroute). Turning on also plugs the MIDI cable if missing. source: keys | laptop | hw_all | hw:<device index>. Hardware rows are a radio group per rig (one device, all, or off).",
+            "description":"Hot-wire one MIDI matrix cell live: route a source to an instrument rig (or unroute). Turning on also plugs the MIDI cable if missing. source: keys (the computer keyboard) | hw_all | hw:<device index>. Hardware rows are a radio group per rig (one device, all, or off).",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"on":{"type":"boolean"}},"required":["node","source","on"]}
         }},
         {"type":"function","function":{
             "name":"set_matrix_rule",
-            "description":"Shape ONE MIDI route live: channel filter (0-15, omit=omni), transpose (-24..24 semitones), key_lo/key_hi (split zone), vel_lo/vel_hi (velocity layer), enabled (mute). source: keys | laptop | hw:<device index>. Releases held notes on the destination. Example: node 1, source keys, key_hi 59, transpose -12 = bass zone an octave down.",
+            "description":"Shape ONE MIDI route live: channel filter (0-15, omit=omni), transpose (-24..24 semitones), key_lo/key_hi (split zone), vel_lo/vel_hi (velocity layer), enabled (mute). source: keys (the computer keyboard) | hw:<device index>. Releases held notes on the destination. Example: node 1, source keys, key_hi 59, transpose -12 = bass zone an octave down.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"channel":{"type":"integer"},"transpose":{"type":"integer"},"key_lo":{"type":"integer"},"key_hi":{"type":"integer"},"vel_lo":{"type":"integer"},"vel_hi":{"type":"integer"},"enabled":{"type":"boolean"}},"required":["node","source"]}
         }},
         {"type":"function","function":{
@@ -258,17 +276,22 @@ fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"transport_play",
-            "description":"Start the metronome/transport.",
+            "description":"Master transport play: starts EVERY transport-capable instrument (all metronomes).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"transport_stop",
-            "description":"Stop the metronome/transport.",
+            "description":"Master transport stop: stops EVERY transport-capable instrument.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
+            "name":"set_node_playing",
+            "description":"Start or stop ONE rack instrument that has its own transport (a metronome) without touching the others. node = node id from get_graph.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"playing":{"type":"boolean"}},"required":["node","playing"]}
+        }},
+        {"type":"function","function":{
             "name":"set_bpm",
-            "description":"Set the metronome tempo in BPM (20..300).",
+            "description":"Set the global tempo in BPM (20..300), shared by every metronome (the same value the metronome faces show).",
             "parameters":{"type":"object","properties":{"bpm":{"type":"number"}},"required":["bpm"]}
         }},
         {"type":"function","function":{
@@ -278,8 +301,28 @@ fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id. Added dsp/lv2 nodes sound once wired with connect. Use get_graph to see node ids.",
-            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"name":{"type":"string"}},"required":["kind"]}
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id. rig: which rig it joins (index from get_rigs; default = the rig in view). Added dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_rigs",
+            "description":"List every rig (all of them, not just the one in view): index, name, MIDI device, units (node ids), mixer vol/pan/mute/solo, plus which rig is in view. Every rig sounds at once; get_graph nodes carry their rig index too.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"add_rig",
+            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. Returns get_rigs.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C…)"}}}
+        }},
+        {"type":"function","function":{
+            "name":"delete_rig",
+            "description":"Delete a rig and everything in it (units, cables, synth settings). DESTRUCTIVE: ask the user and only then call with confirm=true. The last rig cannot be deleted.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"confirm":{"type":"boolean"}},"required":["rig","confirm"]}
+        }},
+        {"type":"function","function":{
+            "name":"select_rig",
+            "description":"Show a rig in the big rack view (view only — every rig keeps sounding).",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"}},"required":["rig"]}
         }},
         {"type":"function","function":{
             "name":"connect",
@@ -290,6 +333,11 @@ fn tools() -> Value {
             "name":"disconnect",
             "description":"Remove a cable by its id (see get_graph).",
             "parameters":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_node",
+            "description":"Remove a node by id (see get_graph); its cables are removed too. Use this to delete duplicate or unwanted instruments/effects.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"}},"required":["node"]}
         }}
     ])
 }

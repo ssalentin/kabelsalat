@@ -88,7 +88,7 @@ pub enum DspKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
-    /// MIDI source: on-screen keys, laptop keys, hardware MIDI.
+    /// MIDI source: the computer keyboard (on-screen + laptop), hardware MIDI.
     Keys,
     /// Hosted CLAP plugin (e.g. Surge XT).
     Clap { plugin_id: Name },
@@ -102,6 +102,18 @@ pub enum NodeKind {
     MasterOut,
 }
 
+impl NodeKind {
+    /// Does this kind own a start/stop transport (per-instrument Play/Stop)?
+    /// Today only the metronome. The wireable file-player node (backing
+    /// tracks, issue #1) joins by returning true here: the `Node::playing`
+    /// flag, `Command::SetNodePlaying`, master TransportPlay/Stop fan-out, the
+    /// face chip and session persistence are all keyed on this predicate, so
+    /// a new transport-capable kind needs only its engine render gate.
+    pub fn supports_transport(&self) -> bool {
+        matches!(self, NodeKind::Dsp(DspKind::Metronome))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
     pub id: NodeId,
@@ -111,7 +123,33 @@ pub struct Node {
     /// rig 0; sessions saved before multi-rig load as rig 0 too.
     #[serde(default)]
     pub rig: u8,
+    /// Per-instrument transport state (start/stop is a property of the rack
+    /// instrument, not only of the global transport). Meaningful only for
+    /// kinds where [`NodeKind::supports_transport`] is true; always false
+    /// otherwise. Persisted in sessions; older sessions load as stopped.
+    #[serde(default)]
+    pub playing: bool,
+    /// Keyboard split point (absolute MIDI note) — a property of the Keys
+    /// node, not a global flag (AUM model, user 2026-11-15). `None` = one
+    /// MIDI OUT (port 0, full range). `Some(p)` = TWO MIDI outs: port 0 (LOW)
+    /// carries played notes below `p`, port 1 (HIGH) notes at/above it;
+    /// routing to rigs is plain graph wiring. Meaningful only for
+    /// `NodeKind::Keys` (always None otherwise); older sessions load unsplit.
+    #[serde(default)]
+    pub split: Option<u8>,
 }
+
+/// Which Keys output port a PLAYED note leaves on: unsplit → 0; split at
+/// `p` → 0 (LOW) below `p`, 1 (HIGH) at/above. Allocation-free.
+pub fn split_port(split: Option<u8>, note: u8) -> u8 {
+    match split {
+        Some(p) if note >= p => 1,
+        _ => 0,
+    }
+}
+
+/// The C4 split point the face chip toggles to (MIDI 60).
+pub const DEFAULT_SPLIT: u8 = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortKind {
@@ -152,7 +190,7 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name, rig: 0 });
+        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None });
         id
     }
 
@@ -167,6 +205,50 @@ impl Graph {
             }
             None => false,
         }
+    }
+
+    /// Set a transport-capable node's playing flag. Returns `Some(changed)`
+    /// for a transport-capable node, `None` if the node is unknown or has no
+    /// transport (the flag stays false there).
+    pub fn set_playing(&mut self, id: NodeId, playing: bool) -> Option<bool> {
+        let n = self.nodes.iter_mut().find(|n| n.id == id)?;
+        if !n.kind.supports_transport() {
+            return None;
+        }
+        let changed = n.playing != playing;
+        n.playing = playing;
+        Some(changed)
+    }
+
+    /// Set (Some) or clear (None) a Keys node's split point. Clearing removes
+    /// the node's HIGH-port (port ≥ 1) MIDI cables — the jack no longer
+    /// exists. Returns `Some(changed)` for a Keys node, `None` if the node is
+    /// unknown or not a Keys source (its split stays None).
+    pub fn set_split(&mut self, id: NodeId, point: Option<u8>) -> Option<bool> {
+        let n = self.nodes.iter_mut().find(|n| n.id == id)?;
+        if !matches!(n.kind, NodeKind::Keys) {
+            return None;
+        }
+        let point = point.map(|p| p.min(127));
+        let mut changed = n.split != point;
+        n.split = point;
+        if point.is_none() {
+            let before = self.edges.len();
+            self.edges.retain(|e| !(e.from.node == id && e.from.port >= 1));
+            changed |= self.edges.len() != before;
+        }
+        Some(changed)
+    }
+
+    /// Master transport: set the playing flag on EVERY transport-capable
+    /// node. Returns true if any flag changed. Allocation-free.
+    pub fn set_all_playing(&mut self, playing: bool) -> bool {
+        let mut changed = false;
+        for n in self.nodes.iter_mut().filter(|n| n.kind.supports_transport()) {
+            changed |= n.playing != playing;
+            n.playing = playing;
+        }
+        changed
     }
 
     pub fn remove_node(&mut self, id: NodeId) {
@@ -248,7 +330,7 @@ impl Graph {
 
 /// One independent rig: a full rack graph bound to a hardware MIDI device
 /// (AUM operating model — a different keyboard per rig). `midi_device`:
-/// `None` = any source (on-screen keys, laptop keys, every hardware device);
+/// `None` = any source (the computer keyboard, every hardware device);
 /// `Some(id)` = only that hardware device. Each rig carries its own MasterOut;
 /// the engine sums them all to the physical output.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -292,6 +374,7 @@ pub struct RigSnapshot {
 /// (counters survive removals), so later edits never collide.
 /// Rare structural op: allocates by design, like `Command::LoadGraph`.
 pub fn merge_rigs(rigs: &[Rig]) -> Graph {
+    let bases = rig_bases(rigs);
     let mut merged = Graph::default();
     let nodes: usize = rigs.iter().map(|r| r.graph.nodes.len()).sum();
     let edges: usize = rigs.iter().map(|r| r.graph.edges.len()).sum();
@@ -314,9 +397,8 @@ pub fn merge_rigs(rigs: &[Rig]) -> Graph {
             merged.edges.push(e);
         }
         // Advance past every id the rig ever used, not just its live nodes.
-        let max_node = rig.graph.nodes.iter().map(|n| n.id).max().map_or(0, |m| m + 1);
         let max_edge = rig.graph.edges.iter().map(|e| e.id).max().map_or(0, |m| m + 1);
-        node_base = node_base.saturating_add(rig.graph.next_node.max(max_node));
+        node_base = bases.get(i + 1).copied().unwrap_or(node_base);
         edge_base = edge_base.saturating_add(rig.graph.next_edge.max(max_edge));
     }
     merged.next_node = node_base;
@@ -324,12 +406,112 @@ pub fn merge_rigs(rigs: &[Rig]) -> Graph {
     merged
 }
 
+/// Hosted Surge voices the live app creates at startup (main-thread CLAP
+/// instances). The demo uses two; the rest serve added rigs.
+pub const VOICE_POOL: usize = 4;
+
+/// The standard new rig ("+ Rig", agent/MCP add_rig): Keys → Surge → Master
+/// (MIDI + stereo L/R), or a bare Keys + Master when no synth voice is free.
+pub fn standard_rig_graph(with_synth: bool) -> Graph {
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    if with_synth {
+        let synth = g.add_node(
+            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            name_bytes("SURGE"),
+        );
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+    }
+    g
+}
+
+/// Node-id base of every rig in a `merge_rigs` result, plus one trailing
+/// entry: the merged `next_node`. Rig `i`'s node `n` lands at `bases[i] + n`.
+pub fn rig_bases(rigs: &[Rig]) -> Vec<NodeId> {
+    let mut bases = Vec::with_capacity(rigs.len() + 1);
+    let mut base: NodeId = 0;
+    bases.push(base);
+    for rig in rigs {
+        let max_node = rig.graph.nodes.iter().map(|n| n.id).max().map_or(0, |m| m + 1);
+        base = base.saturating_add(rig.graph.next_node.max(max_node));
+        bases.push(base);
+    }
+    bases
+}
+
+/// Inverse of [`merge_rigs`]: split a rig-tagged patch into one graph per rig
+/// tag (`0..=max tag`; a tag with no nodes yields an empty graph). Each rig is
+/// rebased to RIG-RELATIVE ids (its lowest node id becomes 0, its lowest edge
+/// id becomes 1) — the same base the cable colors use (rule 4), so a
+/// split → edit → merge round trip keeps every rig's colors. Edges follow
+/// their source node's rig; a cross-rig edge (never created by the UI) is
+/// dropped. Returns `(graphs, bases)` where `bases[i]` is the absolute id of
+/// rig `i`'s relative node 0. Rare structural op: allocates.
+pub fn split_rigs(merged: &Graph) -> (Vec<Graph>, Vec<NodeId>) {
+    let n = merged.nodes.iter().map(|n| n.rig as usize).max().map_or(1, |m| m + 1);
+    let mut graphs = Vec::with_capacity(n);
+    let mut bases = Vec::with_capacity(n);
+    for tag in 0..n {
+        let rig_of = |id: NodeId| merged.node(id).map(|x| x.rig as usize);
+        let base = merged.nodes.iter().filter(|x| x.rig as usize == tag).map(|x| x.id).min().unwrap_or(0);
+        let edges: Vec<&Edge> = merged.edges.iter()
+            .filter(|e| rig_of(e.from.node) == Some(tag) && rig_of(e.to.node) == Some(tag))
+            .collect();
+        let ebase = edges.iter().map(|e| e.id).min().map_or(0, |m| m.saturating_sub(1));
+        let mut g = Graph::default();
+        for x in merged.nodes.iter().filter(|x| x.rig as usize == tag) {
+            let mut x = x.clone();
+            x.id -= base;
+            x.rig = 0;
+            g.nodes.push(x);
+        }
+        for e in edges {
+            let mut e = e.clone();
+            e.id -= ebase;
+            e.from.node -= base;
+            e.to.node -= base;
+            g.edges.push(e);
+        }
+        g.next_node = g.nodes.iter().map(|x| x.id + 1).max().unwrap_or(0);
+        g.next_edge = g.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+        graphs.push(g);
+        bases.push(base);
+    }
+    (graphs, bases)
+}
+
+/// `SetRigSource` wire body: the current `{node, keyboard, hardware}` pair or
+/// the pre-unification `{node, keys, laptop, hardware}` triple. Missing
+/// flags default to on.
+fn de_rig_source<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(NodeId, bool, bool), D::Error> {
+    #[derive(Deserialize)]
+    struct Wire {
+        node: NodeId,
+        keyboard: Option<bool>,
+        keys: Option<bool>,
+        laptop: Option<bool>,
+        hardware: Option<bool>,
+    }
+    let w = Wire::deserialize(d)?;
+    let keyboard = w.keyboard.unwrap_or_else(|| match (w.keys, w.laptop) {
+        (None, None) => true,
+        (k, l) => k.unwrap_or(false) || l.unwrap_or(false),
+    });
+    Ok((w.node, keyboard, w.hardware.unwrap_or(true)))
+}
+
 /// Everything a frontend can ask the engine to do. Fixed-size: no heap.
 /// Serde is for off-thread frontends only (bridge socket, sessions); the RT
 /// bus still moves plain fixed-size values — no allocation on the audio path.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
-    AddNode { kind: NodeKind, name: Name },
+    /// `rig`: which rig the node joins (multi-rig; 0 = the first / only rig).
+    /// Older wire bodies without it load as rig 0.
+    AddNode { kind: NodeKind, name: Name, #[serde(default)] rig: u8 },
     RemoveNode(NodeId),
     Connect { id: EdgeId, from: PortRef, to: PortRef, kind: PortKind },
     Disconnect(EdgeId),
@@ -337,9 +519,13 @@ pub enum Command {
     NoteOn { note: u8, velocity: f32, source: SourceId },
     NoteOff { note: u8, source: SourceId },
     /// Per-rig input selection (AUM operating model): which source classes
-    /// feed this instrument node. The MIDI cable still gates routing; this
-    /// filters by source on top. Default: all true.
-    SetRigSource { node: NodeId, keys: bool, laptop: bool, hardware: bool },
+    /// feed this instrument node — the computer keyboard (on-screen clicks
+    /// and laptop typing are one source) and hardware MIDI. The MIDI cable
+    /// still gates routing; this filters by source on top. Default: both on.
+    /// The old `{keys, laptop, hardware}` triple still deserializes, as
+    /// `keyboard = keys || laptop`.
+    #[serde(deserialize_with = "de_rig_source")]
+    SetRigSource { node: NodeId, keyboard: bool, hardware: bool },
     /// Per-rig hardware device selection: None = any device, Some(id) = only
     /// that device (AUM: a different keyboard per rig).
     SetRigDevice { node: NodeId, device: Option<u32> },
@@ -361,13 +547,16 @@ pub enum Command {
     /// Load several independent rigs at once: their graphs are merged
     /// ([`merge_rigs`]), DSP/LV2 rebuilt, the existing CLAP voices remapped to
     /// Clap nodes in node-id order, and each rig's instruments driven by that
-    /// rig's `midi_device` (None = keys + laptop + all hardware devices).
+    /// rig's `midi_device` (None = the keyboard + all hardware devices).
     /// `active` is the UI-selected rig index (engine keeps it for queries).
     /// Rare structural op: allocates (bends RT discipline by design).
     LoadRigs { rigs: Vec<Rig>, active: usize },
-    /// Keyboard split across the two rigs: notes below `point` → rig A (node 1),
-    /// notes at/above → rig B (node 4). `None` disables the split (both full range).
-    SetSplit { point: Option<u8> },
+    /// Split ONE Keys node at `point` (absolute MIDI note): notes below leave
+    /// on its port 0 (LOW), notes at/above on port 1 (HIGH). `None` unsplits
+    /// it (one MIDI OUT, full range) and drops its port-1 cables. Routing is
+    /// plain graph wiring — wire LOW/HIGH to rigs like any ports. The engine
+    /// releases held notes on every instrument the node feeds.
+    SetNodeSplit { node: NodeId, point: Option<u8> },
     /// Live edit of ONE matrix rule (source → dest): channel filter, transpose,
     /// key/velocity ranges, enabled. Fixed-size (CC maps arrive with MIDI-learn).
     /// The engine applies it in place and releases held notes on the destination
@@ -391,8 +580,15 @@ pub enum Command {
     /// Mix the file player (backing track) into the master at `gain` (0..1).
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
+    /// Master transport: start EVERY transport-capable node (sets
+    /// `Node::playing` on all of them). Per-node SetNodePlaying overrides
+    /// individually afterwards.
     TransportPlay,
+    /// Master transport: stop every transport-capable node.
     TransportStop,
+    /// Per-instrument transport: start/stop ONE transport-capable node
+    /// (metronome today; file player later). Ignored for other kinds.
+    SetNodePlaying { node: NodeId, playing: bool },
     /// Set the metronome tempo (BPM).
     SetBpm { bpm: f32 },
 }
@@ -483,19 +679,22 @@ mod tests {
     fn command_json_roundtrip() {
         // The bridge wire format: externally tagged JSON, one line per command.
         let cmds = vec![
-            Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X") },
+            Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X"), rig: 0 },
             Command::RemoveNode(3),
             Command::Connect { id: 12, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi },
             Command::Disconnect(12),
             Command::SetParam { node: 3, param: 3, value: 0.75 },
             Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys },
             Command::NoteOff { note: 60, source: SourceId::Hardware(20) },
-            Command::SetRigSource { node: 1, keys: true, laptop: false, hardware: true },
-            Command::SetSplit { point: Some(60) },
-            Command::SetSplit { point: None },
+            Command::SetRigSource { node: 1, keyboard: true, hardware: true },
+            Command::SetRigSource { node: 4, keyboard: false, hardware: true },
+            Command::SetNodeSplit { node: 0, point: Some(60) },
+            Command::SetNodeSplit { node: 0, point: None },
             Command::SetSystemAudio { gain: 0.5 },
             Command::TransportPlay,
             Command::TransportStop,
+            Command::SetNodePlaying { node: 7, playing: true },
+            Command::SetNodePlaying { node: 7, playing: false },
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();
@@ -505,6 +704,64 @@ mod tests {
         // The exact shape the CLI/bridge accepts.
         let c: Command = serde_json::from_str(r#"{"SetSystemAudio":{"gain":0.5}}"#).unwrap();
         assert!(matches!(c, Command::SetSystemAudio { gain } if (gain - 0.5).abs() < 1e-6));
+        let c: Command = serde_json::from_str(r#"{"SetNodePlaying":{"node":3,"playing":true}}"#).unwrap();
+        assert!(matches!(c, Command::SetNodePlaying { node: 3, playing: true }));
+        let c: Command = serde_json::from_str(r#"{"SetNodeSplit":{"node":0,"point":60}}"#).unwrap();
+        assert!(matches!(c, Command::SetNodeSplit { node: 0, point: Some(60) }));
+        let c: Command = serde_json::from_str(r#"{"SetNodeSplit":{"node":0,"point":null}}"#).unwrap();
+        assert!(matches!(c, Command::SetNodeSplit { node: 0, point: None }));
+    }
+
+    #[test]
+    fn set_rig_source_pair_and_legacy_triple() {
+        // Current wire shape: the (keyboard, hardware) pair.
+        let c = Command::SetRigSource { node: 1, keyboard: false, hardware: true };
+        assert_eq!(serde_json::to_string(&c).unwrap(), r#"{"SetRigSource":{"node":1,"keyboard":false,"hardware":true}}"#);
+        // Old (keys, laptop, hardware) triples migrate: keyboard = keys || laptop.
+        for (keys, laptop, want) in [(true, true, true), (true, false, true), (false, true, true), (false, false, false)] {
+            let json = format!(r#"{{"SetRigSource":{{"node":4,"keys":{keys},"laptop":{laptop},"hardware":false}}}}"#);
+            let c: Command = serde_json::from_str(&json).unwrap();
+            assert!(matches!(c, Command::SetRigSource { node: 4, keyboard, hardware: false } if keyboard == want), "{json}");
+        }
+        // A lone legacy flag counts; omitted flags default on.
+        let c: Command = serde_json::from_str(r#"{"SetRigSource":{"node":1,"laptop":true}}"#).unwrap();
+        assert!(matches!(c, Command::SetRigSource { node: 1, keyboard: true, hardware: true }));
+        let c: Command = serde_json::from_str(r#"{"SetRigSource":{"node":1}}"#).unwrap();
+        assert!(matches!(c, Command::SetRigSource { node: 1, keyboard: true, hardware: true }));
+        // A legacy laptop note source arrives as the unified keyboard.
+        let c: Command = serde_json::from_str(r#"{"NoteOn":{"note":60,"velocity":0.8,"source":"LaptopKeys"}}"#).unwrap();
+        assert!(matches!(c, Command::NoteOn { source: SourceId::Keys, .. }));
+    }
+
+    #[test]
+    fn keys_split_defaults_none_and_round_trips() {
+        // Older sessions have no `split` field: Keys loads unsplit.
+        let json = r#"{"id":0,"kind":"Keys","name":[75,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(n.split, None);
+        let mut g = Graph::demo_patch();
+        assert_eq!(g.set_split(0, Some(60)), Some(true));
+        assert_eq!(g.set_split(0, Some(60)), Some(false), "no-op reports unchanged");
+        assert_eq!(g.set_split(1, Some(60)), None, "only Keys nodes split");
+        assert_eq!(g.node(1).unwrap().split, None);
+        assert_eq!(g.set_split(999, Some(60)), None, "unknown node");
+        let back: Graph = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back.node(0).unwrap().split, Some(60), "split survives serde (sessions)");
+    }
+
+    #[test]
+    fn unsplitting_drops_high_port_cables_only() {
+        let mut g = Graph::demo_patch();
+        g.set_split(0, Some(60));
+        // Rewire Surge B (cable 6) to HIGH: port 1.
+        g.disconnect(6);
+        assert!(g.connect_with_id(6, PortRef { node: 0, port: 1 }, PortRef { node: 4, port: 0 }, PortKind::Midi));
+        assert_eq!(g.set_split(0, None), Some(true));
+        assert!(g.edges.iter().all(|e| !(e.from.node == 0 && e.from.port == 1)), "HIGH cable removed");
+        assert!(g.has_route(0, 1, PortKind::Midi), "LOW cable kept");
+        assert_eq!(split_port(None, 100), 0);
+        assert_eq!(split_port(Some(60), 59), 0);
+        assert_eq!(split_port(Some(60), 60), 1);
     }
 
     /// A minimal rig patch: Keys(0) → Clap(1) → Master(2), cables 1 and 2.
@@ -537,6 +794,39 @@ mod tests {
         let n: Node = serde_json::from_str(json).unwrap();
         assert_eq!(n.id, 7);
         assert_eq!(n.rig, 0);
+    }
+
+    #[test]
+    fn node_playing_defaults_false_and_round_trips() {
+        // Older sessions have no `playing` field: they load stopped.
+        let json = r#"{"id":2,"kind":{"Dsp":"Metronome"},"name":[77,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert!(!n.playing);
+        let mut g = Graph::default();
+        let m = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRO"));
+        assert!(!g.node(m).unwrap().playing, "new nodes start stopped");
+        assert_eq!(g.set_playing(m, true), Some(true));
+        assert_eq!(g.set_playing(m, true), Some(false), "no-op reports unchanged");
+        let back: Graph = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert!(back.node(m).unwrap().playing, "playing survives serde (sessions)");
+    }
+
+    #[test]
+    fn playing_only_on_transport_capable_kinds() {
+        let mut g = Graph::demo_patch();
+        let m = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRO"));
+        assert!(NodeKind::Dsp(DspKind::Metronome).supports_transport());
+        assert!(!NodeKind::Dsp(DspKind::Delay).supports_transport());
+        assert_eq!(g.set_playing(2, true), None, "a delay has no transport");
+        assert!(!g.node(2).unwrap().playing);
+        assert_eq!(g.set_playing(999, true), None, "unknown node");
+        // Master fan-out touches only capable nodes.
+        assert!(g.set_all_playing(true));
+        assert!(g.node(m).unwrap().playing);
+        assert!(g.nodes.iter().filter(|n| n.id != m).all(|n| !n.playing));
+        assert!(!g.set_all_playing(true), "already playing: unchanged");
+        assert!(g.set_all_playing(false));
+        assert!(!g.node(m).unwrap().playing);
     }
 
     #[test]
@@ -594,6 +884,47 @@ mod tests {
         // Empty input merges to an empty, usable graph.
         let empty = merge_rigs(&[]);
         assert!(empty.nodes.is_empty() && empty.edges.is_empty());
+    }
+
+    #[test]
+    fn split_rigs_inverts_merge_and_drops_a_rig() {
+        let rigs = vec![
+            Rig::new("A", mini_rig_graph(), None),
+            Rig::new("B", mini_rig_graph(), None),
+            Rig::new("C", mini_rig_graph(), None),
+        ];
+        let merged = merge_rigs(&rigs);
+        let (graphs, bases) = split_rigs(&merged);
+        assert_eq!(graphs.len(), 3);
+        assert_eq!(bases, vec![0, 3, 6]);
+        for g in &graphs {
+            let ids: Vec<NodeId> = g.nodes.iter().map(|n| n.id).collect();
+            assert_eq!(ids, vec![0, 1, 2], "rig-relative ids");
+            assert!(g.nodes.iter().all(|n| n.rig == 0));
+            assert!(g.has_route(0, 1, PortKind::Midi) && g.has_route(1, 2, PortKind::Audio));
+            let eids: Vec<EdgeId> = g.edges.iter().map(|e| e.id).collect();
+            assert_eq!(eids, vec![1, 2]);
+        }
+        // Delete rig A, re-merge: B and C keep their relative layout.
+        let rest: Vec<Rig> = graphs.into_iter().skip(1).zip(["B", "C"])
+            .map(|(g, n)| Rig::new(n, g, None)).collect();
+        let again = merge_rigs(&rest);
+        assert_eq!(rig_bases(&rest), vec![0, 3, 6]);
+        assert_eq!(again.nodes.len(), 6);
+        assert_eq!(again.nodes.iter().map(|n| n.rig).max(), Some(1));
+        assert!(again.has_route(3, 4, PortKind::Midi));
+        // The merged counter continues past every rig: a later add never collides.
+        let mut g = again.clone();
+        let fresh = g.add_node(NodeKind::Keys, name_bytes("K"));
+        assert_eq!(fresh, 6);
+    }
+
+    #[test]
+    fn split_rigs_of_untagged_graph_is_one_rig() {
+        let (graphs, bases) = split_rigs(&mini_rig_graph());
+        assert_eq!(graphs.len(), 1);
+        assert_eq!(bases, vec![0]);
+        assert_eq!(graphs[0].edges.len(), 2);
     }
 
     #[test]

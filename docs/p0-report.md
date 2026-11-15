@@ -67,3 +67,11 @@ on-screen keys, auto-connected hardware MIDI, and a built-in DeepSeek assistant.
 **GO.** All three feasibility risks (RT audio on PipeWire/ARM, CLAP hosting with
 embedded GUI, physics-cable UI at 60fps) are resolved with evidence. P1 builds the
 real graph behind the rack via the shared control plane.
+
+## Live latency reporting (commit 02a9527)
+
+`get_status` (bridge, assistant, and MCP) now reports live audio health:
+`buffer_frames` (512), `buffer_latency_ms` (≈10.67 ms @48 kHz), and `xruns`
+(cpal stream-error counter since startup). The assistant and MCP agents can
+diagnose latency/dropouts without leaving the control plane. Verified: bridge
+and MCP `get_status` return the fields; 89 unit tests pass.

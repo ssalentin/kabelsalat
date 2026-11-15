@@ -23,13 +23,14 @@ filtering gates correctly. Commits `fab4280` (routing) + `d8a990e` (picker).
 
 ## Next increments (the full AUM vision)
 
-1. **Per-device hardware identity.** Currently all hardware is one `HW` class
-   (`Hardware(0)` placeholder). Tag each hardware connection with its real ALSA
-   port id, enumerate devices by name, and let each rig pick a *specific* device
-   (rig 1 = keyboard A, rig 2 = keyboard B). Needs hardware connected to verify
-   (`amidi -l` was empty during this session). Engine `source_accepted` already
-   matches `Hardware(id)` — extend the per-rig filter from a bool to an allowed
-   device set, and the picker from an HW toggle to a device dropdown.
+1. **Per-device hardware identity — LANDED (commit 564c3c9).** Each hardware
+   connection is tagged with a device index (`Hardware(idx)`); devices are
+   enumerated by name. The engine pre-routes device ids 0..16 and a per-rig
+   `rig_device: Option<u32>` filter selects which one is heard (`SetRigDevice`
+   command). A per-rig "HW: All / HW: <name>" cycle button appears in the RIG
+   INPUTS strip when devices are connected; assistant `set_rig_device` and MCP
+   `set_rig_device` too. 2 unit tests verify the device filter + matrix routing.
+   Live verification needs a keyboard connected (`amidi -l` was empty here).
 2. **Audio sources as rig inputs.** File player + system-audio capture nodes
    (P2) feed a rig's chain directly, selectable as the rig input.
 3. **Matrix splits/layers/transforms.** The built `matrix.rs` (37 tests) is now

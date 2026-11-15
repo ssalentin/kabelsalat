@@ -60,11 +60,18 @@ Key implementation points:
   Master for 30 blocks, peak 0.27 — audio flows through the hosted LV2 node.
   Live app demo still plays (no regression); 88 tests pass.
 
+## Per-port knob control — LANDED (commit f9f0ef1)
+
+`Lv2Plugin` tracks control-input ports + their native ranges;
+`set_control_normalized(nth, 0..1)` maps a knob to the port range (RT-safe).
+The engine routes `SetParam` on an Lv2 node to the nth control port, so the
+rack's generic LV2 face knobs control the plugin. Verified deterministically in
+`lv2-voice-test` (constant input, control sweep changes output).
+
 ## Remaining polish
 
 1. LV2 instrument (MIDI/atom) support — needs an event buffer + URID atom map.
-2. Per-port knob control of LV2 parameters (currently runs at defaults).
-3. A plugin-browser UI to add LV2/CLAP plugins to a rig (discovery exists).
+2. A plugin-browser UI to add LV2/CLAP plugins to a rig (discovery exists).
 3. MIDI/atom ports via the URID map + an event buffer (for LV2 instruments).
 4. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
 

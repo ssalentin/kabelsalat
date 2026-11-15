@@ -1522,7 +1522,7 @@ impl DemoApp {
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
         // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
-            "perform: drag knobs · click the keys · press Tab to flip the rack and patch",
+            "perform: drag knobs · click the keys · Space starts/stops · Tab flips the rack to patch",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
             "patch: drag jack to jack · drag a plug to another jack to move it · tug off to unplug · Tab flips back",
@@ -5514,6 +5514,9 @@ impl DemoApp {
         let point = self.shown_split(unit);
         let hov_chip = self.face_hovered(painter, unit, chip);
         self.paint_face_chip(painter, chip, "SPLIT", point.is_some(), hov_chip);
+        // One control: a shared hairline frame around chip + state field.
+        let frame = chip.union(readout).expand(2.0);
+        painter.rect_stroke(self.xf.rect(frame), 3.0, Stroke::new(1.0, theme::HAIRLINE_DARK), egui::StrokeKind::Inside);
         // The readout always shows the state (vision review: a lone chip
         // left "is it split?" ambiguous): the split note, or a dim "off".
         match point {
@@ -5754,7 +5757,8 @@ impl DemoApp {
         // Caption ON the meter column (above its top segment): attached to
         // the meter, not floating on the knob-label row (vision review).
         let top = bottom - n as f32 * pitch;
-        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        let w = self.caption_output_g.as_ref().map_or(0.0, |g| g.size.x);
+        self.text_tracked(painter, Vec2::new(x + 11.0 - w / 2.0, top - 18.0), &self.caption_output_g, SUBTEXT);
     }
 
     fn draw_knob(&self, painter: &egui::Painter, ui: usize, ki: usize) {

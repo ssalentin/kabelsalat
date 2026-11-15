@@ -2,7 +2,7 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **P1 live core largely landed** — P0 complete (docs/p0-report.md). Done: two-stack rack UI (Tab flip), multi-voice engine + 8-node DSP, per-rig input selection + keyboard splits (MIDI matrix wired), session save/load (self-test passing), **embedded Surge editor in the main window** (docs/p1-editor.md), **system-audio capture** (docs/p2-system-audio.md), MCP server (14 tools, headless + live-app attach, docs/p3-mcp.md). Next: per-device MIDI routing, file player, dynamic rack + template loading + visual session UI, LV2. · Name: `kabelsalat` (binary = package = `.desktop` = icon = Wayland app id) · Location: `~/Work/kabelsalat`
+Status: **P1 live core largely landed** — P0 complete (docs/p0-report.md). Done: two-stack rack UI (Tab flip), multi-voice engine + 8-node DSP, per-rig input selection + keyboard splits (MIDI matrix wired), session save/load (self-test passing), **embedded Surge editor in the main window** (docs/p1-editor.md), **system-audio capture** (docs/p2-system-audio.md), **file player** (docs/p2-file-player.md), MCP server (14 tools, headless + live-app attach, docs/p3-mcp.md). Next: per-device MIDI routing, dynamic rack + template loading + visual session UI, LV2. · Name: `kabelsalat` (binary = package = `.desktop` = icon = Wayland app id) · Location: `~/Work/kabelsalat`
 
 ## 0. Decision log
 

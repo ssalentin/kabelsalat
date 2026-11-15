@@ -1,7 +1,8 @@
 # LV2 hosting — P3
 
-Status: **discovery + audio hosting landed** (commits `7aaff11`, `db53b84`);
-engine/UI integration is the next step.
+Status: **discovery + audio hosting + engine integration landed** (commits
+`7aaff11`, `db53b84`, `06ac691`, `25287a2`, `bf90611`). LV2 effects run in the
+live mix; a plugin-browser UI is the remaining polish.
 
 ## What works
 
@@ -45,10 +46,25 @@ Key implementation points:
   ControlPort/InputPort nodes; audio ports get buffers, control inputs are set
   to their `lilv_port_get_range` default.
 
-## Next: engine + UI integration
+## Engine integration — LANDED (commit bf90611)
 
-1. Add `NodeKind::Lv2 { uri }` to the control plane; an LV2 voice slot in the
-   engine mirroring the CLAP `ClapVoice` (instantiate off-thread, run in render).
+- `NodeKind::Lv2 { uri: Lv2Uri }` in the control plane (`Lv2Uri` is a 128-byte
+  fixed buffer with string serde, so graphs/sessions carry the URI).
+- The engine builds an `Lv2Slot` (reusable `Lv2Plugin`, `unsafe impl Send`) for
+  every Lv2 node in `new`/`LoadGraph`, and in `render` sums the instruments
+  wired into it, processes, and mixes the output to the master — same flow as
+  built-in DSP. `Lv2Plugin` is created off the hot path (rare structural op).
+- MCP `add_node` accepts `kind:"lv2"` + `uri`; `get_graph` reports lv2 nodes.
+- The rack renders Lv2 nodes with a generic effect face.
+- **Verified:** `kabelsalat lv2-engine-test` runs Keys→Surge→LV2(audiogain_s)→
+  Master for 30 blocks, peak 0.27 — audio flows through the hosted LV2 node.
+  Live app demo still plays (no regression); 88 tests pass.
+
+## Remaining polish
+
+1. LV2 instrument (MIDI/atom) support — needs an event buffer + URID atom map.
+2. Per-port knob control of LV2 parameters (currently runs at defaults).
+3. A plugin-browser UI to add LV2/CLAP plugins to a rig (discovery exists).
 3. MIDI/atom ports via the URID map + an event buffer (for LV2 instruments).
 4. A plugin browser UI + assistant/MCP tools to add LV2 plugins to a rig.
 

@@ -546,7 +546,7 @@ fn make_unit(node: &Node) -> Unit {
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             // L · R as a stereo pair, MONO apart (between them it read as a
             // center channel — vision review).
-            vec![(Dir::In, 0, 0.24, "L"), (Dir::In, 1, 0.44, "R"), (Dir::In, 2, 0.74, "MONO")],
+            vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "MONO IN")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
@@ -1321,12 +1321,35 @@ impl DemoApp {
         let in_rig = |u: &Unit| !multi || u.rig == rig;
         self.keys_unit = self.units.iter().position(|u| in_rig(u) && matches!(u.node_kind, UnitKind::Keys));
         self.master_unit = self.units.iter().position(|u| in_rig(u) && matches!(u.node_kind, UnitKind::Master));
+        let cols = self.stack_columns(rig, multi);
+        // Every rig is laid out with the TALLEST rig's row count (user
+        // 2026-11-15: "rig B is smaller than rig A") — the rack keeps one
+        // size across rig switches; shorter stacks stretch to fill (layout).
+        let rows_all = if multi {
+            (0..self.rig_count()).map(|r| self.stack_columns(r as u8, true).iter().map(|c| c.len()).max().unwrap_or(1)).max().unwrap_or(1)
+        } else {
+            cols.iter().map(|c| c.len()).max().unwrap_or(1)
+        };
+        self.layout_rows = rows_all.max(1);
+        self.stack_cols = cols;
+        // Hidden units (other rigs) keep no rect: layout/draw/hit skip them.
+        for (i, u) in self.units.iter().enumerate() {
+            if !in_rig(u) {
+                if let Some(r) = self.unit_rects.get_mut(i) { *r = Rect::NOTHING; }
+            }
+        }
+    }
+
+    /// One rig's middle stacks: each instrument followed down its audio
+    /// chain (instrument → DSP → DSP …), then any unclaimed DSP alone.
+    /// `multi = false`: the whole patch is one rig.
+    fn stack_columns(&self, rig: u8, multi: bool) -> Vec<Vec<usize>> {
+        let in_rig = |u: &Unit| !multi || u.rig == rig;
         let mut claimed = vec![false; self.units.len()];
         for (i, u) in self.units.iter().enumerate() {
-            if !in_rig(u) { claimed[i] = true; } // never group hidden units
+            // Never group hidden units, nor this rig's Keys/Master anchors.
+            if !in_rig(u) || matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { claimed[i] = true; }
         }
-        if let Some(k) = self.keys_unit { claimed[k] = true; }
-        if let Some(m) = self.master_unit { claimed[m] = true; }
         let mut cols: Vec<Vec<usize>> = Vec::new();
         for i in 0..self.units.len() {
             // Skip claimed units: another rig's synth must not open an
@@ -1335,7 +1358,6 @@ impl DemoApp {
             let mut col = vec![i];
             claimed[i] = true;
             let mut cur = i;
-            // Follow the audio chain instrument → DSP → DSP …
             loop {
                 let next = self.cables.iter().find(|c| {
                     c.dying < 0.0 && c.kind == PortKind::Audio && c.src == cur
@@ -1349,21 +1371,13 @@ impl DemoApp {
             }
             cols.push(col);
         }
-        // Any DSP not claimed by an instrument gets its own column.
         for i in 0..self.units.len() {
             if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_)) {
                 claimed[i] = true;
                 cols.push(vec![i]);
             }
         }
-        self.layout_rows = cols.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
-        self.stack_cols = cols;
-        // Hidden units (other rigs) keep no rect: layout/draw/hit skip them.
-        for (i, u) in self.units.iter().enumerate() {
-            if !in_rig(u) {
-                if let Some(r) = self.unit_rects.get_mut(i) { *r = Rect::NOTHING; }
-            }
-        }
+        cols
     }
 
     /// Number of rigs in the current rack (merge_rigs tags nodes). Single-graph
@@ -1650,10 +1664,14 @@ impl DemoApp {
         for j in 0..n_mid {
             let cx = xs[j + 1];
             let cw = widths[j + 1];
+            // A shorter stack stretches its units to the full column height
+            // (one rack size for every rig, no empty rows).
+            let len = self.stack_cols[j].len().max(1);
+            let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
             for r in 0..self.stack_cols[j].len() {
                 let u = self.stack_cols[j][r];
-                let y = pad + r as f32 * (self.unit_h + gap);
-                self.unit_rects[u] = mk(cx, y, cw, self.unit_h);
+                let y = pad + r as f32 * (uh + gap);
+                self.unit_rects[u] = mk(cx, y, cw, uh);
             }
         }
         // Stage view for the rack: below the masthead, above the hint line.
@@ -3702,6 +3720,11 @@ impl DemoApp {
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("DeepSeek · bring your own key · F12 hides").size(12.0).color(theme::INK_2));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Mouse-reachable close (F12 stays the shortcut).
+                        if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
+                            self.show_assistant = false;
+                        }
+                        ui.add_space(10.0);
                         ui.label(
                             egui::RichText::new(format!("{} · {} · octave C{}", self.surge_status, self.hw_status, self.octave))
                                 .size(12.0)
@@ -5763,9 +5786,11 @@ impl DemoApp {
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
         let lit = lit_segments(self.meter, n);
-        let pitch = ((r.height() - 130.0) / n as f32).clamp(8.0, 17.0);
         let x = r.left() + 34.0;
         let bottom = r.bottom() - 62.0;
+        // Start below the title block (+ room for the OUTPUT caption): on a
+        // short unit a fixed pitch pushed the caption into the subtitle.
+        let pitch = ((bottom - (r.top() + 84.0)) / n as f32).clamp(4.0, 17.0);
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
@@ -7863,6 +7888,21 @@ mod rig_switch_tests {
         let block_left = cells.iter().map(|r| r.left()).fold(f32::MAX, f32::min) - 120.0 - 20.0; // label col + spacing
         let block_mid = block_left + block_w / 2.0;
         assert!((block_mid - sheet_mid).abs() < 60.0, "block centered: mid {block_mid} vs sheet {sheet_mid}");
+    }
+
+    #[test]
+    fn every_rig_view_has_the_same_rack_size() {
+        // Rig A: Keys/Surge/Delay/Master (2 rows); Rig B: Keys/Surge/Master (1 row).
+        let (mut app, ctx) = two_rigs();
+        let (h_a, rows_a) = (app.rack_h, app.layout_rows);
+        app.set_active_rig(1);
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.layout_rows, rows_a, "rows follow the tallest rig");
+        assert!((app.rack_h - h_a).abs() < 0.5, "same rack height: A {h_a} vs B {}", app.rack_h);
+        // Rig B's lone Surge fills the column like Keys does.
+        let surge = app.stack_cols[0][0];
+        let keys = app.keys_unit.unwrap();
+        assert!((app.unit_rects[surge].height() - app.unit_rects[keys].height()).abs() < 0.5, "stretched to full height");
     }
 
     #[test]

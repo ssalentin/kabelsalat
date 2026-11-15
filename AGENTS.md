@@ -162,6 +162,10 @@ Learned so far (2026-11-15, UI polish pass):
 35. **Labels that cables can cross get a plate:** paint order alone is not
     enough — a stroke running through glyphs makes "L" unreadable. Jack labels
     sit on a CHASSIS-colored backing so cables pass visibly behind them.
+36. **One rack size across rigs:** lay every rig out with the tallest rig's
+    row count (`stack_columns` per rig) and stretch shorter stacks to the
+    column height — sizing per rig made Rig B visibly smaller than Rig A
+    and the rack jumped on every switch.
 
 ## Ground rules
 

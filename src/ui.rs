@@ -544,7 +544,9 @@ fn make_unit(node: &Node) -> Unit {
             UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
             vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
-            vec![(Dir::In, 0, 0.30, "L"), (Dir::In, 2, 0.50, "MONO"), (Dir::In, 1, 0.70, "R")],
+            // L · R as a stereo pair, MONO apart (between them it read as a
+            // center channel — vision review).
+            vec![(Dir::In, 0, 0.24, "L"), (Dir::In, 1, 0.44, "R"), (Dir::In, 2, 0.74, "MONO")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
@@ -938,6 +940,7 @@ struct DemoApp {
     show_mixer: bool,
     /// Last frame's MIDI-matrix block width (table + legend), for centering.
     matrix_block_w: f32,
+    matrix_block_h: f32,
     /// Last frame's stage rect (rack/matrix/mixer area) and assistant panel
     /// rect — the hint and the rack must stay inside the stage.
     stage_rect: Rect,
@@ -1117,6 +1120,7 @@ impl DemoApp {
             show_matrix: false,
             show_mixer: false,
             matrix_block_w: 0.0,
+            matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
             assistant_input_h: 56.0,
@@ -5157,10 +5161,14 @@ impl DemoApp {
                                 // legend, last frame) — an estimate of the table
                                 // alone left the block visibly right of center.
                                 let block_w = if self.matrix_block_w > 0.0 { self.matrix_block_w } else { 600.0 };
+                                // Vertically: a third of the free height above (optical
+                                // center), not pinned to the sheet's top edge.
+                                let top_pad = ((h - self.matrix_block_h) / 3.0).max(12.0);
                                 ui.horizontal_top(|ui| {
                                     ui.add_space(((grid_w - block_w) / 2.0).max(0.0));
-                                    let r = ui.vertical(|ui| { ui.add_space(12.0); self.matrix_grid_ui(ui); }).response.rect;
+                                    let r = ui.vertical(|ui| { ui.add_space(top_pad); self.matrix_grid_ui(ui); }).response.rect;
                                     self.matrix_block_w = r.width();
+                                    self.matrix_block_h = r.height() - top_pad;
                                 });
                             });
                     });

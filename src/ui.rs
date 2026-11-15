@@ -188,6 +188,8 @@ pub struct NoteEvent {
     pub note: u8,
     pub velocity: f32,
     pub source: SourceId,
+    /// Arrival timestamp (hardware MIDI latency measurement, task-23).
+    pub created: std::time::Instant,
 }
 
 /// Sink for [`NoteEvent`]s. `Send` so the engine can move it to its own thread.
@@ -811,7 +813,7 @@ impl DemoApp {
                                 if st == 0x90 || st == 0x80 {
                                     let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
                                     if let Ok(mut q) = q.lock() {
-                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev) });
+                                        q.push_back(NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() });
                                         while q.len() > 256 {
                                             q.pop_front();
                                         }
@@ -2335,7 +2337,7 @@ impl DemoApp {
             }
         }
         if let Some(sink) = &mut self.note_sink {
-            sink(NoteEvent { note: semitone.min(127) as u8, velocity: amp.clamp(0.0, 1.0), source: self.current_source });
+            sink(NoteEvent { note: semitone.min(127) as u8, velocity: amp.clamp(0.0, 1.0), source: self.current_source, created: std::time::Instant::now() });
         }
     }
 
@@ -3546,9 +3548,10 @@ impl DemoApp {
         if self.stats_timer <= 0.0 || self.stats_g.is_none() {
             self.stats_timer = 0.25;
             let pulses: usize = self.cables.iter().map(|c| c.pulses.iter().filter(|p| p.active).count()).sum();
+            let midi_ms = crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
             let text = format!(
-                "{:.0} fps · {} cables · {} pulses · {}",
-                self.fps, self.cables.len(), pulses,
+                "{:.0} fps · {} cables · {} pulses · midi {:.1}ms · {}",
+                self.fps, self.cables.len(), pulses, midi_ms,
                 if self.side == Side::Front { "front" } else { "back" });
             self.stats_g = Some(painter.layout(text, FontId::monospace(11.0), SUBTEXT, f32::INFINITY));
         }
@@ -3702,6 +3705,8 @@ impl eframe::App for DemoApp {
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
         for ev in hw {
+            // Hardware input latency: arrival (midir callback) → UI drain (task-23).
+            crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
             let semi = ev.note as usize;
             self.current_source = ev.source;
             self.fire_keys(semi, ev.velocity);

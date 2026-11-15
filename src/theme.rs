@@ -72,10 +72,11 @@ pub const CLIP_BRIGHT: Color32 = Color32::from_rgb(0xF0, 0x55, 0x4A); // danger 
 // LIVE_TEAL so a jacket never reads as "active/playing".
 pub const CABLE_AMBER: Color32 = Color32::from_rgb(0xE2, 0xA6, 0x4E);
 pub const CABLE_ROSE: Color32 = Color32::from_rgb(0xD9, 0x8B, 0xA0);
-pub const CABLE_SAGE: Color32 = Color32::from_rgb(0xA3, 0xBE, 0x7A);
+/// Warm sand (replaced a sage green: audio jackets stay warm/neutral, rule 3).
+pub const CABLE_SAND: Color32 = Color32::from_rgb(0xCF, 0xB8, 0x96);
 pub const CABLE_CYAN: Color32 = Color32::from_rgb(0x4F, 0xB0, 0xC6);
 pub const CABLE_VIOLET: Color32 = Color32::from_rgb(0x9C, 0x8F, 0xD0);
-pub const CABLE_AUDIO_PALETTE: [Color32; 4] = [AUDIO_CREAM, CABLE_AMBER, CABLE_ROSE, CABLE_SAGE];
+pub const CABLE_AUDIO_PALETTE: [Color32; 4] = [AUDIO_CREAM, CABLE_AMBER, CABLE_ROSE, CABLE_SAND];
 pub const CABLE_MIDI_PALETTE: [Color32; 3] = [MIDI_BLUE, CABLE_CYAN, CABLE_VIOLET];
 
 // ---------------------------------------------------------------------------

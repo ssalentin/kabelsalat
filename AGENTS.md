@@ -45,7 +45,8 @@ Learned so far (2026-11-15, UI polish pass):
 3. **Cable colors:** keep audio jackets warm/neutral and MIDI jackets cool
    (per-family palettes) — never mix the family hues; the TONE/WARM warming
    shift applies only to the neutral cream jacket, so tomato stays
-   selection-only.
+   selection-only. Audio palette = cream/amber/rose/sand (a sage green
+   slipped in and broke the warm family — check new hues against it).
 4. **Rig-stable identity:** `merge_rigs` offsets absolute node/edge ids per
    rig — anything visual keyed on ids (colors, …) must use rig-relative ids,
    or it reshuffles when another rig grows.

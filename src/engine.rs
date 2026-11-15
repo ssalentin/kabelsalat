@@ -573,44 +573,56 @@ impl GraphEngine {
             }
         }
         let mut peak = 0.0f32;
-        let master = self.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id);
-        if let Some(master) = master {
+        // Multi-rig: sum every rig's MasterOut to the physical output. Fixed
+        // stack array — no allocation on the audio thread (max 8 rigs).
+        let mut masters = [0u32; 8];
+        let mut n_masters = 0usize;
+        for n in &self.graph.nodes {
+            if matches!(n.kind, NodeKind::MasterOut) && n_masters < masters.len() {
+                masters[n_masters] = n.id;
+                n_masters += 1;
+            }
+        }
+        if n_masters > 0 {
             for (i, frame) in data.chunks_mut(ch).enumerate() {
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
-                for v in &self.voices {
-                    if self.graph.has_route(v.node, master, PortKind::Audio) {
-                        if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
-                            let m = v.scratch[i * 2]; // mono in: center to both
-                            l += m;
-                            r += m;
-                        } else {
-                            l += v.scratch[i * 2];
-                            r += v.scratch[i * 2 + 1];
+                for mi in 0..n_masters {
+                    let master = masters[mi];
+                    for v in &self.voices {
+                        if self.graph.has_route(v.node, master, PortKind::Audio) {
+                            if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
+                                let m = v.scratch[i * 2]; // mono in: center to both
+                                l += m;
+                                r += m;
+                            } else {
+                                l += v.scratch[i * 2];
+                                r += v.scratch[i * 2 + 1];
+                            }
                         }
                     }
-                }
-                for d in &self.dsp {
-                    if self.graph.has_route(d.node, master, PortKind::Audio) {
-                        if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
-                            let m = d.buf[i * 2];
-                            l += m;
-                            r += m;
-                        } else {
-                            l += d.buf[i * 2];
-                            r += d.buf[i * 2 + 1];
+                    for d in &self.dsp {
+                        if self.graph.has_route(d.node, master, PortKind::Audio) {
+                            if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
+                                let m = d.buf[i * 2];
+                                l += m;
+                                r += m;
+                            } else {
+                                l += d.buf[i * 2];
+                                r += d.buf[i * 2 + 1];
+                            }
                         }
                     }
-                }
-                for slot in &self.lv2 {
-                    if self.graph.has_route(slot.node, master, PortKind::Audio) {
-                        if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
-                            let m = slot.buf[i * 2];
-                            l += m;
-                            r += m;
-                        } else {
-                            l += slot.buf[i * 2];
-                            r += slot.buf[i * 2 + 1];
+                    for slot in &self.lv2 {
+                        if self.graph.has_route(slot.node, master, PortKind::Audio) {
+                            if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
+                                let m = slot.buf[i * 2];
+                                l += m;
+                                r += m;
+                            } else {
+                                l += slot.buf[i * 2];
+                                r += slot.buf[i * 2 + 1];
+                            }
                         }
                     }
                 }
@@ -938,5 +950,48 @@ pub fn mono_master_test() -> anyhow::Result<()> {
     anyhow::ensure!(peak > 1e-3, "mono master produced no output (peak {peak})");
     anyhow::ensure!(centered, "mono master not centered (L != R)");
     println!("mono-master-test: OK — mono input centered to L=R (peak {peak:.4})");
+    Ok(())
+}
+
+/// Multi-rig test: two independent rigs (each Keys→Surge→its own Master) must
+/// both sound and sum to the physical output; muting one rig reduces the level.
+pub fn multi_rig_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (va, _ma) = ClapVoice::new(sr)?;
+    let (vb, _mb) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(32, 32);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: sb, port: 0 }, PortKind::Midi);
+    g.connect_with_id(4, PortRef { node: sb, port: 0 }, PortRef { node: mb, port: 0 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(sa, va), (sb, vb)]);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let measure = |e: &mut GraphEngine, buf: &mut [f32]| -> f32 {
+        let mut peak = 0.0f32;
+        for _ in 0..30 {
+            e.render(buf, 2);
+            peak = peak.max(buf.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+        }
+        peak
+    };
+    let both = measure(&mut engine, &mut buf);
+    anyhow::ensure!(both > 1e-3, "two rigs produced no output (peak {both})");
+    // Mute rig B by unplugging its master cable; level must drop.
+    bus.send(Command::Disconnect(4));
+    let one = measure(&mut engine, &mut buf);
+    anyhow::ensure!(both > one * 1.2, "rigs not summing (both {both} vs one {one})");
+    println!("multi-rig-test: OK — two rigs sum to output (both {both:.4} > one {one:.4})");
     Ok(())
 }

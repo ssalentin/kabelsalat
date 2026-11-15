@@ -93,11 +93,10 @@ Tests: `cargo test` (118). CLI self-tests: `session-test`, `capture-test`, `play
   (mode is a STRING; the demo tiles next to the running app otherwise).
 
 **Next builds (in order):**
-1. **Design polish** — DeepSeek-vision review gaps + motion items (§13).
-2. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
+1. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
    rack only rebuilds from UI-side loads; add a bridge notification/poll so remote
    loads refresh the rack (found during multi-rig UI work).
-3. **Matrix rule editing** — per-cell channel/transpose/key-range/velocity/CC-map
+2. **Matrix rule editing** — per-cell channel/transpose/key-range/velocity/CC-map
    editors (engine primitives exist; the matrix view currently toggles routes).
 
 **Hot-wire MIDI matrix — LANDED 2026-11-15.** F11 / top-strip "Matrix" opens the
@@ -500,23 +499,22 @@ Everything queued lives here; update this section as work lands.
 2. **Matrix rule editing** — per-cell channel filter / transpose / key-range /
    velocity-range / CC-map editors in the matrix view (engine Rule primitives exist;
    docs/midi-matrix.md). Includes MIDI-learn for the CC bindings.
-3. **Hurricane design polish** — DeepSeek-vision review (2026-11-15) verdict "close in
-   spirit"; remaining gaps, prioritized:
-   - Shadows: reference is rigorously shadowless — drop the soft shadows under the rack
-     and masthead (keep them only where a sheet truly floats, e.g. windows/drag chip),
-     and remove any emboss/highlight on jack icons.
-   - Display-scale type: add one large-type moment (oversized wordmark or a big numeric
-     readout, e.g. BPM) against the 9–10px tracked caps — the editorial size contrast.
-   - Corner language: unify to either generous radius or true hairline squares (plates,
-     meter, keyboard, jack wells currently mix); Send-style controls follow the one-pill rule.
-   - Paper warmth: verify PAPER against the reference cream on real displays; plates
-     should read as one near-black family separated by hairlines, not lifted grey.
-   - NOTE: the teal/blue/red semantic expansion is deliberate (audio≠MIDI≠clip for live
-     use, brief §3) — do NOT collapse it to monochrome to match the reference literally.
-   - Motion: staged fade-in on template load; ~120ms hover easing on painted controls.
 
 ### Recently landed
 
+- **Hurricane design polish** (2026-11-15, user-requested "it looks unpolished → fix"):
+  shadowless rack/masthead/help (shadows only on floating windows + drag chip); OPEN
+  masthead — 30px Medium wordmark + asterisk directly on paper, no box; plates = the
+  chassis near-black family with faint hairline rules easing to ACCENT on hover (~120ms);
+  CREAM_MID #B4B4B0 rack micro-labels (crisp contrast); near-sharp corners everywhere
+  (sheets/controls r2, windows r4, hero r36, ONE capsule pill CTA with inset keyline);
+  36px BPM readout; roomier top strip (40px, no caption clutter, underline toggles —
+  no dots) + rack spacing (pad 20/gap 12); assistant input = recessed hairline field;
+  staged fade-in on load. DeepSeek-vision verdict: **8.5/10, "a deliberate, polished
+  instrument in the reference's language"** (was "really unpolished"). Deliberate
+  retentions vs the reviewer's notes: MIDI blue (audio≠MIDI live semantics, brief §3)
+  and the pill's inset cream keyline (the reference's own signature CTA treatment,
+  brief §2.3). Before/after: docs/shots/polish-before-after.png.
 - **Hot-wire MIDI matrix** (2026-11-15): F11 sources×rigs grid, live cell toggling
   (cable + source filter + device radio), LV2 instrument columns, assistant
   get_matrix/set_matrix_cell. 118 tests. See §0.1.

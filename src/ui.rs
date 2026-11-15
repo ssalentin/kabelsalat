@@ -56,13 +56,11 @@ const GREEN: Color32 = theme::LIVE_TEAL; // active / playing / sources
 const ORANGE: Color32 = theme::ACCENT; // cable warming
 const CHASSIS: Color32 = theme::DARK_PANEL;
 const RAIL: Color32 = theme::DARK_PANEL_HI;
-const PLATE_FRONT: Color32 = theme::DARK_PANEL_HI;
-const PLATE_BACK: Color32 = Color32::from_rgb(0x20, 0x1F, 0x1E); // one whisper darker
 const BORDER: Color32 = theme::HAIRLINE_DARK;
 const RING: Color32 = theme::CREAM_DIM;
 const PLUG: Color32 = theme::DARK_PANEL_HI;
 const TEXT: Color32 = theme::CREAM;
-const SUBTEXT: Color32 = theme::CREAM_DIM;
+const SUBTEXT: Color32 = theme::CREAM_MID;
 const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
 const BLACK: Color32 = theme::INK; // #1C1C1C
 
@@ -307,23 +305,21 @@ fn sentence_case(s: &str) -> String {
         .join(" ")
 }
 
-/// Plain-text toggle (§4.14): no chip, no box. On = ink text with a 6px
-/// accent dot before; off = secondary ink. Returns whether it was clicked.
+/// Plain-text toggle (§4.14): no chip, no box, no dot. On = ink text with a
+/// 2px accent underline (the reference's active-row logic); off = secondary.
 fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        if on {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-            ui.painter().circle_filled(r.center(), 3.0, theme::ACCENT);
-            ui.add_space(4.0);
-        }
-        let txt = egui::RichText::new(name).size(13.0)
-            .color(if on { theme::INK } else { theme::INK_2 });
-        let resp = ui.add(egui::Label::new(txt).sense(egui::Sense::click()));
-        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-        clicked = resp.clicked();
-    });
-    clicked
+    let txt = egui::RichText::new(name).size(13.0)
+        .color(if on { theme::INK } else { theme::INK_2 });
+    let resp = ui.add(egui::Label::new(txt).sense(egui::Sense::click()));
+    if on {
+        let r = resp.rect;
+        ui.painter().line_segment(
+            [Pos2::new(r.left(), r.bottom() + 1.0), Pos2::new(r.right(), r.bottom() + 1.0)],
+            Stroke::new(2.0, theme::ACCENT),
+        );
+    }
+    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+    resp.clicked()
 }
 
 /// Nav item (§4.14): plain 13px ink text; active/open = deep-accent text +
@@ -695,6 +691,13 @@ struct DemoApp {
     show_matrix: bool,
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
+    /// Motion (design polish): staged fade-in after a template/session load.
+    load_fade: f32,
+    /// Per-unit hover easing (0..1, ~120ms) for the hairline rule brighten.
+    unit_hover: Vec<f32>,
+    /// Toolbar hover easing (~120ms).
+    play_hover_t: f32,
+    flip_hover_t: f32,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
@@ -824,6 +827,10 @@ impl DemoApp {
             rig_levels: Vec::new(),
             show_matrix: false,
             hw_leds: Vec::new(),
+            load_fade: 1.0,
+            unit_hover: Vec::new(),
+            play_hover_t: 0.0,
+            flip_hover_t: 0.0,
             had_kb_focus: true,
             rig_sources: [(true, true, true); 2],
             split_on: false,
@@ -973,6 +980,9 @@ impl DemoApp {
         self.press = None;
         self.hover = None;
         self.graph_sig.clear(); // force shared-graph re-mirror
+        // Motion: staged fade-in for the new rack.
+        self.load_fade = 0.0;
+        self.unit_hover = vec![0.0; self.units.len()];
     }
 
     /// Derive rack structure FOR THE ACTIVE RIG: Keys (left), Master (right),
@@ -1113,8 +1123,8 @@ impl DemoApp {
             }
         }
         // Target row from the drop height.
-        let gap = 10.0;
-        let pad = 16.0;
+        let gap = 12.0;
+        let pad = 20.0;
         let len = self.stack_cols[tj].len() as i32;
         let tr = (((drop.y - pad) / (self.unit_h + gap)).floor() as i32).clamp(0, len);
 
@@ -1144,7 +1154,7 @@ impl DemoApp {
             if u.name_g.is_none() {
                 // Name: Medium 15px, sentence case (§4.3). Subtitle + back
                 // label: tracked micro-caps 10px (+0.14em).
-                u.name_g = Some(layout(&sentence_case(&u.name), theme::medium_font(15.0), TEXT, f32::INFINITY));
+                u.name_g = Some(layout(&sentence_case(&u.name), theme::medium_font(16.0), TEXT, f32::INFINITY));
                 u.sub_g = Some(tracked(&u.sub.to_uppercase(), 10.0, 0.14));
                 u.back_g = Some(tracked(&u.name.to_uppercase(), 10.0, 0.14));
             }
@@ -1163,7 +1173,7 @@ impl DemoApp {
         // Masthead (§4.13): Medium 22px wordmark, display tracking −0.03em;
         // state line in tracked micro-caps.
         self.wordmark_g = Some(Arc::new(ctx.fonts_mut(|f| {
-            theme::layout_tracked(f, "kabelsalat", theme::medium_font(22.0), -0.03)
+            theme::layout_tracked(f, "kabelsalat", theme::medium_font(30.0), -0.03)
         })));
         self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
@@ -1257,8 +1267,8 @@ impl DemoApp {
         let n_mid = self.stack_cols.len();
         self.rack_w = (rect.width() - 60.0).clamp(560.0, 1240.0);
         self.unit_h = ((rect.height() - 210.0) / rows as f32).clamp(84.0, 190.0);
-        let gap = 10.0;
-        let pad = 16.0;
+        let gap = 12.0;
+        let pad = 20.0;
         let rail = 14.0;
         self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
         let inner_w = self.rack_w - 2.0 * (pad + rail);
@@ -2237,12 +2247,12 @@ impl DemoApp {
                             let p = ui.painter();
                             let cell = rect.shrink(3.0);
                             if on {
-                                p.rect_filled(cell, 4.0, theme::LIVE_TEAL);
+                                p.rect_filled(cell, 2.0, theme::LIVE_TEAL);
                             } else {
-                                p.rect_stroke(cell, 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                             }
                             if resp.hovered() {
-                                p.rect_stroke(rect.shrink(1.0), 5.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                                p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
                                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                             }
                             if resp.clicked() { toggles.push((s, *row, !on)); }
@@ -2340,13 +2350,13 @@ impl DemoApp {
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
         let rigs = self.clap_rigs();
         egui::Panel::top("rig_inputs")
-            .default_size(36.0)
+            .default_size(40.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::same(6)),
+                    .inner_margin(egui::Margin::same(8)),
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
@@ -2416,29 +2426,27 @@ impl DemoApp {
                     if nav_button(ui, "Sessions", self.show_sessions) {
                         self.show_sessions = !self.show_sessions;
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     if nav_button(ui, "Plugins", self.show_plugins) {
                         self.show_plugins = !self.show_plugins;
                         if self.show_plugins && !self.plugins_loaded {
                             self.refresh_plugins();
                         }
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     if nav_button(ui, "Transport", self.show_transport || self.playing) {
                         self.show_transport = !self.show_transport;
                     }
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     if nav_button(ui, "Matrix", self.show_matrix) {
                         self.show_matrix = !self.show_matrix;
                     }
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("which sources feed each rig").size(12.0).color(theme::INK_2));
                 });
             });
     }
@@ -2470,7 +2478,7 @@ impl DemoApp {
                             .fill(theme::PAPER)
                             .stroke(Stroke::new(1.5, theme::INK))
                     };
-                    if ui.add(btn.corner_radius(8.0).min_size(egui::vec2(56.0, 20.0)))
+                    if ui.add(btn.corner_radius(2.0).min_size(egui::vec2(56.0, 20.0)))
                         .on_hover_text("start / stop the metronome (Space)").clicked()
                     {
                         self.toggle_play();
@@ -2489,7 +2497,7 @@ impl DemoApp {
                         .fixed_decimals(0);
                     let changed = ui.scope(|ui| {
                         let ts = ui.style().drag_value_text_style.clone();
-                        ui.style_mut().text_styles.insert(ts, theme::medium_font(24.0));
+                        ui.style_mut().text_styles.insert(ts, theme::medium_font(36.0));
                         ui.add(dv).on_hover_text("metronome tempo (20–300)").changed()
                     }).inner;
                     if changed {
@@ -2786,7 +2794,7 @@ impl DemoApp {
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::same(10)),
+                    .inner_margin(egui::Margin::same(14)),
             )
             .show(root, |ui| {
                 ui.heading(egui::RichText::new("Assistant").font(theme::medium_font(16.0)).color(theme::INK));
@@ -2841,11 +2849,20 @@ impl DemoApp {
                         });
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        let edit = ui.add(
-                            egui::TextEdit::singleline(&mut self.chat_input)
-                                .desired_width((ui.available_width() - 64.0).max(80.0))
-                                .hint_text("Ask or instruct…"),
-                        );
+                        // The input is a recessed paper-sink field with a
+                        // hairline frame — not a browser-default box.
+                        let edit = egui::Frame::new()
+                            .fill(theme::PAPER_SINK)
+                            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                            .corner_radius(2.0)
+                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.chat_input)
+                                        .desired_width((ui.available_width() - 76.0).max(80.0))
+                                        .hint_text("Ask or instruct…"),
+                                )
+                            }).inner;
                         let enter =
                             edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
@@ -3059,6 +3076,18 @@ impl DemoApp {
         // Matrix row activity: per-hardware-device LEDs, fast decay.
         if self.hw_leds.len() != self.hw_devices.len() { self.hw_leds.resize(self.hw_devices.len(), 0.0); }
         for l in &mut self.hw_leds { *l *= (-dt / 0.18).exp(); }
+        // Motion: staged load fade-in (~0.45s) + ~120ms hover easing.
+        self.load_fade = (self.load_fade + dt / 0.45).min(1.0);
+        if self.unit_hover.len() != self.units.len() { self.unit_hover.resize(self.units.len(), 0.0); }
+        let ease = 1.0 - (-dt / 0.12).exp();
+        for (i, h) in self.unit_hover.iter_mut().enumerate() {
+            let target = if matches!(self.hover, Some(Hit::Unit(u)) if u == i) { 1.0 } else { 0.0 };
+            *h += (target - *h) * ease;
+        }
+        let pt = if matches!(self.hover, Some(Hit::Play)) { 1.0 } else { 0.0 };
+        self.play_hover_t += (pt - self.play_hover_t) * ease;
+        let ft = if matches!(self.hover, Some(Hit::Flip)) { 1.0 } else { 0.0 };
+        self.flip_hover_t += (ft - self.flip_hover_t) * ease;
 
         let mut n_arrivals = 0usize;
         for ci in 0..self.cables.len() {
@@ -3259,7 +3288,7 @@ impl DemoApp {
     }
 
     fn hit_test(&self, s: Pos2) -> Hit {
-        if (s - Pos2::new(40.0, self.toolbar_top + 40.0)).length() < 19.0 { return Hit::Play; }
+        if (s - Pos2::new(40.0, self.toolbar_top + 44.0)).length() < 19.0 { return Hit::Play; }
         if self.flip_rect().contains(s) {
             return Hit::Flip;
         }
@@ -3643,16 +3672,19 @@ impl DemoApp {
         theme::paper_bg(&painter, rect);
 
         // The rack IS the reference's single inverted hero panel (§4.2):
-        // flat near-black, radius 36, no border, soft ink shadow underneath.
+        // flat near-black, radius 36, borderless, NO shadow (it sits on the
+        // page; only floating sheets get shadows). Template loads fade in.
         let rack_local = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.rack_w, self.rack_h));
         let rack = self.xf.rect(rack_local);
-        theme::flat_panel(&painter, rack, 36.0, CHASSIS, None);
+        let mut rp = painter.clone();
+        rp.set_opacity(self.load_fade);
+        rp.rect_filled(rack, 36.0, CHASSIS);
 
         if self.xf.sy > 0.04 {
-            self.draw_rails(&painter);
+            self.draw_rails(&rp);
             match self.side {
-                Side::Front => self.draw_front(&painter),
-                Side::Back => self.draw_back(&painter),
+                Side::Front => self.draw_front(&rp),
+                Side::Back => self.draw_back(&rp),
             }
         }
 
@@ -3705,16 +3737,20 @@ impl DemoApp {
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
-            let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
-            // Flat plate (§4.3): the whisper tonal step separates it from the
-            // chassis. Hover = 1px hairline; drag = 2px accent inset keyline.
-            painter.rect_filled(sr, 8.0, PLATE_FRONT);
+            // Single near-black family (§2.4): plates are the chassis color;
+            // zones are drawn with 1px hairline rules that brighten on hover
+            // (~120ms ease). Drag = 2px accent inset keyline.
+            painter.rect_filled(sr, 2.0, CHASSIS);
+            let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
-                theme::inset_keyline(painter, sr, 8.0, theme::ACCENT, 2.0, 2.5);
-            } else if hovered {
-                painter.rect_stroke(sr, 8.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+                theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
+            } else {
+                // Faint default rule; hover eases to the accent (clear
+                // interactive state without shadows — DeepSeek review fix).
+                let rule = mix(BORDER, theme::ACCENT, ht);
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
 
             // Label strip: 2px rule, accent when active/dragged (§4.3 — the
@@ -3723,8 +3759,8 @@ impl DemoApp {
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
 
-            self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 16.0), &u.name_g, TEXT);
-            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 40.0), &u.sub_g, SUBTEXT);
+            self.text(painter, r.min.to_vec2() + Vec2::new(34.0, 17.0), &u.name_g, TEXT);
+            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(34.0, 42.0), &u.sub_g, SUBTEXT);
 
             // Activity LED: flat teal disc (+ optional flat halo), accent
             // while dragged. No glow stack.
@@ -3776,8 +3812,8 @@ impl DemoApp {
             let fill = if lit > 0.02 { theme::ACCENT }
                 else if hovered { Color32::from_rgb(0xF0, 0xED, 0xE6) }
                 else { WHITE };
-            painter.rect_filled(xf.rect(kr), 3.0, fill);
-            painter.rect_stroke(xf.rect(kr), 3.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
+            painter.rect_filled(xf.rect(kr), 2.0, fill);
+            painter.rect_stroke(xf.rect(kr), 2.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
         }
         for bi in 0..5 {
             let after = BLACK_AFTER[bi];
@@ -3789,8 +3825,8 @@ impl DemoApp {
             );
             let lit = self.key_leds[BLACK_SEMI[bi]];
             let fill = if lit > 0.02 { theme::ACCENT } else { BLACK };
-            painter.rect_filled(xf.rect(kr), 2.5, fill);
-            painter.rect_stroke(xf.rect(kr), 2.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            painter.rect_filled(xf.rect(kr), 1.5, fill);
+            painter.rect_stroke(xf.rect(kr), 1.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
         }
     }
 
@@ -3910,15 +3946,18 @@ impl DemoApp {
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
-            let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             // Same flat plate treatment as the front (§4.4).
-            painter.rect_filled(sr, 8.0, PLATE_BACK);
+            painter.rect_filled(sr, 2.0, CHASSIS);
+            let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
-                theme::inset_keyline(painter, sr, 8.0, theme::ACCENT, 2.0, 2.5);
-            } else if hovered {
-                painter.rect_stroke(sr, 8.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+                theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
+            } else {
+                // Faint default rule; hover eases to the accent (clear
+                // interactive state without shadows — DeepSeek review fix).
+                let rule = mix(BORDER, theme::ACCENT, ht);
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
             let active = u.led > 0.05 || dragging;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
@@ -4051,8 +4090,8 @@ impl DemoApp {
                 let compat = self.compatible(ui, ji);
                 // Flat socket (§4.12): DARK_PANEL fill + 1.2px hairline.
                 let socket = Rect::from_center_size(c.to_pos2(), Vec2::splat(24.0));
-                painter.rect_filled(xf.rect(socket), 5.0, CHASSIS);
-                painter.rect_stroke(xf.rect(socket), 5.0, Stroke::new(1.2, BORDER), egui::StrokeKind::Inside);
+                painter.rect_filled(xf.rect(socket), 2.0, CHASSIS);
+                painter.rect_stroke(xf.rect(socket), 2.0, Stroke::new(1.2, BORDER), egui::StrokeKind::Inside);
                 if compat {
                     // Compatible drop-target ring: the accent, ±1.5px pulse.
                     let pulse = 1.5 * (self.ui_time * 7.0).sin();
@@ -4162,34 +4201,31 @@ impl DemoApp {
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
     }
 
-    /// The flip pill rect (§4.13): right-anchored at x=376, width follows the
-    /// measured label. Shared by draw_toolbar and hit_test so they never drift.
+    /// The flip pill rect (§4.13): right-anchored at the masthead's right edge,
+    /// width follows the measured label. Shared by draw_toolbar and hit_test.
     fn flip_rect(&self) -> Rect {
-        Rect::from_min_size(Pos2::new(376.0 - self.flip_w, self.toolbar_top + 24.0), Vec2::new(self.flip_w, 32.0))
+        Rect::from_min_size(Pos2::new(430.0 - self.flip_w, self.toolbar_top + 28.0), Vec2::new(self.flip_w, 32.0))
     }
 
     fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
-        // Flat masthead card on paper (§4.13): same geometry, new language.
-        let bar = Rect::from_min_size(Pos2::new(16.0, top + 16.0), Vec2::new(376.0, 48.0));
-        theme::flat_panel(painter, bar, 14.0, theme::PAPER, Some(theme::HAIRLINE));
-
-        // Transport play (§4.13): idle = paper + ink ring + ink triangle;
-        // running = teal fill + ink stop square (ink-on-teal 5.26:1).
-        let c = Pos2::new(40.0, top + 40.0);
-        let hovered = matches!(self.hover, Some(Hit::Play));
+        // Open masthead (§2.4: structure with rules, not boxes): the wordmark
+        // sits directly on the paper — the reference's display moment. Only
+        // the play circle and the single flip pill are objects here.
+        let c = Pos2::new(40.0, top + 44.0);
+        let ht = self.play_hover_t;
         let ink = BLACK;
         if self.playing {
-            painter.circle_filled(c, 15.0, if hovered { mix(GREEN, BLACK, 0.08) } else { GREEN });
+            painter.circle_filled(c, 15.0, mix(GREEN, BLACK, 0.08 * ht));
         } else {
-            painter.circle_filled(c, 15.0, if hovered { theme::PAPER_SINK } else { theme::PAPER });
+            painter.circle_filled(c, 15.0, mix(theme::PAPER, theme::PAPER_SINK, ht));
             painter.circle_stroke(c, 15.0, Stroke::new(1.5, ink));
         }
         if self.playing {
             // Stop square (transport is Play/Stop, not play/pause).
-            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 34.5), Vec2::new(11.0, 11.0)), 1.6, ink);
+            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 38.5), Vec2::new(11.0, 11.0)), 1.6, ink);
         } else {
             painter.add(Shape::convex_polygon(
-                vec![Pos2::new(36.5, top + 32.5), Pos2::new(36.5, top + 47.5), Pos2::new(48.5, top + 40.0)],
+                vec![Pos2::new(36.5, top + 36.5), Pos2::new(36.5, top + 51.5), Pos2::new(48.5, top + 44.0)],
                 ink, Stroke::NONE));
         }
 
@@ -4197,31 +4233,29 @@ impl DemoApp {
         let beat = 60.0 / self.bpm.max(1.0) as f64;
         let beat_phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
-        painter.circle_filled(Pos2::new(66.0, top + 40.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
+        painter.circle_filled(Pos2::new(66.0, top + 44.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
-        // Asterisk + wordmark — the editorial display moment. The asterisk
-        // sits before the wordmark (the brief's ≈(28, top+40) would overlap
-        // the play button, whose hit area must stay at (40, top+40)).
-        theme::asterisk(painter, Pos2::new(80.0, top + 35.0), 7.0, theme::ACCENT, 2.0);
+        // Asterisk + display wordmark — the editorial display moment.
+        theme::asterisk(painter, Pos2::new(80.0, top + 33.0), 9.0, theme::ACCENT, 2.0);
         if let Some(g) = &self.wordmark_g {
-            theme::paint_tracked(painter, Pos2::new(94.0, top + 20.0), g, theme::INK);
+            theme::paint_tracked(painter, Pos2::new(94.0, top + 18.0), g, theme::INK);
         }
         // State line: tracked micro-caps; a 6px teal dot precedes "playing".
         let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
         let state_x = if self.playing {
-            painter.circle_filled(Pos2::new(97.0, top + 49.0), 3.0, GREEN);
+            painter.circle_filled(Pos2::new(97.0, top + 57.0), 3.0, GREEN);
             104.0
         } else { 94.0 };
         if let Some(g) = state_g {
-            theme::paint_tracked(painter, Pos2::new(state_x, top + 44.0), g, theme::INK_2);
+            theme::paint_tracked(painter, Pos2::new(state_x, top + 52.0), g, theme::INK_2);
         }
 
         // Flip button = the app's single pill (§4.13): vivid accent fill,
         // inset cream keyline, Bold 19px cream label (WCAG large text).
         let fb = self.flip_rect();
-        let fhover = matches!(self.hover, Some(Hit::Flip));
-        painter.rect_filled(fb, 16.0, if fhover { mix(theme::ACCENT, BLACK, 0.08) } else { theme::ACCENT });
-        theme::inset_keyline(painter, fb, 16.0, alpha(theme::ON_ACCENT, 0.9), 1.5, 2.5);
+        let fh = self.flip_hover_t;
+        painter.rect_filled(fb, fb.height() / 2.0, mix(theme::ACCENT, BLACK, 0.08 * fh));
+        theme::inset_keyline(painter, fb, fb.height() / 2.0, alpha(theme::ON_ACCENT, 0.9), 1.5, 2.5);
         if let Some(g) = &self.flip_label_g {
             let pos = fb.center() - g.size() * 0.5;
             painter.galley(pos, g.clone(), WHITE);
@@ -4253,8 +4287,8 @@ impl DemoApp {
         if let Some(g) = &self.stats_g {
             let w = g.size().x + 24.0;
             let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 26.0));
-            painter.rect_filled(bar, 8.0, theme::PAPER_SINK);
-            painter.rect_stroke(bar, 8.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            painter.rect_filled(bar, 2.0, theme::PAPER_SINK);
+            painter.rect_stroke(bar, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
             painter.galley(bar.min + Vec2::new(12.0, 6.0), g.clone(), theme::INK_2);
         }
     }
@@ -4264,7 +4298,8 @@ impl DemoApp {
         // the hero-panel motif — flat near-black card, radius 28, no border.
         painter.rect_filled(rect, 0.0, alpha(theme::SCRIM, 0.62));
         let card = Rect::from_center_size(rect.center(), Vec2::new(560.0, 352.0));
-        theme::flat_panel(painter, card, 28.0, theme::DARK_PANEL, None);
+        // Flat dark card (hero-panel motif), no shadow — the scrim separates it.
+        painter.rect_filled(card, 28.0, theme::DARK_PANEL);
         theme::asterisk(painter, card.min + Vec2::new(34.0, 36.0), 7.0, theme::ACCENT, 2.0);
         if let Some(g) = &self.help_title_g {
             theme::paint_tracked(painter, card.min + Vec2::new(48.0, 22.0), g, TEXT);
@@ -4868,6 +4903,17 @@ mod multi_rig_ui_tests {
         for ui in 0..app.units.len() {
             assert!(app.visible(ui));
         }
+    }
+
+    #[test]
+    fn template_load_fades_in() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_demo_patch(); // build_rack resets the fade
+        assert_eq!(app.load_fade, 0.0);
+        app.update(0.1);
+        assert!(app.load_fade > 0.0 && app.load_fade < 1.0);
+        app.update(1.0);
+        assert_eq!(app.load_fade, 1.0);
     }
 
     #[test]

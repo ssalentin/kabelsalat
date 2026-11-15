@@ -146,6 +146,18 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .collect()
 }
 
+/// Shared graph publication for frontends (MCP→UI live sync, PLAN §13).
+/// The engine writes it ONLY on structural ops that actually changed the
+/// graph (loads, add/remove node, connect/disconnect) at block boundaries;
+/// the steady render path never locks it. `rev` lets the UI skip unchanged
+/// snapshots cheaply; duplicate Connects (the UI's per-frame mirror) do NOT
+/// bump it, so UI-originated edits never trigger a rebuild feedback loop.
+#[derive(Clone, Debug)]
+pub struct GraphPub {
+    pub rev: u64,
+    pub graph: Graph,
+}
+
 pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
@@ -175,6 +187,9 @@ pub struct GraphEngine {
     // LoadRigs/LoadGraph structural ops at block boundaries — the per-block
     // render path never locks it. None until a frontend attaches a handle.
     rig_snapshot: Option<Arc<Mutex<RigSnapshot>>>,
+    // Shared graph publication (MCP→UI live sync). Same discipline as
+    // rig_snapshot: written on structural ops only, never on the render path.
+    graph_pub: Option<Arc<Mutex<GraphPub>>>,
     // System-audio capture (e.g. YouTube) mixed into the master.
     system_capture: Option<SystemCapture>,
     system_gain: f32,
@@ -266,6 +281,7 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_snapshot: None,
+            graph_pub: None,
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
@@ -317,6 +333,23 @@ impl GraphEngine {
             if let Ok(mut s) = snap.lock() {
                 s.rigs = self.rig_meta.clone();
                 s.active = self.active_rig;
+            }
+        }
+    }
+
+    /// Attach the shared graph publication (main-thread setup, before the
+    /// engine moves to the audio thread).
+    pub fn set_graph_pub(&mut self, p: Arc<Mutex<GraphPub>>) {
+        self.graph_pub = Some(p);
+    }
+
+    /// Publish the current graph (structural ops only). A poisoned lock is
+    /// skipped, not fatal — the publication is advisory frontend state.
+    fn publish_graph(&mut self) {
+        if let Some(p) = &self.graph_pub {
+            if let Ok(mut g) = p.lock() {
+                g.rev = g.rev.wrapping_add(1);
+                g.graph = self.graph.clone();
             }
         }
     }
@@ -378,17 +411,27 @@ impl GraphEngine {
                     // graph but sound via LoadGraph's voice remap, not here.
                     _ => {}
                 }
+                self.publish_graph();
             }
             Command::RemoveNode(id) => {
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
                 self.lv2.retain(|s| s.node != id);
+                self.publish_graph();
             }
             Command::Connect { id, from, to, kind } => {
-                self.graph.connect_with_id(id, from, to, kind);
+                // Publish only on a real change: the UI's per-frame mirror
+                // re-sends duplicate Connects, which must not bump the rev.
+                if self.graph.connect_with_id(id, from, to, kind) {
+                    self.publish_graph();
+                }
             }
             Command::Disconnect(id) => {
+                let had = self.graph.edges.iter().any(|e| e.id == id);
                 self.graph.disconnect(id);
+                if had {
+                    self.publish_graph();
+                }
             }
             Command::SetParam { node, param, value } => {
                 let v = value as f32;
@@ -480,6 +523,7 @@ impl GraphEngine {
                 self.rig_meta.clear();
                 self.active_rig = 0;
                 self.publish_rig_snapshot();
+                self.publish_graph();
             }
             Command::LoadRigs { rigs, active } => {
                 // Rare structural op: merge the rig graphs into one patch and
@@ -940,6 +984,42 @@ mod tests {
         let mut buf = vec![0.0f32; 64 * 2];
         engine.render(&mut buf, 2);
         (engine, bus)
+    }
+
+    #[test]
+    fn graph_pub_revs_on_structural_changes_only() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
+            rev: 0,
+            graph: crate::control::Graph::default(),
+        }));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        let rev = || pub_.lock().unwrap().rev;
+        assert_eq!(rev(), 0);
+        // Duplicate Connect (the UI's per-frame mirror) must NOT bump the rev.
+        let g = crate::control::Graph::demo_patch();
+        let e0 = &g.edges[0];
+        bus.send(Command::Connect { id: e0.id, from: e0.from, to: e0.to, kind: e0.kind });
+        engine.render(&mut buf, 2);
+        assert_eq!(rev(), 0);
+        // AddNode bumps.
+        bus.send(Command::AddNode {
+            kind: NodeKind::Dsp(crate::control::DspKind::Gain),
+            name: crate::control::name_bytes("G"),
+        });
+        engine.render(&mut buf, 2);
+        assert_eq!(rev(), 1);
+        // LoadGraph bumps and publishes the new graph.
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::default() });
+        engine.render(&mut buf, 2);
+        assert_eq!(rev(), 2);
+        assert!(pub_.lock().unwrap().graph.nodes.is_empty());
+        // Disconnect of a nonexistent id must NOT bump.
+        bus.send(Command::Disconnect(999));
+        engine.render(&mut buf, 2);
+        assert_eq!(rev(), 2);
     }
 
     #[test]

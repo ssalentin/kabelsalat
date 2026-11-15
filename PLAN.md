@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign + multi-rig (backend & UI) + hot-wire MIDI matrix landed; design polish & MCP→UI sync next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live**. **Hurricane visual redesign landed** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; supersedes the earlier Signal dark-glass pass, which was based on a misread reference). 118 unit tests + many CLI self-tests pass. Next: (1) design polish, (2) MCP→UI live sync, (3) matrix rule editing (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
+Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI) + hot-wire MIDI matrix + MCP→UI live sync landed; matrix rule editing is next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live**, **MCP/CLI remote edits sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 121 unit tests + many CLI self-tests pass. Next: (1) matrix rule editing, (2) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (118). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (121). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -23,6 +23,8 @@ Tests: `cargo test` (118). CLI self-tests: `session-test`, `capture-test`, `play
   Master has stereo (ports 0/1) + MONO (port 2, centered). Metronome is a DSP node driven by
   transport. `LoadGraph`/`LoadRigs` rebuild slots + matrix; `set_rig_snapshot` publishes rig state.
   RT discipline: render path is allocation-free; structural ops may allocate at block boundary.
+  Publishes `GraphPub {rev, graph}` + `RigSnapshot` on structural ops only (never the render
+  path) — the UI adopts remote MCP/CLI changes via `sync_from_engine` (divergence check).
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio, Send) + `ClapVoiceMain` (main-thread, !Send),
   `VoiceController` (RT-safe note/param), `param_list()`/`param_text()` for the native editor.
   **2 Surge voices** created at startup (main-thread-only); LoadGraph remaps them in node-id order.
@@ -93,11 +95,10 @@ Tests: `cargo test` (118). CLI self-tests: `session-test`, `capture-test`, `play
   (mode is a STRING; the demo tiles next to the running app otherwise).
 
 **Next builds (in order):**
-1. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` drive the engine but the UI
-   rack only rebuilds from UI-side loads; add a bridge notification/poll so remote
-   loads refresh the rack (found during multi-rig UI work).
-2. **Matrix rule editing** — per-cell channel/transpose/key-range/velocity/CC-map
+1. **Matrix rule editing** — per-cell channel/transpose/key-range/velocity/CC-map
    editors (engine primitives exist; the matrix view currently toggles routes).
+2. **Backlog** — dynamic non-Surge CLAP loading, per-rig volume/pan/mute/solo,
+   sends/aux, recording, tap tempo (§13).
 
 **Hot-wire MIDI matrix — LANDED 2026-11-15.** F11 / top-strip "Matrix" opens the
 sources × instrument-rigs grid (Hurricane: paper sheet, hairline cells, teal = routed).
@@ -493,15 +494,19 @@ Everything queued lives here; update this section as work lands.
 
 ### In progress / next
 
-1. **MCP→UI live sync** — MCP `load_rigs`/`load_graph` commands drive the engine but the
-   UI rack only rebuilds from UI-side loads; add a bridge notification or snapshot poll
-   so remote loads refresh the rack + overview.
-2. **Matrix rule editing** — per-cell channel filter / transpose / key-range /
+1. **Matrix rule editing** — per-cell channel filter / transpose / key-range /
    velocity-range / CC-map editors in the matrix view (engine Rule primitives exist;
    docs/midi-matrix.md). Includes MIDI-learn for the CC bindings.
 
 ### Recently landed
 
+- **MCP→UI live sync** (2026-11-15): engine publishes `GraphPub {rev, graph}` on
+  structural ops that actually change the graph (loads/add/remove/connect/disconnect;
+  duplicate Connects do NOT bump rev). UI polls per frame and adopts the engine graph
+  only when it diverges from its own mirror — UI-originated edits converge, so no
+  rebuild loops and cable animations survive. Remote loads also reset per-rig source
+  filters from rig meta. Verified live: bridge AddNode + LoadGraph adopted by the
+  running UI (get_graph mirror + screenshots). 121 tests.
 - **Hurricane design polish** (2026-11-15, user-requested "it looks unpolished → fix"):
   shadowless rack/masthead/help (shadows only on floating windows + drag chip); OPEN
   masthead — 30px Medium wordmark + asterisk directly on paper, no box; plates = the

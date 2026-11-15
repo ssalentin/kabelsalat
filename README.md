@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="160" alt="kabelsalat logo — three sagging patch cables with signal pulses"/>
+  <img src="assets/logo.svg" width="160" alt="kabelsalat logo — two crossed patch cables with a signal pulse at the crossing"/>
 </p>
 
 <h1 align="center">kabelsalat</h1>

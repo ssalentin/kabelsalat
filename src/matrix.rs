@@ -161,10 +161,11 @@ pub enum SourceId {
     Hardware(u32),
     /// Virtual MIDI input (e.g. the `kabelsalat-in` port).
     Virtual(u32),
-    /// On-screen keyboard.
+    /// The computer keyboard: on-screen key clicks AND laptop typing are one
+    /// source. `LaptopKeys` (the old separate laptop source) still
+    /// deserializes, as `Keys`, so old sessions/rules keep loading.
+    #[serde(alias = "LaptopKeys")]
     Keys,
-    /// Laptop keyboard played as a MIDI source.
-    LaptopKeys,
     /// File player (P2) — one id per player node.
     FilePlayer(u32),
 }
@@ -749,6 +750,17 @@ mod tests {
     // --- SOURCE MATCHING --------------------------------------------------
 
     #[test]
+    fn legacy_laptop_source_deserializes_as_keys() {
+        let s: SourceId = serde_json::from_str(r#""LaptopKeys""#).unwrap();
+        assert_eq!(s, SourceId::Keys);
+        assert_eq!(serde_json::to_string(&SourceId::Keys).unwrap(), r#""Keys""#);
+        // An old rule keyed on the laptop source routes like the keyboard.
+        let r: Rule = serde_json::from_str(&serde_json::to_string(&Rule::new(SourceId::Keys, SURGE_A)).unwrap()
+            .replace(r#""Keys""#, r#""LaptopKeys""#)).unwrap();
+        assert_eq!(r.source, SourceId::Keys);
+    }
+
+    #[test]
     fn source_isolation() {
         let mut m = Matrix::new();
         m.connect(SourceId::Hardware(7), SURGE_A);
@@ -757,7 +769,6 @@ mod tests {
         assert_eq!(dests(&m.route(SourceId::Keys, note_on(60))), vec![SURGE_B]);
         assert!(m.route(SourceId::Hardware(8), note_on(60)).is_empty());
         assert!(m.route(SourceId::Virtual(7), note_on(60)).is_empty());
-        assert!(m.route(SourceId::LaptopKeys, note_on(60)).is_empty());
         // Virtual and hardware ids are distinct namespaces.
         m.connect(SourceId::Virtual(1), PAD);
         assert_eq!(dests(&m.route(SourceId::Virtual(1), note_on(60))), vec![PAD]);

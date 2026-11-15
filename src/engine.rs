@@ -12,11 +12,12 @@
 //! created at startup (loading is main-thread work); dynamic AddNode with
 //! off-thread loading is the follow-up.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{
-    Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
+    split_port, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind,
+    RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
@@ -84,9 +85,9 @@ struct VoiceSlot {
     voice: ClapVoice,
     level: f32,
     scratch: Vec<f32>,
-    // Per-rig input selection (AUM): which source classes feed this rig.
+    // Per-rig input selection (AUM): which source classes feed this rig —
+    // the computer keyboard (on-screen + laptop) and hardware MIDI.
     src_keys: bool,
-    src_laptop: bool,
     src_hw: bool,
     // Which hardware device feeds this rig: None = any, Some(id) = only that
     // device (per-device routing, AUM's "different keyboard per rig").
@@ -96,10 +97,16 @@ struct VoiceSlot {
 /// Does this rig accept notes from the given source? (The MIDI cable gate is
 /// checked separately by the caller.)
 fn source_accepted(s: &VoiceSlot, source: SourceId) -> bool {
+    source_allowed(s.src_keys, s.src_hw, s.rig_device, source)
+}
+
+/// The per-rig source filter as a pure function: `keyboard` gates the one
+/// computer-keyboard source (on-screen clicks and laptop typing alike),
+/// `hardware` + `rig_device` gate hardware MIDI. Other sources always pass.
+fn source_allowed(keyboard: bool, hardware: bool, rig_device: Option<u32>, source: SourceId) -> bool {
     match source {
-        SourceId::Keys => s.src_keys,
-        SourceId::LaptopKeys => s.src_laptop,
-        SourceId::Hardware(id) => s.src_hw && hw_device_allowed(s.rig_device, id),
+        SourceId::Keys => keyboard,
+        SourceId::Hardware(id) => hardware && hw_device_allowed(rig_device, id),
         _ => true,
     }
 }
@@ -120,6 +127,57 @@ struct DspSlot {
     kind: DspKind,
     proc: Box<dyn Processor>,
     buf: Vec<f32>,
+    /// Per-instrument transport (metronome; the file-player node joins via
+    /// `NodeKind::supports_transport`). Engine-owned plain state, set only by
+    /// commands drained at block boundaries — the render path reads it with
+    /// no lock and no atomics.
+    transport: SlotTransport,
+}
+
+/// One transport-capable node's own clock: whether it runs, its beat phase,
+/// and the click envelope in flight. Per slot, so two metronomes never share
+/// (and double-advance) one phase.
+#[derive(Clone, Copy, Default)]
+struct SlotTransport {
+    playing: bool,
+    phase: f64,
+    click_remaining: usize,
+    click_phase: f32,
+}
+
+impl SlotTransport {
+    /// Start/stop at a block boundary. Start lands on the downbeat (the click
+    /// fires on the first rendered frame); stop cuts any click in flight.
+    fn set_playing(&mut self, playing: bool) {
+        if playing && !self.playing {
+            self.phase = 0.0;
+            self.click_remaining = CLICK_FRAMES;
+            self.click_phase = 0.0;
+        }
+        if !playing {
+            self.click_remaining = 0;
+        }
+        self.playing = playing;
+    }
+}
+
+/// Click length in frames (decaying 1 kHz burst).
+const CLICK_FRAMES: usize = 2400;
+
+/// Build the processor slot for a Dsp node, carrying the node's persisted
+/// playing flag into its transport (sessions/LoadGraph restore it).
+fn dsp_slot(node: &crate::control::Node, kind: &DspKind, sample_rate: f64) -> DspSlot {
+    let mut transport = SlotTransport::default();
+    if node.kind.supports_transport() {
+        transport.set_playing(node.playing);
+    }
+    DspSlot {
+        node: node.id,
+        kind: kind.clone(),
+        proc: build_processor(kind, sample_rate),
+        buf: vec![0.0; 8192 * 2],
+        transport,
+    }
 }
 
 struct Lv2Slot {
@@ -144,6 +202,48 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
             _ => None,
         })
         .collect()
+}
+
+/// Number of lock-free per-edge level slots (`EdgeLevels`).
+pub const EDGE_LEVEL_SLOTS: usize = 256;
+
+/// Per-edge audio levels, engine → UI (PLAN §2: cables breathe with live
+/// level). Fixed-size lock-free slots indexed by `edge id % EDGE_LEVEL_SLOTS`;
+/// each slot packs `(edge id << 32) | f32 peak bits` into one AtomicU64, so a
+/// reader never attributes another edge's level to its cable — on a slot
+/// collision the losing edge just reads silence. Written once per block by
+/// the render path (allocation-free, lock-free); smoothing happens in the UI.
+pub struct EdgeLevels {
+    slots: [AtomicU64; EDGE_LEVEL_SLOTS],
+}
+
+impl EdgeLevels {
+    pub fn new() -> Self {
+        Self { slots: std::array::from_fn(|_| AtomicU64::new(0)) }
+    }
+
+    /// Publish `edge`'s block peak (linear, ≥ 0).
+    pub fn store(&self, edge: u32, peak: f32) {
+        let packed = ((edge as u64) << 32) | peak.max(0.0).to_bits() as u64;
+        self.slots[edge as usize % EDGE_LEVEL_SLOTS].store(packed, Ordering::Relaxed);
+    }
+
+    /// Last published peak for `edge`; 0.0 if never published (or evicted by
+    /// a colliding edge id).
+    pub fn load(&self, edge: u32) -> f32 {
+        let v = self.slots[edge as usize % EDGE_LEVEL_SLOTS].load(Ordering::Relaxed);
+        if (v >> 32) as u32 == edge { f32::from_bits(v as u32) } else { 0.0 }
+    }
+}
+
+impl Default for EdgeLevels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn block_peak(buf: &[f32]) -> f32 {
+    buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
 }
 
 /// Per-rig mixer state (AUM overview strip). Unity by default.
@@ -182,20 +282,24 @@ pub struct GraphEngine {
     dsp: Vec<DspSlot>,
     lv2: Vec<Lv2Slot>,
     lv2_in: Vec<f32>,
-    keys_node: Option<NodeId>,
     master_vol: f32,
     master_warm: f32,
-    // Metronome / transport.
-    transport_playing: bool,
+    // Tempo shared by every transport-capable node (per-node run state lives
+    // in each DspSlot's SlotTransport).
     bpm: f32,
-    metro_phase: f64,
-    click_remaining: usize,
-    click_phase: f32,
     out_peak: Arc<AtomicU32>,
-    // MIDI routing matrix (source → rig, with key-range splits). Default rules
-    // mirror "every source plays every rig"; SetSplit edits key ranges in place.
+    // Per-edge audio levels (source node's block peak), published per block.
+    edge_levels: Arc<EdgeLevels>,
+    // MIDI routing matrix (source → instrument: channel/transpose/ranges).
+    // Default rules mirror "every source plays every instrument"; keyboard
+    // zones are NOT matrix rules — a split Keys node's LOW/HIGH ports gate
+    // notes by graph wiring (keys_gate).
     matrix: Matrix,
     route_out: Vec<(NodeId, MidiMsg)>,
+    /// Test-only delivery log: (dest, note, on) for every gated note event
+    /// (incl. split-change releases), so routing is observable without voices.
+    #[cfg(test)]
+    note_log: Vec<(NodeId, u8, bool)>,
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
     rig_meta: Vec<RigMeta>,
     active_rig: usize,
@@ -228,7 +332,6 @@ impl GraphEngine {
         sample_rate: f64,
         voices: Vec<(NodeId, ClapVoice)>,
     ) -> Self {
-        let keys_node = graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
         let voices: Vec<VoiceSlot> = voices
             .into_iter()
             .map(|(node, voice)| VoiceSlot {
@@ -237,7 +340,6 @@ impl GraphEngine {
                 level: 0.85,
                 scratch: vec![0.0; 8192 * 2],
                 src_keys: true,
-                src_laptop: true,
                 src_hw: true,
                 rig_device: None,
             })
@@ -246,23 +348,16 @@ impl GraphEngine {
             .nodes
             .iter()
             .filter_map(|n| match &n.kind {
-                NodeKind::Dsp(kind) => Some(DspSlot {
-                    node: n.id,
-                    kind: kind.clone(),
-                    proc: build_processor(kind, sample_rate),
-                    buf: vec![0.0; 8192 * 2],
-                }),
+                NodeKind::Dsp(kind) => Some(dsp_slot(n, kind, sample_rate)),
                 _ => None,
             })
             .collect();
         let lv2 = build_lv2_slots(&graph, sample_rate);
         // Default routing: every source class feeds every rig (full range).
-        // SetSplit later narrows key ranges per rig, in place (RT-safe).
         let mut matrix = Matrix::new();
         matrix.reserve(64);
-        for v in &voices {
+        for v in voices.iter().filter(|v| v.node != NodeId::MAX) {
             matrix.connect(SourceId::Keys, v.node);
-            matrix.connect(SourceId::LaptopKeys, v.node);
             // Cover hardware device ids 0..MAX so any connected device routes;
             // the per-rig `rig_device` filter then selects which one is heard.
             for dev in 0..MAX_HW_DEVICES {
@@ -272,7 +367,6 @@ impl GraphEngine {
         for slot in &lv2 {
             if slot.plugin.is_instrument() {
                 matrix.connect(SourceId::Keys, slot.node);
-                matrix.connect(SourceId::LaptopKeys, slot.node);
                 for dev in 0..MAX_HW_DEVICES {
                     matrix.connect(SourceId::Hardware(dev), slot.node);
                 }
@@ -286,17 +380,15 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
-            keys_node,
             master_vol: 0.8,
             master_warm: 0.15,
-            transport_playing: false,
             bpm: 96.0,
-            metro_phase: 0.0,
-            click_remaining: 0,
-            click_phase: 0.0,
             out_peak: Arc::new(AtomicU32::new(0)),
+            edge_levels: Arc::new(EdgeLevels::new()),
             matrix,
             route_out: Vec::with_capacity(64),
+            #[cfg(test)]
+            note_log: Vec::new(),
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
@@ -379,40 +471,89 @@ impl GraphEngine {
         self.out_peak.clone()
     }
 
+    /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
+    pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {
+        self.edge_levels.clone()
+    }
+
+    /// Publish every audio edge's level = its source node's output peak this
+    /// block (voices post-level, DSP/LV2 post-process, system capture
+    /// post-gain). Block rate, allocation-free: linear scans over reserved
+    /// graph storage, like the rest of the render path.
+    fn publish_edge_levels(&self, n2: usize, sys: bool) {
+        for e in &self.graph.edges {
+            if e.kind != PortKind::Audio {
+                continue;
+            }
+            let src = e.from.node;
+            let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
+                block_peak(&v.scratch[..n2])
+            } else if let Some(d) = self.dsp.iter().find(|d| d.node == src) {
+                block_peak(&d.buf[..n2])
+            } else if let Some(l) = self.lv2.iter().find(|l| l.node == src) {
+                block_peak(&l.buf[..n2])
+            } else if sys
+                && self.graph.node(src).map_or(false, |n| matches!(n.kind, NodeKind::SystemAudio))
+            {
+                block_peak(&self.system_buf[..n2]) * self.system_gain
+            } else {
+                0.0
+            };
+            self.edge_levels.store(e.id, peak);
+        }
+    }
+
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
     }
 
-    /// MIDI-cable gate: a note reaches `dest` if ANY Keys node has a MIDI
-    /// cable to it. Each rig carries its own Keys node after LoadRigs; a
-    /// single-graph patch has exactly one, so behavior is unchanged there.
-    fn keys_gate(&self, dest: NodeId) -> bool {
-        if let Some(k) = self.keys_node {
-            if self.graph.has_route(k, dest, PortKind::Midi) {
-                return true;
-            }
-        }
+    /// MIDI-cable gate for one PLAYED note (before transpose): it reaches
+    /// `dest` if ANY Keys node has a MIDI cable to `dest` from the port that
+    /// note leaves on — port 0 when unsplit; LOW (0) below the split point,
+    /// HIGH (1) at/above it when split. Each rig carries its own Keys node
+    /// (and its own split) after LoadRigs. Note-offs take the same port as
+    /// their note-on because the zone is a pure function of the note.
+    /// Allocation-free linear scans, like the rest of the render path.
+    fn keys_gate(&self, dest: NodeId, played: u8) -> bool {
         self.graph.nodes.iter().any(|n| {
-            matches!(n.kind, NodeKind::Keys)
-                && Some(n.id) != self.keys_node
-                && self.graph.has_route(n.id, dest, PortKind::Midi)
+            matches!(n.kind, NodeKind::Keys) && {
+                let port = split_port(n.split, played);
+                self.graph.edges.iter().any(|e| {
+                    e.kind == PortKind::Midi
+                        && e.from.node == n.id
+                        && e.from.port == port
+                        && e.to.node == dest
+                })
+            }
         })
+    }
+
+    /// Note-off for all 128 notes on one instrument (stateless-matrix
+    /// safety on rule/split edits). Rare op, allocation-free.
+    fn release_all(&mut self, dest: NodeId) {
+        if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
+            for n in 0..128u16 { s.voice.note_off(n); }
+        }
+        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+            for n in 0..128u8 { s.plugin.note_off(n); }
+        }
+        #[cfg(test)]
+        self.note_log.push((dest, 255, false)); // 255 = all-notes-off marker
     }
 
     fn apply(&mut self, cmd: Command) {
         match cmd {
-            Command::AddNode { kind, name } => {
+            Command::AddNode { kind, name, rig } => {
                 let id = self.graph.add_node(kind.clone(), name);
+                self.graph.set_rig(id, rig);
                 let sr = self.sample_rate;
                 match &kind {
                     NodeKind::Dsp(dk) => {
-                        self.dsp.push(DspSlot {
-                            node: id,
-                            kind: dk.clone(),
-                            proc: build_processor(dk, sr),
-                            buf: vec![0.0; 8192 * 2],
-                        });
+                        if let Some(n) = self.graph.node(id) {
+                            let slot = dsp_slot(n, dk, sr);
+                            self.dsp.push(slot);
+                        }
                     }
                     NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sr, 8192) {
                         Ok(plugin) => {
@@ -420,7 +561,6 @@ impl GraphEngine {
                             self.lv2.push(Lv2Slot { node: id, plugin, buf: vec![0.0; 8192 * 2] });
                             if is_inst {
                                 self.matrix.connect(SourceId::Keys, id);
-                                self.matrix.connect(SourceId::LaptopKeys, id);
                                 for dev in 0..MAX_HW_DEVICES {
                                     self.matrix.connect(SourceId::Hardware(dev), id);
                                 }
@@ -495,12 +635,7 @@ impl GraphEngine {
                     .nodes
                     .iter()
                     .filter_map(|n| match &n.kind {
-                        NodeKind::Dsp(kind) => Some(DspSlot {
-                            node: n.id,
-                            kind: kind.clone(),
-                            proc: build_processor(kind, sr),
-                            buf: vec![0.0; 8192 * 2],
-                        }),
+                        NodeKind::Dsp(kind) => Some(dsp_slot(n, kind, sr)),
                         _ => None,
                     })
                     .collect();
@@ -521,7 +656,6 @@ impl GraphEngine {
                 self.matrix.reserve(64);
                 for &id in &clap_ids {
                     self.matrix.connect(SourceId::Keys, id);
-                    self.matrix.connect(SourceId::LaptopKeys, id);
                     for dev in 0..MAX_HW_DEVICES {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
@@ -529,18 +663,11 @@ impl GraphEngine {
                 for slot in &self.lv2 {
                     if slot.plugin.is_instrument() {
                         self.matrix.connect(SourceId::Keys, slot.node);
-                        self.matrix.connect(SourceId::LaptopKeys, slot.node);
                         for dev in 0..MAX_HW_DEVICES {
                             self.matrix.connect(SourceId::Hardware(dev), slot.node);
                         }
                     }
                 }
-                self.keys_node = self
-                    .graph
-                    .nodes
-                    .iter()
-                    .find(|n| matches!(n.kind, NodeKind::Keys))
-                    .map(|n| n.id);
                 self.rig_meta.clear();
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
@@ -550,7 +677,7 @@ impl GraphEngine {
             Command::LoadRigs { rigs, active } => {
                 // Rare structural op: merge the rig graphs into one patch and
                 // reuse the LoadGraph rebuild (DSP, LV2, CLAP voice remap in
-                // node-id order, matrix, keys_node), then bind each rig's
+                // node-id order, matrix), then bind each rig's
                 // instruments to its MIDI device. Allocates — off the hot path.
                 let merged = crate::control::merge_rigs(&rigs);
                 self.apply(Command::LoadGraph { graph: merged });
@@ -588,7 +715,6 @@ impl GraphEngine {
                     for s in self.voices.iter_mut() {
                         if self.graph.node(s.node).map(|n| n.rig == tag).unwrap_or(false) {
                             s.src_keys = rig.midi_device.is_none();
-                            s.src_laptop = rig.midi_device.is_none();
                             s.src_hw = true;
                             s.rig_device = rig.midi_device;
                         }
@@ -606,10 +732,11 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let gate = self.keys_gate(dest);
-                    if !gate {
+                    if !self.keys_gate(dest, note) {
                         continue;
                     }
+                    #[cfg(test)]
+                    self.note_log.push((dest, m.note(), true));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_on(m.note() as u16, velocity as f64);
@@ -627,10 +754,11 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let gate = self.keys_gate(dest);
-                    if !gate {
+                    if !self.keys_gate(dest, note) {
                         continue;
                     }
+                    #[cfg(test)]
+                    self.note_log.push((dest, m.note(), false));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_off(m.note() as u16);
@@ -643,10 +771,9 @@ impl GraphEngine {
                     }
                 }
             }
-            Command::SetRigSource { node, keys, laptop, hardware } => {
+            Command::SetRigSource { node, keyboard, hardware } => {
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
-                    s.src_keys = keys;
-                    s.src_laptop = laptop;
+                    s.src_keys = keyboard;
                     s.src_hw = hardware;
                 }
             }
@@ -662,24 +789,28 @@ impl GraphEngine {
                 if let Some(b) = mute { m.mute = b; }
                 if let Some(b) = solo { m.solo = b; }
             }
-            Command::SetSplit { point } => {
-                // Rig A (node 1) takes the low zone, rig B (node 4) the high zone.
-                // In-place key-range edits: no allocation on the audio thread.
-                for rule in &mut self.matrix.rules {
-                    rule.key_range = match point {
-                        None => (0, 127),
-                        Some(p) => {
-                            if rule.dest == 1 {
-                                (0, p.saturating_sub(1))
-                            } else if rule.dest == 4 {
-                                (p, 127)
-                            } else {
-                                (0, 127)
-                            }
+            Command::SetNodeSplit { node, point } => {
+                // A Keys-node property: only a real change on a Keys node acts.
+                let point = point.map(|p| p.min(127));
+                let is_change = self.graph.node(node).map_or(false, |n| {
+                    matches!(n.kind, NodeKind::Keys) && n.split != point
+                });
+                if is_change {
+                    // Release held notes on EVERY instrument this Keys node
+                    // feeds, from both ports, BEFORE the zones move — a note
+                    // held across the change would otherwise lose its
+                    // note-off to the other port. Index loop: no allocation.
+                    for i in 0..self.graph.edges.len() {
+                        let e = &self.graph.edges[i];
+                        if e.kind == PortKind::Midi && e.from.node == node {
+                            let dest = e.to.node;
+                            self.release_all(dest);
                         }
-                    };
+                    }
+                    // Unsplitting also drops the node's HIGH-port cables.
+                    self.graph.set_split(node, point);
+                    self.publish_graph();
                 }
-                self.publish_graph();
             }
             Command::MatrixRule { source, dest, channel, transpose, key_lo, key_hi, vel_lo, vel_hi, enabled } => {
                 // Live per-cell rule edit (hot-wire matrix). In-place when the
@@ -706,12 +837,7 @@ impl GraphEngine {
                 }
                 // Stateless-matrix safety: release held notes on the destination
                 // so a range/transpose edit can't orphan a release (rare op).
-                if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
-                    for n in 0..128u16 { s.voice.note_off(n); }
-                }
-                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
-                    for n in 0..128u8 { s.plugin.note_off(n); }
-                }
+                self.release_all(dest);
                 self.publish_graph();
             }
             Command::SetSystemAudio { gain } => {
@@ -720,17 +846,40 @@ impl GraphEngine {
             Command::SetPlayer { gain } => {
                 self.player_gain = gain.clamp(0.0, 1.0);
             }
-            Command::TransportPlay => {
-                self.transport_playing = true;
-                self.metro_phase = 0.0;
-            }
-            Command::TransportStop => {
-                self.transport_playing = false;
-                self.click_remaining = 0;
+            // Global transport = MASTER: fan out to every transport-capable
+            // node (all start together on the downbeat). Per-node
+            // SetNodePlaying overrides individually afterwards.
+            Command::TransportPlay => self.master_transport(true),
+            Command::TransportStop => self.master_transport(false),
+            Command::SetNodePlaying { node, playing } => {
+                // Unknown / non-transport nodes are ignored (flag stays false).
+                if let Some(changed) = self.graph.set_playing(node, playing) {
+                    if let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) {
+                        d.transport.set_playing(playing);
+                    }
+                    if changed {
+                        self.publish_graph();
+                    }
+                }
             }
             Command::SetBpm { bpm } => {
                 self.bpm = bpm.clamp(20.0, 300.0);
             }
+        }
+    }
+
+    /// Master transport fan-out (TransportPlay/Stop): set every
+    /// transport-capable node's flag and slot clock; publish only when a flag
+    /// actually changed (frontends mirror it from GraphPub).
+    fn master_transport(&mut self, playing: bool) {
+        let changed = self.graph.set_all_playing(playing);
+        for d in &mut self.dsp {
+            if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
+                d.transport.set_playing(playing);
+            }
+        }
+        if changed {
+            self.publish_graph();
         }
     }
 
@@ -752,6 +901,8 @@ impl GraphEngine {
 
         // 1. Every instrument renders and applies its level.
         for s in &mut self.voices {
+            // Idle pool voice (no Clap node mapped): skip the plugin entirely.
+            if s.node == NodeId::MAX { continue; }
             s.voice.render(&mut s.scratch[..n2]);
             for x in s.scratch[..n2].iter_mut() {
                 *x *= s.level;
@@ -776,15 +927,13 @@ impl GraphEngine {
             d.proc.process(&mut d.buf[..n2], frames);
         }
 
-        // 2a. Metronome nodes: transport-driven click generators. Their output
-        // reaches the master via normal audio routing like any DSP node.
-        for i in 0..self.dsp.len() {
-            if self.dsp[i].kind == DspKind::Metronome {
-                // Take the buffer out so the helper can borrow engine state;
-                // mem::take on a Vec is allocation-free (RT-safe).
-                let mut buf = std::mem::take(&mut self.dsp[i].buf);
-                self.render_metronome(&mut buf[..n2], frames);
-                self.dsp[i].buf = buf;
+        // 2a. Metronome nodes: click generators gated by their OWN playing
+        // flag (per-instrument transport). Output reaches the master via
+        // normal audio routing like any DSP node.
+        let (sr, bpm) = (self.sample_rate, self.bpm);
+        for d in &mut self.dsp {
+            if d.kind == DspKind::Metronome {
+                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm);
             }
         }
 
@@ -909,39 +1058,38 @@ impl GraphEngine {
             }
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
+        self.publish_edge_levels(n2, sys);
     }
+}
 
-    /// Generate the metronome click into `buf` (stereo-interleaved): a
-    /// decaying 1 kHz burst on each beat while the transport plays. Driven by
-    /// TransportPlay/TransportStop/SetBpm; allocation-free.
-    fn render_metronome(&mut self, buf: &mut [f32], frames: usize) {
-        let frames = frames.min(buf.len() / 2);
-        let n2 = frames * 2;
-        for x in buf[..n2].iter_mut() {
-            *x = 0.0;
+/// Generate one metronome's click into `buf` (stereo-interleaved): a
+/// decaying 1 kHz burst on each beat while ITS transport plays. Driven by
+/// SetNodePlaying / master TransportPlay·Stop / SetBpm; allocation-free.
+fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sample_rate: f64, bpm: f32) {
+    let frames = frames.min(buf.len() / 2);
+    let n2 = frames * 2;
+    for x in buf[..n2].iter_mut() {
+        *x = 0.0;
+    }
+    let spb = sample_rate * 60.0 / bpm as f64;
+    for i in 0..frames {
+        if t.playing {
+            t.phase += 1.0;
+            if t.phase >= spb {
+                t.phase -= spb;
+                t.click_remaining = CLICK_FRAMES;
+                t.click_phase = 0.0;
+            }
         }
-        for i in 0..frames {
-            if self.transport_playing {
-                let spb = self.sample_rate * 60.0 / self.bpm as f64;
-                self.metro_phase += 1.0;
-                if self.metro_phase >= spb {
-                    self.metro_phase -= spb;
-                    self.click_remaining = 2400;
-                    self.click_phase = 0.0;
-                }
-            }
-            if self.click_remaining > 0 {
-                let env = self.click_remaining as f32 / 2400.0;
-                let click = (2.0 * std::f32::consts::PI * 1000.0 * self.click_phase
-                    / self.sample_rate as f32)
-                    .sin()
-                    * env
-                    * 0.4;
-                buf[i * 2] = click;
-                buf[i * 2 + 1] = click;
-                self.click_phase += 1.0;
-                self.click_remaining -= 1;
-            }
+        if t.click_remaining > 0 {
+            let env = t.click_remaining as f32 / CLICK_FRAMES as f32;
+            let click = (2.0 * std::f32::consts::PI * 1000.0 * t.click_phase / sample_rate as f32).sin()
+                * env
+                * 0.4;
+            buf[i * 2] = click;
+            buf[i * 2 + 1] = click;
+            t.click_phase += 1.0;
+            t.click_remaining -= 1;
         }
     }
 }
@@ -950,55 +1098,128 @@ impl GraphEngine {
 mod tests {
     use crate::matrix::{Matrix, MidiMsg, SourceId};
 
-    /// Mirror the engine's default matrix + SetSplit key-range edits.
-    fn split_matrix(point: Option<u8>) -> Matrix {
-        let mut m = Matrix::new();
-        for node in [1u32, 4u32] {
-            m.connect(SourceId::Keys, node);
-            m.connect(SourceId::LaptopKeys, node);
-        }
-        for rule in &mut m.rules {
-            rule.key_range = match point {
-                None => (0, 127),
-                Some(p) => {
-                    if rule.dest == 1 {
-                        (0, p.saturating_sub(1))
-                    } else if rule.dest == 4 {
-                        (p, 127)
-                    } else {
-                        (0, 127)
-                    }
-                }
-            };
-        }
-        m
-    }
-
     fn dests(m: &Matrix, src: SourceId, msg: MidiMsg) -> Vec<u32> {
         let mut out = Vec::new();
         m.route_into(src, msg, &mut out);
         out.iter().map(|(d, _)| *d).collect()
     }
 
-    #[test]
-    fn no_split_both_rigs_play() {
-        let m = split_matrix(None);
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
-        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 30, 100)), vec![1, 4]);
+    /// Demo patch engine (Keys 0 → Surge A 1 / Surge B 4) with a published
+    /// graph. Cable 6 (Keys → Surge B) moves to HIGH when `high_b`.
+    fn split_engine(split: Option<u8>, high_b: bool) -> (super::GraphEngine, crate::control::CommandBus) {
+        use crate::control::{command_bus, Graph, PortKind, PortRef};
+        let mut g = Graph::demo_patch();
+        g.set_split(0, split);
+        if high_b {
+            g.disconnect(6);
+            assert!(g.connect_with_id(6, PortRef { node: 0, port: 1 }, PortRef { node: 4, port: 0 }, PortKind::Midi));
+        }
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        bus.send(crate::control::Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        engine.note_log.clear();
+        (engine, bus)
+    }
+
+    fn play(engine: &mut super::GraphEngine, bus: &mut crate::control::CommandBus, cmd: crate::control::Command) -> Vec<(u32, u8, bool)> {
+        engine.note_log.clear();
+        bus.send(cmd);
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let mut log = engine.note_log.clone();
+        log.sort_unstable();
+        log
+    }
+
+    fn on(note: u8) -> crate::control::Command {
+        crate::control::Command::NoteOn { note, velocity: 0.8, source: SourceId::Keys }
+    }
+    fn off(note: u8) -> crate::control::Command {
+        crate::control::Command::NoteOff { note, source: SourceId::Keys }
     }
 
     #[test]
-    fn split_at_c4_partitions_keyboard() {
-        let m = split_matrix(Some(60));
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 59, 100)), vec![1]); // B3 → A
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 60, 100)), vec![4]); // C4 → B
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_on(0, 96, 100)), vec![4]); // high → B
-        // Note-offs follow the same zone as their note-on.
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_off(0, 59, 0)), vec![1]);
-        assert_eq!(dests(&m, SourceId::Keys, MidiMsg::note_off(0, 60, 0)), vec![4]);
-        // Laptop keys split identically.
-        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 48, 100)), vec![1]);
-        assert_eq!(dests(&m, SourceId::LaptopKeys, MidiMsg::note_on(0, 72, 100)), vec![4]);
+    fn unsplit_keys_play_every_wired_instrument() {
+        let (mut e, mut bus) = split_engine(None, false);
+        assert_eq!(play(&mut e, &mut bus, on(59)), vec![(1, 59, true), (4, 59, true)]);
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(1, 60, true), (4, 60, true)]);
+        // No global auto-split any more: the matrix keeps full-range rules.
+        assert!(e.matrix.rules.iter().all(|r| r.key_range == (0, 127)));
+    }
+
+    #[test]
+    fn split_at_c4_routes_low_and_high_ports() {
+        // LOW (port 0) → Surge A, HIGH (port 1) → Surge B, split at 60.
+        let (mut e, mut bus) = split_engine(Some(60), true);
+        assert_eq!(play(&mut e, &mut bus, on(59)), vec![(1, 59, true)], "59 exits LOW only");
+        assert_eq!(play(&mut e, &mut bus, on(60)), vec![(4, 60, true)], "60 exits HIGH only");
+        assert_eq!(play(&mut e, &mut bus, on(96)), vec![(4, 96, true)]);
+        // Note-offs follow the same port as their note-ons.
+        assert_eq!(play(&mut e, &mut bus, off(59)), vec![(1, 59, false)]);
+        assert_eq!(play(&mut e, &mut bus, off(60)), vec![(4, 60, false)]);
+        // Laptop typing is the same Keyboard source: same Keys-node zones.
+        let lap = crate::control::Command::NoteOn { note: 48, velocity: 0.8, source: SourceId::Keys };
+        assert_eq!(play(&mut e, &mut bus, lap), vec![(1, 48, true)]);
+    }
+
+    #[test]
+    fn split_with_both_cables_on_low_plays_only_the_low_zone() {
+        // Enabling split keeps existing cables on LOW: high notes go nowhere
+        // until something is wired to HIGH (pure graph routing).
+        let (mut e, mut bus) = split_engine(Some(60), false);
+        assert_eq!(play(&mut e, &mut bus, on(40)), vec![(1, 40, true), (4, 40, true)]);
+        assert!(play(&mut e, &mut bus, on(72)).is_empty());
+    }
+
+    #[test]
+    fn split_change_releases_held_notes_on_both_ports() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(Some(60), true);
+        // Hold 59 (LOW → A) and 72 (HIGH → B), then move the split.
+        play(&mut e, &mut bus, on(59));
+        play(&mut e, &mut bus, on(72));
+        let log = play(&mut e, &mut bus, Command::SetNodeSplit { node: 0, point: Some(48) });
+        assert_eq!(log, vec![(1, 255, false), (4, 255, false)], "all-notes-off on both zones' instruments");
+        assert_eq!(e.graph().node(0).unwrap().split, Some(48));
+        // A no-op (same point) releases nothing.
+        assert!(play(&mut e, &mut bus, Command::SetNodeSplit { node: 0, point: Some(48) }).is_empty());
+        // Unsplit: release again, HIGH cable dropped, full range on LOW.
+        let log = play(&mut e, &mut bus, Command::SetNodeSplit { node: 0, point: None });
+        assert_eq!(log, vec![(1, 255, false), (4, 255, false)]);
+        assert!(!e.graph().edges.iter().any(|x| x.from.node == 0 && x.from.port == 1));
+        assert_eq!(play(&mut e, &mut bus, on(72)), vec![(1, 72, true)]);
+        // Non-Keys nodes ignore the command.
+        assert!(play(&mut e, &mut bus, Command::SetNodeSplit { node: 1, point: Some(60) }).is_empty());
+        assert_eq!(e.graph().node(1).unwrap().split, None);
+    }
+
+    #[test]
+    fn rig_source_filter_is_a_keyboard_hardware_pair() {
+        use super::source_allowed;
+        // Keyboard off: on-screen AND laptop notes (one source) are blocked;
+        // hardware still plays.
+        assert!(!source_allowed(false, true, None, SourceId::Keys));
+        assert!(source_allowed(false, true, None, SourceId::Hardware(3)));
+        // Hardware off: only the keyboard plays.
+        assert!(source_allowed(true, false, None, SourceId::Keys));
+        assert!(!source_allowed(true, false, None, SourceId::Hardware(3)));
+        // Device binding narrows hardware only.
+        assert!(source_allowed(true, true, Some(2), SourceId::Hardware(2)));
+        assert!(!source_allowed(true, true, Some(2), SourceId::Hardware(0)));
+        // Non-keyboard, non-hardware sources are never filtered.
+        assert!(source_allowed(false, false, None, SourceId::FilePlayer(0)));
+    }
+
+    #[test]
+    fn default_matrix_has_one_keyboard_rule_per_instrument() {
+        // One Keyboard row: exactly one Keys rule per instrument, no second
+        // laptop rule (the sources are unified).
+        let (e, _bus) = split_engine(None, false);
+        let keys_rules = |dest| e.matrix.rules.iter().filter(|r| r.dest == dest && r.source == SourceId::Keys).count();
+        assert_eq!(keys_rules(1), 1);
+        assert_eq!(keys_rules(4), 1);
     }
 
     #[test]
@@ -1013,11 +1234,10 @@ mod tests {
 
     #[test]
     fn matrix_routes_each_hardware_device() {
-        // Mirror the engine's default matrix: Keys/Laptop + Hardware(0..MAX).
+        // Mirror the engine's default matrix: Keyboard + Hardware(0..MAX).
         let mut m = Matrix::new();
         for node in [1u32, 4u32] {
             m.connect(SourceId::Keys, node);
-            m.connect(SourceId::LaptopKeys, node);
             for dev in 0..super::MAX_HW_DEVICES {
                 m.connect(SourceId::Hardware(dev), node);
             }
@@ -1127,6 +1347,158 @@ mod tests {
         assert_eq!(r.transpose, 7);
     }
 
+    /// Two metronomes: M1 wired to the master (audible), M2 unwired. Returns
+    /// (engine, bus, m1, m2, graph publication).
+    fn two_metronomes() -> (
+        super::GraphEngine,
+        crate::control::CommandBus,
+        u32,
+        u32,
+        std::sync::Arc<std::sync::Mutex<super::GraphPub>>,
+    ) {
+        use crate::control::DspKind;
+        let mut g = crate::control::Graph::default();
+        let m1 = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("M1"));
+        let m2 = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("M2"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: m1, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
+            rev: 0,
+            graph: crate::control::Graph::default(),
+            rules: Vec::new(),
+        }));
+        engine.set_graph_pub(pub_.clone());
+        (engine, bus, m1, m2, pub_)
+    }
+
+    /// Peak output over ~1 s (enough for two beats at 120 BPM).
+    fn peak_1s(engine: &mut super::GraphEngine) -> f32 {
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..(48000 / 512) {
+            engine.render(&mut buf, 2);
+            peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        peak
+    }
+
+    #[test]
+    fn edge_levels_follow_the_source_node() {
+        // M1 → Master (edge 1): playing raises the edge level above
+        // silence; stopping lets it fall back to ~0. M2 has no edges.
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        let levels = engine.edge_levels_handle();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetNodePlaying { node: m1, playing: true });
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut max_edge = 0.0f32;
+        for _ in 0..(48000 / 512) {
+            engine.render(&mut buf, 2);
+            max_edge = max_edge.max(levels.load(1));
+        }
+        assert!(max_edge > 0.05, "playing metronome must light its audio edge (got {max_edge})");
+        bus.send(Command::SetNodePlaying { node: m1, playing: false });
+        for _ in 0..(48000 / 512) {
+            engine.render(&mut buf, 2);
+        }
+        assert!(levels.load(1) < 1e-3, "stopped source must decay to silence (got {})", levels.load(1));
+    }
+
+    #[test]
+    fn edge_level_slots_never_misattribute() {
+        let l = super::EdgeLevels::new();
+        l.store(3, 0.5);
+        assert_eq!(l.load(3), 0.5);
+        // Same slot, different id: the newer edge wins, the older reads 0.
+        let other = 3 + super::EDGE_LEVEL_SLOTS as u32;
+        l.store(other, 0.25);
+        assert_eq!(l.load(other), 0.25);
+        assert_eq!(l.load(3), 0.0);
+        assert_eq!(l.load(42), 0.0, "never-published edge reads silence");
+    }
+
+    #[test]
+    fn metronome_follows_its_own_playing_flag() {
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        // Global transport plays, but M1 is stopped individually → silent.
+        bus.send(Command::TransportPlay);
+        bus.send(Command::SetNodePlaying { node: m1, playing: false });
+        assert!(peak_1s(&mut engine) < 0.05, "stopped metronome must stay silent while the transport plays");
+        assert!(!engine.graph().node(m1).unwrap().playing);
+        // Start M1 on its own → clicks.
+        bus.send(Command::SetNodePlaying { node: m1, playing: true });
+        assert!(peak_1s(&mut engine) > 0.05, "playing metronome must click");
+        // Stop M1 again → silence returns (in-flight click cut).
+        bus.send(Command::SetNodePlaying { node: m1, playing: false });
+        assert!(peak_1s(&mut engine) < 0.05, "metronome did not stop");
+    }
+
+    #[test]
+    fn metronome_clicks_without_global_transport() {
+        // Per-instrument transport: the node's own flag is enough.
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        assert!(peak_1s(&mut engine) < 0.05, "metronomes start stopped");
+        bus.send(Command::SetNodePlaying { node: m1, playing: true });
+        assert!(peak_1s(&mut engine) > 0.05);
+    }
+
+    #[test]
+    fn master_transport_sets_every_capable_node() {
+        let (mut engine, mut bus, m1, m2, pub_) = two_metronomes();
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::TransportPlay);
+        engine.render(&mut buf, 2);
+        let g = engine.graph();
+        assert!(g.node(m1).unwrap().playing && g.node(m2).unwrap().playing, "master play starts all");
+        assert!(g.nodes.iter().filter(|n| n.id != m1 && n.id != m2).all(|n| !n.playing),
+            "non-transport nodes never get the flag");
+        // The published graph carries the flags (UI face mirrors it).
+        let rev = pub_.lock().unwrap().rev;
+        assert!(rev > 0);
+        assert!(pub_.lock().unwrap().graph.node(m2).unwrap().playing);
+        // Per-node override after the master.
+        bus.send(Command::SetNodePlaying { node: m2, playing: false });
+        engine.render(&mut buf, 2);
+        assert!(engine.graph().node(m1).unwrap().playing);
+        assert!(!engine.graph().node(m2).unwrap().playing);
+        assert!(!pub_.lock().unwrap().graph.node(m2).unwrap().playing);
+        // Master stop clears all; repeating it changes nothing → no rev bump.
+        bus.send(Command::TransportStop);
+        engine.render(&mut buf, 2);
+        assert!(engine.graph().nodes.iter().all(|n| !n.playing));
+        let rev = pub_.lock().unwrap().rev;
+        bus.send(Command::TransportStop);
+        engine.render(&mut buf, 2);
+        assert_eq!(pub_.lock().unwrap().rev, rev, "a no-op transport stop must not republish");
+    }
+
+    #[test]
+    fn set_node_playing_ignores_non_transport_nodes() {
+        let (mut engine, mut bus, _m1, _m2, pub_) = two_metronomes();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let master = engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::MasterOut)).unwrap().id;
+        bus.send(Command::SetNodePlaying { node: master, playing: true });
+        bus.send(Command::SetNodePlaying { node: 999, playing: true });
+        engine.render(&mut buf, 2);
+        assert!(!engine.graph().node(master).unwrap().playing);
+        assert_eq!(pub_.lock().unwrap().rev, 0, "ignored commands must not republish");
+    }
+
+    #[test]
+    fn load_graph_restores_persisted_playing() {
+        // Session restore: a graph whose metronome was saved playing clicks
+        // right after LoadGraph — no TransportPlay needed.
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        let mut g = engine.graph().clone();
+        assert_eq!(g.set_playing(m1, true), Some(true));
+        bus.send(Command::LoadGraph { graph: g });
+        assert!(peak_1s(&mut engine) > 0.05);
+        assert!(engine.graph().node(m1).unwrap().playing);
+    }
+
     #[test]
     fn graph_pub_revs_on_structural_changes_only() {
         let (mut bus, drain) = command_bus();
@@ -1150,6 +1522,7 @@ mod tests {
         bus.send(Command::AddNode {
             kind: NodeKind::Dsp(crate::control::DspKind::Gain),
             name: crate::control::name_bytes("G"),
+            rig: 0,
         });
         engine.render(&mut buf, 2);
         assert_eq!(rev(), 1);
@@ -1183,11 +1556,9 @@ mod tests {
         assert_eq!(dests(&engine.matrix, SourceId::Hardware(3), on), vec![4]);
         assert_eq!(dests(&engine.matrix, SourceId::Hardware(0), on), vec![4]);
         assert_eq!(dests(&engine.matrix, SourceId::Keys, on), vec![4]);
-        assert_eq!(dests(&engine.matrix, SourceId::LaptopKeys, on), vec![4]);
         // Each rig's OWN Keys node gates its synth (multi-rig cable gate).
-        assert!(engine.keys_gate(1));
-        assert!(engine.keys_gate(4));
-        assert_eq!(engine.keys_node, Some(0));
+        assert!(engine.keys_gate(1, 60));
+        assert!(engine.keys_gate(4, 60));
         // Rig list + active index are queryable.
         assert_eq!(engine.rig_meta().len(), 2);
         assert_eq!(engine.rig_meta()[0].name, "A");
@@ -1205,7 +1576,6 @@ mod tests {
         assert_eq!(dests(&engine.matrix, SourceId::Hardware(7), on), vec![4]);
         assert!(dests(&engine.matrix, SourceId::Hardware(3), on).is_empty());
         assert!(dests(&engine.matrix, SourceId::Keys, on).is_empty());
-        assert!(dests(&engine.matrix, SourceId::LaptopKeys, on).is_empty());
     }
 
     #[test]
@@ -1319,6 +1689,58 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Per-edge audio level self-test (PLAN §2 signature): the demo's chain
+/// Keys→Surge→Delay→Master + Surge→Master. While a note sounds every audio
+/// edge must publish a level above silence; after note-off (release + delay
+/// tail) the levels must decay back to ~0.
+pub fn edge_level_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let fx = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g.connect_with_id(4, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(synth, voice)]);
+    let levels = engine.edge_levels_handle();
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut lit = [0.0f32; 5];
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        for e in 1..5u32 {
+            lit[e as usize] = lit[e as usize].max(levels.load(e));
+        }
+    }
+    anyhow::ensure!(lit[1] == 0.0, "MIDI edge must not carry an audio level ({})", lit[1]);
+    for e in 2..5 {
+        anyhow::ensure!(lit[e] > 1e-3, "audio edge {e} stayed silent while playing ({})", lit[e]);
+    }
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    let mut secs = 0.0f32;
+    let silent = |l: &EdgeLevels| (2..5u32).all(|e| l.load(e) < 1e-3);
+    while !silent(&levels) && secs < 20.0 {
+        engine.render(&mut buf, 2);
+        secs += 512.0 / sr as f32;
+    }
+    anyhow::ensure!(silent(&levels), "edge levels did not decay after note-off ({:?})",
+        (2..5u32).map(|e| levels.load(e)).collect::<Vec<_>>());
+    println!(
+        "edge-level-test: OK — playing: surge→delay {:.3}, delay→master {:.3}, surge→master {:.3}; silent {secs:.1}s after note-off",
+        lit[2], lit[3], lit[4]
+    );
+    Ok(())
+}
+
 /// Metronome self-test: a Metronome rack node wired Metronome→Master must
 /// click on TransportPlay and fall silent on TransportStop. Also verifies a
 /// patch WITHOUT a metronome node stays silent while playing (the click is no
@@ -1419,7 +1841,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
 
     // Insert a dynamically added gain node: surge -> gain -> master.
     let gain = keys.max(surge).max(master) + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN") });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 });
     bus.send(Command::SetParam { node: gain, param: 0, value: 1.0 });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });

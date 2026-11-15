@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip with vol/pan/mute/solo + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 125 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading (#2), (2) backing tracks (#1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap, mirrored as GitHub feature issues #1–#8 (user request 2026-11-15).**
+Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **RIGS strip (+ Rig / × delete with confirmation) + Mixer view (F10: sources → rig bus → master) + 1–9/←→ view switching (F4 two-rig demo)**, **global agent rig control (get/add/delete/select_rig)**, **big patches pan instead of squishing**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 205 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading (#2), (2) backing tracks (#1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap, mirrored as GitHub feature issues #1–#8 (user request 2026-11-15).**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (125). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (205). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -33,12 +33,15 @@ Tests: `cargo test` (125). CLI self-tests: `session-test`, `capture-test`, `play
 - `dsp.rs` — 8 allocation-proven processors + Metronome placeholder.
 - `matrix.rs` — MIDI routing: `SourceId::{Keys,LaptopKeys,Hardware(dev),...}`, per-rig rules,
   splits/transpose/filters. Allocation-free `route_into`.
-- `theme.rs` — **Hurricane design language** (docs/design-reference-analysis.md): light
-  warm-paper chrome + one near-black hero panel (the rack). Tokens: PAPER/PAPER_SINK/INK/
-  INK_2/HAIRLINE, DARK_PANEL/DARK_PANEL_HI/CREAM/CREAM_DIM/HAIRLINE_DARK, ACCENT (tomato)
-  + text-safe variants, AUDIO_CREAM/MIDI_BLUE/LIVE_TEAL/CLIP_RED. Flat painters:
-  `paper_bg` (watermark asterisk), `flat_panel`, `drop_shadow` (floating sheets only),
-  `inset_keyline`, `asterisk`, flat `value_arc`, stepped `meter_color`; `TrackedLabel`
+- `theme.rs` — **Hurricane design language, all-dark chrome** (user pivot
+  2026-11-15; docs/design-reference-analysis.md §0 overrides): warm near-black
+  surfaces, one tomato accent. Tokens: PAPER/PAPER_SINK/INK/INK_2/HAIRLINE
+  (dark values), DARK_PANEL/DARK_PANEL_HI/CREAM/CREAM_DIM/HAIRLINE_DARK,
+  ACCENT (tomato) + text-safe variants, AUDIO_CREAM/MIDI_BLUE/LIVE_TEAL/
+  CLIP_RED, per-family CABLE_AUDIO_PALETTE/CABLE_MIDI_PALETTE. Flat painters:
+  `paper_bg` (flat dark, no watermark), `crossed_wires` (brand mark),
+  `drop_shadow` (floating sheets only), `inset_keyline`, flat `value_arc`,
+  stepped `meter_color`; `chip_button` (real buttons), `TrackedLabel`
   per-char galley machinery (letter-spacing), `tracked_label`/`section_label`/
   `primary_button` widgets, `visuals()` (light), `install_fonts` (Noto Sans reg/med/bold
   + JetBrains Mono; Medium = display, Bold = flip pill only).
@@ -183,6 +186,47 @@ merged here 2026-11-15; no GitHub tickets).
   app's BYOK key, not from guessing.
 - **2026-11-15** — **Single roadmap in PLAN.md** (user): all work tracking lives in §13
   of this file — no GitHub tickets; BACKLOG.md merged here.
+- **2026-11-15** — **UI evolution pass** (user): crossed-wires logo used in-app
+  (masthead/help/icon), real chip buttons instead of underlined text, multi-color
+  cable jackets (family-safe palettes), then **all-dark chrome** ("the whole
+  background dark, not white"), matrix as a main-stage view instead of a window,
+  assistant as a toggleable wide bottom panel, watermark removed. Spec overrides:
+  docs/design-reference-analysis.md §0.
+- **2026-11-15** — **Evidence + rules** (user): AGENTS.md requires screenshot
+  proof for every visual change, and every fixed error becomes a written rule
+  so it is never repeated.
+- **2026-11-15** — **Orchestrator mode** (user): the lead briefs/delegates/reviews/
+  verifies; implementation runs in Claude subagents (pstack model sheet at
+  ~/.config/t3-pstack/models.md), not in the lead's own edits.
+- **2026-11-15** — **Production DAW direction** (user): start/stop must be a
+  property of each rack instrument that supports it (metronome, audio
+  playback) — per-node transport, not only a global one. The big "flip rack ·
+  Tab" pill is removed (Tab lives in the help overlay); the help overlay gets
+  a redesign; the masthead logo must be dezent (≤16px, left of the wordmark).
+- **2026-11-15** — **Split is a keyboard property** (user): the "Split @ C4"
+  chip leaves the top strip; split becomes a property of the Keys (MIDI
+  keyboard) unit, and a split keyboard exposes TWO MIDI outs (low/high zones)
+  that are wired to rigs like any other ports — explicit graph routing
+  replaces the global auto-split.
+- **2026-11-15** — **Tempo belongs to the metronome** (user): the Transport
+  menu/window is removed; BPM is set on the metronome unit's face (drag +
+  steppers). Space/masthead stay as master transport; set_bpm tools stay.
+- **2026-11-15** — **One Keyboard source** (user): on-screen keys and laptop
+  keys are the same source ("the keyboard") — merged in the matrix, rig
+  source toggles (K/H), routing and sessions; no separate Laptop row.
+- **2026-11-15** — **Rigs are added/deleted in the app** (user): "+ Rig" in the
+  always-visible RIGS strip builds a playable Keys→Surge→Master rig (voice pool
+  of 4 Surge instances, idle voices not rendered); each rig chip has × with a
+  "Delete rig?" confirmation. Surviving rigs keep patch, knobs, synth state,
+  device binding and mix (split_rigs → edit → merge_rigs → one LoadRigs).
+- **2026-11-15** — **Mixer is its own view** (user: "volume of the rigs at the
+  top doesn't make sense"): vol/pan/M/S left the strip; the Mixer stage
+  (chip / F10) shows every source → its rig bus → Master out as channel strips.
+- **2026-11-15** — **The agent operates globally** (user): get_rigs / add_rig /
+  delete_rig (confirm) / select_rig, add_node takes rig=N — in-app agent and MCP.
+- **2026-11-15** — **No squished racks** (user): the assistant panel only takes
+  the height the rack can spare; big patches keep readable units and pan
+  (wheel / trackpad) inside a clipped view with hairline pan indicators.
 
 ## 1. Goal
 
@@ -502,6 +546,57 @@ Everything queued lives here; update this section as work lands.
 
 ### Recently landed
 
+- **Per-instrument transport + cleanup round** (2026-11-15, Opus 5.5 delegates,
+  157 tests + session/metro/multi-rig/rig-mix self-tests OK): metronome nodes
+  get a face Play/Stop chip + beat LED, per-node clock in the engine, global
+  transport = master fan-out, Node.playing persisted, assistant/MCP
+  set_node_playing parity (23 MCP tools). Flip pill REMOVED (Tab flips, help
+  documents it); help overlay redesigned (two columns, key chips, brand mark);
+  matrix typography fixed (18px header, no-wrap columns); ON-chip cream
+  softened (CHIP_ON #E6E4DC). Lead fixes: assistant remove_node parity (the
+  agent could not delete the duplicate metronome — MCP already had it),
+  Stack A/B labels in single-rig mode + clearer one-rig hint + matrix header
+  no false "rig A". Screenshot-verified: help/matrix/front/back (ksalat-clean2).
+  In flight: audio-chain viz + key-LED snap + label shrink-to-fit + no-flash
+  on agent edits (Brief C). Queued: split-as-keyboard-property with two MIDI
+  outs (D), rig overview bar with mini layouts + cycling numbers (E).
+- **Cable re-plug + rig-switch fixes** (2026-11-15, Opus 5.5 delegate, 142
+  tests): dropping a held plug on a compatible jack MOVES it (release_plug/
+  replug_cable, Disconnect→Connect via publish_patch); Drag/Hit hold cable
+  ids (rule 10); Shift+drag fans out; refusals surfaced. Rig keys 1–9/←→ were
+  killed by focused vol/pan DragValues (egui_wants_keyboard_input gate) —
+  fields now drag_only, gate = text_edit_focused (rule 12), one-rig hint.
+  **Live XTEST proof**: plug dragged Delay A IN → Delay B IN, moved and stuck
+  (before/after screenshots). Crafted logo landed: MarkStyle Brand/Mono,
+  woven crossing + plug hardware ≥32px, dezent 16px Mono masthead mark,
+  SVG/painter geometry-parity test, transparent icon corners. Rules 12–13.
+- **UI evolution pass — dark chrome, logo, buttons, cable salad** (2026-11-15,
+  user-directed; orchestrator mode: lead briefs/reviews, Claude subagents
+  implement): **all-dark chrome** (user pivot: "the whole background dark, not
+  white" — theme token values flipped, rack one surface step above the window
+  base); **crossed-wires brand mark** (theme::crossed_wires + assets/logo.svg,
+  masthead/help card/window icon, transparent-corner RGBA); **real chip
+  buttons** replace all underlined-text toggles/nav/selectors (ON = cream +
+  dark text, explicit per-state RichText colors — override_text_color gotcha);
+  **family-safe cable palettes** (audio warm: cream/amber/rose/sage · MIDI
+  cool: blue/cyan/violet, rig-relative id key, warming shift only on cream);
+  assistant **get_graph** tool (parity gap: it could not inspect → could not
+  wire). AGENTS.md: screenshot-evidence requirement + "every fixed error
+  becomes a rule" (10 rules). Spec overrides: docs/design-reference-analysis.md
+  §0. Verified: 125 tests + screenshots (front/back/help/playing/transport).
+  **Batch 2 landed & verified** (Opus 5.5 implementer, 127 tests): inline
+  matrix main-stage view (F11/Tab/Esc guards, rule editor inline), assistant
+  as toggleable wide bottom panel (F12, hidden by default), watermark removed,
+  chip/box padding + global install_spacing. Screenshot-proven in the running
+  app. In flight: plug re-plug fix (root cause: release handler never
+  re-plugged; drag state held stale indices) + crafted logo redesign (woven
+  crossing, plug hardware — user: "quite lazy, needs to be better"; steered:
+  dezent ≤16px masthead variant). DeepSeek-vision verdict on batch 2: 6/10 —
+  findings routed: flip-pill removal + matrix typography + chip softness into
+  the cleanup brief; teal-as-live-semantics defended (documented, keep); rack
+  module spacing logged for a later pass. Queued next round: flip-pill
+  removal + help redesign (brief A), per-instrument transport (brief B,
+  production DAW requirement).
 - **Per-rig mixer + rule publication** (2026-11-15): overview strip now has
   vol/pan/mute/solo per rig (`Command::SetRigMix`, constant-power pan with unity
   center, solo mutes non-solo rigs, applied at each rig's MasterOut; resets on

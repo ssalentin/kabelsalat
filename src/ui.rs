@@ -31,10 +31,10 @@ use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{
-    name_bytes, name_str, Command, CommandBus, DspKind, Graph, Lv2Uri, Node, NodeKind,
-    PortKind as CPortKind, PortRef,
+    name_bytes, name_str, split_port, Command, CommandBus, DspKind, Graph, Lv2Uri, Node, NodeKind,
+    PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
-use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
+use crate::engine::{EdgeLevels, GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 use crate::host::{
     list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
 };
@@ -62,7 +62,7 @@ const PLUG: Color32 = theme::DARK_PANEL_HI;
 const TEXT: Color32 = theme::CREAM;
 const SUBTEXT: Color32 = theme::CREAM_MID;
 const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
-const BLACK: Color32 = theme::INK; // #1C1C1C
+const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fills
 
 /// The reference CLAP instrument (PLAN §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
@@ -70,6 +70,51 @@ const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
+/// Audio cables flow while their smoothed level exceeds this (PLAN §2).
+const AUDIO_PULSE_MIN: f32 = 0.05;
+/// Seconds between traveling pulses on a sounding audio cable.
+const AUDIO_PULSE_EVERY: f32 = 0.25;
+/// Key LED decay τ (s): 1.0 → the 0.02 lit threshold in ≈0.35 s.
+const KEY_LED_TAU: f32 = 0.09;
+/// Unit activity LED decay τ (s).
+const UNIT_LED_TAU: f32 = 0.12;
+
+/// Horizontal space a unit name may not use: 34px left text inset + the
+/// activity LED (+halo) on the same row at the right edge.
+const UNIT_NAME_INSET: f32 = 34.0 + 28.0;
+/// Subtitle sits below the LED row: left inset + 12px right margin.
+const UNIT_SUB_INSET: f32 = 34.0 + 12.0;
+
+/// Shrink-to-fit for one-line unit labels (C4): scale the `natural` px size
+/// down so `text` fits `avail` (floor `floor`); if it still overflows at the
+/// floor, drop trailing characters and append an ellipsis. `measure(text,
+/// size)` returns the laid-out width. Returns (text, size).
+fn fit_label(text: &str, natural: f32, floor: f32, avail: f32, measure: impl Fn(&str, f32) -> f32) -> (String, f32) {
+    let w = measure(text, natural);
+    if !(avail < f32::INFINITY) || w <= avail { return (text.to_string(), natural); }
+    let avail = avail.max(0.0);
+    // Width scales ~linearly with size; step down to absorb hinting error.
+    // Sizes are quantized to 0.5px so window resizes can't grow the font
+    // atlas with a glyph set per fractional size.
+    let mut size = ((natural * avail / w.max(1e-3)) * 2.0).floor() / 2.0;
+    size = size.clamp(floor, natural);
+    while size > floor && measure(text, size) > avail { size = (size - 0.5).max(floor); }
+    if measure(text, size) <= avail { return (text.to_string(), size); }
+    let chars: Vec<char> = text.chars().collect();
+    for n in (0..chars.len()).rev() {
+        let mut t: String = chars[..n].iter().collect::<String>().trim_end().to_string();
+        t.push('…');
+        if measure(&t, size) <= avail { return (t, size); }
+    }
+    ("…".to_string(), size)
+}
+
+/// Engine block peak → visual cable level 0..1 (meter-style dB map:
+/// −48 dBFS → 0, 0 dBFS → 1), so quiet-but-audible signal still breathes.
+fn edge_display_level(peak: f32) -> f32 {
+    if !(peak > 0.0) { return 0.0; }
+    ((20.0 * peak.log10() + 48.0) / 48.0).clamp(0.0, 1.0)
+}
 const MAX_CABLES: usize = 64;
 const FLIP_SECS: f32 = 0.35;
 // Damped spring: omega ≈ 11.4 rad/s (~1.8 Hz), zeta ≈ 0.3 → a few visible
@@ -218,8 +263,21 @@ struct Unit {
     knobs: Vec<Knob>,
     jacks: Vec<Jack>,
     led: f32,
+    /// The node owns a start/stop transport (`NodeKind::supports_transport`:
+    /// metronome today, the file player later) → its face gets a Play/Stop chip.
+    transport: bool,
+    /// Mirror of the engine's `Node::playing` (GraphPub), never a local guess
+    /// while an engine is attached.
+    playing: bool,
+    /// Keys only: mirror of `Node::split`. Some = TWO MIDI OUT jacks (LOW on
+    /// port 0, HIGH on port 1); None = one MIDI OUT. Never a local guess
+    /// while an engine is attached (adopted from GraphPub).
+    split: Option<u8>,
     name_g: Option<Arc<Galley>>,
     sub_g: Option<Arc<theme::TrackedLabel>>,
+    /// Unit width the name/subtitle galleys were fitted to (C4 shrink-to-
+    /// fit); INFINITY = natural size (rects not laid out yet).
+    label_fit_w: f32,
     back_g: Option<Arc<theme::TrackedLabel>>,
 }
 
@@ -243,6 +301,25 @@ impl Unit {
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
     Knob { label, value: default, default, param, label_g: None }
+}
+
+/// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
+/// (port 1) when split (AUM model: a split keyboard is two MIDI sources).
+fn keys_jacks(split: Option<u8>) -> Vec<(Dir, usize, f32, &'static str)> {
+    match split {
+        None => vec![(Dir::Out, 0, 0.62, "MIDI OUT")],
+        Some(_) => vec![(Dir::Out, 0, 0.44, "LOW"), (Dir::Out, 1, 0.80, "HIGH")],
+    }
+}
+
+/// Put a Keys unit's split state + matching jack set in place. Jack label
+/// galleys refill lazily in `ensure_galleys`.
+fn set_unit_split(u: &mut Unit, split: Option<u8>) {
+    if u.split == split && u.jacks.len() == keys_jacks(split).len() { return; }
+    u.split = split;
+    u.jacks = keys_jacks(split).into_iter()
+        .map(|(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None })
+        .collect();
 }
 
 /// Value of the knob bound to `param`, or `default` if the unit has no such knob.
@@ -271,24 +348,23 @@ fn unit_time_mul(u: &Unit) -> f32 {
 }
 
 /// One row of the hot-wire MIDI matrix (PLAN §13): a MIDI source that can
-/// feed any instrument rig. `HwAll` = any hardware device (omni).
+/// feed any instrument rig. `Keys` = the computer keyboard (on-screen clicks
+/// and laptop typing are ONE source); `HwAll` = any hardware device (omni).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MatrixRow { Keys, Laptop, HwAll, HwDev(u32) }
+enum MatrixRow { Keys, HwAll, HwDev(u32) }
 
 impl MatrixRow {
     /// The concrete source a row edits (HwAll is an aggregate — no single rule).
     fn source(self) -> Option<SourceId> {
         match self {
             MatrixRow::Keys => Some(SourceId::Keys),
-            MatrixRow::Laptop => Some(SourceId::LaptopKeys),
             MatrixRow::HwAll => None,
             MatrixRow::HwDev(d) => Some(SourceId::Hardware(d)),
         }
     }
     fn label(self) -> String {
         match self {
-            MatrixRow::Keys => "Keys".into(),
-            MatrixRow::Laptop => "Laptop".into(),
+            MatrixRow::Keys => "Keyboard".into(),
             MatrixRow::HwAll => "HW all".into(),
             MatrixRow::HwDev(d) => format!("HW {d}"),
         }
@@ -345,13 +421,13 @@ fn note_name(n: u8) -> String {
 
 /// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
-fn clap_cell(src: (bool, bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
+/// `src` = the rig's (keyboard, hardware) source pair.
+fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
     if !gate { return false; }
     match row {
         MatrixRow::Keys => src.0,
-        MatrixRow::Laptop => src.1,
-        MatrixRow::HwAll => src.2 && dev.is_none(),
-        MatrixRow::HwDev(d) => src.2 && dev == Some(d),
+        MatrixRow::HwAll => src.1 && dev.is_none(),
+        MatrixRow::HwDev(d) => src.1 && dev == Some(d),
     }
 }
 
@@ -373,38 +449,18 @@ fn sentence_case(s: &str) -> String {
         .join(" ")
 }
 
-/// Plain-text toggle (§4.14): no chip, no box, no dot. On = ink text with a
-/// 2px accent underline (the reference's active-row logic); off = secondary.
+/// Real chip toggle (user request 2026-11-15: buttons, not underlined text).
+/// On = near-black chip + cream text; off = recessed paper chip + hairline.
 fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
-    let txt = egui::RichText::new(name).size(13.0)
-        .color(if on { theme::INK } else { theme::INK_2 });
-    let resp = ui.add(egui::Label::new(txt).sense(egui::Sense::click()));
-    if on {
-        let r = resp.rect;
-        ui.painter().line_segment(
-            [Pos2::new(r.left(), r.bottom() + 1.0), Pos2::new(r.right(), r.bottom() + 1.0)],
-            Stroke::new(2.0, theme::ACCENT),
-        );
-    }
-    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-    resp.clicked()
+    theme::chip_button(ui, name, on).clicked()
 }
 
-/// Nav item (§4.14): plain 13px ink text; active/open = deep-accent text +
-/// 2px accent underline (the reference's active-row logic). No rings/chips.
+/// Nav item as a real button chip (§4.14, updated 2026-11-15): active/open =
+/// near-black fill + cream text; closed = recessed paper chip. No underlines.
+use crate::control::VOICE_POOL;
+
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
-    let color = if active { theme::ACCENT_DEEP } else { theme::INK };
-    let resp = ui.add(egui::Label::new(egui::RichText::new(name).size(13.0).color(color))
-        .sense(egui::Sense::click()));
-    if active {
-        let r = resp.rect;
-        ui.painter().line_segment(
-            [Pos2::new(r.left(), r.bottom() + 1.0), Pos2::new(r.right(), r.bottom() + 1.0)],
-            Stroke::new(2.0, theme::ACCENT),
-        );
-    }
-    if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-    resp.clicked()
+    theme::chip_button(ui, name, active).clicked()
 }
 
 /// 1px hairline vertical rule between nav items (§4.14).
@@ -427,9 +483,9 @@ fn make_unit(node: &Node) -> Unit {
     ) = match &node.kind {
         NodeKind::Keys => (
             UnitKind::Keys, "midi source · click the keys".into(),
-            vec![], vec![PortKind::Midi],
+            vec![], vec![PortKind::Midi, PortKind::Midi],
             vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
-            vec![(Dir::Out, 0, 0.62, "MIDI OUT")],
+            keys_jacks(node.split),
         ),
         NodeKind::Clap { .. } => (
             UnitKind::Clap, "synth · clap".into(),
@@ -499,7 +555,10 @@ fn make_unit(node: &Node) -> Unit {
         knobs,
         jacks: jacks.iter().map(|&(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None }).collect(),
         led: 0.0,
-        name_g: None, sub_g: None, back_g: None,
+        transport: node.kind.supports_transport(),
+        playing: node.playing && node.kind.supports_transport(),
+        split: if matches!(node.kind, NodeKind::Keys) { node.split } else { None },
+        name_g: None, sub_g: None, back_g: None, label_fit_w: f32::INFINITY,
     }
 }
 
@@ -543,6 +602,8 @@ struct Cable {
     level: f32,
     env: f32,
     phase: f32,
+    /// Audio only: countdown to the next level-driven traveling pulse.
+    audio_tick: f32,
 
     age: f32,
     dying: f32, // < 0 alive; else unplug-fall progress (seconds)
@@ -566,7 +627,7 @@ impl Cable {
             pts: [Pos2::ZERO; MAX_SAMPLES], lut: [0.0; MAX_SAMPLES],
             n: 0, total_len: 0.0, curve: [Pos2::ZERO; 4],
             pulses: [dead; MAX_PULSES],
-            level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0,
+            level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
             age: 0.0, dying: -1.0, detach_dst: true, drift: 0.0,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
@@ -607,14 +668,63 @@ struct Pending {
     prev_b: Vec2,
 }
 
+/// Outcome of dropping a held plug on a jack (`replug_cable`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Replug { Moved, Refused, Incompatible }
+
+/// Help card row: key chips (cream Medium 12px) + a caption line.
+struct HelpRow {
+    keys: Vec<Arc<Galley>>,
+    desc: Arc<Galley>,
+}
+
+/// Key chip geometry (AGENTS.md rule 7: ≥ 8px horizontal / ≥ 4px vertical).
+/// Face controls (Keys SPLIT chip + point readout, metronome BPM): 24px
+/// tall keeps ≥ 6px vertical padding around 12px labels (rule 7); widths
+/// leave ≥ 8px horizontal padding around their widest text.
+const FACE_CTL_H: f32 = 24.0;
+const SPLIT_CHIP_W: f32 = 58.0;
+const SPLIT_READOUT_W: f32 = 46.0;
+const BPM_STEP_W: f32 = 22.0;
+const BPM_VALUE_W: f32 = 66.0;
+
+/// Metronome-face BPM control rects (rack-local).
+#[derive(Clone, Copy, Debug)]
+struct BpmRects {
+    minus: Option<Rect>,
+    value: Rect,
+    plus: Option<Rect>,
+}
+
+const HELP_CHIP_PAD: Vec2 = Vec2::new(8.0, 4.0);
+const HELP_CHIP_GAP: f32 = 5.0;
+const HELP_KEY_GAP: f32 = 14.0;
+
+impl HelpRow {
+    fn chip_w(g: &Galley) -> f32 { (g.size().x + 2.0 * HELP_CHIP_PAD.x).max(26.0) }
+    fn keys_width(&self) -> f32 {
+        let w: f32 = self.keys.iter().map(|g| Self::chip_w(g)).sum();
+        w + HELP_CHIP_GAP * self.keys.len().saturating_sub(1) as f32
+    }
+}
+
+/// One help column: tracked section header + rows, widths measured once.
+struct HelpCol {
+    header: Arc<theme::TrackedLabel>,
+    rows: Vec<HelpRow>,
+    keys_w: f32,
+    width: f32,
+}
+
 #[derive(Clone, Copy)]
 enum Hit {
     Play,
-    Flip,
     Knob { unit: usize, idx: usize },
     Key(usize), // semitone
     Jack { unit: usize, jack: usize },
-    Cable(usize, f32), // cable index + grab parameter
+    /// Cable id (not index — `update()` retains dying cables, which shifts
+    /// indices mid-gesture; AGENTS.md rule 10) + grab parameter.
+    Cable(u32, f32),
     Unit(usize),
     Background,
 }
@@ -622,11 +732,17 @@ enum Hit {
 enum Drag {
     None,
     Knob { unit: usize, idx: usize, start_val: f32, press_y: f32 },
-    Plug { ci: usize, end: Dir },
-    Cable { ci: usize, u: f32 },
+    /// Holding a plug: `id` is the cable id, `end` the held end.
+    Plug { id: u32, end: Dir },
+    Cable { id: u32, u: f32 },
     /// Ctrl+drag a rack unit to rearrange it (task-21). `grab` is the pointer's
     /// rack-local offset inside the unit at press, so the box tracks the cursor.
     Unit { unit: usize, grab: Vec2 },
+    /// Dragging a Keys face's split-point readout: `cur` is the point last
+    /// sent, shown while dragging (the engine publication lags a block).
+    Split { unit: usize, start: u8, press: Pos2, cur: u8 },
+    /// Dragging a metronome face's BPM readout (the one global tempo).
+    Bpm { start: f32, press: Pos2 },
 }
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
@@ -692,6 +808,10 @@ struct DemoApp {
     show_sessions: bool,
     session_name: String,
     session_msg: String,
+    /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
+    patch_notice: Option<(String, f32)>,
+    /// Last frame's rig-chip rects in the overview strip (points), per rig.
+    rig_chip_rects: Vec<Rect>,
     // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
     show_plugins: bool,
     plugins_loaded: bool,
@@ -699,7 +819,6 @@ struct DemoApp {
     plugins_lv2: Vec<Lv2PluginInfo>,
     plugin_filter: String,
     plugin_msg: String,
-    show_transport: bool,
     fps: f32,
     stats_timer: f32,
     stats_g: Option<Arc<Galley>>,
@@ -707,6 +826,13 @@ struct DemoApp {
     // Per-frame layout / transform.
     rack_w: f32,
     rack_h: f32,
+    /// Big patches keep readable units and PAN instead of shrinking
+    /// (2026-11-15, user: "racks are squished"): the overflow beyond the
+    /// stage view, the current pan offset, and the rack's clip (Some only
+    /// while overflowing).
+    rack_overflow: Vec2,
+    rack_pan: Vec2,
+    rack_clip: Option<Rect>,
     unit_h: f32,
     unit_rects: Vec<Rect>, // rack-local, indexed by unit
     /// Rack structure derived from the loaded graph (stable while patching).
@@ -728,15 +854,11 @@ struct DemoApp {
     wordmark_g: Option<Arc<theme::TrackedLabel>>,
     state_play_g: Option<Arc<theme::TrackedLabel>>,
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
-    flip_label_g: Option<Arc<Galley>>,
-    /// Flip-pill width, derived from the measured label (§4.13); the rect is
-    /// right-anchored at x=376 and shared by draw_toolbar and hit_test.
-    flip_w: f32,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
     hint_wire_g: Option<Arc<Galley>>,
     help_title_g: Option<Arc<theme::TrackedLabel>>,
-    help_body_g: Option<Arc<Galley>>,
+    help_cols: Vec<HelpCol>,
     help_foot_g: Option<Arc<theme::TrackedLabel>>,
 
     arrivals: [(usize, f32); 32],
@@ -755,8 +877,23 @@ struct DemoApp {
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
     rig_levels: Vec<f32>,
-    /// Hot-wire MIDI matrix window (PLAN §13).
+    /// Hot-wire MIDI matrix — a MAIN-STAGE view, not a window (2026-11-15).
     show_matrix: bool,
+    /// Mixer stage (main-stage view like the matrix): every source → its rig
+    /// bus → Master out. Owns the per-rig vol/pan/mute/solo (2026-11-15, user:
+    /// "volume of the rigs at the top doesn't make sense").
+    show_mixer: bool,
+    /// Last frame's stage rect (rack/matrix/mixer area) and assistant panel
+    /// rect — the hint and the rack must stay inside the stage.
+    stage_rect: Rect,
+    assistant_rect: Rect,
+    /// Last frame's assistant input-row height (+ spacing): the chat history
+    /// gets exactly the rest, so the panel never overflows its rect.
+    assistant_input_h: f32,
+    /// Last frame's rig-bus fader rects in the mixer stage (tests, per rig).
+    mixer_fader_rects: Vec<Rect>,
+    /// Assistant bottom panel (toggleable, hidden by default; 2026-11-15).
+    show_assistant: bool,
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
     /// Motion (design polish): staged fade-in after a template/session load.
@@ -765,7 +902,6 @@ struct DemoApp {
     unit_hover: Vec<f32>,
     /// Toolbar hover easing (~120ms).
     play_hover_t: f32,
-    flip_hover_t: f32,
     /// Matrix rule edits keyed by (source, dest node) — UI mirror of the
     /// engine's rules, drives the editor + cell indicators.
     rule_edits: std::collections::HashMap<(SourceId, u32), RuleEdit>,
@@ -773,15 +909,17 @@ struct DemoApp {
     rule_editor: Option<(usize, MatrixRow)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
+    /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
+    confirm_delete_rig: Option<usize>,
+    /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
+    load_as_rigs: Option<(Vec<crate::control::Rig>, usize)>,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
 
-    /// Per-rig input selection (keys, laptop, hardware) for rigs A=node1, B=node4.
-    rig_sources: [(bool, bool, bool); 2],
-
-    /// Keyboard split at C4 across the two rigs (A=low, B=high).
-    split_on: bool,
+    /// Per-rig input selection (keyboard, hardware) for rigs A=node1, B=node4.
+    /// The keyboard is ONE source: on-screen clicks and laptop typing.
+    rig_sources: [(bool, bool); VOICE_POOL],
 
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
@@ -796,7 +934,7 @@ struct DemoApp {
     /// Connected hardware MIDI device names, indexed by device id.
     hw_devices: Vec<String>,
     /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
-    rig_device: [Option<u32>; 2],
+    rig_device: [Option<u32>; VOICE_POOL],
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -806,6 +944,10 @@ struct DemoApp {
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
+    /// Per-edge audio levels from the engine (lock-free, block rate). Drives
+    /// audio cable breathing + flowing pulses (PLAN §2). None = no engine:
+    /// MIDI arrivals then fake the downstream envelope instead.
+    edge_levels: Option<Arc<EdgeLevels>>,
 
     /// Live patch mirrored for the control bridge (task-16): MCP/CLI queries
     /// read this snapshot. Rebuilt from the living cables whenever they change.
@@ -865,17 +1007,21 @@ impl DemoApp {
             show_sessions: false,
             session_name: String::new(),
             session_msg: String::new(),
+            patch_notice: None,
+            rig_chip_rects: Vec::new(),
             show_plugins: false,
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
             plugin_filter: String::new(),
             plugin_msg: String::new(),
-            show_transport: false,
             fps: 60.0,
             stats_timer: 0.0,
             stats_g: None,
             rack_w: 640.0,
+            rack_overflow: Vec2::ZERO,
+            rack_pan: Vec2::ZERO,
+            rack_clip: None,
             rack_h: 560.0,
             unit_h: 120.0,
             unit_rects: Vec::new(),
@@ -890,13 +1036,11 @@ impl DemoApp {
             wordmark_g: None,
             state_play_g: None,
             state_pause_g: None,
-            flip_label_g: None,
-            flip_w: 150.0,
             hint_front_g: None,
             hint_back_g: None,
             hint_wire_g: None,
             help_title_g: None,
-            help_body_g: None,
+            help_cols: Vec::new(),
             help_foot_g: None,
             arrivals: [(0, 0.0); 32],
             note_sink,
@@ -905,17 +1049,23 @@ impl DemoApp {
             active_rig: 0,
             rig_levels: Vec::new(),
             show_matrix: false,
+            show_mixer: false,
+            stage_rect: Rect::NOTHING,
+            assistant_rect: Rect::NOTHING,
+            assistant_input_h: 56.0,
+            mixer_fader_rects: Vec::new(),
+            show_assistant: false,
             hw_leds: Vec::new(),
             load_fade: 1.0,
             unit_hover: Vec::new(),
             play_hover_t: 0.0,
-            flip_hover_t: 0.0,
             rule_edits: std::collections::HashMap::new(),
             rule_editor: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
+            confirm_delete_rig: None,
+            load_as_rigs: None,
             had_kb_focus: true,
-            rig_sources: [(true, true, true); 2],
-            split_on: false,
+            rig_sources: [(true, true); VOICE_POOL],
             assistant: Assistant::new(),
             key_input: String::new(),
             chat_input: String::new(),
@@ -926,13 +1076,14 @@ impl DemoApp {
             _hw_conns: Vec::new(),
             hw_status: String::new(),
             hw_devices: Vec::new(),
-            rig_device: [None, None],
+            rig_device: [None; VOICE_POOL],
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
             _audio_stream: None,
             bus: None,
             out_level: None,
+            edge_levels: None,
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             graph_pub: None,
@@ -1005,6 +1156,7 @@ impl DemoApp {
         // its nodes/edges into units/cables; ids match so per-frame Connect
         // publishes are engine-side duplicates.
         app.build_rack(&Graph::demo_patch(), &[]);
+        app.begin_load_fade(); // startup rack fades in
         app
     }
 
@@ -1064,13 +1216,21 @@ impl DemoApp {
         self.press = None;
         self.hover = None;
         self.graph_sig.clear(); // force shared-graph re-mirror
-        // Motion: staged fade-in for the new rack.
-        self.load_fade = 0.0;
+        // No load_fade reset here: build_rack also serves sync adoptions
+        // (agent/MCP add_node/connect), which must appear without a flash.
+        // Explicit loads call begin_load_fade().
         self.unit_hover = vec![0.0; self.units.len()];
         // The engine rebuilds its matrix on loads — rule edits start fresh.
         self.rule_edits.clear();
         self.rule_editor = None;
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
+    }
+
+    /// Staged ~0.45s fade-in for an explicitly loaded rack (template,
+    /// session, demo, multi-rig demo, plugin-browser rig). Never for sync
+    /// adoptions — incremental remote edits must not flash the screen.
+    fn begin_load_fade(&mut self) {
+        self.load_fade = 0.0;
     }
 
     /// Derive rack structure FOR THE ACTIVE RIG: Keys (left), Master (right),
@@ -1090,7 +1250,9 @@ impl DemoApp {
         if let Some(m) = self.master_unit { claimed[m] = true; }
         let mut cols: Vec<Vec<usize>> = Vec::new();
         for i in 0..self.units.len() {
-            if !matches!(self.units[i].node_kind, UnitKind::Clap) { continue; }
+            // Skip claimed units: another rig's synth must not open an
+            // (invisible) column in this rig's view.
+            if claimed[i] || !matches!(self.units[i].node_kind, UnitKind::Clap) { continue; }
             let mut col = vec![i];
             claimed[i] = true;
             let mut cur = i;
@@ -1238,12 +1400,27 @@ impl DemoApp {
             Arc::new(ctx.fonts_mut(|f| theme::layout_tracked(f, text, font, tracking_em)))
         };
         // Unit galleys: (re)fill any that are missing — templates rebuild units.
-        for u in &mut self.units {
-            if u.name_g.is_none() {
-                // Name: Medium 15px, sentence case (§4.3). Subtitle + back
-                // label: tracked micro-caps 10px (+0.14em).
-                u.name_g = Some(layout(&sentence_case(&u.name), theme::medium_font(16.0), TEXT, f32::INFINITY));
-                u.sub_g = Some(tracked(&u.sub.to_uppercase(), 10.0, 0.14));
+        // Name + subtitle are shrink-to-fit (C4): refitted whenever the unit
+        // width changes (rack compression), measured under the fonts lock
+        // only — painting happens later in draw_front.
+        for (ui, u) in self.units.iter_mut().enumerate() {
+            let w = self.unit_rects.get(ui).map_or(f32::NAN, |r| r.width());
+            let fit_w = if w.is_finite() && w > 0.0 { w } else { f32::INFINITY };
+            let refit = u.name_g.is_none() || (fit_w - u.label_fit_w).abs() > 0.5;
+            if refit {
+                // Name: Medium 16px, sentence case (§4.3), beside the LED.
+                // Subtitle: tracked micro-caps 10px (+0.14em), below it.
+                let name = sentence_case(&u.name);
+                let (name, size) = fit_label(&name, 16.0, 8.0, fit_w - UNIT_NAME_INSET, |t, sz| {
+                    layout(t, theme::medium_font(sz), TEXT, f32::INFINITY).size().x
+                });
+                u.name_g = Some(layout(&name, theme::medium_font(size), TEXT, f32::INFINITY));
+                let sub = u.sub.to_uppercase();
+                let (sub, size) = fit_label(&sub, 10.0, 8.0, fit_w - UNIT_SUB_INSET, |t, sz| tracked(t, sz, 0.14).size.x);
+                u.sub_g = Some(tracked(&sub, size, 0.14));
+                u.label_fit_w = fit_w;
+            }
+            if u.back_g.is_none() {
                 u.back_g = Some(tracked(&u.name.to_uppercase(), 10.0, 0.14));
             }
             for k in &mut u.knobs {
@@ -1265,87 +1442,68 @@ impl DemoApp {
         })));
         self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
-        // Flip pill (§4.13): Bold 19px = WCAG large text, so ON_ACCENT on the
-        // vivid tomato passes (3.63 ≥ 3.0). Shorten the label if it outgrows
-        // the pill; the pill width follows the measured galley.
-        let mut flip_g = layout("flip rack · Tab", theme::bold_font(19.0), WHITE, f32::INFINITY);
-        if flip_g.size().x > 128.0 {
-            flip_g = layout("flip · Tab", theme::bold_font(19.0), WHITE, f32::INFINITY);
-        }
-        self.flip_w = (flip_g.size().x + 22.0).max(150.0).min(170.0);
-        self.flip_label_g = Some(flip_g);
         // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
             "perform: drag knobs · click the keys · press Tab to flip the rack and patch",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
-            "patch: drag jack to jack · grab a cable to shake it · tug a plug to unplug · Tab flips back",
+            "patch: drag jack to jack · drag a plug to another jack to move it · tug off to unplug · Tab flips back",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_wire_g = Some(layout(
             "now click a highlighted jack to connect · esc or right-click cancels",
             FontId::proportional(12.5), theme::ACCENT_DEEP, f32::INFINITY));
-        // Help card (§4.16): Medium 22px title, 14px body with tight leading
-        // so all 15 rows fit the 560×352 card, tracked micro-caps footer.
+        // Help card (§4.16): Medium 22px title, two columns of key chips +
+        // captions under tracked section labels, tracked micro-caps footer.
         self.help_title_g = Some(Arc::new(ctx.fonts_mut(|f| {
             theme::layout_tracked(f, "kabelsalat — the cables are the show", theme::medium_font(22.0), -0.03)
         })));
-        // Body: 14px cream with tight leading (15 rows fit the 352px card);
-        // key-name columns highlighted in ACCENT_BRIGHT — the reference's
-        // dark-panel "orange highlighted phrases" (§4.16).
-        let body = "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
-             F7 Ambient Pad / F8 demo / F4 multi-rig — each loads a playable rack\n\
-             F9 Plugins · F11 MIDI matrix — browse plugins / hot-wire sources→rigs\n\
-             Space / F10        metronome Play·Stop · Transport window sets BPM\n\
-             Tab                flip the rack · front = perform, back = patch\n\
-             double-click synth open its embedded editor inline · × closes\n\
-             drag knobs         shape the sound · right-click resets\n\
-             click the keys     play Keys — pulses run down the cables\n\
-             laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
-             drag jack to jack  patch a cable (back) · master jacks fan in\n\
-             Ctrl+drag a unit   rearrange the rack — it reflows on release\n\
-             grab a cable       shake it — watch it swing and settle (back)\n\
-             tug a plug         pull it out to unplug (back)\n\
-             click a cable      highlight its whole signal path\n\
-             1–9/←→ rigs · R reset · D stats · ? help · esc cancel";
-        let body_fmt = egui::epaint::text::TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: TEXT,
-            line_height: Some(16.5),
-            ..Default::default()
+        let col = |title: &str, rows: &[(&[&str], &str)]| -> HelpCol {
+            let rows: Vec<HelpRow> = rows.iter().map(|(keys, desc)| HelpRow {
+                keys: keys.iter().map(|k| layout(k, theme::medium_font(12.0), theme::CREAM, f32::INFINITY)).collect(),
+                desc: layout(desc, FontId::proportional(13.5), theme::CREAM_MID, f32::INFINITY),
+            }).collect();
+            let keys_w = rows.iter().map(|r| r.keys_width()).fold(0.0, f32::max);
+            let desc_w = rows.iter().map(|r| r.desc.size().x).fold(0.0, f32::max);
+            HelpCol { header: tracked(&title.to_uppercase(), 10.0, 0.14), rows, keys_w, width: keys_w + HELP_KEY_GAP + desc_w }
         };
-        let mut body_job = egui::epaint::text::LayoutJob::simple(
-            body.to_owned(), FontId::proportional(14.0), TEXT, 504.0);
-        body_job.sections.clear();
-        let mut start = 0usize;
-        for line in body.split_inclusive('\n') {
-            let end = start + line.len();
-            let key_end = line.trim_end_matches('\n').find("  ").map(|p| start + p);
-            match key_end {
-                Some(ke) => {
-                    body_job.sections.push(egui::epaint::text::LayoutSection {
-                        leading_space: 0.0,
-                        byte_range: egui::text::ByteIndex(start)..egui::text::ByteIndex(ke),
-                        format: egui::epaint::text::TextFormat { color: theme::ACCENT_BRIGHT, ..body_fmt.clone() },
-                    });
-                    body_job.sections.push(egui::epaint::text::LayoutSection {
-                        leading_space: 0.0,
-                        byte_range: egui::text::ByteIndex(ke)..egui::text::ByteIndex(end),
-                        format: body_fmt.clone(),
-                    });
-                }
-                None => body_job.sections.push(egui::epaint::text::LayoutSection {
-                    leading_space: 0.0,
-                    byte_range: egui::text::ByteIndex(start)..egui::text::ByteIndex(end),
-                    format: body_fmt.clone(),
-                }),
-            }
-            start = end;
-        }
-        self.help_body_g = Some(ctx.fonts_mut(|f| f.layout_job(body_job)));
+        self.help_cols = vec![
+            col("Play", &[
+                (&["Tab"], "flip the rack · front plays, back patches"),
+                (&["Space"], "master play / stop (every metronome)"),
+                (&["drag"], "the BPM on a metronome to set the tempo"),
+                (&["SPLIT"], "on the keys: LOW / HIGH MIDI outs"),
+                (&["drag"], "a knob to shape the sound"),
+                (&["R"], "reset the knobs"),
+                (&["double-click"], "a synth to open its editor"),
+                (&["1–9", "←", "→"], "switch the rig in view"),
+                (&["F4"], "multi-rig demo"),
+                (&["F5–F8"], "starter templates"),
+            ]),
+            col("Patch & views", &[
+                (&["drag"], "jack to jack to patch a cable"),
+                (&["drag plug"], "onto a jack to move it · tug off to unplug"),
+                (&["Ctrl", "drag"], "a unit to rearrange the rack"),
+                (&["click"], "a cable to select its path"),
+                (&["Del"], "remove the selected cable"),
+                (&["F9"], "plugin browser"),
+                (&["F10"], "mixer view (sources → rig bus → master)"),
+                (&["F11"], "MIDI matrix view"),
+                (&["F12"], "assistant"),
+                (&["D"], "stats"),
+            ]),
+        ];
         self.help_foot_g = Some(tracked("ESC OR ? TO CLOSE", 10.0, 0.14));
     }
 
     // -- layout -----------------------------------------------------------
+
+    /// Stage height the rack needs for unhurried faces: masthead + hint
+    /// overhead (as in `layout`) plus `rows` units at COMFORT_UNIT_H.
+    fn rack_need_h(&self) -> f32 {
+        const COMFORT_UNIT_H: f32 = 150.0;
+        let rows = self.layout_rows.max(1) as f32;
+        210.0 + rows * COMFORT_UNIT_H + (rows - 1.0) * 12.0
+    }
 
     fn layout(&mut self, rect: Rect) {
         self.toolbar_top = rect.top();
@@ -1353,21 +1511,41 @@ impl DemoApp {
         // stack (instrument + its FX chain) | MASTER (right, full height).
         let rows = self.layout_rows.max(1);
         let n_mid = self.stack_cols.len();
-        self.rack_w = (rect.width() - 60.0).clamp(560.0, 1240.0);
-        self.unit_h = ((rect.height() - 210.0) / rows as f32).clamp(84.0, 190.0);
+        // Readable floors: below them the rack grows past the stage and pans
+        // (wheel / trackpad) instead of squishing faces.
+        const MIN_UNIT_H: f32 = 140.0;
+        const MIN_MID_W: f32 = 200.0;
+        const MIN_SIDE_W: f32 = 220.0;
+        // Caps sized for the 1.6x design scale (1600x1000 points): the rack
+        // uses the stage instead of floating small in it.
+        let fit_w = (rect.width() - 60.0).clamp(560.0, 1480.0);
+        self.unit_h = ((rect.height() - 210.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
         let gap = 12.0;
         let pad = 20.0;
         let rail = 14.0;
         self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
-        let inner_w = self.rack_w - 2.0 * (pad + rail);
         let n_cols = n_mid + 2; // keys + stacks + master
-        let usable = inner_w - (n_cols as f32 - 1.0) * gap;
+        let gaps = (n_cols as f32 - 1.0) * gap;
+        let usable_fit = fit_w - 2.0 * (pad + rail) - gaps;
         let side_frac = if n_mid == 0 { 0.5 } else if n_mid <= 2 { 0.26 } else { 0.20 };
         let mid_frac = if n_mid == 0 { 0.0 } else { (1.0 - 2.0 * side_frac) / n_mid as f32 };
+        let (mut side_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
+        if n_mid > 0 && mid_w < MIN_MID_W {
+            mid_w = MIN_MID_W;
+            side_w = side_w.max(MIN_SIDE_W);
+        }
+        // A lone stack must not stretch across half the stage (a one-synth
+        // rig read as a mostly empty face): cap the column, the rack centers.
+        const MAX_MID_W: f32 = 420.0;
+        if n_mid > 0 && mid_w > MAX_MID_W {
+            mid_w = MAX_MID_W;
+            side_w = side_w.min(MAX_MID_W * 1.1);
+        }
+        self.rack_w = 2.0 * (pad + rail) + 2.0 * side_w + n_mid as f32 * mid_w + gaps;
         let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
-        widths.push(usable * side_frac); // keys
-        for _ in 0..n_mid { widths.push(usable * mid_frac); }
-        widths.push(usable * side_frac); // master
+        widths.push(side_w); // keys
+        for _ in 0..n_mid { widths.push(mid_w); }
+        widths.push(side_w); // master
         let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
         let mut x = pad + rail;
         for w in &widths { xs.push(x); x += w + gap; }
@@ -1391,9 +1569,26 @@ impl DemoApp {
                 self.unit_rects[u] = mk(cx, y, cw, self.unit_h);
             }
         }
+        // Stage view for the rack: below the masthead, above the hint line.
+        let view = Rect::from_min_max(
+            Pos2::new(rect.left() + 16.0, rect.top() + 100.0),
+            Pos2::new(rect.right() - 16.0, rect.bottom() - 36.0),
+        );
+        let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
+        if ov != self.rack_overflow {
+            eprintln!("rack layout: stage {:.0}x{:.0} rack {:.0}x{:.0} unit_h {:.0} rows {} → overflow {:.0},{:.0}",
+                rect.width(), rect.height(), self.rack_w, self.rack_h, self.unit_h, rows, ov.x, ov.y);
+        }
+        self.rack_overflow = ov;
+        self.rack_pan = Vec2::new(
+            self.rack_pan.x.clamp(-ov.x / 2.0, ov.x / 2.0),
+            self.rack_pan.y.clamp(-ov.y / 2.0, ov.y / 2.0),
+        );
+        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0).then_some(view.expand(8.0));
         let origin = Pos2::new(
-            rect.center().x - self.rack_w / 2.0,
-            rect.center().y - self.rack_h / 2.0 + 16.0,
+            rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
+            if ov.y > 0.0 { view.center().y - self.rack_h / 2.0 + self.rack_pan.y }
+            else { rect.center().y - self.rack_h / 2.0 + 16.0 },
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -1424,11 +1619,64 @@ impl DemoApp {
 
     // -- graph edits --------------------------------------------------------
 
-    fn add_cable(&mut self, src: usize, src_port: usize, dst: usize, dst_port: usize, kind: PortKind, pattern: u8) {
+    /// Add a user cable with a fresh id. Returns the new id, or `None` when
+    /// the cable was refused (see `cable_refusal`) — callers surface that.
+    fn add_cable(&mut self, src: usize, src_port: usize, dst: usize, dst_port: usize, kind: PortKind, pattern: u8) -> Option<u32> {
+        let _ = pattern; // patterns retired with the demo band
+        if self.cable_refusal(src, src_port, dst, dst_port, None).is_some() { return None; }
         let id = self.next_id;
         self.next_id += 1;
         self.add_cable_id(id, src, src_port, dst, dst_port, kind);
-        let _ = pattern; // patterns retired with the demo band
+        Some(id)
+    }
+
+    /// Why a cable src:sp → dst:dp would be refused, ignoring cable `except`
+    /// (the one being re-plugged). Mirrors `add_cable_id`'s guards.
+    fn cable_refusal(&self, src: usize, src_port: usize, dst: usize, dst_port: usize, except: Option<u32>) -> Option<&'static str> {
+        if src == dst { return Some("can't patch a unit into itself"); }
+        let others = self.cables.iter().filter(|c| Some(c.id) != except).count();
+        if others >= MAX_CABLES { return Some("cable limit reached — unplug one first"); }
+        let dup = self.cables.iter().any(|c| {
+            Some(c.id) != except && c.dying < 0.0
+                && c.src == src && c.src_port == src_port && c.dst == dst && c.dst_port == dst_port
+        });
+        if dup { return Some("those jacks are already patched"); }
+        None
+    }
+
+    fn notify_patch(&mut self, msg: &str) {
+        self.patch_notice = Some((msg.to_owned(), self.ui_time + 2.5));
+    }
+
+    /// Index of the living cable with this id (AGENTS.md rule 10).
+    fn live_cable(&self, id: u32) -> Option<usize> {
+        self.cables.iter().position(|c| c.id == id && c.dying < 0.0)
+    }
+
+    /// Move the held `end` of cable `id` onto jack (`unit`, `port`). The jack
+    /// must match the held end's direction and the cable's kind and give a
+    /// different endpoint pair. The engine sees `Disconnect(old)` now and
+    /// `Connect(new)` on the next patch publish — FIFO bus, order holds.
+    fn replug_cable(&mut self, id: u32, end: Dir, unit: usize, dir: Dir, port: usize) -> Replug {
+        let Some(ci) = self.live_cable(id) else { return Replug::Incompatible };
+        let (src, sp, dst, dp, kind) = {
+            let c = &self.cables[ci];
+            (c.src, c.src_port, c.dst, c.dst_port, c.kind)
+        };
+        if dir != end || self.units[unit].kind(dir, port) != kind { return Replug::Incompatible; }
+        let (ns, nsp, nd, ndp) = if end == Dir::Out { (unit, port, dst, dp) } else { (src, sp, unit, port) };
+        if (ns, nsp, nd, ndp) == (src, sp, dst, dp) { return Replug::Incompatible; }
+        if let Some(why) = self.cable_refusal(ns, nsp, nd, ndp, Some(id)) {
+            self.notify_patch(why);
+            return Replug::Refused;
+        }
+        let was_selected = self.selected == Some(id);
+        self.unplug_cable(ci, end == Dir::In);
+        // A moved plug doesn't fall: drop the old cable outright.
+        self.cables.remove(ci);
+        let new_id = self.add_cable(ns, nsp, nd, ndp, kind, 0);
+        if was_selected { self.selected = new_id; }
+        Replug::Moved
     }
 
     /// Add a cable with an explicit id (demo patch mirrors engine edge ids).
@@ -1438,10 +1686,19 @@ impl DemoApp {
         if self.cables.iter().any(|c| c.dying < 0.0 && c.src == src && c.src_port == src_port && c.dst == dst && c.dst_port == dst_port) {
             return;
         }
-        // Audio is one cream family now (§3); MIDI stays blue.
+        // Cable salad (user request 2026-11-15): warm jackets for audio, cool
+        // for MIDI — family hue semantics survive, shape stays the primary
+        // separator. The key uses RIG-RELATIVE node ids so a patch keeps its
+        // colors across reloads even when other rigs grow (merge_rigs offsets
+        // absolute ids; relative ids within a rig are stable).
+        let rig = self.units[src].rig;
+        let base = self.units.iter().filter(|u| u.rig == rig).map(|u| u.node_id).min().unwrap_or(0);
+        let ls = self.units[src].node_id.saturating_sub(base) as usize;
+        let ld = self.units[dst].node_id.saturating_sub(base) as usize;
+        let key = ls * 7 + ld * 13 + src_port * 3 + dst_port;
         let color = match kind {
-            PortKind::Midi => YELLOW,
-            PortKind::Audio => theme::AUDIO_CREAM,
+            PortKind::Audio => theme::CABLE_AUDIO_PALETTE[key % theme::CABLE_AUDIO_PALETTE.len()],
+            PortKind::Midi => theme::CABLE_MIDI_PALETTE[key % theme::CABLE_MIDI_PALETTE.len()],
         };
         let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, 0, id * 7919 + 13);
         c.next_event = self.time + 0.2 + rng01(&mut c.rng) as f64 * 0.4;
@@ -1480,6 +1737,37 @@ impl DemoApp {
             c.drift = if rng01(&mut c.rng) > 0.5 { 34.0 } else { -34.0 };
             c.v1 += Vec2::new(0.0, -120.0);
             c.v2 += Vec2::new(0.0, -120.0);
+        }
+    }
+
+    /// End a plug drag on cable `id` (held `end`) released at rack-local `l`
+    /// over `hit`. A real drag (≥ 6px) ending on a compatible jack moves the
+    /// plug; otherwise far from its jack (or a plain click) unplugs, and near
+    /// it snaps back.
+    fn release_plug(&mut self, id: u32, end: Dir, l: Vec2, moved: f32, hit: Hit) {
+        let Some(ci) = self.live_cable(id) else { return };
+        let jack = self.endpoint(&self.cables[ci], end);
+        let far = (l - jack).length() > 42.0;
+        if moved >= 6.0 && far && self.side == Side::Back {
+            if let Hit::Jack { unit, jack } = hit {
+                let (dir, port) = { let j = &self.units[unit].jacks[jack]; (j.dir, j.port) };
+                match self.replug_cable(id, end, unit, dir, port) {
+                    Replug::Moved => return,
+                    // A fitting jack that can't take it: keep the cable (snap back).
+                    Replug::Refused => {
+                        let c = &mut self.cables[ci];
+                        if end == Dir::Out { c.over_a = None; } else { c.over_b = None; }
+                        return;
+                    }
+                    Replug::Incompatible => {}
+                }
+            }
+        }
+        if moved < 6.0 || far {
+            self.unplug_cable(ci, end == Dir::In);
+        } else {
+            let c = &mut self.cables[ci];
+            if end == Dir::Out { c.over_a = None; } else { c.over_b = None; }
         }
     }
 
@@ -1523,7 +1811,8 @@ impl DemoApp {
     }
 
     fn handle_laptop_key(&mut self, key: Key, pressed: bool, repeat: bool) {
-        self.current_source = SourceId::LaptopKeys;
+        // Laptop typing and on-screen clicks are one Keyboard source.
+        self.current_source = SourceId::Keys;
         if pressed && !repeat {
             if key == Key::Z {
                 let held: Vec<_> = self.held_keys.drain(..).collect();
@@ -1579,6 +1868,32 @@ impl DemoApp {
             if !e.is_default() { edits.insert((r.source, r.dest), e); }
         }
         self.rule_edits = edits;
+        // Per-instrument transport: adopt the engine's playing flags into the
+        // base graph + unit faces + bridge mirror BEFORE the divergence check,
+        // so a Play/Stop (local chip, MCP, master) never rebuilds the rack.
+        let mut shared = self.shared_graph.lock().ok();
+        for n in g.graph.nodes.iter().filter(|n| n.kind.supports_transport()) {
+            self.base_graph.set_playing(n.id, n.playing);
+            if let Some(sg) = shared.as_mut() { sg.set_playing(n.id, n.playing); }
+            for u in self.units.iter_mut().filter(|u| u.node_id == n.id && u.transport) {
+                u.playing = n.playing;
+            }
+        }
+        // Keys split (a node property): adopt the engine's point the same way
+        // — jacks swap 1 ↔ 2 MIDI outs without a rebuild. A vanished HIGH
+        // jack can't stay referenced by in-flight interaction state.
+        for n in g.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Keys)) {
+            self.base_graph.set_split(n.id, n.split);
+            if let Some(sg) = shared.as_mut() { sg.set_split(n.id, n.split); }
+            for (i, u) in self.units.iter_mut().enumerate() {
+                if u.node_id != n.id || !matches!(u.node_kind, UnitKind::Keys) || u.split == n.split { continue; }
+                set_unit_split(u, n.split);
+                if self.pending.as_ref().map_or(false, |p| p.unit == i) { self.pending = None; }
+                if matches!(self.hover, Some(Hit::Jack { unit, .. }) if unit == i) { self.hover = None; }
+                if matches!(self.press, Some((Hit::Jack { unit, .. }, _)) if unit == i) { self.press = None; }
+            }
+        }
+        drop(shared);
         // Build the UI's current mirror: base nodes + living cables.
         let mut mirror = self.base_graph.clone();
         mirror.edges.clear();
@@ -1607,17 +1922,13 @@ impl DemoApp {
         drop(g);
         self.build_rack(&adopted, &[]);
         // Reset per-rig source filters to the engine's rig bindings.
-        self.rig_sources = [(true, true, true); 2];
-        self.rig_device = [None, None];
-        if let Ok(s) = self.rig_snapshot.lock() {
-            for (i, m) in s.rigs.iter().enumerate().take(2) {
-                if let Some(d) = m.midi_device {
-                    self.rig_sources[i] = (false, false, true);
-                    self.rig_device[i] = Some(d);
-                }
-            }
-        }
-        self.split_on = false;
+        self.rig_sources = [(true, true); VOICE_POOL];
+        self.rig_device = [None; VOICE_POOL];
+        self.adopt_rig_devices();
+        // build_rack resets the view to rig 0 — keep the engine's active rig.
+        let active = self.rig_snapshot.lock().map(|s| s.active).unwrap_or(0);
+        self.active_rig = usize::MAX;
+        self.set_active_rig(active);
         self.editor_open = false;
         self.editor_params.clear();
         self.session_msg = "Patch updated from MCP/CLI".into();
@@ -1702,6 +2013,7 @@ impl DemoApp {
     /// sessions, the demo patch).
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
         self.build_rack(&s.graph, s.params());
+        self.begin_load_fade();
         // Restore plugin state into the remapped voices (rig order).
         let clap_nodes: Vec<u32> = self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
@@ -1719,13 +2031,12 @@ impl DemoApp {
         self.editor_open = false;
         self.editor_params.clear();
         self.editor_status = "editor closed (rack reloaded)".into();
-        // Reset per-rig filters / split for the new graph.
-        self.rig_sources = [(true, true, true); 2];
-        self.rig_device = [None, None];
-        self.split_on = false;
+        // Reset per-rig filters for the new graph (Keys splits travel IN the
+        // graph — Node::split — so LoadGraph restores them).
+        self.rig_sources = [(true, true); VOICE_POOL];
+        self.rig_device = [None; VOICE_POOL];
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
-            let _ = b.send(Command::SetSplit { point: None });
             for u in &self.units {
                 for k in &u.knobs {
                     if let Some(p) = k.param {
@@ -1739,8 +2050,23 @@ impl DemoApp {
 
     /// Send the engine a full graph replacement (voices remap, DSP rebuild).
     fn load_graph_into_engine(&mut self, graph: &Graph) {
+        // A rig add/delete (edit_rigs) loads the same merged graph as rigs;
+        // so does any graph that carries several rig tags (a session saved
+        // from a multi-rig rack) — LoadGraph would drop the engine's rig list.
+        let rigs = self.load_as_rigs.take().or_else(|| {
+            if graph.nodes.iter().all(|n| n.rig == 0) { return None; }
+            let (graphs, _) = crate::control::split_rigs(graph);
+            let rigs: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
+                .map(|(i, g)| crate::control::Rig::new(format!("Rig {}", (b'A' + i.min(25) as u8) as char), g, None))
+                .collect();
+            Some((rigs, 0))
+        });
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::LoadGraph { graph: graph.clone() });
+            let cmd = match rigs {
+                Some((rigs, active)) => Command::LoadRigs { rigs, active },
+                None => Command::LoadGraph { graph: graph.clone() },
+            };
+            let _ = bus.lock().unwrap().send(cmd);
         }
     }
 
@@ -1791,19 +2117,22 @@ impl DemoApp {
             let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
         }
         self.build_rack(&merged, &[]);
+        self.begin_load_fade();
         self.editor_open = false;
         self.editor_params.clear();
-        self.rig_sources = [(true, true, true); 2];
-        self.rig_device = [None, None];
-        self.split_on = false;
-        if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::SetSplit { point: None });
-        }
+        self.rig_sources = [(true, true); VOICE_POOL];
+        self.rig_device = [None; VOICE_POOL];
         self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
     }
 
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
         match name {
+            "get_graph" => match self.shared_graph.lock() {
+                Ok(g) => serde_json::to_value(&*g)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|e| format!("graph serialize: {e}")),
+                Err(_) => "graph lock poisoned".into(),
+            },
             "get_status" => serde_json::json!({
                 "synth": self.surge_status,
                 "midi_in": self.hw_status,
@@ -1816,6 +2145,12 @@ impl DemoApp {
                 "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
                 "xruns": crate::bridge::XRUNS.load(std::sync::atomic::Ordering::Relaxed),
                 "midi_latency_ms": crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+                "layout": {
+                    "stage_h": self.stage_rect.height(), "unit_h": self.unit_h, "rows": self.layout_rows,
+                    "rack_w": self.rack_w, "rack_h": self.rack_h,
+                    "overflow": [self.rack_overflow.x, self.rack_overflow.y],
+                    "assistant_h": if self.show_assistant { self.assistant_rect.height() } else { 0.0 },
+                },
             })
             .to_string(),
             "play_note" => {
@@ -1841,23 +2176,33 @@ impl DemoApp {
             }
             "set_rig_source" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-                let keys = args.get("keys").and_then(|v| v.as_bool()).unwrap_or(true);
-                let laptop = args.get("laptop").and_then(|v| v.as_bool()).unwrap_or(true);
-                let hardware = args.get("hardware").and_then(|v| v.as_bool()).unwrap_or(true);
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keys, laptop, hardware });
-                }
-                format!("rig {node} sources: keys={keys} laptop={laptop} hardware={hardware}")
+                let flag = |k: &str| args.get(k).and_then(|v| v.as_bool());
+                // `keys`/`laptop` are the pre-unification spellings: keyboard = keys || laptop.
+                let keyboard = flag("keyboard").unwrap_or_else(|| match (flag("keys"), flag("laptop")) {
+                    (None, None) => true,
+                    (k, l) => k.unwrap_or(false) || l.unwrap_or(false),
+                });
+                let hardware = flag("hardware").unwrap_or(true);
+                let rig = self.rig_of_node(node);
+                self.rig_sources[rig] = (keyboard, hardware);
+                self.send_rig_source(node);
+                format!("rig {node} sources: keyboard={keyboard} hardware={hardware}")
             }
             "set_split" => {
                 let point = args.get("point").and_then(|v| v.as_u64()).map(|p| p.min(127) as u8);
-                self.split_on = point.is_some();
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetSplit { point });
-                }
+                // Default: the Keys node in view (each rig has its own).
+                let unit = match args.get("node").and_then(|v| v.as_u64()) {
+                    Some(n) => self.units.iter().position(|u| u.node_id == n as u32),
+                    None => self.keys_unit,
+                };
+                let Some(unit) = unit.filter(|&u| matches!(self.units[u].node_kind, UnitKind::Keys)) else {
+                    return "set_split needs a Keys node (get_graph kind Keys) — only keyboards split".into();
+                };
+                let node = self.units[unit].node_id;
+                self.set_keys_split(unit, point);
                 match point {
-                    Some(p) => format!("keyboard split at note {p}: rig A below, rig B at/above"),
-                    None => "split disabled — both rigs play the full keyboard".into(),
+                    Some(p) => format!("keys node {node} split at note {p} ({}): port 0 = LOW (below), port 1 = HIGH (at/above) — wire HIGH with connect from_port 1", note_name(p)),
+                    None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed"),
                 }
             }
             "save_session" => {
@@ -1969,7 +2314,7 @@ impl DemoApp {
                     let gate = self.midi_cable_to(s).is_some();
                     let is_clap = matches!(u.node_kind, UnitKind::Clap);
                     let rig = self.rig_of_unit(s).unwrap_or(0);
-                    let src = self.rig_sources.get(rig).copied().unwrap_or((true, true, true));
+                    let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
                     let dev = self.rig_device.get(rig).copied().flatten();
                     let cell = |row: MatrixRow| if is_clap { clap_cell(src, dev, gate, row) } else { gate };
                     serde_json::json!({
@@ -1977,16 +2322,16 @@ impl DemoApp {
                         "kind": if is_clap { "clap" } else { "lv2" },
                         "midi_cable": gate,
                         "keys": cell(MatrixRow::Keys),
-                        "laptop": cell(MatrixRow::Laptop),
                         "hw_all": cell(MatrixRow::HwAll),
                         "hw_devices": (0..self.hw_devices.len())
                             .map(|d| cell(MatrixRow::HwDev(d as u32))).collect::<Vec<_>>(),
                     })
                 }).collect();
                 serde_json::json!({
-                    "sources": ["keys", "laptop", "hw_all", "hw:<device index>"],
+                    "sources": ["keys", "hw_all", "hw:<device index>"],
+                    "keys": "the computer keyboard: on-screen clicks and laptop typing are one source",
                     "hw_devices": self.hw_devices,
-                    "split": self.split_on,
+                    "split": self.split_report(),
                     "sinks": sinks,
                     "rule_edits": self.rule_edits.iter().map(|((src, node), e)| {
                         serde_json::json!({
@@ -2006,14 +2351,14 @@ impl DemoApp {
                     return format!("no unit with node id {node}");
                 };
                 let row = match source {
-                    "keys" => MatrixRow::Keys,
-                    "laptop" => MatrixRow::Laptop,
+                    // "laptop" is the legacy spelling of the one keyboard row.
+                    "keys" | "keyboard" | "laptop" => MatrixRow::Keys,
                     "hw_all" => MatrixRow::HwAll,
                     s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
                         Ok(d) => MatrixRow::HwDev(d),
                         Err(_) => return format!("bad source '{source}'"),
                     },
-                    _ => return format!("unknown source '{source}' (keys|laptop|hw_all|hw:<d>)"),
+                    _ => return format!("unknown source '{source}' (keys|hw_all|hw:<d>)"),
                 };
                 self.matrix_toggle(inst, row, on);
                 format!("matrix cell {source} → node {node} = {on}")
@@ -2025,13 +2370,12 @@ impl DemoApp {
                     return format!("no unit with node id {node}");
                 }
                 let row = match source {
-                    "keys" => MatrixRow::Keys,
-                    "laptop" => MatrixRow::Laptop,
+                    "keys" | "keyboard" | "laptop" => MatrixRow::Keys,
                     s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
                         Ok(d) => MatrixRow::HwDev(d),
                         Err(_) => return format!("bad source '{source}'"),
                     },
-                    _ => return format!("unknown source '{source}' (keys|laptop|hw:<d>)"),
+                    _ => return format!("unknown source '{source}' (keys|hw:<d>)"),
                 };
                 let Some(src) = row.source() else { return "hw:all has no single rule — use hw:<d>".into() };
                 let mut e = RuleEdit::default();
@@ -2078,17 +2422,24 @@ impl DemoApp {
             "transport_play" => {
                 self.playing = true;
                 self.time = 0.0;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::TransportPlay);
-                }
-                "metronome started".into()
+                self.master_transport(true);
+                "master transport started (every metronome plays)".into()
             }
             "transport_stop" => {
                 self.playing = false;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::TransportStop);
+                self.master_transport(false);
+                "master transport stopped (every metronome stops)".into()
+            }
+            "set_node_playing" => {
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()) else {
+                    return "set_node_playing needs 'node' (id from get_graph)".into();
+                };
+                let playing = args.get("playing").and_then(|v| v.as_bool()).unwrap_or(true);
+                if self.set_node_playing(node as u32, playing) {
+                    format!("node {node} {}", if playing { "playing" } else { "stopped" })
+                } else {
+                    format!("node {node} has no transport (only metronomes start/stop) or does not exist")
                 }
-                "metronome stopped".into()
             }
             "set_bpm" => {
                 let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(96.0).clamp(20.0, 300.0) as f32;
@@ -2129,13 +2480,47 @@ impl DemoApp {
                     "master_out" => Some(NodeKind::MasterOut),
                     _ => None,
                 };
+                // Global: any rig by index; default = the rig in view.
+                let n_rigs = self.rig_count();
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                if rig >= n_rigs {
+                    return format!("no rig {rig}: there are {n_rigs} (0..{}) — add one with add_rig", n_rigs - 1);
+                }
                 match kind {
                     Some(k) => {
-                        if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name }); }
-                        format!("added {kind_str} node (wire it with connect)")
+                        if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 }); }
+                        format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
                     }
                     None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
                 }
+            }
+            "get_rigs" => self.rigs_json().to_string(),
+            "add_rig" => {
+                let n = self.rig_count();
+                if n >= Self::MAX_RIGS { return format!("at most {} rigs", Self::MAX_RIGS); }
+                self.edit_rigs_named(None, args.get("name").and_then(|v| v.as_str()));
+                if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
+                format!("{} — now in view. {}", self.session_msg, self.rigs_json())
+            }
+            "delete_rig" => {
+                let n = self.rig_count();
+                let Some(rig) = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize) else {
+                    return "delete_rig needs rig (index from get_rigs)".into();
+                };
+                if args.get("confirm").and_then(|v| v.as_bool()) != Some(true) {
+                    return format!("not deleted: ask the user first, then call delete_rig with confirm=true (rig {rig} '{}')", self.rig_name(rig));
+                }
+                if n <= 1 { return "not deleted: the last rig cannot be deleted".into(); }
+                if rig >= n { return format!("no rig {rig}: there are {n}"); }
+                self.edit_rigs(Some(rig));
+                format!("{}. {}", self.session_msg, self.rigs_json())
+            }
+            "select_rig" => {
+                let n = self.rig_count();
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if rig >= n { return format!("no rig {rig}: there are {n}"); }
+                self.set_active_rig(rig);
+                format!("showing rig {rig} '{}' (view only — every rig keeps sounding)", self.rig_name(rig))
             }
             "connect" => {
                 let from_node = args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -2155,15 +2540,34 @@ impl DemoApp {
                 if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::Disconnect(id)); }
                 format!("disconnected cable {id}")
             }
+            "remove_node" => {
+                let id = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::RemoveNode(id)); }
+                format!("removed node {id} (and its cables)")
+            }
             _ => format!("unknown tool: {name}"),
         }
     }
 
+    /// Flip one of a rig's two input chips (0 = keyboard, 1 = hardware)
+    /// and publish the (keyboard, hardware) pair.
+    fn toggle_rig_source(&mut self, rig: usize, node: u32, idx: usize) {
+        let Some(s) = self.rig_sources.get_mut(rig) else { return };
+        if idx == 0 { s.0 = !s.0 } else { s.1 = !s.1 }
+        self.send_rig_source(node);
+    }
+
+    /// The Keyboard matrix row's activity LED: on-screen clicks and laptop
+    /// typing both light `key_leds`, so the row LED is their max.
+    fn keyboard_led(&self) -> f32 {
+        self.key_leds.iter().cloned().fold(0.0f32, f32::max)
+    }
+
     fn send_rig_source(&self, node: u32) {
         let rig = self.rig_of_node(node);
-        let (keys, laptop, hardware) = self.rig_sources[rig];
+        let (keyboard, hardware) = self.rig_sources[rig];
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keys, laptop, hardware });
+            let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keyboard, hardware });
         }
     }
 
@@ -2368,11 +2772,10 @@ impl DemoApp {
             let d = &mut self.rig_device[rig];
             match row {
                 MatrixRow::Keys => s.0 = on,
-                MatrixRow::Laptop => s.1 = on,
-                MatrixRow::HwAll => { s.2 = on; if on { *d = None; } }
+                MatrixRow::HwAll => { s.1 = on; if on { *d = None; } }
                 MatrixRow::HwDev(dev) => {
-                    if on { s.2 = true; *d = Some(dev); }
-                    else if *d == Some(dev) { s.2 = false; }
+                    if on { s.1 = true; *d = Some(dev); }
+                    else if *d == Some(dev) { s.1 = false; }
                 }
             }
         }
@@ -2385,187 +2788,187 @@ impl DemoApp {
         }
     }
 
-    /// The hot-wire MIDI matrix window: sources × instrument rigs, live.
-    /// Hurricane language: paper sheet, hairline grid, teal = routed.
-    fn matrix_window(&mut self, ctx: &egui::Context) {
-        if !self.show_matrix { return; }
-        let mut open = self.show_matrix;
+    /// Matrix source rows with their header label and activity LED: ONE
+    /// Keyboard row (on-screen clicks + laptop typing), hardware omni, then
+    /// one row per detected device.
+    fn matrix_rows(&self) -> Vec<(MatrixRow, String, f32)> {
+        let mut rows: Vec<(MatrixRow, String, f32)> = vec![
+            (MatrixRow::Keys, "Keyboard".into(), self.keyboard_led()),
+            (MatrixRow::HwAll, "Hardware: all".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
+        ];
+        for (d, name) in self.hw_devices.iter().enumerate() {
+            rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
+                self.hw_leds.get(d).copied().unwrap_or(0.0)));
+        }
+        rows
+    }
+
+    /// The hot-wire MIDI matrix grid: sources × instrument rigs, live.
+    /// Hurricane language: hairline cells, teal = routed. Rendered inline in
+    /// the main stage (one-window rule) — click toggles a route, right-click
+    /// opens the inline rule editor.
+    fn matrix_grid_ui(&mut self, ui: &mut egui::Ui) {
         let sinks = self.matrix_sinks();
+        if sinks.is_empty() {
+            ui.label(egui::RichText::new("no instruments in the patch — add a rig first").size(12.0).color(theme::INK_2));
+            return;
+        }
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
         let mut edit_requests: Vec<(usize, MatrixRow)> = Vec::new();
-        egui::Window::new(egui::RichText::new("MIDI matrix").font(theme::medium_font(16.0)).color(theme::INK))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(620.0)
-            .show(ctx, |ui| {
-                ui.set_min_width(560.0);
-                ui.label(egui::RichText::new("any source → any rig · click: route · right-click: shape the rule (channel, transpose, ranges)")
-                    .size(12.0).color(theme::INK_2));
-                ui.add_space(6.0);
-                if sinks.is_empty() {
-                    ui.label(egui::RichText::new("no instruments in the patch — add a rig first").size(12.0).color(theme::INK_2));
-                    return;
-                }
-                let mut rows: Vec<(MatrixRow, String, f32)> = vec![
-                    (MatrixRow::Keys, "On-screen keys".into(), self.key_leds.iter().cloned().fold(0.0f32, f32::max)),
-                    (MatrixRow::Laptop, "Laptop keys".into(), self.key_leds.iter().cloned().fold(0.0f32, f32::max)),
-                    (MatrixRow::HwAll, "Hardware: all".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
-                ];
-                for (d, name) in self.hw_devices.iter().enumerate() {
-                    rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
-                        self.hw_leds.get(d).copied().unwrap_or(0.0)));
-                }
-                egui::Grid::new("midi_matrix_grid").num_columns(sinks.len() + 1).spacing([10.0, 6.0]).show(ui, |ui| {
-                    // Header: sink names + rig tags + cable state.
-                    theme::section_label(ui, "Source");
-                    for &s in &sinks {
-                        let u = &self.units[s];
-                        let gate = self.midi_cable_to(s).is_some();
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(sentence_case(&u.name)).font(theme::medium_font(13.0)).color(theme::INK));
-                            ui.label(egui::RichText::new(format!("rig {} · midi {}", (b'A' + u.rig.min(25)) as char, if gate { "in ✓" } else { "unplugged" }))
-                                .size(10.0).color(if gate { theme::LIVE_TEAL_DEEP } else { theme::INK_2 }));
-                        });
-                    }
-                    ui.end_row();
-                    for (row, label, led) in &rows {
-                        // Row header with activity dot.
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                            ui.painter().circle_filled(r.center(), 3.0,
-                                theme::alpha(theme::LIVE_TEAL, 0.25 + 0.75 * led.clamp(0.0, 1.0)));
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
-                        });
-                        for &s in &sinks {
-                            let u = &self.units[s];
-                            let is_clap = matches!(u.node_kind, UnitKind::Clap);
-                            let gate = self.midi_cable_to(s).is_some();
-                            let on = if is_clap {
-                                let rig = self.rig_of_unit(s).unwrap_or(0);
-                                let src = self.rig_sources.get(rig).copied().unwrap_or((true, true, true));
-                                let dev = self.rig_device.get(rig).copied().flatten();
-                                clap_cell(src, dev, gate, *row)
-                            } else {
-                                gate // LV2: the cable is the route (all sources)
-                            };
-                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 22.0), egui::Sense::click());
-                            let p = ui.painter();
-                            let cell = rect.shrink(3.0);
-                            if on {
-                                p.rect_filled(cell, 2.0, theme::LIVE_TEAL);
-                            } else {
-                                p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                            }
-                            // Non-default rule: tomato corner dot + summary.
-                            let node = self.units[s].node_id;
-                            let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
-                            let resp = if let Some(e) = edit.filter(|e| !e.is_default()) {
-                                p.circle_filled(Pos2::new(cell.right() - 2.0, cell.top() + 2.0), 2.0, theme::ACCENT);
-                                resp.on_hover_text(format!("rule: {}\nright-click to edit", e.summary()))
-                            } else if row.source().is_some() {
-                                resp.on_hover_text("click: route on/off · right-click: edit rule")
-                            } else {
-                                resp
-                            };
-                            if resp.hovered() {
-                                p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
-                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                            }
-                            if resp.clicked() { toggles.push((s, *row, !on)); }
-                            if resp.secondary_clicked() && row.source().is_some() {
-                                edit_requests.push((s, *row));
-                            }
-                        }
-                        ui.end_row();
-                    }
+        let rows = self.matrix_rows();
+        // Header cells never wrap ("Surge A" split across lines): Extend
+        // labels + a min column width keep names and status on fixed rows.
+        let no_wrap = |ui: &mut egui::Ui, text: egui::RichText| {
+            ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
+        };
+        egui::Grid::new("midi_matrix_grid").num_columns(sinks.len() + 1).spacing([14.0, 6.0])
+            .min_col_width(90.0).show(ui, |ui| {
+            // Header: sink names + rig tags + cable state.
+            theme::section_label(ui, "Source");
+            for &s in &sinks {
+                let u = &self.units[s];
+                let gate = self.midi_cable_to(s).is_some();
+                ui.vertical(|ui| {
+                    ui.set_min_width(90.0);
+                    no_wrap(ui, egui::RichText::new(sentence_case(&u.name)).font(theme::medium_font(13.0)).color(theme::INK));
+                    // Single-graph mode: all nodes share rig 0 — don't label
+                    // every column "rig A" (user report 2026-11-15).
+                    let rig_txt = if self.rig_count() > 1 { format!("rig {} · ", (b'A' + u.rig.min(25)) as char) } else { String::new() };
+                    no_wrap(ui, egui::RichText::new(format!("{rig_txt}midi {}", if gate { "in ✓" } else { "unplugged" }))
+                        .size(10.0).color(if gate { theme::LIVE_TEAL } else { theme::INK_2 }));
                 });
-                ui.add_space(6.0);
-                let split_txt = if self.split_on {
-                    "Split @ C4 active — low zone → first rig, high zone → second (toggle in the top strip)"
-                } else {
-                    "Full keyboard to every routed rig · split toggle in the top strip"
-                };
-                ui.label(egui::RichText::new(split_txt).size(11.0).color(theme::INK_2));
-                if !self.hw_devices.is_empty() {
-                    ui.label(egui::RichText::new("Hardware rows are a radio group per rig: one device, all devices, or off.")
-                        .size(11.0).color(theme::INK_2));
+            }
+            ui.end_row();
+            for (row, label, led) in &rows {
+                // Row header with activity dot.
+                ui.horizontal(|ui| {
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                    ui.painter().circle_filled(r.center(), 3.0,
+                        theme::alpha(theme::LIVE_TEAL, 0.25 + 0.75 * led.clamp(0.0, 1.0)));
+                    ui.add_space(4.0);
+                    no_wrap(ui, egui::RichText::new(label).size(12.0).color(theme::INK));
+                });
+                for &s in &sinks {
+                    let u = &self.units[s];
+                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
+                    let gate = self.midi_cable_to(s).is_some();
+                    let on = if is_clap {
+                        let rig = self.rig_of_unit(s).unwrap_or(0);
+                        let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
+                        let dev = self.rig_device.get(rig).copied().flatten();
+                        clap_cell(src, dev, gate, *row)
+                    } else {
+                        gate // LV2: the cable is the route (all sources)
+                    };
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 22.0), egui::Sense::click());
+                    let p = ui.painter();
+                    let cell = rect.shrink(3.0);
+                    if on {
+                        p.rect_filled(cell, 2.0, theme::LIVE_TEAL);
+                    } else {
+                        p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                    }
+                    // Non-default rule: tomato corner dot + summary.
+                    let node = self.units[s].node_id;
+                    let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
+                    let resp = if let Some(e) = edit.filter(|e| !e.is_default()) {
+                        p.circle_filled(Pos2::new(cell.right() - 2.0, cell.top() + 2.0), 2.0, theme::ACCENT);
+                        resp.on_hover_text(format!("rule: {}\nright-click to edit", e.summary()))
+                    } else if row.source().is_some() {
+                        resp.on_hover_text("click: route on/off · right-click: edit rule")
+                    } else {
+                        resp
+                    };
+                    if resp.hovered() {
+                        p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() { toggles.push((s, *row, !on)); }
+                    if resp.secondary_clicked() && row.source().is_some() {
+                        edit_requests.push((s, *row));
+                    }
                 }
-            });
-        self.show_matrix = open;
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(self.split_footer()).size(11.0).color(theme::INK_2));
+        if !self.hw_devices.is_empty() {
+            ui.label(egui::RichText::new("Hardware rows are a radio group per rig: one device, all devices, or off.")
+                .size(11.0).color(theme::INK_2));
+        }
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
     }
 
-    /// Per-cell rule editor (right-click a matrix cell): channel filter,
-    /// transpose, key/velocity ranges, enabled — sent live as MatrixRule.
-    fn rule_editor_window(&mut self, ctx: &egui::Context) {
+    /// Per-cell rule editor (right-click a matrix cell), inline beside the
+    /// grid: channel filter, transpose, key/velocity ranges, enabled — sent
+    /// live as MatrixRule (the engine releases held notes on change).
+    fn rule_editor_ui(&mut self, ui: &mut egui::Ui) {
         let Some((unit, row)) = self.rule_editor else { return };
         let Some(src) = row.source() else { self.rule_editor = None; return };
         let Some(u) = self.units.get(unit) else { self.rule_editor = None; return };
         let node = u.node_id;
         let title = format!("{} → {}", row.label(), sentence_case(&u.name));
         let mut edit = self.rule_edits.get(&(src, node)).copied().unwrap_or_default();
-        let mut open = true;
+        let mut close = false;
         let mut changed = false;
         let mut reset = false;
-        egui::Window::new(egui::RichText::new(title).font(theme::medium_font(15.0)).color(theme::INK))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(300.0)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new("shapes this route live · releases held notes on change")
-                    .size(11.0).color(theme::INK_2));
-                ui.add_space(4.0);
-                let mut en = edit.enabled;
-                if ui.checkbox(&mut en, "Route enabled").changed() { edit.enabled = en; changed = true; }
-                let mut omni = edit.channel.is_none();
-                if ui.checkbox(&mut omni, "Omni (any MIDI channel)").changed() {
-                    edit.channel = if omni { None } else { Some(0) };
+        ui.label(egui::RichText::new(title).font(theme::medium_font(15.0)).color(theme::INK));
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("shapes this route live · releases held notes on change")
+            .size(11.0).color(theme::INK_2));
+        ui.add_space(4.0);
+        let mut en = edit.enabled;
+        if ui.checkbox(&mut en, "Route enabled").changed() { edit.enabled = en; changed = true; }
+        let mut omni = edit.channel.is_none();
+        if ui.checkbox(&mut omni, "Omni (any MIDI channel)").changed() {
+            edit.channel = if omni { None } else { Some(0) };
+            changed = true;
+        }
+        if let Some(ch) = edit.channel {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Channel").size(12.0));
+                let mut c = ch as i32 + 1;
+                if ui.add(egui::DragValue::new(&mut c).range(1..=16)).changed() {
+                    edit.channel = Some((c - 1).clamp(0, 15) as u8);
                     changed = true;
                 }
-                if let Some(ch) = edit.channel {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Channel").size(12.0));
-                        let mut c = ch as i32 + 1;
-                        if ui.add(egui::DragValue::new(&mut c).range(1..=16)).changed() {
-                            edit.channel = Some((c - 1).clamp(0, 15) as u8);
-                            changed = true;
-                        }
-                    });
-                }
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Transpose").size(12.0));
-                    let mut t = edit.transpose as i32;
-                    if ui.add(egui::DragValue::new(&mut t).range(-24..=24).suffix(" st")).changed() {
-                        edit.transpose = t.clamp(-24, 24) as i8;
-                        changed = true;
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Key range").size(12.0));
-                    let mut lo = edit.key_lo as i32;
-                    let mut hi = edit.key_hi as i32;
-                    if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.key_lo = lo as u8; changed = true; }
-                    ui.label(egui::RichText::new("–").size(12.0));
-                    if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.key_hi = hi as u8; changed = true; }
-                    ui.label(egui::RichText::new(format!("{} – {}", note_name(edit.key_lo), note_name(edit.key_hi)))
-                        .size(11.0).color(theme::INK_2));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Velocity").size(12.0));
-                    let mut lo = edit.vel_lo as i32;
-                    let mut hi = edit.vel_hi as i32;
-                    if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.vel_lo = lo as u8; changed = true; }
-                    ui.label(egui::RichText::new("–").size(12.0));
-                    if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.vel_hi = hi as u8; changed = true; }
-                });
-                ui.add_space(4.0);
-                if ui.button("Reset rule").clicked() { reset = true; }
             });
-        if !open { self.rule_editor = None; }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Transpose").size(12.0));
+            let mut t = edit.transpose as i32;
+            if ui.add(egui::DragValue::new(&mut t).range(-24..=24).suffix(" st")).changed() {
+                edit.transpose = t.clamp(-24, 24) as i8;
+                changed = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Key range").size(12.0));
+            let mut lo = edit.key_lo as i32;
+            let mut hi = edit.key_hi as i32;
+            if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.key_lo = lo as u8; changed = true; }
+            ui.label(egui::RichText::new("–").size(12.0));
+            if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.key_hi = hi as u8; changed = true; }
+            ui.label(egui::RichText::new(format!("{} – {}", note_name(edit.key_lo), note_name(edit.key_hi)))
+                .size(11.0).color(theme::INK_2));
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Velocity").size(12.0));
+            let mut lo = edit.vel_lo as i32;
+            let mut hi = edit.vel_hi as i32;
+            if ui.add(egui::DragValue::new(&mut lo).range(0..=127)).changed() { edit.vel_lo = lo as u8; changed = true; }
+            ui.label(egui::RichText::new("–").size(12.0));
+            if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.vel_hi = hi as u8; changed = true; }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if theme::chip_button(ui, "Reset rule", false).clicked() { reset = true; }
+            ui.add_space(6.0);
+            if theme::chip_button(ui, "Close", false).on_hover_text("close the rule editor (Esc)").clicked() { close = true; }
+        });
+        if close { self.rule_editor = None; }
         if reset { edit = RuleEdit::default(); changed = true; }
         if changed {
             if edit.is_default() { self.rule_edits.remove(&(src, node)); }
@@ -2587,14 +2990,180 @@ impl DemoApp {
         }
     }
 
+    /// Mirror the rig snapshot's device bindings into the per-synth source
+    /// filters: every synth voice of a device-bound rig takes only that
+    /// device (H on, K off). Indexes by VOICE slot, not rig index.
+    fn adopt_rig_devices(&mut self) {
+        let devs: Vec<Option<u32>> = self.rig_snapshot.lock()
+            .map(|s| s.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
+        for (slot, node) in self.clap_rigs() {
+            let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
+            if let Some(Some(d)) = devs.get(rig) {
+                self.rig_sources[slot] = (false, true);
+                self.rig_device[slot] = Some(*d);
+            }
+        }
+    }
+
+    /// Every rig for the agent: index, name, device, units (node ids), mix.
+    fn rigs_json(&self) -> serde_json::Value {
+        let rigs: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| {
+            let m = self.rig_mix[r.min(7)];
+            let units: Vec<serde_json::Value> = self.units.iter().filter(|u| u.rig as usize == r)
+                .map(|u| serde_json::json!({"node": u.node_id, "name": u.name})).collect();
+            serde_json::json!({
+                "rig": r, "name": self.rig_name(r), "device": self.rig_device_label(r),
+                "units": units, "vol": m.vol, "pan": m.pan, "mute": m.mute, "solo": m.solo,
+            })
+        }).collect();
+        serde_json::json!({"rigs": rigs, "active": self.active_rig, "max_rigs": Self::MAX_RIGS})
+    }
+
+    /// Most rigs the UI manages (the per-rig mixer mirror is `[RigMix; 8]`).
+    const MAX_RIGS: usize = 8;
+
+    /// A fresh rig's patch: Keys→Surge→Master (stereo) while a pooled synth
+    /// voice is free (VOICE_POOL), else Keys→Master — a skeleton the user
+    /// fills from the Plugins browser.
+    fn new_rig_graph(&self) -> Graph {
+        let claps = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count();
+        let voices = if self._surge_main.is_empty() { VOICE_POOL } else { self._surge_main.len() };
+        crate::control::standard_rig_graph(claps < voices)
+    }
+
+    /// Add a rig (`None`) or delete rig `Some(r)`, keeping every surviving
+    /// rig's patch, knob values, synth state, device binding and mixer.
+    /// The live patch is split per rig (rig-relative ids, rule 4), edited,
+    /// re-merged and sent to the engine as ONE LoadRigs.
+    fn edit_rigs(&mut self, delete: Option<usize>) { self.edit_rigs_named(delete, None); }
+
+    /// `edit_rigs` with an explicit name for an added rig (agent `add_rig`).
+    fn edit_rigs_named(&mut self, delete: Option<usize>, add_name: Option<&str>) {
+        let n = self.rig_count();
+        match delete {
+            None if n >= Self::MAX_RIGS => {
+                self.session_msg = format!("At most {} rigs", Self::MAX_RIGS);
+                return;
+            }
+            Some(r) if r >= n || n <= 1 => return,
+            _ => {}
+        }
+        let s = match self.capture_session("Rigs") {
+            Ok(s) => s,
+            Err(e) => { self.session_msg = format!("Rig edit failed: {e}"); return; }
+        };
+        let (graphs, old_bases) = crate::control::split_rigs(&s.graph);
+        let devices: Vec<Option<u32>> = {
+            let snap = self.rig_snapshot.lock().ok();
+            (0..graphs.len()).map(|i| snap.as_ref().and_then(|sn| sn.rigs.get(i).and_then(|m| m.midi_device))).collect()
+        };
+        // (old rig index, rig) — None marks the brand-new rig.
+        let mut rigs: Vec<(Option<usize>, crate::control::Rig)> = graphs.into_iter().enumerate()
+            .map(|(i, g)| (Some(i), crate::control::Rig::new(self.rig_name(i), g, devices[i])))
+            .collect();
+        let msg = match delete {
+            Some(r) => {
+                let name = rigs[r].1.name.clone();
+                rigs.remove(r);
+                format!("Deleted {name}")
+            }
+            None => {
+                let used: Vec<String> = rigs.iter().map(|(_, r)| r.name.clone()).collect();
+                let name = add_name.map(|s| s.trim().chars().take(24).collect::<String>()).filter(|s| !s.is_empty())
+                    .or_else(|| (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)))
+                    .unwrap_or_else(|| format!("Rig {}", n + 1));
+                rigs.push((None, crate::control::Rig::new(name.clone(), self.new_rig_graph(), None)));
+                format!("Added {name}")
+            }
+        };
+        let list: Vec<crate::control::Rig> = rigs.iter().map(|(_, r)| r.clone()).collect();
+        let new_bases = crate::control::rig_bases(&list);
+        let merged = crate::control::merge_rigs(&list);
+        // Old absolute node id → new absolute id (None: the node's rig is gone).
+        let remap = |old: u32| -> Option<u32> {
+            let o = s.graph.node(old)?.rig as usize;
+            let i = rigs.iter().position(|(k, _)| *k == Some(o))?;
+            Some(new_bases[i] + (old - old_bases[o]))
+        };
+        let mut ns = crate::session::Session::new(s.name.clone(), merged);
+        for p in s.params() {
+            if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
+        }
+        for st in s.plugin_states() {
+            if let Some(nid) = remap(st.node) { ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone()); }
+        }
+        // Mixer follows its rig; the new rig starts at unity (applied after
+        // the reload — build_rack resets the mixer).
+        let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        for (i, (k, _)) in rigs.iter().enumerate() {
+            mix[i] = k.map_or(crate::engine::RigMix::DEFAULT, |o| self.rig_mix[o.min(7)]);
+        }
+        let active = match delete {
+            None => rigs.len() - 1,
+            Some(r) if self.active_rig > r => self.active_rig - 1,
+            Some(_) => self.active_rig.min(rigs.len() - 1),
+        };
+        self.load_as_rigs = Some((list.clone(), active));
+        if let Err(e) = self.apply_session(&ns) {
+            self.session_msg = format!("Rig edit failed: {e}");
+            return;
+        }
+        // The engine republishes this on LoadRigs; mirror it now so names and
+        // devices are right on the very next frame (and without an engine).
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            snap.rigs = list.iter().map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+            snap.active = active;
+        }
+        self.adopt_rig_devices();
+        self.rig_mix = mix;
+        self.active_rig = usize::MAX; // force set_active_rig to regroup
+        self.set_active_rig(active);
+        for i in 0..list.len() { self.send_rig_mix(i); }
+        self.session_msg = msg;
+        self.editor_status.clear(); // not "rack reloaded" noise for a rig edit
+    }
+
+    /// "Delete rig?" confirmation (destructive: the rig's units, cables and
+    /// synth state go away). Cancel / Esc keep everything.
+    fn delete_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some(rig) = self.confirm_delete_rig else { return };
+        if rig >= self.rig_count() || self.rig_count() <= 1 { self.confirm_delete_rig = None; return; }
+        let name = self.rig_name(rig);
+        let units = self.units.iter().filter(|u| u.rig as usize == rig).count();
+        let mut decision: Option<bool> = None;
+        let modal = egui::Modal::new(egui::Id::unique("delete_rig_modal")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(egui::RichText::new(format!("Delete {name}?")).size(17.0).strong().color(theme::INK));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(format!(
+                "Its {units} units, their cables and synth settings are removed. The other rigs keep playing."))
+                .size(13.0).color(theme::INK_2));
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Delete rig").clicked() { decision = Some(true); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decision = Some(false); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(false); }
+        match decision {
+            Some(true) => { self.confirm_delete_rig = None; self.edit_rigs(Some(rig)); }
+            Some(false) => self.confirm_delete_rig = None,
+            None => {}
+        }
+    }
+
     /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
     /// when >1 rig is loaded. Per rig: number-key hint, name, bound MIDI device,
-    /// live level; the active rig gets the reference's tomato underline. Click
+    /// live level; the active rig is the filled button chip. Click
     /// or 1–9/←→ switches the BIG VIEW ONLY — every rig keeps sounding.
     fn rig_overview_panel(&mut self, root: &mut egui::Ui) {
+        // Always shown (2026-11-15, user): the strip owns "+ Rig" and the
+        // per-rig delete, so a single-rig rack can grow into several.
         let n = self.rig_count();
-        if n <= 1 { return; }
         let mut switch: Option<usize> = None;
+        let mut add_rig = false;
+        self.rig_chip_rects.clear();
         egui::Panel::top("rig_overview")
             .resizable(false)
             .frame(
@@ -2607,26 +3176,39 @@ impl DemoApp {
                 ui.horizontal(|ui| {
                     theme::section_label(ui, "Rigs");
                     ui.add_space(6.0);
+                    // "+ Rig" sits up front so it never scrolls out of reach.
+                    if n < Self::MAX_RIGS {
+                        let add = theme::chip_button(ui, "+ Rig", false)
+                            .on_hover_text("add a rig: its own keys, synth and master — all rigs sound together");
+                        if add.clicked() { add_rig = true; }
+                        ui.add_space(6.0);
+                    }
+                    nav_separator(ui);
+                    ui.add_space(4.0);
+                    egui::ScrollArea::horizontal().id_salt("rig_strip").show(ui, |ui| { ui.horizontal(|ui| {
                     for rig in 0..n.min(9) {
                         let active = rig == self.active_rig;
                         let name = self.rig_name(rig);
                         let dev = self.rig_device_label(rig);
                         let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
-                        let name_col = if active { theme::INK } else { theme::INK_2 };
-                        let inner = egui::Frame::new()
+                        egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(8, 4))
-                            .show(ui, |ui| {
+                            .show(ui, |ui| { ui.vertical(|ui| {
+                                // Real button chip (2026-11-15): the active rig
+                                // is the filled chip — no underline.
                                 let name_resp = ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new(format!("{}", rig + 1))
-                                        .monospace().size(11.0)
-                                        .color(if active { theme::ACCENT_DEEP } else { theme::INK_2 }));
-                                    ui.add_space(4.0);
-                                    ui.add(egui::Label::new(egui::RichText::new(name).font(theme::medium_font(14.0)).color(name_col))
-                                        .sense(egui::Sense::click()))
-                                }).inner;
-                                if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
-                                if name_resp.clicked() { switch = Some(rig); }
-                                ui.horizontal(|ui| {
+                                    let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), active);
+                                    if n > 1 {
+                                        ui.add_space(2.0);
+                                        let del = egui::Button::new(egui::RichText::new("×").size(13.0).color(theme::INK_2))
+                                            .fill(theme::PAPER_SINK)
+                                            .corner_radius(2.0)
+                                            .min_size(egui::vec2(22.0, 20.0));
+                                        if ui.add(del).on_hover_text(format!("delete {name}…")).clicked() {
+                                            self.confirm_delete_rig = Some(rig);
+                                        }
+                                    }
+                                    ui.add_space(6.0);
                                     theme::tracked_label(ui, &dev, 9.0, 0.14, theme::INK_2);
                                     ui.add_space(6.0);
                                     // Live level: flat teal bar on a hairline track.
@@ -2637,48 +3219,23 @@ impl DemoApp {
                                     if w > 0.5 {
                                         p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
                                     }
-                                });
-                                // Per-rig mixer (AUM feel): vol / pan / mute / solo.
-                                let mut mix_changed = false;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                    let m = &mut self.rig_mix[rig.min(7)];
-                                    ui.label(egui::RichText::new("vol").size(9.0).color(theme::INK_2));
-                                    let mut v = m.vol;
-                                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=1.0).speed(0.01).fixed_decimals(2))
-                                        .on_hover_text("rig volume").changed() { m.vol = v; mix_changed = true; }
-                                    ui.label(egui::RichText::new("pan").size(9.0).color(theme::INK_2));
-                                    let mut p = m.pan;
-                                    if ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2))
-                                        .on_hover_text("rig pan (L −1 … +1 R)").changed() { m.pan = p; mix_changed = true; }
-                                    let mb = egui::Button::new(egui::RichText::new("M").size(10.0)
-                                            .color(if m.mute { theme::PAPER } else { theme::INK_2 }))
-                                        .fill(if m.mute { theme::INK } else { theme::PAPER_SINK })
-                                        .corner_radius(2.0).min_size(egui::vec2(18.0, 16.0));
-                                    if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; mix_changed = true; }
-                                    let sb = egui::Button::new(egui::RichText::new("S").size(10.0)
-                                            .color(if m.solo { theme::INK } else { theme::INK_2 }))
-                                        .fill(if m.solo { theme::LIVE_TEAL } else { theme::PAPER_SINK })
-                                        .corner_radius(2.0).min_size(egui::vec2(18.0, 16.0));
-                                    if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; mix_changed = true; }
-                                });
-                                if mix_changed { self.send_rig_mix(rig); }
-                            });
-                        if active {
-                            let r = inner.response.rect;
-                            ui.painter().line_segment(
-                                [Pos2::new(r.left() + 8.0, r.bottom() + 1.0), Pos2::new(r.right() - 8.0, r.bottom() + 1.0)],
-                                Stroke::new(2.0, theme::ACCENT),
-                            );
-                        }
+                                    chip
+                                }).inner;
+                                if name_resp.clicked() { switch = Some(rig); }
+                                self.rig_chip_rects.push(name_resp.rect);
+                            }); });
                         ui.add_space(4.0);
                     }
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("1–9 / ←→ switch view · all rigs keep sounding")
-                        .size(11.0).color(theme::INK_2));
+                    if n > 1 {
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("1–9 / ←→ switch view · all rigs keep sounding")
+                            .size(11.0).color(theme::INK_2));
+                    }
+                    }); });
                 });
             });
         if let Some(r) = switch { self.set_active_rig(r); }
+        if add_rig { self.edit_rigs(None); }
     }
 
     /// AUM-style per-rig input selection: which sources feed each rig.
@@ -2686,7 +3243,7 @@ impl DemoApp {
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
         let rigs = self.clap_rigs();
         egui::Panel::top("rig_inputs")
-            .default_size(40.0)
+            .default_size(46.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -2699,20 +3256,27 @@ impl DemoApp {
                     theme::section_label(ui, "Rig inputs");
                     ui.add_space(10.0);
                     for (rig, node) in rigs {
-                        // Rigs stay distinguishable by label, not hue (§3).
-                        let label = if rig == 0 { "A" } else { "B" };
-                        ui.label(egui::RichText::new(format!("Rig {label}")).size(13.0).strong().color(theme::INK));
+                        // Each chip pair belongs to ONE synth voice: label it by
+                        // the synth's own name, prefixed by its rig number when
+                        // several rigs exist (2026-11-15: slot letters read
+                        // "Rig C" with only two rigs loaded).
+                        let unit = self.units.iter().find(|u| u.node_id == node);
+                        let name = unit.map_or_else(|| format!("Synth {}", rig + 1), |u| sentence_case(&u.name));
+                        let label = match unit.map(|u| u.rig as usize) {
+                            Some(r) if self.rig_count() > 1 => format!("{} · {name}", r + 1),
+                            _ => name,
+                        };
+                        ui.label(egui::RichText::new(label).size(13.0).strong().color(theme::INK));
                         ui.add_space(4.0);
-                        let (k, l, h) = self.rig_sources[rig];
-                        for (name, on, idx) in [("Keys", k, 0usize), ("Laptop", l, 1), ("HW", h, 2)] {
-                            if text_toggle(ui, name, on) {
-                                let s = &mut self.rig_sources[rig];
-                                match idx {
-                                    0 => s.0 = !s.0,
-                                    1 => s.1 = !s.1,
-                                    _ => s.2 = !s.2,
-                                }
-                                self.send_rig_source(node);
+                        // Two chips: K = the computer keyboard (on-screen +
+                        // laptop typing, one source), H = hardware MIDI.
+                        let (k, h) = self.rig_sources[rig];
+                        for (name, tip, on, idx) in [
+                            ("K", "Keyboard: on-screen keys + laptop typing", k, 0usize),
+                            ("H", "Hardware MIDI devices", h, 1),
+                        ] {
+                            if theme::chip_button(ui, name, on).on_hover_text(tip).clicked() {
+                                self.toggle_rig_source(rig, node, idx);
                             }
                             ui.add_space(6.0);
                         }
@@ -2723,11 +3287,8 @@ impl DemoApp {
                                 None => "HW: All".to_string(),
                                 Some(d) => format!("HW: {}", self.hw_devices.get(d as usize).map(|s| s.as_str()).unwrap_or("?")),
                             };
-                            let resp = ui.add(egui::Label::new(
-                                egui::RichText::new(label).size(13.0).color(theme::INK_2))
-                                .sense(egui::Sense::click()))
+                            let resp = theme::chip_button(ui, &label, false)
                                 .on_hover_text("cycle which hardware device feeds this rig");
-                            if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
                             if resp.clicked() {
                                 let n = self.hw_devices.len() as u32;
                                 let next = match cur {
@@ -2745,14 +3306,7 @@ impl DemoApp {
                         // unit in the rack (task-26) — no per-rig button here.
                         ui.add_space(4.0);
                     }
-                    if nav_button(ui, "Split @ C4", self.split_on) {
-                        self.split_on = !self.split_on;
-                        let point = if self.split_on { Some(60) } else { None };
-                        if let Some(bus) = &self.bus {
-                            let _ = bus.lock().unwrap().send(Command::SetSplit { point });
-                        }
-                    }
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
                     if !self.editor_open && !self.editor_status.is_empty() {
                         ui.label(egui::RichText::new(&self.editor_status).size(12.0).color(theme::ACCENT_DEEP));
                         ui.add_space(8.0);
@@ -2762,105 +3316,29 @@ impl DemoApp {
                     if nav_button(ui, "Sessions", self.show_sessions) {
                         self.show_sessions = !self.show_sessions;
                     }
-                    ui.add_space(10.0);
-                    nav_separator(ui);
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
                     if nav_button(ui, "Plugins", self.show_plugins) {
                         self.show_plugins = !self.show_plugins;
                         if self.show_plugins && !self.plugins_loaded {
                             self.refresh_plugins();
                         }
                     }
-                    ui.add_space(10.0);
-                    nav_separator(ui);
-                    ui.add_space(10.0);
-                    if nav_button(ui, "Transport", self.show_transport || self.playing) {
-                        self.show_transport = !self.show_transport;
-                    }
-                    ui.add_space(10.0);
-                    nav_separator(ui);
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
                     if nav_button(ui, "Matrix", self.show_matrix) {
                         self.show_matrix = !self.show_matrix;
+                        if self.show_matrix { self.show_mixer = false; }
                     }
-                });
-            });
-    }
-
-    /// Compact transport / metronome popover (task-19). A small window (like
-    /// Sessions/Plugins) so it never collides with the custom rack drawing:
-    /// Play/Stop toggle + BPM stepper. The toolbar Play button and Space drive
-    /// the same transport.
-    fn transport_window(&mut self, ctx: &egui::Context) {
-        if !self.show_transport {
-            return;
-        }
-        let mut open = self.show_transport;
-        egui::Window::new("Transport")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    // Play/Stop toggle (§4.13 rules, small version): idle =
-                    // paper + ink ring; running = teal fill + ink glyph.
-                    let btn = if self.playing {
-                        egui::Button::new(egui::RichText::new("Stop").color(theme::INK).strong())
-                            .fill(GREEN)
-                            .stroke(Stroke::NONE)
-                    } else {
-                        egui::Button::new(egui::RichText::new("Play").color(theme::INK).strong())
-                            .fill(theme::PAPER)
-                            .stroke(Stroke::new(1.5, theme::INK))
-                    };
-                    if ui.add(btn.corner_radius(2.0).min_size(egui::vec2(56.0, 20.0)))
-                        .on_hover_text("start / stop the metronome (Space)").clicked()
-                    {
-                        self.toggle_play();
-                    }
-                    ui.add_space(8.0);
-                    theme::tracked_label(ui, "BPM", 10.0, 0.14, theme::INK_2);
-                    ui.add_space(4.0);
-                    if ui.small_button("−").on_hover_text("slower").clicked() {
-                        self.set_bpm(self.bpm - 1.0);
-                    }
-                    // BPM as a big number (§4.18): Medium 24px ink.
-                    let mut bpm = self.bpm;
-                    let dv = egui::DragValue::new(&mut bpm)
-                        .range(20.0..=300.0)
-                        .speed(1.0)
-                        .fixed_decimals(0);
-                    let changed = ui.scope(|ui| {
-                        let ts = ui.style().drag_value_text_style.clone();
-                        ui.style_mut().text_styles.insert(ts, theme::medium_font(36.0));
-                        ui.add(dv).on_hover_text("metronome tempo (20–300)").changed()
-                    }).inner;
-                    if changed {
-                        self.set_bpm(bpm);
-                    }
-                    if ui.small_button("+").on_hover_text("faster").clicked() {
-                        self.set_bpm(self.bpm + 1.0);
-                    }
-                });
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    // Live beat indicator: thumps at the current tempo while playing.
-                    let beat = 60.0 / self.bpm.max(1.0) as f64;
-                    let phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
-                    let thump = if self.playing { (1.0 - phase).powi(3) } else { 0.0 };
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        3.0 + 3.0 * thump,
-                        alpha(GREEN, 0.30 + 0.70 * thump),
-                    );
                     ui.add_space(6.0);
-                    theme::tracked_label(ui, if self.playing { "PLAYING" } else { "STOPPED" },
-                        10.0, 0.14, theme::INK_2);
+                    if nav_button(ui, "Mixer", self.show_mixer) {
+                        self.show_mixer = !self.show_mixer;
+                        if self.show_mixer { self.show_matrix = false; }
+                    }
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Assistant", self.show_assistant) {
+                        self.show_assistant = !self.show_assistant;
+                    }
                 });
             });
-        self.show_transport = open;
     }
 
     /// Visual save/load for sessions (no assistant needed).
@@ -3122,40 +3600,61 @@ impl DemoApp {
         self.show_plugins = open;
     }
 
+    /// Assistant: a toggleable WIDE bottom panel (chip / F12, hidden by
+    /// default) — chat text needs width, not a narrow column (rule 8).
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
-        egui::Panel::right("assistant")
-            .default_size(340.0)
-            .resizable(false)
+        if !self.show_assistant { return; }
+        // The rack keeps a comfortable face height (2026-11-15, user: "racks
+        // are squished when the agent loads"): the panel only gets the height
+        // the rack can spare, within 150..=340 px — never the other way round.
+        let max_h = (root.available_height() - self.rack_need_h()).clamp(150.0, 340.0);
+        let resp = egui::Panel::bottom("assistant")
+            .default_size(max_h.min(260.0))
+            .size_range(150.0..=max_h)
+            .resizable(true)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::same(14)),
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
             )
             .show(root, |ui| {
-                ui.heading(egui::RichText::new("Assistant").font(theme::medium_font(16.0)).color(theme::INK));
-                ui.label(egui::RichText::new("DeepSeek · bring your own key").size(12.0).color(theme::INK_2));
-                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Assistant").font(theme::medium_font(16.0)).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("DeepSeek · bring your own key · F12 hides").size(12.0).color(theme::INK_2));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} · {} · octave C{}", self.surge_status, self.hw_status, self.octave))
+                                .size(12.0)
+                                .color(theme::INK_2),
+                        );
+                    });
+                });
+                ui.add_space(8.0);
                 if !self.assistant.key_set {
-                    ui.label("Paste your DeepSeek API key:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.key_input)
-                            .password(true)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if theme::primary_button(ui, "Save key").clicked() && !self.key_input.trim().is_empty() {
-                        let k = self.key_input.trim().to_string();
-                        match crate::assistant::save_key(&k) {
-                            Ok(()) => {
-                                self.assistant.set_key(k);
-                                self.key_input.clear();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Paste your DeepSeek API key:").size(13.0).color(theme::INK));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.key_input)
+                                .password(true)
+                                .desired_width(360.0),
+                        );
+                        if theme::primary_button(ui, "Save key").clicked() && !self.key_input.trim().is_empty() {
+                            let k = self.key_input.trim().to_string();
+                            match crate::assistant::save_key(&k) {
+                                Ok(()) => {
+                                    self.assistant.set_key(k);
+                                    self.key_input.clear();
+                                }
+                                Err(e) => self.assistant.history.push(ChatLine {
+                                    role: "error".into(),
+                                    text: format!("could not save key: {e}"),
+                                }),
                             }
-                            Err(e) => self.assistant.history.push(ChatLine {
-                                role: "error".into(),
-                                text: format!("could not save key: {e}"),
-                            }),
                         }
-                    }
+                    });
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
                             "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
@@ -3163,20 +3662,33 @@ impl DemoApp {
                         .size(12.0)
                         .color(theme::INK_2),
                     );
+                    for line in self.assistant.history.iter().filter(|l| l.role == "error") {
+                        ui.label(egui::RichText::new(&line.text).size(12.0).color(theme::CLIP_BRIGHT));
+                    }
                 } else {
                     let avail = ui.available_height();
+                    // Exactly the height left above the input row: egui's
+                    // default min_scrolled_height (64px) would overflow a
+                    // short panel past its top edge.
+                    let hist_h = (avail - self.assistant_input_h).max(0.0);
                     egui::ScrollArea::vertical()
-                        .max_height((avail - 90.0).max(100.0))
+                        .min_scrolled_height(hist_h)
+                        .max_height(hist_h)
+                        .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for line in &self.assistant.history {
                                 let (label, color) = match line.role.as_str() {
                                     "user" => ("You", theme::INK),
-                                    "assistant" => ("Assistant", theme::LIVE_TEAL_DEEP),
-                                    _ => ("Error", theme::CLIP_TEXT),
+                                    "assistant" => ("Assistant", theme::LIVE_TEAL),
+                                    _ => ("Error", theme::CLIP_BRIGHT),
                                 };
-                                ui.label(egui::RichText::new(label).size(12.0).strong().color(color));
-                                ui.label(&line.text);
+                                // One wrapped paragraph per line: role label
+                                // inline, text flows across the full width.
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(egui::RichText::new(label).size(13.0).strong().color(color));
+                                    ui.label(egui::RichText::new(&line.text).size(13.0).color(theme::INK));
+                                });
                                 ui.add_space(6.0);
                             }
                             if self.assistant.busy {
@@ -3184,18 +3696,18 @@ impl DemoApp {
                             }
                         });
                     ui.add_space(6.0);
+                    let row_top = ui.cursor().top();
                     ui.horizontal(|ui| {
-                        // The input is a recessed paper-sink field with a
-                        // hairline frame — not a browser-default box.
+                        // Recessed paper-sink field with a hairline frame.
                         let edit = egui::Frame::new()
                             .fill(theme::PAPER_SINK)
                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
                             .corner_radius(2.0)
-                            .inner_margin(egui::Margin::symmetric(6, 4))
+                            .inner_margin(egui::Margin::symmetric(8, 6))
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.chat_input)
-                                        .desired_width((ui.available_width() - 76.0).max(80.0))
+                                        .desired_width((ui.available_width() - 90.0).max(80.0))
                                         .hint_text("Ask or instruct…"),
                                 )
                             }).inner;
@@ -3210,15 +3722,11 @@ impl DemoApp {
                             self.assistant.send_user(t);
                         }
                     });
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!("{} · octave C{}", self.surge_status, self.octave))
-                            .size(12.0)
-                            .color(theme::INK_2),
-                    );
-                    ui.label(egui::RichText::new(&self.hw_status).size(12.0).color(theme::INK_2));
+                    // 6px gap + the row as laid out (+ spacing) → next frame's reserve.
+                    self.assistant_input_h = 6.0 + (ui.cursor().top() - row_top).max(24.0) + ui.spacing().item_spacing.y;
                 }
             });
+        self.assistant_rect = resp.response.rect;
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -3236,7 +3744,7 @@ impl DemoApp {
     fn clap_rigs(&self) -> Vec<(usize, u32)> {
         self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
-            .take(2)
+            .take(VOICE_POOL)
             .enumerate()
             .map(|(rig, u)| (rig, u.node_id))
             .collect()
@@ -3259,11 +3767,16 @@ impl DemoApp {
         let ki = self.keys_idx();
         let vel = self.units.get(ki).and_then(|u| u.knobs.get(1)).map(|k| k.value).unwrap_or(0.8);
         let amp = amp * (0.35 + vel * 0.65);
-        self.key_leds[semitone % 12] = 1.0;
+        // Light on note-on only: a note-off re-lighting the key restarted the
+        // full decay tail AFTER release (user report: key color stays too long).
+        if amp > 0.0 { self.key_leds[semitone % 12] = 1.0; }
         if let Some(u) = self.units.get_mut(ki) { u.led = 1.0; }
+        // A split keyboard sends each note out ONE jack (LOW below the point,
+        // HIGH at/above) — only that jack's cables pulse, like the engine.
+        let port = split_port(self.units.get(ki).and_then(|u| u.split), semitone.min(127) as u8) as usize;
         for ci in 0..self.cables.len() {
             let c = &mut self.cables[ci];
-            if c.src == ki && c.kind == PortKind::Midi && c.dying < 0.0 {
+            if c.src == ki && c.src_port == port && c.kind == PortKind::Midi && c.dying < 0.0 {
                 c.spawn_pulse(0.0, amp);
             }
         }
@@ -3294,13 +3807,94 @@ impl DemoApp {
         }
     }
 
+    /// Publish the patch through the control plane: living cables become
+    /// Connect commands (the engine rejects duplicates), knobs SetParam, and
+    /// the shared graph mirror is rebuilt when the cable set changed. Runs
+    /// once per frame after input, so a re-plug's Disconnect precedes it.
+    fn publish_patch(&mut self) {
+        if let Some(bus) = &self.bus {
+            let mut b = bus.lock().unwrap();
+            for c in &self.cables {
+                if c.dying >= 0.0 { continue; }
+                let (Some(sn), Some(dn)) = (
+                    self.units.get(c.src).map(|u| u.node_id),
+                    self.units.get(c.dst).map(|u| u.node_id),
+                ) else { continue };
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                let _ = b.send(Command::Connect {
+                    id: c.id,
+                    from: PortRef { node: sn, port: c.src_port as u8 },
+                    to: PortRef { node: dn, port: c.dst_port as u8 },
+                    kind,
+                });
+            }
+            for u in &self.units {
+                for k in &u.knobs {
+                    if let Some(p) = k.param {
+                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+                    }
+                }
+            }
+        }
+
+        // Mirror the live patch into the shared graph for bridge queries
+        // (task-16): loaded-graph nodes + living cables as edges. Rebuild only
+        // when the cable set changes — cheap per frame.
+        let sig: Vec<(u32, u32, u8, u32, u8, CPortKind)> = self
+            .cables
+            .iter()
+            .filter(|c| c.dying < 0.0)
+            .map(|c| {
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                let sn = self.units.get(c.src).map(|u| u.node_id).unwrap_or(c.src as u32);
+                let dn = self.units.get(c.dst).map(|u| u.node_id).unwrap_or(c.dst as u32);
+                (c.id, sn, c.src_port as u8, dn, c.dst_port as u8, kind)
+            })
+            .collect();
+        if sig != self.graph_sig {
+            let mut g = self.base_graph.clone();
+            g.edges.clear();
+            for c in &self.cables {
+                if c.dying >= 0.0 { continue; }
+                let (Some(sn), Some(dn)) = (
+                    self.units.get(c.src).map(|u| u.node_id),
+                    self.units.get(c.dst).map(|u| u.node_id),
+                ) else { continue };
+                let kind = match c.kind {
+                    PortKind::Midi => CPortKind::Midi,
+                    PortKind::Audio => CPortKind::Audio,
+                };
+                g.connect_with_id(
+                    c.id,
+                    PortRef { node: sn, port: c.src_port as u8 },
+                    PortRef { node: dn, port: c.dst_port as u8 },
+                    kind,
+                );
+            }
+            if let Ok(mut shared) = self.shared_graph.lock() {
+                *shared = g;
+            }
+            self.graph_sig = sig;
+        }
+    }
+
     fn try_connect(&mut self, from: (usize, usize, Dir, PortKind), to: (usize, usize, Dir, PortKind)) -> bool {
         let (fu, fp, fd, fk) = from;
         let (tu, tp, td, tk) = to;
         if fd == td || fk != tk || fu == tu { return false; }
         let (src, sp, dst, dp) = if fd == Dir::Out { (fu, fp, tu, tp) } else { (tu, tp, fu, fp) };
         let pattern = if dst == 2 { 1 } else { 0 };
-        self.add_cable(src, sp, dst, dp, fk, pattern);
+        if let Some(why) = self.cable_refusal(src, sp, dst, dp, None) {
+            self.notify_patch(why);
+        } else {
+            self.add_cable(src, sp, dst, dp, fk, pattern);
+        }
         true
     }
 
@@ -3343,12 +3937,9 @@ impl DemoApp {
 
     fn toggle_play(&mut self) {
         self.playing = !self.playing;
-        // Drive the engine metronome (task-19): the transport toggle is the
-        // single source of truth for Play/Stop.
-        if let Some(bus) = &self.bus {
-            let cmd = if self.playing { Command::TransportPlay } else { Command::TransportStop };
-            let _ = bus.lock().unwrap().send(cmd);
-        }
+        // Global transport = MASTER: Play/Stop fans out to every
+        // transport-capable rack instrument; per-node chips override after.
+        self.master_transport(self.playing);
         if self.playing {
             self.time = 0.0; // restart the visual beat phase on Play
             for c in &mut self.cables {
@@ -3358,8 +3949,218 @@ impl DemoApp {
         }
     }
 
+    /// Master transport (Space, masthead circle, transport window, assistant
+    /// transport_play/stop): send TransportPlay/Stop. The engine sets every
+    /// transport-capable node and publishes; faces follow via
+    /// `sync_from_engine`. Headless (no GraphPub) applies the flags locally.
+    fn master_transport(&mut self, playing: bool) {
+        if let Some(bus) = &self.bus {
+            let cmd = if playing { Command::TransportPlay } else { Command::TransportStop };
+            let _ = bus.lock().unwrap().send(cmd);
+        }
+        if self.graph_pub.is_none() {
+            let ids: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+            for id in ids { self.apply_node_playing(id, playing); }
+        }
+    }
+
+    /// Per-instrument transport (face chip, assistant set_node_playing):
+    /// start/stop ONE transport-capable node. Returns false if no such unit.
+    /// With an engine attached the face waits for the engine's publication
+    /// (no local guess); headless it applies locally.
+    fn set_node_playing(&mut self, node: u32, playing: bool) -> bool {
+        if !self.units.iter().any(|u| u.node_id == node && u.transport) { return false; }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetNodePlaying { node, playing });
+        }
+        if self.graph_pub.is_none() { self.apply_node_playing(node, playing); }
+        true
+    }
+
+    /// Write one node's playing flag into the unit face, the base graph
+    /// (sessions) and the bridge mirror (MCP --attach get_graph).
+    fn apply_node_playing(&mut self, node: u32, playing: bool) {
+        for u in self.units.iter_mut().filter(|u| u.node_id == node && u.transport) {
+            u.playing = playing;
+        }
+        self.base_graph.set_playing(node, playing);
+        if let Ok(mut g) = self.shared_graph.lock() { g.set_playing(node, playing); }
+    }
+
+    /// Rack-local rect of a transport unit's Play/Stop face chip (front side
+    /// only). Fixed width so the layout never jitters between PLAY/STOP;
+    /// 24px tall keeps ≥4px vertical padding around the 12px label (rule 7).
+    fn transport_chip_rect(&self, unit: usize) -> Option<Rect> {
+        let u = self.units.get(unit)?;
+        if !u.transport { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if r.width() < 140.0 { return None; }
+        let top = (r.top() + 60.0).max(r.center().y + 4.0).min(r.bottom() - 28.0);
+        Some(Rect::from_min_size(Pos2::new(r.left() + 34.0, top), Vec2::new(72.0, 24.0)))
+    }
+
+    /// Keys-face split controls (rack-local): the SPLIT chip and, right of
+    /// it, the split-point readout (drawn/live only while split). Top-right
+    /// of the unit header, left of the activity LED, so they never collide
+    /// with the keyboard or the RATE/VEL knobs on short units. None when the
+    /// unit is too narrow to keep them clear of its name.
+    fn split_rects(&self, unit: usize) -> Option<(Rect, Rect)> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Keys) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; } // hidden (Rect::NOTHING) or unlaid
+        let y = r.top() + 10.0;
+        let readout = Rect::from_min_size(Pos2::new(r.right() - 30.0 - SPLIT_READOUT_W, y), Vec2::new(SPLIT_READOUT_W, FACE_CTL_H));
+        let chip = Rect::from_min_size(Pos2::new(readout.left() - 6.0 - SPLIT_CHIP_W, y), Vec2::new(SPLIT_CHIP_W, FACE_CTL_H));
+        let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
+        if chip.left() < r.left() + 34.0 + name_w + 8.0 { return None; }
+        Some((chip, readout))
+    }
+
+    /// Split point shown on a Keys face: the live drag value while dragging
+    /// its readout, else the unit's (engine-mirrored) split.
+    fn shown_split(&self, unit: usize) -> Option<u8> {
+        match self.drag {
+            Drag::Split { unit: du, cur, .. } if du == unit => Some(cur),
+            _ => self.units.get(unit).and_then(|u| u.split),
+        }
+    }
+
+    /// Split or unsplit a Keys unit (face chip, point drag, assistant).
+    /// Unsplitting first unplugs the HIGH cables — the jack goes away — with
+    /// an on-stage notice (refusal/message pattern); their Disconnects
+    /// precede SetNodeSplit on the FIFO bus. Enabling keeps every existing
+    /// cable on port 0 (LOW). With an engine attached the jacks follow the
+    /// engine's publication (no local guess); headless applies locally.
+    /// Returns false if `unit` is not a Keys unit.
+    fn set_keys_split(&mut self, unit: usize, point: Option<u8>) -> bool {
+        let Some(u) = self.units.get(unit) else { return false };
+        if !matches!(u.node_kind, UnitKind::Keys) { return false; }
+        let point = point.map(|p| p.min(127));
+        if u.split == point { return true; }
+        let node = u.node_id;
+        if point.is_none() {
+            let high: Vec<u32> = self.cables.iter()
+                .filter(|c| c.dying < 0.0 && c.src == unit && c.src_port >= 1)
+                .map(|c| c.id).collect();
+            for id in &high {
+                if let Some(ci) = self.live_cable(*id) { self.unplug_cable(ci, false); }
+            }
+            if !high.is_empty() {
+                let n = high.len();
+                self.notify_patch(&format!("split off — {n} HIGH cable{} unplugged", if n == 1 { "" } else { "s" }));
+            }
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetNodeSplit { node, point });
+        }
+        if self.graph_pub.is_none() { self.apply_keys_split(node, point); }
+        true
+    }
+
+    /// Write one Keys node's split into its unit (jacks), the base graph
+    /// (sessions) and the bridge mirror (MCP --attach get_graph).
+    fn apply_keys_split(&mut self, node: u32, point: Option<u8>) {
+        for (i, u) in self.units.iter_mut().enumerate() {
+            if u.node_id != node || !matches!(u.node_kind, UnitKind::Keys) { continue; }
+            set_unit_split(u, point);
+            if self.pending.as_ref().map_or(false, |p| p.unit == i) { self.pending = None; }
+            if matches!(self.hover, Some(Hit::Jack { unit, .. }) if unit == i) { self.hover = None; }
+        }
+        self.base_graph.set_split(node, point);
+        if let Ok(mut g) = self.shared_graph.lock() { g.set_split(node, point); }
+    }
+
+    /// Unit names fed by a Keys unit's output `port` (living MIDI cables).
+    fn zone_targets(&self, keys: usize, port: usize) -> Vec<String> {
+        self.cables.iter()
+            .filter(|c| c.dying < 0.0 && c.kind == PortKind::Midi && c.src == keys && c.src_port == port)
+            .filter_map(|c| self.units.get(c.dst).map(|u| sentence_case(&u.name)))
+            .collect()
+    }
+
+    /// Every split Keys unit: (unit, point).
+    fn split_keys(&self) -> Vec<(usize, u8)> {
+        self.units.iter().enumerate()
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Keys))
+            .filter_map(|(i, u)| u.split.map(|p| (i, p)))
+            .collect()
+    }
+
+    /// Matrix footer line: each Keys node's split (point + what LOW/HIGH
+    /// feed), not a global flag.
+    fn split_footer(&self) -> String {
+        let splits = self.split_keys();
+        if splits.is_empty() {
+            return "Full keyboard on every MIDI cable · SPLIT on a Keys face gives it LOW / HIGH outs to wire".into();
+        }
+        let list = |v: Vec<String>| if v.is_empty() { "nothing".to_string() } else { v.join(", ") };
+        splits.iter().map(|&(k, p)| {
+            let who = if self.rig_count() > 1 { format!("{} keys", self.rig_name(self.units[k].rig as usize)) } else { "Keys".into() };
+            format!("{who} split @ {} — LOW → {} · HIGH → {}", note_name(p), list(self.zone_targets(k, 0)), list(self.zone_targets(k, 1)))
+        }).collect::<Vec<_>>().join("   ·   ")
+    }
+
+    /// Assistant get_matrix: per-Keys split state.
+    fn split_report(&self) -> serde_json::Value {
+        let ids = |k: usize, port: usize| -> Vec<u32> {
+            self.cables.iter()
+                .filter(|c| c.dying < 0.0 && c.kind == PortKind::Midi && c.src == k && c.src_port == port)
+                .filter_map(|c| self.units.get(c.dst).map(|u| u.node_id)).collect()
+        };
+        serde_json::Value::Array(self.units.iter().enumerate()
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Keys))
+            .map(|(k, u)| serde_json::json!({
+                "keys_node": u.node_id,
+                "point": u.split,
+                "low_port0": ids(k, 0),
+                "high_port1": ids(k, 1),
+            }))
+            .collect())
+    }
+
+    /// Metronome-face BPM control (rack-local): optional −/+ steppers around
+    /// a drag readout. Preferred: one row after the beat LED; narrow units
+    /// stack it under the Play/Stop chip; the narrowest keep the readout
+    /// only. Every metronome face shows the SAME global tempo (engine
+    /// SetBpm) — tempo is shared, Play/Stop is per instrument.
+    fn bpm_rects(&self, unit: usize) -> Option<BpmRects> {
+        let chip = self.transport_chip_rect(unit)?;
+        let r = *self.unit_rects.get(unit)?;
+        let right = r.right() - 14.0;
+        let full = 2.0 * (BPM_STEP_W + 4.0) + BPM_VALUE_W;
+        let row = |x: f32, y: f32, steppers: bool| -> BpmRects {
+            let sz = |w: f32| Vec2::new(w, FACE_CTL_H);
+            if steppers {
+                let minus = Rect::from_min_size(Pos2::new(x, y), sz(BPM_STEP_W));
+                let value = Rect::from_min_size(Pos2::new(minus.right() + 4.0, y), sz(BPM_VALUE_W));
+                let plus = Rect::from_min_size(Pos2::new(value.right() + 4.0, y), sz(BPM_STEP_W));
+                BpmRects { minus: Some(minus), value, plus: Some(plus) }
+            } else {
+                BpmRects { minus: None, value: Rect::from_min_size(Pos2::new(x, y), sz(BPM_VALUE_W)), plus: None }
+            }
+        };
+        let x_row = chip.right() + 32.0; // past the beat LED
+        if x_row + full <= right { return Some(row(x_row, chip.top(), true)); }
+        let y_under = chip.bottom() + 6.0;
+        if y_under + FACE_CTL_H <= r.bottom() - 6.0 {
+            if chip.left() + full <= right { return Some(row(chip.left(), y_under, true)); }
+            if chip.left() + BPM_VALUE_W <= right { return Some(row(chip.left(), y_under, false)); }
+        }
+        if x_row + BPM_VALUE_W <= right { return Some(row(x_row, chip.top(), false)); }
+        None
+    }
+
+    /// Is rack-local `lp` on one of a unit's face drag readouts (the split
+    /// point while split, or the BPM value)?
+    fn on_face_field(&self, unit: usize, lp: Pos2) -> bool {
+        let split = self.units.get(unit).map_or(false, |u| u.split.is_some())
+            && self.split_rects(unit).map_or(false, |(_, r)| r.contains(lp));
+        split || self.bpm_rects(unit).map_or(false, |b| b.value.contains(lp))
+    }
+
     /// Set the metronome tempo, clamped to the engine's 20..=300 range, and
-    /// notify the engine. Used by the transport stepper and the assistant tool.
+    /// notify the engine. Used by the metronome face and the assistant tool.
     fn set_bpm(&mut self, bpm: f32) {
         self.bpm = bpm.clamp(20.0, 300.0);
         if let Some(bus) = &self.bus {
@@ -3399,8 +4200,11 @@ impl DemoApp {
             }
         }
 
-        for u in &mut self.units { u.led *= (-dt / 0.20).exp(); }
-        for k in &mut self.key_leds { *k *= (-dt / 0.22).exp(); }
+        for u in &mut self.units { u.led *= (-dt / UNIT_LED_TAU).exp(); }
+        for k in &mut self.key_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
+        // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
+        // the short tail starts on release.
+        for &(_, semi) in &self.held_keys { self.key_leds[semi % 12] = 1.0; }
         // Per-rig activity for the overview strip: instant attack, slow release.
         let n_rigs = self.rig_count();
         if self.rig_levels.len() != n_rigs { self.rig_levels.resize(n_rigs, 0.0); }
@@ -3422,10 +4226,9 @@ impl DemoApp {
         }
         let pt = if matches!(self.hover, Some(Hit::Play)) { 1.0 } else { 0.0 };
         self.play_hover_t += (pt - self.play_hover_t) * ease;
-        let ft = if matches!(self.hover, Some(Hit::Flip)) { 1.0 } else { 0.0 };
-        self.flip_hover_t += (ft - self.flip_hover_t) * ease;
 
         let mut n_arrivals = 0usize;
+        let edge_levels = self.edge_levels.clone();
         for ci in 0..self.cables.len() {
             let ea = self.endpoint(&self.cables[ci], Dir::Out);
             let eb = self.endpoint(&self.cables[ci], Dir::In);
@@ -3495,14 +4298,35 @@ impl DemoApp {
             }
 
             if c.kind == PortKind::Audio {
+                // The engine's real per-edge level feeds the envelope; the
+                // attack/decay smoothing below stays UI-side.
+                if let (Some(l), true) = (&edge_levels, c.dying < 0.0) {
+                    c.env = c.env.max(edge_display_level(l.load(c.id)));
+                }
                 c.env *= (-dt / 0.32).exp();
                 c.level += (c.env - c.level) * (1.0 - (-dt / 0.05).exp());
+                // Sounding audio cables flow: a traveling pulse every
+                // AUDIO_PULSE_EVERY, amp ∝ level (MIDI pulses stay event-driven).
+                if c.dying < 0.0 && c.level > AUDIO_PULSE_MIN {
+                    c.audio_tick -= dt;
+                    if c.audio_tick <= 0.0 {
+                        let amp = c.level.min(1.0);
+                        c.spawn_pulse(0.0, amp);
+                        c.audio_tick = AUDIO_PULSE_EVERY;
+                    }
+                } else {
+                    c.audio_tick = 0.0; // next sound spawns immediately
+                }
             }
         }
 
         for &(unit, amp) in &self.arrivals[..n_arrivals] {
             let gain = self.units.get(unit).map(unit_out_gain).unwrap_or(1.0);
             if let Some(u) = self.units.get_mut(unit) { u.led = u.led.max(amp); }
+            // No engine attached: arrivals fake the downstream audio envelope
+            // so the chain still animates. With an engine, real per-edge
+            // levels drive audio cables (a muted synth must not look live).
+            if self.edge_levels.is_some() { continue; }
             for c in &mut self.cables {
                 if c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0 {
                     c.env = c.env.max(amp * 0.95 * gain);
@@ -3625,10 +4449,9 @@ impl DemoApp {
 
     fn hit_test(&self, s: Pos2) -> Hit {
         if (s - Pos2::new(40.0, self.toolbar_top + 44.0)).length() < 19.0 { return Hit::Play; }
-        if self.flip_rect().contains(s) {
-            return Hit::Flip;
-        }
         if self.flipping || self.xf.sy < 0.9 { return Hit::Background; }
+        // Panned-away rack parts are clipped: never hit what isn't drawn.
+        if self.rack_clip.is_some_and(|c| !c.contains(s)) { return Hit::Background; }
         let l = self.xf.inv(s);
         let lp = l.to_pos2();
 
@@ -3661,8 +4484,8 @@ impl DemoApp {
                         }
                     }
                 }
-                let mut best: Option<(usize, f32, f32)> = None;
-                for (ci, c) in self.cables.iter().enumerate() {
+                let mut best: Option<(u32, f32, f32)> = None;
+                for c in &self.cables {
                     if c.dying >= 0.0 { continue; }
                     if !self.visible(c.src) || !self.visible(c.dst) { continue; }
                     let thresh = 8.0 + c.level * 3.0;
@@ -3673,11 +4496,11 @@ impl DemoApp {
                             let ab = c.pts[i + 1] - c.pts[i];
                             let t = if ab.length_sq() > 1e-9 { ((lp - c.pts[i]).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
                             let u = (i as f32 + t) / (c.n - 1).max(1) as f32;
-                            best = Some((ci, d, u));
+                            best = Some((c.id, d, u));
                         }
                     }
                 }
-                if let Some((ci, _, u)) = best { return Hit::Cable(ci, u); }
+                if let Some((id, _, u)) = best { return Hit::Cable(id, u); }
                 for (ui, _) in self.units.iter().enumerate() {
                     if self.unit_rects[ui].contains(lp) { return Hit::Unit(ui); }
                 }
@@ -3689,6 +4512,9 @@ impl DemoApp {
     // -- input ----------------------------------------------------------
 
     fn handle_input(&mut self, ctx: &egui::Context, rect: Rect) {
+        // The "Delete rig?" modal owns all input (Esc/Del must reach it, not
+        // the rack's cable shortcuts).
+        if self.confirm_delete_rig.is_some() { return; }
         let mut toggle_play = false;
         let mut flip = false;
         let mut reset_knobs = false;
@@ -3697,6 +4523,19 @@ impl DemoApp {
         let mut load_multi = false;
         let mut rig_switch: Option<usize> = None;
         let mut rig_cycle: i8 = 0;
+        // Pan an overflowing rack with the wheel / trackpad — only over the
+        // bare stage (never over a panel or window that scrolls itself).
+        let ov = self.rack_overflow;
+        if !self.show_matrix && !self.show_mixer && (ov.x > 0.0 || ov.y > 0.0) {
+            let over_stage = ctx.pointer_hover_pos().is_some_and(|p| self.stage_rect.contains(p)
+                && ctx.layer_id_at(p).map_or(true, |l| l.order == egui::Order::Background));
+            let d = ctx.input(|i| i.smooth_scroll_delta());
+            if over_stage && d != Vec2::ZERO {
+                // A plain wheel (y only) pans sideways when only x overflows.
+                let p = self.rack_pan + if d.x == 0.0 && ov.y == 0.0 { Vec2::new(d.y, 0.0) } else { d };
+                self.rack_pan = Vec2::new(p.x.clamp(-ov.x / 2.0, ov.x / 2.0), p.y.clamp(-ov.y / 2.0, ov.y / 2.0));
+            }
+        }
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
@@ -3721,13 +4560,14 @@ impl DemoApp {
                 self.show_plugins = !self.show_plugins;
                 if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
             }
-            // Transport / metronome popover (task-19).
-            if i.consume_key(Modifiers::NONE, Key::F10) {
-                self.show_transport = !self.show_transport;
-            }
             // Hot-wire MIDI matrix (PLAN §13).
             if i.consume_key(Modifiers::NONE, Key::F11) {
                 self.show_matrix = !self.show_matrix;
+                if self.show_matrix { self.show_mixer = false; }
+            }
+            if i.consume_key(Modifiers::NONE, Key::F10) {
+                self.show_mixer = !self.show_mixer;
+                if self.show_mixer { self.show_matrix = false; }
             }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
@@ -3735,6 +4575,9 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.pending.is_some() { self.pending = None; }
+                else if self.show_matrix && self.rule_editor.is_some() { self.rule_editor = None; }
+                else if self.show_matrix { self.show_matrix = false; }
+                else if self.show_mixer { self.show_mixer = false; }
                 else { self.selected = None; }
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
@@ -3747,10 +4590,14 @@ impl DemoApp {
             }
         });
         if toggle_play { self.toggle_play(); }
-        if flip { self.start_flip(); }
+        if flip { self.on_tab(); }
         if let Some(t) = load_tpl { self.load_template(t); }
         if load_demo { self.load_demo_patch(); }
         if load_multi { self.load_multi_rig_demo(); }
+        if (rig_switch.is_some() || rig_cycle != 0) && self.rig_count() <= 1 {
+            // Not a silent no-op: say why nothing switched.
+            self.notify_patch("one rig loaded — its stacks share a master · F4 loads two independent rigs, then 1–9 / ←→ switch");
+        }
         if let Some(r) = rig_switch { self.set_active_rig(r); }
         if rig_cycle != 0 {
             let n = self.rig_count();
@@ -3765,9 +4612,10 @@ impl DemoApp {
             }
         }
 
-        let (pointer, pressed, down, released, right_clicked, ctrl) = ctx.input(|i| {
+        let (pointer, pressed, down, released, right_clicked, ctrl, shift) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(),
-             i.pointer.primary_released(), i.pointer.secondary_clicked(), i.modifiers.ctrl)
+             i.pointer.primary_released(), i.pointer.secondary_clicked(), i.modifiers.ctrl,
+             i.modifiers.shift)
         });
 
         let Some(s) = pointer else {
@@ -3775,6 +4623,39 @@ impl DemoApp {
             self.drag = Drag::None;
             return;
         };
+
+        // Matrix mode: the rack is not on screen, so its hit-testing is inert
+        // except the masthead's Play circle (Tab returns to the rack). The
+        // stage's egui widgets handle their own input.
+        if self.show_matrix || self.show_mixer {
+            let hit = if self.show_help { Hit::Background } else {
+                match self.hit_test(s) { Hit::Play => Hit::Play, _ => Hit::Background }
+            };
+            self.hover = Some(hit);
+            if self.show_help {
+                if pressed { self.show_help = false; }
+                return;
+            }
+            if pressed { self.press = Some((hit, s)); }
+            if released {
+                let moved = self.press.map_or(0.0, |(_, p)| (s - p).length());
+                let press_hit = self.press.map(|(h, _)| h);
+                self.press = None;
+                // A rack drag that began before entering the matrix ends here.
+                if let Drag::Plug { id, .. } = self.drag {
+                    if let Some(c) = self.cables.iter_mut().find(|c| c.id == id) { c.over_a = None; c.over_b = None; }
+                }
+                self.drag = Drag::None;
+                if moved < 6.0 {
+                    match press_hit {
+                        Some(Hit::Play) => self.toggle_play(),
+                        _ => {}
+                    }
+                }
+            }
+            if matches!(hit, Hit::Play) { ctx.set_cursor_icon(CursorIcon::PointingHand); }
+            return;
+        }
 
         if right_clicked {
             if self.pending.is_some() {
@@ -3815,12 +4696,31 @@ impl DemoApp {
                     }
                     Hit::Jack { unit, jack } if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
-                        if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
-                            self.drag = Drag::Plug { ci, end: j.dir };
+                        // Shift on an occupied output = fan out a new cable
+                        // (handled as a pending wire below), not grab the plug.
+                        let fan_out = shift && j.dir == Dir::Out;
+                        if !fan_out {
+                            if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
+                                self.drag = Drag::Plug { id: self.cables[ci].id, end: j.dir };
+                            }
                         }
                     }
-                    Hit::Cable(ci, u) if self.side == Side::Back => {
-                        self.drag = Drag::Cable { ci, u };
+                    Hit::Cable(id, u) if self.side == Side::Back => {
+                        self.drag = Drag::Cable { id, u };
+                    }
+                    // Face drag fields (custom-painted, so no egui focus can
+                    // swallow rack keys — rule 12 by construction).
+                    Hit::Unit(ui) if self.side == Side::Front => {
+                        let lp = l.to_pos2();
+                        let split = self.units[ui].split;
+                        if let (Some(p), Some((_, readout))) = (split, self.split_rects(ui)) {
+                            if readout.contains(lp) {
+                                self.drag = Drag::Split { unit: ui, start: p, press: s, cur: p };
+                            }
+                        }
+                        if self.bpm_rects(ui).map_or(false, |b| b.value.contains(lp)) {
+                            self.drag = Drag::Bpm { start: self.bpm, press: s };
+                        }
                     }
                     _ => {}
                 }
@@ -3833,14 +4733,17 @@ impl DemoApp {
                     let v = (start_val + (press_y - s.y) * 0.006).clamp(0.0, 1.0);
                     self.units[unit].knobs[idx].value = v;
                 }
-                Drag::Plug { ci, end } => {
-                    if ci < self.cables.len() {
-                        let c = &mut self.cables[ci];
-                        if end == Dir::Out { c.over_a = Some(l); } else { c.over_b = Some(l); }
+                Drag::Plug { id, end } => {
+                    match self.live_cable(id) {
+                        Some(ci) => {
+                            let c = &mut self.cables[ci];
+                            if end == Dir::Out { c.over_a = Some(l); } else { c.over_b = Some(l); }
+                        }
+                        None => self.drag = Drag::None,
                     }
                 }
-                Drag::Cable { ci, u } => {
-                    if ci < self.cables.len() && self.cables[ci].dying < 0.0 {
+                Drag::Cable { id, u } => {
+                    if let Some(ci) = self.live_cable(id) {
                         let c = &mut self.cables[ci];
                         let pt = c.point_at_arc(u).to_vec2();
                         let delta = clamp_len(l - pt, 240.0);
@@ -3853,12 +4756,10 @@ impl DemoApp {
                         let a = c.prev_a;
                         let b = c.prev_b;
                         if u < 0.16 && (l - a).length() > 48.0 {
-                            let ci2 = ci;
-                            self.unplug_cable(ci2, false);
+                            self.unplug_cable(ci, false);
                             self.drag = Drag::None;
                         } else if u > 0.84 && (l - b).length() > 48.0 {
-                            let ci2 = ci;
-                            self.unplug_cable(ci2, true);
+                            self.unplug_cable(ci, true);
                             self.drag = Drag::None;
                         }
                     } else {
@@ -3871,15 +4772,30 @@ impl DemoApp {
                     let size = self.unit_rects[unit].size();
                     self.unit_rects[unit] = Rect::from_min_size((l - grab).to_pos2(), size);
                 }
+                Drag::Split { unit, start, press, cur } => {
+                    // Up/right raises the point: one semitone per 6px.
+                    let d = ((press.y - s.y) + (s.x - press.x)) / 6.0;
+                    let p = (start as f32 + d).round().clamp(1.0, 127.0) as u8;
+                    if p != cur {
+                        self.drag = Drag::Split { unit, start, press, cur: p };
+                        self.set_keys_split(unit, Some(p));
+                    }
+                }
+                Drag::Bpm { start, press } => {
+                    // Up/right = faster: one BPM per 3px, whole BPMs only.
+                    let d = ((press.y - s.y) + (s.x - press.x)) / 3.0;
+                    let bpm = (start + d).round().clamp(20.0, 300.0);
+                    if bpm != self.bpm { self.set_bpm(bpm); }
+                }
                 Drag::None => {
                     // Drag-from-jack: one-gesture patching.
                     if let Some((Hit::Jack { unit, jack }, press_pos)) = self.press {
                         if self.pending.is_none() && self.side == Side::Back && (s - press_pos).length() > 7.0 {
-                            let occupied = {
+                            let (occupied, fan_out) = {
                                 let j = &self.units[unit].jacks[jack];
-                                self.cable_at_jack(unit, j.dir, j.port).is_some()
+                                (self.cable_at_jack(unit, j.dir, j.port).is_some(), shift && j.dir == Dir::Out)
                             };
-                            if !occupied { self.start_pending(unit, jack, l); }
+                            if !occupied || fan_out { self.start_pending(unit, jack, l); }
                         }
                     }
                 }
@@ -3892,7 +4808,7 @@ impl DemoApp {
             let press_hit = self.press.map(|(h, _)| h);
             self.press = None;
             let was_plug = matches!(self.drag, Drag::Plug { .. });
-            let plug_info = if let Drag::Plug { ci, end } = self.drag { Some((ci, end)) } else { None };
+            let plug_info = if let Drag::Plug { id, end } = self.drag { Some((id, end)) } else { None };
             let unit_drag = if let Drag::Unit { unit, .. } = self.drag { Some(unit) } else { None };
             self.drag = Drag::None;
 
@@ -3902,17 +4818,10 @@ impl DemoApp {
                 if moved >= 6.0 { self.drop_unit(unit, l); }
             }
 
-            // Plug drag release: far from the jack → unplug; near → snap back.
-            if let Some((ci, end)) = plug_info {
-                if ci < self.cables.len() {
-                    let jack = self.endpoint(&self.cables[ci], end);
-                    if moved < 6.0 || (l - jack).length() > 42.0 {
-                        self.unplug_cable(ci, end == Dir::In);
-                    } else {
-                        let c = &mut self.cables[ci];
-                        if end == Dir::Out { c.over_a = None; } else { c.over_b = None; }
-                    }
-                }
+            // Plug drag release: on a compatible jack → move the plug there;
+            // far from the jack → unplug; near → snap back; click → unplug.
+            if let Some((id, end)) = plug_info {
+                self.release_plug(id, end, l, moved, hit);
             }
 
             // Drag-to-patch release.
@@ -3930,9 +4839,9 @@ impl DemoApp {
             if moved < 6.0 && !was_plug {
                 match press_hit {
                     Some(Hit::Play) => self.toggle_play(),
-                    Some(Hit::Flip) => self.start_flip(),
                     Some(Hit::Jack { unit, jack }) if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
+                        let fan_out = shift && j.dir == Dir::Out;
                         if let Some(p) = &self.pending {
                             let from = (p.unit, self.units[p.unit].jacks[p.jack].port, p.dir, p.kind);
                             if unit == p.unit && jack == p.jack {
@@ -3940,17 +4849,39 @@ impl DemoApp {
                             } else if self.try_connect(from, (unit, j.port, j.dir, self.units[unit].kind(j.dir, j.port))) {
                                 self.pending = None;
                             }
-                        } else if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
+                        } else if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port).filter(|_| !fan_out) {
                             self.unplug_cable(ci, j.dir == Dir::In);
                         } else {
                             self.start_pending(unit, jack, l);
                         }
                     }
-                    Some(Hit::Cable(ci, _)) if self.side == Side::Back => {
-                        if ci < self.cables.len() {
-                            let id = self.cables[ci].id;
+                    Some(Hit::Cable(id, _)) if self.side == Side::Back => {
+                        if self.live_cable(id).is_some() {
                             self.selected = if self.selected == Some(id) { None } else { Some(id) };
                         }
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.split_rects(ui).map_or(false, |(chip, _)| chip.contains(l.to_pos2())) => {
+                        // Keys-face SPLIT chip: split at C4 / unsplit.
+                        let next = if self.units[ui].split.is_some() { None } else { Some(DEFAULT_SPLIT) };
+                        self.set_keys_split(ui, next);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front && self.on_face_field(ui, l.to_pos2()) => {
+                        // A click on a drag readout (split point / BPM) is not a ping.
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.bpm_rects(ui).map_or(false, |b| b.minus.map_or(false, |r| r.contains(l.to_pos2()))) => {
+                        self.set_bpm(self.bpm.round() - 1.0);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.bpm_rects(ui).map_or(false, |b| b.plus.map_or(false, |r| r.contains(l.to_pos2()))) => {
+                        self.set_bpm(self.bpm.round() + 1.0);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.transport_chip_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
+                        // Per-instrument Play/Stop chip on the unit face.
+                        let (node, playing) = (self.units[ui].node_id, self.units[ui].playing);
+                        self.set_node_playing(node, !playing);
                     }
                     Some(Hit::Unit(ui)) => {
                         // Double-click a synth unit → toggle its inline editor
@@ -3980,13 +4911,19 @@ impl DemoApp {
         }
 
         // Cursor affordances.
+        let on_field = match self.hover {
+            Some(Hit::Unit(u)) if self.side == Side::Front => self.on_face_field(u, l.to_pos2()),
+            _ => false,
+        };
         let icon = if matches!(self.drag, Drag::Unit { .. }) {
             CursorIcon::Grabbing
         } else if ctrl && matches!(self.hover, Some(Hit::Unit(_))) {
             CursorIcon::Grab
+        } else if on_field || matches!(self.drag, Drag::Split { .. } | Drag::Bpm { .. }) {
+            CursorIcon::ResizeVertical
         } else {
             match self.hover {
-                Some(Hit::Play) | Some(Hit::Flip) | Some(Hit::Jack { .. }) | Some(Hit::Key(_)) => CursorIcon::PointingHand,
+                Some(Hit::Play) | Some(Hit::Jack { .. }) | Some(Hit::Key(_)) => CursorIcon::PointingHand,
                 Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
                 Some(Hit::Cable(..)) => match self.drag {
                     Drag::Cable { .. } => CursorIcon::Grabbing,
@@ -4004,6 +4941,7 @@ impl DemoApp {
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
         let painter = ui.painter();
         theme::paper_bg(&painter, rect);
 
@@ -4013,6 +4951,7 @@ impl DemoApp {
         let rack_local = Rect::from_min_size(Pos2::ZERO, Vec2::new(self.rack_w, self.rack_h));
         let rack = self.xf.rect(rack_local);
         let mut rp = painter.clone();
+        if let Some(clip) = self.rack_clip { rp.set_clip_rect(clip.intersect(rect)); }
         rp.set_opacity(self.load_fade);
         rp.rect_filled(rack, 36.0, CHASSIS);
 
@@ -4024,10 +4963,251 @@ impl DemoApp {
             }
         }
 
+        self.draw_pan_bars(&painter);
         self.draw_toolbar(&painter, self.toolbar_top);
         self.draw_hint(&painter, rect);
         if self.show_stats { self.draw_stats(&painter, rect); }
         if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// Hairline pan indicators when the rack overflows the stage: a thumb
+    /// showing the visible part on the bottom / right edge of the view.
+    fn draw_pan_bars(&self, painter: &egui::Painter) {
+        let Some(view) = self.rack_clip.map(|c| c.shrink(8.0)) else { return };
+        let ov = self.rack_overflow;
+        if ov.x > 0.0 {
+            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 6.0), Pos2::new(view.right() - 40.0, view.bottom() + 9.0));
+            let frac = view.width() / self.rack_w;
+            let t = 0.5 - self.rack_pan.x / ov.x.max(1.0); // pan +ov/2 = left end
+            let w = track.width() * frac;
+            let x = track.left() + (track.width() - w) * t.clamp(0.0, 1.0);
+            painter.rect_filled(track, 1.5, theme::HAIRLINE);
+            painter.rect_filled(Rect::from_min_size(Pos2::new(x, track.top()), Vec2::new(w, track.height())), 1.5, theme::CREAM_DIM);
+        }
+        if ov.y > 0.0 {
+            let track = Rect::from_min_max(Pos2::new(view.right() + 4.0, view.top() + 20.0), Pos2::new(view.right() + 7.0, view.bottom() - 20.0));
+            let frac = view.height() / self.rack_h;
+            let t = 0.5 - self.rack_pan.y / ov.y.max(1.0);
+            let h = track.height() * frac;
+            let y = track.top() + (track.height() - h) * t.clamp(0.0, 1.0);
+            painter.rect_filled(track, 1.5, theme::HAIRLINE);
+            painter.rect_filled(Rect::from_min_size(Pos2::new(track.left(), y), Vec2::new(track.width(), h)), 1.5, theme::CREAM_DIM);
+        }
+    }
+
+    /// The MIDI matrix as a MAIN-STAGE view (one-window rule, F11 / Matrix
+    /// chip): masthead stays, the rack is replaced by a flat dark hero sheet
+    /// (help-card motif, radius 28) holding the grid and — when a cell's rule
+    /// is being edited — the inline rule editor on the right.
+    fn matrix_stage(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        self.draw_toolbar(&painter, self.toolbar_top);
+
+        let top = self.toolbar_top + 80.0;
+        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
+        let sheet = Rect::from_min_max(
+            Pos2::new(rect.center().x - w / 2.0, top),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + 160.0)),
+        );
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let inner = sheet.shrink2(Vec2::new(32.0, 26.0));
+        let help = self.show_help;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("MIDI matrix").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack")
+                        .size(13.0).color(theme::INK_2));
+                });
+                ui.add_space(12.0);
+                let editor_w = if self.rule_editor.is_some() { 290.0 } else { 0.0 };
+                let h = ui.available_height();
+                ui.horizontal_top(|ui| {
+                    let gap = if editor_w > 0.0 { 25.0 } else { 0.0 };
+                    let grid_w = (ui.available_width() - editor_w - gap).max(200.0);
+                    ui.allocate_ui_with_layout(egui::vec2(grid_w, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                        egui::ScrollArea::both()
+                            .id_salt("matrix_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.matrix_grid_ui(ui));
+                    });
+                    if editor_w > 0.0 {
+                        ui.add_space(12.0);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+                        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                        ui.add_space(12.0);
+                        ui.allocate_ui_with_layout(egui::vec2(editor_w, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            self.rule_editor_ui(ui);
+                        });
+                    }
+                });
+            });
+        });
+
+        if self.show_stats { self.draw_stats(&painter, rect); }
+        if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// Audio sources of a rig, with the knob that sets each one's level:
+    /// synths, LV2 instruments and generator units (no audio input — system
+    /// audio, player, metronome). Effects and Keys are not sources.
+    fn mixer_sources(&self, rig: u8) -> Vec<(usize, Option<usize>)> {
+        self.units.iter().enumerate()
+            .filter(|(_, u)| u.rig == rig)
+            .filter(|(_, u)| match u.node_kind {
+                UnitKind::Clap => true,
+                UnitKind::Keys | UnitKind::Master => false,
+                UnitKind::Dsp(_) => u.lv2_inst
+                    || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
+            })
+            .map(|(i, u)| (i, u.knobs.iter().position(|k| k.param.is_some()
+                && matches!(k.label, "LEVEL" | "GAIN" | "VOLUME" | "VOL"))))
+            .collect()
+    }
+
+    /// Set a unit knob from the mixer and publish it (same path as the rack).
+    fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
+        let Some(u) = self.units.get_mut(unit) else { return };
+        let Some(k) = u.knobs.get_mut(knob) else { return };
+        k.value = v.clamp(0.0, 1.0);
+        if let (Some(p), Some(bus)) = (k.param, &self.bus) {
+            let _ = bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+        }
+    }
+
+    /// Mixer stage: every source → its rig bus → Master out, as channel
+    /// strips. Source faders drive the units' own level knobs; the rig bus is
+    /// the engine's per-rig mix (vol/pan/mute/solo). A main-stage view like the
+    /// matrix (rule 8) — Tab / Esc return to the rack.
+    fn mixer_stage(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        self.draw_toolbar(&painter, self.toolbar_top);
+        let top = self.toolbar_top + 80.0;
+        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
+        let sheet = Rect::from_min_max(
+            Pos2::new(rect.center().x - w / 2.0, top),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + 200.0)),
+        );
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let inner = sheet.shrink2(Vec2::new(32.0, 26.0));
+        let help = self.show_help;
+        let n = self.rig_count();
+        self.mixer_fader_rects.clear();
+        let mut switch: Option<usize> = None;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("every source → its rig bus → Master out · Tab / Esc: back to the rack")
+                        .size(13.0).color(theme::INK_2));
+                });
+                ui.add_space(14.0);
+                let h = ui.available_height();
+                // Strip height: name + sub + fader + value + bus controls.
+                let fader_h = (h - 150.0).clamp(90.0, 480.0);
+                let master_w = 120.0;
+                ui.horizontal_top(|ui| {
+                    let scroll_w = (ui.available_width() - master_w - 24.0).max(200.0);
+                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                for rig in 0..n {
+                                    if rig > 0 {
+                                        let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                    }
+                                    ui.vertical(|ui| {
+                                        let name = self.rig_name(rig);
+                                        let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), rig == self.active_rig && n > 1)
+                                            .on_hover_text("show this rig in the rack view");
+                                        if chip.clicked() { switch = Some(rig); }
+                                        ui.add_space(8.0);
+                                        ui.horizontal_top(|ui| {
+                                            for (unit, knob) in self.mixer_sources(rig as u8) {
+                                                let (uname, sub, level) = {
+                                                    let u = &self.units[unit];
+                                                    (sentence_case(&u.name), u.sub.clone(), u.led)
+                                                };
+                                                let mut v = knob.map(|k| self.units[unit].knobs[k].value);
+                                                mixer_strip(ui, &uname, &sub, &mut v, level, fader_h);
+                                                if let (Some(k), Some(v)) = (knob, v) {
+                                                    if (v - self.units[unit].knobs[k].value).abs() > f32::EPSILON {
+                                                        self.set_unit_knob(unit, k, v);
+                                                    }
+                                                }
+                                            }
+                                            // The rig bus: engine per-rig mix.
+                                            let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
+                                            let mut m = self.rig_mix[rig.min(7)];
+                                            let mut v = Some(m.vol);
+                                            let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
+                                            self.mixer_fader_rects.push(fr);
+                                            let mut changed = v != Some(m.vol);
+                                            m.vol = v.unwrap_or(m.vol);
+                                            // Pan + mute/solo under the bus strip.
+                                            ui.vertical(|ui| {
+                                                ui.add_space(fader_h * 0.5);
+                                                ui.label(egui::RichText::new("pan").size(10.0).color(theme::INK_2));
+                                                let mut p = m.pan;
+                                                let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2)));
+                                                if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
+                                                ui.add_space(6.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
+                                                            .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                                                        .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
+                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                                                    if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; changed = true; }
+                                                    let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
+                                                            .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                                                        .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
+                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                                                    if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; changed = true; }
+                                                });
+                                            });
+                                            if changed {
+                                                self.rig_mix[rig.min(7)] = m;
+                                                self.send_rig_mix(rig);
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+                        });
+                    });
+                    // Master out: the physical output, every rig bus summed.
+                    let (r, _) = ui.allocate_exact_size(egui::vec2(24.0, h - 8.0), egui::Sense::hover());
+                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
+                    ui.vertical(|ui| {
+                        ui.set_width(master_w - 24.0);
+                        theme::section_label(ui, "Master out");
+                        ui.add_space(8.0);
+                        let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+                        ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
+                        ui.add_space(8.0);
+                        let (mr, _) = ui.allocate_exact_size(egui::vec2(14.0, fader_h), egui::Sense::hover());
+                        paint_meter(ui.painter(), mr, self.meter, self.meter_peak);
+                    });
+                });
+            });
+        });
+        if let Some(r) = switch { self.set_active_rig(r); }
+        if self.show_stats { self.draw_stats(&painter, rect); }
+        if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// Tab: in matrix mode it returns to the rack; otherwise it flips the rack.
+    fn on_tab(&mut self) {
+        if self.show_matrix { self.show_matrix = false; }
+        else if self.show_mixer { self.show_mixer = false; }
+        else { self.start_flip(); }
     }
 
     fn draw_rails(&self, painter: &egui::Painter) {
@@ -4095,8 +5275,11 @@ impl DemoApp {
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
 
-            self.text(painter, r.min.to_vec2() + Vec2::new(34.0, 17.0), &u.name_g, TEXT);
-            self.text_tracked(painter, r.min.to_vec2() + Vec2::new(34.0, 42.0), &u.sub_g, SUBTEXT);
+            // Labels are fitted to the unit (ensure_galleys) AND clipped to
+            // it: no label pixel may leave its box into a neighbor (C4).
+            let label_painter = painter.with_clip_rect(sr.intersect(painter.clip_rect()));
+            self.text(&label_painter, r.min.to_vec2() + Vec2::new(34.0, 17.0), &u.name_g, TEXT);
+            self.text_tracked(&label_painter, r.min.to_vec2() + Vec2::new(34.0, 42.0), &u.sub_g, SUBTEXT);
 
             // Activity LED: flat teal disc (+ optional flat halo), accent
             // while dragged. No glow stack.
@@ -4106,9 +5289,13 @@ impl DemoApp {
             self.ell(painter, led, 3.2, alpha(led_col, 0.25 + 0.75 * u.led), Stroke::NONE);
 
             match &u.node_kind {
-                UnitKind::Keys => self.draw_keyboard(painter),
+                UnitKind::Keys => {
+                    self.draw_keyboard(painter);
+                    self.draw_split_face(painter, ui);
+                }
                 UnitKind::Clap => self.draw_surge_display(painter, ui),
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
+                UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, r),
             }
@@ -4116,6 +5303,152 @@ impl DemoApp {
             for ki in 0..u.knobs.len() {
                 self.draw_knob(painter, ui, ki);
             }
+        }
+    }
+
+    /// Is the pointer over rack-local `rect` of `unit` (front face hover)?
+    fn face_hovered(&self, painter: &egui::Painter, unit: usize, rect: Rect) -> bool {
+        matches!(self.hover, Some(Hit::Unit(h)) if h == unit)
+            && painter.ctx().pointer_hover_pos().map_or(false, |p| rect.contains(self.xf.inv(p).to_pos2()))
+    }
+
+    /// A face chip in the theme::chip_button language with EXPLICIT colors
+    /// per state (rule 1): on = cream fill + near-black label; off = raised
+    /// dark chip + hairline + cream-mid label; hover brightens.
+    fn paint_face_chip(&self, painter: &egui::Painter, rect: Rect, label: &str, on: bool, hovered: bool) {
+        let (fill, stroke, txt) = match (on, hovered) {
+            (true, false) => (theme::CREAM, theme::CREAM, theme::DARK_PANEL),
+            (true, true) => (mix(theme::CREAM, theme::DARK_PANEL, 0.10), mix(theme::CREAM, theme::DARK_PANEL, 0.10), theme::DARK_PANEL),
+            (false, false) => (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID),
+            (false, true) => (mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM),
+        };
+        let sc = self.xf.rect(rect);
+        painter.rect_filled(sc, 2.0, fill);
+        painter.rect_stroke(sc, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        self.face_text(painter, rect.center(), label, theme::medium_font(12.0), txt);
+    }
+
+    /// A recessed drag readout (split point / BPM): dark field + hairline
+    /// that brightens on hover/drag; value text is explicit cream (rule 1).
+    fn paint_face_field(&self, painter: &egui::Painter, rect: Rect, active: bool) {
+        let sc = self.xf.rect(rect);
+        painter.rect_filled(sc, 2.0, CHASSIS);
+        let stroke = if active { theme::CREAM_DIM } else { theme::HAIRLINE };
+        painter.rect_stroke(sc, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    }
+
+    /// Centered single-line face text at rack-local `center`, faded with the
+    /// flip like every other rack label. Layout happens on the painter (not
+    /// inside fonts_mut — egui deadlock rule).
+    fn face_text(&self, painter: &egui::Painter, center: Pos2, text: &str, font: FontId, color: Color32) {
+        if self.text_alpha <= 0.01 { return; }
+        let g = painter.layout_no_wrap(text.into(), font, color);
+        let pos = self.xf.p(center.to_vec2() - g.size() / 2.0);
+        let mut tp = painter.clone();
+        tp.set_opacity(self.text_alpha);
+        tp.galley(pos, g, color);
+    }
+
+    /// Keys face: SPLIT chip (split at C4 / unsplit) + the split point as a
+    /// drag readout (note name) while split.
+    fn draw_split_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some((chip, readout)) = self.split_rects(unit) else { return };
+        let point = self.shown_split(unit);
+        let hov_chip = self.face_hovered(painter, unit, chip);
+        self.paint_face_chip(painter, chip, "SPLIT", point.is_some(), hov_chip);
+        if let Some(p) = point {
+            let dragging = matches!(self.drag, Drag::Split { unit: du, .. } if du == unit);
+            let active = dragging || self.face_hovered(painter, unit, readout);
+            self.paint_face_field(painter, readout, active);
+            self.face_text(painter, readout.center(), &note_name(p), theme::medium_font(12.0), TEXT);
+        }
+    }
+
+    /// Transport face (metronome; file player later): a Play/Stop chip in the
+    /// theme::chip_button style — playing = cream fill + near-black label,
+    /// stopped = raised dark chip + hairline — with explicit label colors
+    /// (rule 1), plus a teal state LED that thumps on the beat. Reflects the
+    /// unit's engine-mirrored `playing` flag.
+    fn draw_transport_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some(chip) = self.transport_chip_rect(unit) else { return };
+        let u = &self.units[unit];
+        let xf = &self.xf;
+        let hovered = matches!(self.hover, Some(Hit::Unit(h)) if h == unit)
+            && painter.ctx().pointer_hover_pos().map_or(false, |p| chip.contains(xf.inv(p).to_pos2()));
+        let (fill, stroke, txt) = match (u.playing, hovered) {
+            (true, false) => (theme::CREAM, theme::CREAM, theme::DARK_PANEL),
+            (true, true) => (mix(theme::CREAM, theme::DARK_PANEL, 0.10), mix(theme::CREAM, theme::DARK_PANEL, 0.10), theme::DARK_PANEL),
+            (false, false) => (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID),
+            (false, true) => (mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM),
+        };
+        let sc = xf.rect(chip);
+        painter.rect_filled(sc, 2.0, fill);
+        painter.rect_stroke(sc, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        // Glyph (10px pad from the chip edge): ▶ when stopped, ■ when playing.
+        let gc = Vec2::new(chip.left() + 10.0 + 4.0, chip.center().y);
+        if u.playing {
+            let sq = Rect::from_center_size(gc.to_pos2(), Vec2::splat(8.0));
+            painter.rect_filled(xf.rect(sq), 1.0, txt);
+        } else {
+            let pts = [gc + Vec2::new(-3.5, -4.5), gc + Vec2::new(-3.5, 4.5), gc + Vec2::new(4.5, 0.0)];
+            painter.add(Shape::convex_polygon(pts.iter().map(|p| xf.p(*p)).collect(), txt, Stroke::NONE));
+        }
+        if self.text_alpha > 0.01 {
+            let g = painter.layout_no_wrap(
+                if u.playing { "STOP" } else { "PLAY" }.into(), theme::medium_font(12.0), txt);
+            let pos = xf.p(Vec2::new(chip.left() + 24.0, chip.center().y - g.size().y / 2.0));
+            let mut tp = painter.clone();
+            tp.set_opacity(self.text_alpha);
+            tp.galley(pos, g, txt);
+        }
+        // State LED: teal while this instrument plays (thumps on the beat
+        // when the master clock runs), dim track when stopped.
+        let led = Vec2::new(chip.right() + 16.0, chip.center().y);
+        if u.playing {
+            let beat = 60.0 / self.bpm.max(1.0) as f64;
+            let phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
+            let thump = if self.playing { (1.0 - phase).powi(3) } else { 0.0 };
+            self.ell(painter, led, 7.0 + 2.0 * thump, alpha(GREEN, 0.15 + 0.15 * thump), Stroke::NONE);
+            self.ell(painter, led, 4.0, GREEN, Stroke::NONE);
+        } else {
+            self.ell(painter, led, 4.0, theme::METER_TRACK, Stroke::NONE);
+        }
+        self.draw_bpm_control(painter, unit);
+    }
+
+    /// Metronome-face tempo: −/+ steppers around a drag readout ("96 BPM").
+    /// Shows the ONE global tempo: every metronome face reads and sets the
+    /// same engine SetBpm value (per-face Play/Stop stays per instrument).
+    fn draw_bpm_control(&self, painter: &egui::Painter, unit: usize) {
+        let Some(b) = self.bpm_rects(unit) else { return };
+        for (rect, plus) in [(b.minus, false), (b.plus, true)] {
+            let Some(rect) = rect else { continue };
+            let hov = self.face_hovered(painter, unit, rect);
+            self.paint_face_chip(painter, rect, "", false, hov);
+            // Painted glyphs (no font dependency for − / +), explicit color.
+            let col = if hov { theme::CREAM } else { theme::CREAM_MID };
+            let c = rect.center();
+            let st = Stroke::new(1.5, col);
+            painter.line_segment([self.xf.p(c.to_vec2() + Vec2::new(-4.5, 0.0)), self.xf.p(c.to_vec2() + Vec2::new(4.5, 0.0))], st);
+            if plus {
+                painter.line_segment([self.xf.p(c.to_vec2() + Vec2::new(0.0, -4.5)), self.xf.p(c.to_vec2() + Vec2::new(0.0, 4.5))], st);
+            }
+        }
+        let dragging = matches!(self.drag, Drag::Bpm { .. }) && matches!(self.hover, Some(Hit::Unit(h)) if h == unit);
+        let active = dragging || self.face_hovered(painter, unit, b.value);
+        self.paint_face_field(painter, b.value, active);
+        // Number (Medium 13, cream) + tracked-feel "BPM" caption (cream-mid),
+        // centered together with a 4px gap — ≥ 8px side padding at "300".
+        if self.text_alpha > 0.01 {
+            let num = painter.layout_no_wrap(format!("{:.0}", self.bpm), theme::medium_font(13.0), TEXT);
+            let cap = painter.layout_no_wrap("BPM".into(), FontId::proportional(9.0), SUBTEXT);
+            let w = num.size().x + 4.0 + cap.size().x;
+            let c = b.value.center();
+            let x0 = c.x - w / 2.0;
+            let mut tp = painter.clone();
+            tp.set_opacity(self.text_alpha);
+            tp.galley(self.xf.p(Vec2::new(x0, c.y - num.size().y / 2.0)), num.clone(), TEXT);
+            tp.galley(self.xf.p(Vec2::new(x0 + num.size().x + 4.0, c.y - cap.size().y / 2.0 + 0.5)), cap, SUBTEXT);
         }
     }
 
@@ -4163,6 +5496,24 @@ impl DemoApp {
             let fill = if lit > 0.02 { theme::ACCENT } else { BLACK };
             painter.rect_filled(xf.rect(kr), 1.5, fill);
             painter.rect_stroke(xf.rect(kr), 1.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        }
+        // Split marker: a cream hairline at the LOW|HIGH boundary when the
+        // split point falls inside the on-screen octave (C4..C5 = 60..72).
+        if let Some(p) = self.keys_unit.and_then(|k| self.shown_split(k)) {
+            let semi = p as i32 - 60;
+            if (1..=12).contains(&semi) {
+                let semi = semi as usize;
+                let x = match WHITE_SEMI.iter().position(|&w| w == semi) {
+                    Some(wi) => self.key_rect(wi).left() - 0.5,
+                    None => {
+                        let bi = BLACK_SEMI.iter().position(|&b| b == semi).unwrap_or(0);
+                        self.key_rect(BLACK_AFTER[bi]).right() - self.key_w() * 0.31
+                    }
+                };
+                let top = self.key_rect(0).top() - 6.0;
+                let bot = self.key_rect(0).bottom() + 6.0;
+                painter.line_segment([xf.p(Vec2::new(x, top)), xf.p(Vec2::new(x, bot))], Stroke::new(2.0, theme::CREAM));
+            }
         }
     }
 
@@ -4264,16 +5615,17 @@ impl DemoApp {
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
         self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
 
-        // Drag chip: a paper sticker with the value in Medium 13px ink.
+        // Drag chip: a dark sticker with the value in Medium 13px cream.
         if dragging {
             let g = painter.layout(format!("{:.2}", k.value), theme::medium_font(13.0), theme::INK, f32::INFINITY);
             let chip = Rect::from_min_size(
-                xf.p(c + Vec2::new(-g.size().x / 2.0 - 6.0, -r - 28.0)),
-                g.size() + Vec2::new(12.0, 6.0),
+                xf.p(c + Vec2::new(-g.size().x / 2.0 - 8.0, -r - 30.0)),
+                g.size() + Vec2::new(16.0, 10.0),
             );
             theme::drop_shadow(painter, chip, 6.0);
-            painter.rect_filled(chip, 6.0, theme::PAPER);
-            painter.galley(chip.min + Vec2::new(6.0, 3.0), g, theme::INK);
+            painter.rect_filled(chip, 6.0, theme::PAPER_SINK);
+            painter.rect_stroke(chip, 6.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            painter.galley(chip.min + Vec2::new(8.0, 5.0), g, theme::INK);
         }
     }
 
@@ -4363,9 +5715,10 @@ impl DemoApp {
 
     fn cable_color(&self, c: &Cable) -> Color32 {
         let mut col = c.color;
-        if c.kind == PortKind::Audio {
-            // Subtle flat warm shift toward the accent (§4.10): TONE·0.20 +
-            // WARM·0.15 — keeps the knob feedback without a rainbow.
+        if c.kind == PortKind::Audio && c.color == theme::AUDIO_CREAM {
+            // Subtle flat warm shift toward the accent (§4.10), ONLY for the
+            // neutral cream jacket: TONE·0.20 + WARM·0.15. Colored jackets keep
+            // their hue so tomato stays scarce (selection-only) on the back.
             let mut t = 0.0;
             if let Some(su) = self.units.get(c.src) {
                 if matches!(su.node_kind, UnitKind::Clap) {
@@ -4389,8 +5742,8 @@ impl DemoApp {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, has_sel, hl[ci]);
             if a <= 0.01 { continue; }
-            let hovered = matches!(self.hover, Some(Hit::Cable(i, _)) if i == ci);
-            let grabbed = matches!(self.drag, Drag::Cable { ci: i, .. } if i == ci);
+            let hovered = matches!(self.hover, Some(Hit::Cable(id, _)) if id == c.id);
+            let grabbed = matches!(self.drag, Drag::Cable { id, .. } if id == c.id);
             let level = if c.kind == PortKind::Audio {
                 ((c.level + 0.05 + 0.035 * (self.ui_time * 1.4 + c.phase).sin()) * volume).clamp(0.0, 1.0)
             } else { 0.0 };
@@ -4537,32 +5890,27 @@ impl DemoApp {
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
     }
 
-    /// The flip pill rect (§4.13): right-anchored at the masthead's right edge,
-    /// width follows the measured label. Shared by draw_toolbar and hit_test.
-    fn flip_rect(&self) -> Rect {
-        Rect::from_min_size(Pos2::new(430.0 - self.flip_w, self.toolbar_top + 28.0), Vec2::new(self.flip_w, 32.0))
-    }
-
     fn draw_toolbar(&self, painter: &egui::Painter, top: f32) {
         // Open masthead (§2.4: structure with rules, not boxes): the wordmark
-        // sits directly on the paper — the reference's display moment. Only
-        // the play circle and the single flip pill are objects here.
+        // sits directly on the paper — the reference's display moment. The
+        // play circle is the only object here (Tab flips; no flip pill).
         let c = Pos2::new(40.0, top + 44.0);
         let ht = self.play_hover_t;
-        let ink = BLACK;
+        // Idle = dark disc + cream ring/glyph; playing = teal + dark glyph.
+        let glyph = if self.playing { BLACK } else { theme::INK };
         if self.playing {
             painter.circle_filled(c, 15.0, mix(GREEN, BLACK, 0.08 * ht));
         } else {
             painter.circle_filled(c, 15.0, mix(theme::PAPER, theme::PAPER_SINK, ht));
-            painter.circle_stroke(c, 15.0, Stroke::new(1.5, ink));
+            painter.circle_stroke(c, 15.0, Stroke::new(1.5, glyph));
         }
         if self.playing {
             // Stop square (transport is Play/Stop, not play/pause).
-            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 38.5), Vec2::new(11.0, 11.0)), 1.6, ink);
+            painter.rect_filled(Rect::from_min_size(Pos2::new(34.5, top + 38.5), Vec2::new(11.0, 11.0)), 1.6, glyph);
         } else {
             painter.add(Shape::convex_polygon(
                 vec![Pos2::new(36.5, top + 36.5), Pos2::new(36.5, top + 51.5), Pos2::new(48.5, top + 44.0)],
-                ink, Stroke::NONE));
+                glyph, Stroke::NONE));
         }
 
         // Beat dot: teal thump, no glow ring.
@@ -4571,30 +5919,27 @@ impl DemoApp {
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
         painter.circle_filled(Pos2::new(66.0, top + 44.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
-        // Asterisk + display wordmark — the editorial display moment.
-        theme::asterisk(painter, Pos2::new(80.0, top + 33.0), 9.0, theme::ACCENT, 2.0);
+        // Display wordmark with a small, understated mono brand mark tight to
+        // its left (user 2026-11-15: "more dezent"): 16 px, sitting on the
+        // wordmark baseline across the x-height. The full-color crafted mark
+        // lives in assets/logo.svg, the window icon and the help card.
+        let word_x = 98.0;
         if let Some(g) = &self.wordmark_g {
-            theme::paint_tracked(painter, Pos2::new(94.0, top + 18.0), g, theme::INK);
+            let base = g.chars.first()
+                .and_then(|(c, _)| c.rows.first().and_then(|r| r.glyphs.first().map(|gl| r.pos.y + gl.pos.y)))
+                .unwrap_or(g.size.y * 0.8);
+            theme::crossed_wires(painter, Pos2::new(word_x - 12.0, top + 18.0 + base - 8.0), 16.0,
+                theme::PAPER, theme::MarkStyle::Mono);
+            theme::paint_tracked(painter, Pos2::new(word_x, top + 18.0), g, theme::INK);
         }
         // State line: tracked micro-caps; a 6px teal dot precedes "playing".
         let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
         let state_x = if self.playing {
-            painter.circle_filled(Pos2::new(97.0, top + 57.0), 3.0, GREEN);
-            104.0
-        } else { 94.0 };
+            painter.circle_filled(Pos2::new(word_x + 3.0, top + 57.0), 3.0, GREEN);
+            word_x + 10.0
+        } else { word_x };
         if let Some(g) = state_g {
             theme::paint_tracked(painter, Pos2::new(state_x, top + 52.0), g, theme::INK_2);
-        }
-
-        // Flip button = the app's single pill (§4.13): vivid accent fill,
-        // inset cream keyline, Bold 19px cream label (WCAG large text).
-        let fb = self.flip_rect();
-        let fh = self.flip_hover_t;
-        painter.rect_filled(fb, fb.height() / 2.0, mix(theme::ACCENT, BLACK, 0.08 * fh));
-        theme::inset_keyline(painter, fb, fb.height() / 2.0, alpha(theme::ON_ACCENT, 0.9), 1.5, 2.5);
-        if let Some(g) = &self.flip_label_g {
-            let pos = fb.center() - g.size() * 0.5;
-            painter.galley(pos, g.clone(), WHITE);
         }
     }
 
@@ -4604,7 +5949,16 @@ impl DemoApp {
             else if self.side == Side::Front { &self.hint_front_g }
             else { &self.hint_back_g };
         let Some(g) = g else { return };
-        painter.galley(Pos2::new(16.0, rect.bottom() - 24.0), g.clone(), theme::INK_2);
+        let pos = Pos2::new(16.0, rect.bottom() - 24.0);
+        // A refused patch (duplicate, cable limit) replaces the hint briefly.
+        if let Some((msg, until)) = &self.patch_notice {
+            if *until > self.ui_time {
+                let ng = painter.layout_no_wrap(msg.clone(), FontId::proportional(12.5), theme::ACCENT_DEEP);
+                painter.galley(pos, ng, theme::ACCENT_DEEP);
+                return;
+            }
+        }
+        painter.galley(pos, g.clone(), theme::INK_2);
     }
 
     fn draw_stats(&mut self, painter: &egui::Painter, rect: Rect) {
@@ -4622,10 +5976,10 @@ impl DemoApp {
         }
         if let Some(g) = &self.stats_g {
             let w = g.size().x + 24.0;
-            let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 26.0));
+            let bar = Rect::from_min_size(Pos2::new(rect.right() - w - 16.0, 16.0), Vec2::new(w, 28.0));
             painter.rect_filled(bar, 2.0, theme::PAPER_SINK);
             painter.rect_stroke(bar, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-            painter.galley(bar.min + Vec2::new(12.0, 6.0), g.clone(), theme::INK_2);
+            painter.galley(bar.min + Vec2::new(12.0, 7.0), g.clone(), theme::INK_2);
         }
     }
 
@@ -4633,17 +5987,63 @@ impl DemoApp {
         // Help modal (§4.16): ink scrim over paper, a second appearance of
         // the hero-panel motif — flat near-black card, radius 28, no border.
         painter.rect_filled(rect, 0.0, alpha(theme::SCRIM, 0.62));
-        let card = Rect::from_center_size(rect.center(), Vec2::new(560.0, 352.0));
-        // Flat dark card (hero-panel motif), no shadow — the scrim separates it.
+        let (Some(title), Some(foot)) = (&self.help_title_g, &self.help_foot_g) else { return };
+        const PAD: f32 = 32.0;
+        const GUTTER: f32 = 44.0;
+        let chip_h = self.help_cols.iter()
+            .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.size().y)))
+            .fold(0.0, f32::max) + 2.0 * HELP_CHIP_PAD.y;
+        let n_rows = self.help_cols.iter().map(|c| c.rows.len()).max().unwrap_or(0) as f32;
+        let cols_w: f32 = self.help_cols.iter().map(|c| c.width).sum::<f32>()
+            + GUTTER * self.help_cols.len().saturating_sub(1) as f32;
+        // Vertical rhythm: title row, hairline, section header, rows, hairline, footer.
+        let title_h = title.size.y.max(26.0);
+        let head_h = self.help_cols.iter().map(|c| c.header.size.y).fold(0.0, f32::max);
+        let fixed_h = PAD + title_h + 20.0 + head_h + 14.0 + 18.0 + foot.size.y + PAD - 6.0;
+        // Generous leading (≥ 6px between chips); compress toward that floor
+        // only if the window is too short for the natural pitch.
+        let room = (rect.height() - 32.0 - fixed_h).max(0.0);
+        let pitch = (chip_h + 10.0).min((room / n_rows.max(1.0)).max(chip_h + 6.0));
+        let card_w = (cols_w.max(title.size.x + 34.0) + 2.0 * PAD).max(560.0);
+        let card_h = fixed_h + pitch * n_rows;
+        let card = Rect::from_center_size(rect.center(), Vec2::new(card_w, card_h));
         painter.rect_filled(card, 28.0, theme::DARK_PANEL);
-        theme::asterisk(painter, card.min + Vec2::new(34.0, 36.0), 7.0, theme::ACCENT, 2.0);
-        if let Some(g) = &self.help_title_g {
-            theme::paint_tracked(painter, card.min + Vec2::new(48.0, 22.0), g, TEXT);
+
+        // Title row: crossed-wires mark + display title.
+        let mut y = card.top() + PAD;
+        let mark_c = Pos2::new(card.left() + PAD + 11.0, y + title_h * 0.5);
+        theme::crossed_wires(painter, mark_c, 22.0, theme::DARK_PANEL, theme::MarkStyle::Brand);
+        theme::paint_tracked(painter, Pos2::new(card.left() + PAD + 34.0, y + (title_h - title.size.y) * 0.5), title, TEXT);
+        y += title_h + 10.0;
+        let rule = Stroke::new(1.0, theme::HAIRLINE);
+        painter.hline(card.left() + PAD..=card.right() - PAD, y, rule);
+        y += 10.0;
+
+        // Columns.
+        let mut x = card.left() + PAD + ((card_w - 2.0 * PAD - cols_w) * 0.5).max(0.0);
+        for c in &self.help_cols {
+            theme::paint_tracked(painter, Pos2::new(x, y), &c.header, SUBTEXT);
+            let mut ry = y + head_h + 14.0;
+            for r in &c.rows {
+                let mut kx = x;
+                for g in &r.keys {
+                    let chip = Rect::from_min_size(Pos2::new(kx, ry), Vec2::new(HelpRow::chip_w(g), chip_h));
+                    painter.rect_filled(chip, 5.0, theme::PAPER_SINK);
+                    painter.rect_stroke(chip, 5.0, rule, egui::StrokeKind::Inside);
+                    painter.galley(chip.center() - g.size() * 0.5, g.clone(), theme::CREAM);
+                    kx = chip.right() + HELP_CHIP_GAP;
+                }
+                let dy = ry + (chip_h - r.desc.size().y) * 0.5;
+                painter.galley(Pos2::new(x + c.keys_w + HELP_KEY_GAP, dy), r.desc.clone(), theme::CREAM_MID);
+                ry += pitch;
+            }
+            x += c.width + GUTTER;
         }
-        if let Some(g) = &self.help_body_g { painter.galley(card.min + Vec2::new(28.0, 58.0), g.clone(), TEXT); }
-        if let Some(g) = &self.help_foot_g {
-            theme::paint_tracked(painter, card.min + Vec2::new(28.0, 326.0), g, SUBTEXT);
-        }
+
+        // Footer: hairline + tracked micro-caps close hint.
+        let fy = card.bottom() - PAD + 6.0 - foot.size.y;
+        painter.hline(card.left() + PAD..=card.right() - PAD, fy - 12.0, rule);
+        theme::paint_tracked(painter, Pos2::new(card.left() + PAD, fy), foot, SUBTEXT);
     }
 }
 
@@ -4656,35 +6056,101 @@ fn p_side(unit: usize, app: &DemoApp) -> f32 {
     if x < app.rack_w / 2.0 { -1.0 } else { 1.0 }
 }
 
-impl eframe::App for DemoApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        // Tab belongs to the rack flip, ALWAYS. Strip it from raw input before
-        // egui processes anything, so its focus navigation can't steal it and
-        // bounce focus between the assistant field and the widgets.
-        let mut flip = false;
-        raw_input.events.retain(|ev| {
-            if matches!(ev, egui::Event::Key { key: Key::Tab, pressed: true, .. }) {
-                flip = true;
-                false
-            } else {
-                true
-            }
-        });
-        if flip {
-            self.flip_requested = true;
-        }
-    }
+/// Is the user typing into a text field (chat, API key, search, a DragValue
+/// in edit mode)? Only then do rack shortcuts yield. Not
+/// `egui_wants_keyboard_input()`: that is true for ANY focused widget.
+fn typing(ctx: &egui::Context) -> bool {
+    ctx.text_edit_focused()
+}
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+/// Strip-mixer values are drag controls: a click must not park them in
+/// text-edit mode, where they swallow 1–9/←→ rig switching (user bug
+/// 2026-11-15). Typed entry stays available in the rule editor.
+/// One mixer channel strip: name, sub, vertical fader (+ live meter), value.
+/// `value` None = a source without a level knob (meter only). Returns the
+/// fader rect. The fader is a custom drag widget: it never takes keyboard
+/// focus (rule 12), so rig shortcuts keep working after a drag.
+fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>, level: f32, fader_h: f32) -> Rect {
+    let w = 92.0;
+    let mut fader_rect = Rect::NOTHING;
+    ui.allocate_ui_with_layout(egui::vec2(w, fader_h + 90.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+        ui.set_width(w);
+        let name = if name.chars().count() > 11 { format!("{}…", name.chars().take(10).collect::<String>()) } else { name.to_string() };
+        ui.label(egui::RichText::new(name).size(13.0).strong().color(theme::INK));
+        let sub = sub.split('·').next().unwrap_or("").trim().to_uppercase();
+        let sub = if sub.chars().count() > 13 { format!("{}…", sub.chars().take(12).collect::<String>()) } else { sub };
+        theme::tracked_label(ui, &sub, 9.0, 0.12, theme::INK_2);
+        ui.add_space(8.0);
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
+        fader_rect = r;
+        let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
+        let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top()), egui::vec2(6.0, fader_h));
+        let p = ui.painter();
+        // Track: hairline groove; travel keeps the cap fully inside the rect.
+        let cap_h = 12.0;
+        let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
+        p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
+        if let Some(v) = value.as_mut() {
+            if resp.dragged() {
+                let dy = resp.drag_delta().y;
+                *v = (*v - dy / (y0 - y1)).clamp(0.0, 1.0);
+            }
+            if resp.double_clicked() { *v = 0.8; }
+            let y = y0 + (y1 - y0) * *v;
+            p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
+            let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
+            p.rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
+            p.line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+        }
+        paint_meter(p, mr, level, level);
+        if value.is_some() {
+            resp.on_hover_text("drag to set · double-click: 0.80");
+        }
+        ui.add_space(6.0);
+        let txt = value.map_or("—".to_string(), |v| format!("{v:.2}"));
+        ui.label(egui::RichText::new(txt).size(11.0).monospace().color(theme::CREAM_MID));
+    });
+    fader_rect
+}
+
+/// Vertical stepped meter (Hurricane: flat segments, cream → tomato → clip).
+fn paint_meter(p: &egui::Painter, r: Rect, level: f32, peak: f32) {
+    let segs = ((r.height() / 6.0) as usize).max(4);
+    let seg_h = r.height() / segs as f32;
+    let lit = (level.clamp(0.0, 1.0) * segs as f32).round() as usize;
+    let peak_i = (peak.clamp(0.0, 1.0) * segs as f32).round() as usize;
+    for i in 0..segs {
+        let y = r.bottom() - (i + 1) as f32 * seg_h;
+        let sr = Rect::from_min_size(Pos2::new(r.left(), y + 1.0), egui::vec2(r.width(), seg_h - 2.0));
+        let t = (i as f32 + 0.5) / segs as f32;
+        let on = i < lit || (peak_i > 0 && i + 1 == peak_i);
+        p.rect_filled(sr, 1.0, if on { theme::meter_color(t) } else { theme::METER_TRACK });
+    }
+}
+
+fn drag_only(r: egui::Response) -> egui::Response {
+    if r.has_focus() { r.surrender_focus(); }
+    r
+}
+
+impl DemoApp {
+    /// One app frame minus eframe plumbing (`ui()` delegates here) — tests
+    /// drive the exact runtime path through a plain `egui::Context`.
+    fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.ensure_galleys(&ctx);
 
         // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
         // output, and eframe re-applies it AFTER the app creator runs — so the
         // correction must live here, on the frame path, not in the creator.
-        if ctx.pixels_per_point() < 1.05 {
-            ctx.set_pixels_per_point(1.6);
-            eprintln!("ui scale: corrected to 1.60 on frame path");
+        // The target is the COMPOSITOR's monitor scale (ui_scale_target):
+        // winit-under-XWayland derives 2.33 from the panel's physical DPI on
+        // a 1.6x Hyprland output, which inflated every element by ~46% and
+        // squished the rack (user report 2026-11-15).
+        let target = ui_scale_target();
+        if (ctx.pixels_per_point() - target).abs() > 0.01 {
+            ctx.set_pixels_per_point(target);
+            eprintln!("ui scale: corrected to {target:.2} on frame path");
         }
         static SCALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SCALE_LOGGED.swap(true, Ordering::Relaxed) {
@@ -4693,7 +6159,12 @@ impl eframe::App for DemoApp {
 
         if self.flip_requested {
             self.flip_requested = false;
-            self.start_flip();
+            self.on_tab();
+        }
+        // Assistant bottom panel (F12) — handled before the panels so it
+        // works even while the chat field has keyboard focus.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
+            self.show_assistant = !self.show_assistant;
         }
 
         // Per-rig input selection strip (top, includes the transport row), then
@@ -4711,16 +6182,16 @@ impl eframe::App for DemoApp {
         // Laptop keys (disabled while the assistant text field has focus).
         // Losing keyboard focus drains held keys so note-offs can't orphan
         // (vibez lesson, docs/vibez-notes.md). held_keys are laptop keys, so
-        // the drain fires under the LaptopKeys source regardless of the last
+        // the drain fires under the Keyboard source regardless of the last
         // hardware event.
-        let kb_focus = !ctx.egui_wants_keyboard_input() && ctx.input(|i| i.focused);
+        let kb_focus = !typing(&ctx) && ctx.input(|i| i.focused);
         if !kb_focus && self.had_kb_focus && !self.held_keys.is_empty() {
-            self.current_source = SourceId::LaptopKeys;
+            self.current_source = SourceId::Keys;
             let held: Vec<_> = self.held_keys.drain(..).collect();
             for (_, semi) in held { self.fire_keys(semi, 0.0); }
         }
         self.had_kb_focus = kb_focus;
-        if !ctx.egui_wants_keyboard_input() {
+        if !typing(&ctx) {
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
                 if let egui::Event::Key { key, pressed, repeat, .. } = ev {
@@ -4766,95 +6237,48 @@ impl eframe::App for DemoApp {
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
         self.layout(rect);
-        if !ctx.egui_wants_keyboard_input() {
+        if !typing(&ctx) {
             self.handle_input(&ctx, rect);
         }
         self.update(dt);
 
-        // Publish the patch through the control plane: cables become Connect
-        // commands (duplicates rejected by the model), knobs become SetParam.
-        // Node ids come from the units (unit index ≠ node id in general).
-        if let Some(bus) = &self.bus {
-            let mut b = bus.lock().unwrap();
-            for c in &self.cables {
-                if c.dying >= 0.0 { continue; }
-                let (Some(sn), Some(dn)) = (
-                    self.units.get(c.src).map(|u| u.node_id),
-                    self.units.get(c.dst).map(|u| u.node_id),
-                ) else { continue };
-                let kind = match c.kind {
-                    PortKind::Midi => CPortKind::Midi,
-                    PortKind::Audio => CPortKind::Audio,
-                };
-                let _ = b.send(Command::Connect {
-                    id: c.id,
-                    from: PortRef { node: sn, port: c.src_port as u8 },
-                    to: PortRef { node: dn, port: c.dst_port as u8 },
-                    kind,
-                });
-            }
-            for u in &self.units {
-                for k in &u.knobs {
-                    if let Some(p) = k.param {
-                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
-                    }
-                }
-            }
-        }
-
-        // Mirror the live patch into the shared graph for bridge queries
-        // (task-16): loaded-graph nodes + living cables as edges. Rebuild only
-        // when the cable set changes — cheap per frame.
-        let sig: Vec<(u32, u32, u8, u32, u8, CPortKind)> = self
-            .cables
-            .iter()
-            .filter(|c| c.dying < 0.0)
-            .map(|c| {
-                let kind = match c.kind {
-                    PortKind::Midi => CPortKind::Midi,
-                    PortKind::Audio => CPortKind::Audio,
-                };
-                let sn = self.units.get(c.src).map(|u| u.node_id).unwrap_or(c.src as u32);
-                let dn = self.units.get(c.dst).map(|u| u.node_id).unwrap_or(c.dst as u32);
-                (c.id, sn, c.src_port as u8, dn, c.dst_port as u8, kind)
-            })
-            .collect();
-        if sig != self.graph_sig {
-            let mut g = self.base_graph.clone();
-            g.edges.clear();
-            for c in &self.cables {
-                if c.dying >= 0.0 { continue; }
-                let (Some(sn), Some(dn)) = (
-                    self.units.get(c.src).map(|u| u.node_id),
-                    self.units.get(c.dst).map(|u| u.node_id),
-                ) else { continue };
-                let kind = match c.kind {
-                    PortKind::Midi => CPortKind::Midi,
-                    PortKind::Audio => CPortKind::Audio,
-                };
-                g.connect_with_id(
-                    c.id,
-                    PortRef { node: sn, port: c.src_port as u8 },
-                    PortRef { node: dn, port: c.dst_port as u8 },
-                    kind,
-                );
-            }
-            if let Ok(mut shared) = self.shared_graph.lock() {
-                *shared = g;
-            }
-            self.graph_sig = sig;
-        }
+        self.publish_patch();
 
         self.tessellate();
-        self.draw(ui);
+        if self.show_matrix { self.matrix_stage(ui); }
+        else if self.show_mixer { self.mixer_stage(ui); }
+        else { self.draw(ui); }
         self.sessions_window(&ctx);
         self.plugins_window(&ctx);
-        self.transport_window(&ctx);
-        self.matrix_window(&ctx);
-        self.rule_editor_window(&ctx);
+        self.delete_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
         ctx.request_repaint();
+    }
+
+}
+
+impl eframe::App for DemoApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Tab belongs to the rack flip, ALWAYS. Strip it from raw input before
+        // egui processes anything, so its focus navigation can't steal it and
+        // bounce focus between the assistant field and the widgets.
+        let mut flip = false;
+        raw_input.events.retain(|ev| {
+            if matches!(ev, egui::Event::Key { key: Key::Tab, pressed: true, .. }) {
+                flip = true;
+                false
+            } else {
+                true
+            }
+        });
+        if flip {
+            self.flip_requested = true;
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.frame_ui(ui);
     }
 
     fn on_exit(&mut self) {
@@ -4896,6 +6320,26 @@ pub fn run_session_test() -> anyhow::Result<()> {
     anyhow::ensure!((app.units[3].knobs[0].value - 0.77).abs() < 1e-6, "master volume not restored");
     anyhow::ensure!((app.units[5].knobs[1].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
     anyhow::ensure!(loaded.graph.edges.len() == edges, "edge count changed across round-trip");
+
+    // --- Keys split (a node property): point + the HIGH cable round-trip ---
+    let k = app.keys_unit.ok_or_else(|| anyhow::anyhow!("demo has no Keys"))?;
+    app.set_keys_split(k, Some(60));
+    let surge_b = app.units.iter().position(|u| u.node_id == 4).ok_or_else(|| anyhow::anyhow!("no Surge B"))?;
+    let b = app.cables.iter().position(|c| c.src == k && c.dst == surge_b)
+        .ok_or_else(|| anyhow::anyhow!("no Keys→Surge B cable"))?;
+    let id = app.cables[b].id;
+    app.cables.remove(b);
+    app.add_cable_id(id, k, 1, surge_b, 0, PortKind::Midi); // Surge B on HIGH
+    let split_pkg = crate::session::Session::package_path(&dir, "selftest-split")?;
+    app.capture_session("selftest-split")?.save(&split_pkg)?;
+    app.set_keys_split(k, None);
+    app.apply_session(&crate::session::Session::load(&split_pkg)?)?;
+    let k = app.keys_unit.ok_or_else(|| anyhow::anyhow!("split session lost Keys"))?;
+    anyhow::ensure!(app.units[k].split == Some(60), "split point not restored");
+    anyhow::ensure!(app.units[k].jacks.len() == 2, "split Keys must show LOW + HIGH jacks");
+    anyhow::ensure!(app.cables.iter().any(|c| c.src == k && c.src_port == 1 && app.units[c.dst].node_id == 4),
+        "HIGH cable (Keys port 1 → Surge B) not restored");
+    println!("  keys split: point C4 + HIGH cable round-trip, two MIDI outs — OK");
 
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
@@ -5013,7 +6457,7 @@ fn preferred_host() -> cpal::Host {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
-fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>, Arc<Mutex<crate::engine::GraphPub>>)> {
+fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cpal::Stream, CommandBus, Arc<std::sync::atomic::AtomicU32>, f64, crate::player::PlayerControl, Arc<Mutex<crate::control::RigSnapshot>>, Arc<Mutex<crate::engine::GraphPub>>, Arc<EdgeLevels>)> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -5021,17 +6465,24 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     let cfg = device.default_output_config()?;
     let sample_rate = cfg.sample_rate() as f64;
     let ch = cfg.channels() as usize;
-    // Two instrument voices — one per channel stack (nodes 1 and 4).
-    let (voice_a, main_a) = ClapVoice::new(sample_rate)?;
-    let (voice_b, main_b) = ClapVoice::new(sample_rate)?;
+    // Instrument voice pool: the demo's two stacks (nodes 1 and 4) plus
+    // spares for added rigs. Idle voices (unmapped) are not rendered.
+    let mut voices = Vec::with_capacity(VOICE_POOL);
+    let mut mains = Vec::with_capacity(VOICE_POOL);
+    for i in 0..VOICE_POOL {
+        let (v, m) = ClapVoice::new(sample_rate)?;
+        let node = match i { 0 => 1, 1 => 4, _ => u32::MAX };
+        voices.push((node, v));
+        mains.push(m);
+    }
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
-    let controllers = vec![voice_a.controller(), voice_b.controller()];
+    let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
     let mut config: cpal::StreamConfig = cfg.into();
     // Low latency with headroom: 512 frames @48k = 10.7 ms. Survives CPU load
     // spikes (e.g. parallel builds) that would underrun a 256-frame buffer.
     config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms) voices=2",
+        "audio: host={} device={} rate={} ch={} buffer=512 frames ({:.1} ms) voices={VOICE_POOL}",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
@@ -5043,9 +6494,10 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
         Graph::demo_patch(),
         drain,
         sample_rate,
-        vec![(1, voice_a), (4, voice_b)],
+        voices,
     );
     let level = engine.level_handle();
+    let edge_levels = engine.edge_levels_handle();
     // Multi-rig snapshot: engine publishes rig list/active on LoadRigs; the
     // bridge + UI read it (the audio render path never locks it).
     let rig_snapshot = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
@@ -5080,7 +6532,35 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
         None,
     )?;
     stream.play()?;
-    Ok((vec![main_a, main_b], controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub))
+    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub, edge_levels))
+}
+
+/// UI scale (egui pixels_per_point): KABELSALAT_UI_SCALE overrides; else the
+/// focused Hyprland monitor's scale (what every native app on this output
+/// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
+/// Computed once — the hyprctl query never runs on the frame path again.
+fn ui_scale_target() -> f32 {
+    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        let valid = |s: f32| (1.0..=3.0).contains(&s);
+        if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
+            return s;
+        }
+        if cfg!(test) { return 1.6; }
+        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+            let out = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
+            if let Ok(out) = out {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+                    let mons = v.as_array().cloned().unwrap_or_default();
+                    let pick = mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first());
+                    if let Some(s) = pick.and_then(|m| m["scale"].as_f64()).map(|s| s as f32).filter(|s| valid(*s)) {
+                        return s;
+                    }
+                }
+            }
+        }
+        1.6
+    })
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -5109,7 +6589,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             .with_min_inner_size([760.0, 520.0])
             .with_maximized(true)
             .with_app_id("kabelsalat")
-            .with_title("kabelsalat"),
+            .with_title("kabelsalat")
+            // Crossed-wires brand mark (assets/logo.svg → icon-64.rgba, raw
+            // RGBA8 so no image decoder is needed at runtime).
+            .with_icon(egui::IconData {
+                rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
+                width: 64,
+                height: 64,
+            }),
         ..Default::default()
     };
     eframe::run_native(
@@ -5120,21 +6607,20 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
             // Only fall back to the native 1.6 if detection reports ~1.0 —
             // forcing a higher value makes elements oversized.
             let ppp = cc.egui_ctx.pixels_per_point();
-            if ppp < 1.05 {
-                cc.egui_ctx.set_pixels_per_point(1.6);
-            }
+            cc.egui_ctx.set_pixels_per_point(ui_scale_target());
             eprintln!(
                 "ui scale: detected={ppp:.2} used={:.2}",
                 cc.egui_ctx.pixels_per_point()
             );
             cc.egui_ctx.set_visuals(theme::visuals());
+            theme::install_spacing(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);
 
             let mut sink = sink;
             let mut audio = None;
             if with_audio {
                 match build_audio() {
-                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub)) => {
+                    Ok((mains, controllers, stream, bus, level, sample_rate, player_ctrl, rig_snapshot, graph_pub, edge_levels)) => {
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
@@ -5162,15 +6648,16 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             };
                             let _ = b.lock().unwrap().send(cmd);
                         }));
-                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub));
+                        audio = Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub, edge_levels));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
             let app = match audio {
-                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub)) => {
+                Some((mains, controllers, stream, bus, level, shared_graph, player_ctrl, rig_snapshot, graph_pub, edge_levels)) => {
                     app.shared_graph = shared_graph;
+                    app.edge_levels = Some(edge_levels);
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
@@ -5208,6 +6695,17 @@ mod multi_rig_ui_tests {
         assert_eq!(app.units.iter().filter(|u| u.rig == 1).count(), 3);
         assert_eq!(app.active_rig, 0);
         assert!(app.keys_unit.is_some() && app.master_unit.is_some());
+    }
+
+    #[test]
+    fn each_rig_view_lays_out_only_its_own_stacks() {
+        let mut app = two_rig_app();
+        app.edit_rigs(None); // rig C: Keys → Surge → Master
+        for rig in 0..3 {
+            app.set_active_rig(rig);
+            assert_eq!(app.stack_cols.len(), 1, "rig {rig}: one stack column, no gaps for hidden rigs");
+            assert!(app.stack_cols.iter().flatten().all(|&u| app.units[u].rig as usize == rig));
+        }
     }
 
     #[test]
@@ -5251,7 +6749,7 @@ mod multi_rig_ui_tests {
     #[test]
     fn template_load_fades_in() {
         let mut app = DemoApp::new_with_sink(None);
-        app.load_demo_patch(); // build_rack resets the fade
+        app.load_demo_patch(); // explicit load → begin_load_fade
         assert_eq!(app.load_fade, 0.0);
         app.update(0.1);
         assert!(app.load_fade > 0.0 && app.load_fade < 1.0);
@@ -5266,10 +6764,39 @@ mod multi_rig_ui_tests {
         // the ui() drain path fires note-offs and empties the held set).
         app.handle_laptop_key(Key::A, true, false);
         assert_eq!(app.held_keys.len(), 1);
-        app.current_source = SourceId::LaptopKeys;
+        app.current_source = SourceId::Keys;
         let held: Vec<_> = app.held_keys.drain(..).collect();
         for (_, semi) in held { app.fire_keys(semi, 0.0); }
         assert!(app.held_keys.is_empty());
+    }
+
+    #[test]
+    fn focus_loss_drains_held_laptop_keys_as_keyboard_note_offs() {
+        // Real ui() drain path: hold A in a focused frame, then lose focus.
+        let events = Arc::new(Mutex::new(Vec::<NoteEvent>::new()));
+        let log = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |e| log.lock().unwrap().push(e))));
+        app.load_multi_rig_demo();
+        let ctx = egui::Context::default();
+        let run = |app: &mut DemoApp, focused: bool, evs: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.focused = focused;
+            raw.events = evs;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        };
+        let a = egui::Event::Key { key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE };
+        run(&mut app, true, vec![a]);
+        assert_eq!(app.held_keys.len(), 1);
+        // A hardware event in between must not re-tag the drain.
+        app.current_source = SourceId::Hardware(3);
+        run(&mut app, false, vec![]);
+        assert!(app.held_keys.is_empty(), "focus loss drains held keys");
+        let ev = events.lock().unwrap();
+        let last = ev.last().expect("note-off emitted");
+        assert_eq!(last.velocity, 0.0);
+        assert_eq!(last.source, SourceId::Keys, "drain fires under the one Keyboard source");
+        assert!(ev.iter().all(|e| e.source == SourceId::Keys));
     }
 }
 
@@ -5279,14 +6806,13 @@ mod matrix_ui_tests {
 
     #[test]
     fn clap_cell_state_table() {
-        let all = (true, true, true);
+        let all = (true, true);
         // Cable gate dominates everything.
-        for row in [MatrixRow::Keys, MatrixRow::Laptop, MatrixRow::HwAll, MatrixRow::HwDev(0)] {
+        for row in [MatrixRow::Keys, MatrixRow::HwAll, MatrixRow::HwDev(0)] {
             assert!(!clap_cell(all, None, false, row));
         }
-        // Defaults: keys/laptop/omni-hw on, specific device off.
+        // Defaults: keyboard/omni-hw on, specific device off.
         assert!(clap_cell(all, None, true, MatrixRow::Keys));
-        assert!(clap_cell(all, None, true, MatrixRow::Laptop));
         assert!(clap_cell(all, None, true, MatrixRow::HwAll));
         assert!(!clap_cell(all, None, true, MatrixRow::HwDev(0)));
         // Device-bound rig: only that device.
@@ -5294,17 +6820,60 @@ mod matrix_ui_tests {
         assert!(clap_cell(all, Some(1), true, MatrixRow::HwDev(1)));
         assert!(!clap_cell(all, Some(1), true, MatrixRow::HwDev(0)));
         // Hardware off.
-        assert!(!clap_cell((true, true, false), None, true, MatrixRow::HwAll));
-        assert!(!clap_cell((true, true, false), Some(0), true, MatrixRow::HwDev(0)));
+        assert!(!clap_cell((true, false), None, true, MatrixRow::HwAll));
+        assert!(!clap_cell((true, false), Some(0), true, MatrixRow::HwDev(0)));
         // Source flags independent.
-        assert!(!clap_cell((false, true, true), None, true, MatrixRow::Keys));
-        assert!(clap_cell((false, true, true), None, true, MatrixRow::Laptop));
+        assert!(!clap_cell((false, true), None, true, MatrixRow::Keys));
+        assert!(clap_cell((false, true), None, true, MatrixRow::HwAll));
     }
 
     fn demo_app() -> DemoApp {
         let mut app = DemoApp::new_with_sink(None);
         app.load_multi_rig_demo();
         app
+    }
+
+    /// Run one handle_input pass with the given key presses.
+    fn press_keys(app: &mut DemoApp, keys: &[Key]) {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        for &key in keys {
+            raw.events.push(egui::Event::Key {
+                key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE,
+            });
+        }
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.layout(rect);
+            app.handle_input(ui.ctx(), rect);
+        });
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn tab_in_matrix_returns_to_rack_without_flipping() {
+        let mut app = demo_app();
+        app.show_matrix = true;
+        let side = app.side;
+        app.on_tab();
+        assert!(!app.show_matrix);
+        assert!(!app.flipping && app.side == side, "Tab must not flip while leaving the matrix");
+        app.on_tab();
+        assert!(app.flipping, "Tab in rack mode flips");
+    }
+
+    #[test]
+    fn escape_chain_closes_rule_editor_then_matrix() {
+        let mut app = demo_app();
+        let inst = app.matrix_sinks()[0];
+        app.show_matrix = true;
+        app.rule_editor = Some((inst, MatrixRow::Keys));
+        press_keys(&mut app, &[Key::Escape]);
+        assert!(app.rule_editor.is_none() && app.show_matrix, "first Esc closes the rule editor");
+        press_keys(&mut app, &[Key::Escape]);
+        assert!(!app.show_matrix, "second Esc leaves the matrix");
+        press_keys(&mut app, &[Key::F11]);
+        assert!(app.show_matrix, "F11 toggles the matrix stage");
     }
 
     #[test]
@@ -5345,18 +6914,18 @@ mod matrix_ui_tests {
         // Bind device 0.
         app.matrix_toggle(inst, MatrixRow::HwDev(0), true);
         assert_eq!(app.rig_device[0], Some(0));
-        assert!(app.rig_sources[0].2);
+        assert!(app.rig_sources[0].1);
         // Switch to omni.
         app.matrix_toggle(inst, MatrixRow::HwAll, true);
         assert_eq!(app.rig_device[0], None);
-        assert!(app.rig_sources[0].2);
+        assert!(app.rig_sources[0].1);
         // Bind device 1, then click it off → hardware off.
         app.matrix_toggle(inst, MatrixRow::HwDev(1), true);
         assert_eq!(app.rig_device[0], Some(1));
         app.matrix_toggle(inst, MatrixRow::HwDev(1), false);
-        assert!(!app.rig_sources[0].2);
-        // Keys/laptop untouched by the hw radio.
-        assert!(app.rig_sources[0].0 && app.rig_sources[0].1);
+        assert!(!app.rig_sources[0].1);
+        // The keyboard is untouched by the hw radio.
+        assert!(app.rig_sources[0].0);
     }
 
     #[test]
@@ -5428,9 +6997,1471 @@ mod matrix_ui_tests {
         assert_eq!(v["sinks"][0]["keys"], serde_json::json!(true));
         // Hot-wire a cell through the assistant tool.
         let node = v["sinks"][1]["node"].as_u64().unwrap();
-        let out = app.exec_tool("set_matrix_cell", &serde_json::json!({"node": node, "source": "laptop", "on": false}));
+        let out = app.exec_tool("set_matrix_cell", &serde_json::json!({"node": node, "source": "keys", "on": false}));
         assert!(out.contains("= false"));
         let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
-        assert_eq!(v["sinks"][1]["laptop"], serde_json::json!(false));
+        assert_eq!(v["sinks"][1]["keys"], serde_json::json!(false));
+        // One keyboard source: no separate laptop column/row in the report.
+        assert!(v["sinks"][1].get("laptop").is_none());
+        assert_eq!(v["sources"], serde_json::json!(["keys", "hw_all", "hw:<device index>"]));
+        // "laptop" is accepted as the legacy spelling of the same row.
+        app.exec_tool("set_matrix_cell", &serde_json::json!({"node": node, "source": "laptop", "on": true}));
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
+        assert_eq!(v["sinks"][1]["keys"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn set_rig_source_tool_takes_pair_and_migrates_triple() {
+        let mut app = demo_app();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let node = app.units[app.matrix_sinks()[1]].node_id;
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": node, "keyboard": false}));
+        assert!(out.contains("keyboard=false hardware=true"), "{out}");
+        assert_eq!(app.rig_sources[1], (false, true), "UI mirror follows the tool");
+        assert!(matches!(drain.pop(), Some(Command::SetRigSource { keyboard: false, hardware: true, .. })));
+        // Old triple: keyboard = keys || laptop.
+        app.exec_tool("set_rig_source", &serde_json::json!({"node": node, "keys": false, "laptop": true, "hardware": false}));
+        assert_eq!(app.rig_sources[1], (true, false));
+        assert!(matches!(drain.pop(), Some(Command::SetRigSource { keyboard: true, hardware: false, .. })));
+    }
+
+    #[test]
+    fn matrix_has_one_keyboard_row() {
+        let app = demo_app();
+        let rows = app.matrix_rows();
+        let kb: Vec<_> = rows.iter().filter(|(r, _, _)| *r == MatrixRow::Keys).collect();
+        assert_eq!(kb.len(), 1);
+        assert_eq!(kb[0].1, "Keyboard");
+        assert_eq!(rows.len(), 2 + app.hw_devices.len(), "Keyboard + HW all + one per device");
+        assert!(rows.iter().all(|(_, l, _)| !l.to_lowercase().contains("laptop")));
+    }
+
+    /// Every text galley painted in a frame, with its screen rect.
+    fn painted_texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
+        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for x in v { walk(x, acc) },
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for cs in &out.shapes { walk(&cs.shape, &mut acc); }
+        acc
+    }
+
+    fn panel_frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.rig_inputs_panel(ui);
+            egui::CentralPanel::default().show(ui, |ui| app.matrix_grid_ui(ui));
+        });
+        let texts = painted_texts(&out);
+        out.textures_delta.clear();
+        texts
+    }
+
+    #[test]
+    fn rig_chips_are_k_and_h_and_send_the_pair() {
+        let mut app = demo_app();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        let texts = panel_frame(&mut app, &ctx, vec![]);
+        let count = |t: &str| texts.iter().filter(|(s, _)| s == t).count();
+        // Two chips per rig (2 rigs): K and H — no laptop chip anywhere.
+        assert_eq!(count("K"), 2, "{texts:?}");
+        assert_eq!(count("H"), 2);
+        assert!(texts.iter().all(|(s, _)| !s.contains("Laptop") && !s.contains("laptop")), "{texts:?}");
+        // The matrix shows ONE Keyboard row.
+        assert_eq!(count("Keyboard"), 1);
+        // Click rig A's K chip: the keyboard flips off and the PAIR is sent.
+        let k = texts.iter().find(|(s, _)| s == "K").unwrap().1.center();
+        let btn = |pressed| egui::Event::PointerButton { pos: k, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(k), btn(true)]);
+        panel_frame(&mut app, &ctx, vec![btn(false)]);
+        assert_eq!(app.rig_sources[0], (false, true));
+        let mut sent = Vec::new();
+        while let Some(c) = drain.pop() { sent.push(c); }
+        assert!(matches!(sent.as_slice(), [Command::SetRigSource { keyboard: false, hardware: true, .. }]), "{sent:?}");
+    }
+
+    #[test]
+    fn laptop_typing_and_onscreen_clicks_light_the_same_keyboard_row() {
+        let events = Arc::new(Mutex::new(Vec::<NoteEvent>::new()));
+        let log = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |e| log.lock().unwrap().push(e))));
+        app.load_multi_rig_demo();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut DemoApp, evs: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.events = evs;
+            let mut out = ctx.run_ui(raw, |ui| {
+                app.layout(rect);
+                app.handle_input(ui.ctx(), rect);
+            });
+            out.textures_delta.clear();
+            app.update(1.0 / 60.0);
+        };
+        frame(&mut app, vec![]);
+        assert_eq!(app.keyboard_led(), 0.0);
+        // Laptop typing.
+        app.handle_laptop_key(Key::A, true, false);
+        assert!(app.keyboard_led() > 0.5, "laptop typing lights the Keyboard row");
+        app.handle_laptop_key(Key::A, false, false);
+        for _ in 0..120 { app.update(1.0 / 30.0); }
+        assert!(app.keyboard_led() < 0.05, "LED decayed");
+        // On-screen click on the first white key (real hit-test + input path).
+        let key = app.xf.p(app.key_rect(0).center().to_vec2());
+        let btn = |pressed| egui::Event::PointerButton { pos: key, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(&mut app, vec![egui::Event::PointerMoved(key), btn(true)]);
+        assert!(app.keyboard_led() > 0.5, "on-screen click lights the same row");
+        frame(&mut app, vec![btn(false)]);
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e.velocity > 0.0 && e.note == 60 + WHITE_SEMI[0] as u8), "click fired a note");
+        assert!(ev.len() >= 3);
+        assert!(ev.iter().all(|e| e.source == SourceId::Keys), "both paths are the one Keyboard source");
+    }
+}
+#[cfg(test)]
+mod cable_replug_tests {
+    use super::*;
+    use crate::control::command_bus;
+
+    const SCREEN: Rect = Rect { min: Pos2::ZERO, max: Pos2 { x: 1280.0, y: 800.0 } };
+
+    /// One real app frame: input through a live egui::Context, then the same
+    /// update → publish order as `ui()`.
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>, modifiers: Modifiers) {
+        let mut raw = egui::RawInput::default();
+        raw.events = std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect();
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.layout(SCREEN);
+            app.handle_input(ui.ctx(), SCREEN);
+        });
+        out.textures_delta.clear();
+        app.update(1.0 / 20.0);
+        app.publish_patch();
+    }
+
+    fn button(pos: Pos2, pressed: bool, modifiers: Modifiers) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers }
+    }
+
+    /// Press at `from`, drag to `to` (holding `hold` frames midway), release.
+    fn drag(app: &mut DemoApp, ctx: &egui::Context, from: Pos2, to: Pos2, hold: usize, m: Modifiers) {
+        frame(app, ctx, vec![egui::Event::PointerMoved(from), button(from, true, m)], m);
+        let mid = from + (to - from) * 0.5;
+        for _ in 0..=hold { frame(app, ctx, vec![egui::Event::PointerMoved(mid)], m); }
+        frame(app, ctx, vec![egui::Event::PointerMoved(to)], m);
+        frame(app, ctx, vec![button(to, false, m)], m);
+    }
+
+    fn back_app() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.side = Side::Back;
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![], Modifiers::NONE); // settle layout
+        (app, ctx)
+    }
+
+    fn jack_screen(app: &DemoApp, unit: usize, jack: usize) -> Pos2 {
+        app.xf.p(app.jack_pos(unit, jack))
+    }
+
+    /// A living cable (index ≥ 1, so an earlier cable can die and shift
+    /// indices) and a compatible free In jack to move its In plug onto.
+    fn pick_replug(app: &DemoApp) -> (u32, usize, usize, Pos2, Pos2) {
+        for c in app.cables.iter().skip(1) {
+            if c.dying >= 0.0 { continue; }
+            let origin_ji = app.units[c.dst].jack_index(Dir::In, c.dst_port).unwrap();
+            let from = jack_screen(app, c.dst, origin_ji);
+            for (ui, u) in app.units.iter().enumerate() {
+                if ui == c.src || !app.visible(ui) { continue; }
+                for (ji, j) in u.jacks.iter().enumerate() {
+                    if j.dir != Dir::In || u.kind(Dir::In, j.port) != c.kind { continue; }
+                    if (ui, j.port) == (c.dst, c.dst_port) { continue; }
+                    if app.cable_at_jack(ui, Dir::In, j.port).is_some() { continue; }
+                    let to = jack_screen(app, ui, ji);
+                    if (to - from).length() < 80.0 { continue; }
+                    if !matches!(app.hit_test(to), Hit::Jack { unit, jack } if unit == ui && jack == ji) { continue; }
+                    return (c.id, ui, j.port, from, to);
+                }
+            }
+        }
+        panic!("demo patch has no re-pluggable cable");
+    }
+
+    #[test]
+    fn dropping_a_plug_on_a_compatible_jack_moves_the_cable() {
+        let (mut app, ctx) = back_app();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        // The engine side: a real GraphEngine fed what the UI sends.
+        let (mut ebus, edrain) = command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        engine.set_graph_pub(pub_.clone());
+
+        let (old, target, tport, from, to) = pick_replug(&app);
+        let (src, src_port) = { let c = &app.cables[app.live_cable(old).unwrap()]; (c.src, c.src_port) };
+        let alive_before = app.cables.iter().filter(|c| c.dying < 0.0).count();
+        // Rule 10: an earlier cable dies and is retained away MID-gesture,
+        // shifting every later index while the plug is held.
+        let victim = app.cables[0].id;
+        assert_ne!(victim, old);
+        app.unplug_cable(0, true);
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c)); // drop the pre-gesture publish
+        sent.clear();
+
+        drag(&mut app, &ctx, from, to, 14, Modifiers::NONE);
+        assert!(app.cables.iter().all(|c| c.id != victim), "victim fell away mid-gesture");
+
+        // UI: old cable gone (no fall), one new living cable on the target.
+        assert!(app.cables.iter().all(|c| c.id != old), "re-plugged cable must not linger");
+        let moved: Vec<_> = app.cables.iter()
+            .filter(|c| c.dying < 0.0 && c.dst == target && c.dst_port == tport)
+            .collect();
+        assert_eq!(moved.len(), 1, "exactly one living cable on the target jack");
+        assert_eq!((moved[0].src, moved[0].src_port), (src, src_port), "the source end stays put");
+        let new = moved[0].id;
+        assert_eq!(app.cables.iter().filter(|c| c.dying < 0.0).count(), alive_before - 1);
+
+        // Bus: Disconnect(old) strictly before Connect(new); old never re-sent after.
+        drain.drain(|c| sent.push(c));
+        let disc = sent.iter().position(|c| matches!(c, Command::Disconnect(id) if *id == old)).expect("Disconnect(old)");
+        let conn = sent.iter().position(|c| matches!(c, Command::Connect { id, .. } if *id == new)).expect("Connect(new)");
+        assert!(disc < conn, "Disconnect(old) must precede Connect(new)");
+        assert!(!sent[disc..].iter().any(|c| matches!(c, Command::Connect { id, .. } if *id == old)));
+
+        // Engine: graph has the new edge, not the old one.
+        for c in sent { ebus.send(c); }
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let g = pub_.lock().unwrap().graph.clone();
+        assert!(!g.edges.iter().any(|e| e.id == old), "engine dropped the old route");
+        let e = g.edges.iter().find(|e| e.id == new).expect("engine has the new route");
+        assert_eq!(e.to.node, app.units[target].node_id);
+        assert_eq!(e.to.port as usize, tport);
+        assert_eq!(e.from.node, app.units[src].node_id);
+        // UI mirror agrees.
+        assert!(app.shared_graph.lock().unwrap().edges.iter().any(|e| e.id == new));
+    }
+
+    #[test]
+    fn plain_click_on_a_plug_still_unplugs() {
+        let (mut app, ctx) = back_app();
+        let (old, _, _, from, _) = pick_replug(&app);
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(from), button(from, true, Modifiers::NONE)], Modifiers::NONE);
+        frame(&mut app, &ctx, vec![button(from, false, Modifiers::NONE)], Modifiers::NONE);
+        assert!(app.live_cable(old).is_none(), "click unplugs");
+    }
+
+    #[test]
+    fn dropping_on_an_incompatible_spot_far_away_unplugs() {
+        let (mut app, ctx) = back_app();
+        let (old, _, _, from, _) = pick_replug(&app);
+        // Empty paper far below the rack.
+        let to = Pos2::new(from.x, SCREEN.max.y - 4.0);
+        drag(&mut app, &ctx, from, to, 1, Modifiers::NONE);
+        assert!(app.live_cable(old).is_none(), "tug off unplugs");
+    }
+
+    #[test]
+    fn duplicate_replug_is_refused_with_a_notice_and_keeps_the_cable() {
+        let (mut app, _ctx) = back_app();
+        let (old, target, tport, _, _) = pick_replug(&app);
+        let (src, sp, kind) = { let c = &app.cables[app.live_cable(old).unwrap()]; (c.src, c.src_port, c.kind) };
+        // Occupy the target with the exact endpoints the move would create.
+        assert!(app.add_cable(src, sp, target, tport, kind, 0).is_some());
+        assert_eq!(app.replug_cable(old, Dir::In, target, Dir::In, tport), Replug::Refused);
+        assert!(app.live_cable(old).is_some(), "refused move keeps the cable");
+        assert!(app.patch_notice.is_some(), "refusal is surfaced, not silent");
+        // Wrong direction is incompatible (falls back to unplug/snap-back).
+        assert_eq!(app.replug_cable(old, Dir::In, src, Dir::Out, sp), Replug::Incompatible);
+    }
+
+    #[test]
+    fn shift_drag_from_an_occupied_output_fans_out() {
+        let (mut app, ctx) = back_app();
+        let (old, target, tport, _, to) = pick_replug(&app);
+        let (src, sp) = { let c = &app.cables[app.live_cable(old).unwrap()]; (c.src, c.src_port) };
+        let out_ji = app.units[src].jack_index(Dir::Out, sp).unwrap();
+        let from = jack_screen(&app, src, out_ji);
+        drag(&mut app, &ctx, from, to, 1, Modifiers::SHIFT);
+        assert!(app.live_cable(old).is_some(), "the original cable stays");
+        assert!(app.cables.iter().any(|c| c.dying < 0.0 && c.src == src && c.src_port == sp && c.dst == target && c.dst_port == tport),
+            "Shift+drag adds a second cable from the same output");
+    }
+}
+
+#[cfg(test)]
+mod rig_switch_tests {
+    use super::*;
+
+    /// One full app frame (`frame_ui`, the body of `eframe::App::ui`) through a
+    /// live egui::Context, with the same raw-input hook eframe runs.
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+    }
+
+    fn key(key: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    fn click(pos: Pos2) -> Vec<Vec<egui::Event>> {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        vec![vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]]
+    }
+
+    fn two_rigs() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.active_rig, 0);
+        (app, ctx)
+    }
+
+    #[test]
+    fn assistant_panel_does_not_squish_the_rack() {
+        let (mut app, ctx) = two_rigs();
+        // A 3-unit stack (Surge → Delay → Reverb) is the demanding case.
+        let rows_before = app.layout_rows;
+        let free = app.unit_h;
+        app.assistant.key_set = true;
+        app.show_assistant = true;
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.layout_rows, rows_before);
+        assert!(app.unit_h >= 140.0, "faces stay comfortable with the assistant open: {} (free: {free})", app.unit_h);
+        assert_eq!(app.rack_overflow, Vec2::ZERO,
+            "a demo-sized rack fits beside the assistant (no pan bar): stage {:?} rack_h {} unit_h {}", app.stage_rect, app.rack_h, app.unit_h);
+        assert!(app.stage_rect.bottom() <= app.assistant_rect.top() + 0.5,
+            "the stage ends where the assistant begins: stage {:?} panel {:?}", app.stage_rect, app.assistant_rect);
+    }
+
+    /// One rig with 6 instrument stacks of 4 units (Surge → 3 FX) — the
+    /// kind of patch an agent builds; it must not squish.
+    fn big_patch_app() -> (DemoApp, egui::Context) {
+        let mut g = Graph::default();
+        g.reserve(64, 64);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut eid = 1;
+        for _ in 0..6 {
+            let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+            g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi); eid += 1;
+            let mut prev = synth;
+            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
+                let fx = g.add_node(NodeKind::Dsp(k), name_bytes("FX"));
+                g.connect_with_id(eid, PortRef { node: prev, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio); eid += 1;
+                prev = fx;
+            }
+            g.connect_with_id(eid, PortRef { node: prev, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); eid += 1;
+        }
+        let mut app = DemoApp::new_with_sink(None);
+        app.apply_session(&crate::session::Session::new("big", g)).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx)
+    }
+
+    #[test]
+    fn big_patch_keeps_readable_units_and_pans() {
+        let (mut app, ctx) = big_patch_app();
+        assert_eq!(app.stack_cols.len(), 6);
+        assert_eq!(app.layout_rows, 4);
+        assert!(app.unit_h >= 140.0, "unit height floor, not squished: {}", app.unit_h);
+        let mid_w = app.unit_rects[app.stack_cols[0][0]].width();
+        assert!(mid_w >= 200.0, "column width floor: {mid_w}");
+        let ov = app.rack_overflow;
+        assert!(ov.x > 0.0 && ov.y > 0.0, "the rack overflows the stage instead: {ov:?}");
+        assert!(app.rack_clip.is_some());
+        // Wheel over the bare stage pans (clamped to the overflow).
+        let over = app.stage_rect.center();
+        let before = app.xf.center;
+        for _ in 0..12 {
+            frame(&mut app, &ctx, vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(-60.0, -60.0),
+                    phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers: Modifiers::NONE },
+            ]);
+        }
+        let moved = app.xf.center - before;
+        assert!(moved.x < -1.0, "rack panned sideways: {moved:?}");
+        assert!((moved.y + ov.y / 2.0).abs() < 0.5, "vertical pan goes exactly to its clamp: {moved:?} ov {ov:?}");
+        assert!(app.rack_pan.x >= -ov.x / 2.0 - 0.5 && app.rack_pan.y >= -ov.y / 2.0 - 0.5, "pan stays clamped");
+        // Nothing outside the clip is hittable.
+        let outside = Pos2::new(app.stage_rect.center().x, app.stage_rect.bottom() - 2.0);
+        assert!(matches!(app.hit_test(outside), Hit::Background));
+    }
+
+    #[test]
+    fn small_patch_does_not_overflow() {
+        let (app, _ctx) = two_rigs();
+        assert_eq!(app.rack_overflow, Vec2::ZERO, "the demo fits: no pan, no clip");
+        assert!(app.rack_clip.is_none());
+    }
+
+    #[test]
+    fn plus_rig_with_a_live_engine_keeps_view_and_knobs() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        engine.set_graph_pub(pub_.clone());
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        app.graph_pub = Some(pub_);
+        let mut pump = |drain: &mut crate::control::CommandDrain| {
+            drain.drain(|c| { ebus.send(c); });
+            let mut buf = vec![0.0f32; 64 * 2];
+            engine.render(&mut buf, 2);
+        };
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+        let (u, k) = app.units.iter().enumerate()
+            .find_map(|(i, u)| u.knobs.iter().position(|k| k.param.is_some()).map(|k| (i, k))).unwrap();
+        app.units[u].knobs[k].value = 0.123;
+        app.edit_rigs(None);
+        for _ in 0..4 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+        assert_ne!(app.session_msg, "Patch updated from MCP/CLI", "the engine echo must not rebuild the rack");
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.active_rig, 1, "view stays on the new rig");
+        assert!((app.units[u].knobs[k].value - 0.123).abs() < 1e-6, "knobs survive the engine echo");
+    }
+
+    #[test]
+    fn a_saved_multi_rig_session_loads_as_rigs() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let s = app.capture_session("two").unwrap();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.apply_session(&s).unwrap();
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadRigs { rigs, .. } if rigs.len() == 2)),
+            "a rig-tagged session reloads as LoadRigs, not LoadGraph");
+        assert!(!sent.iter().any(|c| matches!(c, Command::LoadGraph { .. })));
+        assert_eq!(app.rig_count(), 2);
+    }
+
+    #[test]
+    fn assistant_chat_content_stays_inside_its_panel() {
+        let (mut app, ctx) = two_rigs();
+        app.assistant.key_set = true; // chat layout (history + input row)
+        app.show_assistant = true;
+        // A short window clamps the panel to its 150px minimum — the case
+        // where a fixed input-row reserve overflowed the panel's top edge.
+        for _ in 0..4 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 640.0)));
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        }
+        assert!(app.assistant_rect.height() < 200.0, "panel at its minimum: {:?}", app.assistant_rect);
+        let panel = app.assistant_rect;
+        let inside: Vec<Rect> = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+            .filter(|w| w.rect.center().y > panel.top() - 60.0 && w.rect.width() < panel.width() - 4.0)
+            .map(|w| w.rect).collect());
+        assert!(!inside.is_empty());
+        for r in inside {
+            assert!(r.top() >= panel.top() - 0.5 && r.bottom() <= panel.bottom() + 0.5,
+                "widget {r:?} sticks out of the assistant panel {panel:?}");
+        }
+    }
+
+    #[test]
+    fn rig_input_labels_name_the_synth_and_its_rig() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.edit_rigs(None); // rig 2 gets the third synth
+        let mut texts = Vec::new();
+        for _ in 0..2 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+            let out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            texts = out.shapes.iter().filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                _ => None,
+            }).collect();
+            let mut out = out; out.textures_delta.clear();
+        }
+        for want in ["1 · Surge A", "1 · Surge B", "2 · Surge"] {
+            assert!(texts.iter().any(|t| t == want), "rig inputs label {want:?} in {texts:?}");
+        }
+        assert!(!texts.iter().any(|t| t == "Rig C"), "no slot letters posing as rigs");
+    }
+
+    #[test]
+    fn plus_rig_grows_a_single_rig_rack() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 1);
+        let before = app.units.len();
+        app.edit_rigs(None);
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.units.iter().filter(|u| u.rig == 0).count(), before, "rig A untouched");
+        assert_eq!(app.active_rig, 1, "the view jumps to the new rig");
+        assert_eq!(app.rig_name(1), "Rig B");
+        // Standard layout: Keys → Surge → Master, wired (MIDI + L/R audio).
+        let rig1: Vec<&Unit> = app.units.iter().filter(|u| u.rig == 1).collect();
+        assert_eq!(rig1.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count(), 1, "the new rig gets a synth");
+        let live = |app: &DemoApp, r: u8| app.cables.iter().filter(|c| c.dying < 0.0 && app.units[c.src].rig == r).count();
+        assert_eq!(live(&app, 1), 3, "Keys→Surge MIDI + Surge→Master L/R");
+        let a_cables = live(&app, 0);
+        assert!(a_cables > 0);
+        // Pool of 4 voices: rig C takes the last one, rig D is a skeleton.
+        app.edit_rigs(None);
+        assert_eq!(app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count(), 4);
+        app.edit_rigs(None);
+        assert_eq!(app.rig_count(), 4);
+        assert!(app.units.iter().filter(|u| u.rig == 3).all(|u| !matches!(u.node_kind, UnitKind::Clap)), "no free voice → no voiceless synth");
+        assert_eq!(live(&app, 0), a_cables, "earlier rigs keep every cable");
+        frame(&mut app, &ctx, vec![]);
+    }
+
+    #[test]
+    fn deleting_a_rig_keeps_the_survivor_patch_knobs_and_mix() {
+        let (mut app, ctx) = two_rigs();
+        app.rig_mix[1].vol = 0.3;
+        let (ui_idx, k_idx) = app.units.iter().enumerate()
+            .filter(|(_, u)| u.rig == 1)
+            .find_map(|(i, u)| u.knobs.iter().position(|k| k.param.is_some()).map(|k| (i, k)))
+            .expect("rig B has a knob");
+        app.units[ui_idx].knobs[k_idx].value = 0.123;
+        let a_units = app.units.iter().filter(|u| u.rig == 0).count();
+        let b_cables = app.cables.iter().filter(|c| c.dying < 0.0 && app.units[c.src].rig == 1).count();
+        app.edit_rigs(Some(0));
+        assert_eq!(app.rig_count(), 1);
+        assert_eq!(app.units.len(), 3, "only rig B's Keys/Surge/Master remain");
+        assert_eq!(app.rig_name(0), "Rig B");
+        assert_eq!(app.active_rig, 0);
+        assert!((app.rig_mix[0].vol - 0.3).abs() < 1e-6, "mixer follows its rig");
+        assert_eq!(app.cables.iter().filter(|c| c.dying < 0.0).count(), b_cables, "rig B's cables survive");
+        let knob = &app.units[ui_idx - a_units].knobs[k_idx];
+        assert!((knob.value - 0.123).abs() < 1e-6, "knob value survives the id remap");
+        frame(&mut app, &ctx, vec![]);
+        // The last rig cannot be deleted.
+        app.edit_rigs(Some(0));
+        assert_eq!(app.rig_count(), 1);
+    }
+
+    #[test]
+    fn rig_delete_waits_for_confirmation_and_esc_cancels() {
+        let (mut app, ctx) = two_rigs();
+        app.confirm_delete_rig = Some(1);
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.rig_count(), 2, "nothing is deleted before confirming");
+        assert_eq!(app.confirm_delete_rig, Some(1), "the modal stays up");
+        frame(&mut app, &ctx, key(Key::Escape));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.confirm_delete_rig, None, "Esc cancels");
+        assert_eq!(app.rig_count(), 2);
+    }
+
+    fn descs_has_mixer(app: &DemoApp) -> bool {
+        app.help_cols.iter().flat_map(|c| c.rows.iter())
+            .any(|r| r.keys.iter().any(|g| g.text() == "F10") && r.desc.text().contains("mixer"))
+    }
+
+    #[test]
+    fn help_overlay_lists_current_shortcuts_in_two_columns() {
+        let (mut app, ctx) = two_rigs();
+        frame(&mut app, &ctx, key(Key::F1));
+        assert!(app.show_help, "F1 opens help");
+        frame(&mut app, &ctx, vec![]); // paints the card without panicking
+        assert_eq!(app.help_cols.len(), 2, "PLAY + PATCH & VIEWS");
+        let keys: Vec<String> = app.help_cols.iter()
+            .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.text().to_owned())))
+            .collect();
+        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F8", "F9", "F10", "F11", "F12", "1–9", "R", "D", "SPLIT"] {
+            assert!(keys.iter().any(|x| x == k), "help lists {k}");
+        }
+        assert!(descs_has_mixer(&app), "F10 is the mixer now (the Transport window is gone)");
+        let descs: Vec<String> = app.help_cols.iter()
+            .flat_map(|c| c.rows.iter().map(|r| r.desc.text().to_owned())).collect();
+        assert!(descs.iter().any(|d| d.contains("BPM") && d.contains("metronome")), "help says where tempo lives");
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(!app.show_help, "Esc closes help");
+    }
+
+    #[test]
+    fn masthead_has_no_flip_pill_tab_still_flips() {
+        let (mut app, ctx) = two_rigs();
+        // Where the flip pill used to sit (x≈280..430, top+28..60).
+        for ev in click(Pos2::new(355.0, app.toolbar_top + 44.0)) { frame(&mut app, &ctx, ev); }
+        assert!(!app.flipping && app.side == Side::Front, "the old pill area is inert");
+        frame(&mut app, &ctx, key(Key::Tab));
+        assert!(app.flipping, "Tab flips the rack");
+    }
+
+    #[test]
+    fn digit_keys_switch_rigs_on_the_real_frame_path() {
+        let (mut app, ctx) = two_rigs();
+        frame(&mut app, &ctx, key(Key::Num2));
+        assert_eq!(app.active_rig, 1, "2 selects the second rig");
+        frame(&mut app, &ctx, key(Key::Num1));
+        assert_eq!(app.active_rig, 0, "1 selects the first rig");
+    }
+
+    #[test]
+    fn arrow_keys_cycle_rigs_on_the_real_frame_path() {
+        let (mut app, ctx) = two_rigs();
+        frame(&mut app, &ctx, key(Key::ArrowRight));
+        assert_eq!(app.active_rig, 1);
+        frame(&mut app, &ctx, key(Key::ArrowRight));
+        assert_eq!(app.active_rig, 0, "→ wraps");
+        frame(&mut app, &ctx, key(Key::ArrowLeft));
+        assert_eq!(app.active_rig, 1, "← wraps back");
+    }
+
+    #[test]
+    fn keys_still_switch_after_tab_flip() {
+        let (mut app, ctx) = two_rigs();
+        frame(&mut app, &ctx, key(Key::Tab));
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert!(ctx.memory(|m| m.focused()).is_none(), "Tab must not park egui focus on a widget");
+        frame(&mut app, &ctx, key(Key::Num2));
+        assert_eq!(app.active_rig, 1);
+    }
+
+    /// Rig 0's pan DragValue in the mixer stage (first focusable drag
+    /// widget right of rig 0's bus fader).
+    fn mixer_pan_value(app: &DemoApp, ctx: &egui::Context) -> Rect {
+        let f0 = app.mixer_fader_rects[0];
+        ctx.viewport(|v| {
+            v.prev_pass.widgets.get_layer(egui::LayerId::background())
+                .filter(|w| w.sense.senses_drag() && w.sense.is_focusable() && w.rect.left() > f0.right())
+                .min_by(|a, b| a.rect.left().total_cmp(&b.rect.left()))
+                .map(|w| w.rect)
+        }).expect("pan DragValue right of rig 0's bus fader")
+    }
+
+    fn open_mixer(app: &mut DemoApp, ctx: &egui::Context) {
+        app.show_mixer = true;
+        for _ in 0..2 { frame(app, ctx, vec![]); }
+        assert_eq!(app.mixer_fader_rects.len(), 2, "one bus strip per rig");
+    }
+
+    #[test]
+    fn rig_strip_has_no_mixer_controls() {
+        let (app, ctx) = two_rigs();
+        // No focusable drag widget (vol/pan) anywhere in the top strips.
+        let below = app.rig_chip_rects[0].bottom() + 40.0;
+        let n = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+            .filter(|w| w.sense.senses_drag() && w.sense.is_focusable() && w.rect.bottom() < below).count());
+        assert_eq!(n, 0, "vol/pan live in the Mixer view, not the rig strip");
+    }
+
+    #[test]
+    fn keys_switch_rigs_after_clicking_a_mixer_value() {
+        let (mut app, ctx) = two_rigs();
+        open_mixer(&mut app, &ctx);
+        let dv = mixer_pan_value(&app, &ctx);
+        let pan = app.rig_mix[0].pan;
+        for ev in click(dv.center()) { frame(&mut app, &ctx, ev); }
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Num2));
+        assert_eq!(app.active_rig, 1, "2 must switch rigs even after a mixer DragValue was clicked");
+        frame(&mut app, &ctx, key(Key::ArrowLeft));
+        assert_eq!(app.active_rig, 0, "← must cycle rigs after a mixer click");
+        assert_eq!(app.rig_mix[0].pan, pan, "rig keys must not be typed into the mixer value");
+    }
+
+    #[test]
+    fn mixer_bus_fader_drags_and_esc_returns_to_rack() {
+        let (mut app, ctx) = two_rigs();
+        app.rig_mix[0].vol = 0.5;
+        open_mixer(&mut app, &ctx);
+        let c = app.mixer_fader_rects[0].center();
+        let b = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        frame(&mut app, &ctx, vec![egui::Event::PointerMoved(c)]);
+        frame(&mut app, &ctx, vec![b(c, true)]);
+        for dy in [10.0, 20.0, 30.0] { frame(&mut app, &ctx, vec![egui::Event::PointerMoved(c - Vec2::new(0.0, dy))]); }
+        frame(&mut app, &ctx, vec![b(c - Vec2::new(0.0, 30.0), false)]);
+        assert!(app.rig_mix[0].vol > 0.5, "dragging up raises rig volume ({})", app.rig_mix[0].vol);
+        assert_eq!(app.rig_mix[1].vol, 1.0, "the other rig is untouched");
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(!app.show_mixer, "Esc leaves the mixer");
+    }
+
+    #[test]
+    fn mixer_lists_every_source_per_rig() {
+        let (app, _ctx) = two_rigs();
+        for rig in 0..2u8 {
+            let src = app.mixer_sources(rig);
+            assert_eq!(src.len(), 1, "rig {rig}: its Surge is the one source");
+            let (u, k) = src[0];
+            assert!(matches!(app.units[u].node_kind, UnitKind::Clap));
+            assert_eq!(app.units[u].knobs[k.expect("Surge has a LEVEL knob")].label, "LEVEL");
+        }
+    }
+
+    #[test]
+    fn a_focused_text_field_still_gets_the_keys() {
+        let (mut app, ctx) = two_rigs();
+        app.show_assistant = true;
+        frame(&mut app, &ctx, vec![]);
+        // The chat/API-key field: the widest focusable text widget low on
+        // screen (height filter skips the panel's resize handle).
+        let field = ctx.viewport(|v| {
+            v.prev_pass.widgets.get_layer(egui::LayerId::background())
+                .filter(|w| w.sense.is_focusable() && w.sense.senses_drag() && w.rect.top() > 500.0 && w.rect.height() > 10.0)
+                .max_by(|a, b| a.rect.width().total_cmp(&b.rect.width()))
+                .map(|w| w.rect)
+        }).expect("assistant text field");
+        for ev in click(field.center()) { frame(&mut app, &ctx, ev); }
+        assert!(ctx.text_edit_focused(), "clicking the field focuses it");
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Num2, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Text("2".into()),
+        ]);
+        assert_eq!(app.active_rig, 0, "typing a 2 into a text field must not switch rigs");
+    }
+
+    #[test]
+    fn single_rig_digit_says_why_nothing_switched() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 1);
+        frame(&mut app, &ctx, key(Key::Num2));
+        assert_eq!(app.active_rig, 0);
+        assert!(app.patch_notice.as_ref().map_or(false, |(m, _)| m.contains("one rig")), "single-rig press is explained");
+    }
+
+    #[test]
+    fn chip_click_switches_and_keys_keep_working() {
+        let (mut app, ctx) = two_rigs();
+        let chip = app.rig_chip_rects[1].center();
+        for ev in click(chip) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.active_rig, 1, "clicking chip 2 switches");
+        frame(&mut app, &ctx, key(Key::Num1));
+        assert_eq!(app.active_rig, 0, "keys still work after a chip click");
+        frame(&mut app, &ctx, key(Key::ArrowRight));
+        assert_eq!(app.active_rig, 1, "arrows still work after a chip click");
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use crate::control::command_bus;
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+    }
+
+    fn click(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        for ev in [vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]] {
+            frame(app, ctx, ev);
+        }
+    }
+
+    /// Demo patch + a METRONOME wired to the master; rack on the front.
+    fn metro_app() -> (DemoApp, egui::Context, u32) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::demo_patch();
+        let m = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+        g.connect_with_id(10, PortRef { node: m, port: 0 }, PortRef { node: 3, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert!(app.side == Side::Front);
+        (app, ctx, m)
+    }
+
+    fn metro_unit(app: &DemoApp, m: u32) -> usize {
+        app.units.iter().position(|u| u.node_id == m).unwrap()
+    }
+
+    /// Screen position of the metronome's Play/Stop chip.
+    fn chip_pos(app: &DemoApp, m: u32) -> Pos2 {
+        let chip = app.transport_chip_rect(metro_unit(app, m)).expect("metronome face has a chip");
+        app.xf.p(chip.center().to_vec2())
+    }
+
+    #[test]
+    fn only_transport_units_get_a_chip() {
+        let (app, _ctx, m) = metro_app();
+        for (i, u) in app.units.iter().enumerate() {
+            assert_eq!(app.transport_chip_rect(i).is_some(), u.node_id == m, "unit {} chip", u.name);
+        }
+    }
+
+    #[test]
+    fn face_chip_sends_set_node_playing_and_mirrors_the_engine() {
+        let (mut app, ctx, m) = metro_app();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        engine.set_graph_pub(pub_.clone());
+        app.graph_pub = Some(pub_.clone());
+        // Forward what the UI sent to the engine and render one block;
+        // returns the SetNodePlaying commands seen.
+        let mut pump = |drain: &mut crate::control::CommandDrain| {
+            let mut sent = Vec::new();
+            drain.drain(|c| sent.push(c));
+            let toggles: Vec<(u32, bool)> = sent.iter().filter_map(|c| match c {
+                Command::SetNodePlaying { node, playing } => Some((*node, *playing)),
+                _ => None,
+            }).collect();
+            for c in sent { ebus.send(c); }
+            let mut buf = vec![0.0f32; 64 * 2];
+            engine.render(&mut buf, 2);
+            toggles
+        };
+        frame(&mut app, &ctx, vec![]);
+        pump(&mut drain); // settle the per-frame mirror
+        frame(&mut app, &ctx, vec![]);
+        let units_before = app.units.len();
+
+        let p = chip_pos(&app, m);
+        click(&mut app, &ctx, p);
+        let ui = metro_unit(&app, m);
+        assert!(!app.units[ui].playing, "no local guess while an engine is attached");
+        assert_eq!(pump(&mut drain), vec![(m, true)], "chip click sends SetNodePlaying(true)");
+        frame(&mut app, &ctx, vec![]); // sync_from_engine adopts the flag
+        let ui = metro_unit(&app, m);
+        assert!(app.units[ui].playing, "face mirrors the engine's playing flag");
+        assert!(app.base_graph.node(m).unwrap().playing, "base graph (sessions) follows");
+        assert!(app.shared_graph.lock().unwrap().node(m).map_or(true, |n| n.playing), "bridge mirror follows");
+        assert_eq!(app.units.len(), units_before);
+        assert_ne!(app.session_msg, "Patch updated from MCP/CLI", "a Play/Stop must not rebuild the rack");
+
+        let p = chip_pos(&app, m);
+        click(&mut app, &ctx, p);
+        assert_eq!(pump(&mut drain), vec![(m, false)], "second click stops it");
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.units[metro_unit(&app, m)].playing);
+
+        // Master transport (Space) starts every transport-capable node.
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        pump(&mut drain);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.playing);
+        assert!(app.units[metro_unit(&app, m)].playing, "master play reaches the metronome face");
+    }
+
+    #[test]
+    fn headless_chip_toggles_locally() {
+        let (mut app, ctx, m) = metro_app();
+        assert!(app.graph_pub.is_none());
+        let p = chip_pos(&app, m);
+        click(&mut app, &ctx, p);
+        assert!(app.units[metro_unit(&app, m)].playing);
+        assert!(app.base_graph.node(m).unwrap().playing);
+        let p = chip_pos(&app, m);
+        click(&mut app, &ctx, p);
+        assert!(!app.units[metro_unit(&app, m)].playing);
+    }
+
+    #[test]
+    fn set_node_playing_tool_parity() {
+        // Rule 6: the tool exists in the assistant schema AND exec_tool.
+        let tools = crate::assistant::tools();
+        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == "set_node_playing"));
+        let (mut app, _ctx, m) = metro_app();
+        let r = app.exec_tool("set_node_playing", &serde_json::json!({"node": m, "playing": true}));
+        assert!(!r.starts_with("unknown tool"), "{r}");
+        assert!(app.units[metro_unit(&app, m)].playing, "{r}");
+        let r = app.exec_tool("set_node_playing", &serde_json::json!({"node": 2, "playing": true}));
+        assert!(r.contains("no transport"), "a delay has no transport: {r}");
+        // get_graph exposes the flag.
+        app.publish_patch();
+        let g: serde_json::Value = serde_json::from_str(&app.exec_tool("get_graph", &serde_json::json!({}))).unwrap();
+        let node = g["nodes"].as_array().unwrap().iter().find(|n| n["id"] == serde_json::json!(m)).cloned().unwrap();
+        assert_eq!(node["playing"], serde_json::json!(true));
+        // Master stop via the assistant clears it.
+        app.exec_tool("transport_stop", &serde_json::json!({}));
+        assert!(!app.units[metro_unit(&app, m)].playing);
+    }
+
+    #[test]
+    fn playing_round_trips_through_sessions() {
+        let (mut app, _ctx, m) = metro_app();
+        assert!(app.set_node_playing(m, true));
+        let s = app.capture_session("transport").unwrap();
+        assert!(s.graph.node(m).unwrap().playing);
+        let json = serde_json::to_string(&s.graph).unwrap();
+        let back: Graph = serde_json::from_str(&json).unwrap();
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.apply_session(&crate::session::Session::new("t", back)).unwrap();
+        let u = fresh.units.iter().find(|u| u.node_id == m).unwrap();
+        assert!(u.transport && u.playing, "restored metronome face shows playing");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audio-chain visualization (PLAN §2): engine per-edge levels drive audio
+// cables, key LEDs snap, labels fit their units, agent edits never flash.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod audio_viz_tests {
+    use super::*;
+
+    const SCREEN: Rect = Rect { min: Pos2::ZERO, max: Pos2 { x: 1280.0, y: 800.0 } };
+
+    fn engine_app() -> (DemoApp, Arc<EdgeLevels>) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.layout(SCREEN);
+        let levels = Arc::new(EdgeLevels::new());
+        app.edge_levels = Some(levels.clone());
+        (app, levels)
+    }
+
+    fn run(app: &mut DemoApp, secs: f32) {
+        for _ in 0..(secs * 60.0).round() as usize { app.update(1.0 / 60.0); }
+    }
+
+    fn active_pulses(c: &Cable) -> usize { c.pulses.iter().filter(|p| p.active).count() }
+
+    #[test]
+    fn published_edge_levels_make_the_whole_chain_flow() {
+        let (mut app, levels) = engine_app();
+        let audio: Vec<u32> = app.cables.iter().filter(|c| c.kind == PortKind::Audio).map(|c| c.id).collect();
+        assert!(audio.len() >= 3, "demo has Surge→Delay→Master + Surge→Master");
+        // The engine publishes a sounding level on every audio edge (block
+        // rate; re-published each frame like the render path does).
+        for _ in 0..30 {
+            for &id in &audio { levels.store(id, 0.3); }
+            app.update(1.0 / 60.0);
+        }
+        for c in app.cables.iter().filter(|c| c.kind == PortKind::Audio) {
+            assert!(c.level > 0.5, "cable {} must breathe with its edge level (level {})", c.id, c.level);
+            assert!(active_pulses(c) > 0, "cable {} must carry traveling pulses while sounding", c.id);
+        }
+        // MIDI pulses stay event-driven: no key pressed → none.
+        for c in app.cables.iter().filter(|c| c.kind == PortKind::Midi) {
+            assert_eq!(active_pulses(c), 0, "MIDI cable {} pulsed without an event", c.id);
+        }
+        // Silence: levels decay, the spawner stops, pulses drain off.
+        for &id in &audio { levels.store(id, 0.0); }
+        run(&mut app, 2.5);
+        for c in app.cables.iter().filter(|c| c.kind == PortKind::Audio) {
+            assert!(c.level < AUDIO_PULSE_MIN, "cable {} level did not decay ({})", c.id, c.level);
+            assert_eq!(active_pulses(c), 0, "cable {} kept pulsing in silence", c.id);
+        }
+    }
+
+    #[test]
+    fn unpublished_edges_stay_dark_with_an_engine() {
+        // With an engine attached, a MIDI arrival must not fake the synth's
+        // audio envelope (a muted/unrouted synth must not look live).
+        let (mut app, _levels) = engine_app();
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        app.arrivals[0] = (surge, 1.0);
+        app.fire_keys(60, 0.9);
+        run(&mut app, 1.0);
+        for c in app.cables.iter().filter(|c| c.kind == PortKind::Audio) {
+            assert!(c.level < 0.01, "cable {} lit without a published level ({})", c.id, c.level);
+        }
+        // Without an engine the arrival fallback still animates the chain.
+        let mut silent = DemoApp::new_with_sink(None);
+        silent.layout(SCREEN);
+        silent.fire_keys(60, 0.9);
+        let mut peak = 0.0f32;
+        for _ in 0..90 {
+            silent.update(1.0 / 60.0);
+            peak = peak.max(silent.cables.iter().filter(|c| c.kind == PortKind::Audio).map(|c| c.level).fold(0.0, f32::max));
+        }
+        assert!(peak > 0.2, "no-engine fallback must still breathe ({peak})");
+    }
+
+    #[test]
+    fn edge_display_level_maps_db() {
+        assert_eq!(edge_display_level(0.0), 0.0);
+        assert_eq!(edge_display_level(-1.0), 0.0);
+        assert_eq!(edge_display_level(f32::NAN), 0.0);
+        assert!((edge_display_level(1.0) - 1.0).abs() < 1e-6);
+        assert!(edge_display_level(1e-4) == 0.0, "−80 dB is silence");
+        let quiet = edge_display_level(0.05);
+        assert!(quiet > AUDIO_PULSE_MIN, "audible −26 dB signal must flow ({quiet})");
+    }
+
+    /// Real frame through a live egui::Context (rule 11: clear textures).
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.focused = true;
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+    }
+
+    fn key_ev(key: Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed, repeat, modifiers: Modifiers::NONE }
+    }
+
+    #[test]
+    fn key_led_holds_while_held_and_snaps_after_release() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![key_ev(Key::A, true, false)]);
+        assert_eq!(app.held_keys.len(), 1);
+        let semi = app.held_keys[0].1 % 12;
+        // Held (OS key repeats are swallowed): stays fully lit.
+        for _ in 0..20 { frame(&mut app, &ctx, vec![key_ev(Key::A, true, true)]); }
+        app.update(0.5);
+        assert!(app.key_leds[semi] > 0.99, "held key must stay lit ({})", app.key_leds[semi]);
+        // Release: the note-off must not re-light the key; a short tail...
+        frame(&mut app, &ctx, vec![key_ev(Key::A, false, false)]);
+        assert!(app.held_keys.is_empty());
+        for _ in 0..6 { app.update(1.0 / 60.0); }
+        assert!(app.key_leds[semi] > 0.02, "a short visible tail remains ({})", app.key_leds[semi]);
+        // ...then dark within ~0.35 s of release.
+        for _ in 0..15 { app.update(1.0 / 60.0); }
+        assert!(app.key_leds[semi] < 0.02, "key LED still lit 0.35 s after release ({})", app.key_leds[semi]);
+    }
+
+    #[test]
+    fn fit_label_shrinks_then_truncates() {
+        // Fake metric: width = chars × size × 0.6.
+        let m = |t: &str, sz: f32| t.chars().count() as f32 * sz * 0.6;
+        assert_eq!(fit_label("SURGE", 10.0, 8.0, 100.0, m), ("SURGE".to_string(), 10.0));
+        assert_eq!(fit_label("SURGE", 10.0, 8.0, f32::INFINITY, m).1, 10.0);
+        // 20 chars @10 = 120 px; 108 px fits at 9 px.
+        let (t, sz) = fit_label("ABCDEFGHIJKLMNOPQRST", 10.0, 8.0, 108.0, m);
+        assert_eq!(t, "ABCDEFGHIJKLMNOPQRST");
+        assert!(sz <= 9.0 && sz >= 8.0 && m(&t, sz) <= 108.0, "{sz}");
+        // Too wide even at the 8 px floor → ellipsis, still within bounds.
+        let (t, sz) = fit_label("METRONOME · TRANSPORT CLICK", 10.0, 8.0, 60.0, m);
+        assert_eq!(sz, 8.0);
+        assert!(t.ends_with('…') && m(&t, sz) <= 60.0, "{t}");
+        // Degenerate width never panics.
+        let (t, _) = fit_label("X", 10.0, 8.0, -5.0, m);
+        assert_eq!(t, "…");
+    }
+
+    #[test]
+    fn compressed_unit_labels_fit_their_boxes() {
+        // Many units in a narrow window: every name/subtitle galley must fit
+        // inside its unit (draw_front additionally clips to the unit rect).
+        let mut g = Graph::demo_patch();
+        for (i, k) in [DspKind::Metronome, DspKind::Reverb, DspKind::Eq3, DspKind::Limiter].into_iter().enumerate() {
+            g.add_node(NodeKind::Dsp(k), name_bytes(&format!("FX {i}")));
+        }
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&g, &[]);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut raw_frame = |app: &mut DemoApp| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)));
+            raw.focused = true;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+        };
+        // Frame 1 fixes the HiDPI scale + lays out; later frames refit the
+        // galleys against the laid-out rects (one-frame lag by design).
+        for _ in 0..8 { raw_frame(&mut app); }
+        let mut shrunk = 0;
+        for (i, u) in app.units.iter().enumerate() {
+            if !app.visible(i) { continue; }
+            let w = app.unit_rects[i].width();
+            let name_w = u.name_g.as_ref().unwrap().size().x;
+            let sub_w = u.sub_g.as_ref().unwrap().size.x;
+            assert!(name_w <= (w - UNIT_NAME_INSET).max(0.0) + 1.0 || u.name_g.as_ref().unwrap().text() == "…",
+                "unit {} name {name_w}px overflows {w}px", u.name);
+            assert!(sub_w <= (w - UNIT_SUB_INSET).max(0.0) + 1.0 || u.sub_g.as_ref().unwrap().chars.len() == 1,
+                "unit {} subtitle {sub_w}px overflows {w}px", u.name);
+            if u.label_fit_w.is_finite() { shrunk += 1; }
+        }
+        assert!(shrunk > 0, "labels were never fitted to real unit widths");
+    }
+
+    #[test]
+    fn sync_adoption_does_not_flash_but_loads_do() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.update(1.0);
+        assert_eq!(app.load_fade, 1.0);
+        // Agent/MCP AddNode → engine publishes → UI adopts: no fade replay.
+        let mut remote = app.base_graph.clone();
+        remote.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 5, graph: remote, rules: Vec::new() }));
+        let before = app.units.len();
+        app.graph_pub = Some(pub_);
+        app.sync_from_engine();
+        assert_eq!(app.units.len(), before + 1, "remote AddNode adopted");
+        assert_eq!(app.load_fade, 1.0, "sync adoption must not replay the load fade");
+        // Explicit loads still fade in.
+        app.load_template(Template::LeadReverb);
+        assert_eq!(app.load_fade, 0.0);
+        app.update(1.0);
+        app.load_multi_rig_demo();
+        assert_eq!(app.load_fade, 0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split as a Keys-node property (two MIDI outs) + BPM on the metronome face
+// (brief D, user 2026-11-15).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod split_bpm_tests {
+    use super::*;
+    use crate::control::command_bus;
+
+    /// One frame through the real runtime path; returns every painted text.
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<String> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        fn walk(shape: &Shape, texts: &mut Vec<String>) {
+            match shape {
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(v) => for s in v { walk(s, texts) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for cs in &out.shapes { walk(&cs.shape, &mut texts); }
+        texts
+    }
+
+    fn ptr(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    fn click(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) {
+        for ev in [vec![egui::Event::PointerMoved(pos)], vec![ptr(pos, true)], vec![ptr(pos, false)]] {
+            frame(app, ctx, ev);
+        }
+    }
+
+    fn drag(app: &mut DemoApp, ctx: &egui::Context, from: Pos2, to: Pos2) {
+        frame(app, ctx, vec![egui::Event::PointerMoved(from)]);
+        frame(app, ctx, vec![ptr(from, true)]);
+        for i in 1..=6 {
+            let p = from + (to - from) * (i as f32 / 6.0);
+            frame(app, ctx, vec![egui::Event::PointerMoved(p)]);
+        }
+        frame(app, ctx, vec![ptr(to, false)]);
+    }
+
+    fn screen(app: &DemoApp, r: Rect) -> Pos2 { app.xf.p(r.center().to_vec2()) }
+
+    /// Demo patch (Keys 0 → Surge A 1 / Surge B 4) on the front.
+    fn demo() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert!(app.side == Side::Front);
+        (app, ctx)
+    }
+
+    fn keys(app: &DemoApp) -> usize { app.keys_unit.expect("keys unit") }
+
+    fn out_labels(app: &DemoApp) -> Vec<&'static str> {
+        app.units[keys(app)].jacks.iter().filter(|j| j.dir == Dir::Out).map(|j| j.label).collect()
+    }
+
+    #[test]
+    fn keys_face_shows_one_or_two_midi_outs() {
+        let (mut app, ctx) = demo();
+        assert_eq!(out_labels(&app), vec!["MIDI OUT"], "unsplit: one MIDI OUT");
+        let (chip, _) = app.split_rects(keys(&app)).expect("Keys face has a SPLIT chip");
+        { let p = screen(&app, chip); click(&mut app, &ctx, p); }
+        let k = keys(&app);
+        assert_eq!(app.units[k].split, Some(60), "chip splits at C4");
+        assert_eq!(out_labels(&app), vec!["LOW", "HIGH"], "split: LOW + HIGH MIDI outs");
+        assert!(app.units[k].kind(Dir::Out, 1) == PortKind::Midi, "HIGH is a MIDI port");
+        assert_eq!(app.base_graph.node(app.units[k].node_id).unwrap().split, Some(60), "sessions see it");
+        // Existing cables stay on LOW.
+        assert!(app.cables.iter().filter(|c| c.src == k).all(|c| c.src_port == 0 && c.dying < 0.0));
+        // The point readout + keyboard marker paint without panicking.
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "C4"), "point readout shows the note name");
+        assert!(texts.iter().any(|t| t == "SPLIT"));
+        let (chip, _) = app.split_rects(keys(&app)).unwrap();
+        { let p = screen(&app, chip); click(&mut app, &ctx, p); }
+        assert_eq!(app.units[keys(&app)].split, None);
+        assert_eq!(out_labels(&app), vec!["MIDI OUT"]);
+    }
+
+    #[test]
+    fn unsplitting_unplugs_high_cables_with_a_notice() {
+        let (mut app, ctx) = demo();
+        let k = keys(&app);
+        assert!(app.set_keys_split(k, Some(60)));
+        // Move Surge B's cable to HIGH.
+        let b = app.cables.iter().position(|c| c.src == k && app.units[c.dst].node_id == 4).unwrap();
+        let id = app.cables[b].id;
+        app.cables.remove(b);
+        app.add_cable_id(id, k, 1, app.units.iter().position(|u| u.node_id == 4).unwrap(), 0, PortKind::Midi);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.split_footer().contains("LOW → Surge A") && app.split_footer().contains("HIGH → Surge B"),
+            "matrix footer reflects the Keys split: {}", app.split_footer());
+        assert!(app.set_keys_split(k, None));
+        assert!(app.live_cable(id).is_none(), "HIGH cable unplugged");
+        assert!(app.cables.iter().any(|c| c.src == k && c.src_port == 0 && c.dying < 0.0), "LOW cable kept");
+        assert!(app.patch_notice.as_ref().map_or(false, |(m, _)| m.contains("HIGH")), "notice explains the unplug");
+        frame(&mut app, &ctx, vec![]); // dying HIGH cable still animates without its jack
+    }
+
+    #[test]
+    fn split_chip_sends_set_node_split_and_mirrors_the_engine() {
+        let (mut app, ctx) = demo();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        engine.set_graph_pub(pub_.clone());
+        app.graph_pub = Some(pub_.clone());
+        let mut pump = |drain: &mut crate::control::CommandDrain| {
+            let mut sent = Vec::new();
+            drain.drain(|c| sent.push(c));
+            let splits: Vec<(u32, Option<u8>)> = sent.iter().filter_map(|c| match c {
+                Command::SetNodeSplit { node, point } => Some((*node, *point)),
+                _ => None,
+            }).collect();
+            for c in sent { ebus.send(c); }
+            let mut buf = vec![0.0f32; 64 * 2];
+            engine.render(&mut buf, 2);
+            splits
+        };
+        frame(&mut app, &ctx, vec![]);
+        pump(&mut drain);
+        frame(&mut app, &ctx, vec![]);
+        let units_before = app.units.len();
+        let (chip, _) = app.split_rects(keys(&app)).unwrap();
+        { let p = screen(&app, chip); click(&mut app, &ctx, p); }
+        assert_eq!(app.units[keys(&app)].split, None, "no local guess while an engine is attached");
+        assert_eq!(pump(&mut drain), vec![(0, Some(60))], "chip sends SetNodeSplit(keys, 60)");
+        frame(&mut app, &ctx, vec![]); // sync_from_engine adopts it
+        assert_eq!(app.units[keys(&app)].split, Some(60));
+        assert_eq!(out_labels(&app), vec!["LOW", "HIGH"]);
+        assert_eq!(app.shared_graph.lock().unwrap().node(0).unwrap().split, Some(60), "bridge mirror follows");
+        assert_eq!(app.units.len(), units_before);
+        assert_ne!(app.session_msg, "Patch updated from MCP/CLI", "a split must not rebuild the rack");
+
+        // Drag the point readout up two semitones (12px).
+        let (_, readout) = app.split_rects(keys(&app)).unwrap();
+        let from = screen(&app, readout);
+        { let to = from - Vec2::new(0.0, 12.0 * app.xf.sy); drag(&mut app, &ctx, from, to); }
+        let sent = pump(&mut drain);
+        assert_eq!(sent.last(), Some(&(0, Some(62))), "drag sets the point: {sent:?}");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.units[keys(&app)].split, Some(62));
+        assert_eq!(engine.graph().node(0).unwrap().split, Some(62));
+    }
+
+    #[test]
+    fn zone_pulses_only_the_jack_the_note_leaves() {
+        let (mut app, _ctx) = demo();
+        let k = keys(&app);
+        app.set_keys_split(k, Some(60));
+        let b = app.cables.iter().position(|c| c.src == k && app.units[c.dst].node_id == 4).unwrap();
+        let id = app.cables[b].id;
+        app.cables.remove(b);
+        app.add_cable_id(id, k, 1, app.units.iter().position(|u| u.node_id == 4).unwrap(), 0, PortKind::Midi);
+        let pulses = |app: &DemoApp, port: usize| app.cables.iter()
+            .filter(|c| c.src == k && c.src_port == port)
+            .map(|c| c.pulses.iter().filter(|p| p.active).count()).sum::<usize>();
+        app.fire_keys(59, 0.9);
+        assert!(pulses(&app, 0) > 0 && pulses(&app, 1) == 0, "59 → LOW only");
+        app.fire_keys(60, 0.9);
+        assert!(pulses(&app, 1) > 0, "60 → HIGH");
+    }
+
+    #[test]
+    fn top_strip_has_no_split_or_transport_chip() {
+        let (mut app, ctx) = demo();
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "Matrix"), "the nav strip painted: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("Split @")), "global split chip is gone");
+        assert!(!texts.iter().any(|t| t == "Transport"), "Transport nav chip is gone");
+        // F10 no longer opens a Transport window — it toggles the Mixer stage.
+        let f10 = |pressed| egui::Event::Key { key: Key::F10, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+        frame(&mut app, &ctx, vec![f10(true), f10(false)]);
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(!texts.iter().any(|t| t == "Transport"), "F10 opens no Transport window");
+        assert!(app.show_mixer, "F10 opens the mixer");
+        assert!(texts.iter().any(|t| t == "Mixer"), "Mixer nav chip is painted");
+    }
+
+    #[test]
+    fn agent_operates_on_all_rigs() {
+        // Rule 6: every rig tool exists in the schema AND in exec_tool.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        for t in ["get_rigs", "add_rig", "delete_rig", "select_rig"] { assert!(names.contains(&t), "schema has {t}"); }
+        let mut app = DemoApp::new_with_sink(None);
+        let r = app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
+        assert!(r.contains("Added Bass"), "{r}");
+        assert_eq!(app.rig_count(), 2);
+        let rigs: serde_json::Value = serde_json::from_str(&app.exec_tool("get_rigs", &serde_json::json!({}))).unwrap();
+        assert_eq!(rigs["rigs"].as_array().unwrap().len(), 2);
+        assert_eq!(rigs["rigs"][1]["name"], "Bass");
+        assert_eq!(rigs["rigs"][1]["units"].as_array().unwrap().len(), 3);
+        let r = app.exec_tool("select_rig", &serde_json::json!({"rig": 0}));
+        assert!(r.contains("showing rig 0") && app.active_rig == 0, "{r}");
+        assert!(app.exec_tool("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 5})).contains("no rig 5"));
+        assert!(app.exec_tool("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})).contains("rig 1 'Bass'"));
+        // Destructive: refused without confirm, done with it.
+        assert!(app.exec_tool("delete_rig", &serde_json::json!({"rig": 0})).starts_with("not deleted"));
+        assert_eq!(app.rig_count(), 2);
+        let r = app.exec_tool("delete_rig", &serde_json::json!({"rig": 0, "confirm": true}));
+        assert!(r.contains("Deleted"), "{r}");
+        assert_eq!(app.rig_count(), 1);
+        assert_eq!(app.rig_name(0), "Bass");
+    }
+
+    #[test]
+    fn set_split_tool_parity() {
+        // Rule 6: schema AND exec_tool.
+        let tools = crate::assistant::tools();
+        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == "set_split"));
+        let (mut app, _ctx) = demo();
+        let r = app.exec_tool("set_split", &serde_json::json!({"point": 64}));
+        assert!(r.contains("split at note 64"), "{r}");
+        assert_eq!(app.units[keys(&app)].split, Some(64));
+        app.publish_patch();
+        let g: serde_json::Value = serde_json::from_str(&app.exec_tool("get_graph", &serde_json::json!({}))).unwrap();
+        let k = g["nodes"].as_array().unwrap().iter().find(|n| n["id"] == serde_json::json!(0)).cloned().unwrap();
+        assert_eq!(k["split"], serde_json::json!(64), "get_graph exposes split");
+        let m: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
+        assert_eq!(m["split"][0]["point"], serde_json::json!(64));
+        let r = app.exec_tool("set_split", &serde_json::json!({"node": 1, "point": 60}));
+        assert!(r.contains("only keyboards split"), "{r}");
+        app.exec_tool("set_split", &serde_json::json!({"node": 0}));
+        assert_eq!(app.units[keys(&app)].split, None, "no point = unsplit");
+    }
+
+    #[test]
+    fn split_round_trips_through_sessions() {
+        let (mut app, _ctx) = demo();
+        let k = keys(&app);
+        app.set_keys_split(k, Some(55));
+        let b = app.cables.iter().position(|c| c.src == k && app.units[c.dst].node_id == 4).unwrap();
+        let id = app.cables[b].id;
+        app.cables.remove(b);
+        app.add_cable_id(id, k, 1, app.units.iter().position(|u| u.node_id == 4).unwrap(), 0, PortKind::Midi);
+        let s = app.capture_session("split").unwrap();
+        let json = serde_json::to_string(&s.graph).unwrap();
+        let back: Graph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.node(0).unwrap().split, Some(55));
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.apply_session(&crate::session::Session::new("t", back)).unwrap();
+        let fk = fresh.keys_unit.unwrap();
+        assert_eq!(fresh.units[fk].split, Some(55));
+        assert_eq!(out_labels(&fresh), vec!["LOW", "HIGH"]);
+        assert!(fresh.cables.iter().any(|c| c.src == fk && c.src_port == 1 && fresh.units[c.dst].node_id == 4),
+            "HIGH cable restored on port 1");
+    }
+
+    /// Demo patch + two metronomes wired to the master.
+    fn metro_app() -> (DemoApp, egui::Context, u32, u32) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::demo_patch();
+        let m1 = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+        let m2 = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK 2"));
+        g.connect_with_id(10, PortRef { node: m1, port: 0 }, PortRef { node: 3, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(11, PortRef { node: m2, port: 0 }, PortRef { node: 3, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx, m1, m2)
+    }
+
+    fn unit_of(app: &DemoApp, node: u32) -> usize { app.units.iter().position(|u| u.node_id == node).unwrap() }
+
+    #[test]
+    fn metronome_face_has_bpm_steppers_and_drag() {
+        let (mut app, ctx, m1, m2) = metro_app();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let u1 = unit_of(&app, m1);
+        let b = app.bpm_rects(u1).expect("metronome face shows a BPM control");
+        let chip = app.transport_chip_rect(u1).unwrap();
+        assert!(!b.value.intersects(chip), "BPM never covers the Play/Stop chip");
+        assert!(app.unit_rects[u1].contains_rect(b.value), "BPM stays on its face");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "96") && texts.iter().any(|t| t == "BPM"), "face shows the tempo");
+        let bpm_sent = |drain: &mut crate::control::CommandDrain| {
+            let mut v = Vec::new();
+            drain.drain(|c| if let Command::SetBpm { bpm } = c { v.push(bpm) });
+            v
+        };
+        bpm_sent(&mut drain);
+        // + / − steppers.
+        let plus = b.plus.unwrap_or_else(|| panic!("steppers fit: unit {:?} chip {:?} bpm {:?}", app.unit_rects[u1], chip, b));
+        { let p = screen(&app, plus); click(&mut app, &ctx, p); }
+        assert_eq!(app.bpm, 97.0);
+        assert_eq!(bpm_sent(&mut drain), vec![97.0]);
+        let minus = app.bpm_rects(u1).unwrap().minus.unwrap();
+        { let p = screen(&app, minus); click(&mut app, &ctx, p); }
+        { let p = screen(&app, minus); click(&mut app, &ctx, p); }
+        assert_eq!(app.bpm, 95.0);
+        // Drag the value up 30px → +10 BPM (one per 3px).
+        let from = screen(&app, app.bpm_rects(u1).unwrap().value);
+        { let to = from - Vec2::new(0.0, 30.0 * app.xf.sy); drag(&mut app, &ctx, from, to); }
+        assert_eq!(app.bpm, 105.0, "drag sets the tempo");
+        assert_eq!(bpm_sent(&mut drain).last(), Some(&105.0), "engine gets SetBpm");
+        assert!(!ctx.memory(|m| m.focused().is_some()), "no widget focus: rack keys keep working (rule 12)");
+        // A drag/click on the BPM field never toggles Play/Stop.
+        assert!(!app.units[u1].playing);
+        // The second metronome shows/sets the SAME global tempo.
+        let u2 = unit_of(&app, m2);
+        let plus2 = app.bpm_rects(u2).and_then(|b| b.plus).expect("second face too");
+        { let p = screen(&app, plus2); click(&mut app, &ctx, p); }
+        assert_eq!(app.bpm, 106.0);
+        // Clamped to the engine range.
+        app.set_bpm(400.0);
+        assert_eq!(app.bpm, 300.0);
+    }
+
+    #[test]
+    fn narrow_metronome_still_shows_chip_and_bpm() {
+        let (mut app, _ctx, m1, _m2) = metro_app();
+        let u = unit_of(&app, m1);
+        let r = app.unit_rects[u];
+        for w in [150.0f32, 200.0, 240.0, 320.0] {
+            app.unit_rects[u] = Rect::from_min_size(r.min, Vec2::new(w, r.height()));
+            let chip = app.transport_chip_rect(u).expect("chip");
+            let b = app.bpm_rects(u).unwrap_or_else(|| panic!("BPM at width {w}"));
+            for rr in [Some(b.value), b.minus, b.plus].into_iter().flatten() {
+                assert!(!rr.intersects(chip), "w={w}: overlaps chip");
+                assert!(app.unit_rects[u].contains_rect(rr), "w={w}: leaves the face");
+            }
+        }
     }
 }

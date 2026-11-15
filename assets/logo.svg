@@ -1,28 +1,53 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <!-- kabelsalat: three patch cables, sagging, with signal pulses on the way -->
-  <rect width="512" height="512" fill="#15161e"/>
+  <!-- kabelsalat brand mark: two patch cables in a real weave (tomato over
+       MIDI blue), patch plugs seated in jack sockets, signal pulse at the
+       crossing. Flat fills only (Hurricane §0): no gradients, no glow.
+       Geometry = theme::crossed_wires at full detail, glyph box 392 px
+       (60 px padding): h = 196 / MARK_EXT_FULL = 120.80; cables run
+       center ± (h, h) with inner controls center ± (0.2h, 0.6h).
+       Pinned by theme::tests::mark_geometry_matches_logo_svg. -->
+  <rect width="512" height="512" rx="102" fill="#1C1C1C"/>
 
-  <!-- port rails -->
-  <rect x="56" y="100" width="24" height="240" rx="4" fill="#262838"/>
-  <rect x="432" y="100" width="24" height="240" rx="4" fill="#262838"/>
+  <!-- under-cable (MIDI blue) + flat sheen toward its top edge -->
+  <path id="cable-under" d="M 135.2 376.8 C 231.8 183.5, 280.2 328.5, 376.8 135.2" stroke="#5B8FD0" stroke-width="24.2" fill="none" stroke-linecap="round"/>
+  <path d="M 131.1 374.7 C 232.7 171.6, 281 316.5, 372.7 133.1" stroke="#8EB0D8" stroke-width="6" fill="none" stroke-linecap="butt"/>
+  <!-- weave gap: tile-colored band hugging the over-cable through the crossing -->
+  <path id="weave-gap" d="M 207.1 232.9 C 241.1 257.9, 270.9 254.1, 304.9 279.1" stroke="#1C1C1C" stroke-width="41.1" fill="none" stroke-linecap="butt"/>
+  <!-- over-cable (tomato) + sheen -->
+  <path id="cable-over" d="M 135.2 135.2 C 231.8 328.5, 280.2 183.5, 376.8 376.8" stroke="#EF4825" stroke-width="24.2" fill="none" stroke-linecap="round"/>
+  <path d="M 139.3 133.1 C 231 316.5, 279.3 171.6, 380.9 374.7" stroke="#EF8269" stroke-width="6" fill="none" stroke-linecap="butt"/>
 
-  <!-- plugs, left -->
-  <rect x="80" y="129" width="28" height="22" rx="3" fill="#414459"/>
-  <rect x="80" y="209" width="28" height="22" rx="3" fill="#414459"/>
-  <rect x="80" y="289" width="28" height="22" rx="3" fill="#414459"/>
-  <!-- plugs, right -->
-  <rect x="404" y="129" width="28" height="22" rx="3" fill="#414459"/>
-  <rect x="404" y="209" width="28" height="22" rx="3" fill="#414459"/>
-  <rect x="404" y="289" width="28" height="22" rx="3" fill="#414459"/>
+  <!-- patch plugs: jack socket, housing, two-step boot, cream tip ring -->
+  <g id="plug-under-start">
+    <rect x="60" y="410.9" width="41.1" height="41.1" rx="6" fill="#100F0E" stroke="#8E8E8C" stroke-width="3"/>
+    <rect x="83.1" y="387.9" width="41.1" height="41.1" rx="9" fill="#232120" stroke="#8E8E8C" stroke-width="3" transform="rotate(135 103.6 408.4)"/>
+    <path d="M 135.2 376.8 L 126.7 385.3" stroke="#5B8FD0" stroke-width="27.7" stroke-linecap="round"/>
+    <path d="M 127.5 384.5 L 116.4 395.6" stroke="#5B8FD0" stroke-width="33.8"/>
+    <circle cx="80.5" cy="431.5" r="10.3" fill="#100F0E" stroke="#EFEEE9" stroke-width="5.4"/>
+  </g>
+  <g id="plug-under-end">
+    <rect x="410.9" y="60" width="41.1" height="41.1" rx="6" fill="#100F0E" stroke="#8E8E8C" stroke-width="3"/>
+    <rect x="387.9" y="83.1" width="41.1" height="41.1" rx="9" fill="#232120" stroke="#8E8E8C" stroke-width="3" transform="rotate(-45 408.4 103.6)"/>
+    <path d="M 376.8 135.2 L 385.3 126.7" stroke="#5B8FD0" stroke-width="27.7" stroke-linecap="round"/>
+    <path d="M 384.5 127.5 L 395.6 116.4" stroke="#5B8FD0" stroke-width="33.8"/>
+    <circle cx="431.5" cy="80.5" r="10.3" fill="#100F0E" stroke="#EFEEE9" stroke-width="5.4"/>
+  </g>
+  <g id="plug-over-start">
+    <rect x="60" y="60" width="41.1" height="41.1" rx="6" fill="#100F0E" stroke="#8E8E8C" stroke-width="3"/>
+    <rect x="83.1" y="83.1" width="41.1" height="41.1" rx="9" fill="#232120" stroke="#8E8E8C" stroke-width="3" transform="rotate(-135 103.6 103.6)"/>
+    <path d="M 135.2 135.2 L 126.7 126.7" stroke="#EF4825" stroke-width="27.7" stroke-linecap="round"/>
+    <path d="M 127.5 127.5 L 116.4 116.4" stroke="#EF4825" stroke-width="33.8"/>
+    <circle cx="80.5" cy="80.5" r="10.3" fill="#100F0E" stroke="#EFEEE9" stroke-width="5.4"/>
+  </g>
+  <g id="plug-over-end">
+    <rect x="410.9" y="410.9" width="41.1" height="41.1" rx="6" fill="#100F0E" stroke="#8E8E8C" stroke-width="3"/>
+    <rect x="387.9" y="387.9" width="41.1" height="41.1" rx="9" fill="#232120" stroke="#8E8E8C" stroke-width="3" transform="rotate(45 408.4 408.4)"/>
+    <path d="M 376.8 376.8 L 385.3 385.3" stroke="#EF4825" stroke-width="27.7" stroke-linecap="round"/>
+    <path d="M 384.5 384.5 L 395.6 395.6" stroke="#EF4825" stroke-width="33.8"/>
+    <circle cx="431.5" cy="431.5" r="10.3" fill="#100F0E" stroke="#EFEEE9" stroke-width="5.4"/>
+  </g>
 
-  <!-- sagging cables -->
-  <path d="M 106 140 C 210 280, 302 280, 406 140" stroke="#ffd60a" stroke-width="16" fill="none" stroke-linecap="round"/>
-  <path d="M 106 220 C 210 360, 302 360, 406 220" stroke="#7aa2f7" stroke-width="16" fill="none" stroke-linecap="round"/>
-  <path d="M 106 300 C 210 430, 302 430, 406 300" stroke="#9ece6a" stroke-width="16" fill="none" stroke-linecap="round"/>
-
-  <!-- signal pulses traveling along the cables -->
-  <circle cx="256" cy="245" r="26" fill="#ffd60a" opacity="0.22"/>
-  <circle cx="256" cy="245" r="13" fill="#fffbe6"/>
-  <circle cx="256" cy="325" r="18" fill="#7aa2f7" opacity="0.22"/>
-  <circle cx="256" cy="325" r="9" fill="#e3ecff"/>
+  <!-- signal pulse: cream dot + one flat hairline ring, no glow -->
+  <circle cx="256" cy="256" r="29" fill="none" stroke="#FFFBFA" stroke-opacity="0.35" stroke-width="3"/>
+  <circle id="pulse" cx="256" cy="256" r="14.5" fill="#FFFBFA"/>
 </svg>

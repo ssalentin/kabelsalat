@@ -93,12 +93,30 @@ struct AddNodeArgs {
     kind: String,
     /// Display name (max 31 bytes; defaults to the kind).
     name: Option<String>,
-    /// For kind "dsp": gain, pan, eq3, filter, limiter, saturation, delay, reverb.
+    /// For kind "dsp": gain, pan, eq3, filter, limiter, saturation, delay, reverb, metronome.
     dsp: Option<String>,
     /// For kind "clap": CLAP plugin id (defaults to Surge XT).
     plugin_id: Option<String>,
     /// For kind "lv2": the LV2 plugin URI (see list_plugins).
     uri: Option<String>,
+    /// Multi-rig: which rig (0-based, see get_rigs) the node joins. Default 0.
+    rig: Option<u8>,
+}
+
+/// Arguments for `add_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AddRigArgs {
+    /// Optional rig name (default "Rig A/B/C…").
+    name: Option<String>,
+}
+
+/// Arguments for `delete_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeleteRigArgs {
+    /// Rig index (0-based, see get_rigs).
+    rig: usize,
+    /// Must be true: deleting removes the rig's units, cables and synth state.
+    confirm: bool,
 }
 
 /// Arguments for `remove_node`.
@@ -149,19 +167,46 @@ struct SetParamArgs {
 struct SetRigSourceArgs {
     /// Instrument node id whose input selection to set.
     node: NodeId,
-    /// Accept notes from the on-screen keys.
-    keys: bool,
-    /// Accept notes from the laptop keyboard.
-    laptop: bool,
-    /// Accept notes from hardware MIDI inputs.
-    hardware: bool,
+    /// Accept notes from the computer keyboard (on-screen keys and laptop
+    /// typing are one source). Default true.
+    #[serde(alias = "keys")]
+    keyboard: Option<bool>,
+    /// Accept notes from hardware MIDI inputs. Default true.
+    hardware: Option<bool>,
+    /// Pre-unification laptop flag: folded into `keyboard` (keys || laptop).
+    #[schemars(skip)]
+    #[serde(default)]
+    laptop: Option<bool>,
+}
+
+impl SetRigSourceArgs {
+    /// The (keyboard, hardware) pair; a legacy `laptop` flag ORs into keyboard.
+    fn pair(&self) -> (bool, bool) {
+        let keyboard = match (self.keyboard, self.laptop) {
+            (None, None) => true,
+            (k, l) => k.unwrap_or(false) || l.unwrap_or(false),
+        };
+        (keyboard, self.hardware.unwrap_or(true))
+    }
+}
+
+/// Arguments for `set_node_playing`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetNodePlayingArgs {
+    /// Transport-capable node id (a metronome; see get_graph "transport").
+    node: NodeId,
+    /// true = start this instrument, false = stop it.
+    playing: bool,
 }
 
 /// Arguments for `set_split`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetSplitArgs {
-    /// MIDI note 0..=127 to split the keyboard at: rig A (node 1) plays below,
-    /// rig B (node 4) at/above. Omit (null) to disable the split.
+    /// Keys node id to split (see get_graph, kind keys). Omit = the first
+    /// Keys node in the patch.
+    node: Option<NodeId>,
+    /// MIDI note 0..=127 to split at: notes below leave on the Keys node's
+    /// port 0 (LOW), notes at/above on port 1 (HIGH). Omit (null) = unsplit.
     point: Option<u8>,
 }
 
@@ -201,7 +246,8 @@ struct SetRigDeviceArgs {
 struct SetMatrixRuleArgs {
     /// Destination instrument node id.
     node: NodeId,
-    /// Source: "keys", "laptop", or "hw:<device index>".
+    /// Source: "keys" (the computer keyboard: on-screen + laptop) or
+    /// "hw:<device index>".
     source: String,
     /// MIDI channel filter 0..=15; omit for omni (any channel).
     channel: Option<u8>,
@@ -241,7 +287,7 @@ struct NoteOnArgs {
     note: u8,
     /// Velocity 0.0..=1.0 (default 0.8).
     velocity: Option<f32>,
-    /// Source: "keys" (default), "laptop", "hardware:<port>",
+    /// Source: "keys" (default; the computer keyboard), "hardware:<port>",
     /// "virtual:<port>" or "file_player:<id>".
     source: Option<String>,
 }
@@ -268,7 +314,7 @@ struct RigArg {
     /// own MasterOut.
     graph: Value,
     /// Hardware MIDI device id feeding this rig; null/omitted = any source
-    /// (on-screen keys, laptop keys, every hardware device).
+    /// (the computer keyboard, every hardware device).
     midi_device: Option<u32>,
 }
 
@@ -293,6 +339,17 @@ fn ok_json(v: Value) -> Result<CallToolResult, McpError> {
 /// JSON-RPC protocol error).
 fn tool_err(msg: impl Into<String>) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![ContentBlock::text(msg.into())]))
+}
+
+/// Current rig metadata (local snapshot, or the live app's over the bridge).
+fn rig_meta(st: &State) -> Result<Vec<crate::control::RigMeta>, String> {
+    if matches!(st.backend, Backend::Remote) {
+        let reply = bridge::request(&json!({"op": "query", "name": "get_rigs"})).map_err(|e| format!("{e:#}"))?;
+        let data = reply.get("data").cloned().unwrap_or(Value::Null);
+        let snap: crate::control::RigSnapshot = serde_json::from_value(data).map_err(|e| format!("get_rigs: {e}"))?;
+        return Ok(snap.rigs);
+    }
+    Ok(st.rigs.lock().map(|s| s.rigs.clone()).unwrap_or_default())
 }
 
 fn send_cmd(st: &mut State, cmd: Command) -> Result<(), String> {
@@ -417,7 +474,8 @@ fn parse_source(s: Option<&str>) -> Result<SourceId, String> {
     };
     match tag {
         "keys" => Ok(SourceId::Keys),
-        "laptop" | "laptop_keys" => Ok(SourceId::LaptopKeys),
+        // Legacy spelling: laptop typing IS the keyboard source now.
+        "laptop" | "laptop_keys" | "keyboard" => Ok(SourceId::Keys),
         "hardware" => Ok(SourceId::Hardware(port()?)),
         "virtual" => Ok(SourceId::Virtual(port()?)),
         "file_player" => Ok(SourceId::FilePlayer(port()?)),
@@ -441,7 +499,18 @@ fn graph_json(g: &Graph) -> Value {
                 NodeKind::SystemAudio => json!({"type": "system_audio"}),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
             };
-            json!({"id": n.id, "name": name_str(&n.name), "kind": kind})
+            // `transport`: the node has its own Play/Stop (set_node_playing);
+            // `playing`: its current state (always false without transport).
+            json!({
+                "id": n.id,
+                "name": name_str(&n.name),
+                "kind": kind,
+                "transport": n.kind.supports_transport(),
+                "playing": n.playing,
+                // Keys only: split point (null = unsplit, one MIDI OUT on
+                // port 0); when set, port 0 = LOW (< point), port 1 = HIGH.
+                "split": n.split,
+            })
         })
         .collect();
     let edges: Vec<Value> = g
@@ -531,10 +600,57 @@ fn normalize_rig_graph(v: &mut Value) -> Result<(), String> {
 // Tools — 1:1 with the control plane
 // ---------------------------------------------------------------------------
 
+impl McpServer {
+    /// Shared add/delete rig path: split the live patch per rig, edit the
+    /// list, send ONE LoadRigs (the UI adopts it via GraphPub sync).
+    fn edit_rigs(&self, delete: Option<usize>, name: Option<String>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        let meta = match rig_meta(&st) { Ok(m) => m, Err(e) => return tool_err(e) };
+        let (graphs, _) = control::split_rigs(&st.graph);
+        let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
+            let m = meta.get(i);
+            let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+            Rig::new(name, g, m.and_then(|m| m.midi_device))
+        }).collect();
+        let active = match delete {
+            Some(r) => {
+                if rigs.len() <= 1 { return tool_err("the last rig cannot be deleted"); }
+                if r >= rigs.len() { return tool_err(format!("no rig {r}: there are {}", rigs.len())); }
+                rigs.remove(r);
+                0
+            }
+            None => {
+                if rigs.len() >= 8 { return tool_err("at most 8 rigs"); }
+                let used: Vec<String> = rigs.iter().map(|r| r.name.clone()).collect();
+                let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
+                    (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)).unwrap_or_else(|| "Rig".into())
+                });
+                let claps = st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })).count();
+                rigs.push(Rig::new(name, control::standard_rig_graph(claps < control::VOICE_POOL), None));
+                rigs.len() - 1
+            }
+        };
+        if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active }) {
+            return tool_err(e);
+        }
+        st.graph = merge_rigs(&rigs);
+        let metas: Vec<crate::control::RigMeta> = rigs.iter()
+            .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+        if matches!(st.backend, Backend::Local(_)) {
+            if let Ok(mut s) = st.rigs.lock() { s.rigs = metas.clone(); s.active = active; }
+        }
+        ok_json(json!({"rigs": metas, "active": active}))
+    }
+}
+
 #[tool_router]
 impl McpServer {
     /// The current patch: all nodes and cables.
-    #[tool(name = "get_graph", description = "Query the full patch graph: nodes (id, name, kind) and edges/cables (id, from/to port, midi|audio).")]
+    #[tool(name = "get_graph", description = "Query the full patch graph: nodes (id, name, kind, transport, playing) and edges/cables (id, from/to port, midi|audio). transport=true marks nodes with their own Play/Stop (metronome); playing is their current state.")]
     fn get_graph(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = refresh_remote(&mut st) {
@@ -582,7 +698,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. Clap voices are main-thread-only, so new clap nodes sound via load_graph's voice remap, not add_node.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. Clap voices are main-thread-only, so new clap nodes sound via load_graph's voice remap, not add_node.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -608,10 +724,12 @@ impl McpServer {
         }
         // Send first, then mirror into the local model: both id counters
         // advance exactly once per accepted command and stay in sync.
-        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name }) {
+        let rig = args.rig.unwrap_or(0);
+        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig }) {
             return tool_err(e);
         }
         let id = st.graph.add_node(kind, name);
+        st.graph.set_rig(id, rig);
         ok_json(json!({"id": id, "name": name_str(&name)}))
     }
 
@@ -687,7 +805,7 @@ impl McpServer {
     }
 
     /// Per-rig input selection.
-    #[tool(name = "set_rig_source", description = "Select which source classes feed an instrument node (Command::SetRigSource): keys, laptop, hardware. The MIDI cable still gates routing; this filters by source on top.")]
+    #[tool(name = "set_rig_source", description = "Select which source classes feed an instrument node (Command::SetRigSource): keyboard (the computer keyboard — on-screen keys and laptop typing are ONE source) and hardware (MIDI devices). Omitted flags default to true. The MIDI cable still gates routing; this filters by source on top.")]
     fn set_rig_source(&self, Parameters(args): Parameters<SetRigSourceArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = refresh_remote(&mut st) {
@@ -696,14 +814,15 @@ impl McpServer {
         if st.graph.node(args.node).is_none() {
             return tool_err(format!("node {} does not exist", args.node));
         }
-        if let Err(e) = send_cmd(&mut st, Command::SetRigSource { node: args.node, keys: args.keys, laptop: args.laptop, hardware: args.hardware }) {
+        let (keyboard, hardware) = args.pair();
+        if let Err(e) = send_cmd(&mut st, Command::SetRigSource { node: args.node, keyboard, hardware }) {
             return tool_err(e);
         }
-        ok_json(json!({"node": args.node, "keys": args.keys, "laptop": args.laptop, "hardware": args.hardware}))
+        ok_json(json!({"node": args.node, "keyboard": keyboard, "hardware": hardware}))
     }
 
-    /// Split the keyboard across the two rigs.
-    #[tool(name = "set_split", description = "Split the keyboard across the two rigs (Command::SetSplit). point is a MIDI note 0..=127: rig A (node 1) plays below it, rig B (node 4) at/above. Omit point (null) to disable the split so both rigs play the full keyboard. Example: point 60 splits at C4.")]
+    /// Split one Keys node into LOW/HIGH outputs.
+    #[tool(name = "set_split", description = "Split a Keys node's keyboard (Command::SetNodeSplit) — a property of the Keys node, not a global setting. point is a MIDI note 0..=127: played notes below it leave on the Keys node's port 0 (LOW), notes at/above on port 1 (HIGH). point null/omitted = unsplit (one MIDI OUT, port 0; HIGH-port cables are removed). node defaults to the first Keys node. Routing is plain wiring: connect LOW (from_port 0) and HIGH (from_port 1) to rigs with connect. Held notes are released. Example: {point: 60} splits at C4; then connect {from_node: 0, from_port: 1, to_node: 4, kind: midi}.")]
     fn set_split(&self, Parameters(args): Parameters<SetSplitArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Some(p) = args.point {
@@ -711,10 +830,27 @@ impl McpServer {
                 return tool_err("point must be 0..=127");
             }
         }
-        if let Err(e) = send_cmd(&mut st, Command::SetSplit { point: args.point }) {
+        if let Err(e) = refresh_remote(&mut st) {
             return tool_err(e);
         }
-        ok_json(json!({"point": args.point, "split": args.point.is_some()}))
+        let node = match args.node {
+            Some(id) => match st.graph.node(id) {
+                None => return tool_err(format!("node {id} does not exist")),
+                Some(n) if !matches!(n.kind, NodeKind::Keys) => {
+                    return tool_err(format!("node {id} ({}) is not a Keys node — only keyboards split", name_str(&n.name)))
+                }
+                Some(_) => id,
+            },
+            None => match st.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)) {
+                Some(n) => n.id,
+                None => return tool_err("the patch has no Keys node"),
+            },
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetNodeSplit { node, point: args.point }) {
+            return tool_err(e);
+        }
+        st.graph.set_split(node, args.point);
+        ok_json(json!({"node": node, "point": args.point, "split": args.point.is_some()}))
     }
 
     /// Mix system audio into the master.
@@ -753,20 +889,20 @@ impl McpServer {
     }
 
     /// Edit one matrix rule live (the hot-wire matrix's per-cell shaping).
-    #[tool(name = "set_matrix_rule", description = "Edit ONE MIDI routing rule live (Command::MatrixRule): source ('keys', 'laptop', 'hw:<device index>') → instrument node. Optional channel filter (0..15, omit = omni), transpose (-24..24 semitones), key_lo/key_hi (inclusive played-note split zone), vel_lo/vel_hi (velocity layer), enabled (mute). The engine releases held notes on the destination when the rule changes. Example: {node:1, source:'keys', key_lo:0, key_hi:59, transpose:-12} = bass zone an octave down.")]
+    #[tool(name = "set_matrix_rule", description = "Edit ONE MIDI routing rule live (Command::MatrixRule): source ('keys' = the computer keyboard, on-screen + laptop; 'hw:<device index>') → instrument node. Optional channel filter (0..15, omit = omni), transpose (-24..24 semitones), key_lo/key_hi (inclusive played-note split zone), vel_lo/vel_hi (velocity layer), enabled (mute). The engine releases held notes on the destination when the rule changes. Example: {node:1, source:'keys', key_lo:0, key_hi:59, transpose:-12} = bass zone an octave down.")]
     fn set_matrix_rule(&self, Parameters(args): Parameters<SetMatrixRuleArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if st.graph.node(args.node).is_none() {
             return tool_err(format!("node {} does not exist", args.node));
         }
         let source = match args.source.as_str() {
-            "keys" => crate::matrix::SourceId::Keys,
-            "laptop" => crate::matrix::SourceId::LaptopKeys,
+            // "laptop" is the legacy spelling of the one keyboard source.
+            "keys" | "keyboard" | "laptop" => crate::matrix::SourceId::Keys,
             s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
                 Ok(d) => crate::matrix::SourceId::Hardware(d),
                 Err(_) => return tool_err(format!("bad source '{s}'")),
             },
-            s => return tool_err(format!("unknown source '{s}' (keys|laptop|hw:<d>)")),
+            s => return tool_err(format!("unknown source '{s}' (keys|hw:<d>)")),
         };
         let cmd = Command::MatrixRule {
             source,
@@ -796,7 +932,7 @@ impl McpServer {
     }
 
     /// Load several independent rigs at once.
-    #[tool(name = "load_rigs", description = "Load multiple independent rigs (Command::LoadRigs): each rig is a full rack graph with its own MasterOut, bound to a hardware MIDI device (midi_device null = keys/laptop/all devices). Graphs use the patch shape: nodes [{id, kind, name?}] and edges [{id, from:{node,port}, to:{node,port}, kind:'midi'|'audio'}]; kinds are 'Keys', 'MasterOut', 'SystemAudio', {Clap:{plugin_id}}, {Dsp:'delay'|'reverb'|...}, {Lv2:{uri}}; names/plugin ids may be plain strings. The 2 CLAP voices are remapped to Clap nodes in node-id order across all rigs (surplus Clap nodes are silent — use LV2 instruments for more). Returns {loaded, active, nodes, edges}. Query the result with get_rigs.")]
+    #[tool(name = "load_rigs", description = "Load multiple independent rigs (Command::LoadRigs): each rig is a full rack graph with its own MasterOut, bound to a hardware MIDI device (midi_device null = the keyboard + all devices). Graphs use the patch shape: nodes [{id, kind, name?}] and edges [{id, from:{node,port}, to:{node,port}, kind:'midi'|'audio'}]; kinds are 'Keys', 'MasterOut', 'SystemAudio', {Clap:{plugin_id}}, {Dsp:'delay'|'reverb'|...}, {Lv2:{uri}}; names/plugin ids may be plain strings. The 2 CLAP voices are remapped to Clap nodes in node-id order across all rigs (surplus Clap nodes are silent — use LV2 instruments for more). Returns {loaded, active, nodes, edges}. Query the result with get_rigs.")]
     fn load_rigs(&self, Parameters(args): Parameters<LoadRigsArgs>) -> Result<CallToolResult, McpError> {
         let active = args.active.unwrap_or(0);
         let mut rigs = Vec::with_capacity(args.rigs.len());
@@ -841,6 +977,21 @@ impl McpServer {
             }
         }
         ok_json(summary)
+    }
+
+    /// Add a standard rig to the running setup.
+    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master, wired and playable (a bare Keys + Master when every synth voice is taken). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
+    fn add_rig(&self, Parameters(args): Parameters<AddRigArgs>) -> Result<CallToolResult, McpError> {
+        self.edit_rigs(None, args.name)
+    }
+
+    /// Delete one rig.
+    #[tool(name = "delete_rig", description = "Delete rig `rig` (index from get_rigs) with everything in it. DESTRUCTIVE: requires confirm=true; the last rig cannot be deleted. Returns {rigs, active}.")]
+    fn delete_rig(&self, Parameters(args): Parameters<DeleteRigArgs>) -> Result<CallToolResult, McpError> {
+        if !args.confirm {
+            return tool_err("not deleted: pass confirm=true (ask the user first)");
+        }
+        self.edit_rigs(Some(args.rig), None)
     }
 
     /// Query the multi-rig state.
@@ -922,25 +1073,48 @@ impl McpServer {
     }
 
     /// Start the transport.
-    #[tool(name = "transport_play", description = "Start the transport (Command::TransportPlay).")]
+    #[tool(name = "transport_play", description = "Master transport play (Command::TransportPlay): starts EVERY transport-capable node (all metronomes). Use set_node_playing to start/stop one instrument.")]
     fn transport_play(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportPlay) {
             return tool_err(e);
         }
         st.playing = true;
+        st.graph.set_all_playing(true);
         ok_json(json!({"playing": true}))
     }
 
     /// Stop the transport.
-    #[tool(name = "transport_stop", description = "Stop the transport (Command::TransportStop).")]
+    #[tool(name = "transport_stop", description = "Master transport stop (Command::TransportStop): stops EVERY transport-capable node.")]
     fn transport_stop(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportStop) {
             return tool_err(e);
         }
         st.playing = false;
+        st.graph.set_all_playing(false);
         ok_json(json!({"playing": false}))
+    }
+
+    /// Per-instrument transport: start/stop one node.
+    #[tool(name = "set_node_playing", description = "Start or stop ONE transport-capable rack instrument (Command::SetNodePlaying) — e.g. a metronome — independently of the master transport. Only nodes with transport=true in get_graph accept it. Returns {node, playing}.")]
+    fn set_node_playing(&self, Parameters(args): Parameters<SetNodePlayingArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        match st.graph.node(args.node) {
+            None => return tool_err(format!("node {} does not exist", args.node)),
+            Some(n) if !n.kind.supports_transport() => {
+                return tool_err(format!("node {} ({}) has no transport (only metronomes start/stop)", args.node, name_str(&n.name)))
+            }
+            Some(_) => {}
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetNodePlaying { node: args.node, playing: args.playing }) {
+            return tool_err(e);
+        }
+        st.graph.set_playing(args.node, args.playing);
+        ok_json(json!({"node": args.node, "playing": args.playing}))
     }
 
     /// Set the metronome tempo.
@@ -1147,7 +1321,7 @@ pub fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Attach mode (`kabelsalat mcp --attach`): no local engine — the SAME 20
+/// Attach mode (`kabelsalat mcp --attach`): no local engine — the SAME
 /// tools proxy to the running GUI app through the control bridge. Fails fast
 /// with a clear message when the app isn't running.
 pub fn run_attach() -> anyhow::Result<()> {
@@ -1233,6 +1407,55 @@ mod tests {
     }
 
     #[test]
+    fn set_rig_source_takes_keyboard_hardware_pair() {
+        let (server, _engine) = local_server();
+        let args = |v: Value| -> SetRigSourceArgs { serde_json::from_value(v).unwrap() };
+        let out = tool_json(&server.set_rig_source(Parameters(args(json!({"node": 1, "keyboard": false})))));
+        assert_eq!(out, json!({"node": 1, "keyboard": false, "hardware": true}));
+        // Legacy triple: keyboard = keys || laptop.
+        let out = tool_json(&server.set_rig_source(Parameters(args(json!({"node": 1, "keys": false, "laptop": true, "hardware": false})))));
+        assert_eq!(out, json!({"node": 1, "keyboard": true, "hardware": false}));
+        assert_eq!(args(json!({"node": 1, "keys": false, "laptop": false})).pair(), (false, true));
+        // The schema advertises the pair only (no laptop flag).
+        let schema = serde_json::to_value(schemars::schema_for!(SetRigSourceArgs)).unwrap();
+        let mut props: Vec<&str> = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        props.sort_unstable();
+        assert_eq!(props, ["hardware", "keyboard", "node"], "{schema}");
+        // "laptop" is a legacy spelling of the one keyboard source.
+        assert_eq!(parse_source(Some("laptop")), Ok(SourceId::Keys));
+        assert_eq!(parse_source(Some("keys")), Ok(SourceId::Keys));
+    }
+
+    #[test]
+    fn add_and_delete_rig_through_the_engine_headless() {
+        let (server, mut engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        let mut buf = vec![0.0f32; 64 * 2];
+        // Single-graph demo (2 Surge stacks) → becomes rig 0; rig 1 is new.
+        let added = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Bass".into()) })));
+        assert_eq!(added["rigs"].as_array().unwrap().len(), 2);
+        assert_eq!(added["rigs"][1]["name"], json!("Bass"));
+        assert_eq!(added["active"], json!(1));
+        engine.render(&mut buf, 64);
+        let g = engine.graph();
+        let rig1: Vec<_> = g.nodes.iter().filter(|n| n.rig == 1).collect();
+        assert_eq!(rig1.len(), 3, "Keys + Master + Surge");
+        assert!(rig1.iter().any(|n| matches!(n.kind, NodeKind::Clap { .. })));
+        assert_eq!(g.edges.iter().filter(|e| g.node(e.from.node).map(|n| n.rig) == Some(1)).count(), 3);
+        // Delete needs confirm, then removes rig 0 and keeps "Bass".
+        assert!(is_err(server.delete_rig(Parameters(DeleteRigArgs { rig: 0, confirm: false }))));
+        let left = tool_json(&server.delete_rig(Parameters(DeleteRigArgs { rig: 0, confirm: true })));
+        assert_eq!(left["rigs"].as_array().unwrap().len(), 1);
+        assert_eq!(left["rigs"][0]["name"], json!("Bass"));
+        engine.render(&mut buf, 64);
+        assert_eq!(engine.graph().nodes.len(), 3);
+        assert!(is_err(server.delete_rig(Parameters(DeleteRigArgs { rig: 0, confirm: true }))), "last rig stays");
+    }
+
+    #[test]
     fn load_rigs_get_rigs_round_trip_headless() {
         let (server, mut engine) = local_server();
 
@@ -1278,6 +1501,72 @@ mod tests {
         let status = tool_json(&server.get_status());
         assert_eq!(status["rigs"], json!(2));
         assert_eq!(status["active_rig"], json!(1));
+    }
+
+    #[test]
+    fn set_node_playing_tool_drives_engine_and_graph() {
+        let (server, mut engine) = local_server();
+        // Add a metronome through the real tool path (model + engine).
+        let added = tool_json(&server.add_node(Parameters(AddNodeArgs {
+            kind: "dsp".into(),
+            name: Some("METRO".into()),
+            dsp: Some("metronome".into()),
+            plugin_id: None,
+            uri: None,
+            rig: None,
+        })));
+        let id = added["id"].as_u64().unwrap() as NodeId;
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let node = |v: &Value| v["nodes"].as_array().unwrap().iter().find(|n| n["id"] == json!(id)).cloned().unwrap();
+        let g = tool_json(&server.get_graph());
+        assert_eq!(node(&g)["transport"], json!(true));
+        assert_eq!(node(&g)["playing"], json!(false));
+
+        let r = tool_json(&server.set_node_playing(Parameters(SetNodePlayingArgs { node: id, playing: true })));
+        assert_eq!(r["playing"], json!(true));
+        engine.render(&mut buf, 2);
+        assert!(engine.graph().node(id).unwrap().playing, "engine received SetNodePlaying");
+        assert_eq!(node(&tool_json(&server.get_graph()))["playing"], json!(true));
+
+        // Master stop clears it in the model mirror too.
+        tool_json(&server.transport_stop());
+        engine.render(&mut buf, 2);
+        assert!(!engine.graph().node(id).unwrap().playing);
+        assert_eq!(node(&tool_json(&server.get_graph()))["playing"], json!(false));
+
+        // Non-transport and unknown nodes are rejected (nothing sent).
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        assert!(is_err(server.set_node_playing(Parameters(SetNodePlayingArgs { node: 2, playing: true }))));
+        assert!(is_err(server.set_node_playing(Parameters(SetNodePlayingArgs { node: 999, playing: true }))));
+    }
+
+    #[test]
+    fn set_split_tool_targets_the_keys_node() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let r = tool_json(&server.set_split(Parameters(SetSplitArgs { node: None, point: Some(60) })));
+        assert_eq!(r["node"], json!(0), "defaults to the first Keys node");
+        assert_eq!(r["split"], json!(true));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.graph().node(0).unwrap().split, Some(60), "engine received SetNodeSplit");
+        let keys = |v: &Value| v["nodes"].as_array().unwrap().iter().find(|n| n["id"] == json!(0)).cloned().unwrap();
+        assert_eq!(keys(&tool_json(&server.get_graph()))["split"], json!(60), "get_graph exposes split");
+        tool_json(&server.set_split(Parameters(SetSplitArgs { node: Some(0), point: None })));
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.graph().node(0).unwrap().split, None);
+        assert_eq!(keys(&tool_json(&server.get_graph()))["split"], Value::Null);
+        // Non-Keys / unknown nodes and bad points are rejected.
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(1), point: Some(60) }))));
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(999), point: Some(60) }))));
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: None, point: Some(200) }))));
     }
 
     #[test]

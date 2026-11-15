@@ -21,6 +21,44 @@ part of the UI language).
 
 ---
 
+## 0. USER OVERRIDES — 2026-11-15 (authoritative over the sections below)
+
+The user evolved the language after the light pass landed. These rules win
+wherever they conflict with §1–§5 below (which remain the reference for
+structure, typography, shape scarcity and the rack's internal painting):
+
+1. **All-dark chrome.** The whole app lives on warm near-black surfaces
+   (`PAPER #151412` window base, `PAPER_SINK #100F0E` recessed, rack
+   `DARK_PANEL #1C1C1C` one step above). Text: `INK = CREAM #EFEEE9`,
+   `INK_2 = CREAM_MID #B4B4B0`, rules `HAIRLINE #3A3835`. The legacy token
+   NAMES are kept; their values are the dark side. No light paper anywhere.
+2. **Brand mark = crossed wires** (`theme::crossed_wires`, assets/logo.svg):
+   two S-curved patch cables crossing in an X (tomato over MIDI blue), plug
+   caps with jack cores, cream pulse at the crossing. Replaces the asterisk
+   everywhere (masthead, help card, window icon). No ambient watermark —
+   decoration must never overlap panels (the old bottom-right mark was
+   removed as clutter).
+3. **Real buttons, no underlined text.** Top-strip toggles/nav, HW selector
+   and rig selectors are chip buttons (`theme::chip_button`): ON = cream fill
+   + near-black text, OFF = raised dark chip + hairline. Tomato stays
+   reserved for the flip CTA, selection and primary actions. Explicit
+   `RichText::color` per state (override_text_color would hide ON labels).
+   Boxed text gets ≥8px/4px padding — never touch the boundary.
+4. **Cable salad, family-safe.** Audio jackets: cream/amber/rose/sage (warm);
+   MIDI jackets: blue/cyan/violet (cool) — `CABLE_AUDIO_PALETTE` /
+   `CABLE_MIDI_PALETTE`, keyed on RIG-RELATIVE node ids (stable across
+   reloads). Terminal shape (round/square) stays the primary audio≠MIDI cue.
+   The TONE/WARM warming shift applies ONLY to the cream jacket. Selection
+   still swaps to ACCENT and dims the rest.
+5. **One window.** The MIDI matrix is a MAIN-STAGE view (Matrix chip / F11
+   switches rack ↔ matrix; rule editor inline beside the grid), not a
+   floating window. The assistant is a toggleable wide BOTTOM panel (chip /
+   F12), hidden by default — chat text needs width, not a narrow column.
+6. **Agent parity.** The assistant exposes `get_graph` (and every tool its
+   prompt names) so it can inspect and wire the patch 1:1 with UI/MCP.
+
+---
+
 ## 1. Reference summary (per frame)
 
 ### Frame 1 — straight-on hero (`hurricane-1-api.jpg`)

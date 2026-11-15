@@ -2,7 +2,7 @@
 //! --attach` (task-16).
 //!
 //! A sibling frontend to the one typed control plane (`control.rs`), giving
-//! agents 1:1 access to the graph engine. ONE set of 14 tool definitions
+//! agents 1:1 access to the graph engine. ONE set of 20 tool definitions
 //! serves two backends ([`Backend`]):
 //!
 //! - **Local (headless):** this process owns a local [`Graph`] model (started
@@ -41,8 +41,8 @@ use serde_json::{json, Value};
 
 use crate::bridge;
 use crate::control::{
-    self, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId, NodeKind,
-    PortKind, PortRef,
+    self, merge_rigs, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId,
+    NodeKind, PortKind, PortRef, Rig, RigSnapshot,
 };
 use crate::engine::GraphEngine;
 use crate::host::{ClapVoice, ClapVoiceMain};
@@ -70,6 +70,10 @@ struct State {
     sample_rate: f64,
     audio_live: bool,
     playing: bool,
+    /// Multi-rig state. Local: the engine's shared snapshot (it publishes on
+    /// LoadRigs/LoadGraph at block boundaries). Remote: unused — get_rigs
+    /// forwards to the app's bridge instead.
+    rigs: Arc<Mutex<RigSnapshot>>,
 }
 
 #[derive(Clone)]
@@ -211,6 +215,32 @@ struct NoteOffArgs {
     note: u8,
     /// Source (same syntax as note_on; default "keys").
     source: Option<String>,
+}
+
+/// One rig for `load_rigs`: a full rack graph bound to a MIDI device.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RigArg {
+    /// Rig display name.
+    name: String,
+    /// The rig's patch: {"nodes":[{"id","kind","name"?}],"edges":[{"id",
+    /// "from":{"node","port"},"to":{"node","port"},"kind":"midi"|"audio"}]}.
+    /// Kinds: "Keys", "MasterOut", "SystemAudio", {"Clap":{"plugin_id"}},
+    /// {"Dsp":"delay"|...}, {"Lv2":{"uri"}}. Names/plugin ids accept plain
+    /// strings; id counters are filled in automatically. Each rig needs its
+    /// own MasterOut.
+    graph: Value,
+    /// Hardware MIDI device id feeding this rig; null/omitted = any source
+    /// (on-screen keys, laptop keys, every hardware device).
+    midi_device: Option<u32>,
+}
+
+/// Arguments for `load_rigs`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadRigsArgs {
+    /// The rigs to load (each a full rack with its own MasterOut).
+    rigs: Vec<RigArg>,
+    /// UI-selected rig index (default 0).
+    active: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +442,53 @@ fn validate_connect(g: &Graph, id: EdgeId, from: PortRef, to: PortRef) -> Result
     Ok(())
 }
 
+/// Accept agent-friendly rig graphs: plain-string names/plugin ids are
+/// converted to the control plane's inline byte arrays, missing names
+/// default to empty, and the id counters are filled in from the highest
+/// ids. The raw serde shape (byte arrays + explicit counters) passes through
+/// unchanged, so bridge-style graphs work too.
+fn normalize_rig_graph(v: &mut Value) -> Result<(), String> {
+    let obj = v.as_object_mut().ok_or("rig graph must be a JSON object")?;
+    let mut max_node = 0u32;
+    let mut max_edge = 0u32;
+    if let Some(nodes) = obj.get_mut("nodes").and_then(Value::as_array_mut) {
+        for n in nodes {
+            let no = n.as_object_mut().ok_or("each node must be a JSON object")?;
+            match no.get("name") {
+                Some(Value::String(s)) => {
+                    no.insert("name".into(), json!(name_bytes(s)));
+                }
+                None => {
+                    no.insert("name".into(), json!(name_bytes("")));
+                }
+                _ => {} // already inline bytes
+            }
+            let pid = no.get("kind")
+                .and_then(|k| k.pointer("/Clap/plugin_id"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            if let Some(pid) = pid {
+                no["kind"]["Clap"]["plugin_id"] = json!(name_bytes(&pid));
+            }
+            if let Some(id) = no.get("id").and_then(Value::as_u64) {
+                max_node = max_node.max(id as u32 + 1);
+            }
+        }
+    }
+    if let Some(edges) = obj.get("edges").and_then(Value::as_array) {
+        for e in edges {
+            if let Some(id) = e.get("id").and_then(Value::as_u64) {
+                max_edge = max_edge.max(id as u32 + 1);
+            }
+        }
+    }
+    let nn = obj.get("next_node").and_then(Value::as_u64).unwrap_or(0) as u32;
+    obj.insert("next_node".into(), json!(nn.max(max_node)));
+    let ne = obj.get("next_edge").and_then(Value::as_u64).unwrap_or(0) as u32;
+    obj.insert("next_edge".into(), json!(ne.max(max_edge)));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tools — 1:1 with the control plane
 // ---------------------------------------------------------------------------
@@ -446,6 +523,10 @@ impl McpServer {
             return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
         }
         let level = f32::from_bits(st.level.load(Ordering::Relaxed));
+        let (rig_count, active_rig) = match st.rigs.lock() {
+            Ok(s) => (s.rigs.len(), s.active),
+            Err(_) => (0, 0),
+        };
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
             "edges": st.graph.edges.len(),
@@ -457,6 +538,8 @@ impl McpServer {
             "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,
             "xruns": bridge::XRUNS.load(Ordering::Relaxed),
             "midi_latency_ms": bridge::MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
+            "rigs": rig_count,
+            "active_rig": active_rig,
         }))
     }
 
@@ -631,6 +714,80 @@ impl McpServer {
         ok_json(json!({"node": args.node, "device": args.device}))
     }
 
+    /// Load several independent rigs at once.
+    #[tool(name = "load_rigs", description = "Load multiple independent rigs (Command::LoadRigs): each rig is a full rack graph with its own MasterOut, bound to a hardware MIDI device (midi_device null = keys/laptop/all devices). Graphs use the patch shape: nodes [{id, kind, name?}] and edges [{id, from:{node,port}, to:{node,port}, kind:'midi'|'audio'}]; kinds are 'Keys', 'MasterOut', 'SystemAudio', {Clap:{plugin_id}}, {Dsp:'delay'|'reverb'|...}, {Lv2:{uri}}; names/plugin ids may be plain strings. The 2 CLAP voices are remapped to Clap nodes in node-id order across all rigs (surplus Clap nodes are silent — use LV2 instruments for more). Returns {loaded, active, nodes, edges}. Query the result with get_rigs.")]
+    fn load_rigs(&self, Parameters(args): Parameters<LoadRigsArgs>) -> Result<CallToolResult, McpError> {
+        let active = args.active.unwrap_or(0);
+        let mut rigs = Vec::with_capacity(args.rigs.len());
+        for r in args.rigs {
+            let mut gv = r.graph;
+            if let Err(e) = normalize_rig_graph(&mut gv) {
+                return tool_err(format!("rig '{}': {e}", r.name));
+            }
+            let graph: Graph = match serde_json::from_value(gv) {
+                Ok(g) => g,
+                Err(e) => return tool_err(format!("rig '{}': invalid graph: {e}", r.name)),
+            };
+            rigs.push(Rig::new(r.name, graph, r.midi_device));
+        }
+        // Plain-language integrity check (names, active range, cable wiring).
+        if let Err(e) = crate::session::MultiRigSession::new("mcp", rigs.clone(), active).validate() {
+            return tool_err(format!("{e}"));
+        }
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active }) {
+            return tool_err(e);
+        }
+        // Mirror the merged patch locally so follow-up edits validate against
+        // the real (offset) node ids.
+        let merged = merge_rigs(&rigs);
+        let summary = json!({
+            "loaded": rigs.len(),
+            "active": active,
+            "nodes": merged.nodes.len(),
+            "edges": merged.edges.len(),
+        });
+        st.graph = merged;
+        if matches!(st.backend, Backend::Local(_)) {
+            // Immediate consistency; the engine re-publishes the same state
+            // when it drains the command at the next block boundary.
+            if let Ok(mut s) = st.rigs.lock() {
+                s.rigs = rigs.iter().map(|r| crate::control::RigMeta {
+                    name: r.name.clone(),
+                    midi_device: r.midi_device,
+                }).collect();
+                s.active = active;
+            }
+        }
+        ok_json(summary)
+    }
+
+    /// Query the multi-rig state.
+    #[tool(name = "get_rigs", description = "Query the multi-rig state: {rigs:[{name, midi_device}], active}. Empty rigs means single-graph mode (a plain graph load clears it). midi_device null = any source; a number = only that hardware MIDI device.")]
+    fn get_rigs(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            let reply = match bridge::request(&json!({"op": "query", "name": "get_rigs"})) {
+                Ok(r) => r,
+                Err(e) => return tool_err(format!("{e:#}")),
+            };
+            if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                return tool_err(
+                    reply.get("error").and_then(Value::as_str).unwrap_or("bridge query failed"),
+                );
+            }
+            return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
+        }
+        let s = match st.rigs.lock() {
+            Ok(s) => s,
+            Err(_) => return tool_err("rig snapshot lock poisoned"),
+        };
+        match serde_json::to_value(&*s) {
+            Ok(v) => ok_json(v),
+            Err(e) => tool_err(format!("serializing rig snapshot: {e}")),
+        }
+    }
+
     /// List installed CLAP and LV2 plugins.
     #[tool(name = "list_plugins", description = "List installed CLAP and LV2 plugins (name, id/uri, features) available to host.")]
     fn list_plugins(&self) -> Result<CallToolResult, McpError> {
@@ -724,7 +881,8 @@ impl McpServer {
 or attached to the RUNNING GUI app (--attach) so you control what the user sees. \
 Mutating tools issue control-plane commands; get_graph/get_status read the live patch. \
 Demo patch nodes: 0=KEYS, 1=SURGE A, 2=DELAY A, 3=MASTER OUT, 4=SURGE B, 5=DELAY B. \
-Play notes with note_on/note_off; wire cables with connect/disconnect."
+Play notes with note_on/note_off; wire cables with connect/disconnect. \
+Load several independent rigs (each its own rack + MIDI device) with load_rigs; query them with get_rigs."
 )]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerConfig {
@@ -768,7 +926,7 @@ fn preferred_host() -> cpal::Host {
     cpal::default_host()
 }
 
-fn try_build_audio() -> anyhow::Result<AudioHandles> {
+fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles> {
     let host = preferred_host();
     let device = host
         .default_output_device()
@@ -804,6 +962,7 @@ fn try_build_audio() -> anyhow::Result<AudioHandles> {
 
     let (bus, drain) = control::command_bus();
     let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
+    engine.set_rig_snapshot(rigs);
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -819,10 +978,11 @@ fn try_build_audio() -> anyhow::Result<AudioHandles> {
 
 /// No audio device (or plugin failure): keep the engine rendering into a
 /// dummy buffer at block pace so commands drain and levels stay live.
-fn dummy_audio() -> AudioHandles {
+fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     let sample_rate = 48_000.0;
     let (bus, drain) = control::command_bus();
     let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, vec![]);
+    engine.set_rig_snapshot(rigs);
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())
@@ -837,12 +997,12 @@ fn dummy_audio() -> AudioHandles {
     AudioHandles { mains: vec![], stream: None, bus, level, sample_rate, live: false }
 }
 
-fn build_audio() -> AudioHandles {
-    match try_build_audio() {
+fn build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
+    match try_build_audio(rigs.clone()) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("mcp: live audio unavailable ({e:#}) — serving with dummy render loop");
-            dummy_audio()
+            dummy_audio(rigs)
         }
     }
 }
@@ -885,7 +1045,8 @@ fn serve_stdio(server: McpServer, rpc_stdout: std::fs::File) -> anyhow::Result<(
 pub fn run() -> anyhow::Result<()> {
     let rpc_stdout = reroute_stdout()?;
     eprintln!("kabelsalat mcp: headless control-plane server (MCP over stdio)");
-    let audio = build_audio();
+    let rigs = Arc::new(Mutex::new(RigSnapshot::default()));
+    let audio = build_audio(rigs.clone());
     let state = Arc::new(Mutex::new(State {
         graph: Graph::demo_patch(),
         backend: Backend::Local(audio.bus),
@@ -893,6 +1054,7 @@ pub fn run() -> anyhow::Result<()> {
         sample_rate: audio.sample_rate,
         audio_live: audio.live,
         playing: false,
+        rigs,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout);
@@ -904,7 +1066,7 @@ pub fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Attach mode (`kabelsalat mcp --attach`): no local engine — the SAME 14
+/// Attach mode (`kabelsalat mcp --attach`): no local engine — the SAME 20
 /// tools proxy to the running GUI app through the control bridge. Fails fast
 /// with a clear message when the app isn't running.
 pub fn run_attach() -> anyhow::Result<()> {
@@ -917,6 +1079,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         sample_rate: 0.0,
         audio_live: true,
         playing: false,
+        rigs: Arc::new(Mutex::new(RigSnapshot::default())),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -931,4 +1094,136 @@ pub fn run_attach() -> anyhow::Result<()> {
         tool_router: McpServer::tool_router(),
     };
     serve_stdio(server, rpc_stdout)
+}
+
+// ---------------------------------------------------------------------------
+// Tests — headless load_rigs → get_rigs round trip through the real engine
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rig graph in the agent-friendly shape (string names, no counters).
+    fn rig_graph_json(synth_name: &str) -> Value {
+        json!({
+            "nodes": [
+                {"id": 0, "kind": "Keys", "name": "KEYS"},
+                {"id": 1, "kind": {"Clap": {"plugin_id": SURGE_ID}}, "name": synth_name},
+                {"id": 2, "kind": "MasterOut", "name": "MASTER"}
+            ],
+            "edges": [
+                {"id": 1, "from": {"node": 0, "port": 0}, "to": {"node": 1, "port": 0}, "kind": "Midi"},
+                {"id": 2, "from": {"node": 1, "port": 0}, "to": {"node": 2, "port": 0}, "kind": "Audio"}
+            ]
+        })
+    }
+
+    /// Unwrap a successful tool result's JSON payload.
+    fn tool_json(res: &Result<CallToolResult, McpError>) -> Value {
+        let r = res.as_ref().expect("tool result");
+        let v = serde_json::to_value(r).unwrap();
+        assert_ne!(v.get("isError").and_then(Value::as_bool), Some(true), "tool error: {v}");
+        let text = v.pointer("/content/0/text").and_then(Value::as_str).expect("text content");
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// Local-backend server with a real (voice-less) engine the test drains
+    /// by hand — no audio device or CLAP needed.
+    fn local_server() -> (McpServer, GraphEngine) {
+        let (bus, drain) = control::command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, 48000.0, vec![]);
+        let rigs = Arc::new(Mutex::new(RigSnapshot::default()));
+        engine.set_rig_snapshot(rigs.clone());
+        let state = State {
+            graph: Graph::demo_patch(),
+            backend: Backend::Local(bus),
+            level: engine.level_handle(),
+            sample_rate: 48000.0,
+            audio_live: false,
+            playing: false,
+            rigs,
+        };
+        let server = McpServer {
+            state: Arc::new(Mutex::new(state)),
+            tool_router: McpServer::tool_router(),
+        };
+        (server, engine)
+    }
+
+    #[test]
+    fn load_rigs_get_rigs_round_trip_headless() {
+        let (server, mut engine) = local_server();
+
+        // Single-graph mode: empty rig list.
+        let empty = tool_json(&server.get_rigs());
+        assert_eq!(empty["rigs"].as_array().unwrap().len(), 0);
+        assert_eq!(empty["active"], json!(0));
+
+        let args = LoadRigsArgs {
+            rigs: vec![
+                RigArg { name: "A".into(), graph: rig_graph_json("SURGE A"), midi_device: Some(2) },
+                RigArg { name: "B".into(), graph: rig_graph_json("SURGE B"), midi_device: None },
+            ],
+            active: Some(1),
+        };
+        let loaded = tool_json(&server.load_rigs(Parameters(args)));
+        assert_eq!(loaded["loaded"], json!(2));
+        assert_eq!(loaded["active"], json!(1));
+        assert_eq!(loaded["nodes"], json!(6));
+        assert_eq!(loaded["edges"], json!(4));
+
+        // Wipe the tool's immediate write: only the engine's block-boundary
+        // publish may refill the snapshot.
+        *server.state.lock().unwrap().rigs.lock().unwrap() = RigSnapshot::default();
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2); // drains LoadRigs → publishes
+
+        let got = tool_json(&server.get_rigs());
+        assert_eq!(got["active"], json!(1));
+        assert_eq!(got["rigs"][0]["name"], json!("A"));
+        assert_eq!(got["rigs"][0]["midi_device"], json!(2));
+        assert_eq!(got["rigs"][1]["name"], json!("B"));
+        assert_eq!(got["rigs"][1]["midi_device"], json!(Value::Null));
+
+        // The model mirror is the merged graph: both masters, offset ids.
+        let st = server.state.lock().unwrap();
+        let masters: Vec<NodeId> = st.graph.nodes.iter()
+            .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
+        assert_eq!(masters, vec![2, 5]);
+        drop(st);
+
+        // get_status reports the rig count + active index.
+        let status = tool_json(&server.get_status());
+        assert_eq!(status["rigs"], json!(2));
+        assert_eq!(status["active_rig"], json!(1));
+    }
+
+    #[test]
+    fn load_rigs_rejects_bad_args() {
+        let (server, _engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        // Active index out of range.
+        assert!(is_err(server.load_rigs(Parameters(LoadRigsArgs {
+            rigs: vec![RigArg { name: "A".into(), graph: rig_graph_json("S"), midi_device: None }],
+            active: Some(5),
+        }))));
+        // Empty rig list.
+        assert!(is_err(server.load_rigs(Parameters(LoadRigsArgs { rigs: vec![], active: None }))));
+        // Dangling cable endpoint.
+        let mut bad = rig_graph_json("S");
+        bad["edges"][0]["to"]["node"] = json!(99);
+        assert!(is_err(server.load_rigs(Parameters(LoadRigsArgs {
+            rigs: vec![RigArg { name: "A".into(), graph: bad, midi_device: None }],
+            active: None,
+        }))));
+        // Malformed graph (not an object).
+        assert!(is_err(server.load_rigs(Parameters(LoadRigsArgs {
+            rigs: vec![RigArg { name: "A".into(), graph: json!(42), midi_device: None }],
+            active: None,
+        }))));
+    }
 }

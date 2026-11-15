@@ -265,6 +265,24 @@ impl Rig {
     }
 }
 
+/// Per-rig metadata: the rig list frontends (UI/MCP/bridge) display. Mirrors
+/// [`Rig`] without the graph payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RigMeta {
+    pub name: String,
+    pub midi_device: Option<u32>,
+}
+
+/// Shared multi-rig state for frontends: the rig list plus the UI-selected
+/// rig index. The engine writes it at block boundaries on `LoadRigs` (and
+/// clears it on `LoadGraph`); frontends read it through `Arc<Mutex<_>>`.
+/// The steady audio render path never locks it. Empty = single-graph mode.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RigSnapshot {
+    pub rigs: Vec<RigMeta>,
+    pub active: usize,
+}
+
 /// Merge independent rig graphs into ONE patch (multi-rig load).
 ///
 /// Node ids are offset by a cumulative base per rig (edge ids likewise), edge
@@ -548,6 +566,28 @@ mod tests {
         // Empty input merges to an empty, usable graph.
         let empty = merge_rigs(&[]);
         assert!(empty.nodes.is_empty() && empty.edges.is_empty());
+    }
+
+    #[test]
+    fn rig_snapshot_json_roundtrip() {
+        let s = RigSnapshot {
+            rigs: vec![
+                RigMeta { name: "A".into(), midi_device: Some(2) },
+                RigMeta { name: "B".into(), midi_device: None },
+            ],
+            active: 1,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: RigSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.active, 1);
+        assert_eq!(back.rigs.len(), 2);
+        assert_eq!(back.rigs[0].name, "A");
+        assert_eq!(back.rigs[0].midi_device, Some(2));
+        assert_eq!(back.rigs[1].midi_device, None);
+        // The bridge wire shape: {rigs:[{name,midi_device}],active}.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["rigs"][1]["midi_device"], serde_json::Value::Null);
+        assert_eq!(v["active"], serde_json::json!(1));
     }
 
     #[test]

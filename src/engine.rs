@@ -13,9 +13,11 @@
 //! off-thread loading is the follow-up.
 
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::control::{Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind};
+use crate::control::{
+    Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
+};
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, SourceId};
@@ -109,12 +111,9 @@ fn hw_device_allowed(rig_device: Option<u32>, id: u32) -> bool {
 
 /// Per-rig metadata retained from the last `Command::LoadRigs` — the rig
 /// list frontends (UI/bridge) can query. Empty after a plain `LoadGraph`.
-#[derive(Clone, Debug)]
-#[allow(dead_code)] // public query API for the UI (task-22 integration)
-pub struct RigMeta {
-    pub name: String,
-    pub midi_device: Option<u32>,
-}
+/// Defined in the control plane so snapshots can be shared without engine
+/// types; re-exported here for compatibility.
+pub use crate::control::RigMeta;
 
 struct DspSlot {
     node: NodeId,
@@ -172,6 +171,10 @@ pub struct GraphEngine {
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
     rig_meta: Vec<RigMeta>,
     active_rig: usize,
+    // Shared frontend snapshot (UI/MCP/bridge). Written ONLY on the rare
+    // LoadRigs/LoadGraph structural ops at block boundaries — the per-block
+    // render path never locks it. None until a frontend attaches a handle.
+    rig_snapshot: Option<Arc<Mutex<RigSnapshot>>>,
     // System-audio capture (e.g. YouTube) mixed into the master.
     system_capture: Option<SystemCapture>,
     system_gain: f32,
@@ -262,6 +265,7 @@ impl GraphEngine {
             route_out: Vec::with_capacity(64),
             rig_meta: Vec::new(),
             active_rig: 0,
+            rig_snapshot: None,
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
@@ -295,6 +299,26 @@ impl GraphEngine {
     #[allow(dead_code)] // public query API for the UI (task-22 integration)
     pub fn active_rig(&self) -> usize {
         self.active_rig
+    }
+
+    /// Attach the shared rig-state snapshot frontends read (UI/MCP/bridge).
+    /// The engine publishes into it on `LoadRigs`/`LoadGraph` only — rare
+    /// block-boundary structural ops; the steady render path never locks it.
+    /// Call before the engine moves to the audio thread (main thread setup).
+    pub fn set_rig_snapshot(&mut self, snapshot: Arc<Mutex<RigSnapshot>>) {
+        self.rig_snapshot = Some(snapshot);
+    }
+
+    /// Publish the current rig state into the shared snapshot (structural ops
+    /// only — never called from the per-block sample path). A poisoned lock
+    /// is skipped, not fatal: the snapshot is advisory frontend state.
+    fn publish_rig_snapshot(&self) {
+        if let Some(snap) = &self.rig_snapshot {
+            if let Ok(mut s) = snap.lock() {
+                s.rigs = self.rig_meta.clone();
+                s.active = self.active_rig;
+            }
+        }
     }
 
     pub fn level_handle(&self) -> Arc<AtomicU32> {
@@ -455,6 +479,7 @@ impl GraphEngine {
                     .map(|n| n.id);
                 self.rig_meta.clear();
                 self.active_rig = 0;
+                self.publish_rig_snapshot();
             }
             Command::LoadRigs { rigs, active } => {
                 // Rare structural op: merge the rig graphs into one patch and
@@ -508,6 +533,7 @@ impl GraphEngine {
                     .map(|r| RigMeta { name: r.name.clone(), midi_device: r.midi_device })
                     .collect();
                 self.active_rig = active.min(rigs.len().saturating_sub(1));
+                self.publish_rig_snapshot();
             }
             Command::NoteOn { note, velocity, source } => {
                 let msg = MidiMsg::note_on(0, note, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
@@ -977,6 +1003,34 @@ mod tests {
         engine.render(&mut buf, 2);
         assert!(engine.rig_meta().is_empty());
         assert_eq!(engine.active_rig(), 0);
+    }
+
+    #[test]
+    fn rig_snapshot_published_on_load_and_cleared_on_graph() {
+        use std::sync::{Arc, Mutex};
+        let (mut engine, mut bus) = load_two_rigs(Some(2), None);
+        let snap = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
+        engine.set_rig_snapshot(snap.clone());
+        bus.send(Command::LoadRigs {
+            rigs: vec![Rig::new("A", rig_graph(), Some(2)), Rig::new("B", rig_graph(), None)],
+            active: 1,
+        });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2); // drains LoadRigs → publishes
+        {
+            let s = snap.lock().unwrap();
+            assert_eq!(s.rigs.len(), 2);
+            assert_eq!(s.rigs[0].name, "A");
+            assert_eq!(s.rigs[0].midi_device, Some(2));
+            assert_eq!(s.rigs[1].midi_device, None);
+            assert_eq!(s.active, 1);
+        }
+        // Single-graph load clears the shared snapshot back to empty.
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        engine.render(&mut buf, 2);
+        let s = snap.lock().unwrap();
+        assert!(s.rigs.is_empty());
+        assert_eq!(s.active, 0);
     }
 
     #[test]

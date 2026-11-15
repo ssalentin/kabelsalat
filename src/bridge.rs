@@ -12,7 +12,10 @@
 //!   externally tagged, e.g. `{"SetSystemAudio":{"gain":0.5}}`).
 //! - `{"op":"query","name":"get_graph"}` → `{"ok":true,"data":<Graph JSON>}`.
 //! - `{"op":"query","name":"get_status"}` → `{"ok":true,"data":{nodes, edges,
-//!   sample_rate, output_level, audio_live}}`.
+//!   sample_rate, output_level, audio_live, rigs, active_rig, ...}}`.
+//! - `{"op":"query","name":"get_rigs"}` → `{"ok":true,"data":{rigs:[{name,
+//!   midi_device}], active}}` — the engine's shared rig snapshot (empty in
+//!   single-graph mode).
 //! - Anything else → `{"ok":false,"error":"..."}`. Bad input never panics.
 //!
 //! Socket: `$XDG_RUNTIME_DIR/kabelsalat.sock`, fallback `~/.cache/kabelsalat.sock`.
@@ -31,7 +34,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::control::{Command, CommandBus, Graph};
+use crate::control::{Command, CommandBus, Graph, RigSnapshot};
 
 /// Output buffer size in frames (shared with the audio setup in `ui`).
 pub const BUFFER_FRAMES: u32 = 512;
@@ -62,13 +65,30 @@ pub fn socket_path() -> PathBuf {
 /// Start the bridge thread for the running app. `bus` is the UI's shared
 /// command bus, `graph` the UI-mirrored live patch, `level` the engine's
 /// output-peak handle (f32 bits). Additive: on failure the app keeps running.
+///
+/// Legacy entry point: `get_rigs` reports an empty rig list. Use
+/// [`spawn_with_rigs`] with the engine's shared [`RigSnapshot`] handle to
+/// expose live multi-rig state.
 pub fn spawn(
     bus: Arc<Mutex<CommandBus>>,
     graph: Arc<Mutex<Graph>>,
     level: Arc<AtomicU32>,
     sample_rate: f64,
 ) -> anyhow::Result<()> {
-    spawn_at(socket_path(), bus, graph, level, sample_rate)
+    spawn_with_rigs(bus, graph, level, sample_rate, Arc::new(Mutex::new(RigSnapshot::default())))
+}
+
+/// Like [`spawn`], plus the shared rig-state snapshot the engine publishes
+/// on `LoadRigs`/`LoadGraph` (see `GraphEngine::set_rig_snapshot`). The same
+/// `Arc<Mutex<RigSnapshot>>` must be handed to the engine and to this bridge.
+pub fn spawn_with_rigs(
+    bus: Arc<Mutex<CommandBus>>,
+    graph: Arc<Mutex<Graph>>,
+    level: Arc<AtomicU32>,
+    sample_rate: f64,
+    rigs: Arc<Mutex<RigSnapshot>>,
+) -> anyhow::Result<()> {
+    spawn_at(socket_path(), bus, graph, level, sample_rate, rigs)
 }
 
 fn spawn_at(
@@ -77,6 +97,7 @@ fn spawn_at(
     graph: Arc<Mutex<Graph>>,
     level: Arc<AtomicU32>,
     sample_rate: f64,
+    rigs: Arc<Mutex<RigSnapshot>>,
 ) -> anyhow::Result<()> {
     if path.exists() {
         // Refuse to steal the socket from a live instance; clean up stale ones.
@@ -102,7 +123,7 @@ fn spawn_at(
             // many request lines. Accept errors are logged, never fatal.
             for conn in listener.incoming() {
                 match conn {
-                    Ok(stream) => handle_conn(stream, &bus, &graph, &level, sample_rate),
+                    Ok(stream) => handle_conn(stream, &bus, &graph, &level, sample_rate, &rigs),
                     Err(e) => eprintln!("bridge: accept error: {e}"),
                 }
             }
@@ -117,6 +138,7 @@ fn handle_conn(
     graph: &Arc<Mutex<Graph>>,
     level: &AtomicU32,
     sample_rate: f64,
+    rigs: &Arc<Mutex<RigSnapshot>>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut writer = match stream.try_clone() {
@@ -132,7 +154,7 @@ fn handle_conn(
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(&line, bus, graph, level, sample_rate);
+        let reply = handle_line(&line, bus, graph, level, sample_rate, rigs);
         if writeln!(writer, "{reply}").is_err() || writer.flush().is_err() {
             return;
         }
@@ -151,6 +173,7 @@ fn handle_line(
     graph: &Arc<Mutex<Graph>>,
     level: &AtomicU32,
     sample_rate: f64,
+    rigs: &Arc<Mutex<RigSnapshot>>,
 ) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -186,10 +209,26 @@ fn handle_line(
                     Err(e) => err_reply(format!("serializing graph: {e}")),
                 }
             }
+            Some("get_rigs") => {
+                let s = match rigs.lock() {
+                    Ok(s) => s,
+                    Err(_) => return err_reply("rig snapshot lock poisoned"),
+                };
+                match serde_json::to_value(&*s) {
+                    Ok(data) => json!({"ok": true, "data": data}),
+                    Err(e) => err_reply(format!("serializing rig snapshot: {e}")),
+                }
+            }
             Some("get_status") => {
                 let g = match graph.lock() {
                     Ok(g) => g,
                     Err(_) => return err_reply("graph lock poisoned"),
+                };
+                // Advisory rig state: a poisoned snapshot lock degrades to
+                // zero counts, never to a failed status query.
+                let (rig_count, active_rig) = match rigs.lock() {
+                    Ok(s) => (s.rigs.len(), s.active),
+                    Err(_) => (0, 0),
                 };
                 json!({"ok": true, "data": {
                     "nodes": g.nodes.len(),
@@ -201,10 +240,12 @@ fn handle_line(
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
                     "xruns": XRUNS.load(Ordering::Relaxed),
                     "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                    "rigs": rig_count,
+                    "active_rig": active_rig,
                 }})
             }
             other => err_reply(format!(
-                "unknown query '{}' (use get_graph|get_status)",
+                "unknown query '{}' (use get_graph|get_status|get_rigs)",
                 other.unwrap_or("<missing>")
             )),
         },
@@ -264,22 +305,29 @@ mod tests {
     use super::*;
     use crate::control::{command_bus, CommandDrain};
 
-    fn fixtures() -> (Arc<Mutex<CommandBus>>, CommandDrain, Arc<Mutex<Graph>>, Arc<AtomicU32>) {
+    fn fixtures() -> (
+        Arc<Mutex<CommandBus>>,
+        CommandDrain,
+        Arc<Mutex<Graph>>,
+        Arc<AtomicU32>,
+        Arc<Mutex<RigSnapshot>>,
+    ) {
         let (bus, drain) = command_bus();
         (
             Arc::new(Mutex::new(bus)),
             drain,
             Arc::new(Mutex::new(Graph::demo_patch())),
             Arc::new(AtomicU32::new(0.25f32.to_bits())),
+            Arc::new(Mutex::new(RigSnapshot::default())),
         )
     }
 
     #[test]
     fn cmd_forwarded_to_bus() {
-        let (bus, mut drain, graph, level) = fixtures();
+        let (bus, mut drain, graph, level, rigs) = fixtures();
         let reply = handle_line(
             r#"{"op":"cmd","cmd":{"SetSystemAudio":{"gain":0.5}}}"#,
-            &bus, &graph, &level, 48000.0,
+            &bus, &graph, &level, 48000.0, &rigs,
         );
         assert_eq!(reply, json!({"ok": true}));
         let cmd = drain.pop().expect("command on the bus");
@@ -288,23 +336,52 @@ mod tests {
 
     #[test]
     fn queries_return_live_snapshot() {
-        let (bus, _drain, graph, level) = fixtures();
-        let reply = handle_line(r#"{"op":"query","name":"get_graph"}"#, &bus, &graph, &level, 48000.0);
+        let (bus, _drain, graph, level, rigs) = fixtures();
+        let reply = handle_line(r#"{"op":"query","name":"get_graph"}"#, &bus, &graph, &level, 48000.0, &rigs);
         assert_eq!(reply["ok"], json!(true));
         assert_eq!(reply["data"]["nodes"].as_array().unwrap().len(), 6);
         assert_eq!(reply["data"]["edges"].as_array().unwrap().len(), 8);
 
-        let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0);
+        let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0, &rigs);
         assert_eq!(reply["data"]["nodes"], json!(6));
         assert_eq!(reply["data"]["edges"], json!(8));
         assert_eq!(reply["data"]["sample_rate"], json!(48000.0));
         assert_eq!(reply["data"]["audio_live"], json!(true));
         assert_eq!(reply["data"]["output_level"], json!(0.25));
+        // Single-graph mode: no rigs, active 0.
+        assert_eq!(reply["data"]["rigs"], json!(0));
+        assert_eq!(reply["data"]["active_rig"], json!(0));
+    }
+
+    #[test]
+    fn get_rigs_returns_snapshot_and_status_counts() {
+        let (bus, _drain, graph, level, rigs) = fixtures();
+        {
+            let mut s = rigs.lock().unwrap();
+            s.rigs = vec![
+                crate::control::RigMeta { name: "A".into(), midi_device: Some(2) },
+                crate::control::RigMeta { name: "B".into(), midi_device: None },
+            ];
+            s.active = 1;
+        }
+        let reply = handle_line(r#"{"op":"query","name":"get_rigs"}"#, &bus, &graph, &level, 48000.0, &rigs);
+        assert_eq!(reply["ok"], json!(true));
+        assert_eq!(reply["data"]["active"], json!(1));
+        let list = reply["data"]["rigs"].as_array().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["name"], json!("A"));
+        assert_eq!(list[0]["midi_device"], json!(2));
+        assert_eq!(list[1]["name"], json!("B"));
+        assert_eq!(list[1]["midi_device"], json!(Value::Null));
+
+        let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0, &rigs);
+        assert_eq!(reply["data"]["rigs"], json!(2));
+        assert_eq!(reply["data"]["active_rig"], json!(1));
     }
 
     #[test]
     fn bad_input_is_an_error_not_a_panic() {
-        let (bus, _drain, graph, level) = fixtures();
+        let (bus, _drain, graph, level, rigs) = fixtures();
         for bad in [
             "not json at all",
             "{}",
@@ -314,7 +391,7 @@ mod tests {
             r#"{"op":"query","name":"nope"}"#,
             r#"{"op":"query"}"#,
         ] {
-            let reply = handle_line(bad, &bus, &graph, &level, 48000.0);
+            let reply = handle_line(bad, &bus, &graph, &level, 48000.0, &rigs);
             assert_eq!(reply["ok"], json!(false), "input: {bad}");
             assert!(reply["error"].is_string());
         }
@@ -322,12 +399,12 @@ mod tests {
 
     #[test]
     fn socket_roundtrip_and_stale_cleanup() {
-        let (bus, mut drain, graph, level) = fixtures();
+        let (bus, mut drain, graph, level, rigs) = fixtures();
         let path = std::env::temp_dir().join(format!("ksalat-bridge-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         // A stale (unbound) socket file must be replaced, not fatal.
         std::fs::write(&path, b"").unwrap();
-        spawn_at(path.clone(), bus.clone(), graph.clone(), level.clone(), 44100.0).unwrap();
+        spawn_at(path.clone(), bus.clone(), graph.clone(), level.clone(), 44100.0, rigs.clone()).unwrap();
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -344,8 +421,8 @@ mod tests {
         assert_eq!(v["data"]["sample_rate"], json!(44100.0));
 
         // A second spawn while the first is live must fail, not steal.
-        let (bus2, _d2, g2, lv2) = fixtures();
-        assert!(spawn_at(path.clone(), bus2, g2, lv2, 48000.0).is_err());
+        let (bus2, _d2, g2, lv2, rigs2) = fixtures();
+        assert!(spawn_at(path.clone(), bus2, g2, lv2, 48000.0, rigs2).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }

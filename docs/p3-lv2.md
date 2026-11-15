@@ -85,3 +85,17 @@ Non-Surge CLAP is listed but disabled "coming soon" (the engine remaps its two
 Surge voices, so other CLAP instruments don't load yet). Adding replaces the
 current patch (LoadGraph semantics, noted in the UI). Verified live (XTest):
 add-effect rebuilds the rack and plays; demo/templates/flip/sessions unaffected.
+
+## LV2 instrument foundation — LANDED (commits 037ee78 + probe)
+
+- `Lv2Plugin` detects **atom/MIDI input ports**, maps the `atom:Sequence` and
+  `midi:MidiEvent` URIDs, and exposes `note_on`/`note_off` that write a correctly
+  formatted LV2 atom sequence (8-byte-aligned events) into the port buffer.
+- `is_instrument()` = atom input + audio output. **Verified on real plugins:**
+  LSP multisampler_x12 and oscillator_mono classify as instruments (atom=true).
+- `lv2-instrument-test` detects instruments and probes MIDI→audio. A unit test
+  verifies the atom-sequence byte layout.
+- **Limitation:** the installed LV2 instruments are samplers (need samples) or
+  free-running generators (no MIDI note→pitch), so MIDI→audio output couldn't be
+  confirmed with them. The write path is format-verified; full playback needs a
+  MIDI synth + engine note-routing to Lv2 instrument nodes (next step).

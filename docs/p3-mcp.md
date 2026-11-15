@@ -48,3 +48,34 @@ use, agent access is structurally 1:1 with the app (PLAN §2c) — no parallel A
 - **GUI bridge:** connect MCP to the *running* GUI app (shared control plane over
   a unix socket) so agents control what the user sees, not a separate headless
   engine. This is the next MCP milestone.
+## MCP→GUI bridge (landed, commit f1f7f0f)
+
+The MCP server can now control the **running GUI app**, not just a headless
+engine — true 1:1 access to what the user sees.
+
+- **Bridge:** `src/bridge.rs` runs a unix-socket server in the app at
+  `$XDG_RUNTIME_DIR/kabelsalat.sock` (fallback `~/.cache/kabelsalat.sock`).
+  Newline-delimited JSON: `{"op":"cmd","cmd":<Command>}` → forwarded to the
+  control-plane bus; `{"op":"query","name":"get_graph"|"get_status"}` → reads a
+  shared graph snapshot the UI mirrors from its live cables. `Command` gained
+  serde derives so it crosses the socket as JSON. Stale sockets are removed on
+  start; a live socket is never stolen.
+- **Attach mode:** `kabelsalat mcp --attach` serves the SAME 14 tools over stdio,
+  but proxies each to the bridge socket instead of a local engine. One
+  `#[tool_router]` set; `State.backend` is `Local(bus)` or `Remote` — identical
+  names, schemas, and error semantics. Fails fast with "start the app" if the
+  socket is absent.
+- **CLI:** `kabelsalat send '<json>'` sends one request to the live app and prints
+  the reply (handy for scripting/tests).
+
+### Verified (live app)
+- `send get_graph` → live 6-node / 8-edge patch.
+- `send {"SetSystemAudio":{"gain":0.5}}` → ok; a `NoteOn` raised the live
+  `output_level` 0 → 0.44, proving commands reach the engine.
+- `mcp --attach` → initialize + tools/list (14) + tools/call get_graph (live).
+- 85 unit tests pass (80 + 5 bridge tests).
+
+### Caveats
+- Attach `get_status` omits `transport_playing` (bridge doesn't expose it yet).
+- MCP-added nodes reach the engine but the GUI mirror shows its fixed 6 units
+  (dynamic-node rendering is the dynamic-rack follow-up).

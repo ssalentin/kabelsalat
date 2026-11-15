@@ -175,3 +175,21 @@ A **Sessions** button in the RIG INPUTS strip opens an egui window: name field +
 Uses the same capture/apply logic as the assistant tools — no assistant needed.
 Templates still require the dynamic rack (their graphs differ from the fixed
 6-unit layout); that is the next major UI step.
+
+## Dynamic rack + starter templates (landed, commit 2f313c4)
+
+The rack is now **data-driven**: `build_rack(Graph, params)` rebuilds units,
+cables, and an adaptive layout from any control-plane graph (KEYS left, MASTER
+right, one column per instrument + its DSP chain). Generic DSP faces render
+Reverb/Gain/Filter/Eq3/Limiter/Saturation/Pan.
+
+The 3 starter templates load via the Sessions window picker or **F5** (Lead+
+Reverb), **F6** (Drums+Bass), **F7** (Ambient Pad); **F8** restores the demo.
+Loading rebuilds the rack, applies defaults, and sends `Command::LoadGraph` +
+`SetParam` to the engine (which remaps the Surge voices onto the new instrument
+nodes and rebuilds the DSP + MIDI matrix).
+
+Verified: extended `session-test` asserts exact unit/cable/layout counts for all
+3 templates + demo restore; live GUI F5 → bridge get_graph shows KEYS/LEAD/
+REVERB/MASTER (4 nodes), a note plays (output 0.33), F8 restores the demo.
+Saved-session load now rebuilds full topology (was knob-only recall).

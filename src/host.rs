@@ -570,6 +570,65 @@ impl ClapVoiceMain {
     pub fn deactivate(mut self, stopped: StoppedPluginAudioProcessor<TestHost>) {
         self.instance.deactivate(stopped);
     }
+
+    /// Enumerate all plugin parameters for the native (egui) editor. Main thread
+    /// only. Returns id/name/module/range/value/flags so the UI can render
+    /// grouped sliders without any plugin GUI / X11 window.
+    pub fn param_list(&mut self) -> Vec<ParamDesc> {
+        let Some(params) = self.exts.params else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let count = params.count(&handle);
+        let mut info_buf = ParamInfoBuffer::new();
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let Some(info) = params.get_info(&handle, i, &mut info_buf) else {
+                continue;
+            };
+            let value = params.get_value(&handle, info.id).unwrap_or(info.default_value);
+            out.push(ParamDesc {
+                id: info.id.get(),
+                name: String::from_utf8_lossy(info.name).into_owned(),
+                module: String::from_utf8_lossy(info.module).into_owned(),
+                min: info.min_value,
+                max: info.max_value,
+                value,
+                default: info.default_value,
+                automatable: info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE),
+                hidden: info.flags.contains(ParamInfoFlags::IS_HIDDEN),
+                readonly: info.flags.contains(ParamInfoFlags::IS_READONLY),
+            });
+        }
+        out
+    }
+
+    /// Format a parameter value as the plugin's own text (e.g. "440.0 Hz").
+    pub fn param_text(&mut self, id: u32, value: f64) -> String {
+        let Some(params) = self.exts.params else {
+            return format!("{value:.3}");
+        };
+        let mut buf = [0u8; 256];
+        params
+            .value_to_text(&self.instance.plugin_handle(), ClapId::new(id), value, &mut buf)
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_else(|_| format!("{value:.3}"))
+    }
+}
+
+/// A plugin parameter description for the native editor (no X11 / plugin GUI).
+#[derive(Clone, Debug)]
+pub struct ParamDesc {
+    pub id: u32,
+    pub name: String,
+    pub module: String,
+    pub min: f64,
+    pub max: f64,
+    pub value: f64,
+    pub default: f64,
+    pub automatable: bool,
+    pub hidden: bool,
+    pub readonly: bool,
 }
 
 // ---------------------------------------------------------------------------

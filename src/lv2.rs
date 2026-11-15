@@ -526,6 +526,22 @@ impl Lv2Plugin {
         }
     }
 
+    /// Read back the MIDI event currently in the atom buffer (for verification).
+    pub fn last_midi_event(&self) -> Option<[u8; 3]> {
+        if self.atom_in.is_none() || self.atom_buf.len() < 35 {
+            return None;
+        }
+        let size = u32::from_le_bytes(self.atom_buf[0..4].try_into().ok()?);
+        if size <= 8 {
+            return None;
+        }
+        let data_len = u32::from_le_bytes(self.atom_buf[24..28].try_into().ok()?);
+        if data_len < 3 {
+            return None;
+        }
+        Some([self.atom_buf[32], self.atom_buf[33], self.atom_buf[34]])
+    }
+
     /// Process a stereo-interleaved block (allocation-free).
     pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
         let frames = frames.min(self.block);

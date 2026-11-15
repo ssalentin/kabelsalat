@@ -218,6 +218,15 @@ impl GraphEngine {
                 matrix.connect(SourceId::Hardware(dev), v.node);
             }
         }
+        for slot in &lv2 {
+            if slot.plugin.is_instrument() {
+                matrix.connect(SourceId::Keys, slot.node);
+                matrix.connect(SourceId::LaptopKeys, slot.node);
+                for dev in 0..MAX_HW_DEVICES {
+                    matrix.connect(SourceId::Hardware(dev), slot.node);
+                }
+            }
+        }
         Self {
             graph,
             drain,
@@ -262,6 +271,11 @@ impl GraphEngine {
 
     pub fn level_handle(&self) -> Arc<AtomicU32> {
         self.out_peak.clone()
+    }
+
+    /// Read back the MIDI event pending at an LV2 instrument node (verification).
+    pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
+        self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -350,6 +364,15 @@ impl GraphEngine {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
                 }
+                for slot in &self.lv2 {
+                    if slot.plugin.is_instrument() {
+                        self.matrix.connect(SourceId::Keys, slot.node);
+                        self.matrix.connect(SourceId::LaptopKeys, slot.node);
+                        for dev in 0..MAX_HW_DEVICES {
+                            self.matrix.connect(SourceId::Hardware(dev), slot.node);
+                        }
+                    }
+                }
                 self.keys_node = self
                     .graph
                     .nodes
@@ -372,6 +395,11 @@ impl GraphEngine {
                             s.voice.note_on(m.note() as u16, velocity as f64);
                         }
                     }
+                    if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        if s.plugin.is_instrument() {
+                            s.plugin.note_on(m.note(), (velocity.clamp(0.0, 1.0) * 127.0) as u8);
+                        }
+                    }
                 }
             }
             Command::NoteOff { note, source } => {
@@ -387,6 +415,11 @@ impl GraphEngine {
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_off(m.note() as u16);
+                        }
+                    }
+                    if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        if s.plugin.is_instrument() {
+                            s.plugin.note_off(m.note());
                         }
                     }
                 }
@@ -749,5 +782,40 @@ pub fn metro_test() -> anyhow::Result<()> {
     let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     anyhow::ensure!(peak < 0.05, "metronome did not stop (peak {peak})");
     println!("metro-test: OK — {click_blocks} click-blocks in 1s @120bpm, silent after stop");
+    Ok(())
+}
+
+/// LV2 instrument engine-routing test: a note sent through the control plane
+/// must reach the LV2 instrument's atom input (verified via readback).
+pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, voice)]);
+
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let inst = g.add_node(
+        NodeKind::Lv2 { uri: Lv2Uri::new("http://lsp-plug.in/plugins/lv2/oscillator_mono") },
+        name_bytes("LV2 INST"),
+    );
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+    bus.send(Command::LoadGraph { graph: g });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let mut buf = vec![0.0f32; 512 * 2];
+    engine.render(&mut buf, 2); // drains LoadGraph + NoteOn
+
+    let ev = engine.lv2_last_note(inst);
+    anyhow::ensure!(ev.is_some(), "LV2 instrument did not receive the note");
+    let ev = ev.unwrap();
+    anyhow::ensure!(ev[0] == 0x90 && ev[1] == 60, "wrong MIDI event reached instrument: {ev:?}");
+    println!("lv2-instrument-engine-test: OK — note routed to LV2 instrument atom input (event {ev:?})");
     Ok(())
 }

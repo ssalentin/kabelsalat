@@ -561,4 +561,19 @@ mod tests {
         assert_eq!(dests(&m, SourceId::Hardware(3), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
         assert_eq!(dests(&m, SourceId::Hardware(15), MidiMsg::note_on(0, 60, 100)), vec![1, 4]);
     }
+
+    #[test]
+    fn dsp_param_maps_for_templates() {
+        use super::dsp_native_param;
+        use crate::control::DspKind;
+        // Template defaults: Reverb(0=mix), Gain(0=gain), Filter(0=cutoff).
+        assert_eq!(dsp_native_param(&DspKind::Reverb, 0), Some(2));
+        assert_eq!(dsp_native_param(&DspKind::Reverb, 1), Some(0));
+        assert_eq!(dsp_native_param(&DspKind::Gain, 0), Some(0));
+        assert_eq!(dsp_native_param(&DspKind::Filter, 0), Some(0));
+        assert_eq!(dsp_native_param(&DspKind::Filter, 1), Some(1));
+        // Delay keeps its time/mix mapping.
+        assert_eq!(dsp_native_param(&DspKind::Delay, super::P_TIME), Some(0));
+        assert_eq!(dsp_native_param(&DspKind::Delay, super::P_MIX), Some(2));
+    }
 }

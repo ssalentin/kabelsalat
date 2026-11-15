@@ -246,8 +246,8 @@ struct Unit {
     name: String,
     sub: String,
     accent: Color32,
-    ins: [PortKind; 2],
-    outs: [PortKind; 2],
+    ins: [PortKind; 3],
+    outs: [PortKind; 3],
     knobs: Vec<Knob>,
     jacks: Vec<Jack>,
     led: f32,
@@ -265,7 +265,11 @@ impl Unit {
         self.jacks.iter().position(|j| j.dir == dir && j.port == port)
     }
     fn kind(&self, dir: Dir, port: usize) -> PortKind {
-        if dir == Dir::In { self.ins[port] } else { self.outs[port] }
+        if dir == Dir::In {
+            self.ins.get(port).copied().unwrap_or(PortKind::Audio)
+        } else {
+            self.outs.get(port).copied().unwrap_or(PortKind::Audio)
+        }
     }
 }
 
@@ -310,6 +314,7 @@ fn dsp_accent(kind: &DspKind) -> Color32 {
         DspKind::Limiter => ORANGE,
         DspKind::Saturation => Color32::from_rgb(0xf7, 0x76, 0x8e), // red
         DspKind::Pan => YELLOW,
+        DspKind::Metronome => YELLOW,
     }
 }
 
@@ -355,6 +360,7 @@ fn make_unit(node: &Node) -> Unit {
                 DspKind::Limiter => (vec![knob("CEIL", 0.8, Some(0)), knob("DRIVE", 0.2, Some(1))], "limiter".into()),
                 DspKind::Saturation => (vec![knob("DRIVE", 0.4, Some(0)), knob("MIX", 0.5, Some(1))], "saturation".into()),
                 DspKind::Pan => (vec![knob("PAN", 0.5, Some(0))], "panner".into()),
+                DspKind::Metronome => (vec![], "metronome · transport click".into()),
                 DspKind::Delay => unreachable!(),
             };
             (
@@ -378,10 +384,10 @@ fn make_unit(node: &Node) -> Unit {
         ),
     };
 
-    let mut ins_arr = [PortKind::Audio; 2];
-    let mut outs_arr = [PortKind::Audio; 2];
-    for (i, k) in ins.iter().take(2).enumerate() { ins_arr[i] = *k; }
-    for (i, k) in outs.iter().take(2).enumerate() { outs_arr[i] = *k; }
+    let mut ins_arr = [PortKind::Audio; 3];
+    let mut outs_arr = [PortKind::Audio; 3];
+    for (i, k) in ins.iter().take(3).enumerate() { ins_arr[i] = *k; }
+    for (i, k) in outs.iter().take(3).enumerate() { outs_arr[i] = *k; }
     Unit {
         node_id: node.id,
         node_kind,
@@ -518,6 +524,9 @@ enum Drag {
     Knob { unit: usize, idx: usize, start_val: f32, press_y: f32 },
     Plug { ci: usize, end: Dir },
     Cable { ci: usize, u: f32 },
+    /// Ctrl+drag a rack unit to rearrange it (task-21). `grab` is the pointer's
+    /// rack-local offset inside the unit at press, so the box tracks the cursor.
+    Unit { unit: usize, grab: Vec2 },
 }
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
@@ -920,6 +929,52 @@ impl DemoApp {
         self.stack_cols = cols;
     }
 
+    /// The movable (middle-stack) unit under a rack-local point, if any.
+    /// KEYS and MASTER are fixed anchors and are never returned (task-21).
+    fn stack_unit_at(&self, l: Vec2) -> Option<usize> {
+        let lp = l.to_pos2();
+        for ui in 0..self.units.len() {
+            if self.keys_unit == Some(ui) || self.master_unit == Some(ui) { continue; }
+            if self.unit_rects[ui].contains(lp) { return Some(ui); }
+        }
+        None
+    }
+
+    /// Ctrl+drag release (task-21): move `unit` to the slot nearest the drop
+    /// point by reordering `stack_cols`; layout() then reflows with no overlaps.
+    /// Unit indices — and therefore cable endpoints — are untouched.
+    fn drop_unit(&mut self, unit: usize, drop: Vec2) {
+        if self.keys_unit == Some(unit) || self.master_unit == Some(unit) { return; }
+        let src = self.stack_cols.iter().enumerate()
+            .find_map(|(j, col)| col.iter().position(|&u| u == unit).map(|r| (j, r)));
+        let Some((sj, sr)) = src else { return };
+
+        // Target column = nearest column x-center, judged from the OTHER units
+        // (the dragged unit's rect is currently at the cursor, so skip it).
+        let mut tj = sj;
+        let mut best_dx = f32::INFINITY;
+        for (j, col) in self.stack_cols.iter().enumerate() {
+            if let Some(r) = col.iter().find(|&&u| u != unit).copied() {
+                let dx = (drop.x - self.unit_rects[r].center().x).abs();
+                if dx < best_dx { best_dx = dx; tj = j; }
+            }
+        }
+        // Target row from the drop height.
+        let gap = 10.0;
+        let pad = 16.0;
+        let len = self.stack_cols[tj].len() as i32;
+        let tr = (((drop.y - pad) / (self.unit_h + gap)).floor() as i32).clamp(0, len);
+
+        // Remove from source, then insert at target (adjust for same-column shift).
+        self.stack_cols[sj].remove(sr);
+        let mut tr = tr as usize;
+        if sj == tj && sr < tr { tr -= 1; }
+        let tr = tr.min(self.stack_cols[tj].len());
+        self.stack_cols[tj].insert(tr, unit);
+        self.stack_cols.retain(|c| !c.is_empty());
+        self.layout_rows = self.stack_cols.iter().map(|c| c.len()).max().unwrap_or(1).max(1);
+    }
+
     /// Galleys are laid out on the first frame: egui loads fonts only once
     /// `Context::run` has started, so the app creator cannot do this.
     fn ensure_galleys(&mut self, ctx: &egui::Context) {
@@ -971,6 +1026,7 @@ impl DemoApp {
              click the keys     play Keys — pulses run down the cables\n\
              laptop keys        A W S E D F T G Y H U J K · Z/X octave\n\
              drag jack to jack  patch a cable (back) · master jacks fan in\n\
+             Ctrl+drag a unit   rearrange the rack — it reflows on release\n\
              grab a cable       shake it — watch it swing and settle (back)\n\
              tug a plug         pull it out to unplug (back)\n\
              click a cable      highlight its whole signal path\n\
@@ -1342,6 +1398,7 @@ impl DemoApp {
                 "buffer_frames": crate::bridge::BUFFER_FRAMES,
                 "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
                 "xruns": crate::bridge::XRUNS.load(std::sync::atomic::Ordering::Relaxed),
+                "midi_latency_ms": crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
             })
             .to_string(),
             "play_note" => {
@@ -1548,6 +1605,7 @@ impl DemoApp {
                         "saturation" => Some(NodeKind::Dsp(DspKind::Saturation)),
                         "delay" => Some(NodeKind::Dsp(DspKind::Delay)),
                         "reverb" => Some(NodeKind::Dsp(DspKind::Reverb)),
+                        "metronome" => Some(NodeKind::Dsp(DspKind::Metronome)),
                         _ => None,
                     },
                     "lv2" => args.get("uri").and_then(|v| v.as_str()).map(|u| NodeKind::Lv2 { uri: Lv2Uri::new(u) }),
@@ -2718,9 +2776,9 @@ impl DemoApp {
             }
         }
 
-        let (pointer, pressed, down, released, right_clicked) = ctx.input(|i| {
+        let (pointer, pressed, down, released, right_clicked, ctrl) = ctx.input(|i| {
             (i.pointer.hover_pos(), i.pointer.primary_pressed(), i.pointer.primary_down(),
-             i.pointer.primary_released(), i.pointer.secondary_clicked())
+             i.pointer.primary_released(), i.pointer.secondary_clicked(), i.modifiers.ctrl)
         });
 
         let Some(s) = pointer else {
@@ -2748,24 +2806,35 @@ impl DemoApp {
 
         if pressed {
             self.press = Some((hit, s));
-            match hit {
-                Hit::Knob { unit, idx } => {
-                    self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
+            // Ctrl+press on a stack unit → rearrange drag (task-21). Overrides
+            // knob/jack sub-hits so the whole box is grabbable; KEYS/MASTER and
+            // non-Ctrl presses fall through to the normal behavior untouched.
+            if ctrl {
+                if let Some(unit) = self.stack_unit_at(l) {
+                    let grab = l - self.unit_rects[unit].min.to_vec2();
+                    self.drag = Drag::Unit { unit, grab };
                 }
-                Hit::Key(semi) => {
-                    self.current_source = SourceId::Keys;
-                    self.fire_keys(60 + semi, 0.95);
-                }
-                Hit::Jack { unit, jack } if self.side == Side::Back => {
-                    let j = &self.units[unit].jacks[jack];
-                    if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
-                        self.drag = Drag::Plug { ci, end: j.dir };
+            }
+            if !matches!(self.drag, Drag::Unit { .. }) {
+                match hit {
+                    Hit::Knob { unit, idx } => {
+                        self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
                     }
+                    Hit::Key(semi) => {
+                        self.current_source = SourceId::Keys;
+                        self.fire_keys(60 + semi, 0.95);
+                    }
+                    Hit::Jack { unit, jack } if self.side == Side::Back => {
+                        let j = &self.units[unit].jacks[jack];
+                        if let Some(ci) = self.cable_at_jack(unit, j.dir, j.port) {
+                            self.drag = Drag::Plug { ci, end: j.dir };
+                        }
+                    }
+                    Hit::Cable(ci, u) if self.side == Side::Back => {
+                        self.drag = Drag::Cable { ci, u };
+                    }
+                    _ => {}
                 }
-                Hit::Cable(ci, u) if self.side == Side::Back => {
-                    self.drag = Drag::Cable { ci, u };
-                }
-                _ => {}
             }
         }
 
@@ -2807,6 +2876,12 @@ impl DemoApp {
                         self.drag = Drag::None;
                     }
                 }
+                Drag::Unit { unit, grab } => {
+                    // Track the cursor in rack-local space; cable endpoints read
+                    // unit_rects, so they stay attached while the box moves.
+                    let size = self.unit_rects[unit].size();
+                    self.unit_rects[unit] = Rect::from_min_size((l - grab).to_pos2(), size);
+                }
                 Drag::None => {
                     // Drag-from-jack: one-gesture patching.
                     if let Some((Hit::Jack { unit, jack }, press_pos)) = self.press {
@@ -2829,7 +2904,14 @@ impl DemoApp {
             self.press = None;
             let was_plug = matches!(self.drag, Drag::Plug { .. });
             let plug_info = if let Drag::Plug { ci, end } = self.drag { Some((ci, end)) } else { None };
+            let unit_drag = if let Drag::Unit { unit, .. } = self.drag { Some(unit) } else { None };
             self.drag = Drag::None;
+
+            // Ctrl+drag release (task-21): reorder the stacks, then auto-layout
+            // reflows. Only when actually moved, so a Ctrl+click is a no-op.
+            if let Some(unit) = unit_drag {
+                if moved >= 6.0 { self.drop_unit(unit, l); }
+            }
 
             // Plug drag release: far from the jack → unplug; near → snap back.
             if let Some((ci, end)) = plug_info {
@@ -2892,15 +2974,21 @@ impl DemoApp {
         }
 
         // Cursor affordances.
-        let icon = match self.hover {
-            Some(Hit::Play) | Some(Hit::Flip) | Some(Hit::Jack { .. }) | Some(Hit::Key(_)) => CursorIcon::PointingHand,
-            Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
-            Some(Hit::Cable(..)) => match self.drag {
-                Drag::Cable { .. } => CursorIcon::Grabbing,
-                _ => CursorIcon::Grab,
-            },
-            Some(Hit::Unit(_)) => CursorIcon::PointingHand,
-            _ => CursorIcon::Default,
+        let icon = if matches!(self.drag, Drag::Unit { .. }) {
+            CursorIcon::Grabbing
+        } else if ctrl && matches!(self.hover, Some(Hit::Unit(_))) {
+            CursorIcon::Grab
+        } else {
+            match self.hover {
+                Some(Hit::Play) | Some(Hit::Flip) | Some(Hit::Jack { .. }) | Some(Hit::Key(_)) => CursorIcon::PointingHand,
+                Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
+                Some(Hit::Cable(..)) => match self.drag {
+                    Drag::Cable { .. } => CursorIcon::Grabbing,
+                    _ => CursorIcon::Grab,
+                },
+                Some(Hit::Unit(_)) => CursorIcon::PointingHand,
+                _ => CursorIcon::Default,
+            }
         };
         ctx.set_cursor_icon(icon);
         let _ = rect;
@@ -2993,8 +3081,11 @@ impl DemoApp {
         for (ui, u) in self.units.iter().enumerate() {
             let r = self.unit_rects[ui];
             let hovered = matches!(self.hover, Some(Hit::Unit(i)) if i == ui);
-            painter.rect_filled(xf.rect(r), 10.0, if hovered { mix(PLATE_FRONT, WHITE, 0.03) } else { PLATE_FRONT });
-            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let fill = if dragging { mix(PLATE_FRONT, YELLOW, 0.10) } else if hovered { mix(PLATE_FRONT, WHITE, 0.03) } else { PLATE_FRONT };
+            painter.rect_filled(xf.rect(r), 10.0, fill);
+            let (bw, bc) = if dragging { (2.0, YELLOW) } else { (1.0, BORDER) };
+            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
 
             // Colored label strip.
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
@@ -3163,8 +3254,11 @@ impl DemoApp {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
             let r = self.unit_rects[ui];
-            painter.rect_filled(xf.rect(r), 10.0, PLATE_BACK);
-            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let fill = if dragging { mix(PLATE_BACK, YELLOW, 0.10) } else { PLATE_BACK };
+            painter.rect_filled(xf.rect(r), 10.0, fill);
+            let (bw, bc) = if dragging { (2.0, YELLOW) } else { (1.0, BORDER) };
+            painter.rect_stroke(xf.rect(r), 10.0, Stroke::new(bw, bc), egui::StrokeKind::Inside);
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(7.0, r.height() - 24.0));
             painter.rect_filled(xf.rect(strip), 3.5, alpha(u.accent, 0.55));
             self.text(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
@@ -3791,6 +3885,39 @@ pub fn run_session_test() -> anyhow::Result<()> {
     let n_audio = app.cables.iter().filter(|c| c.kind == PortKind::Audio).count();
     anyhow::ensure!(n_midi == 1 && n_audio == 1, "lv2 instrument cable kinds (midi={n_midi} audio={n_audio})");
     println!("  lv2 browser: effect 4u/4c, instrument 3u/2c (1 MIDI + 1 audio) — OK");
+
+    // --- Ctrl+drag rearrange (task-21): reorder must keep a valid partition and
+    // reflow with no overlaps; unit indices (cable endpoints) stay untouched. ---
+    app.load_demo_patch();
+    let test_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0));
+    app.layout(test_rect);
+    let u0 = app.stack_cols[0][0];
+    let last_col = app.stack_cols.last().unwrap().clone();
+    let anchor = app.unit_rects[last_col[0]];
+    let drop = Vec2::new(anchor.center().x, anchor.bottom() + 40.0);
+    let cables_before: Vec<(usize, usize)> = app.cables.iter().map(|c| (c.src, c.dst)).collect();
+    app.drop_unit(u0, drop);
+    let mut seen = vec![false; app.units.len()];
+    for col in &app.stack_cols {
+        for &u in col {
+            anyhow::ensure!(!seen[u], "rearrange: unit {u} duplicated");
+            seen[u] = true;
+            anyhow::ensure!(app.keys_unit != Some(u) && app.master_unit != Some(u), "rearrange: anchor moved");
+        }
+    }
+    for u in 0..app.units.len() {
+        if app.keys_unit == Some(u) || app.master_unit == Some(u) { continue; }
+        anyhow::ensure!(seen[u], "rearrange: unit {u} lost");
+    }
+    let cables_after: Vec<(usize, usize)> = app.cables.iter().map(|c| (c.src, c.dst)).collect();
+    anyhow::ensure!(cables_before == cables_after, "rearrange: cable endpoints changed");
+    app.layout(test_rect);
+    for a in 0..app.units.len() {
+        for b in (a + 1)..app.units.len() {
+            anyhow::ensure!(!app.unit_rects[a].intersects(app.unit_rects[b]), "rearrange: overlap {a}/{b}");
+        }
+    }
+    println!("  ctrl+drag rearrange: partition valid, cables intact, reflow no overlaps — OK");
 
     // Demo patch must still load after the templates.
     app.load_demo_patch();

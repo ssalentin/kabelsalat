@@ -167,3 +167,11 @@ The session model is now wired into the app via the assistant (commit `526665d`)
 
 Still to come: a visual save/load UI, starter-template loading (needs the dynamic
 rack to render arbitrary graphs), and undo/redo wired to UI actions.
+
+## Visual Sessions window (landed, commit 16a0a1b)
+
+A **Sessions** button in the RIG INPUTS strip opens an egui window: name field +
+"Save current patch", and a list of saved packages each with a **Load** button.
+Uses the same capture/apply logic as the assistant tools — no assistant needed.
+Templates still require the dynamic rack (their graphs differ from the fixed
+6-unit layout); that is the next major UI step.

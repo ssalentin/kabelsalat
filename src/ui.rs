@@ -547,7 +547,7 @@ fn make_unit(node: &Node) -> Unit {
             vec![(Dir::In, 0, 0.30, "L"), (Dir::In, 2, 0.50, "MONO"), (Dir::In, 1, 0.70, "R")],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
-            UnitKind::Dsp(DspKind::Delay), "insert fx · midi tap".into(),
+            UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
             vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
             vec![(Dir::In, 0, 0.22, "IN"), (Dir::In, 1, 0.46, "MIDI IN"), (Dir::Out, 0, 0.76, "OUT")],
@@ -1877,7 +1877,7 @@ impl DemoApp {
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         self.bus = Some(bus);
         self.out_level = Some(level);
-        self.surge_status = "Surge XT loaded — play!".into();
+        self.surge_status = "Surge loaded — play!".into();
         self
     }
 
@@ -4082,7 +4082,8 @@ impl DemoApp {
         if !(r.width() > 0.0) { return None; } // hidden (Rect::NOTHING) or unlaid
         let y = r.top() + 10.0;
         let readout = Rect::from_min_size(Pos2::new(r.right() - 30.0 - SPLIT_READOUT_W, y), Vec2::new(SPLIT_READOUT_W, FACE_CTL_H));
-        let chip = Rect::from_min_size(Pos2::new(readout.left() - 6.0 - SPLIT_CHIP_W, y), Vec2::new(SPLIT_CHIP_W, FACE_CTL_H));
+        // Chip + state field abut: ONE segmented control ("SPLIT | OFF"), not two buttons.
+        let chip = Rect::from_min_size(Pos2::new(readout.left() - 1.0 - SPLIT_CHIP_W, y), Vec2::new(SPLIT_CHIP_W, FACE_CTL_H));
         let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
         if chip.left() < r.left() + 34.0 + name_w + 8.0 { return None; }
         Some((chip, readout))

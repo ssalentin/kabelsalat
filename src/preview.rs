@@ -255,7 +255,7 @@ impl PreviewApp {
         let (synth_status, synth_stream) = match synth {
             Ok(s) => (
                 if surge_ctrl.is_some() {
-                    "Surge XT loaded — play!".to_string()
+                    "Surge loaded — play!".to_string()
                 } else {
                     "sine synth (Surge unavailable)".to_string()
                 },

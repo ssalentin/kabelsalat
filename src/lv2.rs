@@ -355,3 +355,159 @@ pub fn host_test() -> anyhow::Result<()> {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reusable LV2 plugin wrapper (foundation for engine rig nodes)
+// ---------------------------------------------------------------------------
+
+/// A hosted LV2 plugin instance with audio buffers, ready to process blocks.
+/// Owns the lilv world + instance and the persistent URID-map feature data.
+/// `process` is allocation-free (buffers preallocated); instantiate/Drop are
+/// main-thread only. Not yet `Send` (raw pointers) — engine integration will
+/// wrap it accordingly.
+pub struct Lv2Plugin {
+    world: *mut LilvWorld,
+    instance: *mut LilvInstance,
+    buffers: Vec<Vec<f32>>,
+    audio_in: Vec<usize>,
+    audio_out: Vec<usize>,
+    _urid: Box<UridMap>,
+    _map_data: Box<Lv2UridMap>,
+    block: usize,
+    uri: String,
+}
+
+impl Lv2Plugin {
+    /// Load the first plugin whose URI contains `needle`, instantiate it with
+    /// urid-map + options features, classify ports, and connect buffers.
+    pub fn load(needle: &str, sample_rate: f64, block: usize) -> anyhow::Result<Self> {
+        unsafe {
+            let world = lilv_world_new();
+            anyhow::ensure!(!world.is_null(), "lilv_world_new failed");
+            lilv_world_load_all(world);
+            let plugin = find_plugin(world, needle);
+            anyhow::ensure!(!plugin.is_null(), "LV2 plugin not found: {needle}");
+            let uri = node_borrowed(lilv_plugin_get_uri(plugin));
+
+            let mut urid = Box::new(UridMap { map: std::collections::HashMap::new(), next: 1 });
+            let handle = &mut *urid as *mut UridMap as *mut c_void;
+            let mut map_data = Box::new(Lv2UridMap { handle, map: urid_map_cb });
+            let map_feature = Lv2Feature {
+                uri: b"http://lv2plug.in/ns/ext/urid#map\0".as_ptr() as *const c_char,
+                data: &mut *map_data as *mut Lv2UridMap as *mut c_void,
+            };
+            let map_uri = |s: &[u8]| urid_map_cb(handle, s.as_ptr() as *const c_char);
+            let sr_key = map_uri(b"http://lv2plug.in/ns/lv2core#sampleRate\0");
+            let bl_key = map_uri(b"http://lv2plug.in/ns/ext/buf-size#maxBlockLength\0");
+            let float_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Float\0");
+            let int_ty = map_uri(b"http://lv2plug.in/ns/ext/atom#Int\0");
+            let sr_val: f32 = sample_rate as f32;
+            let bl_val: i32 = block as i32;
+            let options = [
+                Lv2Option { context: 0, subject: 0, key: sr_key, size: 4, ty: float_ty, value: &sr_val as *const f32 as *const c_void },
+                Lv2Option { context: 0, subject: 0, key: bl_key, size: 4, ty: int_ty, value: &bl_val as *const i32 as *const c_void },
+                Lv2Option { context: 0, subject: 0, key: 0, size: 0, ty: 0, value: std::ptr::null() },
+            ];
+            let options_feature = Lv2Feature {
+                uri: b"http://lv2plug.in/ns/ext/options#options\0".as_ptr() as *const c_char,
+                data: options.as_ptr() as *mut c_void,
+            };
+            let features: [*const Lv2Feature; 3] = [&map_feature, &options_feature, std::ptr::null()];
+
+            let instance = lilv_plugin_instantiate(plugin, sample_rate, features.as_ptr());
+            anyhow::ensure!(!instance.is_null(), "instantiate failed for {uri}");
+
+            let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+            let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
+            let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
+            let nports = lilv_plugin_get_num_ports(plugin);
+            let mut buffers: Vec<Vec<f32>> = (0..nports).map(|_| vec![0.0f32; block]).collect();
+            let mut audio_in = Vec::new();
+            let mut audio_out = Vec::new();
+            let desc = &*(*instance).lv2_descriptor;
+            let h = (*instance).lv2_handle;
+            let connect_port = desc.connect_port.expect("no connect_port");
+            for i in 0..nports {
+                let port = lilv_plugin_get_port_by_index(plugin, i);
+                let is_audio = lilv_port_is_a(plugin, port, audio);
+                let is_control = lilv_port_is_a(plugin, port, control);
+                let is_in = lilv_port_is_a(plugin, port, input);
+                if is_audio && is_in {
+                    audio_in.push(i as usize);
+                } else if is_audio && !is_in {
+                    audio_out.push(i as usize);
+                } else if is_control && is_in {
+                    let mut def: *mut LilvNode = std::ptr::null_mut();
+                    lilv_port_get_range(plugin, port, &mut def, std::ptr::null_mut(), std::ptr::null_mut());
+                    let v = if !def.is_null() { let f = lilv_node_as_float(def); lilv_node_free(def); f } else { 1.0 };
+                    buffers[i as usize][0] = if v == 0.0 { 1.0 } else { v };
+                }
+                connect_port(h, i, buffers[i as usize].as_mut_ptr() as *mut c_void);
+            }
+            lilv_node_free(audio);
+            lilv_node_free(control);
+            lilv_node_free(input);
+            anyhow::ensure!(!audio_in.is_empty() && !audio_out.is_empty(), "{uri} has no audio in/out");
+            if let Some(activate) = desc.activate {
+                activate(h);
+            }
+            Ok(Self { world, instance, buffers, audio_in, audio_out, _urid: urid, _map_data: map_data, block, uri })
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// Process a stereo-interleaved block (allocation-free).
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
+        let frames = frames.min(self.block);
+        unsafe {
+            for &i in &self.audio_in {
+                for f in 0..frames {
+                    self.buffers[i][f] = input.get(f * 2).copied().unwrap_or(0.0);
+                }
+            }
+            let desc = &*(*self.instance).lv2_descriptor;
+            (desc.run.expect("no run"))((*self.instance).lv2_handle, frames as u32);
+            for f in 0..frames {
+                let l = self.audio_out.first().map(|&i| self.buffers[i][f]).unwrap_or(0.0);
+                let r = self.audio_out.get(1).map(|&i| self.buffers[i][f]).unwrap_or(l);
+                if f * 2 + 1 < output.len() {
+                    output[f * 2] = l;
+                    output[f * 2 + 1] = r;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Lv2Plugin {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.instance.is_null() {
+                let desc = &*(*self.instance).lv2_descriptor;
+                if let Some(deactivate) = desc.deactivate {
+                    deactivate((*self.instance).lv2_handle);
+                }
+                lilv_instance_free(self.instance);
+            }
+            if !self.world.is_null() {
+                lilv_world_free(self.world);
+            }
+        }
+    }
+}
+
+/// CLI self-test for the reusable wrapper: load a plugin, process a block.
+pub fn voice_test() -> anyhow::Result<()> {
+    let mut plugin = Lv2Plugin::load("audiogain_s", 48000.0, 256)
+        .or_else(|_| Lv2Plugin::load("amp", 48000.0, 256))?;
+    let input = vec![0.5f32; 256 * 2];
+    let mut output = vec![0.0f32; 256 * 2];
+    plugin.process(&input, &mut output, 256);
+    let peak = output.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    anyhow::ensure!(peak > 1e-4, "Lv2Plugin produced no output (peak {peak})");
+    println!("lv2-voice-test: OK — reusable Lv2Plugin '{}' processed 256 frames, peak {peak:.4}", plugin.uri());
+    Ok(())
+}

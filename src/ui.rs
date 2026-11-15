@@ -441,6 +441,9 @@ struct DemoApp {
 
     show_help: bool,
     show_stats: bool,
+    show_sessions: bool,
+    session_name: String,
+    session_msg: String,
     fps: f32,
     stats_timer: f32,
     stats_g: Option<Arc<Galley>>,
@@ -591,6 +594,9 @@ impl DemoApp {
             meter: 0.0,
             show_help: false,
             show_stats: false,
+            show_sessions: false,
+            session_name: String::new(),
+            session_msg: String::new(),
             fps: 60.0,
             stats_timer: 0.0,
             stats_g: None,
@@ -1385,9 +1391,93 @@ impl DemoApp {
                         ui.label(egui::RichText::new(&self.editor_status).small().italics().color(ORANGE));
                         ui.add_space(8.0);
                     }
+                    let sess_btn = egui::Button::new(egui::RichText::new("Sessions").small().color(TEXT))
+                        .fill(Color32::from_rgb(0x26, 0x28, 0x38))
+                        .corner_radius(4.0);
+                    if ui.add(sess_btn).clicked() {
+                        self.show_sessions = !self.show_sessions;
+                    }
+                    ui.add_space(10.0);
                     ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
                 });
             });
+    }
+
+    /// Visual save/load for sessions (no assistant needed).
+    fn sessions_window(&mut self, ctx: &egui::Context) {
+        if !self.show_sessions {
+            return;
+        }
+        let mut open = self.show_sessions;
+        egui::Window::new("Sessions")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut self.session_name);
+                });
+                if ui.button("Save current patch").clicked() {
+                    let name = if self.session_name.trim().is_empty() {
+                        "Untitled".to_string()
+                    } else {
+                        self.session_name.clone()
+                    };
+                    match self.capture_session(&name) {
+                        Ok(s) => {
+                            let path = crate::session::Session::package_path(&Self::sessions_dir(), &name);
+                            match path.and_then(|p| s.save(&p).map(|_| p)) {
+                                Ok(_) => self.session_msg = format!("Saved '{name}'"),
+                                Err(e) => self.session_msg = format!("Save failed: {e}"),
+                            }
+                        }
+                        Err(e) => self.session_msg = format!("Capture failed: {e}"),
+                    }
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Saved sessions").small().strong());
+                let dir = Self::sessions_dir();
+                let mut names: Vec<String> = std::fs::read_dir(&dir)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter_map(|e| {
+                                let p = e.path();
+                                if p.extension().map(|x| x == "ksalat").unwrap_or(false) {
+                                    p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                names.sort();
+                if names.is_empty() {
+                    ui.label(egui::RichText::new("none yet — save one above").small().italics());
+                }
+                for name in names {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&name).small());
+                        if ui.small_button("Load").clicked() {
+                            let path = crate::session::Session::package_path(&dir, &name);
+                            match path.and_then(|p| crate::session::Session::load(&p)) {
+                                Ok(s) => match self.apply_session(&s) {
+                                    Ok(_) => self.session_msg = format!("Loaded '{name}'"),
+                                    Err(e) => self.session_msg = format!("Apply failed: {e}"),
+                                },
+                                Err(e) => self.session_msg = format!("Load failed: {e}"),
+                            }
+                        }
+                    });
+                }
+                if !self.session_msg.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new(&self.session_msg).small().color(GREEN));
+                }
+            });
+        self.show_sessions = open;
     }
 
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
@@ -2863,6 +2953,7 @@ impl eframe::App for DemoApp {
 
         self.tessellate();
         self.draw(ui);
+        self.sessions_window(&ctx);
 
         // Keep the embedded editor alive: X events, CLAP gui requests, and
         // child geometry in the reserved region (physical pixels).

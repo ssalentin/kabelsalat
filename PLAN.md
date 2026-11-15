@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **RIGS strip (+ Rig / × delete with confirmation) + Mixer view (F10: sources → rig bus → master) + 1–9/←→ view switching (F4 two-rig demo)**, **global agent rig control (get/add/delete/select_rig)**, **big patches pan instead of squishing**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 210 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading (#2), (2) backing tracks (#1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap, mirrored as GitHub feature issues #1–#8 (user request 2026-11-15).**
+Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **RIGS strip (+ Rig / × delete with confirmation) + Mixer view (F10: sources → rig bus → master) + 1–9/←→ view switching (F4 two-rig demo)**, **global agent rig control (get/add/delete/select_rig)**, **big patches pan instead of squishing**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 213 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading (#2), (2) backing tracks (#1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap, mirrored as GitHub feature issues #1–#8 (user request 2026-11-15).**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (210). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (213). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -224,6 +224,10 @@ merged here 2026-11-15; no GitHub tickets).
   (chip / F10) shows every source → its rig bus → Master out as channel strips.
 - **2026-11-15** — **The agent operates globally** (user): get_rigs / add_rig /
   delete_rig (confirm) / select_rig, add_node takes rig=N — in-app agent and MCP.
+- **2026-11-15** — **Brand in the top bar** (user): the RIG INPUTS strip (K/H
+  per synth) is gone; the crossed-wires mark + wordmark sit there instead,
+  without the play button (which stays on the stage). Per-synth keyboard /
+  hardware routing lives in the MIDI matrix.
 - **2026-11-15** — **Stability/latency pass** (goal): render thread promoted to
   realtime via rtkit (worst render 26 ms → 1 ms, 0 xruns under full CPU load),
   buffer 512 → 256 frames (10.7 → 5.3 ms), dev profile optimized (deps -O2),

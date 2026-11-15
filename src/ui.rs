@@ -438,6 +438,16 @@ impl RuleEdit {
         if !self.enabled { parts.push("muted".into()); }
         if parts.is_empty() { "transparent".into() } else { parts.join(" · ") }
     }
+    /// In-cell code for a routed matrix cell: the rule's defining change,
+    /// so a shaped route reads differently from a plain one at a glance.
+    fn cell_code(&self) -> String {
+        if !self.enabled { return "off".into(); }
+        if self.transpose != 0 { return format!("{:+}", self.transpose); }
+        if let Some(ch) = self.channel { return format!("ch {}", ch + 1); }
+        if (self.key_lo, self.key_hi) != (0, 127) { return "keys".into(); }
+        if (self.vel_lo, self.vel_hi) != (0, 127) { return "vel".into(); }
+        "ALL".into()
+    }
     fn to_command(&self, source: SourceId, dest: u32) -> Command {
         Command::MatrixRule {
             source, dest,
@@ -889,6 +899,8 @@ struct DemoApp {
 
     // Cached text.
     wordmark_g: Option<Arc<theme::TrackedLabel>>,
+    /// The wordmark at top-bar size (the brand moved into the top bar).
+    topbar_word_g: Option<Arc<theme::TrackedLabel>>,
     state_play_g: Option<Arc<theme::TrackedLabel>>,
     /// Captions for the face activity displays (Surge output bars, Delay
     /// echo dots) — unlabeled they read as broken meters (vision review).
@@ -950,6 +962,8 @@ struct DemoApp {
     rule_editor: Option<(usize, MatrixRow)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
+    /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
+    last_mix_rev: u64,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
@@ -1081,6 +1095,7 @@ impl DemoApp {
             toolbar_top: 0.0,
             text_alpha: 1.0,
             wordmark_g: None,
+            topbar_word_g: None,
             state_play_g: None,
             caption_output_g: None,
             caption_echoes_g: None,
@@ -1111,6 +1126,7 @@ impl DemoApp {
             rule_edits: std::collections::HashMap::new(),
             rule_editor: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
+            last_mix_rev: 0,
             confirm_delete_rig: None,
             load_as_rigs: None,
             had_kb_focus: true,
@@ -1495,6 +1511,9 @@ impl DemoApp {
         // state line in tracked micro-caps.
         self.wordmark_g = Some(Arc::new(ctx.fonts_mut(|f| {
             theme::layout_tracked(f, "kabelsalat", theme::medium_font(30.0), -0.03)
+        })));
+        self.topbar_word_g = Some(Arc::new(ctx.fonts_mut(|f| {
+            theme::layout_tracked(f, "kabelsalat", theme::medium_font(20.0), -0.03)
         })));
         self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
         self.caption_output_g = Some(tracked("OUTPUT", 10.0, 0.14));
@@ -1912,6 +1931,12 @@ impl DemoApp {
     fn sync_from_engine(&mut self) {
         let Some(pub_) = &self.graph_pub else { return };
         let Ok(g) = pub_.lock() else { return };
+        // Mixer mirror: adopt remote (MCP/CLI/agent) SetRigMix changes —
+        // the Mixer showed stale vol/pan after a bridge edit (rule 25 class).
+        if g.mix_rev != self.last_mix_rev {
+            self.last_mix_rev = g.mix_rev;
+            self.rig_mix = g.mix;
+        }
         if g.rev == self.last_graph_rev { return; }
         self.last_graph_rev = g.rev;
         // Mirror the engine's rules (covers remote MCP rule edits too).
@@ -1978,8 +2003,10 @@ impl DemoApp {
             && serde_json::to_value(&mirror.edges).ok() == serde_json::to_value(&g.graph.edges).ok();
         if same { return; }
         let adopted = g.graph.clone();
+        let mix = g.mix;
         drop(g);
         self.build_rack(&adopted, &[]);
+        self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
         self.rig_sources = [(true, true); VOICE_POOL];
         self.rig_device = [None; VOICE_POOL];
@@ -2853,7 +2880,7 @@ impl DemoApp {
     fn matrix_rows(&self) -> Vec<(MatrixRow, String, f32)> {
         let mut rows: Vec<(MatrixRow, String, f32)> = vec![
             (MatrixRow::Keys, "Keyboard".into(), self.keyboard_led()),
-            (MatrixRow::HwAll, "Hardware: all".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
+            (MatrixRow::HwAll, "All hardware".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
         ];
         for (d, name) in self.hw_devices.iter().enumerate() {
             rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
@@ -2880,8 +2907,8 @@ impl DemoApp {
         let no_wrap = |ui: &mut egui::Ui, text: egui::RichText| {
             ui.add(egui::Label::new(text).wrap_mode(egui::TextWrapMode::Extend));
         };
-        egui::Grid::new("midi_matrix_grid").num_columns(sinks.len() + 1).spacing([14.0, 6.0])
-            .min_col_width(90.0).show(ui, |ui| {
+        egui::Grid::new("midi_matrix_grid").num_columns(sinks.len() + 1).spacing([20.0, 10.0])
+            .min_col_width(120.0).show(ui, |ui| {
             // Header: sink names + rig tags + cable state.
             theme::section_label(ui, "Source");
             for &s in &sinks {
@@ -2892,13 +2919,13 @@ impl DemoApp {
                     // Multi-rig: "2 · Surge" like the RIG INPUTS labels — two
                     // columns both headed "Surge" were indistinguishable.
                     let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
-                    no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(13.0)).color(theme::INK));
+                    no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
                     // Single-graph mode: all nodes share rig 0 — don't label
                     // every column "rig A" (user report 2026-11-15).
                     // Same rig naming as the RIGS strip, same "MIDI" casing as everywhere.
                     let rig_txt = if self.rig_count() > 1 { format!("{} · ", self.rig_name(u.rig as usize)) } else { String::new() };
                     no_wrap(ui, egui::RichText::new(format!("{rig_txt}MIDI {}", if gate { "in ✓" } else { "unplugged" }))
-                        .size(10.0).color(if gate { theme::LIVE_TEAL } else { theme::INK_2 }));
+                        .size(11.5).color(if gate { theme::LIVE_TEAL } else { theme::INK_2 }));
                 });
             }
             ui.end_row();
@@ -2909,7 +2936,7 @@ impl DemoApp {
                     ui.painter().circle_filled(r.center(), 3.0,
                         theme::alpha(theme::LIVE_TEAL, 0.25 + 0.75 * led.clamp(0.0, 1.0)));
                     ui.add_space(4.0);
-                    no_wrap(ui, egui::RichText::new(label).size(12.0).color(theme::INK));
+                    no_wrap(ui, egui::RichText::new(label).size(14.0).color(theme::INK));
                 });
                 for &s in &sinks {
                     let u = &self.units[s];
@@ -2923,19 +2950,25 @@ impl DemoApp {
                     } else {
                         gate // LV2: the cable is the route (all sources)
                     };
-                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 22.0), egui::Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
+                    let node = self.units[s].node_id;
+                    let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
+                    let shaped = edit.filter(|e| !e.is_default());
                     if on {
+                        // Routed: teal fill + an in-cell code — "ALL" (every
+                        // note passes) or the shaped rule's change ("+12",
+                        // "ch 2", "keys", "vel"); explicit colors (rule 1).
                         p.rect_filled(cell, 2.0, theme::LIVE_TEAL);
+                        let code = shaped.map_or_else(|| "ALL".to_string(), |e| e.cell_code());
+                        p.text(cell.center(), egui::Align2::CENTER_CENTER, code, theme::medium_font(12.5), theme::DARK_PANEL);
                     } else {
                         p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                     }
-                    // Non-default rule: tomato corner dot + summary.
-                    let node = self.units[s].node_id;
-                    let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
-                    let resp = if let Some(e) = edit.filter(|e| !e.is_default()) {
-                        p.circle_filled(Pos2::new(cell.right() - 2.0, cell.top() + 2.0), 2.0, theme::ACCENT);
+                    // Shaped rule: the in-cell code says so (no extra accent
+                        // dot — tomato stays CTA/selection-only); hover = summary.
+                    let resp = if let Some(e) = shaped {
                         resp.on_hover_text(format!("rule: {}\nright-click to edit", e.summary()))
                     } else if row.source().is_some() {
                         resp.on_hover_text("click: route on/off · right-click: edit rule")
@@ -2955,7 +2988,9 @@ impl DemoApp {
             }
         });
         ui.add_space(6.0);
-        ui.label(egui::RichText::new(self.split_footer()).size(11.0).color(theme::INK_2));
+        ui.label(egui::RichText::new("ALL = every note passes · +12 / ch 2 / keys / vel / off = a shaped rule (right-click a cell) · empty = not routed")
+            .size(12.5).color(theme::INK_2));
+        ui.label(egui::RichText::new(self.split_footer()).size(12.5).color(theme::INK_2));
         if !self.hw_devices.is_empty() {
             ui.label(egui::RichText::new("Hardware rows are a radio group per rig: one device, all devices, or off.")
                 .size(11.0).color(theme::INK_2));
@@ -3305,7 +3340,6 @@ impl DemoApp {
     /// AUM-style per-rig input selection: which sources feed each rig.
     /// Hurricane top strip (§4.14): paper, plain-text toggles, hairline nav.
     fn rig_inputs_panel(&mut self, root: &mut egui::Ui) {
-        let rigs = self.clap_rigs();
         egui::Panel::top("rig_inputs")
             .default_size(46.0)
             .resizable(false)
@@ -3317,59 +3351,19 @@ impl DemoApp {
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    theme::section_label(ui, "Rig inputs");
-                    ui.add_space(10.0);
-                    for (rig, node) in rigs {
-                        // Each chip pair belongs to ONE synth voice: label it by
-                        // the synth's own name, prefixed by its rig number when
-                        // several rigs exist (2026-11-15: slot letters read
-                        // "Rig C" with only two rigs loaded).
-                        let unit = self.units.iter().find(|u| u.node_id == node);
-                        let name = unit.map_or_else(|| format!("Synth {}", rig + 1), |u| sentence_case(&u.name));
-                        let label = match unit.map(|u| u.rig as usize) {
-                            Some(r) if self.rig_count() > 1 => format!("{} · {name}", r + 1),
-                            _ => name,
-                        };
-                        ui.label(egui::RichText::new(label).size(13.0).strong().color(theme::INK));
-                        ui.add_space(4.0);
-                        // Two chips: K = the computer keyboard (on-screen +
-                        // laptop typing, one source), H = hardware MIDI.
-                        let (k, h) = self.rig_sources[rig];
-                        for (name, tip, on, idx) in [
-                            ("K", "Keyboard: on-screen keys + laptop typing", k, 0usize),
-                            ("H", "Hardware MIDI devices", h, 1),
-                        ] {
-                            if theme::chip_button(ui, name, on).on_hover_text(tip).clicked() {
-                                self.toggle_rig_source(rig, node, idx);
-                            }
-                            ui.add_space(6.0);
-                        }
-                        // Per-rig hardware device selector (AUM: a keyboard per rig).
-                        if !self.hw_devices.is_empty() {
-                            let cur = self.rig_device[rig];
-                            let label = match cur {
-                                None => "HW: All".to_string(),
-                                Some(d) => format!("HW: {}", self.hw_devices.get(d as usize).map(|s| s.as_str()).unwrap_or("?")),
-                            };
-                            let resp = theme::chip_button(ui, &label, false)
-                                .on_hover_text("cycle which hardware device feeds this rig");
-                            if resp.clicked() {
-                                let n = self.hw_devices.len() as u32;
-                                let next = match cur {
-                                    None => Some(0),
-                                    Some(d) => if d + 1 >= n { None } else { Some(d + 1) },
-                                };
-                                self.rig_device[rig] = next;
-                                if let Some(bus) = &self.bus {
-                                    let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: next });
-                                }
-                            }
-                            ui.add_space(6.0);
-                        }
-                        // Editor is opened inline by double-clicking the synth
-                        // unit in the rack (task-26) — no per-rig button here.
-                        ui.add_space(4.0);
+                    // Brand in the top bar (user 2026-11-15: the RIG INPUTS
+                    // chips are not needed here — the logo goes in their place,
+                    // without the play button). Per-synth Keyboard/Hardware
+                    // routing lives in the MIDI matrix (same toggles).
+                    ui.add_space(4.0);
+                    let (mark, _) = ui.allocate_exact_size(egui::vec2(20.0, 22.0), egui::Sense::hover());
+                    theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
+                    ui.add_space(6.0);
+                    if let Some(g) = self.topbar_word_g.clone() {
+                        let (r, _) = ui.allocate_exact_size(g.size, egui::Sense::hover());
+                        theme::paint_tracked(ui.painter(), r.min, &g, theme::INK);
                     }
+                    ui.add_space(14.0);
                     ui.add_space(6.0);
                     if !self.editor_open && !self.editor_status.is_empty() {
                         ui.label(egui::RichText::new(&self.editor_status).size(12.0).color(theme::ACCENT_DEEP));
@@ -4515,17 +4509,33 @@ impl DemoApp {
         let r = self.unit_rects[k];
         let avail = r.width() - 40.0;
         if avail < 96.0 { return 0.0; } // too narrow: hide the keyboard
-        (avail / 8.0).clamp(12.0, 30.0)
+        // Up to 44px: the playable octave scales with the face instead of
+        // sitting small in a large Keys unit (vision review).
+        (avail / 8.0).clamp(12.0, 44.0)
+    }
+
+    /// White-key height: proportional to the key width, bounded by the face.
+    fn key_h(&self) -> f32 {
+        let r = self.unit_rects[self.keys_idx()];
+        (self.key_w() * 2.6).min((r.height() - 210.0).max(60.0)).clamp(60.0, 130.0)
     }
 
     fn key_rect(&self, white_idx: usize) -> Rect {
         let r = self.unit_rects[self.keys_idx()];
         let kw = self.key_w();
+        let kh = self.key_h();
         let x0 = r.center().x - kw * 4.0;
         Rect::from_min_size(
-            Pos2::new(x0 + white_idx as f32 * kw, r.center().y - 30.0),
-            Vec2::new(kw - 1.0, 60.0),
+            Pos2::new(x0 + white_idx as f32 * kw, r.center().y - kh / 2.0),
+            Vec2::new(kw - 1.0, kh),
         )
+    }
+
+    /// Black key `bi` (0..5), drawn over the white key it follows.
+    fn black_key_rect(&self, bi: usize) -> Rect {
+        let base = self.key_rect(BLACK_AFTER[bi]);
+        let bw = self.key_w() * 0.62;
+        Rect::from_min_size(Pos2::new(base.right() - bw / 2.0 + 0.5, base.top()), Vec2::new(bw, base.height() * 0.62))
     }
 
     fn hit_test(&self, s: Pos2) -> Hit {
@@ -4548,6 +4558,11 @@ impl DemoApp {
                 }
                 // Keys keyboard (only when the active rig has a Keys unit).
                 if self.keys_unit.map_or(false, |k| self.visible(k)) {
+                    // Black keys first: they lie ON the whites (before, a
+                    // click on a black key played the white under it).
+                    for bi in 0..5 {
+                        if self.black_key_rect(bi).contains(lp) { return Hit::Key(BLACK_SEMI[bi]); }
+                    }
                     for wi in 0..8 {
                         if self.key_rect(wi).contains(lp) { return Hit::Key(WHITE_SEMI[wi]); }
                     }
@@ -5098,7 +5113,7 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("MIDI matrix").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
                     ui.label(egui::RichText::new("any source → any rig · click: route · right-click: shape the rule · Tab / Esc: back to the rack")
                         .size(13.0).color(theme::INK_2));
@@ -5113,7 +5128,16 @@ impl DemoApp {
                         egui::ScrollArea::both()
                             .id_salt("matrix_scroll")
                             .auto_shrink([false, false])
-                            .show(ui, |ui| self.matrix_grid_ui(ui));
+                            .show(ui, |ui| {
+                                // Center the table in the sheet while it fits
+                                // (a top-left huddle left the sheet empty — review).
+                                let cols = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst).count();
+                                let table_w = 150.0 + cols as f32 * 140.0;
+                                ui.horizontal_top(|ui| {
+                                    ui.add_space(((grid_w - table_w) / 2.0).max(0.0));
+                                    ui.vertical(|ui| { ui.add_space(12.0); self.matrix_grid_ui(ui); });
+                                });
+                            });
                     });
                     if editor_w > 0.0 {
                         ui.add_space(12.0);
@@ -5195,8 +5219,15 @@ impl DemoApp {
                 ui.horizontal_top(|ui| {
                     let scroll_w = ui.available_width().max(200.0);
                     ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        // Center the strips in the sheet while they fit (a left-
+                        // huddled mixer left most of the sheet empty — review).
+                        let gap = ui.spacing().item_spacing.x;
+                        let strips: usize = (0..n).map(|r| self.mixer_sources(r as u8).len() + 1).sum();
+                        let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + 96.0 + 2.0 * gap;
+                        let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
+                                ui.add_space(pad);
                                 for rig in 0..n {
                                     if rig > 0 {
                                         let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
@@ -5204,9 +5235,20 @@ impl DemoApp {
                                     }
                                     ui.vertical(|ui| {
                                         let name = self.rig_name(rig);
-                                        let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), rig == self.active_rig && n > 1)
-                                            .on_hover_text("show this rig in the rack view");
-                                        if chip.clicked() { switch = Some(rig); }
+                                        // A group HEADING, not a chip: a filled chip read as a
+                                        // filter/tab while every rig is shown (vision review).
+                                        // The rig in the rack view gets an "IN VIEW" tag.
+                                        ui.horizontal(|ui| {
+                                            let head = ui.add(egui::Label::new(egui::RichText::new(format!("{} · {}", rig + 1, name))
+                                                .font(theme::medium_font(14.0)).color(theme::INK)).sense(egui::Sense::click()))
+                                                .on_hover_text("show this rig in the rack view");
+                                            if head.hovered() { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                            if head.clicked() { switch = Some(rig); }
+                                            if rig == self.active_rig && n > 1 {
+                                                ui.add_space(6.0);
+                                                theme::tracked_label(ui, "SHOWN IN RACK", 9.0, 0.14, theme::LIVE_TEAL);
+                                            }
+                                        });
                                         ui.add_space(8.0);
                                         ui.horizontal_top(|ui| {
                                             for (unit, knob) in self.mixer_sources(rig as u8) {
@@ -5228,7 +5270,7 @@ impl DemoApp {
                                             let mut v = Some(m.vol);
                                             // One column: fader, then PAN and M/S directly under it.
                                             let mut changed = false;
-                                            ui.allocate_ui_with_layout(egui::vec2(92.0, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                            ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                                                 let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
                                                 self.mixer_fader_rects.push(fr);
                                                 changed = v != Some(m.vol);
@@ -5238,7 +5280,9 @@ impl DemoApp {
                                                     ui.add_space(8.0);
                                                     theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
                                                     let mut p = m.pan;
-                                                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02).fixed_decimals(2)));
+                                                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
+                                                        .custom_formatter(|v, _| pan_text(v as f32))
+                                                        .custom_parser(parse_pan)));
                                                     if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
                                                 });
                                                 ui.add_space(4.0);
@@ -5272,11 +5316,21 @@ impl DemoApp {
                                     ui.set_width(96.0);
                                     theme::section_label(ui, "Master out");
                                     ui.add_space(4.0);
-                                    let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+                                    let rigs = if n == 1 { "1 rig · peak meter".to_string() } else { format!("sum of {n} rigs · peak meter") };
                                     ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
                                     ui.add_space(8.0);
-                                    let (mr, _) = ui.allocate_exact_size(egui::vec2(14.0, fader_h), egui::Sense::hover());
+                                    // Meter + dB scale: a labeled peak meter, not a missing fader.
+                                    let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
+                                    let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
                                     paint_meter(ui.painter(), mr, self.meter, self.meter_peak);
+                                    for db in [0.0f32, -6.0, -12.0, -24.0, -48.0] {
+                                        // Labels only (a tick hairline beside "0" read as "-0"),
+                                        // with a real minus sign.
+                                        let y = mr.bottom() - mr.height() * 10f32.powf(db / 20.0);
+                                        let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
+                                        ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
+                                            label, FontId::monospace(9.5), theme::CREAM_DIM);
+                                    }
                                     ui.add_space(6.0);
                                     // Meter-only strip: say so with a live peak readout.
                                     let db = if self.meter_peak < 0.001 { "−∞ dB".to_string() } else { format!("{:.0} dB", 20.0 * self.meter_peak.log10()) };
@@ -5576,13 +5630,7 @@ impl DemoApp {
             painter.rect_stroke(xf.rect(kr), 2.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
         }
         for bi in 0..5 {
-            let after = BLACK_AFTER[bi];
-            let base = self.key_rect(after);
-            let bw = self.key_w() * 0.62;
-            let kr = Rect::from_min_size(
-                Pos2::new(base.right() - bw / 2.0 + 0.5, base.top()),
-                Vec2::new(bw, 38.0),
-            );
+            let kr = self.black_key_rect(bi);
             let lit = self.key_leds[BLACK_SEMI[bi]];
             let fill = if lit > 0.02 { theme::ACCENT } else { BLACK };
             painter.rect_filled(xf.rect(kr), 1.5, fill);
@@ -6025,27 +6073,18 @@ impl DemoApp {
         let thump = if self.playing { (1.0 - beat_phase).powi(3) } else { 0.0 };
         painter.circle_filled(Pos2::new(66.0, top + 44.0), 3.0 + 3.5 * thump, alpha(GREEN, 0.35 + 0.65 * thump));
 
-        // Display wordmark with a small, understated mono brand mark tight to
-        // its left (user 2026-11-15: "more dezent"): 16 px, sitting on the
-        // wordmark baseline across the x-height. The full-color crafted mark
-        // lives in assets/logo.svg, the window icon and the help card.
-        let word_x = 98.0;
-        if let Some(g) = &self.wordmark_g {
-            let base = g.chars.first()
-                .and_then(|(c, _)| c.rows.first().and_then(|r| r.glyphs.first().map(|gl| r.pos.y + gl.pos.y)))
-                .unwrap_or(g.size.y * 0.8);
-            theme::crossed_wires(painter, Pos2::new(word_x - 12.0, top + 18.0 + base - 8.0), 16.0,
-                theme::PAPER, theme::MarkStyle::Mono);
-            theme::paint_tracked(painter, Pos2::new(word_x, top + 18.0), g, theme::INK);
-        }
+        // The wordmark + brand mark live in the top bar now (user
+        // 2026-11-15); the masthead keeps the play circle, beat dot and the
+        // state line beside them.
+        let word_x = 80.0;
         // State line: tracked micro-caps; a 6px teal dot precedes "playing".
         let state_g = if self.playing { &self.state_play_g } else { &self.state_pause_g };
         let state_x = if self.playing {
-            painter.circle_filled(Pos2::new(word_x + 3.0, top + 57.0), 3.0, GREEN);
+            painter.circle_filled(Pos2::new(word_x + 3.0, top + 44.0), 3.0, GREEN);
             word_x + 10.0
         } else { word_x };
         if let Some(g) = state_g {
-            theme::paint_tracked(painter, Pos2::new(state_x, top + 52.0), g, theme::INK_2);
+            theme::paint_tracked(painter, Pos2::new(state_x, top + 39.0), g, theme::INK_2);
         }
     }
 
@@ -6176,8 +6215,25 @@ fn typing(ctx: &egui::Context) -> bool {
 /// `value` None = a source without a level knob (meter only). Returns the
 /// fader rect. The fader is a custom drag widget: it never takes keyboard
 /// focus (rule 12), so rig shortcuts keep working after a drag.
+/// Pan readout: "C" at center, else the side and amount ("L 0.30").
+fn pan_text(v: f32) -> String {
+    if v.abs() < 0.005 { "C".into() } else if v < 0.0 { format!("L {:.2}", -v) } else { format!("R {:.2}", v) }
+}
+
+/// Inverse of [`pan_text`] (also accepts plain numbers).
+fn parse_pan(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("c") { return Some(0.0); }
+    if let Some(r) = t.strip_prefix(['L', 'l']) { return r.trim().parse::<f64>().ok().map(|v| -v.abs()); }
+    if let Some(r) = t.strip_prefix(['R', 'r']) { return r.trim().parse::<f64>().ok().map(f64::abs); }
+    t.parse().ok()
+}
+
+/// Mixer channel-strip width (sources and rig buses share it).
+const STRIP_W: f32 = 116.0;
+
 fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>, level: f32, fader_h: f32) -> Rect {
-    let w = 92.0;
+    let w = STRIP_W;
     let mut fader_rect = Rect::NOTHING;
     ui.allocate_ui_with_layout(egui::vec2(w, fader_h + 90.0), egui::Layout::top_down(egui::Align::Center), |ui| {
         ui.set_width(w);
@@ -6631,7 +6687,7 @@ fn build_audio() -> anyhow::Result<(Vec<ClapVoiceMain>, Vec<VoiceController>, cp
     engine.set_rig_snapshot(rig_snapshot.clone());
     // Graph publication (MCP→UI live sync): the engine publishes the graph on
     // structural changes; the UI adopts it when it diverges from its mirror.
-    let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch(), rules: Vec::new() }));
+    let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch(), rules: Vec::new(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
@@ -7077,7 +7133,7 @@ mod matrix_ui_tests {
     #[test]
     fn sync_adopts_remote_graph_and_skips_converged() {
         let mut app = DemoApp::new_with_sink(None);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 1, graph: app.base_graph.clone(), rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 1, graph: app.base_graph.clone(), rules: Vec::new(), ..Default::default() }));
         app.graph_pub = Some(pub_.clone());
         // Engine graph == UI mirror → no rebuild (UI-originated edits converge).
         let units_before = app.units.len();
@@ -7109,7 +7165,7 @@ mod matrix_ui_tests {
         remote_rule.transpose = -12;
         remote_rule.key_range = (0, 59);
         let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub {
-            rev: 1, graph: app.base_graph.clone(), rules: vec![remote_rule],
+            rev: 1, graph: app.base_graph.clone(), rules: vec![remote_rule], ..Default::default()
         }));
         app.graph_pub = Some(pub_);
         app.sync_from_engine();
@@ -7211,28 +7267,29 @@ mod matrix_ui_tests {
     }
 
     #[test]
-    fn rig_chips_are_k_and_h_and_send_the_pair() {
+    fn top_bar_shows_the_brand_and_the_matrix_owns_rig_sources() {
         let mut app = demo_app();
         let (bus, mut drain) = crate::control::command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         let ctx = egui::Context::default();
+        panel_frame(&mut app, &ctx, vec![]); // fonts ready
+        app.ensure_galleys(&ctx);            // as frame_ui does
         let texts = panel_frame(&mut app, &ctx, vec![]);
         let count = |t: &str| texts.iter().filter(|(s, _)| s == t).count();
-        // Two chips per rig (2 rigs): K and H — no laptop chip anywhere.
-        assert_eq!(count("K"), 2, "{texts:?}");
-        assert_eq!(count("H"), 2);
-        assert!(texts.iter().all(|(s, _)| !s.contains("Laptop") && !s.contains("laptop")), "{texts:?}");
-        // The matrix shows ONE Keyboard row.
+        // User 2026-11-15: no RIG INPUTS chips in the top bar — the brand sits there.
+        assert_eq!(count("K") + count("H"), 0, "no K/H chips: {texts:?}");
+        assert!(texts.iter().any(|(s, _)| s == "k"), "wordmark painted (tracked per-char): {texts:?}");
+        assert!(texts.iter().all(|(s, _)| !s.contains("Laptop") && !s.contains("laptop")));
+        // The matrix keeps ONE Keyboard row; its rig-A cell is the old K chip.
         assert_eq!(count("Keyboard"), 1);
-        // Click rig A's K chip: the keyboard flips off and the PAIR is sent.
-        let k = texts.iter().find(|(s, _)| s == "K").unwrap().1.center();
-        let btn = |pressed| egui::Event::PointerButton { pos: k, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(k), btn(true)]);
+        let cell = texts.iter().find(|(s, _)| s == "ALL").expect("rig A keyboard cell").1.center();
+        let btn = |pressed| egui::Event::PointerButton { pos: cell, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(cell), btn(true)]);
         panel_frame(&mut app, &ctx, vec![btn(false)]);
-        assert_eq!(app.rig_sources[0], (false, true));
+        assert_eq!(app.rig_sources[0], (false, true), "keyboard off for rig A");
         let mut sent = Vec::new();
         while let Some(c) = drain.pop() { sent.push(c); }
-        assert!(matches!(sent.as_slice(), [Command::SetRigSource { keyboard: false, hardware: true, .. }]), "{sent:?}");
+        assert!(sent.iter().any(|c| matches!(c, Command::SetRigSource { keyboard: false, hardware: true, .. })), "{sent:?}");
     }
 
     #[test]
@@ -7350,7 +7407,7 @@ mod cable_replug_tests {
         // The engine side: a real GraphEngine fed what the UI sends.
         let (mut ebus, edrain) = command_bus();
         let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new(), ..Default::default() }));
         engine.set_graph_pub(pub_.clone());
 
         let (old, target, tport, from, to) = pick_replug(&app);
@@ -7571,7 +7628,7 @@ mod rig_switch_tests {
         app.bus = Some(Arc::new(Mutex::new(tx)));
         let (mut ebus, edrain) = crate::control::command_bus();
         let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new(), ..Default::default() }));
         engine.set_graph_pub(pub_.clone());
         engine.set_rig_snapshot(app.rig_snapshot.clone());
         app.graph_pub = Some(pub_);
@@ -7635,28 +7692,6 @@ mod rig_switch_tests {
     }
 
     #[test]
-    fn rig_input_labels_name_the_synth_and_its_rig() {
-        let mut app = DemoApp::new_with_sink(None);
-        let ctx = egui::Context::default();
-        app.edit_rigs(None); // rig 2 gets the third synth
-        let mut texts = Vec::new();
-        for _ in 0..2 {
-            let mut raw = egui::RawInput::default();
-            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
-            let out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-            texts = out.shapes.iter().filter_map(|s| match &s.shape {
-                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
-                _ => None,
-            }).collect();
-            let mut out = out; out.textures_delta.clear();
-        }
-        for want in ["1 · Surge A", "1 · Surge B", "2 · Surge"] {
-            assert!(texts.iter().any(|t| t == want), "rig inputs label {want:?} in {texts:?}");
-        }
-        assert!(!texts.iter().any(|t| t == "Rig C"), "no slot letters posing as rigs");
-    }
-
-    #[test]
     fn silent_meters_light_nothing() {
         assert_eq!(lit_segments(0.0, 14), 0);
         assert_eq!(lit_segments(1e-9, 14), 0, "a decaying tail is silence");
@@ -7714,6 +7749,70 @@ mod rig_switch_tests {
             assert!(!vis.is_empty(), "rig {rig} has cables");
             for c in vis { assert!(finite(c), "rig {rig} cable {} curve {:?}", c.id, c.curve); }
         }
+    }
+
+    #[test]
+    fn pan_reads_as_a_side_and_round_trips() {
+        assert_eq!(pan_text(0.0), "C");
+        assert_eq!(pan_text(-0.3), "L 0.30");
+        assert_eq!(pan_text(1.0), "R 1.00");
+        for v in [-1.0f32, -0.3, 0.0, 0.42, 1.0] {
+            assert!((parse_pan(&pan_text(v)).unwrap() as f32 - v).abs() < 0.006, "{v}");
+        }
+        assert_eq!(parse_pan("0.5"), Some(0.5));
+    }
+
+    #[test]
+    fn matrix_cells_name_their_rule() {
+        let base = RuleEdit::default();
+        assert_eq!(base.cell_code(), "ALL");
+        assert_eq!(RuleEdit { transpose: 12, ..base }.cell_code(), "+12");
+        assert_eq!(RuleEdit { transpose: -5, ..base }.cell_code(), "-5");
+        assert_eq!(RuleEdit { channel: Some(1), ..base }.cell_code(), "ch 2");
+        assert_eq!(RuleEdit { key_lo: 0, key_hi: 59, ..base }.cell_code(), "keys");
+        assert_eq!(RuleEdit { vel_lo: 40, ..base }.cell_code(), "vel");
+        assert_eq!(RuleEdit { enabled: false, transpose: 12, ..base }.cell_code(), "off", "a muted rule says so first");
+    }
+
+    #[test]
+    fn remote_mix_changes_reach_the_mixer() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        app.graph_pub = Some(pub_.clone());
+        // A remote client (MCP/CLI) sets rig B's mix — the UI never sent it.
+        ebus.send(Command::SetRigMix { rig: 1, vol: Some(0.8), pan: Some(-0.3), mute: Some(true), solo: None });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        app.sync_from_engine();
+        let m = app.rig_mix[1];
+        assert!((m.vol - 0.8).abs() < 1e-6 && (m.pan + 0.3).abs() < 1e-6 && m.mute, "mixer mirrors the engine: {m:?}");
+        assert!((app.rig_mix[0].vol - 1.0).abs() < 1e-6, "rig A untouched");
+        // A busy publication (UI holding the lock) is retried, not lost.
+        let guard = pub_.lock().unwrap();
+        ebus.send(Command::SetRigMix { rig: 0, vol: Some(0.5), pan: None, mute: None, solo: None });
+        engine.render(&mut buf, 2);
+        drop(guard);
+        engine.render(&mut buf, 2);
+        app.sync_from_engine();
+        assert!((app.rig_mix[0].vol - 0.5).abs() < 1e-6, "retried after the lock was free");
+    }
+
+    #[test]
+    fn black_keys_are_playable_and_the_octave_scales() {
+        let (app, _ctx) = two_rigs();
+        assert!(app.key_w() > 30.0, "keys grow with the face: {}", app.key_w());
+        for bi in 0..5 {
+            let c = app.black_key_rect(bi).center();
+            assert!(matches!(app.hit_test(app.xf.p(c.to_vec2())), Hit::Key(s) if s == BLACK_SEMI[bi]),
+                "black key {bi} hits its own semitone");
+        }
+        let low = app.key_rect(0);
+        let below_black = Pos2::new(low.right() - 2.0, low.bottom() - 4.0);
+        assert!(matches!(app.hit_test(app.xf.p(below_black.to_vec2())), Hit::Key(0)), "white below the black stays white");
     }
 
     #[test]
@@ -8027,7 +8126,7 @@ mod transport_tests {
         app.bus = Some(Arc::new(Mutex::new(tx)));
         let (mut ebus, edrain) = command_bus();
         let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new(), ..Default::default() }));
         engine.set_graph_pub(pub_.clone());
         app.graph_pub = Some(pub_.clone());
         // Forward what the UI sent to the engine and render one block;
@@ -8317,7 +8416,7 @@ mod audio_viz_tests {
         // Agent/MCP AddNode → engine publishes → UI adopts: no fade replay.
         let mut remote = app.base_graph.clone();
         remote.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 5, graph: remote, rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 5, graph: remote, rules: Vec::new(), ..Default::default() }));
         let before = app.units.len();
         app.graph_pub = Some(pub_);
         app.sync_from_engine();
@@ -8449,7 +8548,7 @@ mod split_bpm_tests {
         app.bus = Some(Arc::new(Mutex::new(tx)));
         let (mut ebus, edrain) = command_bus();
         let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
-        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new() }));
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::default(), rules: Vec::new(), ..Default::default() }));
         engine.set_graph_pub(pub_.clone());
         app.graph_pub = Some(pub_.clone());
         let mut pump = |drain: &mut crate::control::CommandDrain| {

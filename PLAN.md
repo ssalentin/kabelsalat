@@ -2,14 +2,14 @@
 
 **An AUM-style live plugin host for Linux, in Rust — where the cables are the show.**
 
-Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & per-rig mixer next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 123 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading, (2) per-rig mixer, (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **All work tracking lives in this file (§13 roadmap) — no GitHub tickets.**
+Status: **core app complete + Hurricane redesign (polished) + multi-rig (backend & UI + per-rig mixer) + hot-wire MIDI matrix with live rule editing + MCP→UI sync landed; dynamic CLAP loading & backing tracks next.** P0–P3 done. Working: data-driven rack (Tab flip, animated cables), 8-node DSP, per-rig MIDI routing + splits + per-device binding, sessions, **native egui plugin param editor (NO X11 — double-click a unit)**, system-audio capture, file player, **metronome as a normal rack node**, visual transport, **Ctrl+drag rack rearrange**, master stereo+MONO inputs, live audio/MIDI latency reporting, MCP server (headless + live-app attach) + DeepSeek assistant, CLAP (Surge) + LV2 effect/instrument hosting, plugin browser, starter templates, **multi-rig overview strip with vol/pan/mute/solo + 1–9/←→ view switching (F4 two-rig demo)**, **hot-wire MIDI matrix (F11): any source → any rig, live, with per-cell rule shaping (right-click)**, **MCP/CLI remote edits (graph + rules) sync into the UI live**. **Hurricane visual redesign landed & polished** (src/theme.rs: warm paper + one near-black hero rack panel, flat fills, hairlines, tomato accent — docs/design-reference-analysis.md; DeepSeek-vision verdict 8.5/10). 125 unit tests + many CLI self-tests pass. Next: (1) dynamic CLAP loading, (2) backing tracks (GitHub #1), (3) backlog (§13). · Name: `kabelsalat` · Location: `~/Work/kabelsalat` · See **§0.1 Session handoff** below. **Work tracking: PLAN.md §13 roadmap; GitHub issues only when explicitly requested (backing tracks = #1).**
 
 ## 0.1 Session handoff (read me first in a new session)
 
 **Repo:** `~/Work/kabelsalat` → `github.com/ssalentin/kabelsalat` (branch `main`, all pushed).
 Rust, single binary. Build: `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`. Run the app:
 `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
-Tests: `cargo test` (123). CLI self-tests: `session-test`, `capture-test`, `player-test`,
+Tests: `cargo test` (125). CLI self-tests: `session-test`, `capture-test`, `player-test`,
 `metro-test`, `mono-master-test`, `multi-rig-test`, `multi-rig-load-test`, `add-node-test`,
 `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`, `lv2-instrument-test`,
 `lv2-instrument-engine-test`, `audio-test`, `host-test`. MCP: `kabelsalat mcp` (headless) or
@@ -97,9 +97,8 @@ Tests: `cargo test` (123). CLI self-tests: `session-test`, `capture-test`, `play
 **Next builds (in order):**
 1. **Dynamic non-Surge CLAP loading** — arbitrary CLAP instruments beyond the two
    startup Surge voices (main-thread instantiation + voice-delivery side channel).
-2. **Per-rig volume/pan/mute/solo** on the overview strip (AUM mixer feel).
-3. **Backlog** — rule snapshot publication, MIDI-learn/CC maps, sends/aux,
-   recording, tap tempo (§13).
+2. **Backing tracks** (GitHub #1) — deck UI + YouTube/URL sources.
+3. **Backlog** — MIDI-learn/CC maps, sends/aux, recording, tap tempo (§13).
 
 **Hot-wire MIDI matrix — LANDED 2026-11-15.** F11 / top-strip "Matrix" opens the
 sources × instrument-rigs grid (Hurricane: paper sheet, hairline cells, teal = routed).
@@ -497,14 +496,20 @@ Everything queued lives here; update this section as work lands.
 
 1. **Dynamic non-Surge CLAP loading** — load arbitrary CLAP instruments (today the
    engine remaps its two startup Surge voices; other CLAP shows "coming soon").
-   Needs main-thread instantiation + a voice-delivery side channel.
-2. **Per-rig volume/pan/mute/solo** on the overview strip (AUM mixer feel).
-3. **Rule snapshot publication** — remote `set_matrix_rule` (MCP) edits the engine
-   but the UI's rule indicators mirror UI/assistant-originated edits only; publish
-   rules alongside GraphPub for full parity (same pattern as rig_snapshot).
+   Needs main-thread instantiation + a voice-delivery side channel. Dedicated round:
+   parameterize ClapVoice::new by plugin id, async voice delivery to the engine,
+   LoadGraph remap by plugin identity.
+2. **Backing tracks** (GitHub #1) — deck UI + YouTube/URL sources (see backlog).
 
 ### Recently landed
 
+- **Per-rig mixer + rule publication** (2026-11-15): overview strip now has
+  vol/pan/mute/solo per rig (`Command::SetRigMix`, constant-power pan with unity
+  center, solo mutes non-solo rigs, applied at each rig's MasterOut; resets on
+  loads). `rig-mix-test` self-test verifies mute/solo/vol/pan on real Surge voices.
+  GraphPub now carries the matrix rules and bumps on MatrixRule/SetSplit, so the
+  UI mirrors **remote** rule edits too (parity gap closed). MCP/assistant
+  `set_rig_mix` tools. 125 tests.
 - **Matrix rule editing** (2026-11-15): right-click any matrix cell → live rule
   editor (channel filter, transpose ±24, key/velocity ranges with note names,
   enable/mute, reset). `Command::MatrixRule` applies in place (creates missing
@@ -551,6 +556,12 @@ Everything queued lives here; update this section as work lands.
 
 ### Backlog (after the above)
 
+- **Backing tracks: local files, YouTube, URL sources + deck UI** — GitHub issue #1
+  (https://github.com/ssalentin/kabelsalat/issues/1). Engine player exists
+  (src/player.rs, assistant play_file only); needs a deck UI (portal file picker,
+  seek/loop/gain, drag-drop), yt-dlp-backed YouTube/URL audio (optional dependency,
+  ToS posture documented), and a wireable source node. RT discipline: workers +
+  lock-free rings, the existing player is the template.
 - **LV2 instrument audible playback** — routing is verified; confirm sound with a real
   MIDI synth (installed LV2 instruments are samplers/generators).
 - **MIDI matrix rules: CC maps + MIDI-learn** — cc_map whitelist/bindings exist in the

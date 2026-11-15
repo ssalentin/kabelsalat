@@ -62,6 +62,7 @@ fn main() -> anyhow::Result<()> {
         "add-node-test" => engine::add_node_test(),
         "mono-master-test" => engine::mono_master_test(),
         "multi-rig-test" => engine::multi_rig_test(),
+        "rig-mix-test" => engine::rig_mix_test(),
         "multi-rig-load-test" => engine::multi_rig_load_test(),
         other => {
             eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, lv2-instrument-test, lv2-instrument-engine-test");

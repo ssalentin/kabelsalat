@@ -219,6 +219,21 @@ struct SetMatrixRuleArgs {
     enabled: Option<bool>,
 }
 
+/// Arguments for `set_rig_mix`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetRigMixArgs {
+    /// Rig index (0-based, as in get_rigs).
+    rig: u8,
+    /// Volume 0..1 (omit to keep).
+    vol: Option<f32>,
+    /// Pan -1 (L) .. 1 (R) (omit to keep).
+    pan: Option<f32>,
+    /// Mute (omit to keep).
+    mute: Option<bool>,
+    /// Solo — mutes every non-solo rig (omit to keep).
+    solo: Option<bool>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -768,6 +783,16 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "source": args.source}))
+    }
+
+    /// Per-rig mixer (the overview strip's vol/pan/mute/solo).
+    #[tool(name = "set_rig_mix", description = "Per-rig mixer (Command::SetRigMix): rig index (0-based, see get_rigs), vol 0..1, pan -1..1, mute, solo. Omitted fields keep their value. Solo mutes every non-solo rig. Applied at the rig's master when summing to the output; resets on graph loads.")]
+    fn set_rig_mix(&self, Parameters(args): Parameters<SetRigMixArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::SetRigMix { rig: args.rig, vol: args.vol, pan: args.pan, mute: args.mute, solo: args.solo }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"rig": args.rig, "vol": args.vol, "pan": args.pan, "mute": args.mute, "solo": args.solo}))
     }
 
     /// Load several independent rigs at once.

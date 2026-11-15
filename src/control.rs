@@ -343,6 +343,17 @@ pub enum Command {
     /// Per-rig hardware device selection: None = any device, Some(id) = only
     /// that device (AUM: a different keyboard per rig).
     SetRigDevice { node: NodeId, device: Option<u32> },
+    /// Per-rig mixer (AUM overview strip): volume (0..1), pan (-1..1),
+    /// mute/solo. Applied at the rig's MasterOut when summing to the physical
+    /// output. Omitted fields keep their current value. Solo mutes every
+    /// non-solo rig; resets on graph loads.
+    SetRigMix {
+        rig: u8,
+        vol: Option<f32>,
+        pan: Option<f32>,
+        mute: Option<bool>,
+        solo: Option<bool>,
+    },
     /// Replace the whole graph (template load). The engine rebuilds DSP, remaps
     /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
     /// matrix. Rare structural op: allocates (bends RT discipline by design).

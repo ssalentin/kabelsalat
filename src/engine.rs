@@ -146,6 +146,19 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
         .collect()
 }
 
+/// Per-rig mixer state (AUM overview strip). Unity by default.
+#[derive(Clone, Copy, Debug)]
+pub struct RigMix {
+    pub vol: f32,
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+}
+
+impl RigMix {
+    pub const DEFAULT: Self = Self { vol: 1.0, pan: 0.0, mute: false, solo: false };
+}
+
 /// Shared graph publication for frontends (MCP→UI live sync, PLAN §13).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
@@ -156,6 +169,9 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
 pub struct GraphPub {
     pub rev: u64,
     pub graph: Graph,
+    /// Matrix rules at publication time — lets frontends mirror remote rule
+    /// edits (MCP set_matrix_rule) as well as graph changes.
+    pub rules: Vec<Rule>,
 }
 
 pub struct GraphEngine {
@@ -183,6 +199,9 @@ pub struct GraphEngine {
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
     rig_meta: Vec<RigMeta>,
     active_rig: usize,
+    // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
+    // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
+    rig_mix: [RigMix; 8],
     // Shared frontend snapshot (UI/MCP/bridge). Written ONLY on the rare
     // LoadRigs/LoadGraph structural ops at block boundaries — the per-block
     // render path never locks it. None until a frontend attaches a handle.
@@ -280,6 +299,7 @@ impl GraphEngine {
             route_out: Vec::with_capacity(64),
             rig_meta: Vec::new(),
             active_rig: 0,
+            rig_mix: [RigMix::DEFAULT; 8],
             rig_snapshot: None,
             graph_pub: None,
             system_capture: None,
@@ -350,6 +370,7 @@ impl GraphEngine {
             if let Ok(mut g) = p.lock() {
                 g.rev = g.rev.wrapping_add(1);
                 g.graph = self.graph.clone();
+                g.rules = self.matrix.rules.clone();
             }
         }
     }
@@ -522,6 +543,7 @@ impl GraphEngine {
                     .map(|n| n.id);
                 self.rig_meta.clear();
                 self.active_rig = 0;
+                self.rig_mix = [RigMix::DEFAULT; 8];
                 self.publish_rig_snapshot();
                 self.publish_graph();
             }
@@ -633,6 +655,13 @@ impl GraphEngine {
                     s.rig_device = device;
                 }
             }
+            Command::SetRigMix { rig, vol, pan, mute, solo } => {
+                let m = &mut self.rig_mix[(rig as usize).min(7)];
+                if let Some(v) = vol { m.vol = v.clamp(0.0, 1.0); }
+                if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
+                if let Some(b) = mute { m.mute = b; }
+                if let Some(b) = solo { m.solo = b; }
+            }
             Command::SetSplit { point } => {
                 // Rig A (node 1) takes the low zone, rig B (node 4) the high zone.
                 // In-place key-range edits: no allocation on the audio thread.
@@ -650,6 +679,7 @@ impl GraphEngine {
                         }
                     };
                 }
+                self.publish_graph();
             }
             Command::MatrixRule { source, dest, channel, transpose, key_lo, key_hi, vel_lo, vel_hi, enabled } => {
                 // Live per-cell rule edit (hot-wire matrix). In-place when the
@@ -682,6 +712,7 @@ impl GraphEngine {
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                     for n in 0..128u8 { s.plugin.note_off(n); }
                 }
+                self.publish_graph();
             }
             Command::SetSystemAudio { gain } => {
                 self.system_gain = gain.clamp(0.0, 1.0);
@@ -798,20 +829,35 @@ impl GraphEngine {
             }
         }
         if n_masters > 0 {
+            // Per-rig mix gains, once per block (rig_mix changes only via
+            // commands drained at block start). Constant-power pan, unity
+            // center: gl = sqrt(1-pan), gr = sqrt(1+pan).
+            let any_solo = self.rig_mix.iter().any(|m| m.solo);
+            let mut gains = [(1.0f32, 1.0f32); 8];
+            for mi in 0..n_masters {
+                let rig = self.graph.node(masters[mi]).map(|n| n.rig as usize).unwrap_or(0).min(7);
+                let m = self.rig_mix[rig];
+                let g = if m.mute || (any_solo && !m.solo) { 0.0 } else { m.vol };
+                gains[mi] = (g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt());
+            }
             for (i, frame) in data.chunks_mut(ch).enumerate() {
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
                 for mi in 0..n_masters {
                     let master = masters[mi];
+                    let (gl, gr) = gains[mi];
+                    if gl == 0.0 && gr == 0.0 { continue; } // muted: skip the work
+                    let mut ml = 0.0f32;
+                    let mut mr = 0.0f32;
                     for v in &self.voices {
                         if self.graph.has_route(v.node, master, PortKind::Audio) {
                             if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
                                 let m = v.scratch[i * 2]; // mono in: center to both
-                                l += m;
-                                r += m;
+                                ml += m;
+                                mr += m;
                             } else {
-                                l += v.scratch[i * 2];
-                                r += v.scratch[i * 2 + 1];
+                                ml += v.scratch[i * 2];
+                                mr += v.scratch[i * 2 + 1];
                             }
                         }
                     }
@@ -819,11 +865,11 @@ impl GraphEngine {
                         if self.graph.has_route(d.node, master, PortKind::Audio) {
                             if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
                                 let m = d.buf[i * 2];
-                                l += m;
-                                r += m;
+                                ml += m;
+                                mr += m;
                             } else {
-                                l += d.buf[i * 2];
-                                r += d.buf[i * 2 + 1];
+                                ml += d.buf[i * 2];
+                                mr += d.buf[i * 2 + 1];
                             }
                         }
                     }
@@ -831,14 +877,16 @@ impl GraphEngine {
                         if self.graph.has_route(slot.node, master, PortKind::Audio) {
                             if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
                                 let m = slot.buf[i * 2];
-                                l += m;
-                                r += m;
+                                ml += m;
+                                mr += m;
                             } else {
-                                l += slot.buf[i * 2];
-                                r += slot.buf[i * 2 + 1];
+                                ml += slot.buf[i * 2];
+                                mr += slot.buf[i * 2 + 1];
                             }
                         }
                     }
+                    l += ml * gl;
+                    r += mr * gr;
                 }
                 if sys {
                     l += self.system_buf[i * 2] * self.system_gain;
@@ -1059,12 +1107,34 @@ mod tests {
     }
 
     #[test]
+    fn matrix_rule_publishes_rules_for_frontends() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
+            rev: 0, graph: crate::control::Graph::default(), rules: Vec::new(),
+        }));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::MatrixRule {
+            source: SourceId::Keys, dest: 1,
+            channel: None, transpose: 7,
+            key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true,
+        });
+        engine.render(&mut buf, 2);
+        let p = pub_.lock().unwrap();
+        assert_eq!(p.rev, 1, "rule edit must bump the publication rev");
+        let r = p.rules.iter().find(|r| r.source == SourceId::Keys && r.dest == 1).unwrap();
+        assert_eq!(r.transpose, 7);
+    }
+
+    #[test]
     fn graph_pub_revs_on_structural_changes_only() {
         let (mut bus, drain) = command_bus();
         let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
         let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub {
             rev: 0,
             graph: crate::control::Graph::default(),
+            rules: Vec::new(),
         }));
         engine.set_graph_pub(pub_.clone());
         let mut buf = vec![0.0f32; 64 * 2];
@@ -1443,6 +1513,72 @@ pub fn multi_rig_test() -> anyhow::Result<()> {
     let one = measure(&mut engine, &mut buf);
     anyhow::ensure!(both > one * 1.2, "rigs not summing (both {both} vs one {one})");
     println!("multi-rig-test: OK — two rigs sum to output (both {both:.4} > one {one:.4})");
+    Ok(())
+}
+
+/// Per-rig mixer self-test: mute/solo/vol/pan applied at the rig masters.
+pub fn rig_mix_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (va, _ma) = ClapVoice::new(sr)?;
+    let (vb, _mb) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(32, 32);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: sb, port: 0 }, PortKind::Midi);
+    g.connect_with_id(4, PortRef { node: sb, port: 0 }, PortRef { node: mb, port: 0 }, PortKind::Audio);
+    // Tag rig B's nodes (merge_rigs does this in real multi-rig loads).
+    for n in &mut g.nodes {
+        if n.id == sb || n.id == mb { n.rig = 1; }
+    }
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(sa, va), (sb, vb)]);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let measure = |e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for _ in 0..30 {
+            e.render(buf, 2);
+            for f in buf.chunks(2) {
+                pl = pl.max(f[0].abs());
+                pr = pr.max(f[1].abs());
+            }
+        }
+        (pl, pr)
+    };
+    let (both_l, both_r) = measure(&mut engine, &mut buf);
+    anyhow::ensure!(both_l > 1e-3 && both_r > 1e-3, "two rigs produced no output");
+    // Mute rig B → level drops.
+    bus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: Some(true), solo: None });
+    let (muted_l, _) = measure(&mut engine, &mut buf);
+    anyhow::ensure!(both_l > muted_l * 1.2, "mute did not drop level (both {both_l} vs muted {muted_l})");
+    // Solo rig A ≈ mute rig B.
+    bus.send(Command::SetRigMix { rig: 1, vol: None, pan: None, mute: Some(false), solo: None });
+    bus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: None, solo: Some(true) });
+    let (solo_l, _) = measure(&mut engine, &mut buf);
+    anyhow::ensure!((solo_l - muted_l).abs() < both_l * 0.15, "solo != mute-other (solo {solo_l} vs muted {muted_l})");
+    bus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: None, solo: Some(false) });
+    // Pan rig A hard left: rig A leaves the right channel, rig B stays centered.
+    bus.send(Command::SetRigMix { rig: 0, vol: None, pan: Some(-1.0), mute: None, solo: None });
+    let (pan_l, pan_r) = measure(&mut engine, &mut buf);
+    anyhow::ensure!(pan_r < both_r * 0.95, "hard-left pan did not reduce right (both {both_r} vs pan {pan_r})");
+    anyhow::ensure!(pan_r > 1e-3, "hard-left pan of rig A killed rig B's right ({pan_r})");
+    anyhow::ensure!(pan_l > 1e-3, "hard-left pan killed left");
+    // Volume 0 on both rigs → silence.
+    bus.send(Command::SetRigMix { rig: 0, vol: Some(0.0), pan: Some(0.0), mute: None, solo: None });
+    bus.send(Command::SetRigMix { rig: 1, vol: Some(0.0), pan: None, mute: None, solo: None });
+    let (zero_l, zero_r) = measure(&mut engine, &mut buf);
+    anyhow::ensure!(zero_l < 1e-4 && zero_r < 1e-4, "vol 0 not silent ({zero_l}, {zero_r})");
+    println!("rig-mix-test: OK — mute/solo/vol/pan shape the rig sum (both {both_l:.4}, muted {muted_l:.4}, solo {solo_l:.4}, pan R {pan_r:.4})");
     Ok(())
 }
 

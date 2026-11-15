@@ -454,6 +454,7 @@ impl McpServer {
             "buffer_frames": bridge::BUFFER_FRAMES,
             "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,
             "xruns": bridge::XRUNS.load(Ordering::Relaxed),
+            "midi_latency_ms": bridge::MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
         }))
     }
 

@@ -37,6 +37,16 @@ use crate::control::{Command, CommandBus, Graph};
 pub const BUFFER_FRAMES: u32 = 512;
 /// Count of audio stream errors / xruns reported by cpal since startup.
 pub static XRUNS: AtomicU32 = AtomicU32::new(0);
+/// Rolling average of the MIDI input→processing delay in microseconds (the
+/// hardware-MIDI queue wait; add the audio buffer for total input→sound latency).
+pub static MIDI_LATENCY_US: AtomicU32 = AtomicU32::new(0);
+
+/// Update the MIDI-latency rolling average (called when hardware MIDI is drained).
+pub fn record_midi_latency(us: u32) {
+    let prev = MIDI_LATENCY_US.load(Ordering::Relaxed);
+    let next = if prev == 0 { us } else { (prev * 3 + us) / 4 };
+    MIDI_LATENCY_US.store(next, Ordering::Relaxed);
+}
 
 /// Where the bridge listens (and where clients connect).
 pub fn socket_path() -> PathBuf {
@@ -190,6 +200,7 @@ fn handle_line(
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
                     "xruns": XRUNS.load(Ordering::Relaxed),
+                    "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
                 }})
             }
             other => err_reply(format!(

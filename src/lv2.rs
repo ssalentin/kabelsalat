@@ -141,6 +141,30 @@ pub struct Lv2PluginInfo {
     pub uri: String,
     pub name: String,
     pub num_ports: u32,
+    pub is_instrument: bool,
+}
+
+/// Classify a plugin as an instrument (atom/MIDI input + audio output) by port
+/// classes — no instantiation required.
+unsafe fn classify_instrument(
+    plugin: *const LilvPlugin,
+    audio: *const LilvNode,
+    atom: *const LilvNode,
+    input: *const LilvNode,
+) -> bool {
+    let n = lilv_plugin_get_num_ports(plugin);
+    let (mut has_atom_in, mut has_audio_out) = (false, false);
+    for i in 0..n {
+        let port = lilv_plugin_get_port_by_index(plugin, i);
+        let is_in = lilv_port_is_a(plugin, port, input);
+        if lilv_port_is_a(plugin, port, atom) && is_in {
+            has_atom_in = true;
+        }
+        if lilv_port_is_a(plugin, port, audio) && !is_in {
+            has_audio_out = true;
+        }
+    }
+    has_atom_in && has_audio_out
 }
 
 /// Read a borrowed node (owned by the plugin, e.g. get_uri) — do NOT free.
@@ -174,6 +198,9 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
         }
         lilv_world_load_all(world);
         let plugins = lilv_world_get_all_plugins(world);
+        let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+        let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+        let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
         let mut out = Vec::new();
         if !plugins.is_null() {
             let mut iter = lilv_plugins_begin(plugins);
@@ -184,11 +211,15 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
                         uri: node_borrowed(lilv_plugin_get_uri(plugin)),
                         name: node_owned(lilv_plugin_get_name(plugin)),
                         num_ports: lilv_plugin_get_num_ports(plugin),
+                        is_instrument: classify_instrument(plugin, audio, atom, input),
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
             }
         }
+        lilv_node_free(audio);
+        lilv_node_free(atom);
+        lilv_node_free(input);
         lilv_world_free(world);
         out
     }

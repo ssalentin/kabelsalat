@@ -1489,7 +1489,8 @@ impl DemoApp {
                 }
                 s.push_str(&format!("LV2 plugins ({}):\n", lv2.len()));
                 for p in lv2.iter().take(30) {
-                    s.push_str(&format!("  {} — {}\n", p.name, p.uri));
+                    let kind = if p.is_instrument { " [instrument]" } else { "" };
+                    s.push_str(&format!("  {}{} — {}\n", p.name, kind, p.uri));
                 }
                 s
             }

@@ -637,7 +637,7 @@ impl McpServer {
         let lv2_json: Vec<_> = lv2
             .iter()
             .take(60)
-            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports}))
+            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports, "is_instrument": p.is_instrument}))
             .collect();
         ok_json(json!({"clap": clap_json, "lv2_count": lv2.len(), "lv2": lv2_json}))
     }

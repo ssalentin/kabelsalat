@@ -281,10 +281,40 @@ impl GraphEngine {
     fn apply(&mut self, cmd: Command) {
         match cmd {
             Command::AddNode { kind, name } => {
-                self.graph.add_node(kind, name);
+                let id = self.graph.add_node(kind.clone(), name);
+                let sr = self.sample_rate;
+                match &kind {
+                    NodeKind::Dsp(dk) => {
+                        self.dsp.push(DspSlot {
+                            node: id,
+                            kind: dk.clone(),
+                            proc: build_processor(dk, sr),
+                            buf: vec![0.0; 8192 * 2],
+                        });
+                    }
+                    NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sr, 8192) {
+                        Ok(plugin) => {
+                            let is_inst = plugin.is_instrument();
+                            self.lv2.push(Lv2Slot { node: id, plugin, buf: vec![0.0; 8192 * 2] });
+                            if is_inst {
+                                self.matrix.connect(SourceId::Keys, id);
+                                self.matrix.connect(SourceId::LaptopKeys, id);
+                                for dev in 0..MAX_HW_DEVICES {
+                                    self.matrix.connect(SourceId::Hardware(dev), id);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("lv2 node {id}: {e}"),
+                    },
+                    // CLAP voices are main-thread-only; added clap nodes join the
+                    // graph but sound via LoadGraph's voice remap, not here.
+                    _ => {}
+                }
             }
             Command::RemoveNode(id) => {
                 self.graph.remove_node(id);
+                self.dsp.retain(|s| s.node != id);
+                self.lv2.retain(|s| s.node != id);
             }
             Command::Connect { id, from, to, kind } => {
                 self.graph.connect_with_id(id, from, to, kind);
@@ -817,5 +847,42 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     let ev = ev.unwrap();
     anyhow::ensure!(ev[0] == 0x90 && ev[1] == 60, "wrong MIDI event reached instrument: {ev:?}");
     println!("lv2-instrument-engine-test: OK — note routed to LV2 instrument atom input (event {ev:?})");
+    Ok(())
+}
+
+/// Dynamic-patch test: a DSP node added via AddNode (not LoadGraph) must sound.
+pub fn add_node_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (voice, _main) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(surge, voice)]);
+
+    // Insert a dynamically added gain node: surge -> gain -> master.
+    let gain = keys.max(surge).max(master) + 1;
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN") });
+    bus.send(Command::SetParam { node: gain, param: 0, value: 1.0 });
+    bus.send(Command::Disconnect(2));
+    bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::Connect { id: 4, from: PortRef { node: gain, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut peak = 0.0f32;
+    for _ in 0..30 {
+        engine.render(&mut buf, 2);
+        peak = peak.max(buf.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    }
+    anyhow::ensure!(peak > 1e-3, "dynamically added DSP node did not sound (peak {peak})");
+    println!("add-node-test: OK — dynamically added DSP gain node sounds (peak {peak:.4})");
     Ok(())
 }

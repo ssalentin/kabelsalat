@@ -31,10 +31,15 @@ use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{
-    name_str, Command, CommandBus, DspKind, Graph, Node, NodeKind, PortKind as CPortKind, PortRef,
+    name_bytes, name_str, Command, CommandBus, DspKind, Graph, Lv2Uri, Node, NodeKind,
+    PortKind as CPortKind, PortRef,
 };
 use crate::engine::{GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
-use crate::host::{ClapVoice, ClapVoiceMain, EditorRect, EditorStatus, EmbeddedEditor};
+use crate::host::{
+    list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, EditorRect, EditorStatus,
+    EmbeddedEditor,
+};
+use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::SourceId;
 use crate::session::Template;
 
@@ -59,6 +64,10 @@ const TEXT: Color32 = Color32::from_rgb(0xec, 0xee, 0xf6);
 const SUBTEXT: Color32 = Color32::from_rgb(0x8f, 0x95, 0xad);
 const WHITE: Color32 = Color32::from_rgb(0xff, 0xff, 0xff);
 const BLACK: Color32 = Color32::from_rgb(0x00, 0x00, 0x00);
+
+/// The reference CLAP instrument (PLAN §1). The engine's two voices are Surge,
+/// so it is the only CLAP plugin that can currently be added from the browser.
+const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
@@ -575,6 +584,13 @@ struct DemoApp {
     show_sessions: bool,
     session_name: String,
     session_msg: String,
+    // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
+    show_plugins: bool,
+    plugins_loaded: bool,
+    plugins_clap: Vec<ClapPluginInfo>,
+    plugins_lv2: Vec<Lv2PluginInfo>,
+    plugin_filter: String,
+    plugin_msg: String,
     fps: f32,
     stats_timer: f32,
     stats_g: Option<Arc<Galley>>,
@@ -691,6 +707,12 @@ impl DemoApp {
             show_sessions: false,
             session_name: String::new(),
             session_msg: String::new(),
+            show_plugins: false,
+            plugins_loaded: false,
+            plugins_clap: Vec::new(),
+            plugins_lv2: Vec::new(),
+            plugin_filter: String::new(),
+            plugin_msg: String::new(),
             fps: 60.0,
             stats_timer: 0.0,
             stats_g: None,
@@ -935,6 +957,7 @@ impl DemoApp {
         self.help_body_g = Some(layout(
             "starter templates: Sessions window, or F5 Lead+Reverb / F6 Drums+Bass\n\
              F7 Ambient Pad / F8 demo patch — each loads a playable rack\n\
+             F9 / Plugins       browse installed LV2/CLAP and add to a rig\n\
              Tab                flip the rack · front = perform, back = patch\n\
              F2 / F3            embed the Surge A / B editor in this window\n\
              drag knobs         shape the sound · right-click resets\n\
@@ -1705,6 +1728,16 @@ impl DemoApp {
                     if ui.add(sess_btn).clicked() {
                         self.show_sessions = !self.show_sessions;
                     }
+                    ui.add_space(6.0);
+                    let plug_btn = egui::Button::new(egui::RichText::new("Plugins").small().color(TEXT))
+                        .fill(Color32::from_rgb(0x26, 0x28, 0x38))
+                        .corner_radius(4.0);
+                    if ui.add(plug_btn).on_hover_text("browse installed LV2 / CLAP plugins and add them to a rig").clicked() {
+                        self.show_plugins = !self.show_plugins;
+                        if self.show_plugins && !self.plugins_loaded {
+                            self.refresh_plugins();
+                        }
+                    }
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("which sources feed each rig").small().italics().color(SUBTEXT));
                 });
@@ -1798,6 +1831,116 @@ impl DemoApp {
                 }
             });
         self.show_sessions = open;
+    }
+
+    // -- plugin browser (task-18) -------------------------------------------
+
+    /// Scan installed CLAP + LV2 plugins. Filesystem / lilv work — done only on
+    /// open / refresh, never on the per-frame path.
+    fn refresh_plugins(&mut self) {
+        self.plugins_clap = list_clap_plugins();
+        self.plugins_lv2 = lv2_discover();
+        self.plugins_loaded = true;
+    }
+
+    /// The proven LV2 effect chain: Keys → Surge → <lv2> → Master (+ dry path).
+    /// Mirrors engine::lv2_engine_test.
+    fn build_lv2_chain_graph(uri: &str, name: &str) -> Graph {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let fx = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes(name));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+        g
+    }
+
+    /// Add an LV2 effect: rebuild the rack as Keys→Surge→effect→Master and
+    /// rewire the engine (same path as loading a template).
+    fn add_lv2_effect(&mut self, uri: &str, name: &str) {
+        let g = Self::build_lv2_chain_graph(uri, name);
+        let s = crate::session::Session::new(format!("LV2: {name}"), g);
+        match self.apply_session(&s) {
+            Ok(_) => self.plugin_msg = format!("Added '{name}' — Keys→Surge→{name}→Master"),
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
+    /// Start a fresh single-Surge rig (the only CLAP instrument the engine loads).
+    fn add_surge_rig(&mut self) {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+        let s = crate::session::Session::new("Surge rig", g);
+        match self.apply_session(&s) {
+            Ok(_) => self.plugin_msg = "New Surge rig — Keys→Surge→Master".into(),
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
+    /// Browse installed plugins and add them to a rig (no assistant needed).
+    fn plugins_window(&mut self, ctx: &egui::Context) {
+        if !self.show_plugins { return; }
+        let mut open = self.show_plugins;
+        egui::Window::new("Plugins")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.text_edit_singleline(&mut self.plugin_filter);
+                    if ui.button("Refresh").clicked() { self.refresh_plugins(); }
+                });
+                ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").small().italics().color(SUBTEXT));
+                let filter = self.plugin_filter.to_lowercase();
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    ui.label(egui::RichText::new(format!("LV2 effects ({})", self.plugins_lv2.len())).small().strong());
+                    let mut added: Option<(String, String)> = None;
+                    for p in &self.plugins_lv2 {
+                        if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&p.name).small());
+                            if ui.small_button("Add effect").on_hover_text(&p.uri).clicked() {
+                                added = Some((p.uri.clone(), p.name.clone()));
+                            }
+                        });
+                    }
+                    if let Some((uri, name)) = added { self.add_lv2_effect(&uri, &name); }
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("CLAP instruments ({})", self.plugins_clap.len())).small().strong());
+                    let mut add_surge = false;
+                    for p in &self.plugins_clap {
+                        if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
+                        let is_surge = p.id == SURGE_ID;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&p.name).small());
+                            if is_surge {
+                                if ui.small_button("New rig").clicked() { add_surge = true; }
+                            } else {
+                                ui.add_enabled(false, egui::Button::new(egui::RichText::new("coming soon").small()))
+                                    .on_hover_text("only Surge loads for now — other CLAP instruments are not wired yet");
+                            }
+                        });
+                    }
+                    if add_surge { self.add_surge_rig(); }
+                });
+                if !self.plugin_msg.is_empty() {
+                    ui.separator();
+                    ui.label(egui::RichText::new(&self.plugin_msg).small().color(GREEN));
+                }
+            });
+        self.show_plugins = open;
     }
 
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
@@ -2318,6 +2461,11 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
             if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
             if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
+            // Plugin browser (task-18).
+            if i.consume_key(Modifiers::NONE, Key::F9) {
+                self.show_plugins = !self.show_plugins;
+                if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
+            }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
             }
@@ -3325,6 +3473,7 @@ impl eframe::App for DemoApp {
         self.tessellate();
         self.draw(ui);
         self.sessions_window(&ctx);
+        self.plugins_window(&ctx);
 
         // Keep the embedded editor alive: X events, CLAP gui requests, and
         // child geometry in the reserved region (physical pixels).

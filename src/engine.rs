@@ -269,24 +269,29 @@ impl GraphEngine {
             }
             Command::SetParam { node, param, value } => {
                 let v = value as f32;
-                match param {
-                    P_VOL => self.master_vol = v,
-                    P_WARM => self.master_warm = v,
-                    P_LEVEL => {
-                        // Voice level for instrument nodes; for DSP nodes param 0
-                        // is the node's first native knob (e.g. Reverb mix).
-                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
-                            s.level = v;
-                        } else if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
-                            if let Some(native) = dsp_native_param(&s.kind, P_LEVEL) {
-                                s.proc.set_param(native, v);
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                    // LV2 knobs map param index → nth control port (normalized).
+                    s.plugin.set_control_normalized(param as usize, v);
+                } else {
+                    match param {
+                        P_VOL => self.master_vol = v,
+                        P_WARM => self.master_warm = v,
+                        P_LEVEL => {
+                            // Voice level for instrument nodes; for DSP nodes param 0
+                            // is the node's first native knob (e.g. Reverb mix).
+                            if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                                s.level = v;
+                            } else if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+                                if let Some(native) = dsp_native_param(&s.kind, P_LEVEL) {
+                                    s.proc.set_param(native, v);
+                                }
                             }
                         }
-                    }
-                    _ => {
-                        if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
-                            if let Some(native) = dsp_native_param(&s.kind, param) {
-                                s.proc.set_param(native, v);
+                        _ => {
+                            if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+                                if let Some(native) = dsp_native_param(&s.kind, param) {
+                                    s.proc.set_param(native, v);
+                                }
                             }
                         }
                     }

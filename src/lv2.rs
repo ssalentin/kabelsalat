@@ -371,6 +371,8 @@ pub struct Lv2Plugin {
     buffers: Vec<Vec<f32>>,
     audio_in: Vec<usize>,
     audio_out: Vec<usize>,
+    control_in: Vec<usize>,
+    control_ranges: Vec<(f32, f32)>,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
     block: usize,
@@ -429,6 +431,8 @@ impl Lv2Plugin {
             let mut buffers: Vec<Vec<f32>> = (0..nports).map(|_| vec![0.0f32; block]).collect();
             let mut audio_in = Vec::new();
             let mut audio_out = Vec::new();
+            let mut control_in = Vec::new();
+            let mut control_ranges = Vec::new();
             let desc = &*(*instance).lv2_descriptor;
             let h = (*instance).lv2_handle;
             let connect_port = desc.connect_port.expect("no connect_port");
@@ -443,9 +447,15 @@ impl Lv2Plugin {
                     audio_out.push(i as usize);
                 } else if is_control && is_in {
                     let mut def: *mut LilvNode = std::ptr::null_mut();
-                    lilv_port_get_range(plugin, port, &mut def, std::ptr::null_mut(), std::ptr::null_mut());
-                    let v = if !def.is_null() { let f = lilv_node_as_float(def); lilv_node_free(def); f } else { 1.0 };
-                    buffers[i as usize][0] = if v == 0.0 { 1.0 } else { v };
+                    let mut min: *mut LilvNode = std::ptr::null_mut();
+                    let mut max: *mut LilvNode = std::ptr::null_mut();
+                    lilv_port_get_range(plugin, port, &mut def, &mut min, &mut max);
+                    let d = if !def.is_null() { let f = lilv_node_as_float(def); lilv_node_free(def); f } else { 1.0 };
+                    let lo = if !min.is_null() { let f = lilv_node_as_float(min); lilv_node_free(min); f } else { 0.0 };
+                    let hi = if !max.is_null() { let f = lilv_node_as_float(max); lilv_node_free(max); f } else { 1.0 };
+                    buffers[i as usize][0] = if d == 0.0 { 1.0 } else { d };
+                    control_in.push(i as usize);
+                    control_ranges.push((lo, hi));
                 }
                 connect_port(h, i, buffers[i as usize].as_mut_ptr() as *mut c_void);
             }
@@ -456,12 +466,26 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, _urid: urid, _map_data: map_data, block, uri })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, _urid: urid, _map_data: map_data, block, uri })
         }
     }
 
     pub fn uri(&self) -> &str {
         &self.uri
+    }
+
+    /// Number of control-input ports (knobs).
+    pub fn control_count(&self) -> usize {
+        self.control_in.len()
+    }
+
+    /// Set the nth control port from a normalized 0..1 knob, mapped to the
+    /// port's native range. Allocation-free (audio-thread safe).
+    pub fn set_control_normalized(&mut self, nth: usize, value: f32) {
+        if let (Some(&port), Some(&(lo, hi))) = (self.control_in.get(nth), self.control_ranges.get(nth)) {
+            let v = lo + (hi - lo) * value.clamp(0.0, 1.0);
+            self.buffers[port][0] = v;
+        }
     }
 
     /// Process a stereo-interleaved block (allocation-free).
@@ -513,6 +537,25 @@ pub fn voice_test() -> anyhow::Result<()> {
     plugin.process(&input, &mut output, 256);
     let peak = output.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     anyhow::ensure!(peak > 1e-4, "Lv2Plugin produced no output (peak {peak})");
+    // Deterministic knob check: sweeping a control must change the output
+    // (direction-agnostic — port ranges/signs vary by plugin).
+    if plugin.control_count() > 0 {
+        let measure = |p: &mut Lv2Plugin, v: f32| -> f32 {
+            p.set_control_normalized(0, v);
+            let mut o = vec![0.0f32; 256 * 2];
+            for _ in 0..4 {
+                p.process(&input, &mut o, 256);
+            }
+            o.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+        };
+        let peak_max = measure(&mut plugin, 1.0);
+        let peak_min = measure(&mut plugin, 0.0);
+        anyhow::ensure!(
+            (peak_max - peak_min).abs() > 1e-3,
+            "LV2 knob had no effect (max {peak_max} vs min {peak_min})"
+        );
+        println!("lv2-voice-test: knob control verified (control sweep {peak_min:.4} ↔ {peak_max:.4})");
+    }
     println!("lv2-voice-test: OK — reusable Lv2Plugin '{}' processed 256 frames, peak {peak:.4}", plugin.uri());
     Ok(())
 }

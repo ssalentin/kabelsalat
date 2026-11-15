@@ -3738,6 +3738,12 @@ impl DemoApp {
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
+                            // Empty state: an open chat must read as a chat, not a status bar.
+                            if self.assistant.history.is_empty() && !self.assistant.busy {
+                                ui.label(egui::RichText::new(
+                                    "No messages yet — ask about routing, sounds or rigs, e.g. \"add a rig with a reverb\" or \"why is rig B silent?\"")
+                                    .size(13.0).color(theme::INK_2));
+                            }
                             for line in &self.assistant.history {
                                 let (label, color) = match line.role.as_str() {
                                     "user" => ("You", theme::INK),

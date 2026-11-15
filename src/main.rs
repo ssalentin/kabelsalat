@@ -12,6 +12,7 @@ mod control;
 mod dsp;
 mod engine;
 mod host;
+mod lv2;
 mod matrix;
 mod mcp;
 mod midi;
@@ -50,8 +51,9 @@ fn main() -> anyhow::Result<()> {
         "session-test" => ui::run_session_test(),
         "capture-test" => capture::run_test(),
         "player-test" => player::run_test(),
+        "lv2-test" => lv2::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test");
             std::process::exit(1);
         }
     }

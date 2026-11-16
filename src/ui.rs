@@ -11541,6 +11541,16 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
         std::env::remove_var("WAYLAND_DISPLAY");
         eprintln!("ui: forcing X11 backend (WAYLAND_DISPLAY hidden; embedding needs XWayland)");
     }
+    // Text input without an input-method server (#30): with XMODIFIERS
+    // =@im=fcitx every typed character goes through fcitx5's XIM bridge, which
+    // under XWayland stopped delivering text after a while — every text field
+    // went dead while shortcuts (plain key events) kept working. The rack
+    // needs no IME (umlauts come straight from the XKB layout), so use X's
+    // local input method. KABELSALAT_IME=1 keeps the system IME.
+    if std::env::var_os("KABELSALAT_IME").is_none() && std::env::var_os("XMODIFIERS").is_some() {
+        std::env::remove_var("XMODIFIERS");
+        eprintln!("ui: text input via the local X input method (XMODIFIERS cleared; KABELSALAT_IME=1 keeps fcitx/ibus)");
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])

@@ -1109,7 +1109,7 @@ impl McpServer {
     }
 
     /// Start the transport.
-    #[tool(name = "transport_play", description = "Master transport play (Command::TransportPlay): starts EVERY transport-capable node (all metronomes). Use set_node_playing to start/stop one instrument.")]
+    #[tool(name = "transport_play", description = "Master transport play (Command::TransportPlay): starts EVERY transport-capable node (all metronomes) and runs the song clock hosted CLAP plugins follow, from beat 0. Use set_node_playing to start/stop one instrument.")]
     fn transport_play(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportPlay) {
@@ -1121,7 +1121,7 @@ impl McpServer {
     }
 
     /// Stop the transport.
-    #[tool(name = "transport_stop", description = "Master transport stop (Command::TransportStop): stops EVERY transport-capable node.")]
+    #[tool(name = "transport_stop", description = "Master transport stop (Command::TransportStop): stops EVERY transport-capable node and halts the song clock CLAP plugins follow.")]
     fn transport_stop(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportStop) {
@@ -1154,7 +1154,7 @@ impl McpServer {
     }
 
     /// Set the metronome tempo.
-    #[tool(name = "set_bpm", description = "Set the metronome tempo in BPM (Command::SetBpm), 20..300. Start the metronome with transport_play.")]
+    #[tool(name = "set_bpm", description = "Set the tempo in BPM (Command::SetBpm), 20..300: the metronome and the tempo-synced features of hosted CLAP plugins follow it. Start the metronome with transport_play.")]
     fn set_bpm(&self, Parameters(args): Parameters<SetBpmArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         let bpm = args.bpm.clamp(20.0, 300.0);

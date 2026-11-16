@@ -206,7 +206,7 @@ impl PreviewApp {
                     if let Some(voice) = &mut surge_voice {
                         let frames = data.len() / ch;
                         if frames * 2 <= scratch.len() {
-                            voice.render(&mut scratch[..frames * 2]);
+                            voice.render(&mut scratch[..frames * 2], crate::transport::Transport::default());
                             for (i, frame) in data.chunks_mut(ch).enumerate() {
                                 frame[0] = scratch[i * 2];
                                 if ch > 1 {

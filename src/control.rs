@@ -581,15 +581,18 @@ pub enum Command {
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
     /// Master transport: start EVERY transport-capable node (sets
-    /// `Node::playing` on all of them). Per-node SetNodePlaying overrides
+    /// `Node::playing` on all of them) and run the song clock hosted CLAP
+    /// plugins follow, from beat 0. Per-node SetNodePlaying overrides
     /// individually afterwards.
     TransportPlay,
-    /// Master transport: stop every transport-capable node.
+    /// Master transport: stop every transport-capable node and halt the
+    /// song clock (its position stays).
     TransportStop,
     /// Per-instrument transport: start/stop ONE transport-capable node
-    /// (metronome today; file player later). Ignored for other kinds.
+    /// (metronome today; file player later). Ignored for other kinds; never
+    /// moves the song clock.
     SetNodePlaying { node: NodeId, playing: bool },
-    /// Set the metronome tempo (BPM).
+    /// Set the tempo (BPM) of the metronomes and of the song clock.
     SetBpm { bpm: f32 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },

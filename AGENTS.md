@@ -195,6 +195,12 @@ Learned so far (2026-11-15, UI polish pass):
     (clamped to the range; missing default = minimum), never a "0 → 1.0"
     unity hack: it silenced Vitalium and the LSP oscillator through the
     engine. `lv2-instrument-engine-test` must report an audible peak.
+43. **One tempo→beat factor:** everything that counts beats (the song clock
+    hosted plugins get, each metronome's phase) advances by
+    `Transport::beats_per_frame`. The metronome counted samples per beat, so a
+    tempo change mid-beat left its click 1/16 beat off the beats a
+    tempo-synced plugin sees. Check with `kabelsalat transport-test` (real
+    Surge) and `cargo test --bin kabelsalat song_clock master_started`.
 
 ## Ground rules
 

@@ -201,12 +201,14 @@ fn system_prompt() -> String {
      LOW below the point, port 1 = HIGH at/above; wire each to a rig with connect \
      from_port 0/1 — there is no automatic rig split), flip_rack.\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
-     (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome; \
+     (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
+     tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
      the user drags it on any metronome's face).\n\
      - Transport: start/stop is a property of each rack instrument that supports it \
      (metronome today; get_graph marks them transport=true with their playing state). \
      set_node_playing(node, playing) starts/stops ONE instrument; transport_play/\
-     transport_stop are the master and start/stop ALL of them.\n\
+     transport_stop are the master and start/stop ALL of them. The master is also the \
+     song clock CLAP plugins follow: play runs it from beat 0, stop halts it.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
@@ -344,12 +346,12 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"transport_play",
-            "description":"Master transport play: starts EVERY transport-capable instrument (all metronomes).",
+            "description":"Master transport play: starts EVERY transport-capable instrument (all metronomes) and runs the song clock hosted CLAP plugins follow, from beat 0.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"transport_stop",
-            "description":"Master transport stop: stops EVERY transport-capable instrument.",
+            "description":"Master transport stop: stops EVERY transport-capable instrument and halts the song clock CLAP plugins follow.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
@@ -359,7 +361,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_bpm",
-            "description":"Set the global tempo in BPM (20..300), shared by every metronome (the same value the metronome faces show).",
+            "description":"Set the global tempo in BPM (20..300), shared by every metronome (the same value the metronome faces show) and by tempo-synced CLAP plugin features.",
             "parameters":{"type":"object","properties":{"bpm":{"type":"number"}},"required":["bpm"]}
         }},
         {"type":"function","function":{

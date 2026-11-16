@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=kabelsalat
+GenericName=Audio/MIDI Plugin Host
+Comment=Live audio/MIDI wiring with animated cables: an AUM-style CLAP and LV2 host
+Exec=kabelsalat
+Icon=kabelsalat
+Terminal=false
+Categories=AudioVideo;Audio;Music;Midi;
+Keywords=synth;clap;lv2;midi;rack;surge;
+StartupWMClass=kabelsalat

@@ -229,8 +229,9 @@ Learned so far (2026-11-15, UI polish pass):
 49. **Gain staging before colour:** the master `tanh` warmth saw the raw sum
     of every voice; 8–16 held notes spent 2.5–4.9 % of samples in hard
     saturation ("burning crackle"). A zero-latency `MasterLimiter` holds the
-    sum at 0.7 first. Never add lookahead on the master (it adds to every
-    played note's latency).
+    sum at 0.7 first (0 % hard saturation for held notes; a big chord's
+    onset still touches it for 2–5 ms, masked by the attack). Never add
+    lookahead on the master (it adds to every played note's latency).
 
 ## Ground rules
 

@@ -1906,6 +1906,17 @@ mod master_limiter_tests {
     }
 
     #[test]
+    fn a_chord_onset_is_caught_within_a_few_milliseconds() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let x = 4.0f32; // a big chord's sum, from silence
+        let mut g = 1.0;
+        for _ in 0..(48000 * 5 / 1000) {
+            g = lim.gain_for(x, x);
+        }
+        assert!((x * g - MasterLimiter::CEILING).abs() < 0.02, "after 5 ms the sum is held: {}", x * g);
+    }
+
+    #[test]
     fn leaves_a_single_voice_alone_and_holds_a_chord_at_the_ceiling() {
         let (g, p) = run(0.5);
         assert_eq!((g, p), (1.0, 0.5), "below the ceiling nothing changes");

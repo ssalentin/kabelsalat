@@ -411,6 +411,9 @@ pub struct GraphEngine {
     lv2_in: Vec<f32>,
     master_vol: f32,
     master_warm: f32,
+    /// Master bus limiter (zero latency) in front of the warmth stage: many
+    /// voices at once drove `tanh` into hard, buzzing saturation.
+    master_lim: MasterLimiter,
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -547,6 +550,7 @@ impl GraphEngine {
             lv2_in: vec![0.0; 8192 * 2],
             master_vol: 0.8,
             master_warm: 0.15,
+            master_lim: MasterLimiter::new(sample_rate),
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -1782,9 +1786,11 @@ impl GraphEngine {
             }
             let drive = 1.0 + self.master_warm * 3.0;
             let vol = self.master_vol;
+            let lim = &mut self.master_lim;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
-                let l = (acc[i * 2] * drive).tanh() * vol;
-                let r = (acc[i * 2 + 1] * drive).tanh() * vol;
+                let g = lim.gain_for(acc[i * 2], acc[i * 2 + 1]);
+                let l = (acc[i * 2] * g * drive).tanh() * vol;
+                let r = (acc[i * 2 + 1] * g * drive).tanh() * vol;
                 peak = peak.max(l.abs()).max(r.abs());
                 frame[0] = l;
                 if ch > 1 {
@@ -1802,6 +1808,36 @@ impl GraphEngine {
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
+    }
+}
+
+/// Zero-latency peak limiter for the master bus: holds the summed signal
+/// under `CEILING` so the warmth stage after it only colours, never buzzes.
+/// No lookahead (it would add its window to every played note); the brief
+/// attack overshoot lands in the soft `tanh` that follows.
+struct MasterLimiter {
+    env: f32,
+    gain: f32,
+    rel: f32,
+    atk: f32,
+}
+
+impl MasterLimiter {
+    /// Summed level a single loud voice reaches; more voices are held here.
+    const CEILING: f32 = 0.7;
+
+    fn new(sample_rate: f64) -> Self {
+        let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
+        Self { env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001) }
+    }
+
+    fn gain_for(&mut self, l: f32, r: f32) -> f32 {
+        let peak = l.abs().max(r.abs());
+        self.env = peak.max(self.env * self.rel);
+        let target = if self.env > Self::CEILING { Self::CEILING / self.env } else { 1.0 };
+        let coef = if target < self.gain { self.atk } else { self.rel };
+        self.gain = coef * self.gain + (1.0 - coef) * target;
+        self.gain
     }
 }
 
@@ -1850,6 +1886,35 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
+
+#[cfg(test)]
+mod master_limiter_tests {
+    use super::MasterLimiter;
+
+    fn run(amp: f32) -> (f32, f32) {
+        let mut lim = MasterLimiter::new(48000.0);
+        let (mut gmin, mut peak) = (1.0f32, 0.0f32);
+        for i in 0..48000 {
+            let x = amp * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin();
+            let g = lim.gain_for(x, x);
+            if i > 4800 {
+                gmin = gmin.min(g);
+                peak = peak.max((x * g).abs());
+            }
+        }
+        (gmin, peak)
+    }
+
+    #[test]
+    fn leaves_a_single_voice_alone_and_holds_a_chord_at_the_ceiling() {
+        let (g, p) = run(0.5);
+        assert_eq!((g, p), (1.0, 0.5), "below the ceiling nothing changes");
+        for amp in [1.0f32, 2.0, 4.0] {
+            let (_, p) = run(amp);
+            assert!((p - MasterLimiter::CEILING).abs() < 0.01, "amp {amp}: held at {p}");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

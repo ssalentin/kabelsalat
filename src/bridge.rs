@@ -323,6 +323,7 @@ fn handle_line_with_pub(
                     "count_in_beat": tp.count_in_beat,
                     "count_in_enabled": tp.count_in_enabled,
                     "count_in_bars": tp.count_in_bars,
+                    "record_sync": tp.record_sync,
                     "bpm": tp.bpm,
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,

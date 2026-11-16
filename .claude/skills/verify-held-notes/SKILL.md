@@ -1,6 +1,6 @@
 ---
 name: verify-held-notes
-description: Exhaustively checks that releasing a key always silences what it started, across every interleaving of split, MIDI-matrix, MIDI-cable and template-load edits, by driving the real GraphEngine::apply. Use when a change touches note routing in src/engine.rs (NoteOn/NoteOff, keys_gate, release_all, SetNodeSplit, MatrixRule, Connect/Disconnect, LoadGraph/LoadRigs), src/matrix.rs (Rule::transform, route_into) or Graph::set_split/connect/disconnect in src/control.rs, or when chasing a stuck/hanging note.
+description: Exhaustively checks that releasing a key always silences what it started, across every interleaving of split, MIDI-matrix, MIDI-cable, node-removal and template-load edits, by driving the real GraphEngine::apply. Use when a change touches note routing in src/engine.rs (NoteOn/NoteOff, keys_gate, release_all, SetNodeSplit, MatrixRule, Connect/Disconnect, RemoveNode, SetRigSource/SetRigDevice, LoadGraph/LoadRigs), src/matrix.rs (Rule::transform, route_into) or Graph::set_split/connect/disconnect in src/control.rs, or when chasing a stuck/hanging note.
 ---
 
 # Verify held notes
@@ -22,19 +22,19 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cargo test --bin kabelsalat held_notes_are_released -- --nocapture
 ```
 
-About 25 s in debug. The check lives in `src/engine/held_notes.rs`
+About 20 s in debug. The check lives in `src/engine/held_notes.rs`
 (registered by `#[cfg(test)] mod held_notes;` in `src/engine.rs`). Subagents
 add `CARGO_TARGET_DIR=$HOME/.cache/ksalat-<name>-target` (never /tmp).
 
 Expected output at the sync commit:
 
 ```
-held-notes: 93363 reachable states explored to fixpoint
-KNOWN FINDING {Cable}: ...   1. NoteOn 59  2. Disconnect cable 1  3. NoteOff 59
-KNOWN FINDING {Load}:  ...   1. MatrixRule Keys→Surge A transpose +12 ...  2. NoteOn 59  3. LoadGraph start patch  4. NoteOff 59
-held-notes: 10 combined kind-set(s) attributed to known findings
+held-notes: 66970 reachable states explored to fixpoint
+held-notes: 0 combined kind-set(s) attributed to known findings
 test result: ok
 ```
+
+`KNOWN` is empty. Every stuck note is a failure.
 
 ## How it works (enough to judge a result)
 
@@ -53,6 +53,7 @@ test result: ok
   - `MatrixRule` Keys→A: transpose 0, transpose +12, disabled. Keys→B: transpose 0, transpose −12.
   - `Disconnect` of cables 1 and 6.
   - `Connect`: cable 1 to Keys port 0, cable 6 to port 0 (LOW) and port 1 (HIGH).
+  - `RemoveNode` of Surge B.
   - `LoadGraph` of the start patch.
 - "Sounding" is read from the test-only `note_log` (delivered note-on,
   note-off, and the `255` all-notes-off marker of `release_all`). A note-off
@@ -63,7 +64,7 @@ test result: ok
   `explore(200_000)`'s bound it prints what it found, says `STOPPED AT BOUND`,
   and fails. A bound never passes.
 - Each stuck note is labelled with the routing-edit **kinds** (Split, Matrix,
-  Cable, Load) applied while its key was held. Root causes print with their
+  Cable, Node, Load) applied while its key was held. Root causes print with their
   shortest trace. Kind-sets that contain a `KNOWN` set are counted, not
   printed.
 
@@ -96,37 +97,40 @@ test result: ok
   `GraphEngine` fields it reads (`graph`, `matrix`, `note_log`, `apply`)
   changed. Update the check to the new API without changing what it asserts.
 
-## Open findings (confirmed with real Surge XT audio at the sync commit)
+## Fixed findings (history)
 
-1. **Cable:** hold a key, unplug (or move, rule 13 = Disconnect + Connect) the
-   Keys→Surge MIDI cable, release the key: the note-off is dropped by
-   `keys_gate` because the cable is gone, and Surge keeps sounding.
-   `Command::Disconnect` releases nothing. Real audio: peak 0.31 five seconds
-   after release (0.00 without the unplug).
-2. **Load:** with a transposed rule (Keys→Surge A +12), hold 59 (Surge plays
-   71), load a template (`LoadGraph`), release: the rebuilt matrix sends the
-   note-off as 59, 71 stays on. `LoadGraph`/`LoadRigs` release nothing, and the
-   CLAP voice survives the reload (remapped by plugin id). Real audio: peak
-   0.23 (0.00 without the load).
+Found by this check and confirmed with real Surge XT audio (peak 5–6 s after
+release: stuck about 0.2–0.3, released 0.00). Fixed in the commit after
+`507db06` by calling `release_all` first:
 
-Product code was not changed for these. A fix would likely call `release_all`
-on the old destinations in `Disconnect` (MIDI edges from a Keys node) and on
-every instrument before the `LoadGraph` rebuild. After a fix, remove the
-entry from `KNOWN` and add the rule to AGENTS.md.
+1. **Cable:** hold a key, unplug (or move, rule 13) the Keys→Surge MIDI cable,
+   release. `keys_gate` dropped the note-off. Now `Disconnect` of a MIDI edge
+   from a Keys node releases its destination.
+2. **Load:** transposed rule (+12), hold 59 (Surge plays 71), load a template,
+   release. The rebuilt matrix sent the note-off as 59. Now `LoadGraph` (and
+   `LoadRigs`, which calls it) releases every node of the old graph.
+3. **Node** (found once `RemoveNode` joined the alphabet): the voice went idle
+   still holding the note. Now `RemoveNode` releases the node first.
+4. **Source filter** (outside this model, confirmed by audio only):
+   `SetRigSource` turning the keyboard off while a key is held made
+   `source_accepted` drop its note-off. Now `SetRigSource` and
+   `SetRigDevice` release the node first. `SetRigDevice` is the same
+   mechanism for hardware sources and is inferred, not separately measured.
 
 ## Coverage record
 
 | Check covers | Where |
 |---|---|
 | Note dispatch | `src/engine.rs`: `apply` arms `NoteOn`, `NoteOff`; `keys_gate`; `release_all` |
-| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `LoadGraph` |
+| Routing edits | `src/engine.rs`: `apply` arms `SetNodeSplit`, `MatrixRule`, `Connect`, `Disconnect`, `RemoveNode`, `LoadGraph` |
 | Matrix | `src/matrix.rs`: `Matrix::route_into`, `Rule::transform`, `transpose_note` |
 | Graph edits | `src/control.rs`: `Graph::set_split`, `connect_with_id`, `disconnect`, `split_port` |
 
-**Sync commit: `1772263`.** At that commit the check was confirmed to describe
-the code above. When any listed function changes after it, re-read the change
+**Sync commit: see `git log -1 --format=%h -- src/engine/held_notes.rs`** (the
+commit that last touched this check; it was confirmed against the code at that
+commit). When any listed function changes after it, re-read the change
 against "How it works". If the check still describes the code, rerun it and
-only then move this commit forward (`git log -1 --format=%h`). If it no
+only then record that by committing (touch the check or this file). If it no
 longer does (for example a new routing command, or note-offs now tracked per
 key), extend `EDITS`/`Step` first.
 
@@ -136,12 +140,11 @@ key), extend `EDITS`/`Step` first.
   the `HwDirect` thread) takes the same `apply` path but is not in the
   alphabet.
 - **The voice-level source filter.** `source_accepted`, `SetRigSource`,
-  `SetRigDevice`: the check runs with no CLAP voice slots. By reading the code,
-  `SetRigSource` turning a source off while a key is held blocks that key's
-  note-off the same way. Unverified.
-- **Voice binding changes.** `RemoveNode`, `AddNode`, `LoadGraph` of a
-  *different* graph, `LoadRigs` (multi-rig merge, several Keys nodes), and
-  idle voices being re-bound later.
+  `SetRigDevice`: the check runs with no CLAP voice slots, so it cannot see
+  them. Their release was confirmed by audio once (Fixed findings 4).
+- **Voice binding changes.** `AddNode`, `LoadGraph` of a *different* graph,
+  `LoadRigs` (multi-rig merge, several Keys nodes), and idle voices being
+  re-bound later.
 - **Detail limits:**
   - Two keys only (59, 60).
   - Splits only at None, 60 and 48.

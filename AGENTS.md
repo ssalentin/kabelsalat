@@ -313,6 +313,10 @@ Learned so far (2026-11-15, UI polish pass):
     goes through `capture_session` → `remap_session` → the LoadRigs/LoadGraph
     decision, is used once (never leaks into a later load), and the UI
     mirror (`rig_snapshot`) follows what the engine will publish.
+66. **An MCP tool forwarded to the app is on `UI_BRIDGE_TOOLS`:** the
+    instrument tools called `ui_bridge_tool("install_instrument")` but the
+    app's serve list did not include them, so attached agents got "not
+    served". `ui_bridge_tools_cover_mcp` reads mcp.rs and fails on any gap.
 
 ## Working on kabelsalat
 

@@ -86,7 +86,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         id: "setbfree",
         name: "setBfree",
         format: Format::Lv2,
-        description: "Hammond B3 tonewheel organ + rotary — plays once kabelsalat supports the LV2 worker (#36)",
+        description: "Hammond B3 tonewheel organ + rotary",
         repo: "pantherb/setBfree",
         route: InstallRoute::DistroPackage { pkg: "setbfree" },
         home: Home::Lv2,

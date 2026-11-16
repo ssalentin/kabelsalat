@@ -44,10 +44,15 @@ use clack_extensions::params::{
     ParamInfoFlags, ParamRescanFlags, PluginParams,
 };
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
-use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
-use clack_host::events::Match;
+use clack_host::events::event_types::{
+    NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
+};
+use clack_host::events::{EventFlags, EventHeader, Match};
 use clack_host::host::{HostError, HostExtensions};
 use clack_host::prelude::*;
+use clack_host::utils::{BeatTime, SecondsTime};
+
+use crate::transport::{Transport, BEATS_PER_BAR};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -438,19 +443,21 @@ impl ClapVoice {
         self.process_errors
     }
 
-    /// Render `out.len() / 2` stereo-interleaved frames. RT-safe: no
-    /// allocation, no locks, no syscalls. Call from the audio thread only.
-    pub fn render(&mut self, out: &mut [f32]) {
+    /// Render `out.len() / 2` stereo-interleaved frames with the host
+    /// `transport` as of the first frame. RT-safe: no allocation, no locks,
+    /// no syscalls. Call from the audio thread only.
+    pub fn render(&mut self, out: &mut [f32], mut transport: Transport) {
         let frames = out.len() / 2;
         let mut done = 0usize;
         while done < frames {
             let n = (frames - done).min(BLOCK);
-            self.render_block(n, &mut out[done * 2..(done + n) * 2]);
+            self.render_block(n, &mut out[done * 2..(done + n) * 2], &transport);
+            transport.advance(n, self.sample_rate);
             done += n;
         }
     }
 
-    fn render_block(&mut self, n: usize, out: &mut [f32]) {
+    fn render_block(&mut self, n: usize, out: &mut [f32], transport: &Transport) {
         self.ev_in.clear();
         self.ev_out.clear();
 
@@ -509,7 +516,7 @@ impl ClapVoice {
             &self.ev_in.as_input(),
             &mut self.ev_out.as_output(),
             Some(self.frame),
-            None,
+            Some(&transport_event(transport)),
         );
         if status.is_err() {
             self.process_errors += 1;
@@ -532,6 +539,32 @@ impl ClapVoice {
     }
 }
 
+/// The CLAP view of the host transport: tempo, 4/4, and both timelines.
+fn transport_event(t: &Transport) -> TransportEvent {
+    let mut flags = TransportFlags::HAS_TEMPO
+        | TransportFlags::HAS_BEATS_TIMELINE
+        | TransportFlags::HAS_SECONDS_TIMELINE
+        | TransportFlags::HAS_TIME_SIGNATURE;
+    flags.set(TransportFlags::IS_PLAYING, t.playing);
+    let (bar_number, bar_start) = t.bar();
+    TransportEvent {
+        header: EventHeader::new_core(0, EventFlags::empty()),
+        flags,
+        song_pos_beats: BeatTime::from_float(t.beats),
+        song_pos_seconds: SecondsTime::from_float(t.seconds),
+        tempo: t.bpm,
+        tempo_inc: 0.0,
+        loop_start_beats: BeatTime::from_int(0),
+        loop_end_beats: BeatTime::from_int(0),
+        loop_start_seconds: SecondsTime::from_int(0),
+        loop_end_seconds: SecondsTime::from_int(0),
+        bar_start: BeatTime::from_float(bar_start),
+        bar_number,
+        time_signature_numerator: BEATS_PER_BAR,
+        time_signature_denominator: 4,
+    }
+}
+
 fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
     match cmd {
         VoiceCmd::NoteOn(k, v) => {
@@ -551,6 +584,35 @@ fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
             ),
             v,
         )),
+    }
+}
+
+#[cfg(test)]
+mod transport_event_tests {
+    use super::*;
+
+    #[test]
+    fn plugins_get_tempo_position_and_play_state() {
+        let mut t = Transport::stopped(90.0);
+        let stopped = transport_event(&t);
+        assert_eq!(stopped.tempo, 90.0);
+        assert!(!stopped.flags.contains(TransportFlags::IS_PLAYING));
+        assert!(stopped.flags.contains(
+            TransportFlags::HAS_TEMPO
+                | TransportFlags::HAS_BEATS_TIMELINE
+                | TransportFlags::HAS_SECONDS_TIMELINE
+                | TransportFlags::HAS_TIME_SIGNATURE
+        ));
+        assert_eq!((stopped.time_signature_numerator, stopped.time_signature_denominator), (4, 4));
+
+        t.set_playing(true);
+        t.advance(48000 * 4, 48000.0); // 4 s at 90 BPM = 6 beats
+        let playing = transport_event(&t);
+        assert!(playing.flags.contains(TransportFlags::IS_PLAYING));
+        assert!((playing.song_pos_beats.to_float() - 6.0).abs() < 1e-6);
+        assert!((playing.song_pos_seconds.to_float() - 4.0).abs() < 1e-6);
+        assert_eq!(playing.bar_number, 1);
+        assert_eq!(playing.bar_start.to_float(), 4.0);
     }
 }
 
@@ -1135,11 +1197,11 @@ pub fn run_preset_test() -> Result<()> {
     // Zero-crossing rate + RMS of 0.4 s of note 60 — a cheap timbre fingerprint.
     let mut measure = |voice: &mut ClapVoice| -> (f32, f32) {
         let mut buf = vec![0.0f32; 512 * 2];
-        for _ in 0..20 { voice.render(&mut buf); } // settle
+        for _ in 0..20 { voice.render(&mut buf, Transport::default()); } // settle
         ctl.note_on(60, 0.9);
         let (mut zc, mut sq, mut n, mut prev) = (0usize, 0.0f64, 0usize, 0.0f32);
         for _ in 0..(sr as usize * 4 / 10 / 512) {
-            voice.render(&mut buf);
+            voice.render(&mut buf, Transport::default());
             for f in buf.chunks(2) {
                 let x = f[0];
                 if (x > 0.0) != (prev > 0.0) { zc += 1; }
@@ -1147,7 +1209,7 @@ pub fn run_preset_test() -> Result<()> {
             }
         }
         ctl.note_off(60);
-        for _ in 0..60 { voice.render(&mut buf); } // release tail
+        for _ in 0..60 { voice.render(&mut buf, Transport::default()); } // release tail
         (zc as f32 / n as f32 * sr as f32 / 2.0, (sq / n as f64).sqrt() as f32)
     };
     let (zc_a, rms_a) = measure(&mut voice);
@@ -1155,7 +1217,7 @@ pub fn run_preset_test() -> Result<()> {
     let data = std::fs::read(&flute.path)?;
     main.load_state(&fxp_to_state(&data)?)?;
     let mut buf = vec![0.0f32; 512 * 2];
-    for _ in 0..20 { voice.render(&mut buf); } // Surge applies state on the audio thread
+    for _ in 0..20 { voice.render(&mut buf, Transport::default()); } // Surge applies state on the audio thread
     let saved = main.save_state()?;
     // The plugin now reports a different patch than the init one.
     let named = saved != init_state;
@@ -1573,7 +1635,7 @@ fn voice_render_loop(
 ) -> Result<u64> {
     let mut block = [0.0f32; BLOCK * 2];
     while !stop.load(Ordering::Relaxed) {
-        voice.render(&mut block);
+        voice.render(&mut block, Transport::default());
         // Interleave into the ring; block (sleep) when full -> real-time pacing.
         let mut peak = 0.0f32;
         for &s in &block {
@@ -2330,7 +2392,7 @@ mod patch_search_tests {
         let mut buf = vec![0.0f32; 256 * 2];
         let mut peak = 0.0f32;
         for _ in 0..8 {
-            voice.render(&mut buf);
+            voice.render(&mut buf, Transport::default());
             for &s in &buf {
                 peak = peak.max(s.abs());
             }
@@ -2358,14 +2420,14 @@ mod patch_search_tests {
         load_dexed_patch(&mut main, target).expect("load_dexed_patch");
         let mut buf = vec![0.0f32; 256 * 2];
         for _ in 0..4 {
-            voice.render(&mut buf);
+            voice.render(&mut buf, Transport::default());
         }
         let after = main.save_state().expect("save after");
         assert_ne!(before, after, "Dexed state should change after loading patch");
         voice.note_on(60, 0.9);
         let mut peak = 0.0f32;
         for _ in 0..8 {
-            voice.render(&mut buf);
+            voice.render(&mut buf, Transport::default());
             for &s in &buf {
                 peak = peak.max(s.abs());
             }

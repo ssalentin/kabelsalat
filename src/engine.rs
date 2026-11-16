@@ -24,6 +24,7 @@ use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
+use crate::transport::Transport;
 
 /// Max hardware MIDI device ids pre-routed in the matrix (per-rig filter selects).
 pub const MAX_HW_DEVICES: u32 = 16;
@@ -134,9 +135,9 @@ struct DspSlot {
     transport: SlotTransport,
 }
 
-/// One transport-capable node's own clock: whether it runs, its beat phase,
-/// and the click envelope in flight. Per slot, so two metronomes never share
-/// (and double-advance) one phase.
+/// One transport-capable node's own clock: whether it runs, its phase within
+/// the beat (0..1), and the click envelope in flight. Per slot, so two
+/// metronomes never share (and double-advance) one phase.
 #[derive(Clone, Copy, Default)]
 struct SlotTransport {
     playing: bool,
@@ -293,9 +294,10 @@ pub struct GraphEngine {
     lv2_in: Vec<f32>,
     master_vol: f32,
     master_warm: f32,
-    // Tempo shared by every transport-capable node (per-node run state lives
-    // in each DspSlot's SlotTransport).
-    bpm: f32,
+    // Song clock handed to every CLAP voice. Its tempo is shared by every
+    // transport-capable node (per-node run state lives in each DspSlot's
+    // SlotTransport); its playing flag is the MASTER transport only.
+    transport: Transport,
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
@@ -399,7 +401,7 @@ impl GraphEngine {
             lv2_in: vec![0.0; 8192 * 2],
             master_vol: 0.8,
             master_warm: 0.15,
-            bpm: 96.0,
+            transport: Transport::stopped(96.0),
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
             matrix,
@@ -445,6 +447,11 @@ impl GraphEngine {
 
     pub fn graph(&self) -> &Graph {
         &self.graph
+    }
+
+    /// Song clock as of the next block's first frame.
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 
     /// Rig list from the last `LoadRigs` (empty for single-graph loads).
@@ -942,7 +949,8 @@ impl GraphEngine {
             }
             // Global transport = MASTER: fan out to every transport-capable
             // node (all start together on the downbeat). Per-node
-            // SetNodePlaying overrides individually afterwards.
+            // SetNodePlaying overrides individually afterwards and never
+            // touches the song clock plugins see.
             Command::TransportPlay => self.master_transport(true),
             Command::TransportStop => self.master_transport(false),
             Command::SetNodePlaying { node, playing } => {
@@ -957,15 +965,16 @@ impl GraphEngine {
                 }
             }
             Command::SetBpm { bpm } => {
-                self.bpm = bpm.clamp(20.0, 300.0);
+                self.transport.bpm = bpm.clamp(20.0, 300.0) as f64;
             }
         }
     }
 
-    /// Master transport fan-out (TransportPlay/Stop): set every
-    /// transport-capable node's flag and slot clock; publish only when a flag
-    /// actually changed (frontends mirror it from GraphPub).
+    /// Master transport (TransportPlay/Stop): run or halt the song clock and
+    /// set every transport-capable node's flag and slot clock; publish only
+    /// when a flag actually changed (frontends mirror it from GraphPub).
     fn master_transport(&mut self, playing: bool) {
+        self.transport.set_playing(playing);
         let changed = self.graph.set_all_playing(playing);
         for d in &mut self.dsp {
             if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
@@ -1041,7 +1050,7 @@ impl GraphEngine {
         for s in &mut self.voices {
             // Idle pool voice (no Clap node mapped): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
-            s.voice.render(&mut s.scratch[..n2]);
+            s.voice.render(&mut s.scratch[..n2], self.transport);
             for x in s.scratch[..n2].iter_mut() {
                 *x *= s.level;
             }
@@ -1068,12 +1077,13 @@ impl GraphEngine {
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
-        let (sr, bpm) = (self.sample_rate, self.bpm);
+        let (sr, bpm) = (self.sample_rate, self.transport.bpm);
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm);
             }
         }
+        self.transport.advance(frames, sr);
 
         // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
         for slot in &mut self.lv2 {
@@ -1224,18 +1234,20 @@ impl GraphEngine {
 /// Generate one metronome's click into `buf` (stereo-interleaved): a
 /// decaying 1 kHz burst on each beat while ITS transport plays. Driven by
 /// SetNodePlaying / master TransportPlay·Stop / SetBpm; allocation-free.
-fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sample_rate: f64, bpm: f32) {
+fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sample_rate: f64, bpm: f64) {
     let frames = frames.min(buf.len() / 2);
     let n2 = frames * 2;
     for x in buf[..n2].iter_mut() {
         *x = 0.0;
     }
-    let spb = sample_rate * 60.0 / bpm as f64;
+    // Phase counts beats with the song clock's own factor, so a tempo change
+    // mid-beat leaves a master-started click on the beats plugins see.
+    let beat_inc = Transport::beats_per_frame(bpm, sample_rate);
     for i in 0..frames {
         if t.playing {
-            t.phase += 1.0;
-            if t.phase >= spb {
-                t.phase -= spb;
+            t.phase += beat_inc;
+            if t.phase >= 1.0 {
+                t.phase -= 1.0;
                 t.click_remaining = CLICK_FRAMES;
                 t.click_phase = 0.0;
             }
@@ -1635,6 +1647,73 @@ mod tests {
         bus.send(Command::TransportStop);
         engine.render(&mut buf, 2);
         assert_eq!(pub_.lock().unwrap().rev, rev, "a no-op transport stop must not republish");
+    }
+
+    #[test]
+    fn song_clock_follows_master_transport_and_tempo() {
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        let mut buf = vec![0.0f32; 480 * 2];
+        let mut run = |engine: &mut super::GraphEngine, blocks: usize| {
+            for _ in 0..blocks {
+                engine.render(&mut buf, 2);
+            }
+            engine.transport()
+        };
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        let t = run(&mut engine, 100);
+        assert!(!t.playing && t.beats == 0.0 && t.bpm == 120.0, "stopped clock stands still: {t:?}");
+
+        // A single instrument's own Play is not the song: plugins stay stopped.
+        bus.send(Command::SetNodePlaying { node: m1, playing: true });
+        let t = run(&mut engine, 100);
+        assert!(!t.playing && t.beats == 0.0, "SetNodePlaying must not move the song clock: {t:?}");
+
+        bus.send(Command::TransportPlay);
+        let t = run(&mut engine, 100); // 1 s at 120 BPM
+        assert!(t.playing && (t.beats - 2.0).abs() < 1e-9 && (t.seconds - 1.0).abs() < 1e-9, "{t:?}");
+        bus.send(Command::SetNodePlaying { node: m1, playing: false });
+        bus.send(Command::SetBpm { bpm: 60.0 });
+        let t = run(&mut engine, 100); // 1 s at 60 BPM
+        assert!(t.playing && (t.beats - 3.0).abs() < 1e-9 && t.bpm == 60.0, "tempo change mid-run: {t:?}");
+
+        bus.send(Command::TransportStop);
+        let t = run(&mut engine, 100);
+        assert!(!t.playing && (t.beats - 3.0).abs() < 1e-9, "stop keeps the position: {t:?}");
+        bus.send(Command::TransportPlay);
+        let t = run(&mut engine, 50);
+        assert!((t.beats - 0.5).abs() < 1e-9 && (t.seconds - 0.5).abs() < 1e-9, "play rewinds to beat 0: {t:?}");
+    }
+
+    #[test]
+    fn master_started_metronome_clicks_on_the_song_clocks_beats() {
+        // Also across a tempo change in the middle of a beat: the click and
+        // the beats a tempo-synced plugin sees must not drift apart.
+        let (mut engine, mut bus, _m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::TransportPlay);
+        let mut buf = vec![0.0f32; 2];
+        let (mut clicks, mut was_quiet) = (Vec::new(), true);
+        for frame in 0..48000usize * 3 {
+            if frame == 30000 {
+                bus.send(Command::SetBpm { bpm: 90.0 }); // 1.25 beats in
+            }
+            let beats = engine.transport().beats;
+            engine.render(&mut buf, 2);
+            // CLICK_FRAMES of 1 kHz decay follow each onset; an onset is the
+            // first loud frame after the previous click died away.
+            let loud = buf[0].abs() > 1e-4;
+            if loud && was_quiet && clicks.last().map_or(true, |&(f, _)| frame - f > super::CLICK_FRAMES) {
+                clicks.push((frame, beats));
+            }
+            was_quiet = !loud;
+        }
+        assert!(clicks.len() >= 5, "expected a click per beat, got {clicks:?}");
+        for (frame, beats) in &clicks {
+            // The 1 kHz burst starts at a zero crossing: its first loud frame
+            // is one or two frames after the beat.
+            let off_beat = (beats - beats.round()).abs();
+            assert!(off_beat < 3.0 * 120.0 / (60.0 * 48000.0), "click at frame {frame} is {off_beat:.5} beats off the beat ({beats:.5})");
+        }
     }
 
     #[test]

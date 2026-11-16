@@ -80,6 +80,8 @@ const AUDIO_PULSE_MIN: f32 = 0.05;
 const AUDIO_PULSE_EVERY: f32 = 0.25;
 /// Key LED decay τ (s): 1.0 → the 0.02 lit threshold in ≈0.35 s.
 const KEY_LED_TAU: f32 = 0.09;
+/// How long a mouse-clicked on-screen key sounds.
+const CLICK_NOTE_MS: u64 = 450;
 /// How often hardware MIDI inputs are rescanned for hot-plugged devices.
 const HW_RESCAN_SECS: f32 = 2.0;
 /// Unit activity LED decay τ (s).
@@ -6856,9 +6858,16 @@ impl DemoApp {
         self.assistant_rect = Rect::NOTHING;
         self.assistant_input_rect = Rect::NOTHING;
         if let Some(semi) = note {
-            self.current_source = SourceId::Keys;
-            self.fire_keys((base + semi).min(127), 0.95);
+            self.click_note((base + semi).min(127));
         }
+    }
+
+    /// A mouse click on an on-screen key: a note of `CLICK_NOTE_MS`, released
+    /// by the note-off scheduler (a click has no key-up to send one).
+    fn click_note(&mut self, note: usize) {
+        self.current_source = SourceId::Keys;
+        self.fire_keys(note, 0.95);
+        self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note));
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -7425,6 +7434,8 @@ impl DemoApp {
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
         self.agent_activity.prune(self.ui_time);
+        let now_t = self.ui_time;
+        self.ui_node_grace.retain(|_, until| *until > now_t);
         // `--demo-agent` keeps its touch fresh so the screenshot hook always
         // shows the highlight (not a 2.6s-faded rack).
         if self.demo_agent_hold {
@@ -8044,10 +8055,7 @@ impl DemoApp {
                     Hit::Knob { unit, idx } => {
                         self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
                     }
-                    Hit::Key(semi) => {
-                        self.current_source = SourceId::Keys;
-                        self.fire_keys(60 + semi, 0.95);
-                    }
+                    Hit::Key(semi) => self.click_note(60 + semi),
                     Hit::Jack { unit, jack } if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
                         // Shift on an occupied output = fan out a new cable
@@ -9729,11 +9737,15 @@ impl DemoApp {
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
             self.toggle_dock(DockView::Assistant);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
-            self.toggle_dock(DockView::Assistant);
-        }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
-            self.toggle_dock(DockView::Keyboard);
+        // Letter shortcuts yield to a focused text field (rule 12): 'c' / 'v'
+        // typed into the chat must land in the chat, not swap the dock.
+        if !typing(&ctx) {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+                self.toggle_dock(DockView::Assistant);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
+                self.toggle_dock(DockView::Keyboard);
+            }
         }
 
         // Per-rig input selection strip (top, includes the transport row), then
@@ -13332,6 +13344,42 @@ mod ui_polish_agent_tests {
         run_frame(&mut app, &ctx, size, vec![key(false)]);
         assert_eq!(app.chat_input, "a", "assistant dock types into chat: {:?}", app.chat_input);
         assert!(events.lock().unwrap().is_empty(), "assistant dock fires no note");
+    }
+
+    #[test]
+    fn typing_c_and_v_in_the_chat_stays_in_the_chat() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        app.dock = DockView::Assistant;
+        app.focus_chat_request = true;
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        for (k, ch) in [(Key::C, "c"), (Key::V, "v")] {
+            let ev = |pressed| egui::Event::Key { key: k, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE };
+            run_frame(&mut app, &ctx, size, vec![ev(true), egui::Event::Text(ch.into())]);
+            run_frame(&mut app, &ctx, size, vec![ev(false)]);
+        }
+        assert_eq!(app.chat_input, "cv", "letters reach the chat");
+        assert_eq!(app.dock, DockView::Assistant, "typing does not swap the dock");
+    }
+
+    #[test]
+    fn a_clicked_on_screen_key_is_released() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<NoteEvent>::new()));
+        let log = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |e| log.lock().unwrap().push(e))));
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        let c = DemoApp::dock_key_rect(app.dock_kb_rect, 0).center();
+        click_at(&mut app, &ctx, size, c);
+        std::thread::sleep(std::time::Duration::from_millis(CLICK_NOTE_MS + 50));
+        run_frame(&mut app, &ctx, size, vec![]);
+        let ev = events.lock().unwrap();
+        assert!(ev.iter().any(|e| e.velocity > 0.0), "the click plays a note");
+        assert!(ev.iter().any(|e| e.velocity == 0.0), "and releases it: {:?}", ev.iter().map(|e| (e.note, e.velocity)).collect::<Vec<_>>());
     }
 
     #[test]

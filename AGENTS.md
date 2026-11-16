@@ -289,6 +289,14 @@ Learned so far (2026-11-15, UI polish pass):
     "connected" and the keyboard stayed dead. The hot-plug pass reads
     /proc/asound/seq/clients (`alsa_port_subscribed`) and reconnects stale
     ports.
+62. **Level after the limiter is made up, and the last stage is bounded:**
+    the limiter (ceiling 0.7) fed `tanh` with no make-up, so the master
+    peaked at −2.3…−4.4 dBFS at full volume ("the master is so low"). Make-up
+    maps the ceiling to −1 dBFS; because the zero-latency limiter overshoots
+    on chord onsets for ~1 ms, a final soft knee (`MasterLimiter::knee`,
+    transparent below −3 dBFS) keeps every sample ≤ −1 dBFS — make-up alone
+    measured +3.3 dBFS. Meters showing what users hear are dB-scaled
+    (`meter_db_pos`), never linear amplitude.
 
 ## Working on kabelsalat
 

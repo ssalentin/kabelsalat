@@ -1019,7 +1019,7 @@ fn make_unit(node: &Node) -> Unit {
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
-            vec![knob("VOLUME", 0.8, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
+            vec![knob("VOLUME", 1.0, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             // L · R as a stereo pair, MONO apart (between them it read as a
             // center channel — vision review).
             vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
@@ -9438,11 +9438,11 @@ impl DemoApp {
                                     // Meter + dB scale: a labeled peak meter, not a missing fader.
                                     let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
                                     let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
-                                    paint_meter(ui.painter(), mr, self.meter, self.meter_peak);
+                                    paint_meter(ui.painter(), mr, meter_db_pos(self.meter), meter_db_pos(self.meter_peak));
                                     for db in [0.0f32, -6.0, -12.0, -24.0, -48.0] {
                                         // Labels only (a tick hairline beside "0" read as "-0"),
                                         // with a real minus sign.
-                                        let y = mr.bottom() - mr.height() * 10f32.powf(db / 20.0);
+                                        let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
                                         let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
                                         ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
                                             label, FontId::monospace(9.5), theme::CREAM_DIM);
@@ -9884,7 +9884,7 @@ impl DemoApp {
     fn draw_meter(&self, painter: &egui::Painter, unit: usize) {
         let (x, bottom, pitch) = self.meter_geom(unit);
         let n = METER_SEGS;
-        let lit = lit_segments(self.meter, n);
+        let lit = lit_segments(meter_db_pos(self.meter), n);
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
@@ -9895,8 +9895,8 @@ impl DemoApp {
             painter.rect_filled(self.xf.rect(seg), 1.0, fill);
         }
         // Peak-hold tick: 2px, accent — clip red once the peak hits ≥ 0.9.
-        if self.meter_peak > 0.02 {
-            let i = ((self.meter_peak * n as f32).ceil() as usize).clamp(1, n) - 1;
+        if meter_db_pos(self.meter_peak) > 0.02 {
+            let i = ((meter_db_pos(self.meter_peak) * n as f32).ceil() as usize).clamp(1, n) - 1;
             let tick = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch - 2.0),
                 Vec2::new(22.0, 2.0),
@@ -10488,7 +10488,7 @@ impl DemoApp {
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
-            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.8) * 0.85)
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 1.0) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
@@ -10884,6 +10884,14 @@ fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>
 /// Lit segments of an n-segment meter. Below the -60 dBFS floor (0.001)
 /// nothing lights: the smoothed meter decays toward zero without reaching
 /// it, and `ceil` of a 1e-9 tail kept one segment lit forever in silence.
+/// Master meter position for a linear peak: a dB scale from −60 dB (0.0)
+/// to 0 dBFS (1.0), like a mixer. Linear amplitude made a healthy −12 dBFS
+/// light a quarter of the meter ("the master is so low").
+fn meter_db_pos(amp: f32) -> f32 {
+    if !(amp > 0.0) { return 0.0; }
+    ((20.0 * amp.log10() + 60.0) / 60.0).clamp(0.0, 1.0)
+}
+
 fn lit_segments(level: f32, n: usize) -> usize {
     if level < 0.001 { return 0; }
     ((level.min(1.0) * n as f32).ceil() as usize).min(n)
@@ -12645,6 +12653,12 @@ mod rig_switch_tests {
 
     #[test]
     fn silent_meters_light_nothing() {
+        // Master meter in dB: −12 dBFS sits at 80 %, not at a linear 25 %.
+        assert!((meter_db_pos(10f32.powf(-12.0 / 20.0)) - 0.8).abs() < 1e-4);
+        assert!((meter_db_pos(1.0) - 1.0).abs() < 1e-6 && meter_db_pos(2.0) == 1.0);
+        assert_eq!(meter_db_pos(0.0005), 0.0, "below −60 dB is dark");
+        assert_eq!(meter_db_pos(f32::NAN), 0.0);
+        assert!(lit_segments(meter_db_pos(0.25), 14) >= 11, "a healthy −12 dBFS lights most of the meter");
         assert_eq!(lit_segments(0.0, 14), 0);
         assert_eq!(lit_segments(1e-9, 14), 0, "a decaying tail is silence");
         assert_eq!(lit_segments(0.0009, 14), 0);

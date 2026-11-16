@@ -654,7 +654,7 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
-            master_vol: 0.8,
+            master_vol: 1.0,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             transport: Transport::stopped(96.0),
@@ -2096,12 +2096,12 @@ impl GraphEngine {
                 }
             }
             let drive = 1.0 + self.master_warm * 3.0;
-            let vol = self.master_vol;
+            let vol = self.master_vol * MasterLimiter::makeup(drive);
             let lim = &mut self.master_lim;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
                 let g = lim.gain_for(acc[i * 2], acc[i * 2 + 1]);
-                let l = (acc[i * 2] * g * drive).tanh() * vol;
-                let r = (acc[i * 2 + 1] * g * drive).tanh() * vol;
+                let l = MasterLimiter::knee((acc[i * 2] * g * drive).tanh() * vol);
+                let r = MasterLimiter::knee((acc[i * 2 + 1] * g * drive).tanh() * vol);
                 peak = peak.max(l.abs()).max(r.abs());
                 frame[0] = l;
                 if ch > 1 {
@@ -2144,6 +2144,32 @@ struct MasterLimiter {
 impl MasterLimiter {
     /// Summed level a single loud voice reaches; more voices are held here.
     const CEILING: f32 = 0.7;
+    /// Output peak of the whole master chain at VOLUME 100%: −1 dBFS. The
+    /// limiter ceiling is mapped through the saturation and made up to this,
+    /// so the headroom it buys is not lost as level (was −2.3…−4.4 dBFS).
+    const OUT_PEAK: f32 = 0.891;
+
+    /// Make-up gain after `tanh(x * drive)`: maps the limiter ceiling to
+    /// `OUT_PEAK` for any WARM drive. Saturation (rule 49) is unchanged —
+    /// the tanh input is the same; only the level after it moves.
+    fn makeup(drive: f32) -> f32 {
+        Self::OUT_PEAK / (Self::CEILING * drive).tanh()
+    }
+
+    /// Below this output level the knee is transparent (−3 dBFS).
+    const KNEE: f32 = 0.708;
+
+    /// Final soft knee: identity up to `KNEE`, then glides into `OUT_PEAK`
+    /// and never beyond. The limiter has a 1 ms attack (zero latency), so a
+    /// chord onset overshoots it for a moment; with make-up gain that
+    /// overshoot reached +3.3 dBFS — digital clipping. The knee bounds it.
+    #[inline]
+    fn knee(y: f32) -> f32 {
+        let a = y.abs();
+        if a <= Self::KNEE { return y; }
+        let room = Self::OUT_PEAK - Self::KNEE;
+        (Self::KNEE + room * ((a - Self::KNEE) / room).tanh()).copysign(y)
+    }
 
     fn new(sample_rate: f64) -> Self {
         let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
@@ -2233,6 +2259,30 @@ mod master_limiter_tests {
             g = lim.gain_for(x, x);
         }
         assert!((x * g - MasterLimiter::CEILING).abs() < 0.02, "after 10 ms the sum is held: {}", x * g);
+    }
+
+    #[test]
+    fn full_volume_reaches_minus_one_dbfs_and_never_beyond() {
+        // The whole master chain at VOLUME 100%: limiter → tanh(WARM) → make-up.
+        for warm in [0.0f32, 0.15, 0.5, 1.0] {
+            let drive = 1.0 + warm * 3.0;
+            let makeup = MasterLimiter::makeup(drive);
+            let mut lim = MasterLimiter::new(48000.0);
+            let mut peak = 0.0f32;
+            for i in 0..48000 {
+                let x = 4.0 * (i as f32 * 0.05).sin(); // a chord far above the ceiling
+                let g = lim.gain_for(x, x);
+                peak = peak.max(MasterLimiter::knee((x * g * drive).tanh() * makeup).abs());
+            }
+            let db = 20.0 * peak.log10();
+            assert!(db <= -0.99 && db > -1.6, "warm {warm}: master peak {db:.2} dBFS (was −2.3…−4.4 before make-up)");
+        }
+        // A quiet single voice gets the make-up too (no longer 2–4 dB down).
+        let quiet = 0.1f32;
+        let out = MasterLimiter::knee((quiet * 1.45).tanh() * MasterLimiter::makeup(1.45));
+        assert!(out > quiet * 1.6, "make-up lifts a quiet voice: {out}");
+        assert_eq!(MasterLimiter::knee(0.5), 0.5, "the knee is transparent below −3 dBFS");
+        assert!(MasterLimiter::knee(5.0) <= MasterLimiter::OUT_PEAK && MasterLimiter::knee(-5.0) >= -MasterLimiter::OUT_PEAK, "bounded both ways");
     }
 
     #[test]

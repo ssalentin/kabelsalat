@@ -80,6 +80,8 @@ struct State {
     count_in_bars: u8,
     /// Headless CC binding mirror keyed by (source, dest).
     cc_maps: std::collections::HashMap<(SourceId, NodeId), Vec<crate::matrix::CcMapping>>,
+    /// Recorder status (headless): the shared handle the engine's tap writes.
+    record: Arc<crate::record::RecorderShared>,
 }
 
 #[derive(Clone)]
@@ -1485,6 +1487,43 @@ impl McpServer {
         let _ = crate::assistant::save_count_in(enabled, bars);
         ok_json(json!({"enabled": enabled, "bars": bars}))
     }
+
+    /// Start recording the master output.
+    #[tool(name = "record_start", description = "Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/ (Command::RecordStart). Idempotent: a second start while recording is a no-op.")]
+    fn record_start(&self) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::RecordStart) {
+            return tool_err(e);
+        }
+        ok_json(json!({"recording": true}))
+    }
+
+    /// Stop recording.
+    #[tool(name = "record_stop", description = "Stop recording (Command::RecordStop): the writer drains the ring and finalizes the WAV header. Idempotent: a stop while idle is a no-op.")]
+    fn record_stop(&self) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::RecordStop) {
+            return tool_err(e);
+        }
+        ok_json(json!({"recording": false}))
+    }
+
+    /// Recording status: path, elapsed seconds, dropped frames.
+    #[tool(name = "record_status", description = "Get recording status: recording (bool), path (the last/finalized WAV), seconds (elapsed), dropped_frames (ring overruns), finalized.")]
+    fn record_status(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            let reply = match bridge::request(&json!({"op": "query", "name": "get_record"})) {
+                Ok(r) => r,
+                Err(e) => return tool_err(format!("{e:#}")),
+            };
+            if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                return tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("bridge query failed"));
+            }
+            return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
+        }
+        ok_json(serde_json::to_value(st.record.snapshot()).unwrap_or(json!({})))
+    }
 }
 
 #[tool_handler(
@@ -1525,6 +1564,7 @@ struct AudioHandles {
     graph_pub: Arc<Mutex<GraphPub>>,
     sample_rate: f64,
     live: bool,
+    record: Arc<crate::record::RecorderShared>,
 }
 
 /// Prefer the native PipeWire host (same policy as the app), fall back to
@@ -1579,6 +1619,8 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     engine.set_rig_snapshot(rigs);
     let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
+    let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
+    engine.set_recorder(recorder_tap);
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -1589,7 +1631,7 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
         None,
     )?;
     stream.play()?;
-    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, sample_rate, live: true })
+    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, sample_rate, live: true, record })
 }
 
 /// No audio device (or plugin failure): keep the engine rendering into a
@@ -1601,6 +1643,8 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     engine.set_rig_snapshot(rigs);
     let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
+    let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
+    engine.set_recorder(recorder_tap);
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())
@@ -1612,7 +1656,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
             }
         })
         .expect("spawning dummy audio thread");
-    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, sample_rate, live: false }
+    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, sample_rate, live: false, record }
 }
 
 fn build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
@@ -1681,6 +1725,7 @@ pub fn run() -> anyhow::Result<()> {
         count_in_enabled: ci_enabled,
         count_in_bars: ci_bars,
         cc_maps: std::collections::HashMap::new(),
+        record: audio.record,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout);
@@ -1710,6 +1755,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         count_in_enabled: false,
         count_in_bars: 1,
         cc_maps: std::collections::HashMap::new(),
+        record: Arc::new(crate::record::RecorderShared::new()),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -1785,6 +1831,7 @@ mod tests {
             count_in_enabled: false,
             count_in_bars: 1,
             cc_maps: std::collections::HashMap::new(),
+            record: Arc::new(crate::record::RecorderShared::new()),
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),

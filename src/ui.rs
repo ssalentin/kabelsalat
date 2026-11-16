@@ -646,6 +646,45 @@ fn nav_separator(ui: &mut egui::Ui) {
     );
 }
 
+/// The REC chip: tomato fill + a filled dot only while recording (Hurricane:
+/// tomato is reserved for the active record state); a calm dark chip with a
+/// dim open dot when idle. `secs` shows elapsed time while recording.
+fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
+    let (fill, stroke, txt) = if recording {
+        (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::DARK_PANEL)
+    } else {
+        (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
+    };
+    let dot = if recording { "●" } else { "○" };
+    let label = if recording { format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60) } else { format!("{dot} REC") };
+    ui.scope(|ui| {
+        let base = egui::style::WidgetVisuals {
+            bg_fill: fill,
+            weak_bg_fill: fill,
+            bg_stroke: Stroke::new(1.0, stroke),
+            corner_radius: 2.0.into(),
+            fg_stroke: Stroke::new(1.0, txt),
+            expansion: 0.0,
+        };
+        let hot = egui::style::WidgetVisuals {
+            bg_fill: if recording { theme::mix(theme::ACCENT_DEEP, theme::INK, 0.08) } else { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07) },
+            weak_bg_fill: fill,
+            ..base
+        };
+        let v = ui.visuals_mut();
+        v.widgets.inactive = base;
+        v.widgets.hovered = hot;
+        v.widgets.active = hot;
+        v.widgets.open = base;
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).size(12.5).color(txt))
+                .corner_radius(2.0)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+    }).inner
+}
+
 /// Build a rack unit from a control-plane node. The face (jacks + knobs) is
 /// chosen by node kind; known kinds keep their bespoke faces, other DSP kinds
 /// get a generic labeled box with 1–2 knobs bound to engine params 0/1.
@@ -1199,6 +1238,13 @@ struct DemoApp {
     last_graph_rev: u64,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
+    /// Master recorder status (engine writes `recording`/`dropped`; the writer
+    /// thread owns the path/seconds). Read-only here — the REC button sends
+    /// RecordStart/Stop through the command bus, the engine stays authoritative.
+    recorder: Option<std::sync::Arc<crate::record::RecorderShared>>,
+    /// "Sync to transport" toggle mirror (the engine is authoritative via
+    /// Command::SetRecordSync; this only drives the chip's display).
+    record_sync: bool,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
 
@@ -1370,6 +1416,8 @@ impl DemoApp {
             graph_pub: None,
             last_graph_rev: 0,
             player_ctrl: None,
+            recorder: None,
+            record_sync: false,
             graph_sig: Vec::new(),
             editor_open: false,
             editor_rig: 0,
@@ -3118,6 +3166,24 @@ impl DemoApp {
                 self.master_transport(false);
                 "master transport stopped (every metronome stops)".into()
             }
+            "record_start" => {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::RecordStart);
+                }
+                "recording started (master output → ~/Music/kabelsalat/)".into()
+            }
+            "record_stop" => {
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::RecordStop);
+                }
+                "recording stopped".into()
+            }
+            "record_status" => match &self.recorder {
+                Some(r) => serde_json::to_value(r.snapshot())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|e| format!("record status: {e}")),
+                None => "{\"recording\":false,\"available\":false}".into(),
+            },
             "set_node_playing" => {
                 let Some(node) = args.get("node").and_then(|v| v.as_u64()) else {
                     return "set_node_playing needs 'node' (id from get_graph)".into();
@@ -4667,6 +4733,28 @@ impl DemoApp {
                     if nav_button(ui, "Assistant", self.show_assistant) {
                         self.show_assistant = !self.show_assistant;
                     }
+                    // Master recording (GitHub #6): a REC chip (tomato only
+                    // while recording) + a sync-to-transport toggle + elapsed
+                    // time while active. Start/stop go through the command bus.
+                    ui.add_space(6.0);
+                    nav_separator(ui);
+                    ui.add_space(6.0);
+                    let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
+                    let secs = self.recorder.as_ref().map(|r| r.snapshot().seconds).unwrap_or(0.0);
+                    if rec_chip(ui, recording, secs).on_hover_text("record the master output to ~/Music/kabelsalat/").clicked() {
+                        self.toggle_recording();
+                    }
+                    ui.add_space(6.0);
+                    let sync = self.record_sync;
+                    if theme::chip_button(ui, "SYNC", sync)
+                        .on_hover_text("start/stop recording with the master transport (Space)")
+                        .clicked()
+                    {
+                        self.record_sync = !sync;
+                        if let Some(bus) = &self.bus {
+                            let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
+                        }
+                    }
                     // Telemetry IN the page (D toggles): right-aligned bar text.
                     if self.show_stats {
                         let line = self.stats_text();
@@ -5429,6 +5517,16 @@ impl DemoApp {
             self.count_in_beat = 0;
         }
         self.master_transport(self.playing);
+    }
+
+    /// Toggle master recording (REC chip). The engine is the authority: it
+    /// flips the recorder's recording flag and messages the writer thread.
+    fn toggle_recording(&mut self) {
+        let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
+        if let Some(bus) = &self.bus {
+            let cmd = if recording { Command::RecordStop } else { Command::RecordStart };
+            let _ = bus.lock().unwrap().send(cmd);
+        }
     }
 
     /// Master transport (Space, masthead circle, transport window, assistant
@@ -8280,6 +8378,7 @@ struct BuiltAudio {
     level: Arc<std::sync::atomic::AtomicU32>,
     sample_rate: f64,
     player_ctrl: crate::player::PlayerControl,
+    recorder: std::sync::Arc<crate::record::RecorderShared>,
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
     edge_levels: Arc<EdgeLevels>,
@@ -8352,6 +8451,11 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // File player (backing track): decode thread + ring; UI holds the control.
     let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
     engine.set_player_sink(player_sink);
+    // Master recorder: writer thread + ring; engine holds the tap, the UI (and
+    // the bridge via LIVE_RECORDER) hold the shared status.
+    let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
+    engine.set_recorder(recorder_tap);
+    let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
@@ -8401,6 +8505,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         level,
         sample_rate,
         player_ctrl,
+        recorder,
         rig_snapshot,
         graph_pub,
         edge_levels,
@@ -8504,6 +8609,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             sample_rate,
                             player_ctrl,
+                            recorder,
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
@@ -8548,6 +8654,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             shared_graph,
                             player_ctrl,
+                            recorder,
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
@@ -8570,6 +8677,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     level,
                     shared_graph,
                     player_ctrl,
+                    recorder,
                     rig_snapshot,
                     graph_pub,
                     edge_levels,
@@ -8579,6 +8687,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
+                    app.recorder = Some(recorder);
                     app.with_audio(
                         mains,
                         controllers,

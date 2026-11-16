@@ -24,6 +24,7 @@ use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
+use crate::record::RecorderTap;
 use crate::transport::{CountInConfig, MasterClock, Transport};
 
 /// Max hardware MIDI device ids pre-routed in the matrix (per-rig filter selects).
@@ -390,6 +391,12 @@ pub struct GraphEngine {
     // Runtime CLAP voice delivery + retirement side channels (UI <-> audio).
     voice_rx: Option<rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>>,
     voice_retire_tx: Option<rtrb::Producer<ClapVoice>>,
+    // Master recording tap (the final output). None = recording unavailable
+    // (headless tests, silent demo). The tap's ring producer is pushed from
+    // the render path; its `recording` flag is the authority on start/stop.
+    recorder: Option<RecorderTap>,
+    // "Sync to transport": start recording on master Play, stop on Stop.
+    record_sync: bool,
 }
 
 impl GraphEngine {
@@ -484,6 +491,8 @@ impl GraphEngine {
             player_buf: vec![0.0; 8192 * 2],
             voice_rx: None,
             voice_retire_tx: None,
+            recorder: None,
+            record_sync: false,
         }
     }
 
@@ -505,6 +514,25 @@ impl GraphEngine {
     /// Attach the file-player ring consumer (decode thread started elsewhere).
     pub fn set_player_sink(&mut self, sink: PlayerSink) {
         self.player_sink = Some(sink);
+    }
+
+    /// Attach the master recording tap (writer thread started elsewhere).
+    pub fn set_recorder(&mut self, tap: RecorderTap) {
+        self.recorder = Some(tap);
+    }
+
+    /// Start recording the master output (idempotent). No-op without a tap.
+    fn record_start(&mut self) {
+        if let Some(rec) = &self.recorder {
+            rec.begin();
+        }
+    }
+
+    /// Stop recording (idempotent). No-op without a tap.
+    fn record_stop(&mut self) {
+        if let Some(rec) = &self.recorder {
+            rec.stop();
+        }
     }
 
     pub fn graph(&self) -> &Graph {
@@ -1165,6 +1193,9 @@ impl GraphEngine {
                     self.transport_dirty = true;
                 }
             }
+            Command::RecordStart => self.record_start(),
+            Command::RecordStop => self.record_stop(),
+            Command::SetRecordSync { on } => self.record_sync = on,
         }
     }
 
@@ -1220,6 +1251,14 @@ impl GraphEngine {
             }
             if changed {
                 self.publish_graph();
+            }
+        }
+        // Sync-to-transport: recording follows the master transport.
+        if self.record_sync {
+            if playing {
+                self.record_start();
+            } else {
+                self.record_stop();
             }
         }
     }
@@ -1528,6 +1567,11 @@ impl GraphEngine {
                 for s in frame.iter_mut().skip(2) {
                     *s = 0.0;
                 }
+            }
+            // Record tap: the final output (post master vol/warm), what the
+            // user hears. RT-safe — push never blocks; a full ring drops frames.
+            if let Some(rec) = &mut self.recorder {
+                rec.push_stereo(data, ch);
             }
         }
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);

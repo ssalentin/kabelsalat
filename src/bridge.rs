@@ -336,8 +336,18 @@ fn handle_line_with_pub(
                     "active_rig": active_rig,
                 }})
             }
+            Some("get_record") => {
+                let rec = match crate::record::LIVE_RECORDER.get() {
+                    Some(r) => r.snapshot(),
+                    None => crate::record::RecordStatus::default(),
+                };
+                match serde_json::to_value(rec) {
+                    Ok(data) => json!({"ok": true, "data": data}),
+                    Err(e) => err_reply(format!("serializing record status: {e}")),
+                }
+            }
             other => err_reply(format!(
-                "unknown query '{}' (use get_graph|get_status|get_rigs)",
+                "unknown query '{}' (use get_graph|get_status|get_rigs|get_record)",
                 other.unwrap_or("<missing>")
             )),
         },

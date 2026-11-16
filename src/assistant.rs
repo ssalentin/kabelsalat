@@ -418,6 +418,21 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
+            "name":"record_start",
+            "description":"Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/. Idempotent: a second start while recording is a no-op.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"record_stop",
+            "description":"Stop recording: the writer drains the ring and finalizes the WAV header. Idempotent: a stop while idle is a no-op.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"record_status",
+            "description":"Get recording status: recording (bool), path (the last/take WAV), seconds (elapsed), dropped_frames (ring overruns), finalized.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
             "name":"set_node_playing",
             "description":"Start or stop ONE rack instrument that has its own transport (a metronome) without touching the others. node = node id from get_graph.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"playing":{"type":"boolean"}},"required":["node","playing"]}

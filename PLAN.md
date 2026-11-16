@@ -741,9 +741,10 @@ Everything queued lives here; update this section as work lands.
      set_param, ...) bypass the app and are not undoable yet — route them through
      the UI bridge when attached. Per-voice rig sources (keyboard/hardware toggles)
      are not in the snapshot.
-  3. **Capability discovery (S):** `catalog` (every tool + args, derived from
-     `tools()`) and `can` (actions valid for the rig in view) to keep a growing tool
-     surface honest.
+  3. **Capability discovery — deferred:** both frontends already hand the model the
+     full typed tool list (assistant tool schema, MCP tools/list); Bravo needs a
+     catalog because 672 actions hide behind 13 tools. Revisit if our tool count
+     outgrows the schema (> ~80 tools) or the agent starts inventing verbs.
   4. **Loudness target (S, after 1):** `set_master_target` (−14/−16/−8 LUFS or a
      number, true peak ≤ −1 dBTP) driving master gain before the limiter (rule 49).
   5. **Sends as a typed command (M, extends #5):** `set_send(rig|node, bus, amount)`

@@ -530,6 +530,7 @@ impl RuleEdit {
             && self.vel_hi == 127
             && self.enabled
             && self.cc_map.is_empty()
+            && !self.cc_only
     }
     fn set_cc(&mut self, cc: u8, param: u32) {
         let cc = cc & 0x7F;

@@ -974,10 +974,16 @@ impl GraphEngine {
     /// set every transport-capable node's flag and slot clock; publish only
     /// when a flag actually changed (frontends mirror it from GraphPub).
     fn master_transport(&mut self, playing: bool) {
+        // The song starts at beat 0: a metronome already running on its own
+        // restarts with it, or it would click off the plugins' beats.
+        let song_starts = playing && !self.transport.playing;
         self.transport.set_playing(playing);
         let changed = self.graph.set_all_playing(playing);
         for d in &mut self.dsp {
             if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
+                if song_starts {
+                    d.transport.set_playing(false);
+                }
                 d.transport.set_playing(playing);
             }
         }
@@ -1682,6 +1688,35 @@ mod tests {
         bus.send(Command::TransportPlay);
         let t = run(&mut engine, 50);
         assert!((t.beats - 0.5).abs() < 1e-9 && (t.seconds - 0.5).abs() < 1e-9, "play rewinds to beat 0: {t:?}");
+    }
+
+    #[test]
+    fn master_play_realigns_a_metronome_that_was_already_running() {
+        // Started alone (or restored playing from a session), then the master
+        // starts the song: the click must land on the song clock's beats.
+        let (mut engine, mut bus, m1, _m2, _pub) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetNodePlaying { node: m1, playing: true });
+        let mut buf = vec![0.0f32; 2];
+        for _ in 0..12000 {
+            engine.render(&mut buf, 2); // half a beat at 120 BPM
+        }
+        bus.send(Command::TransportPlay);
+        let (mut clicks, mut was_quiet) = (Vec::new(), true);
+        for frame in 0..48000usize * 2 {
+            let beats = engine.transport().beats;
+            engine.render(&mut buf, 2);
+            let loud = buf[0].abs() > 1e-4;
+            if loud && was_quiet && clicks.last().map_or(true, |&(f, _)| frame - f > super::CLICK_FRAMES) {
+                clicks.push((frame, beats));
+            }
+            was_quiet = !loud;
+        }
+        assert!(clicks.len() >= 3, "expected a click per beat, got {clicks:?}");
+        for (frame, beats) in &clicks {
+            let off_beat = (beats - beats.round()).abs();
+            assert!(off_beat < 3.0 * 120.0 / (60.0 * 48000.0), "click at frame {frame} is {off_beat:.5} beats off the song beat ({beats:.5})");
+        }
     }
 
     #[test]

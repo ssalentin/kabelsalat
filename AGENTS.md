@@ -206,6 +206,10 @@ Learned so far (2026-11-15, UI polish pass):
     layout LoadRigs produces) before `apply_session` uses it; knobs, plugin
     states and matrix routes follow their node via one remap. A removed
     rig-A unit shifted rig B's ids, and a restored route landed on Master.
+45. **WAV writers count samples, never floored frames:** the audio thread's
+    L/R push can split across two ring drains, so `n / channels` per drain
+    under-counted the header by 2–151 frames while the data was right.
+    `record-test` reads the file back and compares it sample for sample.
 
 ## Ground rules
 

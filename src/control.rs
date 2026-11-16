@@ -614,6 +614,17 @@ pub enum Command {
     SetCountIn { enabled: bool, bars: u8 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },
+    /// Start recording the final master output to a new timestamped WAV under
+    /// ~/Music/kabelsalat/. Idempotent — a second start while recording is a
+    /// no-op. The writer thread generates the path, so no path crosses the
+    /// fixed-size bus.
+    RecordStart,
+    /// Stop recording: the writer drains the ring and finalizes the WAV header.
+    /// Idempotent — a stop while idle is a no-op.
+    RecordStop,
+    /// "Sync to transport": while on, master TransportPlay starts a recording
+    /// and TransportStop stops it (recording follows the master transport).
+    SetRecordSync { on: bool },
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).
@@ -724,6 +735,9 @@ mod tests {
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None },
+            Command::RecordStart,
+            Command::RecordStop,
+            Command::SetRecordSync { on: true },
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();

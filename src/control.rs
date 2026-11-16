@@ -641,6 +641,10 @@ pub enum Command {
     /// "Sync to transport": while on, master TransportPlay starts a recording
     /// and TransportStop stops it (recording follows the master transport).
     SetRecordSync { on: bool },
+    /// Reset the master-bus loudness meter (Bravo 1 "measure loop"): clears
+    /// the integrated-loudness gate, windows, true-peak hold and band/LFE
+    /// accumulators so a fresh integrated measurement starts now.
+    ResetMeter,
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).
@@ -768,6 +772,7 @@ mod tests {
             Command::RecordStart,
             Command::RecordStop,
             Command::SetRecordSync { on: true },
+            Command::ResetMeter,
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();

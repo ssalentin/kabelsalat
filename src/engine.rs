@@ -23,6 +23,7 @@ use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
+use crate::meter::{MasterMeter, MeterSnapshot};
 use crate::player::PlayerSink;
 use crate::record::RecorderTap;
 use crate::transport::{CountInConfig, MasterClock, Transport};
@@ -399,6 +400,10 @@ pub struct GraphPub {
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
+    /// Master-bus loudness/peak/band meter (Bravo 1 "measure loop"), bumped by
+    /// `meter_rev` every render block via a non-blocking `try_lock` (rule 33).
+    pub meter: MeterSnapshot,
+    pub meter_rev: u64,
 }
 
 pub struct GraphEngine {
@@ -487,6 +492,8 @@ pub struct GraphEngine {
     // A synced take is armed but not started until the song clock reaches
     // beat 0 (after any count-in); see render().
     record_sync_pending: bool,
+    // Master-bus meter (Bravo 1): fed the final stereo output every block.
+    meter: MasterMeter,
 }
 
 impl GraphEngine {
@@ -589,6 +596,7 @@ impl GraphEngine {
             recorder: None,
             record_sync: false,
             record_sync_pending: false,
+            meter: MasterMeter::new(sample_rate),
         }
     }
 
@@ -828,8 +836,27 @@ impl GraphEngine {
         }
     }
 
+    /// Publish the master meter snapshot (Bravo 1). Called from the render
+    /// path every block: a fixed-size Copy under a NON-blocking `try_lock`
+    /// (never waits on the UI; if busy, the fresh snapshot goes out next
+    /// block — rule 33). Snapshot is computed only when a publication handle
+    /// is attached and the lock succeeds.
+    fn publish_meter(&mut self) {
+        let Some(p) = &self.graph_pub else { return };
+        if let Ok(mut g) = p.try_lock() {
+            g.meter = self.meter.snapshot();
+            g.meter_rev = g.meter_rev.wrapping_add(1);
+        }
+    }
+
     pub fn level_handle(&self) -> Arc<AtomicU32> {
         self.out_peak.clone()
+    }
+
+    /// The master-bus loudness/peak/band snapshot (Bravo 1), for queries and
+    /// the `meter-test` self-test. Computes on demand from the meter's state.
+    pub fn meter_snapshot(&self) -> MeterSnapshot {
+        self.meter.snapshot()
     }
 
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
@@ -1428,6 +1455,10 @@ impl GraphEngine {
                     self.transport_dirty = true;
                 }
             }
+            Command::ResetMeter => {
+                self.meter.reset();
+                self.publish_meter();
+            }
         }
     }
 
@@ -1822,7 +1853,15 @@ impl GraphEngine {
             if let Some(rec) = &mut self.recorder {
                 rec.push_stereo(data, ch);
             }
+            // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
+            // output the user hears.
+            self.meter.process(data, ch);
+        } else {
+            // No master wired: the output is silent. Keep the loudness windows
+            // honest (they must decay, not hold stale energy).
+            self.meter.process_silence(frames);
         }
+        self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
     }
@@ -3509,6 +3548,95 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         "cc-map-test: OK — Surge XT '{}/{}' (id {}) CC74 0→127 moved {:.2}→{:.2}; '{}/{}' (id {}) CC7 0→127 moved {:.2}→{:.2}, RMS {:.4}→{:.4}",
         cutoff.module, cutoff.name, cutoff.id, val_low, val_high,
         gain_p.module, gain_p.name, gain_p.id, g_low, g_high, rms_low, rms_high
+    );
+    Ok(())
+}
+
+/// `kabelsalat meter-test`: render REAL audio through `GraphEngine::render`
+/// (a Surge voice playing notes, as the existing engine self-tests do) and
+/// check the meter reads sane loudness/bands/true-peak against the signal,
+/// plus the reset path. Modeled on `record-test` (rule 37: temp only).
+pub fn meter_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+
+    let (voice, _main) = ClapVoice::new(SR)?;
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, SR, vec![(synth, voice)]);
+
+    // Attach a publication handle so the render path exercises `publish_meter`.
+    let graph_pub = std::sync::Arc::new(std::sync::Mutex::new(GraphPub {
+        rev: 0, graph: crate::control::Graph::default(), rules: Vec::new(), ..Default::default()
+    }));
+    engine.set_graph_pub(graph_pub.clone());
+
+    let mut buf = vec![0.0f32; BLOCK * 2];
+    engine.render(&mut buf, 2); // Surge applies its init patch on the audio thread
+
+    // 1. Held chord for ~1.5 s: the meter (momentary, short-term) must read
+    //    above the silent floor, and bands 2/3 (> 500 Hz) should carry energy.
+    for &n in &[60u8, 64, 67] {
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+    }
+    for _ in 0..(1.5 * SR / BLOCK as f64) as usize {
+        engine.render(&mut buf, 2);
+    }
+    let snap = engine.meter_snapshot();
+    anyhow::ensure!(
+        snap.momentary_lufs > -60.0 && snap.short_term_lufs > -60.0,
+        "a held chord must read above silence: momentary {}, short-term {}",
+        snap.momentary_lufs, snap.short_term_lufs
+    );
+    anyhow::ensure!(
+        snap.band_db[2] > snap.band_db[0].max(snap.band_db[1]) - 10.0 || snap.band_db[3] > snap.band_db[0],
+        "a synth chord should have HF energy: bands {:?}",
+        snap.band_db
+    );
+
+    // 2. True peak must be finite (the limiter caps the sum, so ≥ -1 dBFS-ish).
+    anyhow::ensure!(
+        snap.true_peak_db.is_finite() && snap.true_peak_db > -60.0,
+        "true peak {} should be a real in-range reading", snap.true_peak_db
+    );
+
+    // 3. Integrated loudness accumulates once above the absolute gate.
+    anyhow::ensure!(
+        snap.integrated_lufs.is_finite() && snap.integrated_lufs > -60.0,
+        "integrated loudness should have gated data: {}", snap.integrated_lufs
+    );
+
+    // 4. Reset clears the integration (then silence leaves it NaN).
+    for &n in &[60u8, 64, 67] {
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+    }
+    for _ in 0..8 { engine.render(&mut buf, 2); }
+    bus.send(Command::ResetMeter);
+    engine.render(&mut buf, 2);
+    let after_reset = engine.meter_snapshot();
+    anyhow::ensure!(
+        after_reset.integrated_lufs.is_nan(),
+        "reset must clear the integration gate: {}", after_reset.integrated_lufs
+    );
+    anyhow::ensure!(
+        graph_pub.lock().unwrap().meter_rev > 0,
+        "the meter must publish through GraphPub"
+    );
+
+    println!(
+        "meter-test: OK — chord momentary {:.2} LUFS / short-term {:.2} / integrated {:.2}, true peak {:.2} dBTP, bands {:?}, low-end corr {:.2}",
+        snap.momentary_lufs, snap.short_term_lufs, snap.integrated_lufs,
+        snap.true_peak_db, snap.band_db, snap.low_end_corr
     );
     Ok(())
 }

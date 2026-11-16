@@ -230,7 +230,8 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
-     get_status, list_plugins.\n\
+     get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
+     verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -291,6 +292,11 @@ pub(crate) fn tools() -> Value {
             "name":"get_status",
             "description":"Get current audio/MIDI/UI status of the app, including recent MIDI events",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"measure_mix",
+            "description":"Read the master-bus loudness/profile meter (Bravo measure loop): momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation + a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness measurement now (this resets the integration, not the signal).",
+            "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
         }},
         {"type":"function","function":{
             "name":"play_note",

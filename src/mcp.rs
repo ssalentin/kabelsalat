@@ -277,6 +277,13 @@ struct RecordSyncArgs {
     on: bool,
 }
 
+/// Arguments for `measure_mix`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MeasureMixArgs {
+    /// Restart the integrated-loudness gate from now (default false).
+    reset: Option<bool>,
+}
+
 /// Arguments for `set_rig_device`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRigDeviceArgs {
@@ -802,6 +809,12 @@ impl McpServer {
             Some(t) => (t.playing, t.counting_in, t.count_in_beat, t.count_in_enabled, t.count_in_bars, t.bpm, t.record_sync),
             None => (st.playing, false, 0, st.count_in_enabled, st.count_in_bars, 96.0, st.record_sync),
         };
+        let meter = st
+            .graph_pub
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map(|g| serde_json::to_value(g.meter).unwrap_or_else(|_| json!(null)))
+            .unwrap_or_else(|| json!(null));
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
             "edges": st.graph.edges.len(),
@@ -821,7 +834,37 @@ impl McpServer {
             "midi_latency_ms": bridge::MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
             "rigs": rig_count,
             "active_rig": active_rig,
+            "meter": meter,
         }))
+    }
+
+    /// Master-bus loudness/true-peak/band meter (Bravo 1 "measure loop").
+    #[tool(name = "measure_mix", description = "Read the master-bus loudness/profile meter: momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation with a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness gate.")]
+    fn measure_mix(&self, Parameters(args): Parameters<MeasureMixArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if args.reset == Some(true) {
+            if let Err(e) = send_cmd(&mut st, Command::ResetMeter) {
+                return tool_err(e);
+            }
+        }
+        if matches!(st.backend, Backend::Remote) {
+            let reply = match bridge::request(&json!({"op": "query", "name": "get_status"})) {
+                Ok(r) => r,
+                Err(e) => return tool_err(format!("{e:#}")),
+            };
+            if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+                return tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("bridge query failed"));
+            }
+            let data = reply.get("data").cloned().unwrap_or(Value::Null);
+            return ok_json(data.get("meter").cloned().unwrap_or(Value::Null));
+        }
+        let meter = st
+            .graph_pub
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map(|g| serde_json::to_value(g.meter).unwrap_or_else(|_| json!(null)))
+            .unwrap_or_else(|| json!(null));
+        ok_json(meter)
     }
 
     /// Add a node to the patch.

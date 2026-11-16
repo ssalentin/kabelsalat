@@ -7,6 +7,7 @@
 
 mod assistant;
 mod audio;
+mod audio_in;
 mod bridge;
 mod capture;
 mod control;
@@ -82,8 +83,9 @@ fn main() -> anyhow::Result<()> {
         "cc-map-test" => engine::cc_map_test(),
         "meter-test" => engine::meter_test(),
         "record-test" => record::run_test(),
+        "audio-in-test" => audio_in::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
             std::process::exit(1);
         }
     }

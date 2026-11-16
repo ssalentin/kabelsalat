@@ -277,6 +277,12 @@ Learned so far (2026-11-15, UI polish pass):
     per-voice keyboard/hardware switches were missing, so undoing a later
     job silently turned a switched-off source back on. Test undo with a
     non-default value — a default one passes even when nothing is restored.
+60. **Audio inputs are PipeWire sources, opened by node name:** cpal's ALSA
+    host listed duplicate/0-channel/null devices under non-unique names,
+    "no device" opened the first list entry, and a missing device silently
+    fell back to the laptop mic. List sources via `pactl -f json` (monitors
+    out), capture with `pw-record --target <node>`, and a missing device is
+    "not available" — never another input.
 
 ## Working on kabelsalat
 

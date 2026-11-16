@@ -76,7 +76,7 @@ cpal and PipeWire agree: **zero xruns**.
 ## 5. MIDI (midir / ALSA-seq)
 
 - Ports found: `Midi Through 14:0`, `vibez-midi-in:vibez-midi-listener 128:0`
-  (another app). **No hardware controller attached** (PLAN §11 open item).
+  (another app). **No hardware controller attached** (docs/ARCHITECTURE.md §11 open item).
 - Virtual input port **`kabelsalat-in`** created (client `kabelsalat`, port 0).
 - **Self-test (second midir client in-process):** 8/8 messages received
   (C-major arpeggio note on/off ×3, CC7, pitch bend), 0 dropped; ALSA-seq
@@ -87,7 +87,7 @@ cpal and PipeWire agree: **zero xruns**.
 - Events cross the thread boundary as fixed-size records in a preallocated
   rtrb ring (512 slots); decoding/logging happens off the callback thread.
 
-## 6. Real-time discipline (PLAN §7)
+## 6. Real-time discipline (docs/ARCHITECTURE.md §7)
 
 Callbacks are allocation-free, lock-free, log-free and syscall-free:
 sine phase + atomics only; timing via `Instant::now()` (CLOCK_MONOTONIC through

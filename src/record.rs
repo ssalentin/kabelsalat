@@ -11,7 +11,7 @@
 //! message ring) and is the authority on start/stop; the UI/agents hold the
 //! [`Arc<RecorderShared>`] to read live status and to shut the writer down on
 //! exit. Per-rig stems are not captured yet — the tap sits after the final
-//! master sum, not per-rig (documented in PLAN §13).
+//! master sum, not per-rig (stems: GitHub issue #6).
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};

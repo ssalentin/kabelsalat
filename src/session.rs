@@ -1,4 +1,4 @@
-//! Sessions, undo, starter templates (task-8, PLAN §2b/§7).
+//! Sessions, undo, starter templates (task-8, docs/ARCHITECTURE.md §2b/§7).
 //!
 //! A session is the control-plane [`Graph`] plus knob/param values, opaque
 //! plugin state blobs, and an optional MIDI-matrix config slot. It persists
@@ -57,7 +57,7 @@ pub const STATE_DIR: &str = "state";
 /// Package directory extension.
 pub const PACKAGE_EXT: &str = "ksalat";
 
-/// The Surge XT CLAP id — the reference plugin (PLAN §1), native on ARM.
+/// The Surge XT CLAP id — the reference plugin (docs/ARCHITECTURE.md §1), native on ARM.
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 
 // ---------------------------------------------------------------------------
@@ -781,7 +781,7 @@ impl History {
 }
 
 // ---------------------------------------------------------------------------
-// Starter templates (PLAN §2b: the graph is never a blank page of fear)
+// Starter templates (docs/ARCHITECTURE.md §2b: the graph is never a blank page of fear)
 // ---------------------------------------------------------------------------
 
 /// One-click starting points. Each builds a pre-wired, playable [`Graph`]

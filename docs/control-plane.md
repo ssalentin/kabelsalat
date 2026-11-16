@@ -1,7 +1,7 @@
 # Control plane (P1 keystone, task-6)
 
 `src/control.rs` is the single typed API behind every frontend — the rack UI,
-the built-in assistant, the CLI, and the future MCP server (PLAN §2c). 1:1 MCP
+the built-in assistant, the CLI, and the future MCP server (docs/ARCHITECTURE.md §2c). 1:1 MCP
 parity is structural because all frontends issue the same commands.
 
 ## Model

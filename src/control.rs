@@ -1,4 +1,4 @@
-//! The single control plane (PLAN §2c).
+//! The single control plane (docs/ARCHITECTURE.md §2c).
 //!
 //! The UI, the built-in assistant, the CLI, and the future MCP server are
 //! sibling frontends to this one typed API. Commands mutate the graph; the

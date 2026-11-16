@@ -4,7 +4,10 @@ Pull requests are welcome — bug fixes, plugins that misbehave, UI polish, docs
 new rack units. If you are new here, look for issues labelled
 [`good first issue`](https://github.com/ssalentin/kabelsalat/labels/good%20first%20issue)
 or [`help wanted`](https://github.com/ssalentin/kabelsalat/labels/help%20wanted).
-For a bigger change, open an issue first so we can agree on the shape.
+Comment on an issue before you start so nobody does the same work twice. For a
+bigger change, open an issue first so we can agree on the shape. Planned work is
+grouped into [milestones](https://github.com/ssalentin/kabelsalat/milestones);
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) explains how the app is built.
 
 ## Getting started
 
@@ -23,7 +26,7 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
 - **Evidence.** Every change is proven: tests for behaviour, and **screenshots**
   (before/after) for anything visible. The CLI self-tests
   (`kabelsalat record-test`, `rig-mix-test`, `cc-map-test`, …) cover the
-  real audio paths — see [PLAN.md §0.1](PLAN.md).
+  real audio paths — the full list is in [AGENTS.md](AGENTS.md#working-on-kabelsalat).
 - **A green suite.** `cargo test --bin kabelsalat` must pass.
 - **The project rules.** [AGENTS.md](AGENTS.md) lists rules learned from real
   bugs (realtime safety, agent parity, layout). They apply to humans too —

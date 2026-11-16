@@ -17,7 +17,7 @@
 //! save/restore state, and EMBED the plugin GUI into a host-owned X11 window
 //! (XWayland) — no detached plugin windows.
 //!
-//! Architecture (matches PLAN.md §7):
+//! Architecture (matches docs/ARCHITECTURE.md §7):
 //! - main thread: plugin instance lifecycle, params/state/GUI (CLAP [main-thread])
 //! - audio thread: owns `ClapVoice` (the `StartedPluginAudioProcessor`), renders
 //!   blocks (CLAP [audio-thread])

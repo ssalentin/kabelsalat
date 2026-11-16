@@ -18,7 +18,7 @@
 //! The midir callback runs on midir's own thread, not the audio callback,
 //! but we still keep it allocation-free: events go into a preallocated
 //! `rtrb` ring as fixed-size records; decoding/logging happens on the main
-//! thread (PLAN.md §7 discipline, ready for the future MIDI matrix).
+//! thread (docs/ARCHITECTURE.md §7 discipline, ready for the future MIDI matrix).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

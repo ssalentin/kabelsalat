@@ -1,4 +1,4 @@
-//! MCP server — `kabelsalat mcp` (PLAN §2c, task-14) and `kabelsalat mcp
+//! MCP server — `kabelsalat mcp` (docs/ARCHITECTURE.md §2c, task-14) and `kabelsalat mcp
 //! --attach` (task-16).
 //!
 //! A sibling frontend to the one typed control plane (`control.rs`), giving

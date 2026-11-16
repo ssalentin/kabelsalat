@@ -1,6 +1,6 @@
 # P0 — Animated wiring demo (`ui-demo`)
 
-The signature feature (PLAN.md §2) in Reason-rack form: **one window, two sides
+The signature feature (docs/ARCHITECTURE.md §2) in Reason-rack form: **one window, two sides
 of a mini rack.** Front = perform, back = patch. The cables are the show.
 
 ## Run

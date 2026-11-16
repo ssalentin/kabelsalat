@@ -783,9 +783,9 @@ impl McpServer {
             .as_ref()
             .and_then(|p| p.lock().ok())
             .map(|g| g.transport);
-        let (playing, counting_in, count_in_beat, count_in_enabled, count_in_bars, bpm) = match tp {
-            Some(t) => (t.playing, t.counting_in, t.count_in_beat, t.count_in_enabled, t.count_in_bars, t.bpm),
-            None => (st.playing, false, 0, st.count_in_enabled, st.count_in_bars, 96.0),
+        let (playing, counting_in, count_in_beat, count_in_enabled, count_in_bars, bpm, record_sync) = match tp {
+            Some(t) => (t.playing, t.counting_in, t.count_in_beat, t.count_in_enabled, t.count_in_bars, t.bpm, t.record_sync),
+            None => (st.playing, false, 0, st.count_in_enabled, st.count_in_bars, 96.0, st.record_sync),
         };
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
@@ -798,6 +798,7 @@ impl McpServer {
             "count_in_beat": count_in_beat,
             "count_in_enabled": count_in_enabled,
             "count_in_bars": count_in_bars,
+            "record_sync": record_sync,
             "bpm": bpm,
             "buffer_frames": bridge::BUFFER_FRAMES,
             "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,

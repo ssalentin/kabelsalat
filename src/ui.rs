@@ -2792,6 +2792,7 @@ impl DemoApp {
                 "count_in_beat": self.count_in_beat,
                 "count_in_enabled": self.count_in_enabled,
                 "count_in_bars": self.count_in_bars,
+                "record_sync": self.record_sync,
                 "bpm": self.bpm,
                 "cables": self.cables.len(),
                 "fps": self.fps,

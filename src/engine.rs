@@ -1399,6 +1399,9 @@ impl GraphEngine {
             Command::RecordStart => self.record_start(),
             Command::RecordStop => self.record_stop(),
             Command::SetRecordSync { on } => {
+                if !on {
+                    self.record_sync_pending = false; // a count-in still running must not start a take
+                }
                 if self.record_sync != on {
                     self.record_sync = on;
                     self.transport_dirty = true;

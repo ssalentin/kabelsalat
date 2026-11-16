@@ -239,6 +239,9 @@ fn start_with_capacity(
         .name("kabelsalat-recorder".into())
         .spawn(move || writer_loop(msg_rx, consumer, dir, sample_rate, channels, thread_shared))
         .expect("spawn recorder thread");
+    // Known before anyone can begin/stop: an unpark is never lost to a
+    // writer that has not registered itself yet.
+    let _ = shared.writer.set(handle.thread().clone());
     if let Ok(mut j) = shared.join.lock() {
         *j = Some(handle);
     }
@@ -253,7 +256,6 @@ fn writer_loop(
     channels: usize,
     shared: Arc<RecorderShared>,
 ) {
-    let _ = shared.writer.set(std::thread::current());
     let mut file: Option<std::fs::File> = None;
     let mut path: Option<String> = None;
     let mut samples: u64 = 0;
@@ -293,7 +295,7 @@ fn writer_loop(
                 }
             }
         }
-        if shared.shutdown.load(Ordering::Relaxed) || msg.is_abandoned() {
+        if shared.shutdown.load(Ordering::Acquire) || msg.is_abandoned() {
             if file.is_some() {
                 finalize_take(&mut data, &mut file, &mut samples, &mut buf, &mut bytes, max_data_samples);
                 set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), true, None, false);
@@ -357,9 +359,14 @@ fn finalize_take(
     max_data_samples: u64,
 ) {
     loop {
-        let n = drain(data, buf, buf.len());
+        // Never past the frame-aligned RIFF limit; the rest is dropped.
+        let room = max_data_samples.saturating_sub(*samples).min(buf.len() as u64) as usize;
+        let n = drain(data, buf, if room == 0 { buf.len() } else { room });
         if n == 0 {
             break;
+        }
+        if room == 0 {
+            continue;
         }
         samples_to_bytes(&buf[..n], bytes);
         if let Some(f) = file.as_mut() {
@@ -1042,6 +1049,34 @@ mod tests {
             .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
             .count();
         assert_eq!(files, 0, "no WAV file for a cancelled count-in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_turned_off_during_count_in_starts_no_take() {
+        const SR: f64 = 48000.0;
+        const BLOCK: usize = 480;
+        let dir = temp_dir("sync-off");
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, SR, vec![]);
+        let (tap, shared) = start_with_capacity(dir.clone(), SR as u32, 2, SR as usize * 2 * 2);
+        engine.set_recorder(tap);
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetRecordSync { on: true });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = [0.0f32; BLOCK * 2];
+        for _ in 0..100 {
+            engine.render(&mut buf, 2); // halfway through the count-in
+        }
+        bus.send(Command::SetRecordSync { on: false });
+        for _ in 0..200 {
+            engine.render(&mut buf, 2); // past the count-in: the song plays
+        }
+        assert!(!shared.is_recording(), "SYNC switched off during the count-in must not start a take");
+        assert_eq!(shared.snapshot().takes, 0);
+        drop(engine);
+        shared.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

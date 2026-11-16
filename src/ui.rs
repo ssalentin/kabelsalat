@@ -435,7 +435,7 @@ impl MatrixRow {
 
 /// UI-side mirror of one matrix rule's editable fields (Command::MatrixRule + MatrixCcMap).
 /// The engine owns the truth; this drives the editor + cell indicators.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RuleEdit {
     channel: Option<u8>,
     transpose: i8,
@@ -445,6 +445,18 @@ struct RuleEdit {
     vel_hi: u8,
     enabled: bool,
     cc_map: Vec<crate::matrix::CcMapping>,
+    /// The engine rule exists only for CC bindings (no notes routed).
+    #[serde(default)]
+    cc_only: bool,
+}
+
+/// One shaped matrix route as a session stores it (`Session::matrix`).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedRule {
+    source: SourceId,
+    dest: u32,
+    #[serde(flatten)]
+    edit: RuleEdit,
 }
 
 impl Default for RuleEdit {
@@ -458,6 +470,7 @@ impl Default for RuleEdit {
             vel_hi: 127,
             enabled: true,
             cc_map: Vec::new(),
+            cc_only: false,
         }
     }
 }
@@ -2156,6 +2169,7 @@ impl DemoApp {
                 vel_lo: r.vel_range.0, vel_hi: r.vel_range.1,
                 enabled: r.enabled,
                 cc_map: r.cc_map.clone(),
+                cc_only: r.cc_only,
             };
             if !e.is_default() { edits.insert((r.source, r.dest), e); }
         }
@@ -2312,7 +2326,39 @@ impl DemoApp {
                 rig += 1;
             }
         }
+        // Shaped matrix routes and CC/MIDI-learn bindings (rule 33 mirror).
+        let mut rules: Vec<SavedRule> = self.rule_edits.iter()
+            .map(|(&(source, dest), e)| SavedRule { source, dest, edit: e.clone() })
+            .collect();
+        rules.sort_by_key(|r| (format!("{:?}", r.source), r.dest));
+        if !rules.is_empty() {
+            s.set_matrix(Some(serde_json::to_value(&rules)?));
+        }
         Ok(s)
+    }
+
+    /// Re-apply a session's shaped matrix routes after its graph is loaded.
+    fn restore_session_rules(&mut self, s: &crate::session::Session) {
+        let rules: Vec<SavedRule> = s.matrix()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        self.rule_edits.clear();
+        for r in rules {
+            if let Some(bus) = &self.bus {
+                let mut b = bus.lock().unwrap();
+                if !r.edit.cc_only {
+                    let e = &r.edit;
+                    let _ = b.send(Command::MatrixRule {
+                        source: r.source, dest: r.dest, channel: e.channel, transpose: e.transpose,
+                        key_lo: e.key_lo, key_hi: e.key_hi, vel_lo: e.vel_lo, vel_hi: e.vel_hi, enabled: e.enabled,
+                    });
+                }
+                for m in &r.edit.cc_map {
+                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param) });
+                }
+            }
+            self.rule_edits.insert((r.source, r.dest), r.edit);
+        }
     }
 
     /// Pool index in `_surge_main` / `surge_controllers` for CLAP rig slot `rig`.
@@ -2432,6 +2478,7 @@ impl DemoApp {
                 }
             }
         }
+        self.restore_session_rules(s);
         Ok(())
     }
 
@@ -9039,6 +9086,57 @@ mod rig_switch_tests {
         assert_eq!(app.rig_count(), 2);
         assert_eq!(app.active_rig, 1, "view stays on the new rig");
         assert!((app.units[u].knobs[k].value - 0.123).abs() < 1e-6, "knobs survive the engine echo");
+    }
+
+    #[test]
+    fn matrix_rules_and_cc_bindings_survive_a_session_round_trip() {
+        // Live app + engine; returns the engine's published rules after `f`.
+        fn live(f: impl FnOnce(&mut DemoApp)) -> (DemoApp, Vec<crate::matrix::Rule>) {
+            let mut app = DemoApp::new_with_sink(None);
+            let ctx = egui::Context::default();
+            let (tx, mut drain) = crate::control::command_bus();
+            app.bus = Some(Arc::new(Mutex::new(tx)));
+            let (mut ebus, edrain) = crate::control::command_bus();
+            let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+            let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+            engine.set_graph_pub(pub_.clone());
+            app.graph_pub = Some(pub_.clone());
+            let mut pump = |drain: &mut crate::control::CommandDrain| {
+                drain.drain(|c| { ebus.send(c); });
+                let mut buf = vec![0.0f32; 64 * 2];
+                engine.render(&mut buf, 2);
+            };
+            for _ in 0..2 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+            f(&mut app);
+            for _ in 0..3 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+            let rules = pub_.lock().unwrap().rules.clone();
+            (app, rules)
+        }
+        let dev = SourceId::Hardware(20);
+        let (mut app, _) = live(|app| {
+            if let Some(bus) = &app.bus {
+                let _ = bus.lock().unwrap().send(Command::MatrixRule {
+                    source: SourceId::Keys, dest: 1, channel: None, transpose: 12,
+                    key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true,
+                });
+            }
+            app.set_cc_binding(SourceId::Keys, 1, 74, Some(42));
+            app.set_cc_binding(dev, 1, 7, Some(43)); // learn on an unrouted device
+        });
+        let saved = app.capture_session("cc").unwrap();
+        let json = serde_json::to_string(&saved.matrix()).unwrap();
+        let back: Option<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        let mut reloaded = crate::session::Session::new("cc", saved.graph.clone());
+        reloaded.set_matrix(back);
+
+        let (fresh, rules) = live(|app| app.apply_session(&reloaded).unwrap());
+        let keys = rules.iter().find(|r| r.source == SourceId::Keys && r.dest == 1).expect("Keys rule restored");
+        assert_eq!(keys.transpose, 12);
+        assert_eq!(keys.param_for_cc(74), Some(42));
+        let learned = rules.iter().find(|r| r.source == dev && r.dest == 1).expect("learned rule restored");
+        assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
+        assert_eq!(learned.param_for_cc(7), Some(43));
+        assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
     }
 
     #[test]

@@ -737,10 +737,10 @@ Everything queued lives here; update this section as work lands.
      session + rigs + mixer + rig in view + patch names before the job's first
      change; a job = one assistant request or a remote burst with gaps < 3 s);
      `undo`/`redo` in assistant, exec_tool and MCP (`--attach`), Ctrl+Z / Ctrl+Shift+Z.
-     Open: MCP edit tools that go straight to the engine bus (connect, add_node,
-     set_param, ...) bypass the app and are not undoable yet — route them through
-     the UI bridge when attached. Per-voice rig sources (keyboard/hardware toggles)
-     are not in the snapshot.
+     MCP edits that go straight to the engine (connect, add_node, set_param, ...)
+     are covered too: the bridge asks the app for a pre-edit snapshot (≤ 1 s wait,
+     ~1 frame in practice) before forwarding any `Command::is_rack_edit`. Open:
+     per-voice rig sources (keyboard/hardware toggles) are not in the snapshot.
   3. **Capability discovery — deferred:** both frontends already hand the model the
      full typed tool list (assistant tool schema, MCP tools/list); Bravo needs a
      catalog because 672 actions hide behind 13 tools. Revisit if our tool count

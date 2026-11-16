@@ -51,11 +51,19 @@ pub static UI_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub static REMOTE_CMDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 
 fn ui_call(tool: String, args: Value) -> Result<String, String> {
+    ui_call_within(tool, args, Duration::from_secs(5))
+}
+
+fn ui_call_within(tool: String, args: Value, wait: Duration) -> Result<String, String> {
     if !UI_ATTACHED.load(Ordering::Relaxed) { return Err("no app UI attached".into()); }
     let (tx, rx) = std::sync::mpsc::channel();
     UI_INBOX.lock().map_err(|_| "ui inbox poisoned".to_string())?.push((tool, args, tx));
-    rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|_| "the app did not answer in 5 s".to_string())
+    rx.recv_timeout(wait).map_err(|_| format!("the app did not answer in {} ms", wait.as_millis()))
 }
+
+/// UI inbox tool the bridge sends before forwarding a rack edit: the app
+/// snapshots the rack for agent undo while the engine has not seen the edit.
+pub const BEFORE_REMOTE_EDIT: &str = "__before_remote_edit";
 
 /// Output buffer size in frames (shared with the audio setup in `ui`).
 pub const BUFFER_FRAMES: u32 = 256;
@@ -260,6 +268,12 @@ fn handle_line_with_pub(
                 Ok(c) => c,
                 Err(e) => return err_reply(format!("invalid Command: {e}")),
             };
+            // Agent undo: let the app snapshot BEFORE the engine applies the
+            // edit (best effort — an idle/absent UI must not block the bus).
+            // Never while holding the bus lock: the UI frame may need it.
+            if cmd.is_rack_edit() && UI_ATTACHED.load(Ordering::Relaxed) {
+                let _ = ui_call_within(BEFORE_REMOTE_EDIT.into(), json!({}), Duration::from_millis(1000));
+            }
             let mut b = match bus.lock() {
                 Ok(b) => b,
                 Err(_) => return err_reply("command bus lock poisoned"),

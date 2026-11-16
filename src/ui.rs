@@ -1747,6 +1747,8 @@ struct DemoApp {
     hw_status: String,
     /// Connected hardware MIDI device names, indexed by device id.
     hw_devices: Vec<String>,
+    /// Last hardware MIDI event for the info line ("eX MIDI 1 · C4 v100").
+    last_midi: Option<String>,
     /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
     rig_device: [Option<u32>; VOICE_POOL],
     surge_status: String,
@@ -1982,6 +1984,7 @@ impl DemoApp {
             hw_midi_rev: u64::MAX,
             hw_status: String::new(),
             hw_devices: Vec::new(),
+            last_midi: None,
             rig_device: [None; VOICE_POOL],
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
@@ -2410,7 +2413,7 @@ impl DemoApp {
                 (&["B"], "plugin browser (also F9)"),
                 (&["F11"], "MIDI matrix view"),
                 (&["F12"], "assistant"),
-                (&["D"], "stats"),
+                (&["I"], "MIDI + performance info"),
             ]),
         ];
         self.help_foot_g = Some(tracked("ESC OR ? TO CLOSE", 10.0, 0.14));
@@ -6213,13 +6216,13 @@ impl DemoApp {
                             }
                         }
                     }
-                    // Telemetry IN the page (D toggles): right-aligned bar text.
+                    // MIDI + performance info IN the page (I toggles): right-aligned bar text.
                     if self.show_stats {
                         let line = self.stats_text();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(6.0);
                             ui.label(egui::RichText::new(line).monospace().size(11.0).color(theme::INK_2))
-                                .on_hover_text("audio · frame rate · patch · MIDI input latency (D hides)");
+                                .on_hover_text("last MIDI event · audio · frame rate · patch · MIDI input latency (I hides)");
                         });
                     }
                 });
@@ -8635,7 +8638,8 @@ impl DemoApp {
             if i.consume_key(Modifiers::SHIFT, Key::T) { tap_tempo = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
-            if i.consume_key(Modifiers::NONE, Key::D) { self.show_stats = !self.show_stats; }
+            // I = info (MIDI + performance). Not D: D is a laptop note key.
+            if i.consume_key(Modifiers::NONE, Key::I) { self.show_stats = !self.show_stats; }
             // Multi-rig big-view switching (visual only): 1–9 select, ←→ cycle.
             let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
             for (d, k) in digits.iter().enumerate() {
@@ -10664,6 +10668,19 @@ impl DemoApp {
 
     /// Telemetry line for the top bar (user: in the page, not an overlay;
     /// with the sample rate). Refreshed 4x/s so the numbers stay readable.
+    /// "ESI MIDIMATE eX MIDI 1 · C4 v100": the device without ALSA's
+    /// client prefix/suffix, then the event.
+    fn midi_event_text(&self, src: SourceId, what: &str) -> String {
+        let dev = match src {
+            SourceId::Hardware(d) => self.hw_devices.get(d as usize)
+                .map(|n| { let k = midi_port_key(n); k.split_once(':').map_or(k, |(_, port)| port).trim().to_string() })
+                .unwrap_or_else(|| format!("HW {d}")),
+            SourceId::Keys => "Keyboard".into(),
+            other => format!("{other:?}"),
+        };
+        format!("{dev} · {what}")
+    }
+
     fn stats_text(&mut self) -> String {
         self.stats_timer -= 1.0 / 60.0;
         if self.stats_timer <= 0.0 || self.stats_line.is_empty() {
@@ -10675,7 +10692,8 @@ impl DemoApp {
                 let frames = crate::bridge::BUFFER_FRAMES;
                 format!("{:.1} kHz · {frames} fr ({:.1} ms)", sr as f64 / 1000.0, frames as f64 / sr as f64 * 1000.0)
             } else { "no audio".into() };
-            self.stats_line = format!("{audio} · {:.0} fps · {} cables · {} pulses · midi {:.1} ms",
+            let midi = self.last_midi.as_deref().unwrap_or("no MIDI yet");
+            self.stats_line = format!("MIDI {midi}  |  {audio} · {:.0} fps · {} cables · {} pulses · midi {:.1} ms",
                 self.fps, self.cables.len(), pulses, midi_ms);
         }
         self.stats_line.clone()
@@ -11016,6 +11034,11 @@ impl DemoApp {
             if let SourceId::Hardware(d) = ev.source {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
+            self.last_midi = Some(self.midi_event_text(ev.source, &if ev.velocity > 0.0 {
+                format!("{} v{}", note_name(ev.note), (ev.velocity * 127.0).round() as u8)
+            } else {
+                format!("{} off", note_name(ev.note))
+            }));
             let semi = ev.note as usize;
             self.current_source = ev.source;
             self.fire_keys_with(semi, ev.velocity, !sounded);
@@ -11029,6 +11052,7 @@ impl DemoApp {
             if let SourceId::Hardware(d) = src {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
+            self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
             let learned = self.complete_cc_learn(src, cc);
             self.apply_cc_to_knobs(src, ch, cc, val, learned);
         }
@@ -12941,6 +12965,24 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn i_toggles_the_info_line_with_the_last_midi_event() {
+        let (mut app, ctx) = two_rigs();
+        assert!(!app.show_stats);
+        frame(&mut app, &ctx, key(Key::I));
+        assert!(app.show_stats, "I shows the info line");
+        app.hw_devices = vec!["ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into()];
+        app.hw_queue.lock().unwrap().push_back((NoteEvent { note: 60, velocity: 100.0 / 127.0, source: SourceId::Hardware(0), created: std::time::Instant::now() }, true));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.last_midi.as_deref(), Some("ESI MIDIMATE eX MIDI 1 · C4 v100"));
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 64));
+        frame(&mut app, &ctx, vec![]);
+        app.stats_timer = 0.0;
+        assert!(app.stats_text().starts_with("MIDI ESI MIDIMATE eX MIDI 1 · CC74 64"), "{}", app.stats_line);
+        frame(&mut app, &ctx, key(Key::I));
+        assert!(!app.show_stats, "I hides it again");
+    }
+
+    #[test]
     fn help_overlay_lists_current_shortcuts_in_two_columns() {
         let (mut app, ctx) = two_rigs();
         frame(&mut app, &ctx, key(Key::F1));
@@ -12950,7 +12992,7 @@ mod rig_switch_tests {
         let keys: Vec<String> = app.help_cols.iter()
             .flat_map(|c| c.rows.iter().flat_map(|r| r.keys.iter().map(|g| g.text().to_owned())))
             .collect();
-        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F8", "F9", "F10", "F11", "F12", "1–9", "R", "D", "SPLIT"] {
+        for k in ["Tab", "Space", "Ctrl", "Del", "double-click", "F4", "F5–F8", "F9", "F10", "F11", "F12", "1–9", "R", "I", "SPLIT"] {
             assert!(keys.iter().any(|x| x == k), "help lists {k}");
         }
         assert!(descs_has_mixer(&app), "F10 is the mixer now (the Transport window is gone)");

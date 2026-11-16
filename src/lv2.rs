@@ -235,7 +235,9 @@ unsafe fn pin_plugin_library(plugin: *const LilvPlugin) {
         return;
     }
     // NOLOAD: only bump the already-mapped library; NODELETE: never unmap it.
-    libc::dlopen(path, libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE);
+    if libc::dlopen(path, libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE).is_null() {
+        eprintln!("lv2: could not pin {:?}", std::ffi::CStr::from_ptr(path));
+    }
     lilv_free(path as *mut c_void);
 }
 

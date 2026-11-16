@@ -694,8 +694,11 @@ Everything queued lives here; update this section as work lands.
   thread: up to 5 s per wave of 4 hanging bundles. Move to a background thread.
 - Vitalium (LV2) crashes intermittently after an instance is freed (heap corruption
   in its own worker thread / static destructors; seen in tests and lv2-async-test,
-  ~1 in 4 suite runs at worst). Library pinning (f5a2228) did not stop it. Candidates:
-  never free Vitalium instances (pool/reuse), or run LV2 tests serially.
+  ~1 in 4 suite runs at worst). Library pinning (f5a2228) did not stop it. Running the
+  Vitalium tests one at a time (VITALIUM_TEST_LOCK) gave 0 crashes in 8 suite runs, so the
+  likely trigger is two instances active on different threads (Vitalium global state).
+  App risk left: the LV2 loader instantiating a second Vitalium while the audio thread
+  runs the first.
 - Hot-plugged MIDI devices are matched by port name, which includes the ALSA client
   number; a re-plug that gets a different client number becomes a new device index.
 - `transport-test` flaked 2 of ~20 runs, both the first run right after a fresh build

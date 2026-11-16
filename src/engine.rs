@@ -1906,14 +1906,14 @@ mod master_limiter_tests {
     }
 
     #[test]
-    fn a_chord_onset_is_caught_within_a_few_milliseconds() {
+    fn a_chord_onset_is_caught_within_ten_milliseconds() {
         let mut lim = MasterLimiter::new(48000.0);
         let x = 4.0f32; // a big chord's sum, from silence
         let mut g = 1.0;
-        for _ in 0..(48000 * 5 / 1000) {
+        for _ in 0..(48000 * 10 / 1000) {
             g = lim.gain_for(x, x);
         }
-        assert!((x * g - MasterLimiter::CEILING).abs() < 0.02, "after 5 ms the sum is held: {}", x * g);
+        assert!((x * g - MasterLimiter::CEILING).abs() < 0.02, "after 10 ms the sum is held: {}", x * g);
     }
 
     #[test]

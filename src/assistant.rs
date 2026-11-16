@@ -540,6 +540,11 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional Surge patch query, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
         }},
         {"type":"function","function":{
+            "name":"rename_rig",
+            "description":"Rename a rig (index from get_rigs), e.g. 'Bass' or 'Pads'. Up to 24 characters; names are kept in saved sessions.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"name":{"type":"string"}},"required":["rig","name"]}
+        }},
+        {"type":"function","function":{
             "name":"delete_rig",
             "description":"Delete a rig and everything in it (units, cables, synth settings). DESTRUCTIVE: ask the user and only then call with confirm=true. The last rig cannot be deleted.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"confirm":{"type":"boolean"}},"required":["rig","confirm"]}

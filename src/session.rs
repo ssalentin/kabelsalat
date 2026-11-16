@@ -90,6 +90,8 @@ pub struct Session {
     params: Vec<ParamValue>, // sorted by (node, param), unique
     states: Vec<PluginState>, // sorted by node, unique
     matrix: Option<Value>,
+    /// Rig names in rig order (#33); empty = the default "Rig A/B/…".
+    pub rig_names: Vec<String>,
 }
 
 impl Default for Session {
@@ -106,6 +108,7 @@ impl Session {
             params: Vec::new(),
             states: Vec::new(),
             matrix: None,
+            rig_names: Vec::new(),
         }
     }
 
@@ -338,6 +341,7 @@ impl Session {
             params: self.params.clone(),
             matrix: self.matrix.clone(),
             states: refs,
+            rig_names: self.rig_names.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -386,6 +390,7 @@ impl Session {
             params: manifest.params,
             states,
             matrix: manifest.matrix,
+            rig_names: manifest.rig_names,
         };
         session.validate()?;
         Ok(session)
@@ -407,6 +412,9 @@ struct SessionFile {
     matrix: Option<Value>,
     #[serde(default)]
     states: Vec<StateRef>,
+    /// Rig names (older sessions have none → default names).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rig_names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1071,6 +1079,26 @@ mod tests {
         assert!(err.contains("newer kabelsalat"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rig_names_round_trip_through_the_package() {
+        let dir = std::env::temp_dir().join(format!("ksalat-rignames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Session::new("names", Graph::demo_patch());
+        s.rig_names = vec!["Bass".into(), "Pads".into()];
+        let pkg = dir.join("names.ksalat");
+        s.save(&pkg).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().rig_names, vec!["Bass".to_string(), "Pads".to_string()]);
+        // Older packages (no field) load with default names.
+        let mut plain = Session::new("plain", Graph::demo_patch());
+        plain.rig_names.clear();
+        let pkg2 = dir.join("plain.ksalat");
+        plain.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join("session.json")).unwrap();
+        assert!(!json.contains("rig_names"), "absent when empty: old readers stay happy");
+        assert!(Session::load(&pkg2).unwrap().rig_names.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -740,6 +740,7 @@ fn remap_session(
     remap: impl Fn(u32) -> Option<u32>,
 ) -> crate::session::Session {
     let mut ns = crate::session::Session::new(s.name.clone(), graph);
+    ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
     }
@@ -1716,6 +1717,10 @@ struct DemoApp {
     master_meter: crate::meter::MeterSnapshot,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
+    /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
+    rename_rig_dialog: Option<(usize, String)>,
+    /// Rig names of the session being applied (load path names its rigs).
+    session_rig_names: Vec<String>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
     load_as_rigs: Option<(Vec<crate::control::Rig>, usize)>,
     /// Previous frame's keyboard-focus state: losing focus drains held keys
@@ -1979,6 +1984,8 @@ impl DemoApp {
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
+            rename_rig_dialog: None,
+            session_rig_names: Vec::new(),
             load_as_rigs: None,
             had_kb_focus: true,
             rig_sources: [(true, true); VOICE_POOL],
@@ -3513,6 +3520,7 @@ impl DemoApp {
         if !rules.is_empty() {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
         }
+        s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         Ok(s)
     }
 
@@ -3623,6 +3631,7 @@ impl DemoApp {
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
         let canonical = canonical_rig_session(s);
         let s = &canonical;
+        self.session_rig_names = s.rig_names.clone();
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
         self.sync_clap_slots(&s.graph);
@@ -3671,14 +3680,36 @@ impl DemoApp {
         // A rig add/delete (edit_rigs) loads the same merged graph as rigs;
         // so does any graph that carries several rig tags (a session saved
         // from a multi-rig rack) — LoadGraph would drop the engine's rig list.
+        // Names from the session being applied, used once (never leak into a
+        // later load).
+        let names = std::mem::take(&mut self.session_rig_names);
         let rigs = self.load_as_rigs.take().or_else(|| {
-            if graph.nodes.iter().all(|n| n.rig == 0) { return None; }
+            // A single rig keeps LoadGraph — unless the session renamed it,
+            // which only the rig list (LoadRigs) can carry (#33).
+            let renamed_single = names.first().is_some_and(|n| !n.trim().is_empty() && n != "Rig A");
+            if graph.nodes.iter().all(|n| n.rig == 0) && !renamed_single { return None; }
             let (graphs, _) = crate::control::split_rigs(graph);
             let rigs: Vec<crate::control::Rig> = graphs.into_iter().enumerate()
-                .map(|(i, g)| crate::control::Rig::new(format!("Rig {}", (b'A' + i.min(25) as u8) as char), g, None))
+                .map(|(i, g)| {
+                    let name = names.get(i).filter(|n| !n.trim().is_empty()).cloned()
+                        .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+                    crate::control::Rig::new(name, g, None)
+                })
                 .collect();
             Some((rigs, 0))
         });
+        // Mirror the rig list now (names, devices), so chips, mixer and
+        // get_rigs show it on the next frame — and without an engine (rule 25).
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            match &rigs {
+                Some((rigs, active)) => {
+                    snap.rigs = rigs.iter().map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+                    snap.active = *active;
+                }
+                // LoadGraph: the engine drops its rig list; so does the mirror.
+                None => { snap.rigs.clear(); snap.active = 0; }
+            }
+        }
         if let Some(bus) = &self.bus {
             let cmd = match rigs {
                 Some((rigs, active)) => Command::LoadRigs { rigs, active },
@@ -4620,6 +4651,20 @@ impl DemoApp {
                 self.edit_rigs(Some(rig));
                 self.agent_activity.record(origin, format!("Delete {deleted_name}"), vec![], now);
                 format!("{}. {}", self.session_msg, self.rigs_json())
+            }
+            "rename_rig" => {
+                let Some(rig) = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize) else {
+                    return "rename_rig needs rig (index from get_rigs) and name".into();
+                };
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                match self.rename_rig(rig, name) {
+                    Ok(n) => {
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(origin, format!("Rename rig {} → {n}", rig + 1), vec![], now);
+                        format!("rig {rig} is now '{n}'. {}", self.rigs_json())
+                    }
+                    Err(e) => e,
+                }
             }
             "select_rig" => {
                 let n = self.rig_count();
@@ -5791,6 +5836,7 @@ impl DemoApp {
                 | "get_matrix"
                 | "undo"
                 | "redo"
+                | "rename_rig"
                 | "list_audio_outputs"
                 | "set_audio_output"
                 | "list_app_streams"
@@ -6075,6 +6121,53 @@ impl DemoApp {
         }
     }
 
+    /// Rename rig `rig` (#33): the engine owns the name (RenameRig, published
+    /// with the rig snapshot); the snapshot is mirrored at once so chips,
+    /// mixer and get_rigs show it on the next frame (rule 25).
+    fn rename_rig(&mut self, rig: usize, name: &str) -> Result<String, String> {
+        let name: String = name.trim().chars().take(24).collect();
+        if name.is_empty() { return Err("a rig name cannot be empty".into()); }
+        let n = self.rig_count();
+        if rig >= n { return Err(format!("no rig {rig}: there are {n}")); }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::RenameRig { rig: rig as u8, name: name_bytes(&name) });
+        }
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            while snap.rigs.len() < n {
+                let i = snap.rigs.len();
+                snap.rigs.push(crate::control::RigMeta { name: format!("Rig {}", (b'A' + i.min(25) as u8) as char), midi_device: None });
+            }
+            snap.rigs[rig].name = name.clone();
+        }
+        Ok(name)
+    }
+
+    /// "Rename rig" dialog (double-click a rig chip): Enter saves, Esc cancels.
+    fn rename_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some((rig, mut text)) = self.rename_rig_dialog.take() else { return };
+        let mut decision: Option<bool> = None;
+        let modal = egui::Modal::new(egui::Id::new("rename_rig_modal")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(egui::RichText::new("Rename rig").size(17.0).strong().color(theme::INK));
+            ui.add_space(8.0);
+            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("rename_rig_text").desired_width(300.0).char_limit(24));
+            if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decision = Some(true); }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Rename").clicked() { decision = Some(true); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decision = Some(false); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(false); }
+        match decision {
+            Some(true) => { let _ = self.rename_rig(rig, &text); }
+            Some(false) => {}
+            None => self.rename_rig_dialog = Some((rig, text)),
+        }
+    }
+
     /// Multi-rig overview strip: always visible above the rack.
     /// Every control (RIGS label, "+ Rig" button, separator, rig chips, delete
     /// button, source label, level bar) shares one 26px centered baseline.
@@ -6142,6 +6235,7 @@ impl DemoApp {
                                                 );
                                             }
                                             if chip.clicked() { switch = Some(rig); }
+                                            if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
                                             self.rig_chip_rects.push(chip.rect);
                                             if n > 1 {
                                                 let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
@@ -11315,6 +11409,7 @@ impl DemoApp {
         }
         self.knob_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
+        self.rename_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
         // Full frame rate while focused (the cables are the show); ~30 fps in
@@ -13213,6 +13308,42 @@ mod rig_switch_tests {
     fn descs_has_mixer(app: &DemoApp) -> bool {
         app.help_cols.iter().flat_map(|c| c.rows.iter())
             .any(|r| r.keys.iter().any(|g| g.text() == "F10") && r.desc.text().contains("mixer"))
+    }
+
+    #[test]
+    fn rigs_can_be_renamed_and_names_survive_save_and_load() {
+        let (mut app, ctx) = two_rigs();
+        let out = app.exec_tool("rename_rig", &serde_json::json!({"rig": 1, "name": "  Bass  "}));
+        assert!(out.contains("'Bass'"), "{out}");
+        assert_eq!(app.rig_name(1), "Bass");
+        assert!(app.exec_tool("rename_rig", &serde_json::json!({"rig": 1, "name": "   "})).contains("cannot be empty"));
+        assert!(app.exec_tool("rename_rig", &serde_json::json!({"rig": 7, "name": "X"})).contains("no rig 7"));
+        assert_eq!(app.rig_name(1), "Bass", "rejected renames change nothing");
+
+        // The dialog: Enter renames.
+        app.rename_rig_dialog = Some((0, "Lead".into()));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Enter));
+        assert_eq!(app.rig_name(0), "Lead");
+        assert!(app.rename_rig_dialog.is_none());
+
+        // Names live in the session and come back on load (multi-rig).
+        let s = app.capture_session("names").unwrap();
+        assert_eq!(s.rig_names, vec!["Lead".to_string(), "Bass".to_string()]);
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.apply_session(&s).unwrap();
+        assert_eq!((fresh.rig_name(0), fresh.rig_name(1)), ("Lead".to_string(), "Bass".to_string()));
+
+        // …and a single renamed rig keeps its name too.
+        let mut one = DemoApp::new_with_sink(None);
+        one.rename_rig(0, "Organ").unwrap();
+        let s1 = one.capture_session("one").unwrap();
+        let mut fresh1 = DemoApp::new_with_sink(None);
+        fresh1.apply_session(&s1).unwrap();
+        assert_eq!(fresh1.rig_name(0), "Organ");
+        // A later load without names does not inherit stale ones.
+        fresh1.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
+        assert_eq!(fresh1.rig_name(0), "Rig A");
     }
 
     #[test]

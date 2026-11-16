@@ -184,6 +184,13 @@ Learned so far (2026-11-15, UI polish pass):
     unbound in `voices`, and `sync_from_engine` skipped `sync_clap_slots` when
     `mirror == g.graph` — connect `Keys`/`Hardware` and bind idle matching
     voices in `AddNode`, and run `sync_clap_slots` even on `same` syncs.
+41. **Every edit that can change a held note's note-off path releases first:**
+    the matrix is stateless, so `Disconnect` (Keys MIDI cable), `LoadGraph`/
+    `LoadRigs`, `RemoveNode`, `SetRigSource`/`SetRigDevice` (like split and
+    rule edits) call `release_all` before changing routing. Unplugging a cable
+    or loading a template while holding a key left Surge droning. Run the
+    `verify-held-notes` check (`cargo test --bin kabelsalat held_notes`) on any
+    routing change, and add new routing commands to its alphabet.
 
 ## Ground rules
 

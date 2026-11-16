@@ -31,6 +31,7 @@ pub(super) enum Kind {
     Split,
     Matrix,
     Cable,
+    Node,
     Load,
 }
 
@@ -51,11 +52,13 @@ enum Edit {
     Unplug(u32),
     /// Connect a MIDI cable Keys.port → dest with this edge id.
     Plug { id: u32, port: u8, dest: u32 },
+    /// RemoveNode of an instrument.
+    Remove(u32),
     /// LoadGraph of the start patch (template load).
     LoadStart,
 }
 
-const EDITS: [Edit; 13] = [
+const EDITS: [Edit; 14] = [
     Edit::Split(None),
     Edit::Split(Some(60)),
     Edit::Split(Some(48)),
@@ -69,6 +72,7 @@ const EDITS: [Edit; 13] = [
     Edit::Plug { id: 1, port: 0, dest: SURGE_A },
     Edit::Plug { id: 6, port: 0, dest: SURGE_B },
     Edit::Plug { id: 6, port: 1, dest: SURGE_B },
+    Edit::Remove(SURGE_B),
 ];
 // LoadStart is appended separately so the edit list stays readable.
 
@@ -78,6 +82,7 @@ impl Edit {
             Edit::Split(_) => Kind::Split,
             Edit::Rule { .. } => Kind::Matrix,
             Edit::Unplug(_) | Edit::Plug { .. } => Kind::Cable,
+            Edit::Remove(_) => Kind::Node,
             Edit::LoadStart => Kind::Load,
         }
     }
@@ -97,6 +102,7 @@ impl Edit {
                 enabled,
             },
             Edit::Unplug(id) => Command::Disconnect(id),
+            Edit::Remove(id) => Command::RemoveNode(id),
             Edit::Plug { id, port, dest } => Command::Connect {
                 id,
                 from: PortRef { node: KEYS, port },
@@ -237,6 +243,7 @@ fn describe(step: Step) -> String {
             let port = if port == 0 { "LOW/main" } else { "HIGH" };
             format!("Connect cable {id} Keys {port} → {name}")
         }
+        Step::Edit(Edit::Remove(_)) => "RemoveNode Surge B".to_string(),
         Step::Edit(Edit::LoadStart) => "LoadGraph start patch".to_string(),
     }
 }
@@ -298,14 +305,7 @@ pub(super) fn explore(max_states: usize) -> Report {
 /// Kind-sets whose stuck notes are open, reported findings (see the skill).
 /// Any stuck note whose kinds contain a KNOWN set is attributed to it; every
 /// other stuck note fails the check. A fix must remove its entry.
-pub(super) const KNOWN: &[&[Kind]] = &[
-    // Unplugging a Keys MIDI cable (or moving it) while a key is held: the
-    // note-off is gated by the missing cable (keys_gate) and never arrives.
-    &[Kind::Cable],
-    // LoadGraph (template load) while a key is held: nothing is released and
-    // the rebuilt matrix can route the note-off to a different pitch.
-    &[Kind::Load],
-];
+pub(super) const KNOWN: &[&[Kind]] = &[];
 
 #[test]
 fn held_notes_are_released_under_every_routing_edit() {

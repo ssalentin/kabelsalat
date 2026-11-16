@@ -561,8 +561,10 @@ impl GraphEngine {
         })
     }
 
-    /// Note-off for all 128 notes on one instrument (stateless-matrix
-    /// safety on rule/split edits). Rare op, allocation-free.
+    /// Note-off for all 128 notes on one instrument. The matrix is stateless,
+    /// so every edit that can change a held note's note-off path (split, rule,
+    /// MIDI cable, source filter, node removal, graph load) calls this first.
+    /// Rare op, allocation-free. Checked by `held_notes` (verify-held-notes).
     fn release_all(&mut self, dest: NodeId) {
         if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
             for n in 0..128u16 { s.voice.note_off(n); }
@@ -619,6 +621,8 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::RemoveNode(id) => {
+                // An idle voice keeps a held note and replays it when rebound.
+                self.release_all(id);
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
                 self.lv2.retain(|s| s.node != id);
@@ -637,6 +641,15 @@ impl GraphEngine {
                 }
             }
             Command::Disconnect(id) => {
+                // keys_gate drops a note-off whose Keys cable is gone.
+                let fed = self.graph.edges.iter().find(|e| {
+                    e.id == id
+                        && e.kind == PortKind::Midi
+                        && self.graph.node(e.from.node).map_or(false, |n| matches!(n.kind, NodeKind::Keys))
+                });
+                if let Some(dest) = fed.map(|e| e.to.node) {
+                    self.release_all(dest);
+                }
                 let had = self.graph.edges.iter().any(|e| e.id == id);
                 self.graph.disconnect(id);
                 if had {
@@ -687,6 +700,11 @@ impl GraphEngine {
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
                 // path; a future version can rebuild off-thread and swap.
+                // Voices survive the rebuild, the old note-off paths do not.
+                for i in 0..self.graph.nodes.len() {
+                    let id = self.graph.nodes[i].id;
+                    self.release_all(id);
+                }
                 self.graph = graph;
                 let sr = self.sample_rate;
                 self.dsp = self
@@ -844,12 +862,15 @@ impl GraphEngine {
                 }
             }
             Command::SetRigSource { node, keyboard, hardware } => {
+                // source_accepted would drop the note-off of a source turned off.
+                self.release_all(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.src_keys = keyboard;
                     s.src_hw = hardware;
                 }
             }
             Command::SetRigDevice { node, device } => {
+                self.release_all(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.rig_device = device;
                 }

@@ -1,6 +1,6 @@
 # MIDI matrix (P1, task-9)
 
-`src/matrix.rs` is the MIDI routing core from PLAN §5: **any source → any
+`src/matrix.rs` is the MIDI routing core from docs/ARCHITECTURE.md §5: **any source → any
 destination**, with per-rule channel filter, transpose, key/velocity ranges
 (splits & layers), and CC mapping. It is a **pure, deterministic, standalone
 module** — no engine, I/O, locks, or threads. Engine integration (feeding it
@@ -118,7 +118,7 @@ m.add_rule(
 - **RT discipline:** reserve the output `Vec` once (`route_into` only clears
   and pushes); reserve rule storage with `Matrix::reserve`. Edit/swap the
   table off-thread at block boundaries, exactly like the `RenderPlan`
-  (PLAN §7). No allocation, locks, or syscalls inside routing itself.
+  (docs/ARCHITECTURE.md §7). No allocation, locks, or syscalls inside routing itself.
 - **CC bindings:** delivered CC events are unchanged MIDI; look up the
   binding via `matrix.rules_from(source)` → `rule.param_for_cc(cc)` and
   apply it as a `SetParam { node: rule.dest, param, value }`-style update.

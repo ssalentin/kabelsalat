@@ -296,7 +296,7 @@ fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
 /// Number of lock-free per-edge level slots (`EdgeLevels`).
 pub const EDGE_LEVEL_SLOTS: usize = 256;
 
-/// Per-edge audio levels, engine → UI (PLAN §2: cables breathe with live
+/// Per-edge audio levels, engine → UI (docs/ARCHITECTURE.md §2: cables breathe with live
 /// level). Fixed-size lock-free slots indexed by `edge id % EDGE_LEVEL_SLOTS`;
 /// each slot packs `(edge id << 32) | f32 peak bits` into one AtomicU64, so a
 /// reader never attributes another edge's level to its cable — on a slot
@@ -378,7 +378,7 @@ impl Default for TransportPub {
     }
 }
 
-/// Shared graph publication for frontends (MCP→UI live sync, PLAN §13).
+/// Shared graph publication for frontends (MCP→UI live sync).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
 /// the steady render path never locks it. `rev` lets the UI skip unchanged
@@ -2939,7 +2939,7 @@ pub fn lv2_engine_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Per-edge audio level self-test (PLAN §2 signature): the demo's chain
+/// Per-edge audio level self-test (docs/ARCHITECTURE.md §2 signature): the demo's chain
 /// Keys→Surge→Delay→Master + Surge→Master. While a note sounds every audio
 /// edge must publish a level above silence; after note-off (release + delay
 /// tail) the levels must decay back to ~0.

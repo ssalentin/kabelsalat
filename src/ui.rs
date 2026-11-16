@@ -1,4 +1,4 @@
-//! egui UI — the signature animated wiring (PLAN.md §2), Reason-style rack.
+//! egui UI — the signature animated wiring (docs/ARCHITECTURE.md §2), Reason-style rack.
 //! Owned by the ui-cables workstream. P0: standalone demo (`ui-demo`).
 //!
 //! One window, two sides of a mini rack:
@@ -81,14 +81,14 @@ const KNOB_SLOT_HALF: f32 = 26.0;
 const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
 const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fills
 
-/// The reference CLAP instrument (PLAN §1). The engine's two voices are Surge,
+/// The reference CLAP instrument (docs/ARCHITECTURE.md §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 const DEXED_ID: &str = "com.digital-suburban.dexed";
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
-/// Audio cables flow while their smoothed level exceeds this (PLAN §2).
+/// Audio cables flow while their smoothed level exceeds this (docs/ARCHITECTURE.md §2).
 const AUDIO_PULSE_MIN: f32 = 0.05;
 /// Seconds between traveling pulses on a sounding audio cable.
 const AUDIO_PULSE_EVERY: f32 = 0.25;
@@ -586,7 +586,7 @@ fn unit_time_mul(u: &Unit) -> f32 {
     }
 }
 
-/// One row of the hot-wire MIDI matrix (PLAN §13): a MIDI source that can
+/// One row of the hot-wire MIDI matrix: a MIDI source that can
 /// feed any instrument rig. `Keys` = the computer keyboard (on-screen clicks
 /// and laptop typing are ONE source); `HwAll` = any hardware device (omni).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1498,7 +1498,7 @@ struct DemoApp {
 
     /// Source tag applied to the next fire_keys (set by each input path).
     current_source: SourceId,
-    /// Multi-rig UI (PLAN §13.1): the rig shown in the big view. Visual only —
+    /// Multi-rig UI: the rig shown in the big view. Visual only —
     /// every rig keeps sounding; switching never touches the audio path.
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
@@ -1630,7 +1630,7 @@ struct DemoApp {
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Per-edge audio levels from the engine (lock-free, block rate). Drives
-    /// audio cable breathing + flowing pulses (PLAN §2). None = no engine:
+    /// audio cable breathing + flowing pulses (docs/ARCHITECTURE.md §2). None = no engine:
     /// MIDI arrivals then fake the downstream envelope instead.
     edge_levels: Option<Arc<EdgeLevels>>,
 
@@ -2661,7 +2661,7 @@ impl DemoApp {
         }
     }
 
-    /// MCP→UI live sync (PLAN §13): adopt the engine's graph when a remote
+    /// MCP→UI live sync: adopt the engine's graph when a remote
     /// structural change (MCP/CLI load_graph/load_rigs/add_node/connect/…)
     /// diverges from the UI's own mirror. UI-originated edits converge (the
     /// per-frame Connect mirror is idempotent engine-side), so they never
@@ -3416,7 +3416,7 @@ impl DemoApp {
         }
     }
 
-    /// Load two independent rigs (PLAN §13.1, AUM operating model): each a
+    /// Load two independent rigs (AUM operating model): each a
     /// full rack with its own MasterOut, merged via merge_rigs and sent to the
     /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
     /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
@@ -4700,7 +4700,7 @@ impl DemoApp {
         }
     }
 
-    // -- hot-wire MIDI matrix (PLAN §13) ------------------------------------
+    // -- hot-wire MIDI matrix ------------------------------------
 
     /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments).
     fn matrix_sinks(&self) -> Vec<usize> {
@@ -5681,7 +5681,7 @@ impl DemoApp {
         }
     }
 
-    /// Multi-rig overview strip (PLAN §13.1): always visible above the rack.
+    /// Multi-rig overview strip: always visible above the rack.
     /// Every control (RIGS label, "+ Rig" button, separator, rig chips, delete
     /// button, source label, level bar) shares one 26px centered baseline.
     fn rig_overview_panel(&mut self, root: &mut egui::Ui) {
@@ -8360,7 +8360,7 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F9) {
                 self.toggle_stage(StageView::Plugins);
             }
-            // Hot-wire MIDI matrix (PLAN §13).
+            // Hot-wire MIDI matrix.
             if i.consume_key(Modifiers::NONE, Key::F11) {
                 self.toggle_stage(StageView::Matrix);
             }
@@ -11092,7 +11092,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Multi-rig UI tests (PLAN §13.1): view switching is visual only — the merged
+// Multi-rig UI tests: view switching is visual only — the merged
 // graph, cables, and per-rig grouping must stay intact across switches.
 // ---------------------------------------------------------------------------
 
@@ -12683,7 +12683,7 @@ mod transport_tests {
 }
 
 // ---------------------------------------------------------------------------
-// Audio-chain visualization (PLAN §2): engine per-edge levels drive audio
+// Audio-chain visualization (docs/ARCHITECTURE.md §2): engine per-edge levels drive audio
 // cables, key LEDs snap, labels fit their units, agent edits never flash.
 // ---------------------------------------------------------------------------
 

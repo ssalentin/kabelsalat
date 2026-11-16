@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Capture kabelsalat ui-demo screenshots (front/back/playing/help/transport)
 # without disturbing a running real app instance. Lead-side verification harness
-# (PLAN.md §0.1). Requires: grim, Hyprland, python3, ImageMagick for analysis.
+# (AGENTS.md, "Working on kabelsalat"). Requires: grim, Hyprland, python3, ImageMagick for analysis.
 # Usage: scripts/capture.sh <outdir> [binary]
 set -euo pipefail
 OUT=${1:?usage: capture.sh <outdir> [binary]}

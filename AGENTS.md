@@ -7,7 +7,7 @@ proven with screenshots.** Do not claim a visual change works without showing
 it. Before/after screenshots are expected for design work; embed them in the
 reply by absolute path so the user can see them inline.
 
-How to capture (verified harness, PLAN.md §0.1):
+How to capture (verified harness, see "Working on kabelsalat" below):
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -24,7 +24,7 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
   `deepseek-flash` (text+image), OpenAI-style `image_url` data-URL parts,
   **max_tokens ≥ 4000**. Downscale images first (`magick`).
 - Non-visual changes: `cargo test` (unit suite) plus the relevant CLI self-test
-  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — see PLAN.md §0.1).
+  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below).
 
 ## Every fixed error becomes a rule (user, 2026-11-15)
 
@@ -262,13 +262,46 @@ Learned so far (2026-11-15, UI polish pass):
     (this Hyprland uses Lua: `hyprctl dispatch 'hl.dsp.window.fullscreen()'`),
     and crop screenshots to the window geometry, not the whole output.
 
+## Working on kabelsalat
+
+- **Where things live (one place each, never mirrored):** planned work, bugs
+  and ideas = [GitHub issues](https://github.com/ssalentin/kabelsalat/issues)
+  with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
+  `testing`) and milestones per release; how and why it is built =
+  `docs/ARCHITECTURE.md`; released changes = `CHANGELOG.md` (add yours under
+  **Unreleased**); rules = this file. Read open issues with
+  `gh issue list -R ssalentin/kabelsalat`; reference them in commits
+  (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
+  becomes an issue, not a note in a doc.
+- **Releases:** SemVer tags `vX.Y.Z` on `main`; move the CHANGELOG
+  **Unreleased** block under the new version, bump `Cargo.toml`, tag, then
+  `gh release create vX.Y.Z --notes-file <that block>`.
+- **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
+  `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+  The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
+  that starts it is killed at its time limit — say so to the user.
+- **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
+  real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
+  `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
+  `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
+  `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
+  (`./target/debug/kabelsalat <name>`).
+- **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
+  the running app); one-shot: `kabelsalat send '<json>'`.
+- **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
+  shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
+  (rule 55), inject keys with `scripts/xtest_key.py` (F4 = 0xffc1, F1–F10 = X
+  keycodes 67–76, F11/F12 = 95/96 — the script handles it), `grim -o eDP-1`.
+  Mouse clicks need screen coords: window origin × monitor scale + egui pos.
+- **Hyprland window glitch:** the app process can run while its window stops
+  listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
+
 ## Ground rules
 
-- Read **PLAN.md §0.1 (session handoff)** before working; the roadmap and all
-  conventions live in PLAN.md (§13 is the single source of truth, mirrored as
-  GitHub issues #1–#8).
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
-  spec; `src/theme.rs` is the single palette source. Light warm-paper chrome,
+  spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).
 - **No X11 child windows** — plugin editors are native egui.
 - **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside

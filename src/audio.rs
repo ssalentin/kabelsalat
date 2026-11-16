@@ -1,5 +1,5 @@
 //! Audio I/O via cpal (ALSA host → PipeWire bridge).
-//! Owned by the audio-io workstream; see PLAN.md §7 for the real-time rules.
+//! Owned by the audio-io workstream; see docs/ARCHITECTURE.md §7 for the real-time rules.
 //!
 //! P0 test modes (all through `kabelsalat audio-test`):
 //!
@@ -16,7 +16,7 @@
 //!   at low gain instead of just metering (opt-in: speaker/mic feedback risk)
 //! - `KSALAT_FREQ`     sine frequency in Hz (default 440)
 //!
-//! Real-time discipline (PLAN.md §7): the callbacks below never allocate, lock,
+//! Real-time discipline (docs/ARCHITECTURE.md §7): the callbacks below never allocate, lock,
 //! log, or make syscalls. Statistics live in preallocated atomics; timing uses
 //! `Instant::now()` (CLOCK_MONOTONIC via vDSO on aarch64 Linux — no syscall);
 //! the optional duplex handoff uses a preallocated `rtrb` ring. All reporting

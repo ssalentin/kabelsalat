@@ -1,7 +1,7 @@
 # Sessions, undo, starter templates (P1, task-8)
 
-`src/session.rs` persists the control-plane graph (PLAN §7 "Sessions") and
-delivers the GarageBand inheritance (PLAN §2b): one-click starter templates,
+`src/session.rs` persists the control-plane graph (docs/ARCHITECTURE.md §7 "Sessions") and
+delivers the GarageBand inheritance (docs/ARCHITECTURE.md §2b): one-click starter templates,
 undo for every edit, and saves that never corrupt a user's work.
 
 Built entirely on `src/control.rs` — the session stores the same `Graph` the
@@ -98,7 +98,7 @@ history.redo(&mut session);
 task-9 serializes its routing table into this slot; the session persists it
 verbatim without understanding it, so the two workstreams stay decoupled.
 
-## Starter templates (PLAN §2b)
+## Starter templates (docs/ARCHITECTURE.md §2b)
 
 `Template::ALL` → `Lead + Reverb`, `Drums + Bass`, `Ambient Pad`. Each
 `Template::graph()` is a pre-wired `Graph` from existing node kinds

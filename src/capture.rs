@@ -1,4 +1,4 @@
-//! System-audio capture (PLAN: "wire YouTube playback into the mix").
+//! System-audio capture (ARCHITECTURE: "wire YouTube playback into the mix").
 //!
 //! Streams a PipeWire/Pulse **monitor** source into a lock-free ring the engine
 //! consumes. Uses `parec` (PipeWire's PulseAudio compat) so no native PipeWire

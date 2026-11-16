@@ -18,7 +18,7 @@ even without an audio device.
 `transport_stop`.
 
 Because every tool maps to the same typed `Command`/query the UI and assistant
-use, agent access is structurally 1:1 with the app (PLAN §2c) — no parallel API.
+use, agent access is structurally 1:1 with the app (docs/ARCHITECTURE.md §2c) — no parallel API.
 
 ## Verified
 

@@ -1,4 +1,4 @@
-//! File player (backing tracks) — PLAN P2.
+//! File player (backing tracks) — ARCHITECTURE §8 P2.
 //!
 //! Decodes an audio file on its own thread and streams stereo f32 samples into a
 //! lock-free ring the engine consumes (same RT pattern as `capture.rs`). The

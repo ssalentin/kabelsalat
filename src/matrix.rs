@@ -21,7 +21,7 @@
 //!
 //! RT discipline: [`Matrix::route_into`] reuses a caller-reserved output
 //! buffer, so steady-state routing never allocates. Rule edits happen
-//! off-thread; the engine swaps the table at block boundaries (PLAN §7).
+//! off-thread; the engine swaps the table at block boundaries (docs/ARCHITECTURE.md §7).
 
 // The engine consumes this module during integration; until then the public
 // API is exercised by the unit tests only. Remove once the engine wires it in.
@@ -413,7 +413,7 @@ impl Matrix {
     }
 
     /// Reserve rule storage so block-boundary edits within capacity never
-    /// allocate (PLAN §7 discipline, same as `Graph::reserve`).
+    /// allocate (docs/ARCHITECTURE.md §7 discipline, same as `Graph::reserve`).
     pub fn reserve(&mut self, rules: usize) {
         self.rules.reserve(rules);
     }
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn two_surge_layers_split_acceptance() {
-        // PLAN §5 / task-9 acceptance: two Surge layers split across the
+        // docs/ARCHITECTURE.md §5 / task-9 acceptance: two Surge layers split across the
         // keyboard — bass below C4 (shifted down an octave), lead from C4 up,
         // plus a pad layered over the whole range.
         let mut m = Matrix::new();

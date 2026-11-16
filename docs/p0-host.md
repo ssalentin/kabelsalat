@@ -46,7 +46,7 @@ the descriptor named "Surge XT" with feature `instrument`).
 
 ## 3. Architecture of the spike (src/host.rs)
 
-Matches PLAN.md §7 thread model:
+Matches docs/ARCHITECTURE.md §7 thread model:
 
 - **Main thread** — `PluginInstance<TestHost>` (it is `!Send`): discovery,
   instantiation, params/state/GUI calls, `call_on_main_thread_callback()` pump.

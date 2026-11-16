@@ -86,6 +86,34 @@ pub enum DspKind {
     Metronome,
 }
 
+/// Which device channels an `AudioIn` node turns into its stereo OUT. A guitar
+/// or vocal mic is usually mono on one input of a stereo interface, so the
+/// node picks the left or right channel (centered to both); `Stereo` passes the
+/// pair through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioInChannel {
+    MonoL,
+    MonoR,
+    Stereo,
+}
+
+impl Default for AudioInChannel {
+    fn default() -> Self {
+        AudioInChannel::MonoL
+    }
+}
+
+impl AudioInChannel {
+    /// Short face readout: which physical input channel of the interface.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AudioInChannel::MonoL => "In 1",
+            AudioInChannel::MonoR => "In 2",
+            AudioInChannel::Stereo => "ST",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     /// MIDI source: the computer keyboard (on-screen + laptop), hardware MIDI.
@@ -98,6 +126,11 @@ pub enum NodeKind {
     Lv2 { uri: Lv2Uri },
     /// Desktop playback capture (P2).
     SystemAudio,
+    /// Live audio input (microphone / guitar / interface) — a rack-able source
+    /// with an audio OUT port (issue #28). `device` names the cpal input device
+    /// (`None` = the default input); `channels` picks which device channels fill
+    /// the stereo OUT.
+    AudioIn { device: Option<String>, channels: AudioInChannel },
     /// Stereo output bus.
     MasterOut,
 }
@@ -608,6 +641,16 @@ pub enum Command {
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
     SetSystemAudio { gain: f32 },
+    /// Configure an `AudioIn` node's device + channel selection (structural:
+    /// rebuilds the input slot and publishes the graph). `device` = cpal input
+    /// device name (None = default input); `channels` = mono L / R / stereo.
+    /// Omitted (None) fields keep their current value. Gain and monitor are
+    /// engine params (`P_AUDIO_IN_GAIN` / `P_AUDIO_IN_MONITOR` via SetParam).
+    SetAudioIn {
+        node: NodeId,
+        device: Option<String>,
+        channels: Option<AudioInChannel>,
+    },
     /// Mix the file player (backing track) into the master at `gain` (0..1).
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
@@ -670,7 +713,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
-            | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
+            | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. })
     }
 }
@@ -773,6 +816,8 @@ mod tests {
             Command::RecordStop,
             Command::SetRecordSync { on: true },
             Command::ResetMeter,
+            Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
+            Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();
@@ -1058,5 +1103,26 @@ mod tests {
             r#"{"name":"X","graph":{"nodes":[],"edges":[],"next_node":0,"next_edge":0}}"#,
         ).unwrap();
         assert_eq!(r.midi_device, None);
+    }
+
+    #[test]
+    fn audio_in_node_and_command_json_roundtrip() {
+        // The wire shape: {AudioIn:{device,channels}} and {SetAudioIn:{...}}.
+        let c: NodeKind = serde_json::from_str(r#"{"AudioIn":{"device":"USB Audio","channels":"MonoR"}}"#).unwrap();
+        assert_eq!(c, NodeKind::AudioIn { device: Some("USB Audio".into()), channels: AudioInChannel::MonoR });
+        let c: NodeKind = serde_json::from_str(r#"{"AudioIn":{"device":null,"channels":"Stereo"}}"#).unwrap();
+        assert_eq!(c, NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo });
+
+        let cmd: Command = serde_json::from_str(r#"{"SetAudioIn":{"node":3,"device":"Mic","channels":"Stereo"}}"#).unwrap();
+        assert!(matches!(cmd, Command::SetAudioIn { node: 3, device, channels: Some(AudioInChannel::Stereo) } if device.as_deref() == Some("Mic")));
+        let cmd: Command = serde_json::from_str(r#"{"SetAudioIn":{"node":3,"device":null,"channels":null}}"#).unwrap();
+        assert!(matches!(cmd, Command::SetAudioIn { node: 3, device: None, channels: None }));
+
+        // A graph with an AudioIn node round-trips through serde (sessions).
+        let mut g = Graph::default();
+        let a = g.add_node(NodeKind::AudioIn { device: Some("Iface".into()), channels: AudioInChannel::Stereo }, name_bytes("AUDIO IN"));
+        let back: Graph = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back.node(a).unwrap().kind, NodeKind::AudioIn { device: Some("Iface".into()), channels: AudioInChannel::Stereo });
+        assert!(Command::SetAudioIn { node: a, device: None, channels: None }.is_rack_edit());
     }
 }

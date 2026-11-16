@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{
-    name_str, split_port, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind, ParamId,
-    PortKind, RigSnapshot,
+    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind,
+    ParamId, PortKind, RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
@@ -38,6 +38,12 @@ pub const P_TIME: ParamId = 1;  // delay time
 pub const P_MIX: ParamId = 2;   // delay / effect mix
 pub const P_VOL: ParamId = 3;   // master volume
 pub const P_WARM: ParamId = 4;  // master saturation
+/// Audio In gain (linear 0..=4; the face knob is 0..1 mapped ×4). Sent via
+/// SetParam; distinct node kind so no collision with plugin param space.
+pub const P_AUDIO_IN_GAIN: ParamId = 64;
+/// Audio In monitor toggle (0 = off, ≥ 0.5 = on): adds the input (post-gain)
+/// straight to the master so the performer hears it before wiring it.
+pub const P_AUDIO_IN_MONITOR: ParamId = 65;
 
 /// Translate an engine param id to a processor's native param id for a kind.
 /// Returns None if the knob doesn't apply to this kind.
@@ -202,6 +208,92 @@ struct Lv2Slot {
     node: NodeId,
     plugin: crate::lv2::Lv2Plugin,
     buf: Vec<f32>,
+}
+
+/// One `AudioIn` node's render-side state. The ring `consumer` is filled by the
+/// input stream's callback thread (stereo-interleaved) and popped here at block
+/// boundaries — allocation- and lock-free (rule 29/46). Ownership of the live
+/// capture (cpal stream) lives off the audio thread; only this consumer crosses.
+pub struct AudioInSlot {
+    node: NodeId,
+    channels: AudioInChannel,
+    device: Option<String>,
+    /// Read end of the engine ring (None until the UI opens a capture).
+    consumer: Option<rtrb::Consumer<f32>>,
+    /// Stereo-interleaved output buffer for this node this block.
+    raw: Vec<f32>,
+    /// Post-gain stereo output (what the OUT jack + monitor carry).
+    buf: Vec<f32>,
+    gain: f32,
+    monitor: bool,
+    /// Last raw sample (threaded through drops/inserts to avoid a click).
+    last: [f32; 2],
+    /// Drift reconciler (input vs output clock).
+    drift: crate::audio_in::Drift,
+    /// Counters for the UI status readout (test observability too).
+    dropped: u64,
+    starved: u64,
+}
+
+impl AudioInSlot {
+    fn new(node: NodeId, channels: AudioInChannel, device: Option<String>) -> Self {
+        let block = crate::bridge::BUFFER_FRAMES as usize * 2;
+        Self {
+            node,
+            channels,
+            device,
+            consumer: None,
+            raw: vec![0.0; 8192 * 2],
+            buf: vec![0.0; 8192 * 2],
+            gain: 1.0,
+            monitor: false,
+            last: [0.0; 2],
+            drift: crate::audio_in::Drift::new(block.max(2)),
+            dropped: 0,
+            starved: 0,
+        }
+    }
+}
+
+/// Lock-free per-AudioIn-node input level (pre-gain), engine → UI (rule 33).
+/// Same slot/tag scheme as [`EdgeLevels`], keyed by node id.
+pub struct AudioInLevels {
+    slots: [AtomicU64; 64],
+}
+
+impl AudioInLevels {
+    pub fn new() -> Self {
+        Self { slots: std::array::from_fn(|_| AtomicU64::new(0)) }
+    }
+    pub fn store(&self, node: u32, peak: f32) {
+        let packed = ((node as u64) << 32) | peak.max(0.0).to_bits() as u64;
+        self.slots[node as usize % 64].store(packed, Ordering::Relaxed);
+    }
+    pub fn load(&self, node: u32) -> f32 {
+        let v = self.slots[node as usize % 64].load(Ordering::Relaxed);
+        if (v >> 32) as u32 == node { f32::from_bits(v as u32) } else { 0.0 }
+    }
+}
+
+impl Default for AudioInLevels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Build an AudioIn slot for every AudioIn node in the graph (rare structural
+/// op, allocates — the slots preallocate their buffers once).
+fn build_audio_in_slots(graph: &Graph) -> Vec<AudioInSlot> {
+    graph
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::AudioIn { device, channels } => {
+                Some(AudioInSlot::new(n.id, *channels, device.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Work the audio thread hands to the LV2 loader thread: instantiating a
@@ -470,6 +562,12 @@ pub struct GraphEngine {
     player_sink: Option<PlayerSink>,
     player_gain: f32,
     player_buf: Vec<f32>,
+    // Audio In nodes (live mic/guitar/interface): one slot per node, rings fed
+    // by input callbacks off the audio thread (rule 46).
+    audio_in: Vec<AudioInSlot>,
+    audio_in_levels: Arc<AudioInLevels>,
+    /// UI → audio: delivers a freshly-opened input ring's consumer to the slot.
+    audio_in_rx: Option<rtrb::Consumer<(NodeId, rtrb::Consumer<f32>)>>,
     // Runtime CLAP voice delivery + retirement side channels (UI <-> audio).
     voice_rx: Option<rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>>,
     /// LV2 loader thread link (`spawn_lv2_loader`); None loads inline
@@ -528,6 +626,7 @@ impl GraphEngine {
             })
             .collect();
         let lv2 = build_lv2_slots(&graph, sample_rate);
+        let audio_in = build_audio_in_slots(&graph);
         // Default routing: every source class feeds every rig (full range).
         let mut matrix = Matrix::new();
         matrix.reserve(64);
@@ -587,6 +686,9 @@ impl GraphEngine {
             player_sink: None,
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
+            audio_in,
+            audio_in_levels: Arc::new(AudioInLevels::new()),
+            audio_in_rx: None,
             voice_rx: None,
             lv2_req: None,
             lv2_resp: None,
@@ -724,6 +826,23 @@ impl GraphEngine {
     /// Attach a system-audio capture source (started off the audio thread).
     pub fn set_system_capture(&mut self, cap: SystemCapture) {
         self.system_capture = Some(cap);
+    }
+
+    /// Attach the UI→audio ring that delivers freshly-opened input captures
+    /// (a `(node, consumer)` pair per opened AudioIn node).
+    pub fn set_audio_in_channel(&mut self, rx: rtrb::Consumer<(NodeId, rtrb::Consumer<f32>)>) {
+        self.audio_in_rx = Some(rx);
+    }
+
+    /// Lock-free per-node input level (pre-gain peak) for the face meter/tuner.
+    pub fn audio_in_levels_handle(&self) -> Arc<AudioInLevels> {
+        self.audio_in_levels.clone()
+    }
+
+    /// Live input state for the status readout: (dropped, starved) counters.
+    #[allow(dead_code)] // query API; the UI reads `audio_in_levels`/get_status instead
+    pub fn audio_in_status(&self, node: NodeId) -> Option<(u64, u64)> {
+        self.audio_in.iter().find(|s| s.node == node).map(|s| (s.dropped, s.starved))
     }
 
     /// Attach the file-player ring consumer (decode thread started elsewhere).
@@ -880,6 +999,8 @@ impl GraphEngine {
                 block_peak(&d.buf[..n2])
             } else if let Some(l) = self.lv2.iter().find(|l| l.node == src) {
                 block_peak(&l.buf[..n2])
+            } else if let Some(a) = self.audio_in.iter().find(|a| a.node == src) {
+                block_peak(&a.buf[..n2])
             } else if sys
                 && self.graph.node(src).map_or(false, |n| matches!(n.kind, NodeKind::SystemAudio))
             {
@@ -936,6 +1057,21 @@ impl GraphEngine {
                 return true;
             }
             false
+        } else if self.audio_in.iter().any(|s| s.node == node) {
+            let Some(s) = self.audio_in.iter_mut().find(|s| s.node == node) else {
+                return false;
+            };
+            match param {
+                P_AUDIO_IN_GAIN => {
+                    s.gain = v.clamp(0.0, 4.0);
+                    true
+                }
+                P_AUDIO_IN_MONITOR => {
+                    s.monitor = v >= 0.5;
+                    true
+                }
+                _ => false,
+            }
         } else {
             self.apply_dsp_or_master_param(node, param, v)
         }
@@ -991,6 +1127,9 @@ impl GraphEngine {
                         }
                     }
                     NodeKind::Lv2 { uri } => self.request_lv2(id, *uri),
+                    NodeKind::AudioIn { device, channels } => {
+                        self.audio_in.push(AudioInSlot::new(id, *channels, device.clone()));
+                    }
                     NodeKind::Clap { plugin_id } => {
                         self.matrix.connect(SourceId::Keys, id);
                         for dev in 0..MAX_HW_DEVICES {
@@ -1014,6 +1153,7 @@ impl GraphEngine {
                 self.release_all(id);
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
+                self.audio_in.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
                     let slot = self.lv2.remove(i);
                     self.retire_lv2(slot);
@@ -1085,6 +1225,7 @@ impl GraphEngine {
                         _ => None,
                     })
                     .collect();
+                self.audio_in = build_audio_in_slots(&self.graph);
                 // Old instances are freed (on the loader thread when it runs);
                 // new ones load below, after the matrix is rebuilt.
                 while let Some(slot) = self.lv2.pop() {
@@ -1410,6 +1551,29 @@ impl GraphEngine {
             Command::SetSystemAudio { gain } => {
                 self.system_gain = gain.clamp(0.0, 1.0);
             }
+            Command::SetAudioIn { node, device, channels } => {
+                // Structural: rewrite the node's device/channels, rebuild its
+                // slot, and publish so frontends adopt the selection.
+                let (next_device, next_channels) = {
+                    let Some(n) = self.graph.nodes.iter_mut().find(|n| n.id == node) else { return };
+                    let NodeKind::AudioIn { device: d, channels: c } = &mut n.kind else { return };
+                    let nd: Option<String> = device.or_else(|| d.as_ref().cloned());
+                    let nc = channels.unwrap_or(*c);
+                    if nd == *d && nc == *c {
+                        return; // no-op
+                    }
+                    *d = nd.clone();
+                    *c = nc;
+                    (nd, nc)
+                };
+                // Keep any already-opened ring; a fresh consumer arrives from
+                // the UI once it (re)opens the device. Old samples drain out.
+                if let Some(slot) = self.audio_in.iter_mut().find(|s| s.node == node) {
+                    slot.channels = next_channels;
+                    slot.device = next_device;
+                }
+                self.publish_graph();
+            }
             Command::SetPlayer { gain } => {
                 self.player_gain = gain.clamp(0.0, 1.0);
             }
@@ -1531,6 +1695,60 @@ impl GraphEngine {
         }
     }
 
+    /// Fill every AudioIn node's stereo buffer from its input ring: map the chosen
+    /// channel, apply gain, reconcile the clocks, and publish the input level.
+    /// Allocation- and lock-free (rule 29).
+    fn fill_audio_in(&mut self, frames: usize) {
+        use crate::audio_in::DriftAction;
+        let n2 = frames * 2;
+        for s in &mut self.audio_in {
+            for x in s.buf[..n2].iter_mut() {
+                *x = 0.0;
+            }
+            let Some(consumer) = s.consumer.as_mut() else {
+                // No capture opened for this node yet: silent, no level.
+                continue;
+            };
+            for i in 0..frames {
+                let l = match consumer.pop() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        s.starved += 1;
+                        s.last[0]
+                    }
+                };
+                let r = match consumer.pop() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        s.starved += 1;
+                        s.last[1]
+                    }
+                };
+                s.last = [l, r];
+                s.raw[i * 2] = l;
+                s.raw[i * 2 + 1] = r;
+                let (ol, or) = match s.channels {
+                    AudioInChannel::Stereo => (l, r),
+                    AudioInChannel::MonoL => (l, l),
+                    AudioInChannel::MonoR => (r, r),
+                };
+                let g = s.gain;
+                s.buf[i * 2] = ol * g;
+                s.buf[i * 2 + 1] = or * g;
+            }
+            match s.drift.action(consumer.slots()) {
+                DriftAction::DropOne => {
+                    let _ = consumer.pop();
+                    s.dropped += 1;
+                }
+                DriftAction::InsertOne => {}
+                DriftAction::Hold => {}
+            }
+            let peak = block_peak(&s.raw[..n2]);
+            self.audio_in_levels.store(s.node, peak);
+        }
+    }
+
     /// Render one device block, allocation-free.
     pub fn render(&mut self, data: &mut [f32], ch: usize) {
         while let Some(cmd) = self.drain.pop() {
@@ -1575,6 +1793,14 @@ impl GraphEngine {
                 let _ = tx.push(voice);
             }
         }
+        // Attach freshly-opened input captures (UI opened a device for a node):
+        // a (node, ring consumer) pair, swapped in place of any stale consumer.
+        while let Some(rx) = self.audio_in_rx.as_mut() {
+            let Ok((node, consumer)) = rx.pop() else { break };
+            if let Some(slot) = self.audio_in.iter_mut().find(|s| s.node == node) {
+                slot.consumer = Some(consumer);
+            }
+        }
         // Mixer publication: a fixed-size copy under a NON-blocking lock
         // (never waits on the UI; retried next block if it is busy).
         if self.mix_dirty {
@@ -1608,6 +1834,10 @@ impl GraphEngine {
             }
         }
 
+        // 1a. Audio In nodes: pull the input ring into each node's stereo
+        // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
+        self.fill_audio_in(frames);
+
         // 2. Each DSP node sums the instruments wired into it, then processes.
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
@@ -1620,6 +1850,13 @@ impl GraphEngine {
                 if self.graph.has_route(v.node, d.node, PortKind::Audio) {
                     for i in 0..n2 {
                         d.buf[i] += v.scratch[i];
+                    }
+                }
+            }
+            for a in &self.audio_in {
+                if self.graph.has_route(a.node, d.node, PortKind::Audio) {
+                    for i in 0..n2 {
+                        d.buf[i] += a.buf[i];
                     }
                 }
             }
@@ -1698,6 +1935,13 @@ impl GraphEngine {
                 if self.graph.has_route(v.node, slot.node, PortKind::Audio) {
                     for i in 0..n2 {
                         self.lv2_in[i] += v.scratch[i];
+                    }
+                }
+            }
+            for a in &self.audio_in {
+                if self.graph.has_route(a.node, slot.node, PortKind::Audio) {
+                    for i in 0..n2 {
+                        self.lv2_in[i] += a.buf[i];
                     }
                 }
             }
@@ -1800,6 +2044,25 @@ impl GraphEngine {
                             acc[i * 2] += slot.buf[i * 2] * gl;
                             acc[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
                         }
+                    }
+                }
+                // Audio In wired into this master (OUT jack → graph routing).
+                for a in &self.audio_in {
+                    if !self.graph.has_route(a.node, master, PortKind::Audio) {
+                        continue;
+                    }
+                    for i in 0..frames {
+                        acc[i * 2] += a.buf[i * 2] * gl;
+                        acc[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                    }
+                }
+            }
+            // Audio In monitoring: a monitor-ON node is added dry (post-gain) to
+            // the mixed master so the performer hears it before wiring it.
+            for a in &self.audio_in {
+                if a.monitor {
+                    for i in 0..n2 {
+                        acc[i] += a.buf[i];
                     }
                 }
             }
@@ -2709,6 +2972,79 @@ mod tests {
         let s = snap.lock().unwrap();
         assert!(s.rigs.is_empty());
         assert_eq!(s.active, 0);
+    }
+
+    #[test]
+    fn audio_in_routes_and_meters() {
+        use crate::control::{command_bus, name_bytes, AudioInChannel, Command, NodeKind, PortKind, PortRef};
+        use super::{P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR};
+        let (mut bus, drain) = command_bus();
+        // AudioIn → Master (audio), single-rig graph.
+        let mut g = crate::control::Graph::default();
+        let ain = g.add_node(
+            NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo },
+            name_bytes("AUDIO IN"),
+        );
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: ain, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let levels = engine.audio_in_levels_handle();
+        // Side channel: UI hands the engine a freshly-opened input ring.
+        let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+        engine.set_audio_in_channel(side_rx);
+        // Data ring: a stereo interleaved sine at 0.4 (L) / 0.2 (R).
+        let (mut data_tx, data_rx) = rtrb::RingBuffer::<f32>::new(4096);
+        for i in 0..1024usize {
+            let t = i as f32 / 48000.0;
+            let _ = data_tx.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.4);
+            let _ = data_tx.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.2);
+        }
+        let _ = side_tx.push((ain, data_rx));
+
+        let mut buf = vec![0.0f32; 256 * 2];
+        engine.render(&mut buf, 2);
+        // Audio reaches the master (wired OUT), scaled by unity gain.
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.0, "AudioIn output must reach master: {peak}");
+        // The input level (pre-gain) is published for the face meter.
+        assert!(levels.load(ain) > 0.0, "published input level");
+
+        // Gain via SetParam scales the wired path.
+        bus.send(Command::SetParam { node: ain, param: P_AUDIO_IN_GAIN, value: 0.25 });
+        // Monitor via SetParam: 1.0 = on.
+        bus.send(Command::SetParam { node: ain, param: P_AUDIO_IN_MONITOR, value: 1.0 });
+        engine.render(&mut buf, 2);
+        let slot = engine.audio_in.iter().find(|s| s.node == ain).unwrap();
+        assert_eq!(slot.gain, 0.25, "gain applied (0.25 raw)");
+        assert!(slot.monitor, "monitor on");
+    }
+
+    #[test]
+    fn audio_in_monitor_without_wiring_reaches_master() {
+        use crate::control::{command_bus, name_bytes, AudioInChannel, Command, NodeKind};
+        use super::P_AUDIO_IN_MONITOR;
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let ain = g.add_node(
+            NodeKind::AudioIn { device: None, channels: AudioInChannel::MonoL },
+            name_bytes("AUDIO IN"),
+        );
+        let _master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        // NO cable: monitor must carry it. The master sum runs for a MasterOut node.
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+        engine.set_audio_in_channel(side_rx);
+        let (mut data_tx, data_rx) = rtrb::RingBuffer::<f32>::new(4096);
+        for _ in 0..1024usize {
+            let _ = data_tx.push(0.5);
+            let _ = data_tx.push(0.5);
+        }
+        let _ = side_tx.push((ain, data_rx));
+        bus.send(Command::SetParam { node: ain, param: P_AUDIO_IN_MONITOR, value: 1.0 });
+        let mut buf = vec![0.0f32; 256 * 2];
+        engine.render(&mut buf, 2);
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.0, "monitor carries the input to master without wiring: {peak}");
     }
 
     #[test]

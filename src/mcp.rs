@@ -99,7 +99,7 @@ struct McpServer {
 /// Arguments for `add_node`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AddNodeArgs {
-    /// Node kind: "keys", "clap", "dsp", "system_audio" or "master_out".
+    /// Node kind: "keys", "clap", "dsp", "audio_in", "system_audio" or "master_out".
     kind: String,
     /// Display name (max 31 bytes; defaults to the kind).
     name: Option<String>,
@@ -109,6 +109,11 @@ struct AddNodeArgs {
     plugin_id: Option<String>,
     /// For kind "lv2": the LV2 plugin URI (see list_plugins).
     uri: Option<String>,
+    /// For kind "audio_in": the cpal input device (raw ALSA name from
+    /// list_audio_devices; null/omitted = the default input).
+    device: Option<String>,
+    /// For kind "audio_in": which channel(s) feed the OUT: "in_1"|"in_2"|"stereo".
+    channels: Option<String>,
     /// Multi-rig: which rig (0-based, see get_rigs) the node joins. Default 0.
     rig: Option<u8>,
 }
@@ -245,6 +250,23 @@ struct SetSystemAudioArgs {
     /// Mix level 0..1 for system-audio capture (0 mutes). Headless mode has no
     /// capture source, so this only sets the gain.
     gain: f32,
+}
+
+/// Arguments for `set_audio_in`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetAudioInArgs {
+    /// The AudioIn node id (from get_graph, kind "audio_in").
+    node: NodeId,
+    /// cpal input device (raw name from list_audio_devices). null/empty = the
+    /// default input.
+    device: Option<String>,
+    /// Which input channel(s) feed the OUT: "in_1" (left / mic), "in_2"
+    /// (right / Hi-Z guitar), or "stereo".
+    channels: Option<String>,
+    /// Input gain 0..1 (engine maps ×4 → 0..=4 linear).
+    gain: Option<f64>,
+    /// Low-latency monitoring on/off (adds the input, post-gain, to the master).
+    monitor: Option<bool>,
 }
 
 /// Arguments for `set_player`.
@@ -560,6 +582,10 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
             Ok(NodeKind::Dsp(parse_dsp_kind(dsp)?))
         }
         "system_audio" => Ok(NodeKind::SystemAudio),
+        "audio_in" => Ok(NodeKind::AudioIn {
+            device: args.device.clone().filter(|d| !d.is_empty()),
+            channels: parse_audio_ch(args.channels.as_deref()),
+        }),
         "master_out" => Ok(NodeKind::MasterOut),
         "lv2" => {
             let uri = args
@@ -569,6 +595,25 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
             Ok(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(uri) })
         }
         other => Err(format!("unknown node kind '{other}'")),
+    }
+}
+
+/// Parse an AudioIn channel selector: "in_1"/"l"/"1" → MonoL, "in_2"/"r"/"2"
+/// → MonoR, "st"/"stereo" → Stereo.
+fn parse_audio_ch(s: Option<&str>) -> crate::control::AudioInChannel {
+    match s.unwrap_or("in_1").to_ascii_lowercase().as_str() {
+        "r" | "2" | "right" | "in_2" | "in2" | "mono_r" | "monor" => crate::control::AudioInChannel::MonoR,
+        "st" | "s" | "stereo" | "12" => crate::control::AudioInChannel::Stereo,
+        _ => crate::control::AudioInChannel::MonoL,
+    }
+}
+
+/// Machine-readable channel tag for `get_graph` / `set_audio_in` output.
+fn ch_kind_str(c: crate::control::AudioInChannel) -> &'static str {
+    match c {
+        crate::control::AudioInChannel::MonoL => "in_1",
+        crate::control::AudioInChannel::MonoR => "in_2",
+        crate::control::AudioInChannel::Stereo => "stereo",
     }
 }
 
@@ -616,6 +661,11 @@ fn graph_json(g: &Graph) -> Value {
                 NodeKind::Dsp(k) => json!({"type": "dsp", "dsp": dsp_kind_str(k)}),
                 NodeKind::Lv2 { uri } => json!({"type": "lv2", "uri": uri.as_str()}),
                 NodeKind::SystemAudio => json!({"type": "system_audio"}),
+                NodeKind::AudioIn { device, channels } => json!({
+                    "type": "audio_in",
+                    "device": device,
+                    "channels": ch_kind_str(*channels),
+                }),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
             };
             // `transport`: the node has its own Play/Stop (set_node_playing);
@@ -868,7 +918,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. Clap voices are main-thread-only, so new clap nodes sound via load_graph's voice remap, not add_node.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (cpal name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. Clap voices are main-thread-only, so new clap nodes sound via load_graph's voice remap, not add_node.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -878,6 +928,7 @@ impl McpServer {
             NodeKind::Keys => "KEYS".into(),
             NodeKind::Clap { .. } => "CLAP".into(),
             NodeKind::Dsp(k) => dsp_kind_str(k).to_ascii_uppercase(),
+            NodeKind::AudioIn { .. } => "AUDIO IN".into(),
             NodeKind::Lv2 { uri } => uri
                 .as_str()
                 .rsplit(['/', '#'])
@@ -1032,6 +1083,73 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"gain": gain}))
+    }
+
+    /// Configure an Audio In node (device, channels, gain, monitor).
+    #[tool(name = "set_audio_in", description = "Configure a live Audio In rack unit (Command::SetAudioIn + SetParam) — a mic/guitar/interface patched into the graph like a source. node is the AudioIn node id; device is a cpal input name from list_audio_devices (null/empty = default input); channels is 'in_1' (left/mic), 'in_2' (right/Hi-Z), or 'stereo'; gain 0..1 sets the input gain; monitor true adds the input (post-gain) straight to the master for low-latency monitoring. Omitted fields keep their value.")]
+    fn set_audio_in(&self, Parameters(args): Parameters<SetAudioInArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        let Some(node) = st.graph.nodes.iter().find(|n| n.id == args.node) else {
+            return tool_err(format!("node {} does not exist", args.node));
+        };
+        if !matches!(node.kind, NodeKind::AudioIn { .. }) {
+            return tool_err(format!("node {} is not an Audio In node (kind {:?})", args.node, node.kind));
+        }
+        // device/channels → the node kind (structural, published, remapped).
+        if args.device.is_some() || args.channels.is_some() {
+            let (cur_dev, cur_ch) = match &node.kind {
+                NodeKind::AudioIn { device, channels } => (device.clone(), *channels),
+                _ => unreachable!(),
+            };
+            let device = match &args.device {
+                Some(d) if !d.is_empty() => Some(d.clone()),
+                Some(_) => None, // empty string → default input
+                None => cur_dev,
+            };
+            let channels = args.channels.as_deref().map(|s| parse_audio_ch(Some(s))).unwrap_or(cur_ch);
+            if let Err(e) = send_cmd(&mut st, Command::SetAudioIn { node: args.node, device, channels: Some(channels) }) {
+                return tool_err(e);
+            }
+            // Mirror into the local model.
+            if let Some(n) = st.graph.nodes.iter_mut().find(|n| n.id == args.node) {
+                if let NodeKind::AudioIn { device: d, channels: c } = &mut n.kind {
+                    *d = match &args.device { Some(s) if !s.is_empty() => Some(s.clone()), Some(_) => None, None => d.clone() };
+                    *c = channels;
+                }
+            }
+        }
+        // gain / monitor → engine params (SetParam, session-persisted).
+        if let Some(gain) = args.gain {
+            let g = gain.clamp(0.0, 1.0);
+            if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: crate::engine::P_AUDIO_IN_GAIN, value: g }) {
+                return tool_err(e);
+            }
+        }
+        if let Some(mon) = args.monitor {
+            let v = if mon { 1.0 } else { 0.0 };
+            if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param: crate::engine::P_AUDIO_IN_MONITOR, value: v }) {
+                return tool_err(e);
+            }
+        }
+        let summary = st.graph.nodes.iter().find(|n| n.id == args.node).map(|n| match &n.kind {
+            NodeKind::AudioIn { device, channels } => {
+                serde_json::json!({"node": n.id, "device": device, "channels": ch_kind_str(*channels)})
+            }
+            _ => serde_json::json!({}),
+        }).unwrap_or(serde_json::json!({}));
+        ok_json(summary)
+    }
+
+    /// List live audio input devices.
+    #[tool(name = "list_audio_devices", description = "List live audio input devices (microphones, guitars, interfaces) available to Audio In units: the cpal name (use as set_audio_in 'device'), a readable label, channel count and which is the default.")]
+    fn list_audio_devices(&self) -> Result<CallToolResult, McpError> {
+        let devs = crate::audio_in::list_input_devices();
+        ok_json(json!({"devices": devs.iter().map(|d| serde_json::json!({
+            "name": d.name, "raw": d.raw, "channels": d.channels, "default": d.default,
+        })).collect::<Vec<_>>()}))
     }
 
     /// Set the file-player mix gain.
@@ -1356,6 +1474,7 @@ impl McpServer {
                 .map(|c| (c.index as u32, c.name))
                 .collect(),
             NodeKind::MasterOut => vec![(3, "Volume".into()), (4, "Warmth".into())],
+            NodeKind::AudioIn { .. } => vec![(crate::engine::P_AUDIO_IN_GAIN, "Gain".into()), (crate::engine::P_AUDIO_IN_MONITOR, "Monitor".into())],
             NodeKind::Clap { .. } => {
                 return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
             }
@@ -2168,6 +2287,8 @@ mod tests {
             dsp: Some("metronome".into()),
             plugin_id: None,
             uri: None,
+            device: None,
+            channels: None,
             rig: None,
         })));
         let id = added["id"].as_u64().unwrap() as NodeId;

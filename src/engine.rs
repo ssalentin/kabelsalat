@@ -3496,7 +3496,12 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     use crate::matrix::SourceId;
     let sr = 48000.0;
     // Real synths first; the LSP oscillator only proves routing.
-    let candidates = ["urn:distrho:vitalium", "http://lsp-plug.in/plugins/lv2/oscillator_mono"];
+    // KABELSALAT_LV2_URI tests one specific instrument (e.g. a freshly
+    // installed catalog entry); default: real synths first, then the LSP
+    // oscillator, which only proves routing.
+    let wanted = std::env::var("KABELSALAT_LV2_URI").ok().filter(|u| !u.is_empty());
+    let defaults = ["urn:distrho:vitalium", "http://lsp-plug.in/plugins/lv2/oscillator_mono"];
+    let candidates: Vec<&str> = match &wanted { Some(u) => vec![u.as_str()], None => defaults.to_vec() };
     let uri = candidates
         .iter()
         .find(|u| crate::lv2::Lv2Plugin::load(u, sr, 512).map_or(false, |p| p.is_instrument()))

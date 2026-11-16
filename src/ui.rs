@@ -1238,6 +1238,28 @@ const AGENT_TOUCH_SECS: f32 = 2.6;
 /// Fade-out tail (seconds) at the end of [`AGENT_TOUCH_SECS`].
 const AGENT_FADE_SECS: f32 = 1.2;
 
+/// One agent-undo step: everything a rig edit or session load restores
+/// (graph + knobs + plugin states + matrix via the session, plus the rig
+/// list, mixer, rig in view and patch names that the session does not carry).
+struct UndoSnap {
+    session: crate::session::Session,
+    rigs: Vec<crate::control::RigMeta>,
+    mix: [crate::engine::RigMix; 8],
+    active: usize,
+    patch_names: [Option<String>; VOICE_POOL],
+}
+
+/// Agent undo depth (snapshots hold plugin states — keep it bounded).
+const UNDO_LIMIT: usize = 32;
+/// Remote (MCP) calls closer than this belong to one job / one undo step.
+const REMOTE_JOB_GAP: f32 = 3.0;
+
+/// Tools that only read: they never open an undo step.
+fn tool_is_read_only(name: &str) -> bool {
+    name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
+        || matches!(name, "record_status" | "undo" | "redo")
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AgentOrigin {
     Assistant,
@@ -1395,6 +1417,10 @@ struct DemoApp {
     rig_chip_rects: Vec<Rect>,
     /// Last frame's "+ Rig" button rect in the overview strip (points).
     add_rig_rect: Rect,
+    /// Agent undo/redo (one step per agent job) and the open job.
+    undo_past: Vec<UndoSnap>,
+    undo_future: Vec<UndoSnap>,
+    undo_job: Option<(AgentOrigin, f32)>,
     /// UI time until which the last take is playing (Play/Stop chip state).
     take_play_until: f32,
     /// Top-bar groups (tests): the View segment and the Bottom panel toggles.
@@ -1690,6 +1716,9 @@ impl DemoApp {
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
+            undo_past: Vec::new(),
+            undo_future: Vec::new(),
+            undo_job: None,
             take_play_until: 0.0,
             view_group_rect: Rect::NOTHING,
             dock_group_rect: Rect::NOTHING,
@@ -3029,6 +3058,78 @@ impl DemoApp {
         }
     }
 
+    // -- agent undo -------------------------------------------------------
+
+    fn capture_undo(&mut self) -> Option<UndoSnap> {
+        let session = self.capture_session("Undo").ok()?;
+        let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
+        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, patch_names: self.patch_names.clone() })
+    }
+
+    /// Before an agent's first change in a job, snapshot the rack. A job is
+    /// one assistant request, or a burst of remote calls (gaps < 3 s).
+    fn note_agent_change(&mut self, origin: AgentOrigin) {
+        let now = self.ui_time;
+        let same_job = match self.undo_job {
+            Some((o, last)) => o == origin && (origin == AgentOrigin::Assistant || now - last < REMOTE_JOB_GAP),
+            None => false,
+        };
+        if !same_job {
+            if let Some(snap) = self.capture_undo() {
+                self.undo_past.push(snap);
+                if self.undo_past.len() > UNDO_LIMIT { self.undo_past.remove(0); }
+                self.undo_future.clear();
+            }
+        }
+        self.undo_job = Some((origin, now));
+    }
+
+    /// Restore a snapshot exactly the way a rig edit reloads (rule 20:
+    /// mixer and rig in view are applied AFTER the reload).
+    fn restore_undo(&mut self, snap: UndoSnap) -> anyhow::Result<()> {
+        let (graphs, _) = crate::control::split_rigs(&snap.session.graph);
+        let list: Vec<crate::control::Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
+            let meta = snap.rigs.get(i);
+            let name = meta.map(|m| m.name.clone()).filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+            crate::control::Rig::new(name, g, meta.and_then(|m| m.midi_device))
+        }).collect();
+        let active = snap.active.min(list.len().saturating_sub(1));
+        self.load_as_rigs = Some((list.clone(), active));
+        self.apply_session(&snap.session)?;
+        if let Ok(mut s) = self.rig_snapshot.lock() {
+            s.rigs = list.iter().map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+            s.active = active;
+        }
+        self.adopt_rig_devices();
+        self.patch_names = snap.patch_names;
+        self.rig_mix = snap.mix;
+        self.active_rig = usize::MAX; // force set_active_rig to regroup
+        self.set_active_rig(active);
+        for i in 0..list.len() { self.send_rig_mix(i); }
+        self.editor_status.clear();
+        Ok(())
+    }
+
+    /// Undo (or redo) the last agent job. Returns a line for the agent/UI.
+    fn undo_agent(&mut self, undo: bool) -> Result<String, String> {
+        let from = if undo { &mut self.undo_past } else { &mut self.undo_future };
+        let Some(target) = from.pop() else {
+            return Err(if undo { "nothing to undo".into() } else { "nothing to redo".into() });
+        };
+        let Some(current) = self.capture_undo() else { return Err("could not capture the current rack".into()) };
+        if undo { self.undo_future.push(current) } else { self.undo_past.push(current) }
+        self.undo_job = None; // the next agent change starts a fresh step
+        self.restore_undo(target).map_err(|e| e.to_string())?;
+        let what = if undo { "undid" } else { "redid" };
+        self.session_msg = format!("{what} the last agent change");
+        Ok(format!("{what} the last agent change · undo left {} · redo left {}", self.undo_past.len(), self.undo_future.len()))
+    }
+
+    fn undo_agent_tool(&mut self, undo: bool) -> String {
+        match self.undo_agent(undo) { Ok(s) | Err(s) => s }
+    }
+
     /// Play (or stop) the last recorded take through the file player.
     fn toggle_take_playback(&mut self, path: &str, secs: f64) {
         let playing = self.take_play_until > self.ui_time;
@@ -3355,7 +3456,10 @@ impl DemoApp {
 
     fn exec_tool_with_origin(&mut self, name: &str, args: &serde_json::Value, origin: AgentOrigin) -> String {
         let now = self.ui_time;
+        if !tool_is_read_only(name) { self.note_agent_change(origin); }
         match name {
+            "undo" => return self.undo_agent_tool(true),
+            "redo" => return self.undo_agent_tool(false),
             "get_graph" => match self.shared_graph.lock() {
                 Ok(g) => serde_json::to_value(&*g)
                     .map(|v| v.to_string())
@@ -5292,6 +5396,8 @@ impl DemoApp {
                 | "clear_cc_map"
                 | "learn_cc"
                 | "get_matrix"
+                | "undo"
+                | "redo"
                 | "add_rig" => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 other => format!("tool '{other}' is not served over the UI bridge"),
             };
@@ -5406,6 +5512,7 @@ impl DemoApp {
             return;
         }
         let msg = format!("{}\n{}", self.chat_context(), t);
+        self.undo_job = None; // a new request = a new undo step
         self.assistant.send_user_display(t, msg);
     }
 
@@ -10219,6 +10326,12 @@ impl DemoApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
                 self.toggle_dock(DockView::Keyboard);
             }
+            // Agent undo/redo (Ctrl+Shift+Z first: Ctrl+Z would match it too).
+            let redo = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z));
+            let undo = !redo && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Z));
+            if redo || undo {
+                if let Err(e) = self.undo_agent(undo) { self.session_msg = e; }
+            }
         }
 
         // Per-rig input selection strip (top, includes the transport row), then
@@ -13235,6 +13348,47 @@ mod split_bpm_tests {
         assert_eq!(u.sub, "Surge XT · Wurli");
         // Tracked captions paint one glyph per shape: join them.
         assert!(texts.concat().contains("SURGE XT · WURLI"), "subtitle repainted: {texts:?}");
+    }
+
+    #[test]
+    fn agent_undo_reverts_one_whole_job_and_redo_restores_it() {
+        let (mut app, ctx) = demo();
+        assert_eq!(app.rig_count(), 1);
+        // One assistant job: add a rig AND turn rig A down.
+        app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.3}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 2);
+        assert!((app.rig_mix[0].vol - 0.3).abs() < 1e-6);
+        assert_eq!(app.undo_past.len(), 1, "one job = one undo step");
+
+        let out = app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert!(out.contains("undid"), "{out}");
+        assert_eq!(app.rig_count(), 1, "the added rig is gone");
+        assert!((app.rig_mix[0].vol - 1.0).abs() < 1e-6, "and the mix change with it");
+
+        app.exec_tool("redo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.rig_name(1), "Bass", "rig names survive undo/redo");
+        assert!((app.rig_mix[0].vol - 0.3).abs() < 1e-6);
+        assert!(app.exec_tool("redo", &serde_json::json!({})).contains("nothing to redo"));
+
+        // A new chat request opens a new step; remote calls split on a 3 s gap.
+        app.submit_chat("louder".into());
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.9}));
+        assert_eq!(app.undo_past.len(), 2);
+        app.exec_tool_with_origin("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.5}), AgentOrigin::Remote);
+        app.exec_tool_with_origin("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.4}), AgentOrigin::Remote);
+        assert_eq!(app.undo_past.len(), 3, "a remote burst is one step");
+        app.ui_time += REMOTE_JOB_GAP + 1.0;
+        app.exec_tool_with_origin("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.2}), AgentOrigin::Remote);
+        assert_eq!(app.undo_past.len(), 4, "after a pause, a new step");
+        // Read-only tools never open a step.
+        app.ui_time += REMOTE_JOB_GAP + 1.0;
+        app.exec_tool_with_origin("get_rigs", &serde_json::json!({}), AgentOrigin::Remote);
+        assert_eq!(app.undo_past.len(), 4);
     }
 
     #[test]

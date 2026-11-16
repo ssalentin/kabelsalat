@@ -733,9 +733,14 @@ Everything queued lives here; update this section as work lands.
      (published like `GraphPub.mix`, rule 33); a `measure_mix` tool in assistant +
      exec_tool + MCP (rule 6) so the agent can check its own mix moves. Pairs with
      the audio-analysis testing item above (same meters).
-  2. **Agent undo (M):** `History` (session.rs) exists but is not agent-facing. One
-     agent job = one undo step (snapshot before its first mutating call), snapshot
-     also the per-rig mix; `undo`/`redo` tools in both frontends.
+  2. **Agent undo — done (2026-11-16):** one agent job = one undo step (snapshot of
+     session + rigs + mixer + rig in view + patch names before the job's first
+     change; a job = one assistant request or a remote burst with gaps < 3 s);
+     `undo`/`redo` in assistant, exec_tool and MCP (`--attach`), Ctrl+Z / Ctrl+Shift+Z.
+     Open: MCP edit tools that go straight to the engine bus (connect, add_node,
+     set_param, ...) bypass the app and are not undoable yet — route them through
+     the UI bridge when attached. Per-voice rig sources (keyboard/hardware toggles)
+     are not in the snapshot.
   3. **Capability discovery (S):** `catalog` (every tool + args, derived from
      `tools()`) and `can` (actions valid for the rig in view) to keep a growing tool
      surface honest.

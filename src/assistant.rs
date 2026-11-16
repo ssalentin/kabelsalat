@@ -473,6 +473,16 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"}},"required":["query"]}
         }},
         {"type":"function","function":{
+            "name":"undo",
+            "description":"Undo the last agent job (everything one request changed: graph, cables, knobs, synth sounds, matrix, rigs, mixer) in one step. Use when the user says undo/revert/that was wrong, or to back out your own mistake.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"redo",
+            "description":"Redo the agent job that undo just reverted.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
             "name":"get_rigs",
             "description":"List every rig (all of them, not just the one in view): index, name, MIDI device, units (node ids), mixer vol/pan/mute/solo, plus which rig is in view. Every rig sounds at once; get_graph nodes carry their rig index too.",
             "parameters":{"type":"object","properties":{}}

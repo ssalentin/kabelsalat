@@ -1408,6 +1408,22 @@ impl McpServer {
     }
 
     /// Add a standard rig to the running setup.
+    #[tool(name = "undo", description = "Undo the last agent job in the running app (needs kabelsalat mcp --attach): one step per in-app assistant request or per burst of attached calls served by the app (add_rig, load_sound, set_cc_map, ...). Restores graph, cables, knobs, synth sounds, matrix, rigs and mixer.")]
+    fn undo(&self) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("undo", json!({}));
+        }
+        tool_err("undo needs the running app (kabelsalat mcp --attach)")
+    }
+
+    #[tool(name = "redo", description = "Redo the agent job that undo reverted (needs kabelsalat mcp --attach).")]
+    fn redo(&self) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("redo", json!({}));
+        }
+        tool_err("redo needs the running app (kabelsalat mcp --attach)")
+    }
+
     #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id> -> Master for any installed CLAP instrument from list_plugins; needs the running app), wired and playable (a bare Keys + Master when every synth voice is taken). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
     fn add_rig(&self, Parameters(args): Parameters<AddRigArgs>) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);

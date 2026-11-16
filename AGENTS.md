@@ -232,6 +232,11 @@ Learned so far (2026-11-15, UI polish pass):
     sum at 0.7 first (0 % hard saturation for held notes; a big chord's
     onset still touches it for 2–5 ms, masked by the attack). Never add
     lookahead on the master (it adds to every played note's latency).
+50. **Push only on a green gate you checked explicitly:** gate commits and
+    pushes on `cargo test` exiting 0 AND its output containing
+    `test result: ok` — never on `grep "test result"` (it also matches
+    `FAILED`) and never with `;` between test and push. Twice a red run was
+    pushed this way (f2659d7, ad36805).
 
 ## Ground rules
 

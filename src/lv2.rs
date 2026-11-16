@@ -241,6 +241,12 @@ unsafe fn pin_plugin_library(plugin: *const LilvPlugin) {
     lilv_free(path as *mut c_void);
 }
 
+/// Tests that run Vitalium hold this: two Vitalium instances processing on
+/// parallel test threads crash inside the plugin (shared global state);
+/// the app only ever runs instances on its one audio thread.
+#[cfg(test)]
+pub(crate) static VITALIUM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Serializes every lilv world build/load, plugin instantiation and free:
 /// the app now does these from several threads (plugin scan, LV2 loader,
 /// editor), and plugin libraries keep process-global state.
@@ -1373,6 +1379,7 @@ mod tests {
 
     #[test]
     fn vitalium_survives_repeated_load_and_free() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Freeing the last instance used to dlclose vitalium-lv2.so, whose
         // static destructors crash; the second load then hit freed state.
         for _ in 0..5 {
@@ -1383,6 +1390,7 @@ mod tests {
 
     #[test]
     fn vitalium_apply_preset_and_render_audio() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Ok(mut plugin) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else {
             return;
         };

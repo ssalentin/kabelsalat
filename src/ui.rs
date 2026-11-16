@@ -11614,6 +11614,7 @@ mod split_bpm_tests {
 
     #[test]
     fn vitalium_and_dexed_editor_support() {
+        let _one_at_a_time = crate::lv2::VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         if !lv2_discover().iter().any(|p| p.uri == "urn:distrho:vitalium") {
             return;
         }

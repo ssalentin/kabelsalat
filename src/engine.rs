@@ -203,6 +203,78 @@ struct Lv2Slot {
     buf: Vec<f32>,
 }
 
+/// Work the audio thread hands to the LV2 loader thread: instantiating a
+/// plugin (~200 ms for Vitalium), parsing its presets and freeing an
+/// instance all block far longer than one audio buffer.
+enum Lv2Request {
+    Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
+    Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
+    Retire(Lv2Slot),
+    RetirePreset(crate::lv2::Lv2Preset),
+}
+
+/// What the loader hands back; attached at the next block boundary.
+enum Lv2Response {
+    Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
+    Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
+}
+
+const LV2_RING: usize = 64;
+const LV2_SLOT_CAP: usize = 32;
+
+fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
+    match crate::lv2::Lv2Plugin::load(uri, sample_rate, 8192) {
+        Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2] }),
+        Err(e) => {
+            eprintln!("lv2 node {node}: {e}");
+            None
+        }
+    }
+}
+
+/// The LV2 loader thread: serves requests until the engine drops its end.
+fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer<Lv2Response>, sample_rate: f64) {
+    loop {
+        let Ok(r) = req.pop() else {
+            if req.is_abandoned() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        };
+        let out = match r {
+            Lv2Request::Load { node, uri, gen } => {
+                load_lv2_slot(node, uri.as_str(), sample_rate).map(|slot| Lv2Response::Loaded { node, gen, slot })
+            }
+            Lv2Request::Preset { node, uri, preset_uri } => crate::lv2::discover_presets(uri.as_str())
+                .into_iter()
+                .find(|p| p.uri == preset_uri)
+                .map(|preset| Lv2Response::Preset { node, preset }),
+            Lv2Request::Retire(slot) => {
+                drop(slot);
+                None
+            }
+            Lv2Request::RetirePreset(p) => {
+                drop(p);
+                None
+            }
+        };
+        let mut pending = out;
+        while let Some(msg) = pending.take() {
+            match resp.push(msg) {
+                Ok(()) => {}
+                Err(rtrb::PushError::Full(m)) => {
+                    if resp.is_abandoned() {
+                        return;
+                    }
+                    pending = Some(m);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+}
+
 /// Load an LV2 plugin instance for every Lv2 node (rare structural op).
 fn build_lv2_slots(graph: &Graph, sample_rate: f64) -> Vec<Lv2Slot> {
     graph
@@ -390,6 +462,13 @@ pub struct GraphEngine {
     player_buf: Vec<f32>,
     // Runtime CLAP voice delivery + retirement side channels (UI <-> audio).
     voice_rx: Option<rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>>,
+    /// LV2 loader thread link (`spawn_lv2_loader`); None loads inline
+    /// (tests, offline self-tests).
+    lv2_req: Option<rtrb::Producer<Lv2Request>>,
+    lv2_resp: Option<rtrb::Consumer<Lv2Response>>,
+    /// Bumped by every graph load: a plugin the loader finishes for an
+    /// older graph is retired, not attached.
+    lv2_gen: u64,
     voice_retire_tx: Option<rtrb::Producer<ClapVoice>>,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
@@ -490,9 +569,109 @@ impl GraphEngine {
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
             voice_rx: None,
+            lv2_req: None,
+            lv2_resp: None,
+            lv2_gen: 0,
             voice_retire_tx: None,
             recorder: None,
             record_sync: false,
+        }
+    }
+
+    /// Instantiate LV2 plugins, parse their presets and free them on a
+    /// loader thread instead of the audio thread. Call before the engine
+    /// moves to the audio thread.
+    pub fn spawn_lv2_loader(&mut self) {
+        let (req_tx, req_rx) = rtrb::RingBuffer::new(LV2_RING);
+        let (resp_tx, resp_rx) = rtrb::RingBuffer::new(LV2_RING);
+        let sr = self.sample_rate;
+        std::thread::Builder::new()
+            .name("kabelsalat-lv2-loader".into())
+            .spawn(move || lv2_loader_loop(req_rx, resp_tx, sr))
+            .expect("spawn lv2 loader");
+        self.lv2_req = Some(req_tx);
+        self.lv2_resp = Some(resp_rx);
+        self.lv2.reserve(LV2_SLOT_CAP);
+    }
+
+    /// Load `uri` for `node`: on the loader thread when there is one.
+    fn request_lv2(&mut self, node: NodeId, uri: crate::control::Lv2Uri) {
+        if let Some(tx) = self.lv2_req.as_mut() {
+            if tx.push(Lv2Request::Load { node, uri, gen: self.lv2_gen }).is_err() {
+                eprintln!("lv2 loader queue full: node {node} not loaded");
+            }
+            return;
+        }
+        if let Some(slot) = load_lv2_slot(node, uri.as_str(), self.sample_rate) {
+            self.attach_lv2(slot);
+        }
+    }
+
+    /// Put a loaded LV2 slot into the render list; an instrument gets the
+    /// default MIDI routes (only its rig's device when the rig has one).
+    fn attach_lv2(&mut self, slot: Lv2Slot) {
+        let node = slot.node;
+        let inst = slot.plugin.is_instrument();
+        self.lv2.push(slot);
+        if inst {
+            let device = self.graph.node(node)
+                .and_then(|n| self.rig_meta.get(n.rig as usize))
+                .and_then(|m| m.midi_device);
+            match device {
+                Some(dev) => {
+                    self.matrix.connect(SourceId::Hardware(dev), node);
+                }
+                None => {
+                    self.matrix.connect(SourceId::Keys, node);
+                    for dev in 0..MAX_HW_DEVICES {
+                        self.matrix.connect(SourceId::Hardware(dev), node);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Free an LV2 slot off the audio thread when the loader runs.
+    fn retire_lv2(&mut self, slot: Lv2Slot) {
+        if let Some(tx) = self.lv2_req.as_mut() {
+            if let Err(rtrb::PushError::Full(Lv2Request::Retire(slot))) = tx.push(Lv2Request::Retire(slot)) {
+                drop(slot); // queue full: free here rather than leak
+            }
+        }
+    }
+
+    /// Adopt what the loader finished (block boundary, allocation-free).
+    fn drain_lv2_loader(&mut self) {
+        loop {
+            let msg = match self.lv2_resp.as_mut() {
+                Some(rx) => match rx.pop() {
+                    Ok(m) => m,
+                    Err(_) => return,
+                },
+                None => return,
+            };
+            match msg {
+                Lv2Response::Loaded { node, gen, slot } => {
+                    let wanted = gen == self.lv2_gen
+                        && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }))
+                        && !self.lv2.iter().any(|s| s.node == node)
+                        && self.lv2.len() < self.lv2.capacity();
+                    if wanted {
+                        self.attach_lv2(slot);
+                        self.publish_graph();
+                    } else {
+                        self.retire_lv2(slot);
+                    }
+                }
+                Lv2Response::Preset { node, preset } => {
+                    if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                        s.plugin.apply_preset(&preset);
+                    }
+                    if let Some(tx) = self.lv2_req.as_mut() {
+                        let _ = tx.push(Lv2Request::RetirePreset(preset));
+                    }
+                }
+            }
         }
     }
 
@@ -736,19 +915,7 @@ impl GraphEngine {
                             self.dsp.push(slot);
                         }
                     }
-                    NodeKind::Lv2 { uri } => match crate::lv2::Lv2Plugin::load(uri.as_str(), sr, 8192) {
-                        Ok(plugin) => {
-                            let is_inst = plugin.is_instrument();
-                            self.lv2.push(Lv2Slot { node: id, plugin, buf: vec![0.0; 8192 * 2] });
-                            if is_inst {
-                                self.matrix.connect(SourceId::Keys, id);
-                                for dev in 0..MAX_HW_DEVICES {
-                                    self.matrix.connect(SourceId::Hardware(dev), id);
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("lv2 node {id}: {e}"),
-                    },
+                    NodeKind::Lv2 { uri } => self.request_lv2(id, *uri),
                     NodeKind::Clap { plugin_id } => {
                         self.matrix.connect(SourceId::Keys, id);
                         for dev in 0..MAX_HW_DEVICES {
@@ -772,7 +939,10 @@ impl GraphEngine {
                 self.release_all(id);
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
-                self.lv2.retain(|s| s.node != id);
+                if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
+                    let slot = self.lv2.remove(i);
+                    self.retire_lv2(slot);
+                }
                 for s in &mut self.voices {
                     if s.node == id {
                         s.node = u32::MAX;
@@ -818,6 +988,10 @@ impl GraphEngine {
             }
             Command::LoadLv2Preset { node, preset_uri } => {
                 if let Some(NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
+                    if let Some(tx) = self.lv2_req.as_mut() {
+                        let _ = tx.push(Lv2Request::Preset { node, uri: *uri, preset_uri });
+                        return;
+                    }
                     let presets = crate::lv2::discover_presets(uri.as_str());
                     if let Some(preset) = presets.iter().find(|p| p.uri == preset_uri) {
                         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
@@ -846,7 +1020,12 @@ impl GraphEngine {
                         _ => None,
                     })
                     .collect();
-                self.lv2 = build_lv2_slots(&self.graph, sr);
+                // Old instances are freed (on the loader thread when it runs);
+                // new ones load below, after the matrix is rebuilt.
+                while let Some(slot) = self.lv2.pop() {
+                    self.retire_lv2(slot);
+                }
+                self.lv2_gen = self.lv2_gen.wrapping_add(1);
                 // Remap existing CLAP voices onto the new Clap nodes by matching
                 // plugin_id (falling back to any idle Surge voice for legacy
                 // "Surge XT" / empty ids); unmatched voices go idle (u32::MAX).
@@ -880,15 +1059,13 @@ impl GraphEngine {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
                 }
-                for slot in &self.lv2 {
-                    if slot.plugin.is_instrument() {
-                        self.matrix.connect(SourceId::Keys, slot.node);
-                        for dev in 0..MAX_HW_DEVICES {
-                            self.matrix.connect(SourceId::Hardware(dev), slot.node);
-                        }
+                self.rig_meta.clear();
+                for i in 0..self.graph.nodes.len() {
+                    if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
+                        let id = self.graph.nodes[i].id;
+                        self.request_lv2(id, uri);
                     }
                 }
-                self.rig_meta.clear();
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
                 if self.master_clock.is_counting_in() {
@@ -1268,6 +1445,7 @@ impl GraphEngine {
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
         }
+        self.drain_lv2_loader();
         // Attach any runtime-loaded CLAP voices delivered from the UI thread.
         while let Some(rx) = self.voice_rx.as_mut() {
             let Ok((node, voice, scratch)) = rx.pop() else { break };
@@ -2692,6 +2870,59 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     anyhow::ensure!(held > 1e-3, "LV2 instrument {uri} is silent at the master while a key is held");
     anyhow::ensure!(after < held * 0.01, "LV2 instrument {uri} keeps sounding after note-off");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
+    Ok(())
+}
+
+/// `lv2-async-test`: adding an LV2 synth must not stall the audio thread.
+/// Adds Vitalium via AddNode with and without the loader thread, reports
+/// the longest render block, then plays a note and checks it sounds.
+pub fn lv2_async_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let uri = "urn:distrho:vitalium";
+    let mut worst = Vec::new();
+    for with_loader in [false, true] {
+        let (mut bus, drain) = command_bus();
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut engine = GraphEngine::new(g, drain, sr, vec![]);
+        if with_loader {
+            engine.spawn_lv2_loader();
+        }
+        let inst = keys.max(master) + 1;
+        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0 });
+        bus.send(Command::Connect { id: 1, from: PortRef { node: keys, port: 0 }, to: PortRef { node: inst, port: 0 }, kind: PortKind::Midi });
+        bus.send(Command::Connect { id: 2, from: PortRef { node: inst, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
+        let mut buf = vec![0.0f32; 256 * 2];
+        let (mut max_block, mut attached_after) = (std::time::Duration::ZERO, None);
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            let t = std::time::Instant::now();
+            engine.render(&mut buf, 2);
+            max_block = max_block.max(t.elapsed());
+            if engine.lv2.iter().any(|s| s.node == inst) {
+                attached_after = Some(start.elapsed());
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(5333)); // one 256-frame buffer
+        }
+        let attached_after = attached_after.ok_or_else(|| anyhow::anyhow!("{uri} never attached (with_loader={with_loader})"))?;
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        let mut peak = 0.0f32;
+        for _ in 0..94 {
+            engine.render(&mut buf, 2);
+            peak = buf.iter().fold(peak, |m, x| m.max(x.abs()));
+        }
+        println!("lv2-async-test: loader={with_loader}: longest render block {:.1} ms, attached after {:.0} ms, note peak {peak:.4}",
+            max_block.as_secs_f64() * 1000.0, attached_after.as_secs_f64() * 1000.0);
+        anyhow::ensure!(peak > 1e-3, "{uri} silent after attach (loader={with_loader})");
+        worst.push(max_block);
+    }
+    anyhow::ensure!(worst[1] < std::time::Duration::from_millis(5), "render blocked {:?} with the loader", worst[1]);
+    println!("lv2-async-test: OK — the loader keeps every render block under one buffer while {uri} loads");
     Ok(())
 }
 

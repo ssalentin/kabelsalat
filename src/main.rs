@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         "edge-level-test" => engine::edge_level_test(),
         "lv2-instrument-test" => lv2::instrument_test(),
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
+        "lv2-async-test" => engine::lv2_async_test(),
         "add-node-test" => engine::add_node_test(),
         "mono-master-test" => engine::mono_master_test(),
         "multi-rig-test" => engine::multi_rig_test(),

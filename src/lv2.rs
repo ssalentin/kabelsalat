@@ -511,9 +511,9 @@ pub fn host_test() -> anyhow::Result<()> {
 
 /// A hosted LV2 plugin instance with audio buffers, ready to process blocks.
 /// Owns the lilv world + instance and the persistent URID-map feature data.
-/// `process` is allocation-free (buffers preallocated); instantiate/Drop are
-/// main-thread only. Not yet `Send` (raw pointers) — engine integration will
-/// wrap it accordingly.
+/// `process` is allocation-free (buffers preallocated); `load` and `Drop`
+/// block (world load, instantiate, free) and belong on the engine's LV2
+/// loader thread, never the audio thread.
 pub struct Lv2Plugin {
     world: *mut LilvWorld,
     instance: *mut LilvInstance,
@@ -536,9 +536,10 @@ pub struct Lv2Plugin {
     uri: String,
 }
 
-// SAFETY: the lilv world/instance raw pointers are created on the main thread
-// (load) and thereafter only touched on the audio thread (process/Drop), never
-// concurrently. This is the standard plugin-host pattern (cf. ClapVoice).
+// SAFETY: one thread owns an instance at a time (moved over the engine's
+// rings: loader → audio thread for `process`, back to the loader to free);
+// world/instance creation and freeing hold `LILV_LOCK`, so lilv is never
+// used from two threads at once.
 unsafe impl Send for Lv2Plugin {}
 
 impl Lv2Plugin {

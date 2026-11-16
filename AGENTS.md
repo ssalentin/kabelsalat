@@ -220,6 +220,12 @@ Learned so far (2026-11-15, UI polish pass):
     recorder's writer busy-spun a full core while the ring was empty, and its
     Stop path cleared `recording` after a quick Stop→Start had set it again
     (take 2 went silent). Sleep/park when idle; clear state only on error.
+48. **Device discovery runs on its own thread, never per UI frame:** MIDI
+    inputs were scanned only at startup, so a keyboard plugged in later
+    (M-Wave FM-1) was never seen; a rescan in `update()` would stall while
+    the window is idle. `spawn_hw_midi` owns the connections and rescans
+    every 2 s; unplugged devices keep their index. Tests never scan the
+    machine's hardware (a plugged keyboard broke a matrix layout test).
 
 ## Ground rules
 

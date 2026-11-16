@@ -539,6 +539,7 @@ mod tests {
                 count_in_enabled: true,
                 count_in_bars: 2,
                 bpm: 124.0,
+                record_sync: false,
             },
             ..Default::default()
         }));

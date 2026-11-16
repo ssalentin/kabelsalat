@@ -651,7 +651,7 @@ fn nav_separator(ui: &mut egui::Ui) {
 /// dim open dot when idle. `secs` shows elapsed time while recording.
 fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
     let (fill, stroke, txt) = if recording {
-        (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::DARK_PANEL)
+        (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
     } else {
         (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
     };
@@ -2312,6 +2312,7 @@ impl DemoApp {
             self.count_in_beat = g.transport.count_in_beat;
             self.count_in_enabled = g.transport.count_in_enabled;
             self.count_in_bars = g.transport.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS);
+            self.record_sync = g.transport.record_sync;
             if !matches!(self.drag, Drag::Bpm { .. }) {
                 self.bpm = g.transport.bpm;
             }
@@ -3217,6 +3218,9 @@ impl DemoApp {
                 "master transport stopped (every metronome stops)".into()
             }
             "record_start" => {
+                if self.recorder.is_none() || self.bus.is_none() {
+                    return "recording unavailable: no audio engine (recorder/bus missing)".into();
+                }
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::RecordStart);
                 }
@@ -3234,6 +3238,14 @@ impl DemoApp {
                     .unwrap_or_else(|e| format!("record status: {e}")),
                 None => "{\"recording\":false,\"available\":false}".into(),
             },
+            "set_record_sync" => {
+                let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(!self.record_sync);
+                self.record_sync = on;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRecordSync { on });
+                }
+                serde_json::json!({"record_sync": self.record_sync}).to_string()
+            }
             "set_node_playing" => {
                 let Some(node) = args.get("node").and_then(|v| v.as_u64()) else {
                     return "set_node_playing needs 'node' (id from get_graph)".into();
@@ -4785,9 +4797,15 @@ impl DemoApp {
                     nav_separator(ui);
                     ui.add_space(6.0);
                     let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
-                    let secs = self.recorder.as_ref().map(|r| r.snapshot().seconds).unwrap_or(0.0);
+                    let snap = self.recorder.as_ref().map(|r| r.snapshot());
+                    let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
+                    let rec_err = snap.as_ref().and_then(|s| s.error.clone());
                     if rec_chip(ui, recording, secs).on_hover_text("record the master output to ~/Music/kabelsalat/").clicked() {
                         self.toggle_recording();
+                    }
+                    if let Some(err) = rec_err {
+                        ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_DEEP))
+                            .on_hover_text("recording failed to start or write");
                     }
                     ui.add_space(6.0);
                     let sync = self.record_sync;
@@ -8741,6 +8759,11 @@ impl eframe::App for DemoApp {
         // Native editor holds no plugin GUI; just drop its cached state.
         self.editor_open = false;
         self.editor_params.clear();
+        // Drain + finalize any take in flight and join the writer thread, so a
+        // clean exit never leaves a RIFF=36/data_size=0 shell behind.
+        if let Some(r) = self.recorder.take() {
+            r.shutdown();
+        }
     }
 }
 
@@ -11597,6 +11620,35 @@ mod split_bpm_tests {
         assert_eq!(st["count_in_enabled"], serde_json::json!(true));
         assert_eq!(st["count_in_bars"], serde_json::json!(2));
         assert_eq!(st["bpm"], serde_json::json!(120.0));
+    }
+
+    #[test]
+    fn record_tools_parity_and_failure_surfacing() {
+        // Rule 6 + finding #10: record tools exist in the assistant schema AND
+        // exec_tool, and record_start does not claim success without a recorder.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        for t in ["record_start", "record_stop", "record_status", "set_record_sync"] {
+            assert!(names.contains(&t), "assistant tools missing {t}");
+        }
+
+        // No audio engine (bus/recorder absent): record_start must fail loudly.
+        let mut app = DemoApp::new_with_sink(None);
+        assert!(app.bus.is_none() && app.recorder.is_none());
+        let r = app.exec_tool("record_start", &serde_json::json!({}));
+        assert!(r.contains("unavailable"), "record_start must not claim success without a recorder: {r}");
+        assert!(app.exec_tool("record_stop", &serde_json::json!({})).contains("stopped"));
+        assert!(app.exec_tool("record_status", &serde_json::json!({})).contains("\"available\":false"));
+
+        // set_record_sync flips the mirror and, with a bus, sends the command.
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let r = app.exec_tool("set_record_sync", &serde_json::json!({"on": true}));
+        assert!(r.contains("\"record_sync\":true"), "{r}");
+        assert!(app.record_sync, "exec_tool mirrors record_sync");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordSync { on: true })), "sent SetRecordSync: {cmds:?}");
     }
 }
 

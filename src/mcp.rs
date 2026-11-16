@@ -82,6 +82,8 @@ struct State {
     cc_maps: std::collections::HashMap<(SourceId, NodeId), Vec<crate::matrix::CcMapping>>,
     /// Recorder status (headless): the shared handle the engine's tap writes.
     record: Arc<crate::record::RecorderShared>,
+    /// "Sync to transport" mirror (the engine is authoritative via SetRecordSync).
+    record_sync: bool,
 }
 
 #[derive(Clone)]
@@ -263,6 +265,13 @@ struct SetCountInArgs {
     enabled: Option<bool>,
     /// Number of count-in bars (1..=4; 0 disables count-in).
     bars: Option<u8>,
+}
+
+/// Arguments for `set_record_sync`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecordSyncArgs {
+    /// Whether recording follows the master transport (play starts, stop stops).
+    on: bool,
 }
 
 /// Arguments for `set_rig_device`.
@@ -1492,6 +1501,9 @@ impl McpServer {
     #[tool(name = "record_start", description = "Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/ (Command::RecordStart). Idempotent: a second start while recording is a no-op.")]
     fn record_start(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Local(_)) && !st.record.is_live() {
+            return tool_err("recording unavailable: no audio engine (recorder not attached)");
+        }
         if let Err(e) = send_cmd(&mut st, Command::RecordStart) {
             return tool_err(e);
         }
@@ -1523,6 +1535,18 @@ impl McpServer {
             return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
         }
         ok_json(serde_json::to_value(st.record.snapshot()).unwrap_or(json!({})))
+    }
+
+    /// Toggle sync-to-transport recording.
+    #[tool(name = "set_record_sync", description = "Toggle 'sync to transport' (Command::SetRecordSync): while on, master transport play starts a recording and stop stops it. The take begins at song beat 0 (after any count-in).")]
+    fn set_record_sync(&self, Parameters(args): Parameters<RecordSyncArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let on = args.on;
+        if let Err(e) = send_cmd(&mut st, Command::SetRecordSync { on }) {
+            return tool_err(e);
+        }
+        st.record_sync = on;
+        ok_json(json!({"record_sync": on}))
     }
 }
 
@@ -1715,6 +1739,7 @@ pub fn run() -> anyhow::Result<()> {
     if ci_enabled || ci_bars != 1 {
         let _ = audio.bus.send(Command::SetCountIn { enabled: ci_enabled, bars: ci_bars });
     }
+    let recorder = audio.record.clone(); // shut it down after the session ends
     let state = Arc::new(Mutex::new(State {
         graph: Graph::demo_patch(),
         backend: Backend::Local(audio.bus),
@@ -1728,12 +1753,15 @@ pub fn run() -> anyhow::Result<()> {
         count_in_bars: ci_bars,
         cc_maps: std::collections::HashMap::new(),
         record: audio.record,
+        record_sync: false,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout);
 
     // The stream and the CLAP main-thread handles stayed alive on this (the
-    // creating) thread for the whole session; tear them down last.
+    // creating) thread for the whole session; tear them down last. Stop + join
+    // the recorder writer first so a take in flight is drained and finalized.
+    recorder.shutdown();
     drop(audio.stream);
     drop(audio.mains);
     result
@@ -1758,6 +1786,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         count_in_bars: 1,
         cc_maps: std::collections::HashMap::new(),
         record: Arc::new(crate::record::RecorderShared::new()),
+        record_sync: false,
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -1834,6 +1863,7 @@ mod tests {
             count_in_bars: 1,
             cc_maps: std::collections::HashMap::new(),
             record: Arc::new(crate::record::RecorderShared::new()),
+            record_sync: false,
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),
@@ -2088,5 +2118,23 @@ mod tests {
         let st3 = tool_json(&server.get_status());
         assert_eq!(st3["counting_in"], json!(false));
         assert_eq!(st3["transport_playing"], json!(false));
+    }
+
+    #[test]
+    fn record_start_fails_without_engine_and_set_record_sync_mirrors() {
+        // Finding #9/#10: headless local_server has a dummy (non-live) recorder,
+        // so record_start must report unavailable, not claim success. And
+        // set_record_sync exists + mirrors into State.
+        let (server, mut engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        assert!(is_err(server.record_start()), "record_start must not claim success without a recorder");
+        let mut buf = vec![0.0f32; 480 * 2];
+        let r = tool_json(&server.set_record_sync(Parameters(RecordSyncArgs { on: true })));
+        assert_eq!(r, json!({"record_sync": true}));
+        engine.render(&mut buf, 2); // drain SetRecordSync into the engine
+        assert!(engine.transport_pub().record_sync, "engine adopted record_sync");
     }
 }

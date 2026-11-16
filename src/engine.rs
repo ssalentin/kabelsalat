@@ -361,6 +361,7 @@ pub struct TransportPub {
     pub count_in_enabled: bool,
     pub count_in_bars: u8,
     pub bpm: f32,
+    pub record_sync: bool,
 }
 
 impl Default for TransportPub {
@@ -372,6 +373,7 @@ impl Default for TransportPub {
             count_in_enabled: false,
             count_in_bars: 1,
             bpm: 96.0,
+            record_sync: false,
         }
     }
 }
@@ -479,6 +481,9 @@ pub struct GraphEngine {
     recorder: Option<RecorderTap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
     record_sync: bool,
+    // A synced take is armed but not started until the song clock reaches
+    // beat 0 (after any count-in); see render().
+    record_sync_pending: bool,
 }
 
 impl GraphEngine {
@@ -579,6 +584,7 @@ impl GraphEngine {
             voice_retire_tx: None,
             recorder: None,
             record_sync: false,
+            record_sync_pending: false,
         }
     }
 
@@ -720,14 +726,14 @@ impl GraphEngine {
 
     /// Start recording the master output (idempotent). No-op without a tap.
     fn record_start(&mut self) {
-        if let Some(rec) = &self.recorder {
+        if let Some(rec) = &mut self.recorder {
             rec.begin();
         }
     }
 
     /// Stop recording (idempotent). No-op without a tap.
     fn record_stop(&mut self) {
-        if let Some(rec) = &self.recorder {
+        if let Some(rec) = &mut self.recorder {
             rec.stop();
         }
     }
@@ -759,6 +765,7 @@ impl GraphEngine {
             count_in_enabled: self.count_in.enabled,
             count_in_bars: self.count_in.bars,
             bpm: self.transport.bpm as f32,
+            record_sync: self.record_sync,
         }
     }
 
@@ -1091,6 +1098,7 @@ impl GraphEngine {
                     self.transport.set_playing(false);
                     self.count_in_slot.set_playing(false);
                     self.last_count_in_beat = 0;
+                    self.record_sync_pending = false;
                     self.transport_dirty = true;
                 }
                 self.publish_rig_snapshot();
@@ -1390,7 +1398,12 @@ impl GraphEngine {
             }
             Command::RecordStart => self.record_start(),
             Command::RecordStop => self.record_stop(),
-            Command::SetRecordSync { on } => self.record_sync = on,
+            Command::SetRecordSync { on } => {
+                if self.record_sync != on {
+                    self.record_sync = on;
+                    self.transport_dirty = true;
+                }
+            }
         }
     }
 
@@ -1448,11 +1461,16 @@ impl GraphEngine {
                 self.publish_graph();
             }
         }
-        // Sync-to-transport: recording follows the master transport.
-        if self.record_sync {
-            if playing {
-                self.record_start();
-            } else {
+        // Sync-to-transport: recording follows the master transport. The take
+        // actually begins the block the song clock reaches beat 0 (render);
+        // play only arms it, stop cancels it and stops any running take.
+        if playing {
+            if self.record_sync {
+                self.record_sync_pending = true;
+            }
+        } else {
+            self.record_sync_pending = false;
+            if self.record_sync {
                 self.record_stop();
             }
         }
@@ -1464,6 +1482,12 @@ impl GraphEngine {
             self.apply(cmd);
         }
         self.drain_lv2_loader();
+        // Sync-to-transport: begin the take the block the song clock starts at
+        // beat 0 (immediately on play without a count-in, or right after one).
+        if self.record_sync_pending && self.master_clock == MasterClock::Playing {
+            self.record_sync_pending = false;
+            self.record_start();
+        }
         // Attach any runtime-loaded CLAP voices delivered from the UI thread.
         while let Some(rx) = self.voice_rx.as_mut() {
             let Ok((node, voice, scratch)) = rx.pop() else { break };
@@ -1585,6 +1609,9 @@ impl GraphEngine {
                         }
                     }
                     self.transport_dirty = true;
+                    if self.record_sync {
+                        self.record_sync_pending = true;
+                    }
                 } else {
                     self.master_clock = MasterClock::CountingIn { remaining_beats: rem, total_beats };
                     let beat = self.master_clock.count_in_beat();

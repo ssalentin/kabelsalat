@@ -216,6 +216,10 @@ Learned so far (2026-11-15, UI polish pass):
     runs on a background scan (`start_plugin_scan`). Every lilv world
     build/load/instantiate/free holds `LILV_LOCK` — concurrent lilv use from
     two threads corrupted the heap. Check with `kabelsalat lv2-async-test`.
+47. **Worker threads park, never spin; only failures clear a live flag:** the
+    recorder's writer busy-spun a full core while the ring was empty, and its
+    Stop path cleared `recording` after a quick Stop→Start had set it again
+    (take 2 went silent). Sleep/park when idle; clear state only on error.
 
 ## Ground rules
 

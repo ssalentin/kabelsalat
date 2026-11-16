@@ -2,21 +2,22 @@
 //!
 //! Same RT pattern as capture.rs/player.rs: the audio thread pushes interleaved
 //! stereo f32 into a preallocated lock-free ring (never blocks; a full ring
-//! drops frames and counts them); a writer thread drains the ring into a
+//! drops whole frames and counts them); a writer thread drains the ring into a
 //! 32-bit-float WAV under ~/Music/kabelsalat/ with a timestamped name, patching
-//! the header when recording stops. The header is hand-written (no `hound`).
+//! the header on every written second (crash-safe) and on stop. The header is
+//! hand-written (no `hound`).
 //!
-//! Ownership: the engine holds the [`RecorderTap`] (ring producer + a channel
-//! to the writer) and is the authority on start/stop; the UI/agents hold the
-//! [`Arc<RecorderShared>`] to read live status. Per-rig stems are not captured
-//! yet — the tap sits after the final master sum, not per-rig (documented in
-//! PLAN §13).
+//! Ownership: the engine holds the [`RecorderTap`] (ring producer + a control
+//! message ring) and is the authority on start/stop; the UI/agents hold the
+//! [`Arc<RecorderShared>`] to read live status and to shut the writer down on
+//! exit. Per-rig stems are not captured yet — the tap sits after the final
+//! master sum, not per-rig (documented in PLAN §13).
 
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{JoinHandle, Thread};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -40,15 +41,26 @@ pub struct RecordStatus {
     pub seconds: f64,
     pub dropped_frames: u64,
     pub finalized: bool,
+    /// Last start/stop failure (dir/file creation, write error), if any.
+    pub error: Option<String>,
+    /// The last take stopped at the 4 GiB WAV cap instead of on request.
+    pub limit_reached: bool,
+    /// Monotonic count of finalized takes (never resets, unlike `finalized`).
+    pub takes: u64,
 }
 
 /// State shared by the audio thread (tap), the writer thread, and the UI.
-/// `recording` and `dropped_frames` are atomics (RT-safe read/write); `status`
-/// is a mutex owned by the writer thread — the audio callback never touches it.
+/// `live`, `recording`, `shutdown` and `dropped_frames` are atomics (RT-safe);
+/// `status` is a mutex owned by the writer thread — the audio callback never
+/// touches it. `join` is the writer's JoinHandle, joined once on shutdown.
 pub struct RecorderShared {
+    live: AtomicBool,
     recording: AtomicBool,
+    shutdown: AtomicBool,
     dropped_frames: AtomicU64,
     status: Mutex<WavStatus>,
+    writer: OnceLock<Thread>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -56,34 +68,78 @@ struct WavStatus {
     path: Option<String>,
     seconds: f64,
     finalized: bool,
+    error: Option<String>,
+    limit_reached: bool,
+    takes: u64,
 }
 
 impl RecorderShared {
     pub fn new() -> Self {
+        Self::with_live(false)
+    }
+
+    /// A recorder attached to a real writer thread (used by `start`).
+    fn live() -> Self {
+        Self::with_live(true)
+    }
+
+    fn with_live(live: bool) -> Self {
         Self {
+            live: AtomicBool::new(live),
             recording: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
             dropped_frames: AtomicU64::new(0),
             status: Mutex::new(WavStatus::default()),
+            writer: OnceLock::new(),
+            join: Mutex::new(None),
         }
+    }
+
+    /// True only when a writer thread + tap are attached (the dummy
+    /// `RecorderShared::new()` used by attach mode and tests is not live).
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
     }
 
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
     }
 
+    fn unpark_writer(&self) {
+        if let Some(t) = self.writer.get() {
+            t.unpark();
+        }
+    }
+
+    /// Stop any take in flight, wake the writer, and join it so the WAV is
+    /// drained and its header finalized before the process exits.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.recording.store(false, Ordering::Release);
+        self.unpark_writer();
+        if let Ok(mut j) = self.join.lock() {
+            if let Some(h) = j.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
     /// Assemble the current snapshot from the atomics + writer status.
     pub fn snapshot(&self) -> RecordStatus {
-        let (path, seconds, finalized) = self
+        let (path, seconds, finalized, error, limit_reached, takes) = self
             .status
             .lock()
-            .map(|s| (s.path.clone(), s.seconds, s.finalized))
-            .unwrap_or((None, 0.0, false));
+            .map(|s| (s.path.clone(), s.seconds, s.finalized, s.error.clone(), s.limit_reached, s.takes))
+            .unwrap_or((None, 0.0, false, None, false, 0));
         RecordStatus {
             recording: self.recording.load(Ordering::Relaxed),
             path,
             seconds,
             dropped_frames: self.dropped_frames.load(Ordering::Relaxed),
             finalized,
+            error,
+            limit_reached,
+            takes,
         }
     }
 }
@@ -91,29 +147,32 @@ impl RecorderShared {
 /// Engine side: push the final output into the ring and signal the writer.
 pub struct RecorderTap {
     producer: Producer<f32>,
-    tx: Sender<RecorderMsg>,
+    msg_tx: Producer<RecorderMsg>,
     shared: Arc<RecorderShared>,
 }
 
 impl RecorderTap {
     /// Idempotent start: only the false→true transition messages the writer and
     /// resets the drop counter for the new take.
-    pub fn begin(&self) {
+    pub fn begin(&mut self) {
         if !self.shared.recording.swap(true, Ordering::Relaxed) {
             self.shared.dropped_frames.store(0, Ordering::Relaxed);
-            let _ = self.tx.send(RecorderMsg::Start);
+            let _ = self.msg_tx.push(RecorderMsg::Start);
+            self.shared.unpark_writer();
         }
     }
 
     /// Idempotent stop: only the true→false transition tells the writer.
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         if self.shared.recording.swap(false, Ordering::Relaxed) {
-            let _ = self.tx.send(RecorderMsg::Stop);
+            let _ = self.msg_tx.push(RecorderMsg::Stop);
+            self.shared.unpark_writer();
         }
     }
 
     /// Push one block of interleaved f32 as stereo (channels 0/1). RT-safe:
-    /// never blocks; a frame that can't fit is dropped and counted.
+    /// never blocks; a frame that can't fit whole is dropped and counted, so a
+    /// frame is never split (an L without its R would swap every later frame).
     pub fn push_stereo(&mut self, data: &[f32], ch: usize) {
         if !self.shared.recording.load(Ordering::Relaxed) {
             return;
@@ -124,17 +183,28 @@ impl RecorderTap {
         for i in 0..frames {
             let l = data[i * ch];
             let r = if ch > 1 { data[i * ch + 1] } else { l };
-            if self.producer.push(l).is_err() {
-                dropped += 1; // ring full: drop the whole frame (R never pushed)
-                continue;
-            }
-            if self.producer.push(r).is_err() {
-                dropped += 1; // L landed, R lost — overrun glitch
+            // `slots()` is a lower bound (the consumer only frees slots), so a
+            // `>= 2` check guarantees both pushes succeed — never L-only.
+            if self.producer.slots() >= 2 {
+                let _ = self.producer.push(l);
+                let _ = self.producer.push(r);
+            } else {
+                dropped += 1;
             }
         }
         if dropped > 0 {
             self.shared.dropped_frames.fetch_add(dropped, Ordering::Relaxed);
         }
+    }
+}
+
+impl Drop for RecorderTap {
+    fn drop(&mut self) {
+        // Teardown without a UI handle (engine/stream dropped): stop the take
+        // and wake the writer so it drains + finalizes + exits.
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.recording.store(false, Ordering::Release);
+        self.shared.unpark_writer();
     }
 }
 
@@ -161,97 +231,133 @@ fn start_with_capacity(
     channels: usize,
     cap: usize,
 ) -> (RecorderTap, Arc<RecorderShared>) {
-    let shared = Arc::new(RecorderShared::new());
+    let shared = Arc::new(RecorderShared::live());
     let (producer, consumer) = RingBuffer::new(cap.max(2));
-    let (tx, rx) = mpsc::channel();
+    let (msg_tx, msg_rx) = RingBuffer::new(64);
     let thread_shared = shared.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("kabelsalat-recorder".into())
-        .spawn(move || writer_loop(rx, consumer, dir, sample_rate, channels, thread_shared))
+        .spawn(move || writer_loop(msg_rx, consumer, dir, sample_rate, channels, thread_shared))
         .expect("spawn recorder thread");
-    (RecorderTap { producer, tx, shared: shared.clone() }, shared)
+    if let Ok(mut j) = shared.join.lock() {
+        *j = Some(handle);
+    }
+    (RecorderTap { producer, msg_tx, shared: shared.clone() }, shared)
 }
 
 fn writer_loop(
-    rx: Receiver<RecorderMsg>,
-    mut consumer: Consumer<f32>,
+    mut msg: Consumer<RecorderMsg>,
+    mut data: Consumer<f32>,
     dir: PathBuf,
     sample_rate: u32,
     channels: usize,
     shared: Arc<RecorderShared>,
 ) {
+    let _ = shared.writer.set(std::thread::current());
     let mut file: Option<std::fs::File> = None;
     let mut path: Option<String> = None;
     let mut samples: u64 = 0;
     let mut buf = vec![0.0f32; 4096];
     let mut bytes = Vec::with_capacity(4096 * 4);
+    let max_data_samples = max_data_bytes(channels) / 4;
+    let patch_every = (sample_rate as u64).saturating_mul(2).max(1); // ~1 s stereo
+    let mut next_patch = 0u64;
     loop {
+        // Control messages first (in order), so a Start/Stop raced by teardown
+        // is still honored before the shutdown check below ends the loop.
+        while let Ok(m) = msg.pop() {
+            match m {
+                RecorderMsg::Start => {
+                    // Unreachable via the idempotent begin(); handled anyway.
+                    if file.is_some() {
+                        finalize_take(&mut data, &mut file, &mut samples, &mut buf, &mut bytes, max_data_samples);
+                        set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), true, None, false);
+                    }
+                    let base = format!("kabelsalat-{}", timestamp());
+                    if begin_take(&dir, sample_rate, channels, &base, &mut file, &mut path, &mut samples, &shared) {
+                        next_patch = samples + patch_every;
+                    } else {
+                        file = None;
+                        path = None;
+                        samples = 0;
+                    }
+                }
+                RecorderMsg::Stop => {
+                    if file.is_some() {
+                        finalize_take(&mut data, &mut file, &mut samples, &mut buf, &mut bytes, max_data_samples);
+                        set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), true, None, false);
+                    }
+                    file = None;
+                    path = None;
+                    samples = 0;
+                }
+            }
+        }
+        if shared.shutdown.load(Ordering::Relaxed) || msg.is_abandoned() {
+            if file.is_some() {
+                finalize_take(&mut data, &mut file, &mut samples, &mut buf, &mut bytes, max_data_samples);
+                set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), true, None, false);
+            }
+            break;
+        }
         if file.is_some() {
-            let n = drain(&mut consumer, &mut buf);
+            let room = max_data_samples - samples;
+            let n = drain(&mut data, &mut buf, room as usize);
             if n > 0 {
                 samples_to_bytes(&buf[..n], &mut bytes);
                 let written = file.as_mut().map(|f| f.write_all(&bytes).is_ok()).unwrap_or(false);
                 if !written {
-                    // Disk error: abandon this take and report idle.
-                    set_status(&shared, None, 0.0, true);
+                    // Mid-take write error: finalize best-effort and drain the
+                    // ring so stale samples don't leak into the next take.
+                    if let Some(f) = file.as_mut() {
+                        patch_header(f, samples, max_data_samples);
+                    }
+                    drain_to_empty(&mut data);
                     shared.recording.store(false, Ordering::Relaxed);
+                    set_status(&shared, None, 0.0, true, Some("write failed".into()), false);
                     file = None;
                     path = None;
                     samples = 0;
                     continue;
                 }
                 samples += n as u64;
-                set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), false);
-            }
-            match rx.try_recv() {
-                Ok(RecorderMsg::Stop) => {
-                    finish(&mut consumer, &mut file, &mut samples, sample_rate, channels, &shared, &path, &mut buf, &mut bytes);
+                if samples >= next_patch {
+                    if let Some(f) = file.as_mut() {
+                        patch_header(f, samples, max_data_samples);
+                    }
+                    next_patch = samples + patch_every;
+                }
+                if samples >= max_data_samples {
+                    finalize_take(&mut data, &mut file, &mut samples, &mut buf, &mut bytes, max_data_samples);
+                    set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), true, None, true);
+                    shared.recording.store(false, Ordering::Relaxed);
                     file = None;
                     path = None;
                     samples = 0;
+                    continue;
                 }
-                Ok(RecorderMsg::Start) => {
-                    // Unreachable via the engine's idempotent begin(); handled
-                    // anyway: finalize the current take and begin a fresh one.
-                    finish(&mut consumer, &mut file, &mut samples, sample_rate, channels, &shared, &path, &mut buf, &mut bytes);
-                    file = None;
-                    path = None;
-                    samples = 0;
-                    begin_take(&dir, sample_rate, channels, &mut file, &mut path, &mut samples, &shared);
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    finish(&mut consumer, &mut file, &mut samples, sample_rate, channels, &shared, &path, &mut buf, &mut bytes);
-                    break;
-                }
+                set_status(&shared, path.clone(), seconds(samples, sample_rate, channels), false, None, false);
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         } else {
-            match rx.recv() {
-                Ok(RecorderMsg::Start) => {
-                    begin_take(&dir, sample_rate, channels, &mut file, &mut path, &mut samples, &shared);
-                }
-                Ok(RecorderMsg::Stop) => {} // idle no-op
-                Err(_) => break,
-            }
+            std::thread::park();
         }
     }
 }
 
-/// Drain the ring to empty, write it, patch the header, and publish the final
-/// status. A Stop must not leave pushed-but-unwritten samples behind.
-fn finish(
-    consumer: &mut Consumer<f32>,
+/// Drain the ring to empty and patch the header. A Stop must not leave
+/// pushed-but-unwritten samples behind.
+fn finalize_take(
+    data: &mut Consumer<f32>,
     file: &mut Option<std::fs::File>,
     samples: &mut u64,
-    sample_rate: u32,
-    channels: usize,
-    shared: &Arc<RecorderShared>,
-    path: &Option<String>,
     buf: &mut [f32],
     bytes: &mut Vec<u8>,
+    max_data_samples: u64,
 ) {
     loop {
-        let n = drain(consumer, buf);
+        let n = drain(data, buf, buf.len());
         if n == 0 {
             break;
         }
@@ -263,57 +369,83 @@ fn finish(
         }
         *samples += n as u64;
     }
-    finalize(file, *samples);
-    set_status(shared, path.clone(), seconds(*samples, sample_rate, channels), true);
-    shared.recording.store(false, Ordering::Relaxed);
+    if let Some(f) = file.as_mut() {
+        patch_header(f, *samples, max_data_samples);
+    }
 }
 
 fn seconds(samples: u64, sample_rate: u32, channels: usize) -> f64 {
     samples as f64 / (sample_rate.max(1) as f64 * channels.max(1) as f64)
 }
 
+/// Largest frame-aligned data size a 32-bit RIFF can address: the RIFF size
+/// field holds `36 + data_size`, so data must stay ≤ `u32::MAX - 36` and be a
+/// whole frame (block_align = channels * 4) or the header wraps and corrupts.
+fn max_data_bytes(channels: usize) -> u64 {
+    let block_align = (channels.max(1) as u64) * 4;
+    (u32::MAX as u64 - 36) / block_align * block_align
+}
+
 fn begin_take(
     dir: &PathBuf,
     sample_rate: u32,
     channels: usize,
+    base: &str,
     file: &mut Option<std::fs::File>,
     path: &mut Option<String>,
     samples: &mut u64,
     shared: &Arc<RecorderShared>,
-) {
+) -> bool {
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("record: cannot create {}: {e}", dir.display());
-        set_status(shared, None, 0.0, true);
+        set_status(shared, None, 0.0, true, Some(format!("cannot create recording dir: {e}")), false);
         shared.recording.store(false, Ordering::Relaxed);
-        return;
+        return false;
     }
-    let p = dir.join(format!("kabelsalat-{}.wav", timestamp()));
-    match std::fs::File::create(&p) {
-        Ok(mut f) => {
+    match unique_path(dir, base) {
+        Ok((mut f, name)) => {
             if write_wav_header(&mut f, sample_rate, channels as u16, 0).is_ok() {
-                let name = p.to_string_lossy().into_owned();
                 *file = Some(f);
                 *path = Some(name.clone());
                 *samples = 0;
-                set_status(shared, Some(name), 0.0, false);
+                set_status(shared, Some(name), 0.0, false, None, false);
+                true
             } else {
-                let _ = std::fs::remove_file(&p);
-                eprintln!("record: cannot write header for {}", p.display());
-                set_status(shared, None, 0.0, true);
+                let _ = std::fs::remove_file(&name);
+                eprintln!("record: cannot write header for {name}");
+                set_status(shared, None, 0.0, true, Some(format!("cannot write header for {name}")), false);
                 shared.recording.store(false, Ordering::Relaxed);
+                false
             }
         }
         Err(e) => {
-            eprintln!("record: cannot create {}: {e}", p.display());
-            set_status(shared, None, 0.0, true);
+            eprintln!("record: cannot create recording: {e}");
+            set_status(shared, None, 0.0, true, Some(format!("cannot create recording: {e}")), false);
             shared.recording.store(false, Ordering::Relaxed);
+            false
         }
     }
 }
 
-fn drain(consumer: &mut Consumer<f32>, buf: &mut [f32]) -> usize {
+/// Open `<base>.wav` for creation, retrying `<base>-2.wav`, `<base>-3.wav`, …
+/// so two takes in the same second never overwrite each other (`create_new`).
+fn unique_path(dir: &Path, base: &str) -> std::io::Result<(std::fs::File, String)> {
+    let mut suffix = 0u32;
+    loop {
+        let name = if suffix == 0 { format!("{base}.wav") } else { format!("{base}-{}.wav", suffix + 1) };
+        let p = dir.join(&name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(f) => return Ok((f, p.to_string_lossy().into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn drain(consumer: &mut Consumer<f32>, buf: &mut [f32], max: usize) -> usize {
+    let limit = buf.len().min(max);
     let mut n = 0;
-    while n < buf.len() {
+    while n < limit {
         match consumer.pop() {
             Ok(s) => {
                 buf[n] = s;
@@ -325,6 +457,10 @@ fn drain(consumer: &mut Consumer<f32>, buf: &mut [f32]) -> usize {
     n
 }
 
+fn drain_to_empty(consumer: &mut Consumer<f32>) {
+    while consumer.pop().is_ok() {}
+}
+
 fn samples_to_bytes(samples: &[f32], out: &mut Vec<u8>) {
     out.clear();
     out.reserve(samples.len() * 4);
@@ -333,26 +469,39 @@ fn samples_to_bytes(samples: &[f32], out: &mut Vec<u8>) {
     }
 }
 
-fn set_status(shared: &Arc<RecorderShared>, path: Option<String>, seconds: f64, finalized: bool) {
+fn set_status(
+    shared: &Arc<RecorderShared>,
+    path: Option<String>,
+    seconds: f64,
+    finalized: bool,
+    error: Option<String>,
+    limit_reached: bool,
+) {
     if let Ok(mut s) = shared.status.lock() {
         s.path = path;
         s.seconds = seconds;
         s.finalized = finalized;
+        s.error = error;
+        s.limit_reached = limit_reached;
+        if finalized {
+            s.takes += 1;
+        }
     }
 }
 
 /// Patch the RIFF size (offset 4) and data size (offset 40) with the real
-/// counts. The streaming header was written with zeroes. `samples` is the
+/// counts, then seek back to the end so appends continue. `samples` is the
 /// total f32 sample count (4 bytes each), counted exactly (never per-frame
-/// floored), so a mid-push drain can't under-count the header.
-fn finalize(file: &mut Option<std::fs::File>, samples: u64) {
-    let Some(f) = file.as_mut() else { return };
-    let data_size = (samples * 4).min(u32::MAX as u64) as u32;
-    let _ = f.seek(SeekFrom::Start(4));
-    let _ = f.write_all(&(36u32.wrapping_add(data_size)).to_le_bytes());
-    let _ = f.seek(SeekFrom::Start(40));
-    let _ = f.write_all(&data_size.to_le_bytes());
-    let _ = f.flush();
+/// floored), so a mid-push drain can't under-count the header. `data_size` is
+/// capped to the frame-aligned maximum so a >4 GiB take never wraps the header.
+fn patch_header(file: &mut std::fs::File, samples: u64, max_data_samples: u64) {
+    let data_size = (samples * 4).min(max_data_samples * 4) as u32;
+    let _ = file.seek(SeekFrom::Start(4));
+    let _ = file.write_all(&(36u32 + data_size).to_le_bytes());
+    let _ = file.seek(SeekFrom::Start(40));
+    let _ = file.write_all(&data_size.to_le_bytes());
+    let _ = file.seek(SeekFrom::End(0));
+    let _ = file.flush();
 }
 
 const WAV_HEADER_LEN: usize = 44;
@@ -547,6 +696,40 @@ pub fn run_test() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{command_bus, Command, Graph};
+    use crate::engine::GraphEngine;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ksalat-record-unit-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn ramp(frames: usize, sign: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            v[i * 2] = sign * ((i as f32 / frames as f32) - 0.5);
+            v[i * 2 + 1] = -sign * ((i as f32 / frames as f32) - 0.5);
+        }
+        v
+    }
+
+    fn wav_samples(bytes: &[u8]) -> Vec<f32> {
+        bytes[WAV_HEADER_LEN..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn read_take_file(dir: &Path) -> (PathBuf, Vec<u8>) {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        files.sort();
+        let p = files.last().expect("a take file").clone();
+        let bytes = std::fs::read(&p).unwrap();
+        (p, bytes)
+    }
 
     #[test]
     fn wav_header_roundtrips() {
@@ -575,55 +758,87 @@ mod tests {
     }
 
     #[test]
-    fn dropped_frames_counted_when_ring_full() {
-        // A 4-sample ring holds 2 stereo frames; pushing 4 frames with no
-        // consumer drops the last 2 (per-frame, no interleaving glitch).
-        let (producer, _consumer) = RingBuffer::<f32>::new(4);
-        let (tx, _rx) = mpsc::channel();
-        let shared = Arc::new(RecorderShared::new());
+    fn max_data_is_frame_aligned_and_under_riff_limit() {
+        let m = max_data_bytes(2);
+        assert_eq!(m % 8, 0, "stereo data size must be a whole frame (block_align 8)");
+        assert!(m <= u32::MAX as u64 - 36, "RIFF size must not wrap");
+        assert!(36 + m <= u32::MAX as u64);
+    }
+
+    #[test]
+    fn one_free_slot_never_splits_a_frame() {
+        // A 3-slot ring fits one whole frame (L+R) but not two; the second
+        // frame must be dropped whole, never L-only (which would swap every
+        // later frame and leave a non-frame-aligned stream).
+        let (producer, mut consumer) = RingBuffer::<f32>::new(3);
+        let (msg_tx, _msg_rx) = RingBuffer::<RecorderMsg>::new(4);
+        let shared = Arc::new(RecorderShared::live());
         shared.recording.store(true, Ordering::Relaxed);
-        let mut tap = RecorderTap { producer, tx, shared: shared.clone() };
+        let mut tap = RecorderTap { producer, msg_tx, shared: shared.clone() };
+        tap.push_stereo(&[1.0, 2.0, 3.0, 4.0], 2);
+        assert_eq!(shared.dropped_frames.load(Ordering::Relaxed), 1, "one whole frame dropped");
+        let mut popped = 0;
+        while consumer.pop().is_ok() {
+            popped += 1;
+        }
+        assert_eq!(popped, 2, "the ring must hold whole frames only (L without R would be {popped})");
+    }
+
+    #[test]
+    fn dropped_frames_counted_when_ring_full() {
+        let (producer, _consumer) = RingBuffer::<f32>::new(4);
+        let (msg_tx, _msg_rx) = RingBuffer::<RecorderMsg>::new(4);
+        let shared = Arc::new(RecorderShared::live());
+        shared.recording.store(true, Ordering::Relaxed);
+        let mut tap = RecorderTap { producer, msg_tx, shared: shared.clone() };
         let data = [0.5f32, -0.5, 0.25, -0.25, 0.75, -0.75, 0.1, -0.1];
         tap.push_stereo(&data, 2);
         assert_eq!(shared.dropped_frames.load(Ordering::Relaxed), 2, "2 frames of 4 dropped");
-        // Idle tap pushes nothing (and drops nothing).
         shared.recording.store(false, Ordering::Relaxed);
         tap.push_stereo(&data, 2);
-        assert_eq!(shared.dropped_frames.load(Ordering::Relaxed), 2);
+        assert_eq!(shared.dropped_frames.load(Ordering::Relaxed), 2, "idle tap drops nothing");
     }
 
     #[test]
     fn begin_and_stop_are_idempotent() {
         let (producer, _consumer) = RingBuffer::<f32>::new(8);
-        let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(RecorderShared::new());
-        let tap = RecorderTap { producer, tx, shared: shared.clone() };
+        let (msg_tx, mut msg_rx) = RingBuffer::<RecorderMsg>::new(8);
+        let shared = Arc::new(RecorderShared::live());
+        let mut tap = RecorderTap { producer, msg_tx, shared: shared.clone() };
         tap.begin();
-        tap.begin(); // second start is a no-op
-        assert_eq!(rx.try_recv().ok(), Some(RecorderMsg::Start));
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)), "only one Start sent");
+        tap.begin();
+        assert_eq!(msg_rx.pop().ok(), Some(RecorderMsg::Start));
+        assert!(msg_rx.pop().is_err(), "only one Start sent");
         tap.stop();
-        tap.stop(); // second stop is a no-op
-        assert_eq!(rx.try_recv().ok(), Some(RecorderMsg::Stop));
-        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)), "only one Stop sent");
+        tap.stop();
+        assert_eq!(msg_rx.pop().ok(), Some(RecorderMsg::Stop));
+        assert!(msg_rx.pop().is_err(), "only one Stop sent");
         assert!(!shared.is_recording());
     }
 
     #[test]
-    fn ring_writer_roundtrip() {
-        // A tiny end-to-end: 2 s of a ramp through a 2-frame ring would drop
-        // everything, so use the real ~4 s headroom and verify the written WAV
-        // is byte-identical to what was pushed.
-        let dir = std::env::temp_dir().join(format!("ksalat-record-unit-{}", std::process::id()));
+    fn same_second_takes_get_distinct_files_and_first_is_intact() {
+        let dir = temp_dir("same-second");
+        let base = "kabelsalat-20260101-000000";
+        // Pre-create the first name with known content.
+        std::fs::write(dir.join(format!("{base}.wav")), b"first take").unwrap();
+        let (mut f2, name2) = unique_path(&dir, base).unwrap();
+        assert_eq!(name2, dir.join(format!("{base}-2.wav")).to_string_lossy());
+        write_wav_header(&mut f2, 48000, 2, 0).unwrap();
+        drop(f2);
+        // The original file is untouched; the new one is a distinct file.
+        assert_eq!(std::fs::read(dir.join(format!("{base}.wav"))).unwrap(), b"first take");
+        assert!(dir.join(format!("{base}-2.wav")).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ring_writer_roundtrip() {
+        let dir = temp_dir("roundtrip");
         let (mut tap, shared) = start_with_capacity(dir.clone(), 48000, 2, 48000 * 2 * 2);
         let sr = 48000u32;
         let frames = sr as usize / 4; // 0.25 s
-        let mut data = vec![0.0f32; frames * 2];
-        for i in 0..frames {
-            data[i * 2] = (i as f32 / frames as f32) - 0.5;
-            data[i * 2 + 1] = 0.5 - (i as f32 / frames as f32);
-        }
+        let data = ramp(frames, 1.0);
         tap.begin();
         tap.push_stereo(&data, 2);
         tap.stop();
@@ -642,9 +857,243 @@ mod tests {
         assert_eq!(h.data_size as usize, data.len() * 4);
         assert_eq!(status.seconds, frames as f64 / sr as f64);
         assert_eq!(status.dropped_frames, 0);
-        let wav: Vec<f32> = bytes[WAV_HEADER_LEN..].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        assert_eq!(wav, data, "round trip is lossless");
+        assert_eq!(wav_samples(&bytes), data, "round trip is lossless");
+        drop(tap);
+        shared.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drop_finalizes_the_take() {
+        // Exit without a stop: dropping the tap (engine teardown) + shutting
+        // the shared down must drain and finalize the header, not leave
+        // RIFF=36 / data_size=0.
+        let dir = temp_dir("drop");
+        let (tap, shared) = start_with_capacity(dir.clone(), 48000, 2, 48000 * 2 * 2);
+        let data = ramp(4800, 1.0); // 0.1 s
+        {
+            let mut tap = tap;
+            tap.begin();
+            tap.push_stereo(&data, 2);
+        } // tap dropped: signals shutdown, but does not join
+        shared.shutdown();
+        let (_, bytes) = read_take_file(&dir);
+        let h = parse_wav_header(&bytes).unwrap();
+        assert_eq!(h.data_size as usize, data.len() * 4, "header finalized after drop");
+        assert_eq!(bytes.len(), WAV_HEADER_LEN + data.len() * 4);
+        assert_eq!(wav_samples(&bytes), data);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn header_is_patched_while_recording() {
+        // Crash resilience: while a take is still open, the header is patched
+        // ~every second, so a kill still leaves a playable (if slightly
+        // truncated) file rather than a data_size=0 shell.
+        let dir = temp_dir("patch");
+        // Low rate so one "second" of stereo is small (2000 samples).
+        let (mut tap, shared) = start_with_capacity(dir.clone(), 1000, 2, 20000);
+        let data = ramp(2500, 1.0); // 1.25 s at 1 kHz
+        tap.begin();
+        tap.push_stereo(&data, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (path, patched) = loop {
+            let s = shared.snapshot();
+            if let Some(p) = &s.path {
+                if let Ok(bytes) = std::fs::read(p) {
+                    if let Some(h) = parse_wav_header(&bytes) {
+                        if h.data_size > 0 {
+                            break (p.clone(), h.data_size as usize);
+                        }
+                    }
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "header never patched mid-take");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(patched > 0, "header must be patched mid-take (a kill still leaves a playable file)");
+        assert!(patched <= data.len() * 4, "patched size {patched} must not exceed the {} samples pushed", data.len());
+        drop(tap);
+        shared.shutdown();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_stop_begin_second_take_stays_live() {
+        // Regression (finding #6): begin→stop→begin where the writer runs the
+        // first take's finalize AFTER the second begin. `recording` must stay
+        // true (the writer's Stop path never clears it), so take 2 records.
+        let dir = temp_dir("race");
+        let (mut tap, shared) = start_with_capacity(dir.clone(), 48000, 2, 48000 * 2 * 2);
+        let a = ramp(4800, 0.6);
+        let b = ramp(4800, -0.7);
+        tap.begin();
+        tap.push_stereo(&a, 2);
+        tap.stop();
+        tap.begin(); // take 2, before the writer finalizes take 1
+        // Wait until take 1 is finalized on disk; then push B. The old code
+        // cleared `recording` here and silently dropped B (empty take 2).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if shared.snapshot().takes >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "take 1 never finalized");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        tap.push_stereo(&b, 2);
+        tap.stop();
+        drop(tap);
+        shared.shutdown();
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .collect();
+        files.sort();
+        assert_eq!(files.len(), 2, "two distinct takes");
+        let s0 = wav_samples(&std::fs::read(&files[0]).unwrap());
+        let s1 = wav_samples(&std::fs::read(&files[1]).unwrap());
+        assert!(
+            (s0 == a && s1 == b) || (s0 == b && s1 == a),
+            "take 1 and take 2 must each be intact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_take_starts_at_song_beat_zero_not_count_in() {
+        // Finding #8/#9: with record_sync on, the take begins the block the
+        // song clock reaches beat 0 (after the count-in), not on the first
+        // count-in click; a stop during count-in leaves nothing recording.
+        const SR: f64 = 48000.0;
+        const BLOCK: usize = 480;
+        let dir = temp_dir("sync");
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, SR, vec![]);
+        let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
+        let (tap, shared) = start_with_capacity(dir.clone(), SR as u32, 2, SR as usize * 2 * 2);
+        engine.set_recorder(tap);
+
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetRecordSync { on: true });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = [0.0f32; BLOCK * 2];
+        // 1 bar = 4 beats = 200 blocks of 480 frames @ 120 BPM.
+        for _ in 0..199 {
+            engine.render(&mut buf, 2);
+        }
+        assert!(!shared.is_recording(), "no recording during the count-in");
+        assert!(graph_pub.lock().unwrap().transport.record_sync, "record_sync published");
+        engine.render(&mut buf, 2); // transition block: song clock → beat 0
+        assert!(!shared.is_recording(), "take starts the block after the transition");
+        engine.render(&mut buf, 2); // first song block
+        assert!(shared.is_recording(), "recording must start at song beat 0");
+        for _ in 0..49 {
+            engine.render(&mut buf, 2);
+        }
+        bus.send(Command::TransportStop);
+        engine.render(&mut buf, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let status = loop {
+            let s = shared.snapshot();
+            if s.finalized && !s.recording {
+                break s;
+            }
+            assert!(std::time::Instant::now() < deadline, "sync take did not finalize");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // 50 blocks = 0.5 s of song, NOT 2.5 s (count-in excluded).
+        assert!((status.seconds - 0.5).abs() < 0.02, "take should be ~0.5 s of song, got {} s", status.seconds);
+        drop(engine);
+        shared.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stop_during_count_in_leaves_no_take() {
+        const SR: f64 = 48000.0;
+        const BLOCK: usize = 480;
+        let dir = temp_dir("sync-stop");
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, SR, vec![]);
+        let (tap, shared) = start_with_capacity(dir.clone(), SR as u32, 2, SR as usize * 2 * 2);
+        engine.set_recorder(tap);
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetRecordSync { on: true });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = [0.0f32; BLOCK * 2];
+        for _ in 0..100 {
+            engine.render(&mut buf, 2); // halfway through the count-in
+        }
+        bus.send(Command::TransportStop);
+        engine.render(&mut buf, 2);
+        assert!(!shared.is_recording(), "stopping mid count-in must not leave a take running");
+        assert_eq!(shared.snapshot().takes, 0, "no click-only file was started");
+        drop(engine);
+        shared.shutdown();
+        let files = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "wav").unwrap_or(false))
+            .count();
+        assert_eq!(files, 0, "no WAV file for a cancelled count-in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sum the recorder thread's user+system CPU ticks (utime/stime in
+    /// /proc/self/task/<tid>/stat), for the busy-spin regression check.
+    #[cfg(target_os = "linux")]
+    fn recorder_cpu_ticks() -> Option<u64> {
+        let tasks = std::fs::read_dir("/proc/self/task").ok()?;
+        for entry in tasks.flatten() {
+            let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            // The 19-char name is truncated to 15 by the kernel.
+            if !comm.trim().starts_with("kabelsalat-rec") {
+                continue;
+            }
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let rest = stat.rsplit_once(')')?.1; // skip "pid (comm)" — comm may contain spaces
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            // utime = field 14 → index 11 (field 3 is index 0), stime = field 15.
+            let utime: u64 = f.get(11)?.parse().ok()?;
+            let stime: u64 = f.get(12)?.parse().ok()?;
+            return Some(utime + stime);
+        }
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn writer_thread_idles_instead_of_spinning() {
+        // Finding #1: while recording with an empty ring, the writer must sleep,
+        // not busy-spin. At HZ=100 a spin burns ~200 ticks over 2 s; a sleeping
+        // loop a handful.
+        let dir = temp_dir("cpu");
+        let (mut tap, shared) = start_with_capacity(dir.clone(), 48000, 2, 48000 * 2 * 2);
+        let data = ramp(480, 1.0); // 0.01 s burst
+        tap.begin();
+        tap.push_stereo(&data, 2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if shared.snapshot().seconds > 0.0 {
+                break; // writer drained the burst; ring now empty, still recording
+            }
+            assert!(std::time::Instant::now() < deadline, "writer never drained the burst");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let before = recorder_cpu_ticks().expect("recorder thread present");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let after = recorder_cpu_ticks().expect("recorder thread present");
+        let delta = after - before;
+        assert!(delta < 50, "writer burned {delta} CPU ticks over 2 s of empty-ring recording (busy-spin)");
+        tap.stop();
+        drop(tap);
+        shared.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

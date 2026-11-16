@@ -429,6 +429,20 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
     g
 }
 
+/// A rig around one CLAP instrument: Keys → plugin → Master (MIDI + stereo
+/// L/R). `name` labels the synth unit.
+pub fn plugin_rig_graph(plugin_id: &str, name: &str) -> Graph {
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name_bytes(&name.to_uppercase()));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+    g
+}
+
 /// Node-id base of every rig in a `merge_rigs` result, plus one trailing
 /// entry: the merged `next_node`. Rig `i`'s node `n` lands at `bases[i] + n`.
 pub fn rig_bases(rigs: &[Rig]) -> Vec<NodeId> {

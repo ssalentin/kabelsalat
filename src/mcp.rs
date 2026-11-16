@@ -118,6 +118,9 @@ struct AddNodeArgs {
 struct AddRigArgs {
     /// Optional rig name (default "Rig A/B/C…").
     name: Option<String>,
+    /// Optional CLAP plugin id (from list_plugins): the rig is Keys → that
+    /// plugin → Master instead of the default Surge rig.
+    plugin_id: Option<String>,
 }
 
 /// Arguments for `delete_rig`.
@@ -1291,8 +1294,20 @@ impl McpServer {
     }
 
     /// Add a standard rig to the running setup.
-    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master, wired and playable (a bare Keys + Master when every synth voice is taken). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
+    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id> -> Master for any installed CLAP instrument from list_plugins; needs the running app), wired and playable (a bare Keys + Master when every synth voice is taken). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
     fn add_rig(&self, Parameters(args): Parameters<AddRigArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            // The running app adds the rig itself: it keeps every rig's knobs
+            // and synth state and loads non-Surge plugins on its UI thread.
+            let mut a = json!({});
+            if let Some(n) = &args.name { a["name"] = json!(n); }
+            if let Some(p) = &args.plugin_id { a["plugin_id"] = json!(p); }
+            return Self::ui_bridge_tool("add_rig", a);
+        }
+        if args.plugin_id.is_some() {
+            return tool_err("add_rig with plugin_id needs the running app (kabelsalat mcp --attach)");
+        }
         self.edit_rigs(None, args.name)
     }
 
@@ -1902,7 +1917,7 @@ mod tests {
         };
         let mut buf = vec![0.0f32; 64 * 2];
         // Single-graph demo (2 Surge stacks) → becomes rig 0; rig 1 is new.
-        let added = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Bass".into()) })));
+        let added = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Bass".into()), plugin_id: None })));
         assert_eq!(added["rigs"].as_array().unwrap().len(), 2);
         assert_eq!(added["rigs"][1]["name"], json!("Bass"));
         assert_eq!(added["active"], json!(1));

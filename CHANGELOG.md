@@ -19,6 +19,12 @@ releases may still change behaviour and session files.
 - After recording, the top bar names the saved take with **Play** and **Folder**.
 
 ### Fixed
+- Vitalium (LV2) could corrupt memory and crash the app when an instance was
+  removed or reloaded; instances are now kept and reused (#14).
+- Agent tools no longer freeze the window while plugins are scanned for the
+  first time (#15).
+- A re-plugged MIDI keyboard keeps its rig binding and matrix row (#16).
+- Undo keeps the keyboard/hardware source switches (#17).
 - Recording file names use local time instead of UTC.
 - The file player reads 24-bit PCM and 32-bit float WAV (it can play the
   app's own recordings).

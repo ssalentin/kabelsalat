@@ -253,6 +253,30 @@ fn spawn_hw_midi(
     }
 }
 
+/// A MIDI port name without ALSA's trailing "client:port" numbers
+/// ("FM-1:FM-1 MIDI 1 24:0" → "FM-1:FM-1 MIDI 1"): stable across re-plugs.
+fn midi_port_key(name: &str) -> &str {
+    match name.rsplit_once(' ') {
+        Some((head, tail)) if tail.split_once(':').is_some_and(|(c, p)| {
+            !c.is_empty() && !p.is_empty() && c.bytes().all(|b| b.is_ascii_digit()) && p.bytes().all(|b| b.is_ascii_digit())
+        }) => head,
+        _ => name,
+    }
+}
+
+/// Which known device index a port belongs to (#16). `Err(())` = already
+/// connected (live under this exact name), `Ok(None)` = a new device.
+/// A re-plug can get another ALSA client number: an OFFLINE device with the
+/// same name minus that number is the same keyboard, so it keeps its index
+/// (and with it its rig binding and matrix row).
+fn match_midi_device(devices: &[(String, bool)], name: &str) -> Result<Option<usize>, ()> {
+    if let Some(i) = devices.iter().position(|(n, _)| n == name) {
+        return if devices[i].1 { Err(()) } else { Ok(Some(i)) };
+    }
+    let key = midi_port_key(name);
+    Ok(devices.iter().position(|(n, live)| !*live && midi_port_key(n) == key))
+}
+
 fn rescan_hw_midi(
     hw: &HwMidi,
     conns: &mut Vec<Option<midir::MidiInputConnection<()>>>,
@@ -284,15 +308,18 @@ fn rescan_hw_midi(
         }
         let mut to_connect = Vec::new();
         for (name, port) in &ports {
-            let dev = match devices.iter().position(|(n, _)| n == name) {
-                Some(i) if devices[i].1 => continue,
-                Some(i) => i,
-                None if devices.len() >= crate::engine::MAX_HW_DEVICES as usize => {
+            let dev = match match_midi_device(&devices, name) {
+                Err(()) => continue,
+                Ok(Some(i)) => {
+                    devices[i].0 = name.clone(); // the new client number
+                    i
+                }
+                Ok(None) if devices.len() >= crate::engine::MAX_HW_DEVICES as usize => {
                     // The engine routes Hardware(0..16) only: a 17th id would be mute.
                     eprintln!("midi: {name} ignored — {} hardware devices is the limit", crate::engine::MAX_HW_DEVICES);
                     continue;
                 }
-                None => {
+                Ok(None) => {
                     devices.push((name.clone(), false));
                     devices.len() - 1
                 }
@@ -1247,6 +1274,8 @@ struct UndoSnap {
     mix: [crate::engine::RigMix; 8],
     active: usize,
     patch_names: [Option<String>; VOICE_POOL],
+    /// Per-voice keyboard/hardware source switches (not in the session).
+    rig_sources: [(bool, bool); VOICE_POOL],
 }
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3079,7 +3108,10 @@ impl DemoApp {
     fn capture_undo(&mut self) -> Option<UndoSnap> {
         let session = self.capture_session("Undo").ok()?;
         let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
-        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, patch_names: self.patch_names.clone() })
+        Some(UndoSnap {
+            session, rigs, mix: self.rig_mix, active: self.active_rig,
+            patch_names: self.patch_names.clone(), rig_sources: self.rig_sources,
+        })
     }
 
     /// Before an agent's first change in a job, snapshot the rack. A job is
@@ -3119,6 +3151,9 @@ impl DemoApp {
         }
         self.adopt_rig_devices();
         self.patch_names = snap.patch_names;
+        // apply_session reset the source switches: restore and re-send them.
+        self.rig_sources = snap.rig_sources;
+        for (_, node) in self.clap_rigs() { self.send_rig_source(node); }
         self.rig_mix = snap.mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
@@ -3995,8 +4030,11 @@ impl DemoApp {
                 format!("rig {rig}: vol {:.2} pan {:.2} mute {} solo {}", m.vol, m.pan, m.mute, m.solo)
             }
             "list_plugins" => {
-                let clap = crate::host::list_clap_plugins();
-                let lv2 = crate::lv2::discover();
+                if !self.plugin_lists_ready() {
+                    return "scanning installed plugins in the background (first run) — ask again in a few seconds".into();
+                }
+                let clap = self.plugins_clap.clone();
+                let lv2 = self.plugins_lv2.clone();
                 let mut s = format!("CLAP plugins ({}):\n", clap.len());
                 for p in clap.iter().take(20) {
                     s.push_str(&format!("  {} [{}] {}\n", p.name, p.id, p.features.join(",")));
@@ -4208,8 +4246,10 @@ impl DemoApp {
                 let name = args.get("name").and_then(|v| v.as_str());
                 match args.get("plugin_id").and_then(|v| v.as_str()) {
                     Some(id) => {
-                        let known = self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.clone())
-                            .or_else(|| crate::host::list_clap_plugins().into_iter().find(|p| p.id == id).map(|p| p.name));
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_rig again in a few seconds".into();
+                        }
+                        let known = self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.clone());
                         let Some(label) = known else {
                             return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
                         };
@@ -6404,6 +6444,15 @@ impl DemoApp {
             .spawn(move || { let _ = tx.send(scan()); })
             .expect("spawn plugin scan");
         self.plugin_scan = Some(rx);
+    }
+
+    /// Plugin lists for UI-thread callers (agent tools): never scan here —
+    /// a cold CLAP scan blocked the UI for up to 5 s per wave (#15). Starts
+    /// the background scan if needed; false = not ready yet, ask again.
+    fn plugin_lists_ready(&mut self) -> bool {
+        self.poll_plugin_scan();
+        if !self.plugins_loaded { self.start_plugin_scan(false); self.poll_plugin_scan(); }
+        self.plugins_loaded
     }
 
     /// Adopt a finished background scan (cheap; called every frame).
@@ -11988,6 +12037,7 @@ mod rig_switch_tests {
     fn add_rig_with_a_plugin_id_builds_that_plugins_rig_next_to_the_others() {
         let mut app = DemoApp::new_with_sink(None);
         app.plugins_clap = vec![ClapPluginInfo { id: "org.example.synth".into(), name: "Example".into(), vendor: "V".into(), features: vec!["instrument".into()] }];
+        app.plugins_loaded = true; // the background scan has finished (#15: tools never scan inline)
         let before = app.rig_count();
         let r = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.example.synth"}));
         assert_eq!(app.rig_count(), before + 1, "{r}");
@@ -13429,6 +13479,7 @@ mod split_bpm_tests {
         assert!((app.rig_mix[0].vol - 0.3).abs() < 1e-6);
         assert!(app.exec_tool("redo", &serde_json::json!({})).contains("nothing to redo"));
 
+
         // A new chat request opens a new step; remote calls split on a 3 s gap.
         app.submit_chat("louder".into());
         app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.9}));
@@ -13443,6 +13494,17 @@ mod split_bpm_tests {
         app.ui_time += REMOTE_JOB_GAP + 1.0;
         app.exec_tool_with_origin("get_rigs", &serde_json::json!({}), AgentOrigin::Remote);
         assert_eq!(app.undo_past.len(), 4);
+
+        // Per-voice source switches survive an undo of a LATER job (#17):
+        // job 1 turns the keyboard off, job 2 changes the mix, undo job 2.
+        app.submit_chat("keyboard off".into());
+        let node = app.clap_rigs()[0].1;
+        app.exec_tool("set_rig_source", &serde_json::json!({"node": node, "keyboard": false, "hardware": true}));
+        app.submit_chat("quieter".into());
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.2}));
+        app.exec_tool("undo", &serde_json::json!({}));
+        assert!(!app.rig_sources[0].0, "undoing the mix change keeps the keyboard off");
+        assert!(app.rig_sources[0].1);
     }
 
     #[test]
@@ -14476,5 +14538,30 @@ mod face_layout_tests {
             .collect();
         assert!(bottom_row.len() >= 3, "keys, a bottom stack and master share the bottom: {bottom_row:?}");
         assert!(bottom_row.iter().all(|y| (y - bottom_row[0]).abs() < 0.5), "one knob line: {bottom_row:?}");
+    }
+}
+
+#[cfg(test)]
+mod midi_hotplug_tests {
+    use super::*;
+
+    #[test]
+    fn replugged_device_keeps_its_index_even_with_a_new_client_number() {
+        assert_eq!(midi_port_key("M-Wave FM-1:M-Wave FM-1 MIDI 1 24:0"), "M-Wave FM-1:M-Wave FM-1 MIDI 1");
+        assert_eq!(midi_port_key("Some Synth"), "Some Synth");
+        assert_eq!(midi_port_key("Synth 2 Port A"), "Synth 2 Port A", "words are not client numbers");
+
+        let devices = vec![
+            ("Launchkey:Launchkey MIDI 20:0".to_string(), true),
+            ("M-Wave FM-1:M-Wave FM-1 MIDI 1 24:0".to_string(), false), // unplugged
+        ];
+        // Re-plugged with another ALSA client number → same index 1.
+        assert_eq!(match_midi_device(&devices, "M-Wave FM-1:M-Wave FM-1 MIDI 1 28:0"), Ok(Some(1)));
+        // Still connected under its exact name → skip.
+        assert_eq!(match_midi_device(&devices, "Launchkey:Launchkey MIDI 20:0"), Err(()));
+        // A second, identical Launchkey while the first is live → a new device.
+        assert_eq!(match_midi_device(&devices, "Launchkey:Launchkey MIDI 32:0"), Ok(None));
+        // Something never seen → new.
+        assert_eq!(match_midi_device(&devices, "Other:Other 40:0"), Ok(None));
     }
 }

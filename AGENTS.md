@@ -261,6 +261,22 @@ Learned so far (2026-11-15, UI polish pass):
     `hyprctl activewindow` shows your pid immediately before any dispatch
     (this Hyprland uses Lua: `hyprctl dispatch 'hl.dsp.window.fullscreen()'`),
     and crop screenshots to the window geometry, not the whole output.
+56. **Never free a Vitalium instance — retire it:** its JUCE threads outlive
+    instance teardown, so freeing (or instantiating next to a freed one)
+    corrupted the heap: 10/16 suite runs crashed, 0/16 with the Vitalium tests
+    skipped. `lv2::retire` parks `NEVER_FREE` plugins and `Lv2Plugin::load`
+    reuses them (re-activated, controls at defaults); `Drop` leaks them as a
+    safety net. Retire LV2 instances with `lv2::retire`, never `drop`.
+57. **UI-thread code never scans plugins:** agent tools on the UI thread use
+    the background scan's lists (`plugin_lists_ready`); a cold CLAP scan there
+    froze the UI for up to 5 s per wave of hanging bundles.
+58. **Identify MIDI devices by name without ALSA's client:port suffix:**
+    midir names end in "24:0", which changes on a re-plug; matching the full
+    name turned a re-plugged keyboard into a new device (`midi_port_key`).
+59. **An undo snapshot holds everything `apply_session` resets:** the
+    per-voice keyboard/hardware switches were missing, so undoing a later
+    job silently turned a switched-off source back on. Test undo with a
+    non-default value — a default one passes even when nothing is restored.
 
 ## Working on kabelsalat
 

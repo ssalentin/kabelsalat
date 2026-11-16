@@ -252,7 +252,7 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
             Lv2Request::Retire(slot) => {
-                drop(slot);
+                crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
                 None
             }
             Lv2Request::RetirePreset(p) => {

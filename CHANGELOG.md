@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **System audio in the mixer:** every other app that is playing (YouTube in
+  the browser, …) gets a strip with volume and mute (#31).
+- **Output device selection** at Master out (e.g. MOTU M2 vs. speakers):
+  moves the live stream without a dropout, remembered across restarts (#31).
+- Agent tools `list_audio_outputs`, `set_audio_output`, `list_app_streams`,
+  `set_app_stream`.
 - **Audio In rack unit** (#28): plug in a microphone, guitar or audio interface
   and play it live through the rack. An Audio In node picks a device (cpal, hot
   plug rescans every 2 s — a MOTU M2 shows up as "MOTU M2", readable, not the
@@ -37,6 +43,8 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- The top bar no longer runs past the window edge in narrow windows (compact
+  mode, window-width based); the info line is truncated or moves to the hint row.
 - The master output was 2–4 dB too quiet at full volume: level lost in the
   master limiter is now made up (peaks at −1 dBFS, never above), VOLUME and
   the templates default to 100 %, and the master meters use a dB scale.

@@ -297,6 +297,16 @@ Learned so far (2026-11-15, UI polish pass):
     transparent below −3 dBFS) keeps every sample ≤ −1 dBFS — make-up alone
     measured +3.3 dBFS. Meters showing what users hear are dB-scaled
     (`meter_db_pos`), never linear amplitude.
+63. **Parsers of external tool output are tested on the tool's REAL output:**
+    pactl prints a sink-input's `client` as a string ("29124") while the
+    client's `index` is a number; a hand-typed test JSON used numbers, passed,
+    and the app never found its own stream. Paste real output (trimmed) into
+    the test, never retype its shape.
+64. **Layout modes follow the window width, never `ui.available_width()`:**
+    the latter follows the previous frame's content width, so the top bar's
+    compact mode flipped between frames and its buttons jumped under the
+    mouse (clicks missed). Decide from `ctx.content_rect()`; test narrow
+    windows by clicking, not only by measuring.
 
 ## Working on kabelsalat
 

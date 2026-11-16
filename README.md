@@ -1,133 +1,156 @@
 <p align="center">
-  <img src="assets/logo.svg" width="160" alt="kabelsalat logo — two crossed patch cables with a signal pulse at the crossing"/>
+  <img src="assets/logo.svg" width="140" alt="kabelsalat logo — two crossed patch cables with a signal pulse at the crossing"/>
 </p>
 
 <h1 align="center">kabelsalat</h1>
 
-<p align="center"><strong>Live audio/MIDI wiring, alive.</strong></p>
-
-A live plugin host for Linux, written in Rust — [AUM](https://kymatica.com/apps/aum)'s
-routing workflow with GarageBand's approachability. Wire plugins and audio sources
-into a graph, route MIDI anywhere, and play live — while the signal flows through
-cables that **sag, swing, and glow**.
-
-> **Status: working dev preview.** Multiple independent rigs, a live MIDI matrix
-> and mixer, CLAP + LV2 hosting with native editors, and an MCP server are live.
-> Still evolving. The plan and progress are public: [PLAN.md](PLAN.md).
+<p align="center"><strong>A live rack for Linux: plug in instruments, wire them up, play.</strong></p>
 
 <p align="center">
-  <img src="docs/shots/rack-front.png" width="49%" alt="kabelsalat rack front: keys, two Surge XT synths with delays, master out"/>
-  <img src="docs/shots/rack-back.png" width="49%" alt="kabelsalat rack back: the same rack flipped, MIDI and audio patch cables between the jacks"/>
+  <a href="https://github.com/ssalentin/kabelsalat/releases"><img alt="Release" src="https://img.shields.io/github/v/release/ssalentin/kabelsalat?sort=semver"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg"></a>
+  <img alt="Platform: Linux" src="https://img.shields.io/badge/platform-Linux-lightgrey.svg">
 </p>
-<p align="center"><em>Front (perform) and back (patch). <strong>Tab</strong> flips the rack.</em></p>
 
-## The idea
+<p align="center">
+  <img src="docs/shots/front.png" width="100%" alt="The kabelsalat rack: a keyboard source, a Surge XT synth with a delay, and the master output with its level meter"/>
+</p>
 
-Linux has capable plugin hosts, but none combine AUM's live workflow with a modern
-interface. kabelsalat is that gap:
+kabelsalat turns your computer into a live setup like the ones built with
+[AUM](https://kymatica.com/apps/aum) on the iPad: synths and effects sit in a
+rack, connected by patch cables that you can see and grab, and everything you
+play goes straight to the speakers. Several setups ("rigs") can sound at once,
+each played from its own keyboard or controller.
 
-- **Animated wiring is the signature.** Cables hang like real patch leads, MIDI
-  notes launch visible pulses along them, audio cables breathe with their level,
-  and dragging a node makes its cables swing and settle. You *see* your signal path.
-- **Reason's rack flip** — labeled rack units up front; press **Tab** to flip the
-  rack and patch the cables on the back. Cables swing, dangle, and beg to be grabbed.
-- **GarageBand-inspired approachability** — playable starter templates, smart macro
-  controls, slick 60fps interactions, instant sound. No manual required.
-- **Agent-native** — a full MCP server gives AI agents 1:1 access to every feature,
-  through the same control plane the UI uses. Plus a **built-in assistant**
-  (DeepSeek, bring-your-own-key) that can inspect, play, and help set things up.
-- **One window, no scatter** — plugin parameters open in a native editor inside
-  the app, never as disconnected plugin windows.
-- **System audio in the mix** — wire YouTube/browser playback straight into a
-  channel (PipeWire monitor capture).
-- **MIDI matrix** — route any source to any destination with channel filters,
-  transpose, and key-range **splits & layers** for live playing.
-- **Mixer channels** — source nodes, insert FX (pre/post fader), sends, and buses.
-- **CLAP + LV2 plugin hosting** (Surge XT is the reference plugin).
-- **Built for ARM64 too** — developed on Asahi Linux (M1), native plugins only.
-- Follows the [Omarchy](https://omarchy.org) desktop theme, keyboard-first.
+## What you can do
 
-No timeline, no arranger. The graph is the instrument.
+### Play right away
+Open the app and play with your laptop keyboard, the on-screen keyboard, or any
+USB MIDI keyboard — devices are found while the app runs, just plug them in.
+Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
+ambient pad with one key.
 
-## What works today
+<p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The rack with the full-width software keyboard opened at the bottom"/></p>
 
-- **Data-driven rack.** A graph of nodes wired by physical, animated cables.
-  **Tab** flips front (perform) and back (patch bay). Drag jack to jack to patch,
-  drag a plug to move it, **Ctrl**+drag a unit to rearrange.
-- **Multiple rigs.** **+ Rig** adds an independent, playable rig (Keys → Surge →
-  Master). Each rig has its own MIDI source and device, all rigs sound at once.
-  **1–9** / **← →** switch the rig in view, **F4** loads a two-rig demo.
-- **MIDI matrix** (**F11**). Sources × rigs grid with live per-cell rules:
-  channel, transpose, key and velocity ranges. **SPLIT** on the keys gives LOW /
-  HIGH MIDI outs for keyboard splits. Held notes are always released when routing
-  changes under them (checked exhaustively by the `verify-held-notes` test).
-- **Mixer** (**F10** / **M**). Per-rig volume, pan, mute and solo.
-- **Starter templates.** **F5–F8**: Lead+Reverb, Drums+Bass, Ambient Pad, demo.
-- **Play immediately.** Laptop keyboard, on-screen keys, or hardware MIDI
-  (auto-connected, played from its own thread so sound never waits for a frame).
-- **CLAP + LV2 hosting.** Surge XT voices, any CLAP instrument via the plugin
-  browser (**F9**), LV2 effects and instruments (e.g. Vitalium) with presets.
-  Double-click a synth for its native parameter editor and sound browser
-  (Surge patches, Dexed `.syx` banks, LV2 presets).
-- **Built-in DSP.** Gain, pan, 3-band EQ, filter, limiter, saturation, delay,
-  reverb, and a metronome node (**Space** = master play/stop).
-- **System audio + backing tracks.** Capture your output's monitor (YouTube,
-  browser) into the mix, and play WAV files.
-- **Sessions.** Save/load patch, knobs and plugin state, including multi-rig.
-- **Built-in assistant** (**F12**). DeepSeek, bring-your-own-key (stored locally
-  `0600`), with tools to inspect the graph, play, route, add rigs and save.
-- **MCP server.** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
-  the running app) exposes 27 tools, 1:1 with the control plane.
-  `kabelsalat send '<json>'` is a one-shot CLI client.
-- **Low latency.** Realtime render thread (rtkit), 256-frame buffer
-  (≈ 5.3 ms at 48 kHz), native fractional HiDPI.
+### Patch with real cables
+Press **Tab** to turn the rack around and patch on the back. Drag from jack to
+jack to connect, drag a plug to move it, pull it off to unplug. The cables
+sag and swing, and light up when signal flows through them.
 
-Press **?** in the app for every shortcut. Self-tests are listed in
-[PLAN.md §0.1](PLAN.md).
+<p align="center"><img src="docs/shots/back.png" width="85%" alt="The back of the rack: MIDI and audio cables between Keys, Surge, Delay and Master"/></p>
 
-## Install (Arch / Omarchy)
+### Run several rigs at once
+**+ Rig** adds an independent setup with its own synth and output — for example
+bass on one keyboard and pads on another. All rigs play together; switch the one
+you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
+(Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
+it has loaded.
+
+### Mix
+The mixer gives every rig volume, pan, mute and solo, with meters that show
+what you actually hear.
+
+<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: per-rig faders, pan, mute and solo, and the master meter"/></p>
+
+### Route MIDI anywhere
+The MIDI matrix decides which keyboard plays which rig. Each connection can be
+shaped: only some keys (keyboard splits), another MIDI channel, transposed, or
+only loud notes.
+
+<p align="center"><img src="docs/shots/matrix.png" width="85%" alt="The MIDI matrix: keyboard and hardware sources routed to two rigs"/></p>
+
+### Control knobs from your controller
+Right-click any knob, turn a knob on your MIDI controller — bound. The knob
+shows its CC number and follows your hardware from then on.
+
+### Record your set
+**REC** records exactly what you hear into a WAV file in `~/Music/kabelsalat/`.
+After stopping you can play the take back or open its folder; **SYNC** starts
+and stops the recording with the transport.
+
+### Ask the assistant — or your own AI agent
+The built-in assistant (bring your own DeepSeek key) can set things up for you:
+"add a reverb to this rig", "split the keys at C4", "load a warm pad". Everything
+an agent changes lights up in the rack, and **Ctrl+Z** undoes the whole request
+in one step. External AI agents (Claude, …) can drive the running app through
+the built-in MCP server; the top bar shows when one is connected and pauses it
+with one click.
+
+<p align="center"><img src="docs/shots/assistant.png" width="85%" alt="The assistant panel at the bottom with quick starters, next to the rack"/></p>
+
+Press **?** in the app for every shortcut.
+
+## Install
+
+**Arch / Omarchy** (builds the package with a launcher entry and icon):
 
 ```sh
 git clone https://github.com/ssalentin/kabelsalat.git
 cd kabelsalat/packaging
-makepkg -si            # builds kabelsalat-git, adds the launcher entry + icon
+makepkg -si
 ```
 
-Optional: `surge-xt-clap` (default synth voices), `dexed-clap`, `lv2-plugins`.
+Recommended: `surge-xt-clap` (the default synth). Optional: `dexed-clap`,
+`lv2-plugins`.
 
-## Build & run
-
-Requires Rust (rustup), `alsa-lib`, `lilv`, and PipeWire or ALSA. Surge XT CLAP
-is the reference instrument.
+**From source** — needs Rust (rustup), `alsa-lib`, `lilv`, and PipeWire or ALSA:
 
 ```sh
-git clone git@github.com:ssalentin/kabelsalat.git
+git clone https://github.com/ssalentin/kabelsalat.git
 cd kabelsalat
-cargo run        # opens the app; play with your laptop keyboard
+cargo run --release
 ```
 
-## Roadmap
+## Contributing
 
-| Phase | Milestone |
-|---|---|
-| **P0** ✅ | Spike: audio I/O, Surge XT CLAP hosted via [clack](https://github.com/prokopyl/clack), MIDI in, animated-cable prototype |
-| **P1** ✅ | Live core: rack + flip, multi-rig engine, DSP, MIDI matrix + splits, per-rig inputs and mixer, sessions, native editor |
-| **P2** 🔨 | Performance: file players ✅, transport/metronome ✅, system-audio capture ✅, recorder, MIDI-learn, tap tempo |
-| **P3** 🔨 | Ecosystem: MCP server + GUI bridge ✅, LV2 hosting ✅, plugin browser ✅, dynamic CLAP loading, in-app plugin installer |
-| **P4** 🔨 | Polish: packaging ✅, bottom keyboard, scenes/setlist, theming |
+Pull requests are welcome! Start with [CONTRIBUTING.md](CONTRIBUTING.md) and
+issues labelled
+[`good first issue`](https://github.com/ssalentin/kabelsalat/labels/good%20first%20issue)
+or [`help wanted`](https://github.com/ssalentin/kabelsalat/labels/help%20wanted).
+Changes are listed in [CHANGELOG.md](CHANGELOG.md); the roadmap lives in
+[PLAN.md](PLAN.md).
 
-Architecture, prior-art survey, and risk notes live in [PLAN.md](PLAN.md).
+---
+
+## Technical details
+
+- **Engine:** Rust, a lock-free and allocation-free render path on a realtime
+  thread (rtkit), 256-frame buffer (≈ 5.3 ms at 48 kHz). Hardware MIDI reaches
+  the engine from its own thread, so sound never waits for a UI frame. A
+  zero-latency master limiter sits before the master saturation.
+- **Plugins:** CLAP via [clack](https://github.com/prokopyl/clack) (scanned out of
+  process, so a crashing plugin cannot take the app down), LV2 via lilv on a
+  loader thread. Plugin editors are native egui panels — no floating plugin
+  windows.
+- **Graph and rigs:** every rig is a graph of nodes and cables; rigs are merged
+  into one engine graph and mixed per rig. Routing changes always release held
+  notes first (checked exhaustively by the `verify-held-notes` test).
+- **UI:** egui/eframe, physics-simulated cables, follows the
+  [Omarchy](https://omarchy.org) desktop theme, native fractional HiDPI.
+- **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drives the
+  running app) exposes the same control plane the UI uses — every UI action has
+  an agent tool. `kabelsalat send '<json>'` is a one-shot CLI client.
+- **Testing:** a unit suite (`cargo test --bin kabelsalat`) plus CLI self-tests
+  that run real plugins (`record-test`, `rig-mix-test`, `cc-map-test`,
+  `transport-test`, …). Rules learned from real bugs are kept in
+  [AGENTS.md](AGENTS.md).
+- **Platforms:** developed and tested on Asahi Linux (Arch, ARM64); x86_64 Linux builds the same way.
 
 ## The name
 
 *Kabelsalat* is German for "cable salad" — the tangled mess behind every desk.
-This app turns it into something beautiful.
+This app turns it into something you want to look at.
 
 ## Inspiration & prior art
 
-- [AUM](https://kymatica.com/apps/aum) (Kymatica) — the workflow this brings to Linux
-- Reason (Reason Studios) — the rack flip: front to perform, back to patch
-- GarageBand (Apple) — the approachability bar: instant sound, smart controls, playfulness
+- [AUM](https://kymatica.com/apps/aum) (Kymatica) — the live workflow this brings to Linux
+- Reason (Reason Studios) — the rack flip: front to play, back to patch
+- GarageBand (Apple) — instant sound, no manual needed
 - [Surge XT](https://surge-synthesizer.github.io/) — reference instrument
 - [clack](https://github.com/prokopyl/clack), [Maolan](https://github.com/maolan/maolan) — Rust plugin hosting
-- [Element](https://github.com/kushview/element), [Carla](https://github.com/falkTX/Carla) — the existing Linux hosts that showed us the gap
+- [Element](https://github.com/kushview/element), [Carla](https://github.com/falkTX/Carla) — the Linux hosts that showed the gap
+
+## License
+
+[MIT](LICENSE) © Sebastian Salentin and contributors.

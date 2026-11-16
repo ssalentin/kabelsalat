@@ -1,8 +1,13 @@
 [package]
 name = "kabelsalat"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 description = "Live audio/MIDI wiring, alive — an AUM-style plugin host with animated cables"
+license = "MIT"
+repository = "https://github.com/ssalentin/kabelsalat"
+readme = "README.md"
+keywords = ["audio", "midi", "plugin-host", "clap", "live"]
+categories = ["multimedia::audio"]
 publish = false
 
 [dependencies]

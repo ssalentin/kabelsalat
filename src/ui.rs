@@ -27,6 +27,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
+#[cfg(not(test))]
 use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
@@ -243,7 +244,7 @@ fn rescan_hw_midi(
     cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
     direct: &Arc<HwDirect>,
 ) {
-    let Ok(probe) = MidiInput::new("kabelsalat-probe") else { return };
+    let Ok(probe) = midir::MidiInput::new("kabelsalat-probe") else { return };
     // KABELSALAT_MIDI_THROUGH=1 accepts the kernel's Midi Through port — a
     // hardware-path self-test feed (aseqsend -p 14:0).
     let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
@@ -313,7 +314,7 @@ fn connect_hw_input(
     cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
     direct: &Arc<HwDirect>,
 ) -> Option<midir::MidiInputConnection<()>> {
-    let mi = MidiInput::new("kabelsalat-hw").ok()?;
+    let mi = midir::MidiInput::new("kabelsalat-hw").ok()?;
     let (q, cc_q, direct) = (q.clone(), cc_q.clone(), direct.clone());
     mi.connect(
         port,
@@ -1112,6 +1113,18 @@ enum StageView {
     Plugins,
 }
 
+/// The bottom dock holds exactly one occupant at a time: no dock, the full-width
+/// software keyboard, or the assistant chat. One owner of the computer keyboard
+/// (rule: the assistant captures typing; the keyboard plays notes; neither when
+/// the dock is closed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum DockView {
+    #[default]
+    None,
+    Keyboard,
+    Assistant,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum PluginCategory {
     #[default]
@@ -1166,6 +1179,121 @@ impl Xform {
 }
 
 // ---------------------------------------------------------------------------
+// Agent activity tracking (rack / cable / matrix / assistant highlights)
+// ---------------------------------------------------------------------------
+
+/// Duration (seconds) an agent-touched unit/cable/cell remains highlighted
+/// before fading completely away.
+const AGENT_TOUCH_SECS: f32 = 2.6;
+/// Fade-out tail (seconds) at the end of [`AGENT_TOUCH_SECS`].
+const AGENT_FADE_SECS: f32 = 1.2;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AgentOrigin {
+    Assistant,
+    Remote,
+}
+
+impl AgentOrigin {
+    fn tag(self) -> &'static str {
+        match self {
+            AgentOrigin::Assistant => "ASST",
+            AgentOrigin::Remote => "MCP",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgentAction {
+    origin: AgentOrigin,
+    summary: String,
+    at: f32,
+    nodes: Vec<u32>,
+}
+
+/// Model-first store of recent agent edits, keyed by stable domain IDs
+/// (`NodeId`, `EdgeId`, `(SourceId, NodeId)`, rig index) so `build_rack`
+/// rebuilds never drop or shift highlights.
+#[derive(Default)]
+struct AgentActivity {
+    nodes: std::collections::HashMap<u32, f32>,
+    edges: std::collections::HashMap<u32, f32>,
+    matrix_cells: std::collections::HashMap<(SourceId, u32), f32>,
+    rigs: std::collections::HashMap<usize, f32>,
+    log: VecDeque<AgentAction>,
+}
+
+impl AgentActivity {
+    fn touch_node(&mut self, node: u32, now: f32) {
+        self.nodes.insert(node, now + AGENT_TOUCH_SECS);
+    }
+
+    fn touch_edge(&mut self, edge: u32, now: f32) {
+        self.edges.insert(edge, now + AGENT_TOUCH_SECS);
+    }
+
+    fn touch_cell(&mut self, src: SourceId, node: u32, now: f32) {
+        self.matrix_cells.insert((src, node), now + AGENT_TOUCH_SECS);
+    }
+
+    fn touch_rig(&mut self, rig: usize, now: f32) {
+        self.rigs.insert(rig, now + AGENT_TOUCH_SECS);
+    }
+
+    fn record(&mut self, origin: AgentOrigin, summary: impl Into<String>, nodes: Vec<u32>, now: f32) {
+        for &n in &nodes {
+            self.touch_node(n, now);
+        }
+        self.log.push_front(AgentAction {
+            origin,
+            summary: summary.into(),
+            at: now,
+            nodes,
+        });
+        while self.log.len() > 24 {
+            self.log.pop_back();
+        }
+    }
+
+    fn strength(expiry: Option<&f32>, now: f32) -> f32 {
+        match expiry {
+            Some(&exp) if exp > now => ((exp - now) / AGENT_FADE_SECS).clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    }
+
+    fn node_alpha(&self, node: u32, now: f32) -> f32 {
+        Self::strength(self.nodes.get(&node), now)
+    }
+
+    fn edge_alpha(&self, edge: u32, now: f32) -> f32 {
+        Self::strength(self.edges.get(&edge), now)
+    }
+
+    fn cell_alpha(&self, src: SourceId, node: u32, now: f32) -> f32 {
+        Self::strength(self.matrix_cells.get(&(src, node)), now)
+    }
+
+    fn rig_alpha(&self, rig: usize, now: f32) -> f32 {
+        Self::strength(self.rigs.get(&rig), now)
+    }
+
+    fn has_active(&self, now: f32) -> bool {
+        self.nodes.values().any(|&e| e > now)
+            || self.edges.values().any(|&e| e > now)
+            || self.matrix_cells.values().any(|&e| e > now)
+            || self.rigs.values().any(|&e| e > now)
+    }
+
+    fn prune(&mut self, now: f32) {
+        self.nodes.retain(|_, exp| *exp > now);
+        self.edges.retain(|_, exp| *exp > now);
+        self.matrix_cells.retain(|_, exp| *exp > now);
+        self.rigs.retain(|_, exp| *exp > now);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -1199,6 +1327,9 @@ struct DemoApp {
     hover: Option<Hit>,
 
     key_leds: [f32; 13],
+    /// Per-MIDI-note LEDs for the multi-octave bottom keyboard (key_leds is
+    /// per pitch class and would light every octave).
+    note_leds: [f32; 128],
     meter: f32,
     /// Peak-hold for the master meter (slow release).
     meter_peak: f32,
@@ -1212,6 +1343,8 @@ struct DemoApp {
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
     rig_chip_rects: Vec<Rect>,
+    /// Last frame's "+ Rig" button rect in the overview strip (points).
+    add_rig_rect: Rect,
     // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
     plugins_loaded: bool,
     plugins_clap: Vec<ClapPluginInfo>,
@@ -1312,10 +1445,32 @@ struct DemoApp {
     /// Last frame's assistant input-row height (+ spacing): the chat history
     /// gets exactly the rest, so the panel never overflows its rect.
     assistant_input_h: f32,
+    /// Last frame's assistant input-row rect (tests verify it stays visible).
+    assistant_input_rect: Rect,
+    /// Agent touch highlights + recent tool/remote action log.
+    agent_activity: AgentActivity,
+    /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
+    /// up agent highlights.
+    ui_mix_grace: [f32; 8],
+    ui_transport_grace: f32,
+    ui_node_grace: std::collections::HashMap<u32, f32>,
+    /// Attribution hint when `exec_tool` triggers a bus command that lands back
+    /// through `sync_from_engine`.
+    pending_agent_origin: Option<(AgentOrigin, f32)>,
     /// Last frame's rig-bus fader rects in the mixer stage (tests, per rig).
     mixer_fader_rects: Vec<Rect>,
-    /// Assistant bottom panel (toggleable, hidden by default; 2026-11-15).
-    show_assistant: bool,
+    /// Bottom dock occupant (None / Keyboard / Assistant). Hidden by default.
+    dock: DockView,
+    /// Set when the assistant opens: the chat field takes focus on the next
+    /// frame so typing goes to the agent instead of the laptop piano.
+    focus_chat_request: bool,
+    /// `--demo-agent` screenshot hook: keeps the demo agent's touch fresh every
+    /// frame so the rack highlight stays visible instead of fading after 2.6s.
+    demo_agent_hold: bool,
+    /// Last frame's dock panel rect (tests + keyboard hit-testing).
+    dock_rect: Rect,
+    /// Last frame's key area inside the dock keyboard (points).
+    dock_kb_rect: Rect,
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
     /// Motion (design polish): staged fade-in after a template/session load.
@@ -1466,6 +1621,7 @@ impl DemoApp {
             selected: None,
             hover: None,
             key_leds: [0.0; 13],
+            note_leds: [0.0; 128],
             meter: 0.0,
             meter_peak: 0.0,
             show_help: false,
@@ -1475,6 +1631,7 @@ impl DemoApp {
             confirm_delete_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
+            add_rig_rect: Rect::NOTHING,
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
@@ -1531,9 +1688,19 @@ impl DemoApp {
             matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
-            assistant_input_h: 56.0,
+            assistant_input_h: 44.0,
+            assistant_input_rect: Rect::NOTHING,
+            agent_activity: AgentActivity::default(),
+            ui_mix_grace: [-1.0; 8],
+            ui_transport_grace: -1.0,
+            ui_node_grace: std::collections::HashMap::new(),
+            pending_agent_origin: None,
             mixer_fader_rects: Vec::new(),
-            show_assistant: false,
+            dock: DockView::None,
+            focus_chat_request: false,
+            demo_agent_hold: false,
+            dock_rect: Rect::NOTHING,
+            dock_kb_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
             load_fade: 1.0,
             unit_hover: Vec::new(),
@@ -2374,23 +2541,105 @@ impl DemoApp {
         }
     }
 
+    fn unit_display_name(&self, node: u32) -> String {
+        self.units
+            .iter()
+            .find(|u| u.node_id == node)
+            .map(|u| sentence_case(&u.name))
+            .unwrap_or_else(|| format!("node {node}"))
+    }
+
+    fn take_pending_agent_origin(&mut self) -> Option<AgentOrigin> {
+        let (origin, exp) = self.pending_agent_origin?;
+        if self.ui_time <= exp {
+            self.pending_agent_origin = None;
+            Some(origin)
+        } else {
+            self.pending_agent_origin = None;
+            None
+        }
+    }
+
     /// MCP→UI live sync (PLAN §13): adopt the engine's graph when a remote
     /// structural change (MCP/CLI load_graph/load_rigs/add_node/connect/…)
     /// diverges from the UI's own mirror. UI-originated edits converge (the
     /// per-frame Connect mirror is idempotent engine-side), so they never
     /// trigger a rebuild — animations and interaction state survive.
     fn sync_from_engine(&mut self) {
+        if self.bus.is_some() {
+            let remote_cmds: Vec<Command> = crate::bridge::REMOTE_CMDS
+                .lock()
+                .map(|mut q| q.drain(..).collect())
+                .unwrap_or_default();
+            let now = self.ui_time;
+            for cmd in remote_cmds {
+                match cmd {
+                    Command::SetParam { node, param, value } => {
+                        let v = value as f32;
+                        if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
+                            for k in &mut u.knobs {
+                                if k.param == Some(param) {
+                                    k.value = v.clamp(0.0, 1.0);
+                                }
+                            }
+                        }
+                        let uname = self.unit_display_name(node);
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Param → {uname}"), vec![node], now);
+                    }
+                    Command::SetRigSource { node, keyboard, hardware } => {
+                        let rig = self.rig_of_node(node);
+                        if let Some(s) = self.rig_sources.get_mut(rig) {
+                            *s = (keyboard, hardware);
+                        }
+                        self.agent_activity.touch_cell(SourceId::Keys, node, now);
+                        let uname = self.unit_display_name(node);
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Sources → {uname}"), vec![node], now);
+                    }
+                    Command::SetRigDevice { node, device } => {
+                        let rig = self.rig_of_node(node);
+                        if let Some(d) = self.rig_device.get_mut(rig) {
+                            *d = device;
+                        }
+                        if let Some(d) = device {
+                            self.agent_activity.touch_cell(SourceId::Hardware(d), node, now);
+                        }
+                        let uname = self.unit_display_name(node);
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Device → {uname}"), vec![node], now);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let Some(pub_) = &self.graph_pub else { return };
         let Ok(g) = pub_.lock() else { return };
+        let now = self.ui_time;
         // Mixer mirror: adopt remote (MCP/CLI/agent) SetRigMix changes —
         // the Mixer showed stale vol/pan after a bridge edit (rule 25 class).
+        let mut mix_diff_rigs: Vec<usize> = Vec::new();
         if g.mix_rev != self.last_mix_rev {
             self.last_mix_rev = g.mix_rev;
+            for r in 0..8 {
+                if g.mix[r] != self.rig_mix[r] && now >= self.ui_mix_grace[r] {
+                    mix_diff_rigs.push(r);
+                }
+            }
             self.rig_mix = g.mix;
         }
+        let mut transport_changed = false;
         if g.transport_rev != self.last_transport_rev {
             self.last_transport_rev = g.transport_rev;
             let was_counting = self.counting_in;
+            let now_playing = g.transport.playing || g.transport.counting_in;
+            let bpm_diff = !matches!(self.drag, Drag::Bpm { .. }) && (g.transport.bpm - self.bpm).abs() > 0.05;
+            if now >= self.ui_transport_grace
+                && (now_playing != self.playing
+                    || bpm_diff
+                    || g.transport.count_in_enabled != self.count_in_enabled
+                    || g.transport.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) != self.count_in_bars
+                    || g.transport.record_sync != self.record_sync)
+            {
+                transport_changed = true;
+            }
             self.counting_in = g.transport.counting_in;
             self.count_in_beat = g.transport.count_in_beat;
             self.count_in_enabled = g.transport.count_in_enabled;
@@ -2399,13 +2648,40 @@ impl DemoApp {
             if !matches!(self.drag, Drag::Bpm { .. }) {
                 self.bpm = g.transport.bpm;
             }
-            let now_playing = g.transport.playing || g.transport.counting_in;
             if (now_playing && !self.playing) || (was_counting && !self.counting_in && g.transport.playing) {
                 self.time = 0.0;
             }
             self.playing = now_playing;
         }
-        if g.rev == self.last_graph_rev { return; }
+        let graph_rev_changed = g.rev != self.last_graph_rev;
+        if !graph_rev_changed {
+            drop(g);
+            if !mix_diff_rigs.is_empty() || transport_changed {
+                let pending_origin = self.take_pending_agent_origin();
+                let n_rigs = self.rig_count();
+                for r in mix_diff_rigs {
+                    self.agent_activity.touch_rig(r, now);
+                    let nodes: Vec<u32> = self.units.iter()
+                        .filter(|u| n_rigs <= 1 || u.rig as usize == r)
+                        .map(|u| u.node_id)
+                        .collect();
+                    if pending_origin.is_none() {
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Mix → {}", self.rig_name(r)), nodes, now);
+                    } else {
+                        for n in nodes { self.agent_activity.touch_node(n, now); }
+                    }
+                }
+                if transport_changed {
+                    let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                    if pending_origin.is_none() && !nodes.is_empty() {
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Transport ({:.0} BPM)", self.bpm), nodes, now);
+                    } else {
+                        for n in nodes { self.agent_activity.touch_node(n, now); }
+                    }
+                }
+            }
+            return;
+        }
         self.last_graph_rev = g.rev;
         // Mirror the engine's rules (covers remote MCP rule edits too).
         let mut edits = std::collections::HashMap::new();
@@ -2421,12 +2697,28 @@ impl DemoApp {
             };
             if !e.is_default() { edits.insert((r.source, r.dest), e); }
         }
+        let mut changed_rules: Vec<(SourceId, u32)> = Vec::new();
+        for (&k, v) in &edits {
+            if self.rule_edits.get(&k) != Some(v) {
+                changed_rules.push(k);
+            }
+        }
+        for &k in self.rule_edits.keys() {
+            if !edits.contains_key(&k) {
+                changed_rules.push(k);
+            }
+        }
         self.rule_edits = edits;
         // Per-instrument transport: adopt the engine's playing flags into the
         // base graph + unit faces + bridge mirror BEFORE the divergence check,
         // so a Play/Stop (local chip, MCP, master) never rebuilds the rack.
+        let mut touched_nodes: Vec<u32> = Vec::new();
         let mut shared = self.shared_graph.lock().ok();
         for n in g.graph.nodes.iter().filter(|n| n.kind.supports_transport()) {
+            let was = self.base_graph.node(n.id).map(|old| old.playing);
+            if was.is_some_and(|w| w != n.playing) && now >= self.ui_node_grace.get(&n.id).copied().unwrap_or(-1.0) {
+                touched_nodes.push(n.id);
+            }
             self.base_graph.set_playing(n.id, n.playing);
             if let Some(sg) = shared.as_mut() { sg.set_playing(n.id, n.playing); }
             for u in self.units.iter_mut().filter(|u| u.node_id == n.id && u.transport) {
@@ -2437,6 +2729,10 @@ impl DemoApp {
         // — jacks swap 1 ↔ 2 MIDI outs without a rebuild. A vanished HIGH
         // jack can't stay referenced by in-flight interaction state.
         for n in g.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Keys)) {
+            let was = self.base_graph.node(n.id).map(|old| old.split);
+            if was.is_some_and(|w| w != n.split) && now >= self.ui_node_grace.get(&n.id).copied().unwrap_or(-1.0) {
+                touched_nodes.push(n.id);
+            }
             self.base_graph.set_split(n.id, n.split);
             if let Some(sg) = shared.as_mut() { sg.set_split(n.id, n.split); }
             for (i, u) in self.units.iter_mut().enumerate() {
@@ -2471,15 +2767,112 @@ impl DemoApp {
         // Full structural comparison (rare path — only when the rev changed).
         let same = serde_json::to_value(&mirror.nodes).ok() == serde_json::to_value(&g.graph.nodes).ok()
             && serde_json::to_value(&mirror.edges).ok() == serde_json::to_value(&g.graph.edges).ok();
-        if same {
-            let adopted = g.graph.clone();
-            drop(g);
-            self.sync_clap_slots(&adopted);
-            return;
+        let mut diff_edges: Vec<u32> = Vec::new();
+        let mut diff_rigs: Vec<usize> = Vec::new();
+        let mut diff_summary: Option<String> = None;
+        if !same {
+            let mut added = 0usize;
+            for n in &g.graph.nodes {
+                let prev = mirror.nodes.iter().find(|m| m.id == n.id);
+                if prev.is_none() {
+                    added += 1;
+                    touched_nodes.push(n.id);
+                    diff_rigs.push(n.rig as usize);
+                } else if prev.is_some_and(|m| m.rig != n.rig || m.name != n.name) {
+                    touched_nodes.push(n.id);
+                }
+            }
+            let mut removed = 0usize;
+            for m in &mirror.nodes {
+                if !g.graph.nodes.iter().any(|n| n.id == m.id) {
+                    removed += 1;
+                    diff_rigs.push(m.rig as usize);
+                    for e in &mirror.edges {
+                        if e.from.node == m.id && e.to.node != m.id { touched_nodes.push(e.to.node); }
+                        if e.to.node == m.id && e.from.node != m.id { touched_nodes.push(e.from.node); }
+                    }
+                }
+            }
+            let mut wired = 0usize;
+            for e in &g.graph.edges {
+                if !mirror.edges.iter().any(|me| me.id == e.id && me.from == e.from && me.to == e.to && me.kind == e.kind) {
+                    wired += 1;
+                    diff_edges.push(e.id);
+                    touched_nodes.push(e.from.node);
+                    touched_nodes.push(e.to.node);
+                }
+            }
+            let mut unwired = 0usize;
+            for me in &mirror.edges {
+                if !g.graph.edges.iter().any(|e| e.id == me.id && e.from == me.from && e.to == me.to && e.kind == me.kind) {
+                    unwired += 1;
+                    touched_nodes.push(me.from.node);
+                    touched_nodes.push(me.to.node);
+                }
+            }
+            diff_summary = Some(match (added, removed, wired, unwired) {
+                (a, 0, _, _) if a > 0 => format!("Added {a} unit{}", if a == 1 { "" } else { "s" }),
+                (0, r, _, _) if r > 0 => format!("Removed {r} unit{}", if r == 1 { "" } else { "s" }),
+                (0, 0, w, 0) if w > 0 => format!("Connected {w} cable{}", if w == 1 { "" } else { "s" }),
+                (0, 0, 0, u) if u > 0 => format!("Disconnected {u} cable{}", if u == 1 { "" } else { "s" }),
+                _ => "Patch updated".into(),
+            });
         }
         let adopted = g.graph.clone();
         let mix = g.mix;
         drop(g);
+
+        let pending_origin = self.take_pending_agent_origin();
+        let origin = pending_origin.unwrap_or(AgentOrigin::Remote);
+        for r in &mix_diff_rigs {
+            self.agent_activity.touch_rig(*r, now);
+            let n_rigs = self.rig_count();
+            for u in &self.units {
+                if n_rigs <= 1 || u.rig as usize == *r {
+                    touched_nodes.push(u.node_id);
+                }
+            }
+        }
+        if transport_changed {
+            for u in self.units.iter().filter(|u| u.transport) {
+                touched_nodes.push(u.node_id);
+            }
+        }
+        for &(src, node) in &changed_rules {
+            if now >= self.ui_node_grace.get(&node).copied().unwrap_or(-1.0) {
+                self.agent_activity.touch_cell(src, node, now);
+                touched_nodes.push(node);
+            }
+        }
+        for &eid in &diff_edges {
+            self.agent_activity.touch_edge(eid, now);
+        }
+        for &r in &diff_rigs {
+            self.agent_activity.touch_rig(r, now);
+        }
+        if !touched_nodes.is_empty() {
+            touched_nodes.sort_unstable();
+            touched_nodes.dedup();
+            if pending_origin.is_none() {
+                let summary = diff_summary.unwrap_or_else(|| {
+                    if !changed_rules.is_empty() {
+                        format!("Rule → {}", self.unit_display_name(changed_rules[0].1))
+                    } else {
+                        format!("Updated {}", self.unit_display_name(touched_nodes[0]))
+                    }
+                });
+                self.agent_activity.record(origin, summary, touched_nodes, now);
+            } else {
+                for n in touched_nodes {
+                    self.agent_activity.touch_node(n, now);
+                }
+            }
+        }
+
+        if same {
+            self.sync_clap_slots(&adopted);
+            return;
+        }
         self.build_rack(&adopted, &[]);
         self.sync_clap_slots(&adopted);
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
@@ -2504,7 +2897,7 @@ impl DemoApp {
                     .history
                     .push(ChatLine { role: "assistant".into(), text: t }),
                 FromWorker::ToolCall { id, name, args } => {
-                    let result = self.exec_tool(&name, &args);
+                    let result = self.exec_tool_with_origin(&name, &args, AgentOrigin::Assistant);
                     self.assistant.send_tool_result(id, result);
                 }
                 FromWorker::Models(list) => {
@@ -2564,6 +2957,20 @@ impl DemoApp {
         }
         if self.stage_view == StageView::Plugins && !self.plugins_loaded {
             self.refresh_plugins();
+        }
+    }
+
+    fn assistant_open(&self) -> bool { self.dock == DockView::Assistant }
+
+    fn keyboard_open(&self) -> bool { self.dock == DockView::Keyboard }
+
+    /// Toggle a dock occupant (one at a time). Opening the assistant also asks
+    /// the chat field to take keyboard focus on the next frame, so the agent
+    /// owns the computer keyboard instead of the laptop piano.
+    fn toggle_dock(&mut self, d: DockView) {
+        self.dock = if self.dock == d { DockView::None } else { d };
+        if self.dock == DockView::Assistant {
+            self.focus_chat_request = true;
         }
     }
 
@@ -2757,6 +3164,7 @@ impl DemoApp {
             }
         }
         // Rewire the engine, then publish every knob value.
+        self.ui_transport_grace = self.ui_time + 0.6;
         self.load_graph_into_engine(&s.graph);
         // The editor referenced the old voice mapping; close it.
         self.editor_open = false;
@@ -2858,6 +3266,11 @@ impl DemoApp {
     }
 
     fn exec_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
+        self.exec_tool_with_origin(name, args, AgentOrigin::Assistant)
+    }
+
+    fn exec_tool_with_origin(&mut self, name: &str, args: &serde_json::Value, origin: AgentOrigin) -> String {
+        let now = self.ui_time;
         match name {
             "get_graph" => match self.shared_graph.lock() {
                 Ok(g) => serde_json::to_value(&*g)
@@ -2887,7 +3300,7 @@ impl DemoApp {
                     "stage_h": self.stage_rect.height(), "unit_h": self.unit_h, "rows": self.layout_rows,
                     "rack_w": self.rack_w, "rack_h": self.rack_h,
                     "overflow": [self.rack_overflow.x, self.rack_overflow.y],
-                    "assistant_h": if self.show_assistant { self.assistant_rect.height() } else { 0.0 },
+                    "assistant_h": if self.assistant_open() { self.assistant_rect.height() } else { 0.0 },
                 },
             })
             .to_string(),
@@ -2901,15 +3314,22 @@ impl DemoApp {
                     std::time::Instant::now() + std::time::Duration::from_millis(ms),
                     semi,
                 ));
+                if let Some(k) = self.keys_unit.and_then(|u| self.units.get(u)).map(|u| u.node_id) {
+                    self.agent_activity.record(origin, format!("Play note {note}"), vec![k], now);
+                }
                 format!("played note {note} for {ms} ms")
             }
             "set_octave" => {
                 let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4).clamp(1, 7) as u8;
                 self.octave = oct;
+                if let Some(k) = self.keys_unit.and_then(|u| self.units.get(u)).map(|u| u.node_id) {
+                    self.agent_activity.record(origin, format!("Octave C{oct}"), vec![k], now);
+                }
                 format!("octave set to C{oct}")
             }
             "flip_rack" => {
                 self.start_flip();
+                self.agent_activity.record(origin, "Flip rack", vec![], now);
                 "rack flipped".into()
             }
             "set_rig_source" => {
@@ -2924,6 +3344,8 @@ impl DemoApp {
                 let rig = self.rig_of_node(node);
                 self.rig_sources[rig] = (keyboard, hardware);
                 self.send_rig_source(node);
+                self.agent_activity.touch_cell(SourceId::Keys, node, now);
+                self.agent_activity.record(origin, format!("Sources → {}", self.unit_display_name(node)), vec![node], now);
                 format!("rig {node} sources: keyboard={keyboard} hardware={hardware}")
             }
             "set_split" => {
@@ -2938,6 +3360,14 @@ impl DemoApp {
                 };
                 let node = self.units[unit].node_id;
                 self.set_keys_split(unit, point);
+                if self.graph_pub.is_some() {
+                    self.pending_agent_origin = Some((origin, now + 1.0));
+                }
+                let summary = match point {
+                    Some(p) => format!("Split Keys at {}", note_name(p)),
+                    None => "Unsplit Keys".into(),
+                };
+                self.agent_activity.record(origin, summary, vec![node], now);
                 match point {
                     Some(p) => format!("keys node {node} split at note {p} ({}): port 0 = LOW (below), port 1 = HIGH (at/above) — wire HIGH with connect from_port 1", note_name(p)),
                     None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed"),
@@ -3026,6 +3456,10 @@ impl DemoApp {
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
                 }
+                if let Some(d) = device {
+                    self.agent_activity.touch_cell(SourceId::Hardware(d), node, now);
+                }
+                self.agent_activity.record(origin, format!("Device → {}", self.unit_display_name(node)), vec![node], now);
                 match device {
                     Some(d) => format!("rig {node} now listens only to hardware device {d}"),
                     None => format!("rig {node} listens to any hardware device"),
@@ -3088,6 +3522,13 @@ impl DemoApp {
                     _ => return format!("unknown source '{source}' (keys|hw_all|hw:<d>)"),
                 };
                 self.matrix_toggle(inst, row, on);
+                if let Some(src) = row.source() {
+                    self.agent_activity.touch_cell(src, node, now);
+                }
+                if let Some(ci) = self.midi_cable_to(inst) {
+                    self.agent_activity.touch_edge(self.cables[ci].id, now);
+                }
+                self.agent_activity.record(origin, format!("Matrix {source} → {}", self.unit_display_name(node)), vec![node], now);
                 format!("matrix cell {source} → node {node} = {on}")
             }
             "set_matrix_rule" => {
@@ -3117,7 +3558,10 @@ impl DemoApp {
                 else { self.rule_edits.insert((src, node), e); }
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(cmd);
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 }
+                self.agent_activity.touch_cell(src, node, now);
+                self.agent_activity.record(origin, format!("Rule → {}: {summary}", self.unit_display_name(node)), vec![node], now);
                 format!("rule {source} → node {node}: {summary}")
             }
             "set_cc_map" => {
@@ -3137,6 +3581,9 @@ impl DemoApp {
                 };
                 let param = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32);
                 self.set_cc_binding(src, node, cc, param);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.agent_activity.touch_cell(src, node, now);
+                self.agent_activity.record(origin, format!("CC {cc} → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
                     .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
                     .unwrap_or_default();
@@ -3165,6 +3612,9 @@ impl DemoApp {
                         self.set_cc_binding(src, node, cc, None);
                     }
                 }
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.agent_activity.touch_cell(src, node, now);
+                self.agent_activity.record(origin, format!("Clear CC → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
                     .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
                     .unwrap_or_default();
@@ -3254,14 +3704,22 @@ impl DemoApp {
             }
             "set_rig_mix" => {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                if rig >= self.rig_count() { return format!("rig {rig} out of range ({} rigs)", self.rig_count()); }
+                let n_rigs = self.rig_count();
+                if rig >= n_rigs { return format!("rig {rig} out of range ({n_rigs} rigs)"); }
                 let m = &mut self.rig_mix[rig.min(7)];
                 if let Some(v) = args.get("vol").and_then(|v| v.as_f64()) { m.vol = v.clamp(0.0, 1.0) as f32; }
                 if let Some(v) = args.get("pan").and_then(|v| v.as_f64()) { m.pan = v.clamp(-1.0, 1.0) as f32; }
                 if let Some(v) = args.get("mute").and_then(|v| v.as_bool()) { m.mute = v; }
                 if let Some(v) = args.get("solo").and_then(|v| v.as_bool()) { m.solo = v; }
                 self.send_rig_mix(rig);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 let m = self.rig_mix[rig.min(7)];
+                let nodes: Vec<u32> = self.units.iter()
+                    .filter(|u| n_rigs <= 1 || u.rig as usize == rig)
+                    .map(|u| u.node_id)
+                    .collect();
+                self.agent_activity.touch_rig(rig, now);
+                self.agent_activity.record(origin, format!("Mix → {} (vol {:.2})", self.rig_name(rig), m.vol), nodes, now);
                 format!("rig {rig}: vol {:.2} pan {:.2} mute {} solo {}", m.vol, m.pan, m.mute, m.solo)
             }
             "list_plugins" => {
@@ -3288,6 +3746,9 @@ impl DemoApp {
                     }
                     self.master_transport(true);
                 }
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, "Transport play", nodes, now);
                 if self.count_in_enabled {
                     format!("master transport count-in started ({} bar)", self.count_in_bars)
                 } else {
@@ -3299,6 +3760,9 @@ impl DemoApp {
                 self.counting_in = false;
                 self.count_in_beat = 0;
                 self.master_transport(false);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, "Transport stop", nodes, now);
                 "master transport stopped (every metronome stops)".into()
             }
             "record_start" => {
@@ -3308,12 +3772,16 @@ impl DemoApp {
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::RecordStart);
                 }
+                let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, "Record start", masters, now);
                 "recording started (master output → ~/Music/kabelsalat/)".into()
             }
             "record_stop" => {
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::RecordStop);
                 }
+                let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, "Record stop", masters, now);
                 "recording stopped".into()
             }
             "record_status" => match &self.recorder {
@@ -3327,7 +3795,9 @@ impl DemoApp {
                 self.record_sync = on;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetRecordSync { on });
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 }
+                self.agent_activity.record(origin, format!("Record sync = {on}"), vec![], now);
                 serde_json::json!({"record_sync": self.record_sync}).to_string()
             }
             "set_node_playing" => {
@@ -3336,6 +3806,10 @@ impl DemoApp {
                 };
                 let playing = args.get("playing").and_then(|v| v.as_bool()).unwrap_or(true);
                 if self.set_node_playing(node as u32, playing) {
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                    let nid = node as u32;
+                    let uname = self.unit_display_name(nid);
+                    self.agent_activity.record(origin, format!("{uname} {}", if playing { "play" } else { "stop" }), vec![nid], now);
                     format!("node {node} {}", if playing { "playing" } else { "stopped" })
                 } else {
                     format!("node {node} has no transport (only metronomes start/stop) or does not exist")
@@ -3344,6 +3818,9 @@ impl DemoApp {
             "set_bpm" => {
                 let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(96.0).clamp(20.0, 300.0) as f32;
                 self.set_bpm(bpm);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, format!("Tempo {bpm:.0} BPM"), nodes, now);
                 format!("tempo set to {bpm:.0} BPM")
             }
             "set_count_in" => {
@@ -3355,17 +3832,28 @@ impl DemoApp {
                     None => (enabled_arg.unwrap_or(!self.count_in_enabled), self.count_in_bars),
                 };
                 self.set_count_in(enabled, bars);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let nodes: Vec<u32> = self.units.iter().filter(|u| u.transport).map(|u| u.node_id).collect();
+                self.agent_activity.record(origin, format!("Count-in {enabled} ({bars}b)"), nodes, now);
                 serde_json::json!({"enabled": self.count_in_enabled, "bars": self.count_in_bars}).to_string()
             }
             "load_template" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("demo").to_lowercase();
-                match name.as_str() {
-                    "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); "Loaded template 'Lead + Reverb'".into() }
-                    "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); "Loaded template 'Drums + Bass'".into() }
-                    "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); "Loaded template 'Ambient Pad'".into() }
-                    "demo" => { self.load_demo_patch(); "Loaded the demo patch".into() }
-                    "multi_rig" | "rigs" => { self.load_multi_rig_demo(); "Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".into() }
-                    _ => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
+                let res = match name.as_str() {
+                    "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); Some("Loaded template 'Lead + Reverb'".to_string()) }
+                    "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); Some("Loaded template 'Drums + Bass'".to_string()) }
+                    "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); Some("Loaded template 'Ambient Pad'".to_string()) }
+                    "demo" => { self.load_demo_patch(); Some("Loaded the demo patch".to_string()) }
+                    "multi_rig" | "rigs" => { self.load_multi_rig_demo(); Some("Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".to_string()) }
+                    _ => None,
+                };
+                match res {
+                    Some(msg) => {
+                        let nodes: Vec<u32> = self.units.iter().map(|u| u.node_id).collect();
+                        self.agent_activity.record(origin, format!("Template: {name}"), nodes, now);
+                        msg
+                    }
+                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
                 }
             }
             "add_node" => {
@@ -3399,7 +3887,12 @@ impl DemoApp {
                 }
                 match kind {
                     Some(k) => {
-                        if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 }); }
+                        if let Some(bus) = &self.bus {
+                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 });
+                            if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        }
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
                         format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
                     }
                     None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
@@ -3424,7 +3917,16 @@ impl DemoApp {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
                 match self.load_sound(rig, q) {
-                    Ok(p) => format!("loaded '{p}' into rig {rig} '{}'", self.rig_name(rig)),
+                    Ok(p) => {
+                        let multi = self.rig_count() > 1;
+                        let nodes: Vec<u32> = self.units.iter()
+                            .filter(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
+                            .map(|u| u.node_id)
+                            .collect();
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(origin, format!("Sound → {p}"), nodes, now);
+                        format!("loaded '{p}' into rig {rig} '{}'", self.rig_name(rig))
+                    }
                     Err(e) => format!("load_sound failed: {e}"),
                 }
             }
@@ -3445,14 +3947,26 @@ impl DemoApp {
                 }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
                 // A Surge patch query means nothing to another plugin.
+                let new_rig = self.active_rig;
                 let sound_query = if args.get("plugin_id").is_some() { None } else { args.get("sound").and_then(|v| v.as_str()) };
                 let sound = match sound_query {
-                    Some(q) => match self.load_sound(self.active_rig, q) {
+                    Some(q) => match self.load_sound(new_rig, q) {
                         Ok(p) => format!(" Sound: {p}."),
                         Err(e) => format!(" Sound not loaded: {e}."),
                     },
                     None => String::new(),
                 };
+                let nodes: Vec<u32> = self.units.iter()
+                    .filter(|u| u.rig as usize == new_rig)
+                    .map(|u| u.node_id)
+                    .collect();
+                let edges: Vec<u32> = self.cables.iter()
+                    .filter(|c| self.units.get(c.src).is_some_and(|u| u.rig as usize == new_rig))
+                    .map(|c| c.id)
+                    .collect();
+                for eid in edges { self.agent_activity.touch_edge(eid, now); }
+                self.agent_activity.touch_rig(new_rig, now);
+                self.agent_activity.record(origin, format!("Add {}", self.rig_name(new_rig)), nodes, now);
                 format!("{} — now in view.{sound} {}", self.session_msg, self.rigs_json())
             }
             "delete_rig" => {
@@ -3465,7 +3979,9 @@ impl DemoApp {
                 }
                 if n <= 1 { return "not deleted: the last rig cannot be deleted".into(); }
                 if rig >= n { return format!("no rig {rig}: there are {n}"); }
+                let deleted_name = self.rig_name(rig);
                 self.edit_rigs(Some(rig));
+                self.agent_activity.record(origin, format!("Delete {deleted_name}"), vec![], now);
                 format!("{}. {}", self.session_msg, self.rigs_json())
             }
             "select_rig" => {
@@ -3473,6 +3989,8 @@ impl DemoApp {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 if rig >= n { return format!("no rig {rig}: there are {n}"); }
                 self.set_active_rig(rig);
+                self.agent_activity.touch_rig(rig, now);
+                self.agent_activity.record(origin, format!("View {}", self.rig_name(rig)), vec![], now);
                 format!("showing rig {rig} '{}' (view only — every rig keeps sounding)", self.rig_name(rig))
             }
             "connect" => {
@@ -3485,17 +4003,51 @@ impl DemoApp {
                 let id = self.shared_graph.lock().map(|g| g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1).unwrap_or(1);
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::Connect { id, from: PortRef { node: from_node, port: from_port }, to: PortRef { node: to_node, port: to_port }, kind });
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 }
+                self.agent_activity.touch_edge(id, now);
+                let sname = self.unit_display_name(from_node);
+                let dname = self.unit_display_name(to_node);
+                self.agent_activity.record(origin, format!("Wire {sname} → {dname}"), vec![from_node, to_node], now);
                 format!("connected {from_node} -> {to_node} ({})", if midi { "midi" } else { "audio" })
             }
             "disconnect" => {
                 let id = args.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::Disconnect(id)); }
+                let endpoints: Vec<u32> = self.cables.iter().find(|c| c.id == id)
+                    .map(|c| {
+                        let mut v = Vec::new();
+                        if let Some(u) = self.units.get(c.src) { v.push(u.node_id); }
+                        if let Some(u) = self.units.get(c.dst) { v.push(u.node_id); }
+                        v
+                    })
+                    .unwrap_or_default();
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::Disconnect(id));
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                }
+                self.agent_activity.record(origin, format!("Unplug cable {id}"), endpoints, now);
                 format!("disconnected cable {id}")
             }
             "remove_node" => {
                 let id = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                if let Some(bus) = &self.bus { let _ = bus.lock().unwrap().send(Command::RemoveNode(id)); }
+                let uname = self.unit_display_name(id);
+                let neighbors: Vec<u32> = self.cables.iter()
+                    .filter(|c| c.dying < 0.0)
+                    .filter_map(|c| {
+                        let s = self.units.get(c.src).map(|u| u.node_id);
+                        let d = self.units.get(c.dst).map(|u| u.node_id);
+                        match (s, d) {
+                            (Some(sn), Some(dn)) if sn == id && dn != id => Some(dn),
+                            (Some(sn), Some(dn)) if dn == id && sn != id => Some(sn),
+                            _ => None,
+                        }
+                    })
+                    .collect();
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::RemoveNode(id));
+                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                }
+                self.agent_activity.record(origin, format!("Remove {uname}"), neighbors, now);
                 format!("removed node {id} (and its cables)")
             }
             _ => format!("unknown tool: {name}"),
@@ -4010,12 +4562,21 @@ impl DemoApp {
             for &s in &sinks {
                 let u = &self.units[s];
                 let gate = self.midi_cable_to(s).is_some();
+                let node_at = self.agent_activity.node_alpha(u.node_id, self.ui_time);
                 ui.vertical(|ui| {
                     ui.set_min_width(90.0);
                     // Multi-rig: "2 · Surge" like the RIG INPUTS labels — two
                     // columns both headed "Surge" were indistinguishable.
                     let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
-                    no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
+                    ui.horizontal(|ui| {
+                        no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
+                        if node_at > 0.01 {
+                            let (br, _) = ui.allocate_exact_size(egui::vec2(44.0, 15.0), egui::Sense::hover());
+                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, node_at));
+                            ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "AGENT",
+                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, node_at));
+                        }
+                    });
                     // Single-graph mode: all nodes share rig 0 — don't label
                     // every column "rig A" (user report 2026-11-15).
                     // Same rig naming as the RIGS strip, same "MIDI" casing as everywhere.
@@ -4074,6 +4635,11 @@ impl DemoApp {
                     if resp.hovered() {
                         p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
                         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    } else if let Some(src) = row.source() {
+                        let cell_at = self.agent_activity.cell_alpha(src, node, self.ui_time);
+                        if cell_at > 0.01 {
+                            p.rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, cell_at)), egui::StrokeKind::Inside);
+                        }
                     }
                     if resp.clicked() { toggles.push((s, *row, !on)); }
                     if resp.secondary_clicked() && row.source().is_some() {
@@ -4466,7 +5032,7 @@ impl DemoApp {
                 | "clear_cc_map"
                 | "learn_cc"
                 | "get_matrix"
-                | "add_rig" => self.exec_tool(&tool, &args),
+                | "add_rig" => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 other => format!("tool '{other}' is not served over the UI bridge"),
             };
             let _ = reply.send(out);
@@ -4741,97 +5307,110 @@ impl DemoApp {
         }
     }
 
-    /// Multi-rig overview strip (PLAN §13.1): always visible above the rack
-    /// when >1 rig is loaded. Per rig: number-key hint, name, bound MIDI device,
-    /// live level; the active rig is the filled button chip. Click
-    /// or 1–9/←→ switches the BIG VIEW ONLY — every rig keeps sounding.
+    /// Multi-rig overview strip (PLAN §13.1): always visible above the rack.
+    /// Every control (RIGS label, "+ Rig" button, separator, rig chips, delete
+    /// button, source label, level bar) shares one 26px centered baseline.
     fn rig_overview_panel(&mut self, root: &mut egui::Ui) {
         // Always shown (2026-11-15, user): the strip owns "+ Rig" and the
         // per-rig delete, so a single-rig rack can grow into several.
+        const STRIP_ROW_H: f32 = 26.0;
         let n = self.rig_count();
         let mut switch: Option<usize> = None;
         let mut add_rig = false;
         self.rig_chip_rects.clear();
+        self.add_rig_rect = Rect::NOTHING;
         egui::Panel::top("rig_overview")
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    theme::section_label(ui, "Rigs");
-                    ui.add_space(6.0);
-                    // "+ Rig" sits up front so it never scrolls out of reach.
-                    if n < Self::MAX_RIGS {
-                        let add = theme::chip_button(ui, "+ Rig", false)
-                            .on_hover_text("add a rig: its own keys, synth and master — all rigs sound together");
-                        if add.clicked() { add_rig = true; }
-                        ui.add_space(6.0);
-                    }
-                    nav_separator(ui);
-                    ui.add_space(4.0);
-                    egui::ScrollArea::horizontal().id_salt("rig_strip").show(ui, |ui| { ui.horizontal(|ui| {
-                    for rig in 0..n.min(9) {
-                        let active = rig == self.active_rig;
-                        let name = self.rig_name(rig);
-                        let dev = self.rig_device_label(rig);
-                        let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
-                        egui::Frame::new()
-                            .inner_margin(egui::Margin::symmetric(8, 4))
-                            .show(ui, |ui| { ui.vertical(|ui| {
-                                // Real button chip (2026-11-15): the active rig
-                                // is the filled chip — no underline.
-                                let name_resp = ui.horizontal(|ui| {
-                                    let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), active);
-                                    if n > 1 {
-                                        ui.add_space(2.0);
-                                        // A quiet close glyph (tab-close idiom), not a second
-                                        // chip: frameless, dim, full-size hit area (rule 7).
-                                        // Icon button: quiet at rest; on hover a filled hit
-                                        // area + danger-tinted glyph (clear remove affordance).
-                                        let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-                                        let hov = dresp.hovered();
-                                        if hov {
-                                            ui.painter().rect_filled(dr, 3.0, theme::DARK_PANEL_HI);
-                                            ui.painter().rect_stroke(dr, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), STRIP_ROW_H),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        theme::section_label(ui, "Rigs");
+                        // "+ Rig" sits up front so it never scrolls out of reach.
+                        if n < Self::MAX_RIGS {
+                            let add = theme::add_rig_button(ui, "Rig")
+                                .on_hover_text("add a rig: its own keys, synth and master — all rigs sound together");
+                            self.add_rig_rect = add.rect;
+                            if add.clicked() { add_rig = true; }
+                        }
+                        nav_separator(ui);
+                        let scroll_w = ui.available_width().max(1.0);
+                        egui::ScrollArea::horizontal()
+                            .id_salt("rig_strip")
+                            .max_width(scroll_w)
+                            .max_height(STRIP_ROW_H)
+                            .show(ui, |ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(scroll_w, STRIP_ROW_H),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        for rig in 0..n.min(9) {
+                                            if rig > 0 {
+                                                ui.add_space(4.0);
+                                                nav_separator(ui);
+                                                ui.add_space(4.0);
+                                            }
+                                            let active = rig == self.active_rig;
+                                            let name = self.rig_name(rig);
+                                            let dev = self.rig_device_label(rig);
+                                            let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
+                                            let chip = theme::chip_button(ui, &format!("{} · {}", rig + 1, name), active);
+                                            let agent_t = self.agent_activity.rig_alpha(rig, self.ui_time);
+                                            if agent_t > 0.01 {
+                                                ui.painter().rect_stroke(
+                                                    chip.rect.expand(1.5),
+                                                    3.0,
+                                                    Stroke::new(1.5, theme::alpha(theme::AGENT_COLOR, agent_t)),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                            }
+                                            if chip.clicked() { switch = Some(rig); }
+                                            self.rig_chip_rects.push(chip.rect);
+                                            if n > 1 {
+                                                let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+                                                let hov = dresp.hovered();
+                                                if hov {
+                                                    ui.painter().rect_filled(dr, 3.0, theme::DARK_PANEL_HI);
+                                                    ui.painter().rect_stroke(dr, 3.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                                }
+                                                ui.painter().text(dr.center(), egui::Align2::CENTER_CENTER, "×", FontId::proportional(15.0),
+                                                    if hov { theme::CLIP_BRIGHT } else { theme::INK_2 });
+                                                if dresp.on_hover_text(format!("Delete {name}… (asks first)")).clicked() {
+                                                    self.confirm_delete_rig = Some(rig);
+                                                }
+                                            }
+                                            ui.add_space(2.0);
+                                            theme::tracked_label(ui, &dev, 9.0, 0.14, theme::INK_2);
+                                            ui.add_space(2.0);
+                                            let (r, _) = ui.allocate_exact_size(egui::vec2(36.0, 3.0), egui::Sense::hover());
+                                            let p = ui.painter();
+                                            p.rect_filled(r, 1.0, theme::HAIRLINE);
+                                            let w = 36.0 * level.clamp(0.0, 1.0);
+                                            if w > 0.5 {
+                                                p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
+                                            }
                                         }
-                                        ui.painter().text(dr.center(), egui::Align2::CENTER_CENTER, "×", FontId::proportional(15.0),
-                                            if hov { theme::CLIP_BRIGHT } else { theme::INK_2 });
-                                        if dresp.on_hover_text(format!("Delete {name}… (asks first)")).clicked() {
-                                            self.confirm_delete_rig = Some(rig);
+                                        if n > 1 {
+                                            ui.add_space(8.0);
+                                            let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
+                                            ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
+                                                .size(11.0).color(theme::INK_2));
                                         }
-                                    }
-                                    ui.add_space(6.0);
-                                    theme::tracked_label(ui, &dev, 9.0, 0.14, theme::INK_2);
-                                    ui.add_space(6.0);
-                                    // Live level: flat teal bar on a hairline track.
-                                    let (r, _) = ui.allocate_exact_size(egui::vec2(36.0, 3.0), egui::Sense::hover());
-                                    let p = ui.painter();
-                                    p.rect_filled(r, 1.0, theme::HAIRLINE);
-                                    let w = 36.0 * level.clamp(0.0, 1.0);
-                                    if w > 0.5 {
-                                        p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
-                                    }
-                                    chip
-                                }).inner;
-                                if name_resp.clicked() { switch = Some(rig); }
-                                self.rig_chip_rects.push(name_resp.rect);
-                            }); });
-                        ui.add_space(4.0);
-                    }
-                    if n > 1 {
-                        ui.add_space(8.0);
-                        // The real key range, not a fixed "1–9" (vision review).
-                        let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
-                        ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
-                            .size(11.0).color(theme::INK_2));
-                    }
-                    }); });
-                });
+                                    },
+                                );
+                            });
+                    },
+                );
             });
         if let Some(r) = switch { self.set_active_rig(r); }
         if add_rig { self.edit_rigs(None); }
@@ -4895,8 +5474,12 @@ impl DemoApp {
                         self.toggle_stage(StageView::Mixer);
                     }
                     ui.add_space(6.0);
-                    if nav_button(ui, "Assistant", self.show_assistant) {
-                        self.show_assistant = !self.show_assistant;
+                    if nav_button(ui, "Keyboard", self.keyboard_open()) {
+                        self.toggle_dock(DockView::Keyboard);
+                    }
+                    ui.add_space(6.0);
+                    if nav_button(ui, "Assistant", self.assistant_open()) {
+                        self.toggle_dock(DockView::Assistant);
                     }
                     // Master recording (GitHub #6): a REC chip (tomato only
                     // while recording) + a sync-to-transport toggle + elapsed
@@ -4922,6 +5505,7 @@ impl DemoApp {
                         .clicked()
                     {
                         self.record_sync = !sync;
+                        self.ui_transport_grace = self.ui_time + 0.6;
                         if let Some(bus) = &self.bus {
                             let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
                         }
@@ -5788,169 +6372,493 @@ impl DemoApp {
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
-    /// Assistant: a toggleable WIDE bottom panel (chip / F12, hidden by
-    /// default) — chat text needs width, not a narrow column (rule 8).
+    /// One bottom dock: exactly one occupant at a time (None / Keyboard /
+    /// Assistant). The occupant owns the computer keyboard.
+    fn dock_panel_ui(&mut self, root: &mut egui::Ui) {
+        match self.dock {
+            DockView::None => {
+                self.dock_rect = Rect::NOTHING;
+                self.assistant_rect = Rect::NOTHING;
+                self.assistant_input_rect = Rect::NOTHING;
+                self.dock_kb_rect = Rect::NOTHING;
+            }
+            DockView::Keyboard => self.keyboard_panel_ui(root),
+            DockView::Assistant => self.assistant_panel_ui(root),
+        }
+    }
+
+    /// Assistant dock occupant: a WIDE bottom panel — chat transcript +
+    /// always-visible input on the left, live patch context & agent activity
+    /// side column on the right when wide. `resizable(false)` with a
+    /// deterministic `default_size` keeps the height stable frame to frame
+    /// (the stored-size + per-frame `size_range` loop shrank it ~3px/frame).
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
-        if !self.show_assistant { return; }
         // The rack keeps a comfortable face height (2026-11-15, user: "racks
         // are squished when the agent loads"): the panel only gets the height
         // the rack can spare, within 150..=340 px — never the other way round.
         let max_h = (root.available_height() - self.rack_need_h()).clamp(150.0, 340.0);
-        let resp = egui::Panel::bottom("assistant")
+        let mut starter_prompt: Option<String> = None;
+        let mut submit_text: Option<String> = None;
+        let mut clear_chat = false;
+        let mut input_rect = Rect::NOTHING;
+        let mut focus_chat = self.focus_chat_request;
+        let resp = egui::Panel::bottom("dock")
             .default_size(max_h.min(260.0))
-            .size_range(150.0..=max_h)
-            .resizable(true)
+            .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(16, 12)),
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
             )
             .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Assistant").font(theme::medium_font(16.0)).color(theme::INK));
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("DeepSeek · bring your own key · F12 hides").size(12.0).color(theme::INK_2));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Mouse-reachable close (F12 stays the shortcut).
-                        if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
-                            self.show_assistant = false;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
+                        if self.assistant.busy {
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("● working").size(11.5).color(theme::AGENT_COLOR));
                         }
-                        ui.add_space(10.0);
-                        // Model switch right in the dialogue (also: /model <name>).
-                        let cur = self.assistant.model();
-                        let mut pick: Option<String> = None;
-                        egui::ComboBox::from_id_salt("assistant_model")
-                            .selected_text(egui::RichText::new(format!("model: {cur}")).size(12.0).color(theme::CREAM))
-                            .show_ui(ui, |ui| {
-                                for m in self.assistant.models.clone() {
-                                    if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
-                                }
-                            }).response.on_hover_text("chat model — switch any time, the conversation stays");
-                        if let Some(m) = pick { self.switch_model(&m); }
-                        ui.add_space(10.0);
-                        ui.label(
-                            egui::RichText::new(format!("{} · {} · octave C{}", self.surge_status, self.hw_status, self.octave))
-                                .size(12.0)
-                                .color(theme::INK_2),
-                        );
-                    });
-                });
-                ui.add_space(8.0);
-                if !self.assistant.key_set {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Paste your DeepSeek API key:").size(13.0).color(theme::INK));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.key_input)
-                                .password(true)
-                                .desired_width(360.0),
-                        );
-                        if theme::primary_button(ui, "Save key").clicked() && !self.key_input.trim().is_empty() {
-                            let k = self.key_input.trim().to_string();
-                            match crate::assistant::save_key(&k) {
-                                Ok(()) => {
-                                    self.assistant.set_key(k);
-                                    self.key_input.clear();
-                                }
-                                Err(e) => self.assistant.history.push(ChatLine {
-                                    role: "error".into(),
-                                    text: format!("could not save key: {e}"),
-                                }),
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
+                                self.dock = DockView::None;
                             }
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
-                        )
-                        .size(12.0)
-                        .color(theme::INK_2),
-                    );
-                    for line in self.assistant.history.iter().filter(|l| l.role == "error") {
-                        ui.label(egui::RichText::new(&line.text).size(12.0).color(theme::CLIP_BRIGHT));
+                            ui.add_space(8.0);
+                            let cur = self.assistant.model();
+                            let mut pick: Option<String> = None;
+                            egui::ComboBox::from_id_salt("assistant_model")
+                                .selected_text(egui::RichText::new(format!("model: {cur}")).size(12.0).color(theme::CREAM))
+                                .show_ui(ui, |ui| {
+                                    for m in self.assistant.models.clone() {
+                                        if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
+                                    }
+                                }).response.on_hover_text("chat model — switch any time, the conversation stays");
+                            if let Some(m) = pick { self.switch_model(&m); }
+                            if !self.assistant.history.is_empty() && !self.assistant.busy {
+                                ui.add_space(8.0);
+                                if theme::chip_button(ui, "Clear", false).on_hover_text("clear visible transcript").clicked() {
+                                    clear_chat = true;
+                                }
+                            }
+                            if ui.available_width() > 360.0 {
+                                if let Some(last) = self.agent_activity.log.front() {
+                                    let active = AgentActivity::strength(Some(&(last.at + AGENT_TOUCH_SECS)), self.ui_time) > 0.01;
+                                    if active {
+                                        ui.add_space(10.0);
+                                        ui.label(
+                                            egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
+                                                .size(11.5)
+                                                .color(theme::AGENT_COLOR),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    },
+                );
+                ui.add_space(6.0);
+                Self::stage_hairline(ui);
+                ui.add_space(6.0);
+
+                let avail_w = ui.available_width();
+                let avail_h = ui.available_height().max(40.0);
+                let two_col = avail_w >= 860.0;
+                let side_w = if two_col { (avail_w * 0.30).clamp(260.0, 360.0) } else { 0.0 };
+                let main_w = if two_col { (avail_w - side_w - 25.0).max(340.0) } else { avail_w };
+                let entities = self.chat_entities();
+
+                let draw_main = |ui: &mut egui::Ui,
+                                 key_input: &mut String,
+                                 chat_input: &mut String,
+                                 assistant: &mut Assistant,
+                                 assistant_input_h: &mut f32,
+                                 starter_prompt: &mut Option<String>,
+                                 submit_text: &mut Option<String>,
+                                 input_rect: &mut Rect,
+                                 focus_chat: &mut bool| {
+                    if !assistant.key_set {
+                        ui.vertical(|ui| {
+                            ui.label(egui::RichText::new("Connect DeepSeek (BYOK)").font(theme::medium_font(13.5)).color(theme::INK));
+                            ui.add_space(4.0);
+                            let row = ui.horizontal(|ui| {
+                                let field_w = (ui.available_width() - 104.0).clamp(120.0, 380.0);
+                                let key_resp = ui.add(
+                                    egui::TextEdit::singleline(key_input)
+                                        .id_salt("assistant_key_input")
+                                        .password(true)
+                                        .desired_width(field_w)
+                                        .hint_text("sk-…"),
+                                );
+                                if *focus_chat { key_resp.request_focus(); *focus_chat = false; }
+                                if theme::primary_button(ui, "Save key").clicked() && !key_input.trim().is_empty() {
+                                    let k = key_input.trim().to_string();
+                                    match crate::assistant::save_key(&k) {
+                                        Ok(()) => {
+                                            assistant.set_key(k);
+                                            key_input.clear();
+                                        }
+                                        Err(e) => assistant.history.push(ChatLine {
+                                            role: "error".into(),
+                                            text: format!("could not save key: {e}"),
+                                        }),
+                                    }
+                                }
+                            });
+                            *input_rect = row.response.rect;
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
+                                )
+                                .size(11.5)
+                                .color(theme::INK_2),
+                            );
+                            for line in assistant.history.iter().filter(|l| l.role == "error") {
+                                ui.label(egui::RichText::new(&line.text).size(12.0).color(theme::CLIP_BRIGHT));
+                            }
+                        });
+                        return;
                     }
-                } else {
-                    let avail = ui.available_height();
-                    let entities = self.chat_entities();
-                    // Exactly the height left above the input row: egui's
-                    // default min_scrolled_height (64px) would overflow a
-                    // short panel past its top edge.
-                    let hist_h = (avail - self.assistant_input_h).max(0.0);
+
+                    let col_h = ui.available_height().max(40.0);
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 18.0).max(34.0));
+                    let hist_h = (col_h - reserve).max(16.0);
                     egui::ScrollArea::vertical()
+                        .id_salt("assistant_chat_scroll")
                         .min_scrolled_height(hist_h)
                         .max_height(hist_h)
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            // Empty state: an open chat must read as a chat, not a status bar.
-                            if self.assistant.history.is_empty() && !self.assistant.busy {
-                                ui.label(egui::RichText::new(
-                                    "No messages yet — ask about routing, sounds or rigs, e.g. \"add a Rig with a reverb\" or \"why is Rig B silent?\"")
-                                    .size(13.0).color(theme::INK_2));
-                            }
-                            for line in &self.assistant.history {
-                                let (label, color) = match line.role.as_str() {
-                                    "user" => ("You", theme::INK),
-                                    "assistant" => ("Assistant", theme::LIVE_TEAL),
-                                    _ => ("Error", theme::CLIP_BRIGHT),
-                                };
-                                // One wrapped paragraph per line: role label
-                                // inline, text flows across the full width.
+                            if assistant.history.is_empty() && !assistant.busy {
+                                ui.label(
+                                    egui::RichText::new("Ask about routing, sounds or rigs — or run a quick starter:")
+                                        .size(12.5)
+                                        .color(theme::INK_2),
+                                );
+                                ui.add_space(6.0);
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new(label).size(13.0).strong().color(color));
-                                    // **bold** renders bold (never raw asterisks); rigs, units
-                                    // and effects named in the reply are highlighted.
-                                    for (k, part) in line.text.split("**").enumerate() {
-                                        if part.is_empty() { continue; }
-                                        for (seg, is_entity) in highlight_segments(part, &entities) {
-                                            let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
-                                            if k % 2 == 1 { t = t.strong(); }
-                                            if is_entity {
-                                                t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
-                                            }
-                                            ui.label(t);
+                                    for prompt in [
+                                        "Add a reverb to this rig",
+                                        "Split keys at C4",
+                                        "Load a warm pad",
+                                        "Add a new rig",
+                                    ] {
+                                        if theme::chip_button(ui, prompt, false).clicked() {
+                                            *starter_prompt = Some(prompt.to_string());
                                         }
                                     }
                                 });
-                                ui.add_space(6.0);
                             }
-                            if self.assistant.busy {
-                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::INK_2));
+                            for line in &assistant.history {
+                                let (label, color, rule) = match line.role.as_str() {
+                                    "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
+                                    "assistant" => ("ASSISTANT", theme::AGENT_COLOR, theme::AGENT_COLOR),
+                                    "system" => ("SYSTEM", theme::INK_2, theme::HAIRLINE),
+                                    _ => ("ERROR", theme::CLIP_BRIGHT, theme::CLIP_RED),
+                                };
+                                ui.horizontal_top(|ui| {
+                                    let (bar, _) = ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
+                                    ui.painter().rect_filled(bar, 1.0, rule);
+                                    ui.add_space(4.0);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new(label).font(theme::medium_font(10.5)).color(color));
+                                        ui.add_space(4.0);
+                                        for (k, part) in line.text.split("**").enumerate() {
+                                            if part.is_empty() { continue; }
+                                            for (seg, is_entity) in highlight_segments(part, &entities) {
+                                                let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
+                                                if k % 2 == 1 { t = t.strong(); }
+                                                if is_entity {
+                                                    t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
+                                                }
+                                                ui.label(t);
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.add_space(5.0);
+                            }
+                            if assistant.busy {
+                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
                             }
                         });
-                    ui.add_space(6.0);
+                    ui.add_space(4.0);
                     let row_top = ui.cursor().top();
-                    ui.horizontal(|ui| {
-                        // Recessed paper-sink field with a hairline frame.
+                    let row = ui.horizontal(|ui| {
                         let edit = egui::Frame::new()
                             .fill(theme::PAPER_SINK)
                             .stroke(Stroke::new(1.0, theme::HAIRLINE))
                             .corner_radius(2.0)
-                            .inner_margin(egui::Margin::symmetric(8, 6))
+                            .inner_margin(egui::Margin::symmetric(8, 4))
                             .show(ui, |ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.chat_input)
-                                        .desired_width((ui.available_width() - 90.0).max(80.0))
+                                let edit_resp = ui.add(
+                                    egui::TextEdit::singleline(chat_input)
+                                        .id_salt("assistant_chat_input")
+                                        .frame(egui::Frame::NONE)
+                                        .desired_width((ui.available_width() - 82.0).max(80.0))
                                         .hint_text("Ask or instruct…"),
-                                )
-                            }).inner;
-                        let enter =
-                            edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                                );
+                                if *focus_chat { edit_resp.request_focus(); *focus_chat = false; }
+                                edit_resp
+                            })
+                            .inner;
+                        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
-                            && !self.chat_input.trim().is_empty()
-                            && !self.assistant.busy
+                            && !chat_input.trim().is_empty()
+                            && !assistant.busy
                         {
-                            let t = self.chat_input.trim().to_string();
-                            self.chat_input.clear();
-                            self.submit_chat(t);
+                            *submit_text = Some(chat_input.trim().to_string());
+                            chat_input.clear();
                         }
                     });
-                    // 6px gap + the row as laid out (+ spacing) → next frame's reserve.
-                    self.assistant_input_h = 6.0 + (ui.cursor().top() - row_top).max(24.0) + ui.spacing().item_spacing.y;
+                    *input_rect = row.response.rect;
+                    *assistant_input_h = (4.0 + (ui.cursor().top() - row_top).max(26.0) + ui.spacing().item_spacing.y).max(34.0);
+                };
+
+                if two_col {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(main_w, avail_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                draw_main(
+                                    ui,
+                                    &mut self.key_input,
+                                    &mut self.chat_input,
+                                    &mut self.assistant,
+                                    &mut self.assistant_input_h,
+                                    &mut starter_prompt,
+                                    &mut submit_text,
+                                    &mut input_rect,
+                                    &mut focus_chat,
+                                );
+                            },
+                        );
+                        ui.add_space(12.0);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, avail_h), egui::Sense::hover());
+                        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                        ui.add_space(12.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(side_w, avail_h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                theme::section_label(ui, "Patch & Engine");
+                                ui.add_space(4.0);
+                                let rig_lbl = format!("{} · {} ({} units)", self.active_rig + 1, self.rig_name(self.active_rig),
+                                    self.units.iter().filter(|u| self.rig_count() <= 1 || u.rig as usize == self.active_rig).count());
+                                ui.add(egui::Label::new(egui::RichText::new(format!("{rig_lbl} · octave C{}", self.octave))
+                                    .size(12.0).color(theme::INK)).truncate());
+                                ui.add(egui::Label::new(egui::RichText::new(format!("{} · {}", self.surge_status, self.hw_status))
+                                    .size(11.5).color(theme::INK_2)).truncate());
+                                ui.add_space(8.0);
+                                Self::stage_hairline(ui);
+                                ui.add_space(6.0);
+                                theme::section_label(ui, "Agent Activity");
+                                ui.add_space(4.0);
+                                let act_h = ui.available_height().max(24.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("assistant_activity_scroll")
+                                    .min_scrolled_height(act_h)
+                                    .max_height(act_h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        if self.agent_activity.log.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new("No agent edits yet — assistant & MCP/CLI changes appear here and highlight in the rack.")
+                                                    .size(11.5)
+                                                    .color(theme::INK_2),
+                                            );
+                                            return;
+                                        }
+                                        for entry in &self.agent_activity.log {
+                                            let active = AgentActivity::strength(Some(&(entry.at + AGENT_TOUCH_SECS)), self.ui_time) > 0.01;
+                                            ui.horizontal(|ui| {
+                                                let (tag_fill, tag_txt) = if active {
+                                                    (theme::AGENT_COLOR, theme::AGENT_COLOR_TEXT)
+                                                } else {
+                                                    (theme::DARK_PANEL_HI, theme::INK_2)
+                                                };
+                                                let (tr, _) = ui.allocate_exact_size(egui::vec2(38.0, 16.0), egui::Sense::hover());
+                                                ui.painter().rect_filled(tr, 2.0, tag_fill);
+                                                ui.painter().text(tr.center(), egui::Align2::CENTER_CENTER, entry.origin.tag(),
+                                                    theme::medium_font(9.5), tag_txt);
+                                                ui.add(egui::Label::new(
+                                                    egui::RichText::new(&entry.summary)
+                                                        .size(12.0)
+                                                        .color(if active { theme::INK } else { theme::INK_2 }),
+                                                ).truncate());
+                                            });
+                                            ui.add_space(3.0);
+                                        }
+                                    });
+                            },
+                        );
+                    });
+                } else {
+                    draw_main(
+                        ui,
+                        &mut self.key_input,
+                        &mut self.chat_input,
+                        &mut self.assistant,
+                        &mut self.assistant_input_h,
+                        &mut starter_prompt,
+                        &mut submit_text,
+                        &mut input_rect,
+                        &mut focus_chat,
+                    );
                 }
             });
+        self.dock_rect = resp.response.rect;
         self.assistant_rect = resp.response.rect;
+        self.assistant_input_rect = input_rect;
+        self.focus_chat_request = focus_chat;
+        if clear_chat {
+            self.assistant.history.clear();
+        }
+        if let Some(p) = starter_prompt.or(submit_text) {
+            self.submit_chat(p);
+        }
+    }
+
+    /// White key `wi` (0..8) rect inside the dock keyboard area, in points.
+    /// Octaves the bottom keyboard shows at this width (white keys ≥ 44 px).
+    fn dock_octaves(kb_rect: Rect) -> usize {
+        (((kb_rect.width() - 12.0) / (7.0 * 44.0)).floor() as usize).clamp(1, 4)
+    }
+
+    /// White keys: 7 per octave plus the top C.
+    fn dock_whites(kb_rect: Rect) -> usize {
+        Self::dock_octaves(kb_rect) * 7 + 1
+    }
+
+    fn dock_key_rect(kb_rect: Rect, wi: usize) -> Rect {
+        let kw = (kb_rect.width() - 12.0) / Self::dock_whites(kb_rect) as f32;
+        let kh = (kb_rect.height() - 12.0).max(40.0);
+        Rect::from_min_size(
+            Pos2::new(kb_rect.left() + 6.0 + wi as f32 * kw, kb_rect.top() + 6.0),
+            Vec2::new(kw - 1.0, kh),
+        )
+    }
+
+    /// Black key `bi` (0..5) of octave `oct`.
+    fn dock_black_key_rect(kb_rect: Rect, oct: usize, bi: usize) -> Rect {
+        let base = Self::dock_key_rect(kb_rect, oct * 7 + BLACK_AFTER[bi]);
+        let bw = (kb_rect.width() - 12.0) / Self::dock_whites(kb_rect) as f32 * 0.58;
+        Rect::from_min_size(Pos2::new(base.right() - bw / 2.0 + 0.5, base.top()), Vec2::new(bw, base.height() * 0.62))
+    }
+
+    /// Semitone of white key `wi` above the keyboard's lowest C.
+    fn dock_white_semi(wi: usize) -> usize {
+        12 * (wi / 7) + WHITE_SEMI[wi % 7]
+    }
+
+    /// Which semitone (above the keyboard's lowest C) a point lands on, black first.
+    fn dock_key_hit(kb_rect: Rect, pos: Pos2) -> Option<usize> {
+        for oct in 0..Self::dock_octaves(kb_rect) {
+            for bi in 0..5 {
+                if Self::dock_black_key_rect(kb_rect, oct, bi).contains(pos) { return Some(12 * oct + BLACK_SEMI[bi]); }
+            }
+        }
+        (0..Self::dock_whites(kb_rect))
+            .find(|&wi| Self::dock_key_rect(kb_rect, wi).contains(pos))
+            .map(Self::dock_white_semi)
+    }
+
+    /// Full-width playable software keyboard (GitHub #9): the Keys unit's octave
+    /// moved to the bottom dock. Plays through the same `fire_keys` path, lights
+    /// the same `key_leds`, and the Keys unit stays unchanged in the rack.
+    fn keyboard_panel_ui(&mut self, root: &mut egui::Ui) {
+        let spare = (root.available_height() - self.rack_need_h()).clamp(140.0, 340.0);
+        let h = spare.min(180.0);
+        let note_leds = self.note_leds;
+        let split = self.keys_unit.and_then(|k| self.shown_split(k));
+        let octave = self.octave;
+        let base = 12 * (octave as usize + 1); // the laptop keys' lowest note
+        let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
+        let mut note: Option<usize> = None;
+        let mut kb_rect = Rect::NOTHING;
+        let resp = egui::Panel::bottom("dock")
+            .default_size(h)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
+            )
+            .show(root, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(egui::RichText::new("Software Keyboard").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(format!("C{octave}–C{} · laptop keys play notes", octave as usize + n_oct))
+                            .size(11.5).color(theme::INK_2));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "×", false).on_hover_text("hide the keyboard (V)").clicked() {
+                                self.dock = DockView::None;
+                            }
+                        });
+                    },
+                );
+                ui.add_space(4.0);
+                // Claim the whole remaining area so the panel's measured height
+                // (egui derives the outer rect from the content's min_rect) stays
+                // at the requested size instead of collapsing to the header row.
+                let (r, kb_resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), ui.available_height().max(48.0)),
+                    egui::Sense::click(),
+                );
+                kb_rect = r;
+                let painter = ui.painter().clone();
+                let lit = |semi: usize| note_leds[(base + semi).min(127)] > 0.02;
+                for wi in 0..Self::dock_whites(kb_rect) {
+                    let kr = Self::dock_key_rect(kb_rect, wi);
+                    let fill = if lit(Self::dock_white_semi(wi)) { theme::ACCENT } else { WHITE };
+                    painter.rect_filled(kr, 3.0, fill);
+                    painter.rect_stroke(kr, 3.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
+                }
+                for oct in 0..Self::dock_octaves(kb_rect) {
+                    for bi in 0..5 {
+                        let kr = Self::dock_black_key_rect(kb_rect, oct, bi);
+                        let fill = if lit(12 * oct + BLACK_SEMI[bi]) { theme::ACCENT } else { BLACK };
+                        painter.rect_filled(kr, 2.0, fill);
+                        painter.rect_stroke(kr, 2.0, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+                    }
+                }
+                // Split point: a line on the left edge of the split key (white keys).
+                if let Some(p) = split {
+                    let span = 12 * Self::dock_octaves(kb_rect);
+                    let semi = p as i64 - base as i64;
+                    if semi > 0 && semi <= span as i64 {
+                        let semi = semi as usize;
+                        let wi = (0..Self::dock_whites(kb_rect)).find(|&w| Self::dock_white_semi(w) >= semi).unwrap_or(0);
+                        let x = Self::dock_key_rect(kb_rect, wi).left() - 0.5;
+                        let top = Self::dock_key_rect(kb_rect, 0).top() - 4.0;
+                        let bot = Self::dock_key_rect(kb_rect, 0).bottom() + 4.0;
+                        painter.line_segment([Pos2::new(x, top), Pos2::new(x, bot)], Stroke::new(2.0, theme::CREAM));
+                    }
+                }
+                if kb_resp.clicked() {
+                    if let Some(pos) = kb_resp.interact_pointer_pos() {
+                        note = Self::dock_key_hit(kb_rect, pos);
+                    }
+                }
+            });
+        self.dock_rect = resp.response.rect;
+        self.dock_kb_rect = kb_rect;
+        self.assistant_rect = Rect::NOTHING;
+        self.assistant_input_rect = Rect::NOTHING;
+        if let Some(semi) = note {
+            self.current_source = SourceId::Keys;
+            self.fire_keys((base + semi).min(127), 0.95);
+        }
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -5995,7 +6903,10 @@ impl DemoApp {
         let amp = amp * (0.35 + vel * 0.65);
         // Light on note-on only: a note-off re-lighting the key restarted the
         // full decay tail AFTER release (user report: key color stays too long).
-        if amp > 0.0 { self.key_leds[semitone % 12] = 1.0; }
+        if amp > 0.0 {
+            self.key_leds[semitone % 12] = 1.0;
+            self.note_leds[semitone.min(127)] = 1.0;
+        }
         if let Some(u) = self.units.get_mut(ki) { u.led = 1.0; }
         // A split keyboard sends each note out ONE jack (LOW below the point,
         // HIGH at/above) — only that jack's cables pulse, like the engine.
@@ -6203,6 +7114,12 @@ impl DemoApp {
 
     fn toggle_play(&mut self) {
         self.playing = !self.playing;
+        self.ui_transport_grace = self.ui_time + 0.6;
+        for u in &self.units {
+            if u.transport {
+                self.ui_node_grace.insert(u.node_id, self.ui_time + 0.6);
+            }
+        }
         // Global transport = MASTER: Play/Stop fans out to every
         // transport-capable rack instrument; per-node chips override after.
         if self.playing {
@@ -6507,6 +7424,17 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        self.agent_activity.prune(self.ui_time);
+        // `--demo-agent` keeps its touch fresh so the screenshot hook always
+        // shows the highlight (not a 2.6s-faded rack).
+        if self.demo_agent_hold {
+            let now = self.ui_time;
+            if let Some(k) = self.keys_unit {
+                self.agent_activity.touch_node(self.units[k].node_id, now);
+                self.agent_activity.touch_cell(SourceId::Keys, self.units[k].node_id, now);
+            }
+            self.agent_activity.touch_rig(0, now);
+        }
         self.tap_flash_t = (self.tap_flash_t - dt * 5.0).max(0.0);
         if self.playing {
             self.time += dt as f64;
@@ -6546,9 +7474,13 @@ impl DemoApp {
 
         for u in &mut self.units { u.led *= (-dt / UNIT_LED_TAU).exp(); }
         for k in &mut self.key_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
+        for k in &mut self.note_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
         // the short tail starts on release.
-        for &(_, semi) in &self.held_keys { self.key_leds[semi % 12] = 1.0; }
+        for &(_, semi) in &self.held_keys {
+            self.key_leds[semi % 12] = 1.0;
+            self.note_leds[semi.min(127)] = 1.0;
+        }
         // Adopt hot-plug changes from the MIDI thread (one atomic load).
         let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
         if rev != self.hw_midi_rev {
@@ -6972,14 +7904,14 @@ impl DemoApp {
                 self.toggle_stage(StageView::Matrix);
             }
             // Letter shortcuts to the views (user 2026-11-15) — letters the
-            // laptop piano does not use: M mixer · N matrix · C chat · B browser.
+            // laptop piano does not use: M mixer · N matrix · B browser.
+            // (C chat and V keyboard are dock toggles, handled before the panels.)
             if i.consume_key(Modifiers::NONE, Key::M) {
                 self.toggle_stage(StageView::Mixer);
             }
             if i.consume_key(Modifiers::NONE, Key::N) {
                 self.toggle_stage(StageView::Matrix);
             }
-            if i.consume_key(Modifiers::NONE, Key::C) { self.show_assistant = !self.show_assistant; }
             if i.consume_key(Modifiers::NONE, Key::B) {
                 self.toggle_stage(StageView::Plugins);
             }
@@ -7008,7 +7940,10 @@ impl DemoApp {
             }
         });
         if toggle_play { self.toggle_play(); }
-        if tap_tempo { self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64()); }
+        if tap_tempo {
+            self.ui_transport_grace = self.ui_time + 0.6;
+            self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
+        }
         if flip { self.on_tab(); }
         if let Some(t) = load_tpl { self.load_template(t); }
         if load_demo { self.load_demo_patch(); }
@@ -7198,6 +8133,8 @@ impl DemoApp {
                     let p = (start as f32 + d).round().clamp(1.0, 127.0) as u8;
                     if p != cur {
                         self.drag = Drag::Split { unit, start, press, cur: p };
+                        let nid = self.units[unit].node_id;
+                        self.ui_node_grace.insert(nid, self.ui_time + 0.6);
                         self.set_keys_split(unit, Some(p));
                     }
                 }
@@ -7205,7 +8142,10 @@ impl DemoApp {
                     // Up/right = faster: one BPM per 3px, whole BPMs only.
                     let d = ((press.y - s.y) + (s.x - press.x)) / 3.0;
                     let bpm = (start + d).round().clamp(20.0, 300.0);
-                    if bpm != self.bpm { self.set_bpm(bpm); }
+                    if bpm != self.bpm {
+                        self.ui_transport_grace = self.ui_time + 0.6;
+                        self.set_bpm(bpm);
+                    }
                 }
                 Drag::None => {
                     // Drag-from-jack: one-gesture patching.
@@ -7288,6 +8228,8 @@ impl DemoApp {
                             || (self.shown_split(ui).is_none() && field.contains(l.to_pos2()))) => {
                         // Keys-face SPLIT chip: split at C4 / unsplit.
                         let next = if self.units[ui].split.is_some() { None } else { Some(DEFAULT_SPLIT) };
+                        let nid = self.units[ui].node_id;
+                        self.ui_node_grace.insert(nid, self.ui_time + 0.6);
                         self.set_keys_split(ui, next);
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front && self.on_face_field(ui, l.to_pos2()) => {
@@ -7295,24 +8237,29 @@ impl DemoApp {
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.bpm_rects(ui).map_or(false, |b| b.minus.map_or(false, |r| r.contains(l.to_pos2()))) => {
+                        self.ui_transport_grace = self.ui_time + 0.6;
                         self.set_bpm(self.bpm.round() - 1.0);
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.bpm_rects(ui).map_or(false, |b| b.plus.map_or(false, |r| r.contains(l.to_pos2()))) => {
+                        self.ui_transport_grace = self.ui_time + 0.6;
                         self.set_bpm(self.bpm.round() + 1.0);
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.metro_action_rects(ui).map_or(false, |m| m.tap.contains(l.to_pos2())) => {
+                        self.ui_transport_grace = self.ui_time + 0.6;
                         self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.metro_action_rects(ui).map_or(false, |m| m.count_in.contains(l.to_pos2())) => {
+                        self.ui_transport_grace = self.ui_time + 0.6;
                         self.set_count_in(!self.count_in_enabled, self.count_in_bars);
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.transport_chip_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
                         // Per-instrument Play/Stop chip on the unit face.
                         let (node, playing) = (self.units[ui].node_id, self.units[ui].playing);
+                        self.ui_node_grace.insert(node, self.ui_time + 0.6);
                         self.set_node_playing(node, !playing);
                     }
                     Some(Hit::Unit(ui)) => {
@@ -7655,6 +8602,7 @@ impl DemoApp {
                                                 });
                                             });
                                             if changed {
+                                                self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
                                                 self.rig_mix[rig.min(7)] = m;
                                                 self.send_rig_mix(rig);
                                             }
@@ -7748,6 +8696,14 @@ impl DemoApp {
         }));
     }
 
+    /// Crisp "AGENT" pill badge inside a rack unit header (rack-local rect).
+    fn draw_agent_badge(&self, painter: &egui::Painter, rect: Rect, alpha_t: f32) {
+        if alpha_t <= 0.01 { return; }
+        let sr = self.xf.rect(rect);
+        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, alpha_t));
+        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, alpha_t));
+    }
+
     fn draw_front(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
@@ -7755,13 +8711,16 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
+            let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             // Single near-black family (§2.4): plates are the chassis color;
             // zones are drawn with 1px hairline rules that brighten on hover
-            // (~120ms ease). Drag = 2px accent inset keyline.
+            // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
+            } else if agent_t > 0.01 {
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -7769,11 +8728,18 @@ impl DemoApp {
                 painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
 
-            // Label strip: 2px rule, accent when active/dragged (§4.3 — the
-            // reference's active service row gets the orange rule).
+            // Label strip: 2px rule, accent when active/dragged (§4.3), or teal
+            // when touched by an agent.
             let active = u.led > 0.05 || dragging;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
-            painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
+            let strip_col = if active {
+                theme::ACCENT
+            } else if agent_t > 0.01 {
+                mix(BORDER, theme::AGENT_COLOR, agent_t)
+            } else {
+                BORDER
+            };
+            painter.rect_filled(xf.rect(strip), 1.0, strip_col);
 
             // Labels are fitted to the unit (ensure_galleys) AND clipped to
             // it: no label pixel may leave its box into a neighbor (C4).
@@ -7802,6 +8768,15 @@ impl DemoApp {
 
             for ki in 0..u.knobs.len() {
                 self.draw_knob(painter, ui, ki);
+            }
+
+            if agent_t > 0.01 {
+                let badge = if self.split_rects(ui).is_some() {
+                    Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
+                } else {
+                    Rect::from_min_size(Pos2::new(r.right() - 74.0, r.top() + 8.0), Vec2::new(46.0, 16.0))
+                };
+                self.draw_agent_badge(painter, badge, agent_t);
             }
         }
     }
@@ -8192,11 +9167,14 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
+            let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
+            } else if agent_t > 0.01 {
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -8205,7 +9183,14 @@ impl DemoApp {
             }
             let active = u.led > 0.05 || dragging;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
-            painter.rect_filled(xf.rect(strip), 1.0, if active { theme::ACCENT } else { BORDER });
+            let strip_col = if active {
+                theme::ACCENT
+            } else if agent_t > 0.01 {
+                mix(BORDER, theme::AGENT_COLOR, agent_t)
+            } else {
+                BORDER
+            };
+            painter.rect_filled(xf.rect(strip), 1.0, strip_col);
         }
 
         // Selection path highlight set.
@@ -8253,6 +9238,11 @@ impl DemoApp {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
+            let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            if agent_t > 0.01 {
+                let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
+                self.draw_agent_badge(painter, badge, agent_t);
+            }
             for (ji, j) in u.jacks.iter().enumerate() {
                 let c = self.jack_pos(ui, ji);
                 let (jw, jh) = j.label_g.as_ref().map_or((0.0, 0.0), |g| (g.size.x, g.size.y));
@@ -8318,6 +9308,7 @@ impl DemoApp {
             let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
             let mut col = self.cable_color(c);
+            let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
@@ -8325,6 +9316,9 @@ impl DemoApp {
             if has_sel && hl[ci] {
                 col = theme::ACCENT;
                 width += 0.5;
+            } else if edge_at > 0.01 {
+                painter.add(bezier_shape(curve, width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
+                col = mix(col, theme::AGENT_COLOR, edge_at * 0.85);
             }
             painter.add(bezier_shape(curve, width, alpha(col, a)));
         }
@@ -8408,8 +9402,10 @@ impl DemoApp {
                 // audio = round capsule, MIDI = square.
                 let body = Rect::from_center_size(p.to_pos2(), Vec2::new(20.0, 16.0));
                 let pr = match c.kind { PortKind::Audio => 8.0, PortKind::Midi => 1.0 };
+                let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
+                let stroke_col = if edge_at > 0.01 { mix(BORDER, theme::AGENT_COLOR, edge_at) } else { BORDER };
                 painter.rect_filled(xf.rect(body), pr, alpha(PLUG, a));
-                painter.rect_stroke(xf.rect(body), pr, Stroke::new(1.0, alpha(BORDER, a)), egui::StrokeKind::Inside);
+                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, a)), egui::StrokeKind::Inside);
                 let band = Rect::from_min_size(body.min + Vec2::new(2.0, 3.0), Vec2::new(16.0, 3.5));
                 painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), a));
             }
@@ -8727,17 +9723,24 @@ impl DemoApp {
             self.flip_requested = false;
             self.on_tab();
         }
-        // Assistant bottom panel (F12) — handled before the panels so it
-        // works even while the chat field has keyboard focus.
+        // Dock toggles (F12 / C / V) — handled before the panels so they work
+        // even while the chat field has keyboard focus. The dock occupant owns
+        // the computer keyboard, but its own close/swap shortcuts never yield.
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
-            self.show_assistant = !self.show_assistant;
+            self.toggle_dock(DockView::Assistant);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+            self.toggle_dock(DockView::Assistant);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::V)) {
+            self.toggle_dock(DockView::Keyboard);
         }
 
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
         self.rig_inputs_panel(ui);
         self.rig_overview_panel(ui);
-        self.assistant_panel_ui(ui);
+        self.dock_panel_ui(ui);
 
         // Native rig editor (task-26): handle open/close requests from unit
         // double-clicks. No X11 — the editor is a plain egui window drawn below.
@@ -8748,19 +9751,17 @@ impl DemoApp {
             self.toggle_lv2_editor(node_id, &uri, &name);
         }
 
-        // Laptop keys (disabled while the assistant text field has focus).
-        // Losing keyboard focus drains held keys so note-offs can't orphan
-        // (vibez lesson, docs/vibez-notes.md). held_keys are laptop keys, so
-        // the drain fires under the Keyboard source regardless of the last
-        // hardware event.
-        let kb_focus = !typing(&ctx) && ctx.input(|i| i.focused);
+        // Laptop keys (disabled while the assistant owns the computer keyboard,
+        // or while any text field has focus). Losing keyboard focus drains held
+        // keys so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
+        let kb_focus = !typing(&ctx) && !self.assistant_open() && ctx.input(|i| i.focused);
         if !kb_focus && self.had_kb_focus && !self.held_keys.is_empty() {
             self.current_source = SourceId::Keys;
             let held: Vec<_> = self.held_keys.drain(..).collect();
             for (_, semi) in held { self.fire_keys(semi, 0.0); }
         }
         self.had_kb_focus = kb_focus;
-        if !typing(&ctx) {
+        if !typing(&ctx) && !self.assistant_open() {
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
                 if let egui::Event::Key { key, pressed, repeat, modifiers, .. } = ev {
@@ -8850,7 +9851,7 @@ impl DemoApp {
         // Full frame rate while focused (the cables are the show); ~30 fps in
         // the background — meters and cables still move, at a third of the
         // UI thread's CPU when the user works in another window.
-        if ctx.input(|i| i.focused) {
+        if ctx.input(|i| i.focused) || self.agent_activity.has_active(self.ui_time) {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -9436,6 +10437,21 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     if std::env::args().any(|a| a == "--metro") {
                         app.add_metronome_to_active_rig();
                     }
+                    if std::env::args().any(|a| a == "--demo-agent") {
+                        app.assistant.key_set = true;
+                        app.dock = DockView::Assistant;
+                        app.demo_agent_hold = true;
+                        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
+                        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+                        app.assistant.history.push(ChatLine {
+                            role: "user".into(),
+                            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
+                        });
+                        app.assistant.history.push(ChatLine {
+                            role: "assistant".into(),
+                            text: "Split **Keys** at C4 and set **Rig A** volume to 0.85.".into(),
+                        });
+                    }
                     app
                 }
             };
@@ -9852,8 +10868,9 @@ mod matrix_ui_tests {
         assert_eq!(count("K") + count("H"), 0, "no K/H chips: {texts:?}");
         assert!(texts.iter().any(|(s, _)| s == "k"), "wordmark painted (tracked per-char): {texts:?}");
         assert!(texts.iter().all(|(s, _)| !s.contains("Laptop") && !s.contains("laptop")));
-        // The matrix keeps ONE Keyboard row; its rig-A cell is the old K chip.
-        assert_eq!(count("Keyboard"), 1);
+        // The matrix keeps ONE Keyboard row (its rig-A cell is the old K chip);
+        // the top bar adds a "Keyboard" toggle for the bottom software keyboard.
+        assert_eq!(count("Keyboard"), 2);
         let cell = texts.iter().find(|(s, _)| s == "ALL").expect("rig A keyboard cell").1.center();
         let btn = |pressed| egui::Event::PointerButton { pos: cell, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         panel_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(cell), btn(true)]);
@@ -10119,7 +11136,7 @@ mod rig_switch_tests {
         let rows_before = app.layout_rows;
         let free = app.unit_h;
         app.assistant.key_set = true;
-        app.show_assistant = true;
+        app.dock = DockView::Assistant;
         for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
         assert_eq!(app.layout_rows, rows_before);
         assert!(app.unit_h >= 140.0, "faces stay comfortable with the assistant open: {} (free: {free})", app.unit_h);
@@ -10352,7 +11369,7 @@ mod rig_switch_tests {
     fn assistant_chat_content_stays_inside_its_panel() {
         let (mut app, ctx) = two_rigs();
         app.assistant.key_set = true; // chat layout (history + input row)
-        app.show_assistant = true;
+        app.dock = DockView::Assistant;
         // A short window clamps the panel to its 150px minimum — the case
         // where a fixed input-row reserve overflowed the panel's top edge.
         for _ in 0..4 {
@@ -10579,7 +11596,7 @@ mod rig_switch_tests {
         frame(&mut app, &ctx, key(Key::B));
         assert_eq!(app.stage_view, StageView::Plugins);
         frame(&mut app, &ctx, key(Key::C));
-        assert!(app.show_assistant);
+        assert!(app.assistant_open());
     }
 
     #[test]
@@ -10833,7 +11850,7 @@ mod rig_switch_tests {
     fn a_focused_text_field_still_gets_the_keys() {
         let (mut app, ctx) = two_rigs();
         app.assistant.key_set = true; // chat field (tests never load the real key)
-        app.show_assistant = true;
+        app.dock = DockView::Assistant;
         frame(&mut app, &ctx, vec![]);
         // The chat/API-key field: the widest focusable text widget low on
         // screen (height filter skips the panel's resize handle).
@@ -12018,5 +13035,322 @@ mod stage_views_tests {
         assert!(DemoApp::list_saved_sessions(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ui_polish_agent_tests {
+    use super::*;
+    use crate::control::command_bus;
+
+    fn walk_texts(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::Shape::Text(t) => texts.push((
+                t.galley.text().to_owned(),
+                t.galley.rect.translate(t.pos.to_vec2()),
+            )),
+            egui::Shape::Vec(v) => for s in v { walk_texts(s, texts) },
+            _ => {}
+        }
+    }
+
+    fn run_frame(
+        app: &mut DemoApp,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk_texts(&cs.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+        let b = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        for ev in [vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]] {
+            run_frame(app, ctx, size, ev);
+        }
+    }
+
+    #[test]
+    fn add_rig_button_aligns_with_rig_chips_and_adds_a_rig() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        assert!(app.add_rig_rect.is_positive(), "+ Rig rect laid out");
+        assert_eq!(app.rig_chip_rects.len(), 1);
+        let chip0 = app.rig_chip_rects[0];
+        assert!(
+            (app.add_rig_rect.height() - chip0.height()).abs() < 0.5,
+            "+ Rig height {} != rig chip height {}",
+            app.add_rig_rect.height(),
+            chip0.height()
+        );
+        assert!(
+            (app.add_rig_rect.center().y - chip0.center().y).abs() < 0.5,
+            "+ Rig center.y {} != rig chip center.y {}",
+            app.add_rig_rect.center().y,
+            chip0.center().y
+        );
+        assert!(app.add_rig_rect.right() < chip0.left(), "+ Rig sits left of rig chips");
+
+        // Clicking "+ Rig" adds a second rig, and alignment holds with 2 chips.
+        let p = app.add_rig_rect.center();
+        click_at(&mut app, &ctx, size, p);
+        for _ in 0..2 { run_frame(&mut app, &ctx, size, vec![]); }
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.rig_chip_rects.len(), 2);
+        for (i, cr) in app.rig_chip_rects.iter().enumerate() {
+            assert!(
+                (app.add_rig_rect.height() - cr.height()).abs() < 0.5,
+                "rig {i} chip height {} vs + Rig {}", cr.height(), app.add_rig_rect.height()
+            );
+            assert!(
+                (app.add_rig_rect.center().y - cr.center().y).abs() < 0.5,
+                "rig {i} chip center.y {} vs + Rig {}", cr.center().y, app.add_rig_rect.center().y
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_panel_at_min_size_keeps_input_visible_and_never_squishes_rack() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let ctx = egui::Context::default();
+        let min_size = Vec2::new(760.0, 520.0);
+        let mut texts = Vec::new();
+        for _ in 0..4 {
+            texts = run_frame(&mut app, &ctx, min_size, vec![]);
+        }
+        assert!(app.unit_h >= 140.0, "rack unit height floor kept at min size: {}", app.unit_h);
+        assert!(
+            app.stage_rect.bottom() <= app.assistant_rect.top() + 0.5,
+            "stage {:?} must not overlap assistant {:?}", app.stage_rect, app.assistant_rect
+        );
+        assert!(app.assistant_input_rect.is_positive(), "input row laid out");
+        assert!(app.assistant_input_rect.height() >= 24.0, "input row not collapsed: {:?}", app.assistant_input_rect);
+        assert!(
+            app.assistant_rect.contains_rect(app.assistant_input_rect),
+            "input row {:?} must fit completely inside assistant panel {:?}",
+            app.assistant_input_rect,
+            app.assistant_rect
+        );
+        let send_rect = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("Send button painted");
+        assert!(
+            app.assistant_rect.contains_rect(send_rect),
+            "Send button {send_rect:?} visible inside assistant {:?}", app.assistant_rect
+        );
+
+        // Wide layout shows both chat and side Agent Activity column.
+        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        let wide_texts = run_frame(&mut app, &ctx, Vec2::new(1600.0, 1000.0), vec![]);
+        assert!(wide_texts.iter().any(|(t, _)| t == "PATCH & ENGINE" || t.starts_with('P')));
+        assert!(wide_texts.iter().any(|(t, _)| t.contains("Split Keys")));
+    }
+
+    #[test]
+    fn agent_touch_set_by_exec_tool_and_remote_graph_pub_fades_and_ignores_user_edits() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub {
+            rev: 0,
+            graph: Graph::default(),
+            rules: Vec::new(),
+            ..Default::default()
+        }));
+        engine.set_graph_pub(pub_.clone());
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        app.graph_pub = Some(pub_.clone());
+        // Warm the frame path so the first-frame ppp correction settles before
+        // any rack geometry is read (frame 2 transiently re-scales the rect).
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut pump = |app: &mut DemoApp| {
+            run_frame(app, &ctx, size, vec![]);
+            drain.drain(|c| { ebus.send(c); });
+            let mut buf = vec![0.0f32; 64 * 2];
+            engine.render(&mut buf, 2);
+            run_frame(app, &ctx, size, vec![])
+        };
+        pump(&mut app);
+        assert!(!app.agent_activity.has_active(app.ui_time), "clean startup has no agent touch");
+
+        // 1. Direct user edits must NOT set agent touch.
+        let keys_idx = app.keys_unit.unwrap();
+        let keys_id = app.units[keys_idx].node_id;
+        let (split_chip, _) = app.split_rects(keys_idx).unwrap();
+        let split_pos = app.xf.p(split_chip.center().to_vec2());
+        click_at(&mut app, &ctx, size, split_pos);
+        pump(&mut app);
+        assert!(app.units[keys_idx].split.is_some(), "user split applied");
+        assert!(!app.agent_activity.has_active(app.ui_time), "user split must not light agent touch");
+        assert!(app.agent_activity.log.is_empty());
+
+        // Direct user mixer edit must NOT set agent touch either.
+        app.stage_view = StageView::Mixer;
+        for _ in 0..2 { run_frame(&mut app, &ctx, size, vec![]); }
+        let f0 = app.mixer_fader_rects[0].center();
+        let btn = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(f0), btn(f0, true)]);
+        run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(f0 - Vec2::new(0.0, 20.0))]);
+        run_frame(&mut app, &ctx, size, vec![btn(f0 - Vec2::new(0.0, 20.0), false)]);
+        pump(&mut app);
+        assert!(!app.agent_activity.has_active(app.ui_time), "user mixer drag must not light agent touch");
+        app.stage_view = StageView::Rack;
+        run_frame(&mut app, &ctx, size, vec![]);
+
+        // 2. Built-in assistant exec_tool lights the named node and paints "AGENT".
+        app.exec_tool("set_matrix_rule", &serde_json::json!({"node": 1, "source": "keys", "transpose": 12}));
+        assert!(app.agent_activity.node_alpha(1, app.ui_time) > 0.9);
+        assert!(app.agent_activity.cell_alpha(SourceId::Keys, 1, app.ui_time) > 0.9);
+        assert_eq!(app.agent_activity.node_alpha(4, app.ui_time), 0.0, "unrelated node stays unlit");
+        let texts = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "AGENT"), "AGENT tag painted in rack");
+
+        // 3. Advancing past AGENT_TOUCH_SECS fades it completely.
+        for _ in 0..100 { app.update(0.04); }
+        assert_eq!(app.agent_activity.node_alpha(1, app.ui_time), 0.0, "agent touch faded out");
+        assert!(!app.agent_activity.has_active(app.ui_time));
+        let texts = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(!texts.iter().any(|(t, _)| t == "AGENT"), "AGENT tag disappears after fade");
+
+        // 4. Remote GraphPub change (e.g. MCP/CLI add_node or SetRigMix) lights the affected node.
+        {
+            let mut g = pub_.lock().unwrap();
+            let nid = g.graph.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+            g.graph.connect_with_id(99, PortRef { node: 1, port: 0 }, PortRef { node: nid, port: 0 }, CPortKind::Audio);
+            g.rev = g.rev.wrapping_add(1);
+            g.mix[0].vol = 0.65;
+            g.mix_rev = g.mix_rev.wrapping_add(1);
+        }
+        let texts = run_frame(&mut app, &ctx, size, vec![]);
+        let reverb_id = app.units.iter().find(|u| u.name == "REVERB").expect("remote node adopted").node_id;
+        assert!(app.agent_activity.node_alpha(reverb_id, app.ui_time) > 0.9, "remote added node lit");
+        assert!(app.agent_activity.edge_alpha(99, app.ui_time) > 0.9, "remote added edge lit");
+        assert!(app.agent_activity.rig_alpha(0, app.ui_time) > 0.9, "remote mix rig lit");
+        assert!(app.agent_activity.node_alpha(keys_id, app.ui_time) > 0.9, "remote rig mix lights rig nodes");
+        assert!(texts.iter().any(|(t, _)| t == "AGENT"), "AGENT tag painted for remote GraphPub edit");
+    }
+
+    #[test]
+    fn assistant_panel_height_is_stable_and_chat_accepts_text() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.focus_chat_request = true;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        let h0 = app.dock_rect.height();
+        assert!(h0 > 100.0, "dock has a real height: {h0}");
+        for _ in 0..20 { run_frame(&mut app, &ctx, size, vec![]); }
+        assert!(
+            (app.dock_rect.height() - h0).abs() < 0.5,
+            "panel height stable across 20 frames: {h0} -> {}",
+            app.dock_rect.height()
+        );
+
+        // Click into the chat field, then an egui Text event lands in chat_input.
+        let field = app.assistant_input_rect;
+        assert!(field.is_positive(), "chat input row laid out");
+        let pos = Pos2::new(field.left() + 24.0, field.center().y);
+        click_at(&mut app, &ctx, size, pos);
+        run_frame(&mut app, &ctx, size, vec![egui::Event::Text("hello".into())]);
+        assert_eq!(app.chat_input, "hello", "typed text lands in chat_input");
+    }
+
+    #[test]
+    fn dock_keyboard_spans_more_octaves_when_wide_and_follows_the_octave() {
+        let narrow = Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 120.0));
+        let wide = Rect::from_min_size(Pos2::ZERO, Vec2::new(1500.0, 120.0));
+        assert_eq!(DemoApp::dock_octaves(narrow), 1);
+        assert_eq!(DemoApp::dock_octaves(wide), 4);
+        // The top white key of a 4-octave keyboard is 48 semitones up.
+        let top = DemoApp::dock_key_rect(wide, DemoApp::dock_whites(wide) - 1).center();
+        assert_eq!(DemoApp::dock_key_hit(wide, top), Some(48));
+        // A black key of the third octave.
+        let b = DemoApp::dock_black_key_rect(wide, 2, 0).center();
+        assert_eq!(DemoApp::dock_key_hit(wide, b), Some(25));
+    }
+
+    #[test]
+    fn dock_keyboard_plays_notes_and_assistant_types_text() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<NoteEvent>::new()));
+        let log = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |e| log.lock().unwrap().push(e))));
+        app.assistant.key_set = true;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let key = |pressed: bool| egui::Event::Key {
+            key: Key::A, physical_key: None, pressed, repeat: false, modifiers: Modifiers::NONE,
+        };
+
+        // Keyboard occupant: laptop key A fires a note, and no chat text is kept.
+        app.dock = DockView::Keyboard;
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        run_frame(&mut app, &ctx, size, vec![key(true), egui::Event::Text("a".into())]);
+        run_frame(&mut app, &ctx, size, vec![key(false)]);
+        assert!(
+            events.lock().unwrap().iter().any(|e| e.velocity > 0.0),
+            "keyboard dock plays a note from the laptop key"
+        );
+        assert_eq!(app.chat_input, "", "keyboard dock does not type into chat");
+
+        // Assistant occupant: the same key press types into chat and fires no note.
+        events.lock().unwrap().clear();
+        app.dock = DockView::Assistant;
+        app.focus_chat_request = true;
+        for _ in 0..2 { run_frame(&mut app, &ctx, size, vec![]); }
+        run_frame(&mut app, &ctx, size, vec![key(true), egui::Event::Text("a".into())]);
+        run_frame(&mut app, &ctx, size, vec![key(false)]);
+        assert_eq!(app.chat_input, "a", "assistant dock types into chat: {:?}", app.chat_input);
+        assert!(events.lock().unwrap().is_empty(), "assistant dock fires no note");
+    }
+
+    #[test]
+    fn dock_keyboard_clicks_play_the_same_notes_as_the_keys_unit() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<NoteEvent>::new()));
+        let log = events.clone();
+        let mut app = DemoApp::new_with_sink(Some(Box::new(move |e| log.lock().unwrap().push(e))));
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        assert!(app.dock_kb_rect.is_positive(), "dock keyboard laid out");
+        // Click a white key (C) and a black key (C#) — the same 60+semi path.
+        let c = DemoApp::dock_key_rect(app.dock_kb_rect, 0).center();
+        click_at(&mut app, &ctx, size, c);
+        let cs = DemoApp::dock_black_key_rect(app.dock_kb_rect, 0, 0).center();
+        click_at(&mut app, &ctx, size, cs);
+        let notes: Vec<u8> = events.lock().unwrap().iter().map(|e| e.note).collect();
+        assert!(notes.contains(&60), "white key C plays note 60: {notes:?}");
+        assert!(notes.contains(&61), "black key C# plays note 61: {notes:?}");
     }
 }

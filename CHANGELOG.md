@@ -8,6 +8,19 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Audio In rack unit** (#28): plug in a microphone, guitar or audio interface
+  and play it live through the rack. An Audio In node picks a device (cpal, hot
+  plug rescans every 2 s — a MOTU M2 shows up as "MOTU M2", readable, not the
+  raw ALSA id) and a channel (In 1 / In 2 / stereo), has gain and an input
+  meter, low-latency monitoring (monitor adds it straight to the master), and a
+  tuner on the face (YIN pitch detection off the audio thread, note + cents).
+  The input ring is lock-free (`rtrb`), the render path stays allocation-free,
+  and a small drift controller reconciles input vs output clocks (drop/insert
+  around a target fill). When the interface is also the output, the input
+  opens at the output sample rate so they share one clock. `kabelsalat
+  audio-in-test` loops the default input to the output and reports measured
+  stream latency. Agent parity: `add_node kind="audio_in"`, `set_audio_in`,
+  `list_audio_devices` in the assistant and MCP; sessions save the selection.
 - **The agent can measure the mix** (`measure_mix`, also in `get_status`):
   momentary, short-term and integrated loudness (LUFS), true peak, a bass
   mono check and a 4-band balance. `kabelsalat meter-test` checks it with

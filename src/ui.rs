@@ -30,10 +30,13 @@ use eframe::egui::{
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{
-    name_bytes, name_str, split_port, Command, CommandBus, DspKind, Graph, Lv2Uri, Node, NodeKind,
-    PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
+    name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
+    Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
-use crate::engine::{EdgeLevels, GraphEngine, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
+use crate::engine::{
+    AudioInLevels, EdgeLevels, GraphEngine, P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX,
+    P_TIME, P_VOL, P_WARM,
+};
 use crate::host::{
     list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
 };
@@ -469,6 +472,9 @@ struct Knob {
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
+    /// Hidden from the face (still settable/bindable — e.g. AudioIn MON, shown
+    /// as a chip instead of a knob). Skipped by draw + face-layout audit.
+    hidden: bool,
     /// Last value sent via `Command::SetParam` so `publish_patch` only sends on change
     /// and never fights incoming hardware CCs.
     sent: Option<f32>,
@@ -511,6 +517,8 @@ enum UnitKind {
     Clap,
     Dsp(crate::control::DspKind),
     Master,
+    /// Live audio input (mic/guitar/interface): a source with an audio OUT.
+    AudioIn,
 }
 
 struct Unit {
@@ -539,6 +547,10 @@ struct Unit {
     /// port 0, HIGH on port 1); None = one MIDI OUT. Never a local guess
     /// while an engine is attached (adopted from GraphPub).
     split: Option<u8>,
+    /// AudioIn only: mirror of the node's device selection (None = default).
+    device: Option<String>,
+    /// AudioIn only: which device channels fill the stereo OUT.
+    channels: AudioInChannel,
     name_g: Option<Arc<Galley>>,
     sub_g: Option<Arc<theme::TrackedLabel>>,
     /// Unit width the name/subtitle galleys were fitted to (C4 shrink-to-
@@ -566,7 +578,13 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, sent: None, clap: None, label_g: None }
+    Knob { label: label.to_string(), value: default, default, param, hidden: false, sent: None, clap: None, label_g: None }
+}
+
+/// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
+/// and persisted; the face renders its state as a chip instead.
+fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
+    Knob { label: label.to_string(), value: default, default, param, hidden: true, sent: None, clap: None, label_g: None }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -817,6 +835,24 @@ fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) ->
     }
 }
 
+/// Parse an AudioIn channel name (L / R / ST / mono_l / mono_r / stereo).
+fn parse_audio_channel(s: &str) -> AudioInChannel {
+    match s.trim().to_lowercase().as_str() {
+        "r" | "right" | "mono_r" | "monor" => AudioInChannel::MonoR,
+        "st" | "stereo" | "s" => AudioInChannel::Stereo,
+        _ => AudioInChannel::MonoL,
+    }
+}
+
+/// Readable AudioIn subtitle: "MOTU M2 · In 1" (device · channel).
+fn audio_in_sub(device: Option<&str>, ch: AudioInChannel) -> String {
+    let dev = device
+        .map(crate::audio_in::pretty_device_name)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Default input".to_string());
+    format!("{dev} · {}", ch.label())
+}
+
 /// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
 /// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
 /// Runs once per unit at galley-build time, never on the frame path.
@@ -979,12 +1015,24 @@ fn make_unit(node: &Node) -> Unit {
             vec![knob("GAIN", 0.5, None)],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         ),
+        NodeKind::AudioIn { device, channels } => (
+            UnitKind::AudioIn, audio_in_sub(device.as_deref(), *channels),
+            vec![], vec![PortKind::Audio],
+            // GAIN is a real bindable engine param; MON is a hidden knob whose
+            // value the face renders as a MON chip (still SetParam/CC path).
+            vec![knob("GAIN", 0.5, Some(P_AUDIO_IN_GAIN)), hidden_knob("MON", 0.0, Some(P_AUDIO_IN_MONITOR))],
+            vec![(Dir::Out, 0, 0.62, "OUT")],
+        )
     };
 
     let mut ins_arr = [PortKind::Audio; 3];
     let mut outs_arr = [PortKind::Audio; 3];
     for (i, k) in ins.iter().take(3).enumerate() { ins_arr[i] = *k; }
     for (i, k) in outs.iter().take(3).enumerate() { outs_arr[i] = *k; }
+    let (device, channels) = match &node.kind {
+        NodeKind::AudioIn { device, channels } => (device.clone(), *channels),
+        _ => (None, AudioInChannel::MonoL),
+    };
     Unit {
         node_id: node.id,
         rig: node.rig,
@@ -1000,6 +1048,8 @@ fn make_unit(node: &Node) -> Unit {
         transport: node.kind.supports_transport(),
         playing: node.playing && node.kind.supports_transport(),
         split: if matches!(node.kind, NodeKind::Keys) { node.split } else { None },
+        device,
+        channels,
         name_g: None, sub_g: None, back_g: None, label_fit_w: f32::INFINITY,
     }
 }
@@ -1668,6 +1718,24 @@ struct DemoApp {
     /// MIDI arrivals then fake the downstream envelope instead.
     edge_levels: Option<Arc<EdgeLevels>>,
 
+    // --- Audio In (live mic/guitar/interface, issue #28) ---
+    /// Per-node input level (pre-gain peak), engine → UI, lock-free.
+    audio_in_levels: Option<Arc<AudioInLevels>>,
+    /// UI → engine: delivers a freshly-opened input ring's consumer to a slot.
+    audio_in_tx: Option<rtrb::Producer<(u32, rtrb::Consumer<f32>)>>,
+    /// Open input captures kept alive on the UI thread, keyed by node id.
+    audio_in_streams: std::collections::HashMap<u32, crate::audio_in::CaptureProc>,
+    /// Device name each node's stream is actually open for (change detection).
+    audio_in_opened: std::collections::HashMap<u32, Option<String>>,
+    /// Per-node tuner (owns the tuner ring consumer + pitch cache).
+    audio_in_tuners: std::collections::HashMap<u32, (rtrb::Consumer<f32>, crate::audio_in::Tuner, Option<crate::audio_in::Pitch>)>,
+    /// Discovered input devices (name, channels, default), rescanned off-frame.
+    input_devices: std::sync::Arc<Mutex<Vec<crate::audio_in::InputDevice>>>,
+    /// Time accumulator for the periodic capture re-sync (hot-plug, rule 48).
+    audio_in_sync_timer: f32,
+    /// Per-node "stream is alive" flag (false after cpal's error callback).
+    audio_in_live: std::collections::HashMap<u32, Arc<std::sync::atomic::AtomicBool>>,
+
     /// Live patch mirrored for the control bridge (task-16): MCP/CLI queries
     /// read this snapshot. Rebuilt from the living cables whenever they change.
     shared_graph: Arc<Mutex<Graph>>,
@@ -1877,6 +1945,14 @@ impl DemoApp {
             bus: None,
             out_level: None,
             edge_levels: None,
+            audio_in_levels: None,
+            audio_in_tx: None,
+            audio_in_streams: std::collections::HashMap::new(),
+            audio_in_opened: std::collections::HashMap::new(),
+            audio_in_tuners: std::collections::HashMap::new(),
+            input_devices: std::sync::Arc::new(Mutex::new(Vec::new())),
+            audio_in_sync_timer: 0.0,
+            audio_in_live: std::collections::HashMap::new(),
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             graph_pub: None,
@@ -1989,6 +2065,8 @@ impl DemoApp {
         self.cc_learn = None;
         self.rule_param_cache = None;
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
+        // Open/refresh input captures for every AudioIn node (structural only).
+        self.sync_audio_in_captures();
     }
 
     /// Staged ~0.45s fade-in for an explicitly loaded rack (template,
@@ -2040,7 +2118,7 @@ impl DemoApp {
         for i in 0..self.units.len() {
             // Skip claimed units: another rig's synth must not open an
             // (invisible) column in this rig's view.
-            if claimed[i] || !matches!(self.units[i].node_kind, UnitKind::Clap) { continue; }
+            if claimed[i] || !matches!(self.units[i].node_kind, UnitKind::Clap | UnitKind::AudioIn) { continue; }
             let mut col = vec![i];
             claimed[i] = true;
             let mut cur = i;
@@ -2630,6 +2708,7 @@ impl DemoApp {
         self.bus = Some(bus);
         self.out_level = Some(level);
         self.surge_status = "Surge loaded — play!".into();
+        self.start_input_device_scan();
         self
     }
 
@@ -2887,6 +2966,33 @@ impl DemoApp {
             }
         }
         drop(shared);
+        // Audio In (a node property): adopt the engine's device/channels in
+        // place so a remote MCP/CLI set_audio_in flips the face without a
+        // rebuild; the capture (re)open is deferred past `drop(g)` below.
+        let mut audio_resync: Vec<u32> = Vec::new();
+        for n in g.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::AudioIn { .. })) {
+            let NodeKind::AudioIn { device, channels } = &n.kind else { continue };
+            let prev = self.base_graph.node(n.id).and_then(|m| match &m.kind {
+                NodeKind::AudioIn { device, channels } => Some((device.clone(), *channels)),
+                _ => None,
+            });
+            if prev.as_ref().map(|(d, c)| d == device && c == channels) == Some(true) {
+                continue;
+            }
+            if let Some(m) = self.base_graph.nodes.iter_mut().find(|m| m.id == n.id) {
+                if let NodeKind::AudioIn { device: d, channels: c } = &mut m.kind {
+                    *d = device.clone();
+                    *c = *channels;
+                }
+            }
+            for u in self.units.iter_mut().filter(|u| u.node_id == n.id) {
+                u.device = device.clone();
+                u.channels = *channels;
+                u.sub = audio_in_sub(u.device.as_deref(), *channels);
+                u.sub_g = None;
+            }
+            audio_resync.push(n.id);
+        }
         // Build the UI's current mirror: base nodes + living cables.
         let mut mirror = self.base_graph.clone();
         mirror.edges.clear();
@@ -2964,6 +3070,11 @@ impl DemoApp {
         let adopted = g.graph.clone();
         let mix = g.mix;
         drop(g);
+        // (Re)open input captures after releasing the graph publication lock —
+        // cpal open is I/O and must not hold the frontend snapshot lock.
+        for node in audio_resync.drain(..) {
+            self.resync_audio_in_capture(node);
+        }
 
         let pending_origin = self.take_pending_agent_origin();
         let origin = pending_origin.unwrap_or(AgentOrigin::Remote);
@@ -3542,6 +3653,12 @@ impl DemoApp {
                     "assistant_h": if self.assistant_open() { self.assistant_rect.height() } else { 0.0 },
                 },
                 "meter": serde_json::to_value(self.master_meter).unwrap_or(serde_json::json!({})),
+                "audio_in": self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::AudioIn)).map(|u| serde_json::json!({
+                    "node": u.node_id,
+                    "device": u.device,
+                    "channels": u.channels.label(),
+                    "level": self.audio_in_level(u.node_id),
+                })).collect::<Vec<_>>(),
             })
             .to_string(),
             "measure_mix" => {
@@ -3665,6 +3782,38 @@ impl DemoApp {
                 } else {
                     "system audio muted".into()
                 }
+            }
+            "list_audio_devices" => {
+                let devs: Vec<crate::audio_in::InputDevice> = self.input_devices.lock().map(|d| d.clone()).unwrap_or_default();
+                serde_json::json!({"devices": devs.iter().map(|d| serde_json::json!({
+                    "name": d.name, "raw": d.raw, "channels": d.channels, "default": d.default,
+                })).collect::<Vec<_>>()}).to_string()
+            }
+            "set_audio_in" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u32::MAX as u64) as u32;
+                let Some(unit) = self.units.iter().position(|u| u.node_id == node && matches!(u.node_kind, UnitKind::AudioIn)) else {
+                    return format!("no Audio In node with id {node} (add one with add_node kind audio_in, then get_graph)");
+                };
+                // device: present + non-empty = select; present + null/empty = default.
+                let device = args.get("device").map(|v| v.as_str().map(String::from)).unwrap_or_else(|| self.units[unit].device.clone());
+                let channels = args.get("channels").and_then(|v| v.as_str()).map(parse_audio_channel);
+                if let Some(gain) = args.get("gain").and_then(|v| v.as_f64()) {
+                    let g = gain.clamp(0.0, 1.0);
+                    if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_GAIN)) {
+                        k.value = g as f32;
+                    }
+                    if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_GAIN, value: g });
+                    }
+                }
+                if let Some(mon) = args.get("monitor").and_then(|v| v.as_bool()) {
+                    self.set_audio_in_monitor(unit, mon);
+                }
+                self.set_audio_in_config(unit, device.filter(|d| !d.is_empty()), channels);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.agent_activity.record(origin, format!("Audio In → {}", sentence_case(&self.units[unit].name)), vec![node], now);
+                let dev = self.units[unit].device.as_deref().unwrap_or("DEFAULT");
+                format!("audio in node {node}: device={dev}, channel={}", self.units[unit].channels.label())
             }
             "play_file" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -4185,6 +4334,10 @@ impl DemoApp {
                         _ => None,
                     },
                     "lv2" => args.get("uri").and_then(|v| v.as_str()).map(|u| NodeKind::Lv2 { uri: Lv2Uri::new(u) }),
+                    "audio_in" => Some(NodeKind::AudioIn {
+                        device: args.get("device").and_then(|v| v.as_str()).map(String::from),
+                        channels: parse_audio_channel(args.get("channels").and_then(|v| v.as_str()).unwrap_or("")),
+                    }),
                     "system_audio" => Some(NodeKind::SystemAudio),
                     "master_out" => Some(NodeKind::MasterOut),
                     _ => None,
@@ -5035,6 +5188,7 @@ impl DemoApp {
             }
             UnitKind::Master => vec![(P_VOL, "Volume".into()), (P_WARM, "Warmth".into())],
             UnitKind::Keys => Vec::new(),
+            UnitKind::AudioIn => vec![(P_AUDIO_IN_GAIN, "Gain".into()), (P_AUDIO_IN_MONITOR, "Monitor".into())],
         }
     }
 
@@ -7537,7 +7691,7 @@ impl DemoApp {
         let label: String = p.name.to_uppercase().chars().take(9).collect();
         u.knobs.push(Knob {
             label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
+            param: None, hidden: false, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
         });
         format!("pinned {} to the face", p.name)
     }
@@ -7984,6 +8138,17 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        // Audio In tuner: drain each open capture's tuner ring and run YIN.
+        if !self.audio_in_tuners.is_empty() {
+            self.pump_audio_in_tuners();
+        }
+        // Periodic capture re-sync (hot-plug): cheap in the steady state; only
+        // opens a stream when a device appears or a dead one returns.
+        self.audio_in_sync_timer += dt;
+        if self.audio_in_sync_timer >= 2.0 {
+            self.audio_in_sync_timer = 0.0;
+            self.sync_audio_in_captures();
+        }
         self.agent_activity.prune(self.ui_time);
         let now_t = self.ui_time;
         self.ui_node_grace.retain(|_, until| *until > now_t);
@@ -8306,8 +8471,12 @@ impl DemoApp {
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
-        let n = self.units.get(unit).map_or(2, |u| u.knobs.len());
-        let slot = Self::knob_slot(n, idx);
+        let Some(u) = self.units.get(unit) else {
+            return Vec2::new(r.left() + FACE_X, self.knob_row_y(unit));
+        };
+        let n = u.knobs.iter().filter(|k| !k.hidden).count();
+        let ordinal = u.knobs[..idx].iter().filter(|k| !k.hidden).count();
+        let slot = Self::knob_slot(n, ordinal);
         Vec2::new(r.right() - FACE_PAD_R - KNOB_SLOT_HALF - slot as f32 * KNOB_PITCH, self.knob_row_y(unit))
     }
 
@@ -8315,7 +8484,7 @@ impl DemoApp {
     fn display_area(&self, unit: usize) -> (f32, f32) {
         let r = self.unit_rects[unit];
         let start = r.left() + FACE_X;
-        let n = self.units.get(unit).map_or(0, |u| u.knobs.len());
+        let n = self.units.get(unit).map_or(0, |u| u.knobs.iter().filter(|k| !k.hidden).count());
         let end = if n == 0 {
             r.right() - FACE_PAD_R
         } else {
@@ -8338,6 +8507,7 @@ impl DemoApp {
                 for (ui, u) in self.units.iter().enumerate() {
                     if !self.visible(ui) { continue; }
                     for ki in 0..u.knobs.len() {
+                        if u.knobs[ki].hidden { continue; }
                         if (l - self.knob_center(ui, ki)).length() < 23.0 {
                             return Hit::Knob { unit: ui, idx: ki };
                         }
@@ -8835,6 +9005,20 @@ impl DemoApp {
                         self.ui_node_grace.insert(node, self.ui_time + 0.6);
                         self.set_node_playing(node, !playing);
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.audio_in_monitor_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
+                        let on = self.units[ui].knobs.iter().find(|k| k.param == Some(P_AUDIO_IN_MONITOR))
+                            .map_or(false, |k| k.value < 0.5);
+                        self.set_audio_in_monitor(ui, on);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.audio_in_channel_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
+                        self.cycle_audio_in_channel(ui);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.audio_in_device_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
+                        self.cycle_audio_in_device(ui);
+                    }
                     Some(Hit::Unit(ui)) => {
                         // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
                         // A single click still pings the unit.
@@ -9035,6 +9219,7 @@ impl DemoApp {
             .filter(|(_, u)| u.rig == rig)
             .filter(|(_, u)| match u.node_kind {
                 UnitKind::Clap => true,
+                UnitKind::AudioIn => true,
                 UnitKind::Keys | UnitKind::Master => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
@@ -9339,9 +9524,11 @@ impl DemoApp {
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, ui),
+                UnitKind::AudioIn => self.draw_audio_in_face(painter, ui),
             }
 
             for ki in 0..u.knobs.len() {
+                if u.knobs[ki].hidden { continue; }
                 self.draw_knob(painter, ui, ki);
             }
 
@@ -9667,6 +9854,275 @@ impl DemoApp {
         let top = bottom - n as f32 * pitch;
         // Left-aligned with the meter column and the title (face grid).
         self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+    }
+
+    // -- Audio In face (issue #28) -------------------------------------------
+
+    /// The AudioIn node's input level (pre-gain peak), engine → UI, lock-free.
+    fn audio_in_level(&self, node: u32) -> f32 {
+        self.audio_in_levels.as_ref().map(|l| l.load(node)).unwrap_or(0.0)
+    }
+
+    /// Monitor chip rect (rack-local; None when the unit is too short/narrow).
+    fn audio_in_monitor_rect(&self, unit: usize) -> Option<Rect> {
+        if !matches!(self.units.get(unit)?.node_kind, UnitKind::AudioIn) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let y = self.audio_in_chips_y(unit)?;
+        let (start, width) = self.display_area(unit);
+        if width < 148.0 { return None; } // three chips need ~148px
+        Some(Rect::from_min_size(Pos2::new(start, y), Vec2::new(42.0, FACE_CTL_H)))
+    }
+
+    /// Device chip rect (right of MON).
+    fn audio_in_device_rect(&self, unit: usize) -> Option<Rect> {
+        let m = self.audio_in_monitor_rect(unit)?;
+        Some(Rect::from_min_size(Pos2::new(m.right() + 6.0, m.top()), Vec2::new(64.0, FACE_CTL_H)))
+    }
+
+    /// Channel chip rect (right of DEV).
+    fn audio_in_channel_rect(&self, unit: usize) -> Option<Rect> {
+        let d = self.audio_in_device_rect(unit)?;
+        Some(Rect::from_min_size(Pos2::new(d.right() + 6.0, d.top()), Vec2::new(36.0, FACE_CTL_H)))
+    }
+
+    /// The chip-row y when the face is tall enough that the chips clear the
+    /// knob row (below the header, above the knobs); None when they'd collide
+    /// (short units show device/channel in the subtitle instead).
+    fn audio_in_chips_y(&self, unit: usize) -> Option<f32> {
+        let r = *self.unit_rects.get(unit)?;
+        let y = (r.top() + 60.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
+        if y + FACE_CTL_H + 8.0 > self.knob_row_y(unit) {
+            return None;
+        }
+        Some(y)
+    }
+
+    fn draw_audio_in_face(&self, painter: &egui::Painter, unit: usize) {
+        let node = self.units[unit].node_id;
+        let (start, width) = self.display_area(unit);
+
+        // Input meter (pre-gain): a horizontal VU in the display area.
+        if width >= 40.0 {
+            let level = self.audio_in_level(node).clamp(0.0, 1.0);
+            let y = self.knob_row_y(unit);
+            let bar_w = width * 0.8;
+            let track = Rect::from_min_size(Pos2::new(start, y - 12.0), Vec2::new(bar_w, 8.0));
+            painter.rect_filled(self.xf.rect(track), 4.0, theme::METER_TRACK);
+            let fill = Rect::from_min_size(Pos2::new(start, y - 12.0), Vec2::new(bar_w * (0.1 + 0.9 * level), 8.0));
+            painter.rect_filled(self.xf.rect(fill), 4.0, alpha(theme::ACCENT, 0.5 + 0.5 * level));
+            if level >= 0.92 {
+                painter.rect_filled(self.xf.rect(Rect::from_min_size(Pos2::new(start, y - 12.0), Vec2::new(5.0, 8.0))), 1.0, theme::CLIP_RED);
+            }
+            // Tuner readout above the meter: note + cents (no signal → hint).
+            let pitch = self.audio_in_tuners.get(&node).and_then(|(_, _, p)| *p);
+            let text = match pitch {
+                Some(p) => format!("{} {:+.0}¢", crate::audio_in::note_name(p.note), p.cents),
+                None => "TUNE".into(),
+            };
+            self.face_text(painter, Pos2::new(start + width * 0.5, y - 22.0), &text, theme::medium_font(12.0), SUBTEXT);
+        }
+
+        // MON / DEV / CH chips (only when the face is tall AND wide enough;
+        // otherwise the subtitle's "device · channel" carries the info).
+        let mon = self.audio_in_monitor_rect(unit);
+        let dev = self.audio_in_device_rect(unit);
+        let ch = self.audio_in_channel_rect(unit);
+        if let Some(m) = mon {
+            let on = self.units[unit].knobs.iter().find(|k| k.param == Some(P_AUDIO_IN_MONITOR))
+                .map_or(false, |k| k.value >= 0.5);
+            let hov = self.face_hovered(painter, unit, m);
+            self.paint_face_chip(painter, m, "MON", on, hov);
+        }
+        if let Some(d) = dev {
+            let label = match self.units[unit].device.as_deref() {
+                Some(raw) => crate::audio_in::pretty_device_name(raw),
+                None => "DEFAULT".to_string(),
+            };
+            let hov = self.face_hovered(painter, unit, d);
+            self.paint_face_chip(painter, d, &label, false, hov);
+        }
+        if let Some(c) = ch {
+            let label = self.units[unit].channels.label();
+            let hov = self.face_hovered(painter, unit, c);
+            self.paint_face_chip(painter, c, label, false, hov);
+        }
+    }
+
+    /// Drain each open AudioIn capture's tuner ring and refresh the pitch.
+    fn pump_audio_in_tuners(&mut self) {
+        // Collect fresh samples per node first (avoid a double borrow).
+        let nodes: Vec<u32> = self.audio_in_tuners.keys().copied().collect();
+        for node in nodes {
+            let Some((rx, tuner, pitch)) = self.audio_in_tuners.get_mut(&node) else { continue };
+            let mut chunk = [0.0f32; 512];
+            let mut any = false;
+            loop {
+                let mut n = 0usize;
+                while n < chunk.len() {
+                    match rx.pop() {
+                        Ok(v) => { chunk[n] = v; n += 1; }
+                        Err(_) => break,
+                    }
+                }
+                if n == 0 { break; }
+                any = true;
+                tuner.process(&chunk[..n]);
+            }
+            if any {
+                *pitch = tuner.process(&[]);
+            }
+        }
+    }
+
+    /// Spawn the input-device discovery thread (rescan every 2 s, rule 48).
+    fn start_input_device_scan(&self) {
+        let shared = self.input_devices.clone();
+        std::thread::Builder::new()
+            .name("kabelsalat-input-scan".into())
+            .spawn(move || loop {
+                let devs = crate::audio_in::list_input_devices();
+                if let Ok(mut slot) = shared.lock() {
+                    *slot = devs;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            })
+            .ok();
+    }
+
+    /// Ensure one open capture per AudioIn node (device match). Called on
+    /// structural changes only (build_rack / apply_session), never per frame.
+    fn sync_audio_in_captures(&mut self) {
+        let sample_rate = self.sample_rate.max(1.0) as u32;
+        // Nodes that need a capture (device name from the graph).
+        let mut wanted: Vec<(u32, Option<String>)> = Vec::new();
+        for n in &self.base_graph.nodes {
+            if let NodeKind::AudioIn { device, .. } = &n.kind {
+                wanted.push((n.id, device.clone()));
+            }
+        }
+        // Drop streams/tuners for nodes no longer present.
+        let present: std::collections::HashSet<u32> = wanted.iter().map(|(id, _)| *id).collect();
+        self.audio_in_streams.retain(|id, _| present.contains(id));
+        self.audio_in_tuners.retain(|id, _| present.contains(id));
+        self.audio_in_opened.retain(|id, _| present.contains(id));
+        self.audio_in_live.retain(|id, _| present.contains(id));
+        let Some(tx) = self.audio_in_tx.as_mut() else { return };
+        for (node, device) in wanted {
+            if self.audio_in_opened.get(&node) == Some(&device) {
+                // Already open for this device: re-open only if the stream died
+                // (device unplugged → the capture reader hit EOF and cleared the flag).
+                let dead = self.audio_in_live.get(&node).map_or(false, |l| !l.load(Ordering::Relaxed));
+                if !dead {
+                    continue;
+                }
+                self.audio_in_streams.remove(&node);
+                self.audio_in_tuners.remove(&node);
+                self.audio_in_opened.remove(&node);
+                self.audio_in_live.remove(&node);
+            }
+            // Open on the UI thread (fast cpal open, like the output stream).
+            let Some(cap) = crate::audio_in::open_capture(device.as_deref(), sample_rate, crate::bridge::BUFFER_FRAMES) else {
+                continue; // no capture available — the meter/tuner stay silent
+            };
+            // Deliver the engine read end through the side channel.
+            if tx.push((node, cap.engine_rx)).is_ok() {
+                self.audio_in_streams.insert(node, cap.stream);
+                self.audio_in_opened.insert(node, device.clone());
+                self.audio_in_live.insert(node, cap.live.clone());
+                self.audio_in_tuners.insert(node, (cap.tuner_rx, crate::audio_in::Tuner::new(cap.sample_rate), None));
+            }
+        }
+    }
+
+    /// Re-open (or close) the capture for one AudioIn node after a device
+    /// change: drop the old stream/tuner and open the new device.
+    fn resync_audio_in_capture(&mut self, node: u32) {
+        self.audio_in_streams.remove(&node);
+        self.audio_in_tuners.remove(&node);
+        self.audio_in_opened.remove(&node);
+        self.audio_in_live.remove(&node);
+        self.sync_audio_in_captures();
+    }
+
+    fn set_audio_in_monitor(&mut self, unit: usize, on: bool) {
+        let Some(u) = self.units.get(unit) else { return };
+        let node = u.node_id;
+        let v = if on { 1.0f32 } else { 0.0f32 };
+        if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_MONITOR)) {
+            k.value = v;
+        }
+        if let Some(bus) = &self.bus {
+            if bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_MONITOR, value: v as f64 }) {
+                if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_MONITOR)) {
+                    k.sent = Some(v);
+                }
+            }
+        }
+    }
+
+    /// Cycle a channel selection for an AudioIn unit (L → R → ST → L ...).
+    fn cycle_audio_in_channel(&mut self, unit: usize) {
+        let next = match self.units.get(unit).map(|u| u.channels) {
+            Some(AudioInChannel::MonoL) => AudioInChannel::MonoR,
+            Some(AudioInChannel::MonoR) => AudioInChannel::Stereo,
+            _ => AudioInChannel::MonoL,
+        };
+        self.set_audio_in_config(unit, self.units[unit].device.clone(), Some(next));
+    }
+
+    /// Rewrite an AudioIn node's device + channels: update the base graph,
+    /// unit mirror, bridge mirror, and the engine (like `set_keys_split`).
+    fn set_audio_in_config(&mut self, unit: usize, device: Option<String>, channels: Option<AudioInChannel>) {
+        let Some(u) = self.units.get(unit) else { return };
+        let node = u.node_id;
+        let cur_dev = u.device.clone();
+        let cur_ch = u.channels;
+        let dev = device.or(cur_dev); // None = default input
+        let ch = channels.unwrap_or(cur_ch);
+        if let Some(n) = self.base_graph.nodes.iter_mut().find(|n| n.id == node) {
+            if let NodeKind::AudioIn { device: d, channels: c } = &mut n.kind {
+                *d = dev.clone();
+                *c = ch;
+            }
+        }
+        if let Ok(mut g) = self.shared_graph.lock() {
+            if let Some(n) = g.nodes.iter_mut().find(|n| n.id == node) {
+                if let NodeKind::AudioIn { device: d, channels: c } = &mut n.kind {
+                    *d = dev.clone();
+                    *c = ch;
+                }
+            }
+        }
+        if let Some(u) = self.units.get_mut(unit) {
+            u.device = dev.clone();
+            u.channels = ch;
+            u.sub = audio_in_sub(u.device.as_deref(), ch);
+            u.sub_g = None;
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetAudioIn { node, device: dev, channels: Some(ch) });
+        }
+        self.resync_audio_in_capture(node);
+    }
+
+    /// Cycle a device selection for an AudioIn unit (through the discovered
+    /// list; Q = DEFAULT). Called from the face chip click.
+    fn cycle_audio_in_device(&mut self, unit: usize) {
+        let devices: Vec<crate::audio_in::InputDevice> = self.input_devices.lock().map(|d| d.clone()).unwrap_or_default();
+        let cur = self.units.get(unit).and_then(|u| u.device.clone());
+        let next = match (&cur, devices.len()) {
+            (None, _) => devices.first().map(|d| d.raw.clone()), // DEFAULT → first named
+            (Some(_), 0) => None,
+            (Some(c), _) => {
+                let pos = devices.iter().position(|d| d.raw == *c);
+                match pos {
+                    Some(i) if i + 1 < devices.len() => Some(devices[i + 1].raw.clone()),
+                    _ => None, // wrap to DEFAULT
+                }
+            }
+        };
+        self.set_audio_in_config(unit, next, None);
     }
 
     fn draw_knob(&self, painter: &egui::Painter, ui: usize, ki: usize) {
@@ -10753,7 +11209,7 @@ pub fn run_app() -> anyhow::Result<()> {
 
 /// Prefer the native PipeWire host (bypasses the ALSA bridge and lets us
 /// request a small quantum directly); fall back to the default host.
-fn preferred_host() -> cpal::Host {
+pub(crate) fn preferred_host() -> cpal::Host {
     for id in cpal::available_hosts() {
         if id.name().to_lowercase().contains("pipewire") {
             if let Ok(h) = cpal::host_from_id(id) {
@@ -10814,6 +11270,8 @@ struct BuiltAudio {
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
     edge_levels: Arc<EdgeLevels>,
+    audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
+    audio_in_levels: Arc<AudioInLevels>,
 }
 
 fn build_audio() -> anyhow::Result<BuiltAudio> {
@@ -10891,6 +11349,11 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
+    // Audio In (issue #28): the UI opens input captures off the audio thread
+    // and hands each ring consumer to the engine through this side channel.
+    let (audio_in_tx, audio_in_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(64);
+    engine.set_audio_in_channel(audio_in_rx);
+    let audio_in_levels = engine.audio_in_levels_handle();
     engine.spawn_lv2_loader();
     let mut rt_tried = false;
     let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
@@ -10942,6 +11405,8 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         rig_snapshot,
         graph_pub,
         edge_levels,
+        audio_in_tx,
+        audio_in_levels,
     })
 }
 
@@ -11046,6 +11511,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            audio_in_tx,
+                            audio_in_levels,
                         } = ba;
                         let bus = Arc::new(Mutex::new(bus));
                         // Control bridge (task-16): MCP/CLI drive THIS app via
@@ -11091,6 +11558,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            audio_in_tx,
+                            audio_in_levels,
                         ));
                     }
                     Err(e) => eprintln!("Surge/audio unavailable, running silent: {e}"),
@@ -11117,6 +11586,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     rig_snapshot,
                     graph_pub,
                     edge_levels,
+                    audio_in_tx,
+                    audio_in_levels,
                 )) => {
                     app.shared_graph = shared_graph;
                     app.edge_levels = Some(edge_levels);
@@ -11124,6 +11595,8 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
                     app.recorder = Some(recorder);
+                    app.audio_in_tx = Some(audio_in_tx);
+                    app.audio_in_levels = Some(audio_in_levels);
                     app.with_audio(
                         mains,
                         controllers,
@@ -14432,13 +14905,14 @@ mod face_layout_tests {
         v.push(("header".to_string(), title.union(sub)));
         v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
         for (ki, k) in u.knobs.iter().enumerate() {
+            if k.hidden { continue; }
             let c = app.knob_center(ui, ki).to_pos2();
             let lw = sz(&k.label_g).x;
             let label = Rect::from_min_size(Pos2::new(c.x - lw / 2.0, c.y + KNOB_R + KNOB_LABEL_GAP), Vec2::new(lw, KNOB_LABEL_H));
             let ring = Rect::from_center_size(c, Vec2::splat(2.0 * KNOB_R + 4.0));
             v.push((format!("knob {}", k.label), ring.union(label)));
         }
-        let has_display = matches!(u.node_kind, UnitKind::Keys | UnitKind::Clap)
+        let has_display = matches!(u.node_kind, UnitKind::Keys | UnitKind::Clap | UnitKind::AudioIn)
             || matches!(u.node_kind, UnitKind::Dsp(_)) && !u.transport;
         if has_display {
             let (start, width) = app.display_area(ui);
@@ -14447,6 +14921,12 @@ mod face_layout_tests {
                 v.push(("display".into(), Rect::from_min_max(
                     Pos2::new(start, y - 20.0), Pos2::new(start + width, y + KNOB_R + KNOB_LABEL_GAP + KNOB_LABEL_H))));
             }
+        }
+        if matches!(u.node_kind, UnitKind::AudioIn) {
+            let mut zone = app.audio_in_monitor_rect(ui).unwrap_or(Rect::NOTHING);
+            if let Some(d) = app.audio_in_device_rect(ui) { zone = zone.union(d); }
+            if let Some(c) = app.audio_in_channel_rect(ui) { zone = zone.union(c); }
+            if zone.is_finite() { v.push(("audio_in chips".into(), zone)); }
         }
         if matches!(u.node_kind, UnitKind::Master) {
             let (x, bottom, pitch) = app.meter_geom(ui);
@@ -14522,6 +15002,25 @@ mod face_layout_tests {
             app.load_template(t);
             check(app, t.title());
         }
+    }
+
+    #[test]
+    fn audio_in_face_is_padded_and_clear() {
+        // A minimal rack: Keys + AudioIn (In 1, wired to Master) + Master. The
+        // Keys/Master stay wide side anchors so the AudioIn unit is the lone
+        // middle column (full chip row visible).
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let _keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let ain = g.add_node(
+            NodeKind::AudioIn { device: None, channels: AudioInChannel::MonoL },
+            name_bytes("AUDIO IN"),
+        );
+        g.connect_with_id(1, PortRef { node: ain, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        assert!(app.units.iter().any(|u| matches!(u.node_kind, UnitKind::AudioIn)), "AudioIn unit built");
+        check(app, "audio in");
     }
 
     #[test]

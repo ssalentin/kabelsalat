@@ -433,6 +433,11 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
+            "name":"set_record_sync",
+            "description":"Toggle 'sync to transport': while on, master transport play starts a recording and stop stops it. The take begins at song beat 0 (after any count-in).",
+            "parameters":{"type":"object","properties":{"on":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
             "name":"set_node_playing",
             "description":"Start or stop ONE rack instrument that has its own transport (a metronome) without touching the others. node = node id from get_graph.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"playing":{"type":"boolean"}},"required":["node","playing"]}

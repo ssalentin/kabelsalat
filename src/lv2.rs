@@ -563,6 +563,39 @@ pub struct Lv2Plugin {
     _map_data: Box<Lv2UridMap>,
     block: usize,
     uri: String,
+    sample_rate: f64,
+}
+
+/// Plugins whose instances must never be freed (#14): Vitalium's own
+/// threads keep running across instance teardown, so freeing (or creating
+/// next to a freed one) corrupted the heap — every crash core showed a
+/// Vitalium thread next to `lilv_instance_free`/`lilv_world_free` or a fresh
+/// instantiate. Retired instances are parked instead and reused by `load`.
+const NEVER_FREE: &[&str] = &["urn:distrho:vitalium"];
+
+/// Parked, deactivated instances of `NEVER_FREE` plugins, reused by `load`.
+/// Never dropped — not even at exit (statics are not destructed).
+static PARKED: std::sync::Mutex<Vec<Lv2Plugin>> = std::sync::Mutex::new(Vec::new());
+
+fn never_free(uri: &str) -> bool {
+    NEVER_FREE.iter().any(|u| uri.contains(u))
+}
+
+/// Retire a plugin instance off the audio thread: parks `NEVER_FREE`
+/// plugins for reuse, frees everything else. Use this instead of `drop`.
+pub fn retire(mut p: Lv2Plugin) {
+    if never_free(&p.uri) {
+        p.set_active(false);
+        if let Ok(mut parked) = PARKED.lock() { parked.push(p); return; }
+        std::mem::forget(p); // poisoned pool: leak rather than free
+        return;
+    }
+    drop(p);
+}
+
+/// How many instances are parked (tests).
+pub fn parked_count(uri_part: &str) -> usize {
+    PARKED.lock().map(|v| v.iter().filter(|p| p.uri.contains(uri_part)).count()).unwrap_or(0)
 }
 
 // SAFETY: one thread owns an instance at a time (moved over the engine's
@@ -575,6 +608,9 @@ impl Lv2Plugin {
     /// Load the first plugin whose URI contains `needle`, instantiate it with
     /// urid-map + options features, classify ports, and connect buffers.
     pub fn load(needle: &str, sample_rate: f64, block: usize) -> anyhow::Result<Self> {
+        if let Some(p) = Self::take_parked(needle, sample_rate, block) {
+            return Ok(p);
+        }
         let _lilv = lilv_guard();
         unsafe {
             let world = lilv_world_new();
@@ -676,7 +712,41 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, block, uri })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, block, uri, sample_rate })
+        }
+    }
+
+    /// A parked instance of `needle` at this rate/block, reset to a fresh
+    /// state: re-activated, controls at their declared defaults (rule 42),
+    /// audio and MIDI buffers cleared.
+    fn take_parked(needle: &str, sample_rate: f64, block: usize) -> Option<Self> {
+        if !never_free(needle) { return None; }
+        let mut parked = PARKED.lock().ok()?;
+        let i = parked.iter().position(|p| p.uri.contains(needle) && p.sample_rate == sample_rate && p.block == block)?;
+        let mut p = parked.swap_remove(i);
+        drop(parked);
+        for m in &p.control_meta {
+            if let Some(b) = p.buffers.get_mut(m.port_index) { b.fill(m.default); }
+        }
+        for &i in p.audio_in.iter().chain(p.audio_out.iter()) {
+            if let Some(b) = p.buffers.get_mut(i) { b.fill(0.0); }
+        }
+        if p.atom_in.is_some() { init_atom_sequence(&mut p.atom_buf, p.urid_sequence); }
+        p.set_active(true);
+        Some(p)
+    }
+
+    /// Plugin activate/deactivate (instance run state; buffers stay).
+    fn set_active(&mut self, on: bool) {
+        unsafe {
+            if self.instance.is_null() { return; }
+            let desc = &*(*self.instance).lv2_descriptor;
+            let h = (*self.instance).lv2_handle;
+            match (on, desc.activate, desc.deactivate) {
+                (true, Some(a), _) => a(h),
+                (false, _, Some(d)) => d(h),
+                _ => {}
+            }
         }
     }
 
@@ -784,6 +854,17 @@ impl Lv2Plugin {
 
 impl Drop for Lv2Plugin {
     fn drop(&mut self) {
+        // Safety net for #14: a NEVER_FREE plugin that was dropped instead of
+        // `retire`d is leaked whole (instance, world and the memory it points
+        // into), never freed.
+        if never_free(&self.uri) {
+            self.set_active(false);
+            std::mem::forget(std::mem::replace(&mut self._urid, Box::new(UridMap { map: Default::default(), next: 1 })));
+            std::mem::forget(std::mem::replace(&mut self._map_data, Box::new(Lv2UridMap { handle: std::ptr::null_mut(), map: urid_map_cb })));
+            std::mem::forget(std::mem::take(&mut self.buffers));
+            std::mem::forget(std::mem::take(&mut self.atom_buf));
+            return;
+        }
         let _lilv = lilv_guard();
         unsafe {
             if !self.instance.is_null() {
@@ -1384,8 +1465,10 @@ mod tests {
         // static destructors crash; the second load then hit freed state.
         for _ in 0..5 {
             let Ok(p) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
-            drop(p);
+            retire(p);
         }
+        // Parked and reused, never freed (#14): five loads, one instance.
+        assert!(parked_count("vitalium") >= 1);
     }
 
     #[test]
@@ -1419,6 +1502,29 @@ mod tests {
         }
         plugin.note_off(60);
         assert!(peak > 1e-4, "expected non-zero audio from Vitalium, got peak={peak}");
+        retire(plugin);
+    }
+
+    #[test]
+    fn reused_vitalium_starts_fresh_and_still_plays() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut first) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
+        let d = first.control_descs().into_iter().find(|d| d.max > d.min).expect("a control");
+        first.set_control_normalized(d.index, if d.default == d.max { 0.0 } else { 1.0 });
+        retire(first);
+        let before = parked_count("vitalium");
+        let mut again = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256).expect("reload");
+        assert_eq!(parked_count("vitalium"), before - 1, "the parked instance was reused, not a new one built");
+        let now = again.control_descs().into_iter().find(|c| c.index == d.index).unwrap();
+        assert!((now.value - d.default).abs() < 1e-6, "controls back at their defaults: {} vs {}", now.value, d.default);
+        again.note_on(60, 100);
+        let (input, mut output, mut peak) = (vec![0.0f32; 512], vec![0.0f32; 512], 0.0f32);
+        for _ in 0..20 {
+            again.process(&input, &mut output, 256);
+            peak = peak.max(output.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+        }
+        assert!(peak > 1e-4, "a reused instance still plays: peak={peak}");
+        retire(again);
     }
 }
 

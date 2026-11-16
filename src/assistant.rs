@@ -480,7 +480,7 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"add_rig",
             "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional patch query loaded into the new rig's Surge (e.g. 'flute'). Returns get_rigs.",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C…)"},"sound":{"type":"string","description":"Optional Surge patch query, e.g. 'flute'"}}}
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional Surge patch query, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
         }},
         {"type":"function","function":{
             "name":"delete_rig",

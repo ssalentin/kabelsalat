@@ -3410,7 +3410,18 @@ impl DemoApp {
             "add_rig" => {
                 let n = self.rig_count();
                 if n >= Self::MAX_RIGS { return format!("at most {} rigs", Self::MAX_RIGS); }
-                self.edit_rigs_named(None, args.get("name").and_then(|v| v.as_str()));
+                let name = args.get("name").and_then(|v| v.as_str());
+                match args.get("plugin_id").and_then(|v| v.as_str()) {
+                    Some(id) => {
+                        let known = self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.clone())
+                            .or_else(|| crate::host::list_clap_plugins().into_iter().find(|p| p.id == id).map(|p| p.name));
+                        let Some(label) = known else {
+                            return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
+                        };
+                        self.edit_rigs_with(None, Some(name.unwrap_or(&label)), Some((id, &label)));
+                    }
+                    None => self.edit_rigs_named(None, name),
+                }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
                 let sound = match args.get("sound").and_then(|v| v.as_str()) {
                     Some(q) => match self.load_sound(self.active_rig, q) {
@@ -4431,7 +4442,8 @@ impl DemoApp {
                 | "set_cc_map"
                 | "clear_cc_map"
                 | "learn_cc"
-                | "get_matrix" => self.exec_tool(&tool, &args),
+                | "get_matrix"
+                | "add_rig" => self.exec_tool(&tool, &args),
                 other => format!("tool '{other}' is not served over the UI bridge"),
             };
             let _ = reply.send(out);
@@ -4588,6 +4600,12 @@ impl DemoApp {
 
     /// `edit_rigs` with an explicit name for an added rig (agent `add_rig`).
     fn edit_rigs_named(&mut self, delete: Option<usize>, add_name: Option<&str>) {
+        self.edit_rigs_with(delete, add_name, None);
+    }
+
+    /// `edit_rigs_named`; an added rig is built around `plugin` = (CLAP id,
+    /// display name) instead of the default Surge rig.
+    fn edit_rigs_with(&mut self, delete: Option<usize>, add_name: Option<&str>, plugin: Option<(&str, &str)>) {
         let n = self.rig_count();
         match delete {
             None if n >= Self::MAX_RIGS => {
@@ -4621,7 +4639,11 @@ impl DemoApp {
                 let name = add_name.map(|s| s.trim().chars().take(24).collect::<String>()).filter(|s| !s.is_empty())
                     .or_else(|| (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)))
                     .unwrap_or_else(|| format!("Rig {}", n + 1));
-                rigs.push((None, crate::control::Rig::new(name.clone(), self.new_rig_graph(), None)));
+                let graph = match plugin {
+                    Some((id, label)) => crate::control::plugin_rig_graph(id, label),
+                    None => self.new_rig_graph(),
+                };
+                rigs.push((None, crate::control::Rig::new(name.clone(), graph, None)));
                 format!("Added {name}")
             }
         };
@@ -5387,15 +5409,7 @@ impl DemoApp {
 
     /// Start a fresh single-instrument CLAP rig for any CLAP plugin.
     fn add_clap_rig(&mut self, plugin_id: &str, name: &str) {
-        let mut g = Graph::default();
-        g.reserve(16, 16);
-        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let label = name.to_uppercase();
-        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name_bytes(&label));
-        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
-        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
-        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
-        g.connect_with_id(3, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+        let g = crate::control::plugin_rig_graph(plugin_id, name);
         let s = crate::session::Session::new(&format!("{name} rig"), g);
         match self.apply_session(&s) {
             Ok(_) => self.plugin_msg = format!("New {name} rig — Keys→{name}→Master"),
@@ -10274,6 +10288,25 @@ mod rig_switch_tests {
         assert!(matches!(dest.kind, NodeKind::Clap { .. }) && dest.rig == 1, "route landed on {:?} (rig {})", dest.kind, dest.rig);
         assert!(app.units.iter().any(|u| u.node_id == r.dest && matches!(u.node_kind, UnitKind::Clap)), "UI and engine agree on the synth's id");
         assert_ne!(app.session_msg, "Patch updated from MCP/CLI", "no divergence rebuild after loading");
+    }
+
+    #[test]
+    fn add_rig_with_a_plugin_id_builds_that_plugins_rig_next_to_the_others() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_clap = vec![ClapPluginInfo { id: "org.example.synth".into(), name: "Example".into(), vendor: "V".into(), features: vec!["instrument".into()] }];
+        let before = app.rig_count();
+        let r = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.example.synth"}));
+        assert_eq!(app.rig_count(), before + 1, "{r}");
+        let rig = (app.rig_count() - 1) as u8;
+        let synth = app.base_graph.nodes.iter()
+            .find(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
+            .expect("the new rig has a CLAP synth");
+        let NodeKind::Clap { plugin_id } = &synth.kind else { unreachable!() };
+        assert_eq!(name_str(plugin_id), "org.example.synth");
+        assert!(app.base_graph.nodes.iter().any(|n| n.rig == 0 && matches!(n.kind, NodeKind::Clap { .. })), "rig A keeps its synth");
+        let bad = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.not.installed"}));
+        assert!(bad.contains("no installed CLAP plugin"), "{bad}");
+        assert_eq!(app.rig_count(), before + 1, "an unknown plugin adds nothing");
     }
 
     #[test]

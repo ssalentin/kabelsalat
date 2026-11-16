@@ -714,3 +714,16 @@ Everything queued lives here; update this section as work lands.
 
 - **vibez** (`~/src/vibez`, Rust + iced) — study its multi-instrument / MIDI routing /
   session approach and adapt what fits (docs/vibez-notes.md).
+- **Audio-analysis testing** (advice from the vibez developer, 2026-11-16): let agents
+  verify sound by analysis, not only by levels. Planned harness items:
+  - Spectral checks: FFT of a rendered note/patch asserts pitch (fundamental),
+    brightness (centroid) and the absence of aliasing/clipping; the master-limiter
+    and crackle work becomes a regression test on hard-saturation share and HF energy.
+  - Routing with noise: white/pink noise sources prove sidechain and send routing
+    (signal appears exactly where routed, nowhere else) — pairs with #5 sends.
+  - Plugin delay compensation: a lookahead compressor or other latency-reporting
+    plugin on one path, the same sample on a dry path; the transients must line up
+    sample-exact (cross-correlation peak at lag 0). Needed before sends/parallel buses.
+  - Some checks stay by ear: the self-tests print what to listen for.
+- **Bravo** (https://obra.art/bravo, an "AI DAW"): research running — mixing model and
+  agent architecture compared with ours; findings and adopted items land here.

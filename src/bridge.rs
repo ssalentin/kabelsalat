@@ -323,6 +323,10 @@ fn handle_line_with_pub(
                     .and_then(|p| p.lock().ok())
                     .map(|g| g.transport)
                     .unwrap_or_default();
+                let meter = graph_pub
+                    .and_then(|p| p.lock().ok())
+                    .map(|g| serde_json::to_value(g.meter).unwrap_or(serde_json::Value::Null))
+                    .unwrap_or(serde_json::Value::Null);
                 json!({"ok": true, "data": {
                     "nodes": g.nodes.len(),
                     "edges": g.edges.len(),
@@ -346,6 +350,7 @@ fn handle_line_with_pub(
                     "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
                     "rigs": rig_count,
                     "active_rig": active_rig,
+                    "meter": meter,
                 }})
             }
             Some("get_record") => {

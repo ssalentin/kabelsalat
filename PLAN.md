@@ -728,11 +728,25 @@ Everything queued lives here; update this section as work lands.
 - **Bravo** (https://obra.art/bravo, a closed-source "AI DAW"; report:
   docs/research/bravo.md, inferred from its public guides — no source available).
   Adopted, in order (S/M = size):
-  1. **Measure loop (M):** the agent is deaf beyond a peak meter. Add short-term and
-     integrated LUFS, true peak, low-end mono check and a band summary to the engine
-     (published like `GraphPub.mix`, rule 33); a `measure_mix` tool in assistant +
-     exec_tool + MCP (rule 6) so the agent can check its own mix moves. Pairs with
-     the audio-analysis testing item above (same meters).
+  1. **Measure loop (M) — done (2026-11-16):** the agent is no longer deaf beyond a
+     peak meter. `src/meter.rs` adds `MasterMeter`, fed the final stereo master output
+     each render block (the recorder tap point) and published as a small Copy
+     `MeterSnapshot` into `GraphPub` (`meter` + `meter_rev`) via a non-blocking
+     `try_lock` (rule 33), allocation-free on the render path. It computes: momentary
+     (400 ms) / short-term (3 s) / gated integrated LUFS (ITU-R BS.1770-4 K-weighting,
+     the two canonical biquads; absolute −70 LU + relative −10 LU gates over a
+     fixed-size block ring), true peak (dBTP) via 4x polyphase-FIR oversampling, a
+     < 120 Hz phase/mono check, and a 4-band energy summary (< 120, 120–500, 500–4k,
+     > 4k Hz) in dB. Exposed as `measure_mix` (read-only; `reset: true` restarts
+     integration via a new `Command::ResetMeter`) in assistant `tools()` + `exec_tool`
+     + MCP (rule 6/23), mirrored into the UI (`sync_from_engine`), and folded into
+     `get_status` (UI/headless/attach). `kabelsalat meter-test` self-test renders real
+     Surge audio through `GraphEngine::render` and checks the numbers. Unit tests pin
+     the spec: a 997 Hz −20 dBFS stereo sine reads −20 LUFS ± 0.3, true peak exceeds
+     the sample peak on an inter-sample-peak signal, silence gates out of the
+     integrated reading, 60 Hz lands in band 0, out-of-phase bass is flagged. Pairs
+     with the audio-analysis testing item above (same meters). Opens Bravo 4
+     (loudness target).
   2. **Agent undo — done (2026-11-16):** one agent job = one undo step (snapshot of
      session + rigs + mixer + rig in view + patch names before the job's first
      change; a job = one assistant request or a remote burst with gaps < 3 s);

@@ -37,6 +37,9 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- The master output was 2–4 dB too quiet at full volume: level lost in the
+  master limiter is now made up (peaks at −1 dBFS, never above), VOLUME and
+  the templates default to 100 %, and the master meters use a dB scale.
 - Vitalium (LV2) could corrupt memory and crash the app when an instance was
   removed or reloaded; instances are now kept and reused (#14).
 - Agent tools no longer freeze the window while plugins are scanned for the

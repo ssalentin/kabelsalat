@@ -118,6 +118,9 @@ extern "C" {
     fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvNode;
     fn lilv_node_as_string(value: *const LilvNode) -> *const c_char;
     fn lilv_node_as_uri(value: *const LilvNode) -> *const c_char;
+    fn lilv_plugin_get_library_uri(plugin: *const LilvPlugin) -> *const LilvNode;
+    fn lilv_file_uri_parse(uri: *const c_char, hostname: *mut *mut c_char) -> *mut c_char;
+    fn lilv_free(ptr: *mut c_void);
     fn lilv_node_free(val: *mut LilvNode);
     fn lilv_new_uri(world: *mut LilvWorld, uri: *const c_char) -> *mut LilvNode;
     fn lilv_node_as_float(value: *const LilvNode) -> f32;
@@ -218,6 +221,24 @@ unsafe fn read_control_meta(world: *mut LilvWorld, plugin: *const LilvPlugin) ->
 }
 
 /// Inspect control-input port descriptions for a plugin URI without instantiating it.
+/// Keep a plugin's shared library mapped for the life of the process.
+/// Freeing an instance makes lilv dlclose the library; Vitalium's static
+/// destructors then crash in `__cxa_finalize` (4 core dumps, 2026-11-16).
+/// Hosts commonly pin plugin libraries; a second load is cheaper anyway.
+unsafe fn pin_plugin_library(plugin: *const LilvPlugin) {
+    let lib = lilv_plugin_get_library_uri(plugin);
+    if lib.is_null() {
+        return;
+    }
+    let path = lilv_file_uri_parse(lilv_node_as_uri(lib), std::ptr::null_mut());
+    if path.is_null() {
+        return;
+    }
+    // NOLOAD: only bump the already-mapped library; NODELETE: never unmap it.
+    libc::dlopen(path, libc::RTLD_NOW | libc::RTLD_NOLOAD | libc::RTLD_NODELETE);
+    lilv_free(path as *mut c_void);
+}
+
 /// Serializes every lilv world build/load, plugin instantiation and free:
 /// the app now does these from several threads (plugin scan, LV2 loader,
 /// editor), and plugin libraries keep process-global state.
@@ -582,6 +603,7 @@ impl Lv2Plugin {
 
             let instance = lilv_plugin_instantiate(plugin, sample_rate, features.as_ptr());
             anyhow::ensure!(!instance.is_null(), "instantiate failed for {uri}");
+            pin_plugin_library(plugin);
 
             let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
             let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
@@ -1345,6 +1367,16 @@ mod tests {
         let brass = presets.iter().find(|p| p.name == "Analog Brass").expect("Analog Brass preset missing");
         assert!(!brass.uri.is_empty());
         assert!(!brass.values.is_empty());
+    }
+
+    #[test]
+    fn vitalium_survives_repeated_load_and_free() {
+        // Freeing the last instance used to dlclose vitalium-lv2.so, whose
+        // static destructors crash; the second load then hit freed state.
+        for _ in 0..5 {
+            let Ok(p) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
+            drop(p);
+        }
     }
 
     #[test]

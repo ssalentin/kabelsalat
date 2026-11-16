@@ -690,8 +690,6 @@ Everything queued lives here; update this section as work lands.
   loading. LV2 instruments can extend this.
 - LV2 instrument classification is a permissive port-based hint (the authoritative LV2
   class is a blank node lilv can't resolve here).
-- Matrix rules (incl. CC maps / MIDI-learn bindings) are not saved in sessions yet:
-  `Session::matrix` exists but `capture_session`/`apply_session` ignore it (#4 review).
 - A cold CLAP scan (first launch, or Refresh with a hanging bundle) runs on the UI
   thread: up to 5 s per wave of 4 hanging bundles. Move to a background thread.
 - `transport-test` flaked once in 11 runs (Surge step 4 instead of 2); cause unknown.

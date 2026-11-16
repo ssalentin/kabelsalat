@@ -45,7 +45,7 @@ use clack_extensions::params::{
 };
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{
-    NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
+    MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match};
 use clack_host::host::{HostError, HostExtensions};
@@ -219,6 +219,7 @@ pub enum VoiceCmd {
     NoteOn(u16, f64),
     NoteOff(u16),
     Param(ClapId, f64),
+    Midi([u8; 3]),
 }
 
 /// Event capacity per block; pushes beyond this are dropped (never allocates
@@ -273,6 +274,10 @@ pub struct ClapVoice {
     processor: StartedPluginAudioProcessor<TestHost>,
     cmds_tx: Arc<Mutex<rtrb::Producer<VoiceCmd>>>,
     cmds_rx: rtrb::Consumer<VoiceCmd>,
+    /// Preallocated audio-thread command queue (avoids Mutex lock in `GraphEngine`).
+    rt_cmds: Vec<VoiceCmd>,
+    /// Sorted `(id, min, max)` table populated once at instantiation for lock-free CC scaling.
+    param_ranges: Vec<(u32, f64, f64)>,
     /// Optional sample-accurate sequence (frame offset, command), e.g. the
     /// host-test arpeggio. Preallocated; consumed with a cursor.
     schedule: Vec<(u64, VoiceCmd)>,
@@ -360,6 +365,19 @@ impl ClapVoice {
         // Surge only reports meaningful latency once active.
         let latency = exts.latency.map(|l| l.get(&plugin.plugin_handle())).unwrap_or(0);
         println!("plugin-reported latency (active): {latency} samples");
+        let mut param_ranges = Vec::new();
+        if let Some(params) = exts.params {
+            let handle = plugin.plugin_handle();
+            let count = params.count(&handle);
+            let mut info_buf = ParamInfoBuffer::new();
+            param_ranges.reserve(count as usize);
+            for i in 0..count {
+                if let Some(info) = params.get_info(&handle, i, &mut info_buf) {
+                    param_ranges.push((info.id.get(), info.min_value, info.max_value));
+                }
+            }
+            param_ranges.sort_unstable_by_key(|&(id, _, _)| id);
+        }
         let processor = stopped
             .start_processing()
             .map_err(|_| anyhow!("start_processing failed"))?;
@@ -372,6 +390,8 @@ impl ClapVoice {
             processor,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
+            rt_cmds: Vec::with_capacity(EVENT_CAP as usize),
+            param_ranges,
             schedule: Vec::new(),
             sched_idx: 0,
             frame: 0,
@@ -426,6 +446,35 @@ impl ClapVoice {
         let _ = self.cmds_tx.lock().unwrap().push(VoiceCmd::NoteOff(note));
     }
 
+    /// Push a command directly from the audio thread (lock-free, allocation-free).
+    pub fn push_rt(&mut self, cmd: VoiceCmd) {
+        if self.rt_cmds.len() < self.rt_cmds.capacity() {
+            self.rt_cmds.push(cmd);
+        }
+    }
+
+    /// Native `(min, max)` range for `id`, if reported by the plugin.
+    pub fn param_range(&self, id: u32) -> Option<(f64, f64)> {
+        self.param_ranges
+            .binary_search_by_key(&id, |&(pid, _, _)| pid)
+            .ok()
+            .map(|idx| (self.param_ranges[idx].1, self.param_ranges[idx].2))
+    }
+
+    /// Scale a normalized `0..=1` value into the parameter's range and queue it
+    /// on the audio thread without locking or allocating.
+    pub fn set_param_normalized_rt(&mut self, id: u32, norm: f64) -> Option<f64> {
+        let (min, max) = self.param_range(id)?;
+        let val = min + norm.clamp(0.0, 1.0) * (max - min);
+        self.push_rt(VoiceCmd::Param(ClapId::new(id), val));
+        Some(val)
+    }
+
+    /// Queue a raw MIDI 1.0 CC event on the audio thread without locking or allocating.
+    pub fn send_cc_rt(&mut self, channel: u8, cc: u8, value: u8) {
+        self.push_rt(VoiceCmd::Midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]));
+    }
+
     /// Install a sample-accurate sequence of (frame offset, command), consumed
     /// as rendering advances. Replaces any previous schedule. Main/setup thread.
     pub fn set_schedule(&mut self, mut schedule: Vec<(u64, VoiceCmd)>) {
@@ -462,6 +511,13 @@ impl ClapVoice {
         self.ev_out.clear();
 
         // Live commands (block-quantized) + scheduled events (sample-accurate).
+        for i in 0..self.rt_cmds.len() {
+            if self.ev_in.len() >= EVENT_CAP {
+                break;
+            }
+            push_cmd(&mut self.ev_in, 0, self.rt_cmds[i]);
+        }
+        self.rt_cmds.clear();
         while let Ok(cmd) = self.cmds_rx.pop() {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
@@ -584,6 +640,7 @@ fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
             ),
             v,
         )),
+        VoiceCmd::Midi(data) => ev_in.push(&MidiEvent::new(time, 0, data)),
     }
 }
 
@@ -700,6 +757,11 @@ impl ClapVoiceMain {
             });
         }
         out
+    }
+
+    /// Current plain value of a single parameter (main thread only).
+    pub fn param_value(&mut self, id: u32) -> Option<f64> {
+        self.exts.params?.get_value(&self.instance.plugin_handle(), ClapId::new(id))
     }
 
     /// Format a parameter value as the plugin's own text (e.g. "440.0 Hz").

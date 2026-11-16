@@ -198,6 +198,7 @@ pub struct Rule {
     /// (0, 127). Note-offs bypass this filter.
     pub vel_range: (u8, u8),
     /// CC whitelist + bindings. Empty = all CCs pass through.
+    #[serde(default)]
     pub cc_map: Vec<CcMapping>,
     /// Muted rules route nothing (live performance toggle).
     pub enabled: bool,
@@ -253,12 +254,31 @@ impl Rule {
     /// controller replaces its binding. A non-empty map acts as a CC
     /// whitelist: unmapped controllers are dropped.
     pub fn map_cc(mut self, cc: u8, param: ParamId) -> Self {
+        self.set_cc(cc, param);
+        self
+    }
+
+    /// Add or replace a CC binding in place. Returns true if the map changed.
+    pub fn set_cc(&mut self, cc: u8, param: ParamId) -> bool {
+        let cc = cc & 0x7F;
         if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
+            if m.param == param {
+                return false;
+            }
             m.param = param;
+            true
         } else {
             self.cc_map.push(CcMapping { cc, param });
+            true
         }
-        self
+    }
+
+    /// Remove a CC binding in place. Returns true if one existed.
+    pub fn unmap_cc(&mut self, cc: u8) -> bool {
+        let cc = cc & 0x7F;
+        let before = self.cc_map.len();
+        self.cc_map.retain(|m| m.cc != cc);
+        self.cc_map.len() < before
     }
 
     pub fn enabled(mut self, on: bool) -> Self {
@@ -930,5 +950,26 @@ mod tests {
             dests(&m.route(SourceId::Hardware(3), note_on(60))),
             vec![SURGE_B]
         );
+    }
+
+    #[test]
+    fn set_cc_unmap_cc_and_legacy_serde_roundtrip() {
+        let mut r = Rule::new(SourceId::Hardware(0), SURGE_A);
+        assert!(r.set_cc(74, 10));
+        assert!(!r.set_cc(74, 10), "idempotent set returns false");
+        assert!(r.set_cc(74, 20), "replacing param returns true");
+        assert_eq!(r.param_for_cc(74), Some(20));
+        assert!(r.unmap_cc(74));
+        assert!(!r.unmap_cc(74), "missing cc returns false");
+        assert!(r.cc_map.is_empty());
+
+        let r2 = Rule::new(SourceId::Hardware(2), SURGE_B).map_cc(74, 55).map_cc(1, 12);
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&r2).unwrap()).unwrap();
+        assert_eq!(back.cc_map, r2.cc_map);
+
+        // Legacy rules saved without `cc_map` deserialize with empty transparent map.
+        let legacy = r#"{"id":1,"source":"Keys","dest":1,"channel":null,"transpose":0,"key_range":[0,127],"vel_range":[0,127],"enabled":true}"#;
+        let legacy_rule: Rule = serde_json::from_str(legacy).unwrap();
+        assert!(legacy_rule.cc_map.is_empty());
     }
 }

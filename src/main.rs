@@ -76,6 +76,7 @@ fn main() -> anyhow::Result<()> {
         "multi-rig-test" => engine::multi_rig_test(),
         "rig-mix-test" => engine::rig_mix_test(),
         "multi-rig-load-test" => engine::multi_rig_load_test(),
+        "cc-map-test" => engine::cc_map_test(),
         other => {
             eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
             std::process::exit(1);

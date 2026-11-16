@@ -234,6 +234,21 @@ impl HwDirect {
         crate::bridge::record_midi_latency(ev.created.elapsed().as_micros() as u32);
         ok
     }
+
+    /// Send one hardware CC straight to the engine from the midir thread.
+    fn send_cc(&self, source: SourceId, channel: u8, cc: u8, value: u8, created: std::time::Instant) -> bool {
+        let Ok(guard) = self.bus.lock() else { return false };
+        let Some(bus) = guard.as_ref() else { return false };
+        let cmd = Command::Cc {
+            source,
+            channel: channel & 0x0F,
+            cc: cc & 0x7F,
+            value: value & 0x7F,
+        };
+        let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
+        crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
+        ok
+    }
 }
 
 /// Sink for [`NoteEvent`]s. `Send` so the engine can move it to its own thread.
@@ -418,9 +433,9 @@ impl MatrixRow {
     }
 }
 
-/// UI-side mirror of one matrix rule's editable fields (Command::MatrixRule).
+/// UI-side mirror of one matrix rule's editable fields (Command::MatrixRule + MatrixCcMap).
 /// The engine owns the truth; this drives the editor + cell indicators.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct RuleEdit {
     channel: Option<u8>,
     transpose: i8,
@@ -429,22 +444,54 @@ struct RuleEdit {
     vel_lo: u8,
     vel_hi: u8,
     enabled: bool,
+    cc_map: Vec<crate::matrix::CcMapping>,
 }
 
 impl Default for RuleEdit {
     fn default() -> Self {
-        Self { channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true }
+        Self {
+            channel: None,
+            transpose: 0,
+            key_lo: 0,
+            key_hi: 127,
+            vel_lo: 0,
+            vel_hi: 127,
+            enabled: true,
+            cc_map: Vec::new(),
+        }
     }
 }
 
 impl RuleEdit {
-    fn is_default(&self) -> bool { *self == Self::default() }
+    fn is_default(&self) -> bool {
+        self.channel.is_none()
+            && self.transpose == 0
+            && self.key_lo == 0
+            && self.key_hi == 127
+            && self.vel_lo == 0
+            && self.vel_hi == 127
+            && self.enabled
+            && self.cc_map.is_empty()
+    }
+    fn set_cc(&mut self, cc: u8, param: u32) {
+        let cc = cc & 0x7F;
+        if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
+            m.param = param;
+        } else {
+            self.cc_map.push(crate::matrix::CcMapping { cc, param });
+        }
+    }
+    fn unmap_cc(&mut self, cc: u8) {
+        let cc = cc & 0x7F;
+        self.cc_map.retain(|m| m.cc != cc);
+    }
     fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if let Some(ch) = self.channel { parts.push(format!("ch {}", ch + 1)); }
         if self.transpose != 0 { parts.push(format!("{:+} st", self.transpose)); }
         if (self.key_lo, self.key_hi) != (0, 127) { parts.push(format!("keys {}–{}", self.key_lo, self.key_hi)); }
         if (self.vel_lo, self.vel_hi) != (0, 127) { parts.push(format!("vel {}–{}", self.vel_lo, self.vel_hi)); }
+        if !self.cc_map.is_empty() { parts.push(format!("{} CC", self.cc_map.len())); }
         if !self.enabled { parts.push("muted".into()); }
         if parts.is_empty() { "transparent".into() } else { parts.join(" · ") }
     }
@@ -456,6 +503,7 @@ impl RuleEdit {
         if let Some(ch) = self.channel { return format!("ch {}", ch + 1); }
         if (self.key_lo, self.key_hi) != (0, 127) { return "keys".into(); }
         if (self.vel_lo, self.vel_hi) != (0, 127) { return "vel".into(); }
+        if !self.cc_map.is_empty() { return format!("{} CC", self.cc_map.len()); }
         "ALL".into()
     }
     fn to_command(&self, source: SourceId, dest: u32) -> Command {
@@ -468,6 +516,13 @@ impl RuleEdit {
             enabled: self.enabled,
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct CcLearn {
+    source: SourceId,
+    dest: u32,
+    param: u32,
 }
 
 /// MIDI note name for editor readouts (60 = C4).
@@ -994,6 +1049,11 @@ struct DemoApp {
     rule_edits: std::collections::HashMap<(SourceId, u32), RuleEdit>,
     /// The matrix cell whose rule editor is open: (sink unit, row).
     rule_editor: Option<(usize, MatrixRow)>,
+    cc_learn: Option<CcLearn>,
+    rule_cc_num: u8,
+    rule_param_id: u32,
+    rule_param_filter: String,
+    rule_param_cache: Option<(u32, Vec<(u32, String)>)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
@@ -1021,6 +1081,7 @@ struct DemoApp {
     /// thread already sent it to the engine (`hw_direct`), so the frame only
     /// animates it.
     hw_queue: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    hw_cc_queue: Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
     /// Hardware MIDI → engine straight from the midir thread: sound never
     /// waits for a UI frame (16 ms focused, 33 ms when throttled unfocused).
     hw_direct: Arc<HwDirect>,
@@ -1182,6 +1243,11 @@ impl DemoApp {
             play_hover_t: 0.0,
             rule_edits: std::collections::HashMap::new(),
             rule_editor: None,
+            cc_learn: None,
+            rule_cc_num: 74,
+            rule_param_id: 0,
+            rule_param_filter: String::new(),
+            rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             last_mix_rev: 0,
             confirm_delete_rig: None,
@@ -1195,6 +1261,7 @@ impl DemoApp {
             held_keys: Vec::new(),
             note_offs: Vec::new(),
             hw_queue: Arc::new(Mutex::new(VecDeque::new())),
+            hw_cc_queue: Arc::new(Mutex::new(VecDeque::new())),
             hw_direct: Arc::new(HwDirect::default()),
             _hw_conns: Vec::new(),
             hw_status: String::new(),
@@ -1255,6 +1322,7 @@ impl DemoApp {
                 }
                 if let Ok(mi) = MidiInput::new("kabelsalat-hw") {
                     let q = app.hw_queue.clone();
+                    let cc_q = app.hw_cc_queue.clone();
                     let direct = app.hw_direct.clone();
                     let dev = dev_idx;
                     if let Ok(conn) = mi.connect(
@@ -1271,6 +1339,18 @@ impl DemoApp {
                                         q.push_back((ev, sounded));
                                         while q.len() > 256 {
                                             q.pop_front();
+                                        }
+                                    }
+                                } else if st == 0xB0 {
+                                    let ch = msg[0] & 0x0F;
+                                    let cc = msg[1] & 0x7F;
+                                    let val = msg[2] & 0x7F;
+                                    let src = SourceId::Hardware(dev);
+                                    let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
+                                    if let Ok(mut cq) = cc_q.lock() {
+                                        cq.push_back((src, ch, cc, val));
+                                        while cq.len() > 256 {
+                                            cq.pop_front();
                                         }
                                     }
                                 }
@@ -1368,6 +1448,8 @@ impl DemoApp {
         // The engine rebuilds its matrix on loads — rule edits start fresh.
         self.rule_edits.clear();
         self.rule_editor = None;
+        self.cc_learn = None;
+        self.rule_param_cache = None;
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
     }
 
@@ -2073,6 +2155,7 @@ impl DemoApp {
                 key_lo: r.key_range.0, key_hi: r.key_range.1,
                 vel_lo: r.vel_range.0, vel_hi: r.vel_range.1,
                 enabled: r.enabled,
+                cc_map: r.cc_map.clone(),
             };
             if !e.is_default() { edits.insert((r.source, r.dest), e); }
         }
@@ -2306,6 +2389,7 @@ impl DemoApp {
             }
         }
         self.clap_slot_map = new_map;
+        self.rule_param_cache = None;
     }
 
     /// Load a Session: rebuild the rack from its graph + params, restore plugin
@@ -2642,8 +2726,12 @@ impl DemoApp {
                             "channel": e.channel, "transpose": e.transpose,
                             "key_range": [e.key_lo, e.key_hi], "vel_range": [e.vel_lo, e.vel_hi],
                             "enabled": e.enabled,
+                            "cc_map": e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect::<Vec<_>>(),
                         })
                     }).collect::<Vec<_>>(),
+                    "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
+                        "source": format!("{:?}", l.source), "node": l.dest, "param": l.param,
+                    })),
                 }).to_string()
             }
             "set_matrix_cell" => {
@@ -2672,16 +2760,14 @@ impl DemoApp {
                 if !self.units.iter().any(|u| u.node_id == node) {
                     return format!("no unit with node id {node}");
                 }
-                let row = match source {
-                    "keys" | "keyboard" | "laptop" => MatrixRow::Keys,
-                    s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
-                        Ok(d) => MatrixRow::HwDev(d),
-                        Err(_) => return format!("bad source '{source}'"),
-                    },
-                    _ => return format!("unknown source '{source}' (keys|hw:<d>)"),
+                let src = match self.parse_rule_source(source) {
+                    Ok(s) => s,
+                    Err(e) => return e,
                 };
-                let Some(src) = row.source() else { return "hw:all has no single rule — use hw:<d>".into() };
                 let mut e = RuleEdit::default();
+                if let Some(prev) = self.rule_edits.get(&(src, node)) {
+                    e.cc_map = prev.cc_map.clone();
+                }
                 if let Some(ch) = args.get("channel").and_then(|v| v.as_u64()) { e.channel = Some(ch.min(15) as u8); }
                 if let Some(t) = args.get("transpose").and_then(|v| v.as_i64()) { e.transpose = t.clamp(-24, 24) as i8; }
                 if let Some(v) = args.get("key_lo").and_then(|v| v.as_u64()) { e.key_lo = v.min(127) as u8; }
@@ -2689,12 +2775,146 @@ impl DemoApp {
                 if let Some(v) = args.get("vel_lo").and_then(|v| v.as_u64()) { e.vel_lo = v.min(127) as u8; }
                 if let Some(v) = args.get("vel_hi").and_then(|v| v.as_u64()) { e.vel_hi = v.min(127) as u8; }
                 if let Some(v) = args.get("enabled").and_then(|v| v.as_bool()) { e.enabled = v; }
+                let summary = e.summary();
+                let cmd = e.to_command(src, node);
                 if e.is_default() { self.rule_edits.remove(&(src, node)); }
                 else { self.rule_edits.insert((src, node), e); }
                 if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(e.to_command(src, node));
+                    let _ = bus.lock().unwrap().send(cmd);
                 }
-                format!("rule {source} → node {node}: {}", e.summary())
+                format!("rule {source} → node {node}: {summary}")
+            }
+            "set_cc_map" => {
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+                    return "set_cc_map needs 'node'".into();
+                };
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node}");
+                }
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("keys");
+                let src = match self.parse_rule_source(source) {
+                    Ok(s) => s,
+                    Err(e) => return e,
+                };
+                let Some(cc) = args.get("cc").and_then(|v| v.as_u64()).filter(|&c| c <= 127).map(|c| c as u8) else {
+                    return "set_cc_map needs 'cc' (0..=127)".into();
+                };
+                let param = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32);
+                self.set_cc_binding(src, node, cc, param);
+                let map: Vec<_> = self.rule_edits.get(&(src, node))
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
+                    .unwrap_or_default();
+                serde_json::json!({"node": node, "source": source, "cc": cc, "param": param, "cc_map": map}).to_string()
+            }
+            "clear_cc_map" => {
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+                    return "clear_cc_map needs 'node'".into();
+                };
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node}");
+                }
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("keys");
+                let src = match self.parse_rule_source(source) {
+                    Ok(s) => s,
+                    Err(e) => return e,
+                };
+                if let Some(cc) = args.get("cc").and_then(|v| v.as_u64()) {
+                    if cc > 127 { return "cc must be 0..=127".into(); }
+                    self.set_cc_binding(src, node, cc as u8, None);
+                } else {
+                    let ccs: Vec<u8> = self.rule_edits.get(&(src, node))
+                        .map(|e| e.cc_map.iter().map(|m| m.cc).collect())
+                        .unwrap_or_default();
+                    for cc in ccs {
+                        self.set_cc_binding(src, node, cc, None);
+                    }
+                }
+                let map: Vec<_> = self.rule_edits.get(&(src, node))
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
+                    .unwrap_or_default();
+                serde_json::json!({"node": node, "source": source, "cc_map": map}).to_string()
+            }
+            "list_cc_maps" => {
+                let filter_node = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32);
+                let filter_src = match args.get("source").and_then(|v| v.as_str()) {
+                    Some(s) => match self.parse_rule_source(s) {
+                        Ok(src) => Some(src),
+                        Err(e) => return e,
+                    },
+                    None => None,
+                };
+                let keys: Vec<(SourceId, u32)> = self.rule_edits.iter()
+                    .filter(|((src, node), e)| {
+                        !e.cc_map.is_empty()
+                            && filter_node.map_or(true, |n| n == *node)
+                            && filter_src.map_or(true, |s| s == *src)
+                    })
+                    .map(|(k, _)| *k)
+                    .collect();
+                let mut entries = Vec::with_capacity(keys.len());
+                for (src, node) in keys {
+                    let choices = self.node_param_choices(node);
+                    if let Some(e) = self.rule_edits.get(&(src, node)) {
+                        let bindings: Vec<_> = e.cc_map.iter().map(|m| {
+                            let name = choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.as_str());
+                            serde_json::json!({"cc": m.cc, "param": m.param, "name": name})
+                        }).collect();
+                        entries.push(serde_json::json!({
+                            "source": Self::source_str(src),
+                            "node": node,
+                            "bindings": bindings,
+                        }));
+                    }
+                }
+                serde_json::json!({
+                    "cc_maps": entries,
+                    "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
+                        "source": Self::source_str(l.source), "node": l.dest, "param": l.param,
+                    })),
+                }).to_string()
+            }
+            "list_params" => {
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+                    return "list_params needs 'node'".into();
+                };
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node}");
+                }
+                let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let words: Vec<&str> = q.split_whitespace().collect();
+                let choices = self.node_param_choices(node);
+                let total = choices.len();
+                let params: Vec<_> = choices.into_iter()
+                    .filter(|(_, name)| {
+                        let low = name.to_lowercase();
+                        words.iter().all(|w| low.contains(w))
+                    })
+                    .take(50)
+                    .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
+                    .collect();
+                serde_json::json!({"node": node, "total": total, "params": params}).to_string()
+            }
+            "learn_cc" => {
+                if args.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
+                    self.cc_learn = None;
+                    return serde_json::json!({"armed": false}).to_string();
+                }
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+                    return "learn_cc needs 'node'".into();
+                };
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node}");
+                }
+                let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("keys");
+                let src = match self.parse_rule_source(source) {
+                    Ok(s) => s,
+                    Err(e) => return e,
+                };
+                let Some(param) = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32) else {
+                    return "learn_cc needs 'param'".into();
+                };
+                self.cc_learn = Some(CcLearn { source: src, dest: node, param });
+                serde_json::json!({"armed": true, "node": node, "source": Self::source_str(src), "param": param}).to_string()
             }
             "set_rig_mix" => {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -3429,21 +3649,21 @@ impl DemoApp {
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
                     let node = self.units[s].node_id;
-                    let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).copied());
+                    let edit = row.source().and_then(|src| self.rule_edits.get(&(src, node)).cloned());
                     let shaped = edit.filter(|e| !e.is_default());
                     if on {
                         // Routed: teal fill + an in-cell code — "ALL" (every
                         // note passes) or the shaped rule's change ("+12",
                         // "ch 2", "keys", "vel"); explicit colors (rule 1).
                         p.rect_filled(cell, 2.0, theme::LIVE_TEAL);
-                        let code = shaped.map_or_else(|| "ALL".to_string(), |e| e.cell_code());
+                        let code = shaped.as_ref().map_or_else(|| "ALL".to_string(), |e| e.cell_code());
                         p.text(cell.center(), egui::Align2::CENTER_CENTER, code, theme::medium_font(12.5), theme::DARK_PANEL);
                     } else {
                         p.rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
                     }
                     // Shaped rule: the in-cell code says so (no extra accent
                         // dot — tomato stays CTA/selection-only); hover = summary.
-                    let resp = if let Some(e) = shaped {
+                    let resp = if let Some(e) = &shaped {
                         resp.on_hover_text(format!("rule: {}\nright-click to edit", e.summary()))
                     } else if row.source().is_some() {
                         resp.on_hover_text("click: route on/off · right-click: edit rule")
@@ -3474,19 +3694,136 @@ impl DemoApp {
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
     }
 
+    fn parse_rule_source(&self, source: &str) -> Result<SourceId, String> {
+        let row = match source {
+            "keys" | "keyboard" | "laptop" => MatrixRow::Keys,
+            s if s.starts_with("hw:") => match s[3..].parse::<u32>() {
+                Ok(d) => MatrixRow::HwDev(d),
+                Err(_) => return Err(format!("bad source '{source}'")),
+            },
+            _ => return Err(format!("unknown source '{source}' (keys|hw:<d>)")),
+        };
+        row.source().ok_or_else(|| "hw:all has no single rule — use hw:<d>".to_string())
+    }
+
+    fn source_str(src: SourceId) -> String {
+        match src {
+            SourceId::Keys => "keys".into(),
+            SourceId::Hardware(d) => format!("hw:{d}"),
+            other => format!("{other:?}"),
+        }
+    }
+
+    fn node_param_choices(&mut self, node_id: u32) -> Vec<(u32, String)> {
+        let Some(u_idx) = self.units.iter().position(|u| u.node_id == node_id) else {
+            return Vec::new();
+        };
+        match &self.units[u_idx].node_kind {
+            UnitKind::Clap => {
+                if let Some(slot) = self.rig_of_unit(u_idx) {
+                    if let Some(idx) = self.clap_pool_idx(slot) {
+                        if let Some(main) = self._surge_main.get_mut(idx) {
+                            return main
+                                .param_list()
+                                .into_iter()
+                                .filter(|p| p.automatable && !p.hidden && !p.readonly)
+                                .map(|p| {
+                                    let label = if p.module.is_empty() {
+                                        p.name
+                                    } else {
+                                        format!("{} / {}", p.module, p.name)
+                                    };
+                                    (p.id, label)
+                                })
+                                .collect();
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            UnitKind::Dsp(dk) => {
+                if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| &n.kind) {
+                    crate::lv2::control_descs_for_uri(uri.as_str())
+                        .into_iter()
+                        .map(|c| (c.index as u32, c.name))
+                        .collect()
+                } else {
+                    crate::engine::dsp_param_choices(dk)
+                        .iter()
+                        .map(|&(id, name)| (id, name.to_string()))
+                        .collect()
+                }
+            }
+            UnitKind::Master => vec![(P_VOL, "Volume".into()), (P_WARM, "Warmth".into())],
+            UnitKind::Keys => Vec::new(),
+        }
+    }
+
+    fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>) {
+        let cc = cc & 0x7F;
+        let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_default();
+        match param {
+            Some(p) => e.set_cc(cc, p),
+            None => e.unmap_cc(cc),
+        }
+        if e.is_default() {
+            self.rule_edits.remove(&(source, dest));
+        } else {
+            self.rule_edits.insert((source, dest), e);
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param });
+        }
+    }
+
+    fn complete_cc_learn(&mut self, incoming_src: SourceId, cc: u8) -> bool {
+        let Some(learn) = self.cc_learn.clone() else { return false };
+        let bind_src = match learn.source {
+            SourceId::Hardware(d) if incoming_src == SourceId::Hardware(d) => incoming_src,
+            SourceId::Hardware(_) => return false,
+            SourceId::Keys => incoming_src,
+            other if other == incoming_src => incoming_src,
+            _ => return false,
+        };
+        self.set_cc_binding(bind_src, learn.dest, cc, Some(learn.param));
+        if learn.source == SourceId::Keys {
+            if let SourceId::Hardware(d) = bind_src {
+                if let Some((unit, _)) = self.rule_editor {
+                    self.rule_editor = Some((unit, MatrixRow::HwDev(d)));
+                }
+            }
+        }
+        self.rule_cc_num = cc & 0x7F;
+        self.cc_learn = None;
+        true
+    }
+
     /// Per-cell rule editor (right-click a matrix cell), inline beside the
-    /// grid: channel filter, transpose, key/velocity ranges, enabled — sent
-    /// live as MatrixRule (the engine releases held notes on change).
+    /// grid: channel filter, transpose, key/velocity ranges, enabled, CC maps +
+    /// MIDI-learn — sent live as MatrixRule / MatrixCcMap.
     fn rule_editor_ui(&mut self, ui: &mut egui::Ui) {
         let Some((unit, row)) = self.rule_editor else { return };
-        let Some(src) = row.source() else { self.rule_editor = None; return };
-        let Some(u) = self.units.get(unit) else { self.rule_editor = None; return };
+        let Some(src) = row.source() else { self.rule_editor = None; self.cc_learn = None; return };
+        let Some(u) = self.units.get(unit) else { self.rule_editor = None; self.cc_learn = None; return };
         let node = u.node_id;
         let title = format!("{} → {}", row.label(), sentence_case(&u.name));
-        let mut edit = self.rule_edits.get(&(src, node)).copied().unwrap_or_default();
+        if self.rule_param_cache.as_ref().map(|(id, _)| *id) != Some(node) {
+            let choices = self.node_param_choices(node);
+            if let Some(&(first_id, _)) = choices
+                .iter()
+                .find(|(_, n)| n.to_lowercase().contains("cutoff"))
+                .or_else(|| choices.first())
+            {
+                self.rule_param_id = first_id;
+            }
+            self.rule_param_cache = Some((node, choices));
+        }
+        let mut edit = self.rule_edits.get(&(src, node)).cloned().unwrap_or_default();
         let mut close = false;
         let mut changed = false;
         let mut reset = false;
+        let mut add_cc: Option<(u8, u32)> = None;
+        let mut remove_ccs: Vec<u8> = Vec::new();
         ui.label(egui::RichText::new(title).font(theme::medium_font(15.0)).color(theme::INK));
         ui.add_space(2.0);
         ui.label(egui::RichText::new("shapes this route live · releases held notes on change")
@@ -3535,19 +3872,144 @@ impl DemoApp {
             ui.label(egui::RichText::new("–").size(12.0));
             if ui.add(egui::DragValue::new(&mut hi).range(0..=127)).changed() { edit.vel_hi = hi as u8; changed = true; }
         });
+        ui.add_space(6.0);
+        ui.separator();
         ui.add_space(4.0);
+        theme::section_label(ui, "CC Maps");
+        let cc_hint = if edit.cc_map.is_empty() {
+            "empty = all CCs pass through"
+        } else {
+            "whitelist active · unmapped CCs filtered"
+        };
+        ui.label(egui::RichText::new(cc_hint).size(11.0).color(theme::INK_2));
+        ui.add_space(4.0);
+        let choices = self.rule_param_cache.as_ref().map(|(_, c)| c.as_slice()).unwrap_or(&[]);
+        for m in &edit.cc_map {
+            let pname = choices
+                .iter()
+                .find(|(id, _)| *id == m.param)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| format!("Param {}", m.param));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
+                ui.label(egui::RichText::new("→").size(12.0).color(theme::INK_2));
+                let label_w = (ui.available_width() - 42.0).max(60.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(label_w, 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(pname).size(12.0).color(theme::INK)).truncate());
+                    },
+                );
+                if theme::chip_button(ui, "×", false).on_hover_text("remove this CC binding").clicked() {
+                    remove_ccs.push(m.cc);
+                }
+            });
+        }
+        if !choices.is_empty() {
+            ui.add_sized(
+                [ui.available_width() - 4.0, 20.0],
+                egui::TextEdit::singleline(&mut self.rule_param_filter).hint_text("filter param…"),
+            );
+            let words: Vec<String> = self.rule_param_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+            let selected_label = choices
+                .iter()
+                .find(|(id, _)| *id == self.rule_param_id)
+                .map(|(_, n)| n.as_str())
+                .unwrap_or("select param…");
+            egui::ComboBox::from_id_salt("rule_cc_param_pick")
+                .width((ui.available_width() - 4.0).max(160.0))
+                .selected_text(egui::RichText::new(selected_label).size(12.0).color(theme::INK))
+                .show_ui(ui, |ui| {
+                    let mut shown = 0usize;
+                    for (id, name) in choices {
+                        let low = name.to_lowercase();
+                        if !words.iter().all(|w| low.contains(w.as_str())) {
+                            continue;
+                        }
+                        if shown >= 80 {
+                            ui.label(egui::RichText::new("… refine filter").size(11.0).color(theme::INK_2));
+                            break;
+                        }
+                        shown += 1;
+                        ui.selectable_value(&mut self.rule_param_id, *id, egui::RichText::new(name).size(12.0).color(theme::INK));
+                    }
+                    if shown == 0 {
+                        ui.label(egui::RichText::new("no matching parameter").size(11.0).color(theme::INK_2));
+                    }
+                });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Param ID").size(12.0).color(theme::INK));
+                let mut pid = self.rule_param_id as i64;
+                if ui.add(egui::DragValue::new(&mut pid).range(0..=u32::MAX as i64)).changed() {
+                    self.rule_param_id = pid.max(0) as u32;
+                }
+            });
+        }
+        ui.add_space(4.0);
+        let learning_here = self.cc_learn.as_ref().is_some_and(|l| l.source == src && l.dest == node);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("CC").size(12.0).color(theme::INK));
+            let mut cc_i = self.rule_cc_num as i32;
+            if ui.add(egui::DragValue::new(&mut cc_i).range(0..=127)).changed() {
+                self.rule_cc_num = cc_i.clamp(0, 127) as u8;
+            }
+            if theme::chip_button(ui, "Add", false)
+                .on_hover_text("bind this CC number to the chosen parameter")
+                .clicked()
+            {
+                add_cc = Some((self.rule_cc_num, self.rule_param_id));
+            }
+            if learning_here {
+                if theme::primary_button(ui, "Learning…")
+                    .on_hover_text("move a hardware knob to bind it (click or Esc to cancel)")
+                    .clicked()
+                {
+                    self.cc_learn = None;
+                }
+            } else if theme::chip_button(ui, "Learn", false)
+                .on_hover_text("arm MIDI-learn: the next hardware CC binds to the chosen parameter")
+                .clicked()
+            {
+                self.cc_learn = Some(CcLearn { source: src, dest: node, param: self.rule_param_id });
+            }
+        });
+        if learning_here {
+            ui.label(egui::RichText::new("Move a hardware knob to bind… (Esc cancels)")
+                .size(11.0).color(theme::ACCENT_BRIGHT));
+        }
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             if theme::chip_button(ui, "Reset rule", false).clicked() { reset = true; }
             ui.add_space(6.0);
             if theme::chip_button(ui, "Close", false).on_hover_text("close the rule editor (Esc)").clicked() { close = true; }
         });
-        if close { self.rule_editor = None; }
-        if reset { edit = RuleEdit::default(); changed = true; }
+        if close {
+            self.rule_editor = None;
+            self.cc_learn = None;
+        }
+        if reset {
+            let old_ccs: Vec<u8> = edit.cc_map.iter().map(|m| m.cc).collect();
+            for cc in old_ccs {
+                self.set_cc_binding(src, node, cc, None);
+            }
+            edit = RuleEdit::default();
+            changed = true;
+            self.cc_learn = None;
+        }
+        for cc in remove_ccs {
+            self.set_cc_binding(src, node, cc, None);
+        }
+        if let Some((cc, param)) = add_cc {
+            self.set_cc_binding(src, node, cc, Some(param));
+        }
         if changed {
+            let cmd = edit.to_command(src, node);
             if edit.is_default() { self.rule_edits.remove(&(src, node)); }
             else { self.rule_edits.insert((src, node), edit); }
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(edit.to_command(src, node));
+                let _ = bus.lock().unwrap().send(cmd);
             }
         }
     }
@@ -3586,7 +4048,14 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
-                "load_sound" | "list_sounds" => self.exec_tool(&tool, &args),
+                "load_sound"
+                | "list_sounds"
+                | "list_params"
+                | "list_cc_maps"
+                | "set_cc_map"
+                | "clear_cc_map"
+                | "learn_cc"
+                | "get_matrix" => self.exec_tool(&tool, &args),
                 other => format!("tool '{other}' is not served over the UI bridge"),
             };
             let _ = reply.send(out);
@@ -5400,6 +5869,7 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.pending.is_some() { self.pending = None; }
+                else if self.show_matrix && self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.show_matrix && self.rule_editor.is_some() { self.rule_editor = None; }
                 else if self.show_matrix { self.show_matrix = false; }
                 else if self.show_mixer { self.show_mixer = false; }
@@ -5861,7 +6331,7 @@ impl DemoApp {
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(12.0);
-                let editor_w = if self.rule_editor.is_some() { 290.0 } else { 0.0 };
+                let editor_w = if self.rule_editor.is_some() { 320.0 } else { 0.0 };
                 let h = ui.available_height();
                 ui.horizontal_top(|ui| {
                     let gap = if editor_w > 0.0 { 25.0 } else { 0.0 };
@@ -5894,7 +6364,13 @@ impl DemoApp {
                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                         ui.add_space(12.0);
                         ui.allocate_ui_with_layout(egui::vec2(editor_w, h), egui::Layout::top_down(egui::Align::Min), |ui| {
-                            self.rule_editor_ui(ui);
+                            egui::ScrollArea::vertical()
+                                .id_salt("rule_editor_scroll")
+                                .max_height(h)
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    self.rule_editor_ui(ui);
+                                });
                         });
                     }
                 });
@@ -7176,6 +7652,17 @@ impl DemoApp {
             self.current_source = ev.source;
             self.fire_keys_with(semi, ev.velocity, !sounded);
         }
+        let hw_ccs: Vec<(SourceId, u8, u8, u8)> = self
+            .hw_cc_queue
+            .lock()
+            .map(|mut q| q.drain(..).collect())
+            .unwrap_or_default();
+        for (src, _ch, cc, _val) in hw_ccs {
+            if let SourceId::Hardware(d) = src {
+                if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
+            }
+            self.complete_cc_learn(src, cc);
+        }
 
         let rect = ui.available_rect_before_wrap();
         let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
@@ -8077,7 +8564,7 @@ mod matrix_ui_tests {
         let mut app = demo_app();
         let out = app.exec_tool("set_matrix_rule", &serde_json::json!({"node": 1, "source": "keys", "key_hi": 59, "transpose": -12}));
         assert!(out.contains("-12 st"), "{out}");
-        let e = app.rule_edits[&(SourceId::Keys, 1)];
+        let e = app.rule_edits[&(SourceId::Keys, 1)].clone();
         assert_eq!(e.key_hi, 59);
         assert_eq!(e.transpose, -12);
         // get_matrix reports the edit.
@@ -8664,11 +9151,11 @@ mod rig_switch_tests {
     fn matrix_cells_name_their_rule() {
         let base = RuleEdit::default();
         assert_eq!(base.cell_code(), "ALL");
-        assert_eq!(RuleEdit { transpose: 12, ..base }.cell_code(), "+12");
-        assert_eq!(RuleEdit { transpose: -5, ..base }.cell_code(), "-5");
-        assert_eq!(RuleEdit { channel: Some(1), ..base }.cell_code(), "ch 2");
-        assert_eq!(RuleEdit { key_lo: 0, key_hi: 59, ..base }.cell_code(), "keys");
-        assert_eq!(RuleEdit { vel_lo: 40, ..base }.cell_code(), "vel");
+        assert_eq!(RuleEdit { transpose: 12, ..base.clone() }.cell_code(), "+12");
+        assert_eq!(RuleEdit { transpose: -5, ..base.clone() }.cell_code(), "-5");
+        assert_eq!(RuleEdit { channel: Some(1), ..base.clone() }.cell_code(), "ch 2");
+        assert_eq!(RuleEdit { key_lo: 0, key_hi: 59, ..base.clone() }.cell_code(), "keys");
+        assert_eq!(RuleEdit { vel_lo: 40, ..base.clone() }.cell_code(), "vel");
         assert_eq!(RuleEdit { enabled: false, transpose: 12, ..base }.cell_code(), "off", "a muted rule says so first");
     }
 
@@ -9826,5 +10313,80 @@ mod split_bpm_tests {
         assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
         frame(&mut app, &ctx, vec![]);
         assert!(!app.dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
+    }
+
+    #[test]
+    fn sync_mirrors_remote_cc_maps() {
+        let mut app = DemoApp::new_with_sink(None);
+        let remote_rule = crate::matrix::Rule::new(SourceId::Hardware(0), 1).map_cc(74, 42);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub {
+            rev: 1,
+            graph: app.base_graph.clone(),
+            rules: vec![remote_rule],
+            ..Default::default()
+        }));
+        app.graph_pub = Some(pub_);
+        app.sync_from_engine();
+        let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("remote cc_map mirrored");
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42 }]);
+        assert_eq!(e.cell_code(), "1 CC");
+    }
+
+    #[test]
+    fn cc_learn_binds_next_hardware_cc() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let out = app.exec_tool("learn_cc", &serde_json::json!({"node": 1, "source": "hw:0", "param": 123}));
+        assert!(out.contains("\"armed\":true"), "{out}");
+        assert!(app.cc_learn.is_some());
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 100));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "MIDI-learn disarms after binding");
+        let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("learned binding stored");
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123 }]);
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123) })));
+    }
+
+    #[test]
+    fn cc_tools_parity_and_roundtrip() {
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        for t in ["set_cc_map", "clear_cc_map", "list_cc_maps", "list_params", "learn_cc"] {
+            assert!(names.contains(&t), "assistant schema missing {t}");
+        }
+        let (mut app, _ctx) = demo();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let r = app.exec_tool("set_cc_map", &serde_json::json!({"node": 1, "source": "keys", "cc": 74, "param": 55}));
+        assert!(r.contains("\"cc\":74") && r.contains("\"param\":55"), "{r}");
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("list_cc_maps", &serde_json::json!({}))).unwrap();
+        assert_eq!(listed["cc_maps"][0]["bindings"][0]["cc"], serde_json::json!(74));
+        let mat: serde_json::Value = serde_json::from_str(&app.exec_tool("get_matrix", &serde_json::json!({}))).unwrap();
+        assert_eq!(mat["rule_edits"][0]["cc_map"][0]["param"], serde_json::json!(55));
+        let dsp_params: serde_json::Value = serde_json::from_str(&app.exec_tool("list_params", &serde_json::json!({"node": 2}))).unwrap();
+        assert_eq!(dsp_params["params"][0]["name"], serde_json::json!("Time"));
+        app.exec_tool("clear_cc_map", &serde_json::json!({"node": 1, "source": "keys"}));
+        assert!(!app.rule_edits.contains_key(&(SourceId::Keys, 1)));
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { dest: 1, cc: 74, param: None, .. })));
+    }
+
+    #[test]
+    fn rule_editor_paints_cc_maps_and_learn() {
+        let (mut app, ctx) = demo();
+        let inst = app.matrix_sinks()[0];
+        let node = app.units[inst].node_id;
+        app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "keys", "cc": 74, "param": 7}));
+        app.show_matrix = true;
+        app.rule_editor = Some((inst, MatrixRow::Keys));
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.contains("whitelist active")), "CC Maps hint painted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Add") && texts.iter().any(|t| t == "Learn"), "Add/Learn buttons painted: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains("74")), "CC 74 binding painted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "1 CC"), "Matrix cell reflects 1 CC: {texts:?}");
     }
 }

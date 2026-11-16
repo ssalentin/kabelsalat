@@ -1310,6 +1310,23 @@ enum PluginCategory {
     Clap,
     Lv2,
     BuiltIn,
+    /// The instrument browser's installable catalog (issue #10).
+    Install,
+}
+
+/// One progress event from an install worker thread.
+enum InstallEvent {
+    Log(String),
+    Done(Result<(), String>),
+}
+
+/// State of the running (or last-finished) instrument install.
+struct InstallState {
+    id: String,
+    rx: Option<std::sync::mpsc::Receiver<InstallEvent>>,
+    log: Vec<String>,
+    running: bool,
+    error: Option<String>,
 }
 
 enum Drag {
@@ -1388,6 +1405,13 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
         || matches!(name, "record_status" | "measure_mix" | "undo" | "redo")
+}
+
+/// Tools that change the machine, not the patch: no agent undo snapshot (an
+/// install never touches the graph/session), but still a mutation for the
+/// agent-paused gate (the bridge treats them as changing, not read-only).
+fn tool_changes_only_system(name: &str) -> bool {
+    name == "install_instrument"
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1568,6 +1592,11 @@ struct DemoApp {
     plugin_filter: String,
     plugin_category: PluginCategory,
     plugin_msg: String,
+    /// Instrument-browser install (issue #10): the running/last worker.
+    install: Option<InstallState>,
+    /// Test-only override of the bundle-probe roots (None = real home + system
+    /// dirs), so catalog "installed" assertions never depend on this machine.
+    catalog_roots: Option<Vec<std::path::PathBuf>>,
     fps: f32,
     stats_timer: f32,
     stats_line: String,
@@ -1898,6 +1927,8 @@ impl DemoApp {
             plugin_filter: String::new(),
             plugin_category: PluginCategory::All,
             plugin_msg: String::new(),
+            install: None,
+            catalog_roots: None,
             fps: 60.0,
             stats_timer: 0.0,
             stats_line: String::new(),
@@ -3749,7 +3780,7 @@ impl DemoApp {
 
     fn exec_tool_with_origin(&mut self, name: &str, args: &serde_json::Value, origin: AgentOrigin) -> String {
         let now = self.ui_time;
-        if !tool_is_read_only(name) { self.note_agent_change(origin); }
+        if !tool_is_read_only(name) && !tool_changes_only_system(name) { self.note_agent_change(origin); }
         match name {
             "undo" => return self.undo_agent_tool(true),
             "redo" => return self.undo_agent_tool(false),
@@ -4366,6 +4397,48 @@ impl DemoApp {
                     s.push_str(&format!("  {}{} — {}\n", p.name, kind, p.uri));
                 }
                 s
+            }
+            "list_instruments" => {
+                let installing_id = self.install.as_ref().map(|i| i.id.clone());
+                let entries: Vec<serde_json::Value> = crate::catalog::CATALOG
+                    .iter()
+                    .map(|e| {
+                        let inst = self.catalog_installed(e);
+                        let (route, pkg) = match e.route {
+                            crate::catalog::InstallRoute::DistroPackage { pkg } => ("distro", Some(pkg)),
+                            crate::catalog::InstallRoute::Source { repo, .. } => ("source", Some(repo)),
+                        };
+                        serde_json::json!({
+                            "id": e.id,
+                            "name": e.name,
+                            "format": e.format.label(),
+                            "description": e.description,
+                            "repo": e.repo,
+                            "route": route,
+                            "pkg_or_repo": pkg,
+                            "installed": inst,
+                            "installing": installing_id.as_deref() == Some(e.id),
+                            "url": crate::catalog::repo_url(e.repo),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({ "instruments": entries }).to_string()
+            }
+            "install_instrument" => {
+                let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    return "install_instrument needs 'id' (from list_instruments)".into();
+                }
+                if args.get("confirm").and_then(|v| v.as_bool()) != Some(true) {
+                    return format!("not installed: installing '{id}' changes the system — ask the user first, then call install_instrument with confirm=true (id '{id}')");
+                }
+                match self.start_install(id) {
+                    Ok(()) => {
+                        self.plugin_msg = format!("Installing '{id}' — see the log below");
+                        format!("installing '{id}' (see the Plugins view for the live log)")
+                    }
+                    Err(e) => format!("install failed to start: {e}"),
+                }
             }
             "transport_play" => {
                 if !self.playing {
@@ -6816,6 +6889,111 @@ impl DemoApp {
         }
     }
 
+    /// Distill the installed-plugin scan into the catalog's `ScanSet` (owned,
+    /// so `catalog` stays free of `host`/`lv2` types).
+    fn catalog_scan(&self) -> crate::catalog::ScanSet {
+        crate::catalog::ScanSet {
+            clap_ids: self.plugins_clap.iter().map(|p| p.id.clone()).collect(),
+            lv2_uris: self.plugins_lv2.iter().map(|p| p.uri.clone()).collect(),
+        }
+    }
+
+    /// Bundle-probe roots: the test override when set, else the real home +
+    /// system dirs.
+    fn catalog_root_paths(&self) -> Vec<std::path::PathBuf> {
+        self.catalog_roots.clone()
+            .unwrap_or_else(|| crate::catalog::plugin_roots(&crate::catalog::home_dir()))
+    }
+
+    /// Is a catalog entry installed (scan evidence OR a bundle path on disk)?
+    fn catalog_installed(&self, entry: &crate::catalog::CatalogEntry) -> bool {
+        let roots = self.catalog_root_paths();
+        let root_refs: Vec<&std::path::Path> = roots.iter().map(|p| p.as_path()).collect();
+        crate::catalog::installed(entry, &self.catalog_scan(), &root_refs)
+    }
+
+    /// Start installing a catalog instrument on a worker thread (rule 46:
+    /// never pacman/git/cmake on the UI thread). Streams a log the Plugins
+    /// view shows; a finished install triggers a plugin rescan.
+    fn start_install(&mut self, id: &str) -> Result<(), String> {
+        let entry = crate::catalog::find(id).ok_or_else(|| format!("no catalog instrument '{id}' (see list_instruments)"))?;
+        if let Some(inst) = &self.install {
+            if inst.running {
+                return Err(format!("'{}' is already installing — wait for it to finish", inst.id));
+            }
+        }
+        let cache = crate::catalog::cache_root();
+        let home = crate::catalog::home_dir();
+        if cfg!(test) {
+            // Tests never run subprocesses (rules 37/48): record the request.
+            // `poll_install` then deactivates it, so a later frame is idle.
+            self.install = Some(InstallState {
+                id: id.to_string(),
+                rx: None,
+                log: vec![format!("(test) would install '{}' — no subprocess runs here", id)],
+                running: true,
+                error: None,
+            });
+            return Ok(());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_id = id.to_string();
+        std::thread::Builder::new()
+            .name(format!("kabelsalat-install-{thread_id}"))
+            .spawn(move || {
+                let mut log = |line: String| { let _ = tx.send(InstallEvent::Log(line)); };
+                let res = crate::catalog::run_install(entry, &cache, &home, &mut log);
+                let _ = tx.send(InstallEvent::Done(res));
+            })
+            .map_err(|e| format!("spawn install: {e}"))?;
+        self.install = Some(InstallState {
+            id: id.to_string(),
+            rx: Some(rx),
+            log: Vec::new(),
+            running: true,
+            error: None,
+        });
+        Ok(())
+    }
+
+    /// Adopt install-worker progress (cheap; called every frame). On success or
+    /// failure the worker is dropped and a plugin rescan picks up new bundles.
+    fn poll_install(&mut self) {
+        let Some(inst) = &mut self.install else { return };
+        let mut done: Option<Result<(), String>> = None;
+        if let Some(rx) = &inst.rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(InstallEvent::Log(line)) => inst.log.push(line),
+                    Ok(InstallEvent::Done(res)) => { done = Some(res); break; }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done = Some(Err("install worker stopped without a result".into()));
+                        break;
+                    }
+                }
+            }
+        } else if inst.running && cfg!(test) {
+            // The test-stub install finishes on the next poll.
+            done = Some(Ok(()));
+        }
+        if let Some(res) = done {
+            inst.rx = None;
+            inst.running = false;
+            match res {
+                Ok(()) => {}
+                Err(e) => inst.error = Some(e),
+            }
+            let keep = 64;
+            if inst.log.len() > keep {
+                let drain = inst.log.len() - keep;
+                inst.log.drain(..drain);
+            }
+            // Rule 46: rescan off-thread so a fresh setBfree/YANES shows up.
+            self.start_plugin_scan(true);
+        }
+    }
+
     /// The proven LV2 effect chain: Keys → Surge → <lv2> → Master (+ dry path).
     /// Mirrors engine::lv2_engine_test.
     fn build_lv2_chain_graph(uri: &str, name: &str) -> Graph {
@@ -6933,6 +7111,28 @@ impl DemoApp {
             });
     }
 
+    /// A taller [`plugin_card`] for catalog entries: name, one-line
+    /// description, repo link and an Install button / Installed badge.
+    fn catalog_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
+        let inner_w = (width - 30.0).max(160.0);
+        egui::Frame::new()
+            .fill(theme::DARK_PANEL_HI)
+            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner_w, 118.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(inner_w);
+                        ui.set_min_height(118.0);
+                        body(ui, inner_w);
+                    },
+                );
+            });
+    }
+
     /// Main-stage plugin browser (one-window rule, F9 / B / Plugins chip).
     fn plugins_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
@@ -6979,6 +7179,7 @@ impl DemoApp {
                         (PluginCategory::BuiltIn, "Built-in (1)".to_string()),
                         (PluginCategory::Clap, format!("CLAP ({})", self.plugins_clap.len())),
                         (PluginCategory::Lv2, format!("LV2 ({})", self.plugins_lv2.len())),
+                        (PluginCategory::Install, format!("Install ({})", crate::catalog::CATALOG.len())),
                     ] {
                         if theme::chip_button(ui, &label, self.plugin_category == cat).clicked() {
                             self.plugin_category = cat;
@@ -7016,6 +7217,7 @@ impl DemoApp {
                 let mut add_metro = false;
                 let mut add_clap: Option<(String, String)> = None;
                 let mut add_lv2: Option<(String, String, bool)> = None;
+                let mut install_request: Option<String> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("plugins_scroll")
@@ -7027,6 +7229,122 @@ impl DemoApp {
                         let gap = 12.0;
                         let cols = ((avail_w + gap) / 340.0).floor().clamp(1.0, 3.0) as usize;
                         let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
+
+                        if self.plugin_category == PluginCategory::Install {
+                            let roots_raw = self.catalog_root_paths();
+                            let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
+                            let scan = self.catalog_scan();
+                            let matches: Vec<&crate::catalog::CatalogEntry> = crate::catalog::CATALOG
+                                .iter()
+                                .filter(|e| {
+                                    filter.is_empty()
+                                        || e.name.to_lowercase().contains(&filter)
+                                        || e.description.to_lowercase().contains(&filter)
+                                        || e.id.to_lowercase().contains(&filter)
+                                        || e.repo.to_lowercase().contains(&filter)
+                                })
+                                .collect();
+
+                            theme::section_label(ui, &format!("Install from the catalog ({})", matches.len()));
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Hand-picked instruments from GitHub — a distro package where one exists, else built into ~/.clap or ~/.lv2")
+                                    .size(12.0)
+                                    .color(theme::INK_2),
+                            );
+                            ui.add_space(10.0);
+
+                            if let Some(inst) = &self.install {
+                                if !inst.log.is_empty() {
+                                    Self::stage_hairline(ui);
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        theme::section_label(ui, "Install log");
+                                        if let Some(err) = &inst.error {
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new(err).size(11.5).color(theme::CLIP_BRIGHT));
+                                        } else if inst.running {
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new("running…").size(11.5).color(theme::AGENT_COLOR));
+                                        } else {
+                                            ui.add_space(8.0);
+                                            ui.label(egui::RichText::new("done — plugins rescanned").size(11.5).color(theme::LIVE_TEAL));
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    let tail = inst.log.iter().rev().take(10).rev().cloned().collect::<Vec<_>>();
+                                    let body = if tail.is_empty() { "…".to_string() } else { tail.join("\n") };
+                                    ui.label(egui::RichText::new(body).size(11.0).monospace().color(theme::INK_2));
+                                    ui.add_space(10.0);
+                                }
+                            }
+
+                            if matches.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(egui::RichText::new("No catalog entries match.").size(13.0).color(theme::INK_2));
+                                return;
+                            }
+
+                            for row in matches.chunks(cols) {
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap;
+                                    for e in row {
+                                        let is_inst = crate::catalog::installed(e, &scan, &roots);
+                                        let active = self.install.as_ref().filter(|i| i.id == e.id);
+                                        let running = active.is_some_and(|i| i.running);
+                                        let failed = active.and_then(|i| i.error.as_deref());
+                                        Self::catalog_card(ui, card_w, |ui, iw| {
+                                            ui.horizontal(|ui| {
+                                                ui.set_width(iw);
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    theme::tracked_label(ui, e.format.label(), 9.5, 0.12, theme::ACCENT_BRIGHT);
+                                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(e.name)
+                                                                    .font(theme::medium_font(14.0))
+                                                                    .color(theme::INK),
+                                                            )
+                                                            .truncate(),
+                                                        );
+                                                    });
+                                                });
+                                            });
+                                            ui.add_space(4.0);
+                                            ui.add(
+                                                egui::Label::new(egui::RichText::new(e.description).size(12.0).color(theme::INK_2))
+                                                    .truncate(),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!("github.com/{}", e.repo))
+                                                        .size(11.0)
+                                                        .color(theme::MIDI_BLUE),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(crate::catalog::repo_url(e.repo));
+                                            ui.add_space(10.0);
+                                            if is_inst {
+                                                ui.label(egui::RichText::new("Installed").size(11.0).color(theme::LIVE_TEAL));
+                                            } else if running {
+                                                ui.label(egui::RichText::new("Installing…").size(12.0).color(theme::AGENT_COLOR));
+                                            } else if let Some(err) = failed {
+                                                ui.label(egui::RichText::new("Install failed").size(12.0).color(theme::CLIP_BRIGHT))
+                                                    .on_hover_text(err);
+                                            } else if theme::primary_button(ui, "Install")
+                                                .on_hover_text(crate::catalog::repo_url(e.repo))
+                                                .clicked()
+                                            {
+                                                install_request = Some(e.id.to_string());
+                                            }
+                                        });
+                                    }
+                                });
+                                ui.add_space(gap);
+                            }
+                            return;
+                        }
 
                         let show_builtin = matches!(self.plugin_category, PluginCategory::All | PluginCategory::BuiltIn)
                             && (filter.is_empty() || "metronome".contains(&filter) || "tempo tap count-in".contains(&filter));
@@ -7217,6 +7535,11 @@ impl DemoApp {
                         self.add_lv2_instrument(&uri, &name);
                     } else {
                         self.add_lv2_effect(&uri, &name);
+                    }
+                }
+                if let Some(id) = install_request {
+                    if let Err(e) = self.start_install(&id) {
+                        self.plugin_msg = format!("Install: {e}");
                     }
                 }
             });
@@ -11236,7 +11559,8 @@ impl DemoApp {
         self.serve_ui_inbox();
         self.sync_from_engine();
         self.poll_plugin_scan();
-        if self.plugin_scan.is_some() {
+        self.poll_install();
+        if self.plugin_scan.is_some() || self.install.as_ref().is_some_and(|i| i.running) {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -13905,6 +14229,70 @@ mod split_bpm_tests {
 
     fn out_labels(app: &DemoApp) -> Vec<&'static str> {
         app.units[keys(app)].jacks.iter().filter(|j| j.dir == Dir::Out).map(|j| j.label).collect()
+    }
+
+    #[test]
+    fn instrument_catalog_parity_and_confirm_gate() {
+        // Rule 6/23: both tools exist in the schema AND exec_tool; installing is
+        // confirm-gated and surfaces through list_instruments.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(names.contains(&"list_instruments"), "schema has list_instruments");
+        assert!(names.contains(&"install_instrument"), "schema has install_instrument");
+
+        let (mut app, _ctx) = demo();
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: SURGE_ID.into(), name: "Surge XT".into(), vendor: "Surge Synth Team".into(), features: vec!["instrument".into()],
+        }];
+        app.catalog_roots = Some(vec![]); // machine-independent: only scan evidence
+
+        assert!(app.catalog_installed(crate::catalog::find("surge-xt").unwrap()), "surge-xt detected from the CLAP scan");
+        assert!(!app.catalog_installed(crate::catalog::find("setbfree").unwrap()), "empty roots + no scan URI = not installed");
+
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("list_instruments", &serde_json::json!({}))).unwrap();
+        let instruments = v["instruments"].as_array().unwrap();
+        assert_eq!(instruments.len(), 5);
+        let surge = instruments.iter().find(|e| e["id"] == "surge-xt").unwrap();
+        assert_eq!(surge["installed"], serde_json::json!(true));
+        assert_eq!(surge["format"], serde_json::json!("CLAP"));
+        let yanes = instruments.iter().find(|e| e["id"] == "yanes").unwrap();
+        assert_eq!(yanes["route"], serde_json::json!("source"));
+        assert_eq!(yanes["url"], serde_json::json!("https://github.com/andrewfader/yanes"));
+
+        // Refused without confirm, nothing starts.
+        let r = app.exec_tool("install_instrument", &serde_json::json!({"id": "setbfree"}));
+        assert!(r.starts_with("not installed"), "{r}");
+        assert!(app.install.is_none(), "refused install starts nothing");
+        // Accepted with confirm.
+        let r = app.exec_tool("install_instrument", &serde_json::json!({"id": "setbfree", "confirm": true}));
+        assert!(r.contains("installing 'setbfree'"), "{r}");
+        assert!(app.install.as_ref().unwrap().running, "test-stub install runs");
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("list_instruments", &serde_json::json!({}))).unwrap();
+        assert_eq!(v["instruments"].as_array().unwrap().iter().find(|e| e["id"] == "setbfree").unwrap()["installing"], serde_json::json!(true));
+        // A second install is refused while one runs; an unknown id errors.
+        assert!(app.exec_tool("install_instrument", &serde_json::json!({"id": "yanes", "confirm": true})).contains("already installing"));
+        assert!(app.exec_tool("install_instrument", &serde_json::json!({"id": "nope", "confirm": true})).contains("no catalog instrument"));
+    }
+
+    #[test]
+    fn instrument_catalog_renders_install_cards_in_stage() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: SURGE_ID.into(), name: "Surge XT".into(), vendor: "Surge Synth Team".into(), features: vec!["instrument".into()],
+        }];
+        app.catalog_roots = Some(vec![]); // only Surge XT reads as installed
+        app.stage_view = StageView::Plugins;
+        app.plugin_category = PluginCategory::Install;
+        let ctx = egui::Context::default();
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let texts = frame(&mut app, &ctx, vec![]);
+        for name in ["setBfree", "Surge XT", "Dexed", "Vitalium", "YANES"] {
+            assert!(texts.iter().any(|t| t == name), "catalog shows {name}: {texts:?}");
+        }
+        assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
     }
 
     #[test]

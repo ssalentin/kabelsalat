@@ -137,6 +137,16 @@ struct DeleteRigArgs {
     confirm: bool,
 }
 
+/// Arguments for `install_instrument`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct InstallInstrumentArgs {
+    /// Catalog instrument id (see list_instruments): setbfree, surge-xt,
+    /// dexed, vitalium, yanes.
+    id: String,
+    /// Must be true: installing changes the user's system.
+    confirm: bool,
+}
+
 /// Arguments for `remove_node`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemoveNodeArgs {
@@ -1713,6 +1723,57 @@ impl McpServer {
         ok_json(json!({"clap": clap_json, "lv2_count": lv2.len(), "lv2": lv2_json}))
     }
 
+    /// List the built-in instrument catalog with installed/running state.
+    #[tool(name = "list_instruments", description = "List the built-in instrument catalog (setBfree, Surge XT, Dexed, Vitalium, YANES): id, format (CLAP/LV2), description, GitHub repo, install route (distro package or build-from-source) and whether each is installed. Attached mode reports the live app's installed/running state; headless mode uses on-disk bundle detection.")]
+    fn list_instruments(&self) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("list_instruments", json!({}));
+        }
+        // Headless: filesystem-only detection (a lilv/clack scan is heavy and
+        // this module must stay scannable without one — rules 48/57).
+        let home = crate::catalog::home_dir();
+        let roots_raw = crate::catalog::plugin_roots(&home);
+        let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
+        let scan = crate::catalog::ScanSet::default();
+        let entries: Vec<Value> = crate::catalog::CATALOG
+            .iter()
+            .map(|e| {
+                let (route, pkg_or_repo) = match e.route {
+                    crate::catalog::InstallRoute::DistroPackage { pkg } => ("distro", Some(pkg)),
+                    crate::catalog::InstallRoute::Source { repo, .. } => ("source", Some(repo)),
+                };
+                json!({
+                    "id": e.id,
+                    "name": e.name,
+                    "format": e.format.label(),
+                    "description": e.description,
+                    "repo": e.repo,
+                    "route": route,
+                    "pkg_or_repo": pkg_or_repo,
+                    "installed": crate::catalog::installed(e, &scan, &roots),
+                    "installing": false,
+                    "url": crate::catalog::repo_url(e.repo),
+                })
+            })
+            .collect();
+        ok_json(json!({"instruments": entries}))
+    }
+
+    /// Install a catalog instrument (destructive: requires confirm, and the
+    /// running app which owns the install worker + log + rescan).
+    #[tool(name = "install_instrument", description = "Install a catalog instrument (from list_instruments): a distro package via sudo pacman, or a build from GitHub source into ~/.clap / ~/.lv2. DESTRUCTIVE: requires confirm=true after asking the user. Runs in the background in the GUI app (live log + plugin rescan), so it needs the running app (kabelsalat mcp --attach).")]
+    fn install_instrument(&self, Parameters(args): Parameters<InstallInstrumentArgs>) -> Result<CallToolResult, McpError> {
+        if !args.confirm {
+            return tool_err("not installed: pass confirm=true (ask the user first — installing changes the system)");
+        }
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("install_instrument", json!({"id": args.id, "confirm": true}));
+        }
+        tool_err("install_instrument needs the running app (kabelsalat mcp --attach) — installs run in the GUI app")
+    }
+
     /// Press a key.
     #[tool(name = "note_on", description = "Send a note-on (Command::NoteOn) to every instrument wired from the keys node that accepts the source. note 0..=127, velocity 0..1 (default 0.8), source default 'keys'.")]
     fn note_on(&self, Parameters(args): Parameters<NoteOnArgs>) -> Result<CallToolResult, McpError> {
@@ -2216,6 +2277,22 @@ mod tests {
             tool_router: McpServer::tool_router(),
         };
         (server, engine)
+    }
+
+    #[test]
+    fn install_instrument_confirm_gate_refuses_without_confirm() {
+        let (server, _engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        let args = |v: Value| -> InstallInstrumentArgs { serde_json::from_value(v).unwrap() };
+        assert!(is_err(server.install_instrument(Parameters(args(json!({"id": "setbfree", "confirm": false}))))),
+            "install without confirm is refused (rule 23)");
+        // Headless MCP has no running app; even a confirmed install is refused,
+        // never a local pacman/git subprocess on the server thread.
+        assert!(is_err(server.install_instrument(Parameters(args(json!({"id": "setbfree", "confirm": true}))))),
+            "headless install (no running app) is refused even with confirm");
     }
 
     #[test]

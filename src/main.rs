@@ -52,6 +52,13 @@ fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: kabelsalat send '<json>' (e.g. '{{\"op\":\"query\",\"name\":\"get_graph\"}}')"))?;
             bridge::cli_send(&payload)
         }
+        "scan-clap" => {
+            let path = std::env::args_os()
+                .nth(2)
+                .ok_or_else(|| anyhow::anyhow!("usage: kabelsalat scan-clap <bundle-path>"))?;
+            host::run_scan_clap(std::path::Path::new(&path))
+        }
+        "clap-scan-test" => host::run_clap_scan_test(),
         "session-test" => ui::run_session_test(),
         "capture-test" => capture::run_test(),
         "player-test" => player::run_test(),

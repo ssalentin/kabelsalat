@@ -26,7 +26,7 @@
 use std::cell::Cell;
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1034,7 +1034,7 @@ fn discover_surge() -> Result<(PluginEntry, CString)> {
 }
 
 /// Metadata for an installed CLAP plugin (for the plugin browser).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClapPluginInfo {
     pub id: String,
     pub name: String,
@@ -1438,29 +1438,425 @@ pub fn load_dexed_patch(main: &mut ClapVoiceMain, patch: &DexedPatch) -> Result<
     main.load_state(&new_state)
 }
 
-pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
+const CLAP_SCAN_PARALLELISM: usize = 4;
+const CLAP_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAP_SCAN_CACHE_VERSION: u32 = 1;
+static SCAN_CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BundleStamp {
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    size: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedBundle {
+    #[serde(flatten)]
+    stamp: BundleStamp,
+    plugins: Vec<ClapPluginInfo>,
+    /// Why this exact bundle failed to scan. A broken bundle is not rescanned
+    /// (and its timeout not paid again) until its file changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClapScanCache {
+    version: u32,
+    entries: std::collections::BTreeMap<String, CachedBundle>,
+}
+
+impl Default for ClapScanCache {
+    fn default() -> Self {
+        Self {
+            version: CLAP_SCAN_CACHE_VERSION,
+            entries: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ScannerCommand {
+    #[cfg_attr(test, allow(dead_code))]
+    CurrentExe,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Custom { program: PathBuf, args: Vec<String> },
+    #[cfg(test)]
+    InProcess,
+}
+
+impl ScannerCommand {
+    fn default_for_process() -> Self {
+        #[cfg(test)]
+        {
+            // Under `cargo test`, `current_exe()` is the libtest harness, which ignores `scan-clap`.
+            Self::InProcess
+        }
+        #[cfg(not(test))]
+        {
+            Self::CurrentExe
+        }
+    }
+}
+
+fn bundle_stamp(path: &std::path::Path) -> Option<BundleStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    let (mtime_secs, mtime_nanos) = match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            (-(d.as_secs() as i64), d.subsec_nanos())
+        }
+    };
+    Some(BundleStamp {
+        mtime_secs,
+        mtime_nanos,
+        size: meta.len(),
+    })
+}
+
+fn clap_scan_cache_path_from(
+    xdg_cache_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_cache_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.filter(|v| !v.is_empty()).map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("kabelsalat").join("clap-scan.json"))
+}
+
+fn clap_scan_cache_path_from_env() -> Option<PathBuf> {
+    clap_scan_cache_path_from(
+        std::env::var_os("XDG_CACHE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn clap_scan_cache_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    clap_scan_cache_path_from_env()
+}
+
+fn load_scan_cache(path: &std::path::Path) -> ClapScanCache {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return ClapScanCache::default();
+    };
+    match serde_json::from_str::<ClapScanCache>(&raw) {
+        Ok(c) if c.version == CLAP_SCAN_CACHE_VERSION => c,
+        _ => ClapScanCache::default(),
+    }
+}
+
+fn save_scan_cache(path: &std::path::Path, cache: &ClapScanCache) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        bail!("cache path has no parent: {}", path.display());
+    };
+    std::fs::create_dir_all(parent)?;
+    let body = serde_json::to_string_pretty(cache)?;
+    let seq = SCAN_CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".clap-scan.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Load one CLAP bundle and read its plugin descriptors.
+pub fn scan_clap_bundle(path: &std::path::Path) -> Result<Vec<ClapPluginInfo>> {
+    // SAFETY: loading a CLAP bundle executes its init code; production listing
+    // runs this inside the isolated `scan-clap` child process.
+    let entry = unsafe { PluginEntry::load(path) }
+        .with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    let factory = entry
+        .get_plugin_factory()
+        .ok_or_else(|| anyhow!("CLAP bundle {} has no plugin factory", path.display()))?;
+    let mut out = Vec::new();
+    for d in factory.plugin_descriptors() {
+        out.push(ClapPluginInfo {
+            id: d.id().unwrap_or(c"?").to_string_lossy().into_owned(),
+            name: d.name().unwrap_or(c"?").to_string_lossy().into_owned(),
+            vendor: d.vendor().unwrap_or(c"?").to_string_lossy().into_owned(),
+            features: d.features().map(|f| f.to_string_lossy().into_owned()).collect(),
+        });
+    }
+    Ok(out)
+}
+
+/// Reroute fd 1 to stderr so plugin init logs cannot corrupt `scan-clap` JSON stdout.
+fn reroute_stdout_to_stderr() -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        let saved = libc::dup(1);
+        if saved < 0 {
+            bail!("dup(stdout) failed: {}", std::io::Error::last_os_error());
+        }
+        if libc::dup2(2, 1) < 0 {
+            libc::close(saved);
+            bail!("dup2(stderr, stdout) failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(std::fs::File::from_raw_fd(saved))
+    }
+}
+
+/// CLI entrypoint for `kabelsalat scan-clap <bundle-path>`.
+pub fn run_scan_clap(path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    let mut json_out = reroute_stdout_to_stderr()?;
+    let plugins = scan_clap_bundle(path)?;
+    let json = serde_json::to_string(&plugins)?;
+    writeln!(json_out, "{json}")?;
+    json_out.flush()?;
+    Ok(())
+}
+
+fn parse_scan_output(stdout: &[u8]) -> Result<Vec<ClapPluginInfo>> {
+    let text = std::str::from_utf8(stdout).context("scanner stdout is not UTF-8")?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        bail!("scanner produced empty stdout");
+    }
+    serde_json::from_str::<Vec<ClapPluginInfo>>(trimmed).context("scanner produced invalid JSON")
+}
+
+fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
+    mut reader: Option<R>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = reader {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        // Negative PID targets the child's process group (set via process_group(0))
+        // so wrapper shells cannot leave grandchildren holding stdout/stderr pipes open.
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_scan_subprocess(
+    program: &std::path::Path,
+    prefix_args: &[String],
+    bundle: &std::path::Path,
+    timeout: Duration,
+) -> Result<Vec<ClapPluginInfo>> {
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(program);
+    cmd.args(prefix_args)
+        .arg(bundle)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn scanner {}", program.display()))?;
+    let stdout_rx = spawn_pipe_reader(child.stdout.take());
+    let stderr_rx = spawn_pipe_reader(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_child_tree(&mut child);
+                    let _ = stdout_rx.join();
+                    let _ = stderr_rx.join();
+                    bail!("timed out after {:.1}s", timeout.as_secs_f32());
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Err(e) => {
+                kill_child_tree(&mut child);
+                return Err(e).context("failed waiting on scanner");
+            }
+        }
+    };
+
+    let stdout = stdout_rx.join().unwrap_or_default();
+    let stderr = stderr_rx.join().unwrap_or_default();
+    if !status.success() {
+        let err_tail = String::from_utf8_lossy(&stderr).trim().to_string();
+        if err_tail.is_empty() {
+            bail!("scanner exited with {status}");
+        }
+        bail!("scanner exited with {status}: {err_tail}");
+    }
+    parse_scan_output(&stdout)
+}
+
+fn scan_one_bundle(
+    cmd: &ScannerCommand,
+    bundle: &std::path::Path,
+    timeout: Duration,
+) -> Result<Vec<ClapPluginInfo>> {
+    match cmd {
+        ScannerCommand::CurrentExe => {
+            let exe = std::env::current_exe().context("cannot resolve current_exe")?;
+            let args = vec!["scan-clap".to_string()];
+            run_scan_subprocess(&exe, &args, bundle, timeout)
+        }
+        ScannerCommand::Custom { program, args } => {
+            run_scan_subprocess(program, args, bundle, timeout)
+        }
+        #[cfg(test)]
+        ScannerCommand::InProcess => scan_clap_bundle(bundle),
+    }
+}
+
+fn list_clap_plugins_with(
+    paths: &[PathBuf],
+    cmd: &ScannerCommand,
+    cache_path: Option<&std::path::Path>,
+    timeout: Duration,
+    parallelism: usize,
+) -> Vec<ClapPluginInfo> {
+    let mut cache = cache_path.map(load_scan_cache).unwrap_or_default();
+    let mut per_bundle: Vec<Option<Vec<ClapPluginInfo>>> = vec![None; paths.len()];
+    let mut uncached: Vec<(usize, &PathBuf, Option<BundleStamp>)> = Vec::new();
+
+    for (idx, path) in paths.iter().enumerate() {
+        let stamp = bundle_stamp(path);
+        let key = path.to_string_lossy();
+        if let (Some(st), Some(cached)) = (&stamp, cache.entries.get(key.as_ref())) {
+            if &cached.stamp == st {
+                match &cached.error {
+                    Some(e) => eprintln!("skip CLAP bundle {} (cached failure): {e}", path.display()),
+                    None => per_bundle[idx] = Some(cached.plugins.clone()),
+                }
+                continue;
+            }
+        }
+        uncached.push((idx, path, stamp));
+    }
+
+    if !uncached.is_empty() {
+        let workers = uncached.len().min(parallelism.max(1));
+        let cursor = AtomicUsize::new(0);
+        let results: Mutex<Vec<(usize, Option<BundleStamp>, Result<Vec<ClapPluginInfo>>)>> =
+            Mutex::new(Vec::with_capacity(uncached.len()));
+
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(idx, path, ref stamp)) = uncached.get(i) else {
+                        break;
+                    };
+                    let res = scan_one_bundle(cmd, path, timeout);
+                    if let Ok(mut guard) = results.lock() {
+                        guard.push((idx, stamp.clone(), res));
+                    }
+                });
+            }
+        });
+
+        let mut cache_dirty = false;
+        if let Ok(scanned) = results.into_inner() {
+            for (idx, stamp, res) in scanned {
+                match res {
+                    Ok(plugins) => {
+                        if let Some(st) = stamp {
+                            cache.entries.insert(
+                                paths[idx].to_string_lossy().into_owned(),
+                                CachedBundle {
+                                    stamp: st,
+                                    plugins: plugins.clone(),
+                                    error: None,
+                                },
+                            );
+                            cache_dirty = true;
+                        }
+                        per_bundle[idx] = Some(plugins);
+                    }
+                    Err(e) => {
+                        eprintln!("skip CLAP bundle {}: {e}", paths[idx].display());
+                        if let Some(st) = stamp {
+                            cache.entries.insert(
+                                paths[idx].to_string_lossy().into_owned(),
+                                CachedBundle { stamp: st, plugins: Vec::new(), error: Some(format!("{e}")) },
+                            );
+                            cache_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if cache_dirty {
+            if let Some(cp) = cache_path {
+                if let Err(e) = save_scan_cache(cp, &cache) {
+                    eprintln!("failed to save CLAP scan cache {}: {e}", cp.display());
+                }
+            }
+        }
+    }
+
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for path in clap_bundle_paths() {
-        // SAFETY: loading a CLAP bundle runs its init code; only standard
-        // CLAP directories and CLAP_PATH are scanned.
-        let entry = match unsafe { PluginEntry::load(&path) } {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let Some(factory) = entry.get_plugin_factory() else { continue };
-        for d in factory.plugin_descriptors() {
-            let id = d.id().unwrap_or(c"?").to_string_lossy().into_owned();
-            if !seen.insert(id.clone()) { continue; }
-            out.push(ClapPluginInfo {
-                id,
-                name: d.name().unwrap_or(c"?").to_string_lossy().into_owned(),
-                vendor: d.vendor().unwrap_or(c"?").to_string_lossy().into_owned(),
-                features: d.features().map(|f| f.to_string_lossy().into_owned()).collect(),
-            });
+    for plugins in per_bundle.into_iter().flatten() {
+        for p in plugins {
+            if seen.insert(p.id.clone()) {
+                out.push(p);
+            }
         }
     }
     out
+}
+
+pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
+    let paths = clap_bundle_paths();
+    let cache_path = clap_scan_cache_path();
+    list_clap_plugins_with(
+        &paths,
+        &ScannerCommand::default_for_process(),
+        cache_path.as_deref(),
+        CLAP_SCAN_TIMEOUT,
+        CLAP_SCAN_PARALLELISM,
+    )
+}
+
+/// `clap-scan-test`: list CLAP plugins out of process (cold, then from the
+/// cache) and print timings + plugin ids. Never loads a bundle in this
+/// process, so it stays safe with crashing or hanging bundles on CLAP_PATH.
+pub fn run_clap_scan_test() -> Result<()> {
+    let t0 = Instant::now();
+    let first = list_clap_plugins();
+    let d1 = t0.elapsed();
+
+    let t1 = Instant::now();
+    let second = list_clap_plugins();
+    let d2 = t1.elapsed();
+
+    anyhow::ensure!(first == second, "cold and warm listings differ");
+    let ids: Vec<&str> = first.iter().map(|p| p.id.as_str()).collect();
+    println!(
+        "clap-scan-test: OK — {} plugins ({:?}) · cold: {:.2} ms · warm: {:.2} ms",
+        first.len(),
+        ids,
+        d1.as_secs_f64() * 1000.0,
+        d2.as_secs_f64() * 1000.0,
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2434,5 +2830,297 @@ mod patch_search_tests {
         }
         assert!(peak > 1e-4, "Dexed should render non-zero audio after patch load (peak={peak})");
         main.retire(voice);
+    }
+}
+
+#[cfg(test)]
+mod clap_scan_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let seq = SCAN_CACHE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "ksalat-{label}-{}-{seq}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sh_cmd(script: &str) -> ScannerCommand {
+        ScannerCommand::Custom {
+            program: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_string(), script.to_string(), "_".to_string()],
+        }
+    }
+
+    #[test]
+    fn parse_scan_output_handles_valid_empty_and_garbage() {
+        let valid = br#"[{"id":"org.test.a","name":"Test A","vendor":"Acme","features":["instrument"]}]"#;
+        let parsed = parse_scan_output(valid).expect("valid JSON should parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "org.test.a");
+        assert_eq!(parsed[0].features, vec!["instrument"]);
+
+        let empty_arr = parse_scan_output(b"[]\n").expect("empty array should parse");
+        assert!(empty_arr.is_empty());
+
+        assert!(parse_scan_output(b"").is_err());
+        assert!(parse_scan_output(b"   \n").is_err());
+        assert!(parse_scan_output(b"not json at all").is_err());
+        assert!(parse_scan_output(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn timeout_kills_hanging_scanner_and_skips_bundle() {
+        let tmp = TempDir::new("timeout");
+        let bundle = tmp.0.join("hang.clap");
+        std::fs::write(&bundle, b"fake").unwrap();
+
+        let cmd = sh_cmd("sleep 10");
+        let start = Instant::now();
+        let plugins = list_clap_plugins_with(
+            &[bundle],
+            &cmd,
+            None,
+            Duration::from_millis(150),
+            CLAP_SCAN_PARALLELISM,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(plugins.is_empty());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "hanging child should be killed on timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn crash_and_garbage_bundles_are_skipped_while_valid_survive_in_order() {
+        let tmp = TempDir::new("mixed");
+        let good1 = tmp.0.join("01-good.clap");
+        let crash = tmp.0.join("02-crash.clap");
+        let garbage = tmp.0.join("03-garbage.clap");
+        let good2 = tmp.0.join("04-good.clap");
+        for p in [&good1, &crash, &garbage, &good2] {
+            std::fs::write(p, b"fake").unwrap();
+        }
+
+        // Script branches on bundle filename ($1): crashes, emits garbage, or valid JSON
+        // (with a duplicate id in good2 to verify first-seen deduplication).
+        let cmd = sh_cmd(
+            r#"case "$1" in
+                *01-good.clap) printf '[{"id":"id.one","name":"One","vendor":"V","features":["instrument"]},{"id":"id.shared","name":"First","vendor":"V","features":[]}]\n' ;;
+                *02-crash.clap) exit 1 ;;
+                *03-garbage.clap) printf 'not valid json\n' ;;
+                *04-good.clap) printf '[{"id":"id.shared","name":"Second","vendor":"V","features":[]},{"id":"id.two","name":"Two","vendor":"V","features":["audio-effect"]}]\n' ;;
+            esac"#,
+        );
+        let plugins = list_clap_plugins_with(
+            &[good1, crash, garbage, good2],
+            &cmd,
+            None,
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        let ids: Vec<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["id.one", "id.shared", "id.two"]);
+        assert_eq!(plugins[1].name, "First");
+
+        let false_cmd = ScannerCommand::Custom {
+            program: PathBuf::from("/bin/false"),
+            args: Vec::new(),
+        };
+        let empty = list_clap_plugins_with(
+            &[tmp.0.join("01-good.clap")],
+            &false_cmd,
+            None,
+            Duration::from_secs(2),
+            1,
+        );
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn failed_bundle_is_not_rescanned_until_it_changes() {
+        let tmp = TempDir::new("negcache");
+        let bad = tmp.0.join("hang.clap");
+        std::fs::write(&bad, b"v1").unwrap();
+        let cache_file = tmp.0.join("cache").join("clap-scan.json");
+        let spawn_log = tmp.0.join("spawns.log");
+        let hang = sh_cmd(&r#"printf '%s\n' "$1" >> '__LOG__'; sleep 10"#.replace("__LOG__", &spawn_log.display().to_string()));
+        let list = |cmd: &ScannerCommand| {
+            let start = Instant::now();
+            let out = list_clap_plugins_with(&[bad.clone()], cmd, Some(&cache_file), Duration::from_millis(150), 1);
+            (out, start.elapsed())
+        };
+        let spawns = || std::fs::read_to_string(&spawn_log).map_or(0, |s| s.lines().count());
+
+        let (first, _) = list(&hang);
+        assert!(first.is_empty());
+        assert_eq!(spawns(), 1);
+        let (second, took) = list(&hang);
+        assert!(second.is_empty());
+        assert_eq!(spawns(), 1, "a cached failure must not spawn the scanner again");
+        assert!(took < Duration::from_millis(100), "cached failure still paid the timeout: {took:?}");
+
+        std::fs::write(&bad, b"v2-fixed").unwrap();
+        let fixed = sh_cmd(r#"printf '[{"id":"id.fixed","name":"F","vendor":"V","features":[]}]\n'"#);
+        let (third, _) = list(&fixed);
+        assert_eq!(third.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["id.fixed"]);
+    }
+
+    #[test]
+    fn cache_hit_does_not_spawn_and_invalidation_rescans_only_changed_bundle() {
+        let tmp = TempDir::new("cache");
+        let a = tmp.0.join("a.clap");
+        let b = tmp.0.join("b.clap");
+        std::fs::write(&a, b"bundle-a-v1").unwrap();
+        std::fs::write(&b, b"bundle-b-v1").unwrap();
+        let cache_file = tmp.0.join("cache").join("clap-scan.json");
+        let spawn_log = tmp.0.join("spawns.log");
+
+        let log_path = spawn_log.display().to_string();
+        let scan_cmd = sh_cmd(
+            &r#"printf '%s\n' "$1" >> '__LOG__'
+            case "$1" in
+                *a.clap) printf '[{"id":"id.a","name":"A1","vendor":"V","features":[]}]\n' ;;
+                *b.clap) printf '[{"id":"id.b","name":"B1","vendor":"V","features":[]}]\n' ;;
+            esac"#
+            .replace("__LOG__", &log_path),
+        );
+
+        // 1. Cold cache scans both bundles and writes the cache file.
+        let paths = vec![a.clone(), b.clone()];
+        let first = list_clap_plugins_with(
+            &paths,
+            &scan_cmd,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        assert_eq!(first.len(), 2);
+        assert!(cache_file.exists());
+        assert_eq!(std::fs::read_to_string(&spawn_log).unwrap().lines().count(), 2);
+
+        // 2. Warm cache: even a `/bin/false` scanner succeeds with 0 spawns because nothing runs.
+        let never_spawn = ScannerCommand::Custom {
+            program: PathBuf::from("/bin/false"),
+            args: Vec::new(),
+        };
+        let second = list_clap_plugins_with(
+            &paths,
+            &never_spawn,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        assert_eq!(second, first);
+
+        // 3. Modify only `b.clap` (different size): only `b.clap` re-scans.
+        std::fs::write(&b, b"bundle-b-v2-longer").unwrap();
+        std::fs::remove_file(&spawn_log).unwrap();
+        let scan_v2 = sh_cmd(
+            &r#"printf '%s\n' "$1" >> '__LOG__'
+            case "$1" in
+                *a.clap) exit 1 ;;
+                *b.clap) printf '[{"id":"id.b","name":"B2","vendor":"V","features":[]}]\n' ;;
+            esac"#
+            .replace("__LOG__", &log_path),
+        );
+        let third = list_clap_plugins_with(
+            &paths,
+            &scan_v2,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            CLAP_SCAN_PARALLELISM,
+        );
+        assert_eq!(third.len(), 2);
+        assert_eq!(third[0].name, "A1");
+        assert_eq!(third[1].name, "B2");
+        let spawned: Vec<String> = std::fs::read_to_string(&spawn_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(spawned, vec![b.display().to_string()]);
+    }
+
+    #[test]
+    fn cfg_test_never_uses_user_cache_and_xdg_cache_home_is_respected() {
+        assert!(clap_scan_cache_path().is_none());
+        assert_eq!(
+            clap_scan_cache_path_from(Some(OsStr::new("/tmp/xdg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/tmp/xdg/kabelsalat/clap-scan.json"))
+        );
+        assert_eq!(
+            clap_scan_cache_path_from(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.cache/kabelsalat/clap-scan.json"))
+        );
+    }
+
+    #[test]
+    fn corrupt_cache_falls_back_to_rescan() {
+        let tmp = TempDir::new("corrupt-cache");
+        let bundle = tmp.0.join("a.clap");
+        std::fs::write(&bundle, b"fake").unwrap();
+        let cache_file = tmp.0.join("clap-scan.json");
+        std::fs::write(&cache_file, b"{corrupt json").unwrap();
+
+        let cmd = sh_cmd(r#"printf '[{"id":"id.ok","name":"OK","vendor":"V","features":[]}]\n'"#);
+        let plugins = list_clap_plugins_with(
+            &[bundle],
+            &cmd,
+            Some(&cache_file),
+            Duration::from_secs(2),
+            1,
+        );
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].id, "id.ok");
+    }
+
+    #[test]
+    fn bounded_parallelism_preserves_order_and_runs_concurrently() {
+        let tmp = TempDir::new("parallel");
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let p = tmp.0.join(format!("b{i}.clap"));
+            std::fs::write(&p, b"fake").unwrap();
+            paths.push(p);
+        }
+
+        let cmd = sh_cmd(
+            r#"sleep 0.12
+            name=$(basename "$1" .clap)
+            printf '[{"id":"id.%s","name":"%s","vendor":"V","features":[]}]\n' "$name" "$name""#,
+        );
+        let start = Instant::now();
+        let plugins = list_clap_plugins_with(
+            &paths,
+            &cmd,
+            None,
+            Duration::from_secs(3),
+            CLAP_SCAN_PARALLELISM,
+        );
+        let elapsed = start.elapsed();
+
+        let ids: Vec<&str> = plugins.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["id.b0", "id.b1", "id.b2", "id.b3", "id.b4", "id.b5"]);
+        // 6 bundles × 120ms sequentially would take >=720ms; with parallelism 4 it finishes in 2 batches (~240ms).
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "expected concurrent batching under 600ms, took {elapsed:?}"
+        );
     }
 }

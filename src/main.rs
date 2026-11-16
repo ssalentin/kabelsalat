@@ -16,6 +16,7 @@ mod host;
 mod lv2;
 mod matrix;
 mod mcp;
+mod meter;
 mod midi;
 mod player;
 mod preview;
@@ -79,9 +80,10 @@ fn main() -> anyhow::Result<()> {
         "rig-mix-test" => engine::rig_mix_test(),
         "multi-rig-load-test" => engine::multi_rig_load_test(),
         "cc-map-test" => engine::cc_map_test(),
+        "meter-test" => engine::meter_test(),
         "record-test" => record::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, midi-test, host-test, ui-demo, mcp [--attach], send, session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
             std::process::exit(1);
         }
     }

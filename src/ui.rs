@@ -1257,7 +1257,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "undo" | "redo")
+        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1577,6 +1577,11 @@ struct DemoApp {
     rig_mix: [crate::engine::RigMix; 8],
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
     last_mix_rev: u64,
+    /// Last adopted `GraphPub::meter_rev` (engine master-meter publication,
+    /// Bravo 1) — updated every block by `sync_from_engine`.
+    last_meter_rev: u64,
+    /// Mirrored master-bus meter snapshot (read by `measure_mix`, `get_status`).
+    master_meter: crate::meter::MeterSnapshot,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
@@ -1807,6 +1812,8 @@ impl DemoApp {
             rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             last_mix_rev: 0,
+            last_meter_rev: 0,
+            master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
             load_as_rigs: None,
             had_kb_focus: true,
@@ -2723,6 +2730,12 @@ impl DemoApp {
             }
             self.rig_mix = g.mix;
         }
+        // Master meter mirror (Bravo 1): the engine publishes a fresh snapshot
+        // every block.
+        if g.meter_rev != self.last_meter_rev {
+            self.last_meter_rev = g.meter_rev;
+            self.master_meter = g.meter;
+        }
         let mut transport_changed = false;
         if g.transport_rev != self.last_transport_rev {
             self.last_transport_rev = g.transport_rev;
@@ -3490,8 +3503,19 @@ impl DemoApp {
                     "overflow": [self.rack_overflow.x, self.rack_overflow.y],
                     "assistant_h": if self.assistant_open() { self.assistant_rect.height() } else { 0.0 },
                 },
+                "meter": serde_json::to_value(self.master_meter).unwrap_or(serde_json::json!({})),
             })
             .to_string(),
+            "measure_mix" => {
+                if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::ResetMeter);
+                    }
+                }
+                serde_json::to_value(self.master_meter)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|e| format!("meter: {e}"))
+            }
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127);
                 let ms = args.get("ms").and_then(|v| v.as_u64()).unwrap_or(500).min(10000);
@@ -13691,6 +13715,32 @@ mod split_bpm_tests {
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
         assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordSync { on: true })), "sent SetRecordSync: {cmds:?}");
+    }
+
+    #[test]
+    fn measure_mix_tool_parity_and_reset() {
+        // Rule 6/23 (Bravo 1): `measure_mix` exists in the assistant schema and
+        // in exec_tool, reads the mirrored meter, and reset sends ResetMeter.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(names.contains(&"measure_mix"), "assistant tools missing measure_mix");
+
+        let mut app = DemoApp::new_with_sink(None);
+        assert!(app.bus.is_none());
+        // Read-only by default: no undo step is opened.
+        let r = app.exec_tool("measure_mix", &serde_json::json!({}));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        for key in ["momentary_lufs", "short_term_lufs", "integrated_lufs", "true_peak_db", "low_end_corr", "low_end_mono", "band_db"] {
+            assert!(v.get(key).is_some(), "measure_mix missing '{key}': {r}");
+        }
+
+        // With a bus, reset=true sends Command::ResetMeter.
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let _ = app.exec_tool("measure_mix", &serde_json::json!({"reset": true}));
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::ResetMeter)), "reset must send ResetMeter: {cmds:?}");
     }
 }
 

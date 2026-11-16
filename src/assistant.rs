@@ -374,28 +374,28 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_params",
-            "description":"List bindable parameters (id, name) on a node (CLAP/LV2/DSP/Master), optionally filtered by query words. Use the returned id with set_cc_map or learn_cc.",
+            "description":"List bindable plugin/DSP parameters (id, name) and rack face knobs on a node, optionally filtered by query words. Use the returned id/target with set_cc_map or learn_cc.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"query":{"type":"string"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"list_cc_maps",
-            "description":"List active MIDI CC → parameter bindings across matrix rules (plus any armed MIDI-learn target). Filter optionally by node or source ('keys' | 'hw:<d>').",
+            "description":"List active MIDI CC → parameter/knob bindings across matrix rules (plus any armed MIDI-learn target). Filter optionally by node or source ('keys' | 'hw:<d>').",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"}}}
         }},
         {"type":"function","function":{
             "name":"set_cc_map",
-            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id (omit param to remove). Non-empty cc_map acts as a whitelist for that rule.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"}},"required":["node","source","cc"]}
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME'). Omit param/knob to unbind that CC.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",
-            "description":"Clear one CC binding (when cc is given) or ALL CC bindings (when cc is omitted) on source → node, returning the rule's CC handling to transparent passthrough when empty.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"}},"required":["node","source"]}
+            "description":"Clear one CC binding (when cc is given) or matching bindings (filtered by optional target/knob, or ALL when omitted) on source → node.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source"]}
         }},
         {"type":"function","function":{
             "name":"learn_cc",
-            "description":"Arm MIDI-learn for (source, node, param) so the next incoming hardware CC binds to that parameter. Pass cancel=true to disarm.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"cancel":{"type":"boolean"}},"required":["node","source","param"]}
+            "description":"Arm MIDI-learn for (node, param/target or knob) on source ('keys' = default, any hardware device, records sender | 'hw:<d>') so the next incoming hardware CC binds to it. Pass cancel=true to disarm.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"},"cancel":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_mix",

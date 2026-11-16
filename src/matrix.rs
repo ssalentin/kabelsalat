@@ -170,13 +170,36 @@ pub enum SourceId {
     FilePlayer(u32),
 }
 
-/// CC binding: controller number → control-plane parameter on the rule's
-/// destination node. MIDI-learn (P2) fills these; the matrix routes the CC
-/// and the destination applies the binding.
+/// Which parameter space a CC binding drives on the destination node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CcTarget {
+    /// Plugin / node native parameter (CLAP param id, LV2 control index, or DSP/Master param).
+    #[default]
+    #[serde(alias = "plugin", alias = "plugin_param")]
+    PluginParam,
+    /// Rack unit knob (`Command::SetParam` semantics: e.g. CLAP voice `P_LEVEL`, DSP engine param, Master vol/warm).
+    #[serde(alias = "knob")]
+    Knob,
+}
+
+impl CcTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CcTarget::PluginParam => "plugin",
+            CcTarget::Knob => "knob",
+        }
+    }
+}
+
+/// CC binding: controller number → parameter on the rule's destination node.
+/// MIDI-learn fills these; the matrix routes the CC and the destination applies
+/// the binding according to `target`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CcMapping {
     pub cc: u8,
     pub param: ParamId,
+    #[serde(default)]
+    pub target: CcTarget,
 }
 
 /// One routing rule: source → destination plus per-rule transforms.
@@ -255,25 +278,36 @@ impl Rule {
         self
     }
 
-    /// Bind a controller to a destination parameter. Re-mapping the same
+    /// Bind a controller to a destination plugin parameter. Re-mapping the same
     /// controller replaces its binding. A non-empty map acts as a CC
     /// whitelist: unmapped controllers are dropped.
-    pub fn map_cc(mut self, cc: u8, param: ParamId) -> Self {
-        self.set_cc(cc, param);
+    pub fn map_cc(self, cc: u8, param: ParamId) -> Self {
+        self.map_cc_target(cc, param, CcTarget::PluginParam)
+    }
+
+    /// Bind a controller to a destination parameter with an explicit target space.
+    pub fn map_cc_target(mut self, cc: u8, param: ParamId, target: CcTarget) -> Self {
+        self.set_cc_target(cc, param, target);
         self
     }
 
-    /// Add or replace a CC binding in place. Returns true if the map changed.
+    /// Add or replace a CC binding (PluginParam target) in place. Returns true if the map changed.
     pub fn set_cc(&mut self, cc: u8, param: ParamId) -> bool {
+        self.set_cc_target(cc, param, CcTarget::PluginParam)
+    }
+
+    /// Add or replace a CC binding in place with an explicit target. Returns true if the map changed.
+    pub fn set_cc_target(&mut self, cc: u8, param: ParamId, target: CcTarget) -> bool {
         let cc = cc & 0x7F;
         if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
-            if m.param == param {
+            if m.param == param && m.target == target {
                 return false;
             }
             m.param = param;
+            m.target = target;
             true
         } else {
-            self.cc_map.push(CcMapping { cc, param });
+            self.cc_map.push(CcMapping { cc, param, target });
             true
         }
     }
@@ -291,9 +325,14 @@ impl Rule {
         self
     }
 
+    /// The full CC binding for a controller, if any.
+    pub fn mapping_for_cc(&self, cc: u8) -> Option<CcMapping> {
+        self.cc_map.iter().find(|m| m.cc == cc).copied()
+    }
+
     /// The parameter a controller is bound to, if any.
     pub fn param_for_cc(&self, cc: u8) -> Option<ParamId> {
-        self.cc_map.iter().find(|m| m.cc == cc).map(|m| m.param)
+        self.mapping_for_cc(cc).map(|m| m.param)
     }
 
     fn accepts_channel(&self, channel: u8) -> bool {
@@ -979,5 +1018,18 @@ mod tests {
         let legacy = r#"{"id":1,"source":"Keys","dest":1,"channel":null,"transpose":0,"key_range":[0,127],"vel_range":[0,127],"enabled":true}"#;
         let legacy_rule: Rule = serde_json::from_str(legacy).unwrap();
         assert!(legacy_rule.cc_map.is_empty());
+
+        // Legacy CcMapping saved without `target` defaults to PluginParam.
+        let legacy_map: CcMapping = serde_json::from_str(r#"{"cc":74,"param":42}"#).unwrap();
+        assert_eq!(legacy_map, CcMapping { cc: 74, param: 42, target: CcTarget::PluginParam });
+
+        // Knob target round-trips and replacing target marks the rule dirty.
+        let mut r3 = Rule::new(SourceId::Hardware(0), SURGE_A);
+        assert!(r3.set_cc_target(7, 0, CcTarget::PluginParam));
+        assert!(!r3.set_cc_target(7, 0, CcTarget::PluginParam));
+        assert!(r3.set_cc_target(7, 0, CcTarget::Knob));
+        assert_eq!(r3.mapping_for_cc(7), Some(CcMapping { cc: 7, param: 0, target: CcTarget::Knob }));
+        let back3: Rule = serde_json::from_str(&serde_json::to_string(&r3).unwrap()).unwrap();
+        assert_eq!(back3.cc_map, r3.cc_map);
     }
 }

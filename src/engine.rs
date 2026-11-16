@@ -957,6 +957,7 @@ impl GraphEngine {
                         r.key_range = (kl, kh);
                         r.vel_range = (vl, vh);
                         r.enabled = enabled;
+                        r.cc_only = false;
                     }
                     None => {
                         let mut r = Rule::new(source, dest);
@@ -1038,7 +1039,9 @@ impl GraphEngine {
                     {
                         Some(r) => r.set_cc(cc, p),
                         None => {
+                            // Learning a knob must not also wire the keys.
                             let mut r = Rule::new(source, dest);
+                            r.cc_only = true;
                             r.set_cc(cc, p);
                             self.matrix.add_rule(r);
                             true
@@ -2032,6 +2035,31 @@ mod tests {
         assert_eq!(dsp_native_param(&DspKind::Metronome, 0), None);
         assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_TIME), None);
         assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_MIX), None);
+    }
+
+    #[test]
+    fn learning_a_knob_on_an_unrouted_device_does_not_route_its_notes() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        // Device 20 is beyond the pre-routed hardware range: no rule to Surge A.
+        let dev = SourceId::Hardware(20);
+        bus.send(Command::MatrixCcMap { source: dev, dest: 1, cc: 74, param: Some(42) });
+        engine.render(&mut buf, 2);
+        engine.note_log.clear();
+        engine.cc_log.clear();
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: dev });
+        bus.send(Command::Cc { source: dev, channel: 0, cc: 74, value: 127 });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.is_empty(), "learn wired the device's notes: {:?}", engine.note_log);
+        assert_eq!(engine.cc_log, vec![(1, 42, 1.0)], "the learned CC must still reach its param");
+        // Shaping the route in the matrix makes it a normal (note) route.
+        bus.send(Command::MatrixRule { source: dev, dest: 1, channel: None, transpose: 0, key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true });
+        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: dev });
+        engine.render(&mut buf, 2);
+        assert!(engine.note_log.iter().any(|&(d, n, on)| d == 1 && n == 62 && on), "{:?}", engine.note_log);
     }
 
     #[test]

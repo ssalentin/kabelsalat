@@ -202,6 +202,10 @@ pub struct Rule {
     pub cc_map: Vec<CcMapping>,
     /// Muted rules route nothing (live performance toggle).
     pub enabled: bool,
+    /// Created only to carry CC bindings (MIDI-learn on an unrouted pair):
+    /// routes controller messages, never notes, until the rule is shaped.
+    #[serde(default)]
+    pub cc_only: bool,
 }
 
 impl Rule {
@@ -217,6 +221,7 @@ impl Rule {
             vel_range: (0, 127),
             cc_map: Vec::new(),
             enabled: true,
+            cc_only: false,
         }
     }
 
@@ -308,6 +313,9 @@ impl Rule {
     /// Pure: depends only on the rule and the event.
     pub fn transform(&self, ev: MidiMsg) -> Option<MidiMsg> {
         if !self.enabled || !self.accepts_channel(ev.channel) {
+            return None;
+        }
+        if self.cc_only && ev.status != CONTROL_CHANGE {
             return None;
         }
         match ev.status {

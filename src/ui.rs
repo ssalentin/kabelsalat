@@ -5399,6 +5399,10 @@ impl DemoApp {
                 | "undo"
                 | "redo"
                 | "add_rig" => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
+                t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
+                    self.note_agent_change(AgentOrigin::Remote);
+                    "ok".into()
+                }
                 other => format!("tool '{other}' is not served over the UI bridge"),
             };
             let _ = reply.send(out);
@@ -13389,6 +13393,20 @@ mod split_bpm_tests {
         app.ui_time += REMOTE_JOB_GAP + 1.0;
         app.exec_tool_with_origin("get_rigs", &serde_json::json!({}), AgentOrigin::Remote);
         assert_eq!(app.undo_past.len(), 4);
+    }
+
+    #[test]
+    fn bridge_asks_for_an_undo_snapshot_before_a_remote_edit() {
+        let (mut app, _ctx) = demo();
+        let (bus, _drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::bridge::UI_INBOX.lock().unwrap().push((crate::bridge::BEFORE_REMOTE_EDIT.into(), serde_json::json!({}), tx));
+        app.serve_ui_inbox();
+        assert_eq!(rx.recv().unwrap(), "ok");
+        assert_eq!(app.undo_past.len(), 1, "the pre-edit rack is on the undo stack");
+        assert!(Command::Connect { id: 1, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: CPortKind::Midi }.is_rack_edit());
+        assert!(!Command::NoteOn { note: 60, velocity: 1.0, source: SourceId::Keys }.is_rack_edit(), "playing is not an edit");
     }
 
     #[test]

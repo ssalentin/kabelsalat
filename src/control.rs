@@ -658,6 +658,19 @@ pub fn command_bus() -> (CommandBus, CommandDrain) {
     (CommandBus { tx }, CommandDrain { rx })
 }
 
+impl Command {
+    /// A change to the rack the user would want to undo (graph, routing,
+    /// knobs, mix, presets) — not playing, transport or recording.
+    pub fn is_rack_edit(&self) -> bool {
+        matches!(self,
+            Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
+            | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
+            | Command::SetRigDevice { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
+            | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
+            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. })
+    }
+}
+
 impl CommandBus {
     /// Non-blocking; returns false if the ring is full (command dropped).
     pub fn send(&mut self, cmd: Command) -> bool {

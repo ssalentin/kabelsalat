@@ -1953,34 +1953,47 @@ pub fn metro_test() -> anyhow::Result<()> {
 /// must reach the LV2 instrument's atom input (verified via readback).
 pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
-    use crate::host::ClapVoice;
     use crate::matrix::SourceId;
     let sr = 48000.0;
-    let (voice, _main) = ClapVoice::new(sr)?;
+    // Real synths first; the LSP oscillator only proves routing.
+    let candidates = ["urn:distrho:vitalium", "http://lsp-plug.in/plugins/lv2/oscillator_mono"];
+    let uri = candidates
+        .iter()
+        .find(|u| crate::lv2::Lv2Plugin::load(u, sr, 512).map_or(false, |p| p.is_instrument()))
+        .ok_or_else(|| anyhow::anyhow!("no LV2 instrument installed (tried {candidates:?})"))?;
     let (mut bus, drain) = command_bus();
-    let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sr, vec![(1, voice)]);
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
 
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let inst = g.add_node(
-        NodeKind::Lv2 { uri: Lv2Uri::new("http://lsp-plug.in/plugins/lv2/oscillator_mono") },
-        name_bytes("LV2 INST"),
-    );
+    let inst = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes("LV2 INST"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
-
     bus.send(Command::LoadGraph { graph: g });
-    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
-    let mut buf = vec![0.0f32; 512 * 2];
-    engine.render(&mut buf, 2); // drains LoadGraph + NoteOn
 
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut peak_over = |engine: &mut GraphEngine, blocks: usize| {
+        let mut peak = 0.0f32;
+        for _ in 0..blocks {
+            engine.render(&mut buf, 2);
+            peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+        peak
+    };
+    let before = peak_over(&mut engine, 10);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let held = peak_over(&mut engine, 47); // ~0.5 s
     let ev = engine.lv2_last_note(inst);
-    anyhow::ensure!(ev.is_some(), "LV2 instrument did not receive the note");
-    let ev = ev.unwrap();
-    anyhow::ensure!(ev[0] == 0x90 && ev[1] == 60, "wrong MIDI event reached instrument: {ev:?}");
-    println!("lv2-instrument-engine-test: OK — note routed to LV2 instrument atom input (event {ev:?})");
+    anyhow::ensure!(matches!(ev, Some(e) if e[1] == 60), "LV2 instrument did not receive the note: {ev:?}");
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak_over(&mut engine, 375); // ~4 s release tail
+    let after = peak_over(&mut engine, 94); // the following ~1 s
+    println!("lv2-instrument-engine-test: {uri}: master peak silent={before:.4} held={held:.4} 4-5 s after release={after:.4}");
+    anyhow::ensure!(held > 1e-3, "LV2 instrument {uri} is silent at the master while a key is held");
+    anyhow::ensure!(after < held * 0.01, "LV2 instrument {uri} keeps sounding after note-off");
+    println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
     Ok(())
 }
 

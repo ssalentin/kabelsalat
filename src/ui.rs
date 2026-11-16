@@ -254,29 +254,50 @@ fn rescan_hw_midi(
             || name == "System"
             || name == "Announce"))
         .collect();
-    let Ok(mut devices) = hw.devices.lock() else { return };
-    let mut changed = false;
-    for (i, (name, live)) in devices.iter_mut().enumerate() {
-        if *live && !ports.iter().any(|(n, _)| n == name) {
-            if let Some(c) = conns.get_mut(i).and_then(Option::take) { c.close(); }
-            *live = false;
+    // Decide under the lock, connect/close outside it: the UI frame reads
+    // the same list and must never wait for an ALSA port to open.
+    let (unplugged, to_connect) = {
+        let Ok(mut devices) = hw.devices.lock() else { return };
+        let mut unplugged = Vec::new();
+        for (i, (name, live)) in devices.iter_mut().enumerate() {
+            if *live && !ports.iter().any(|(n, _)| n == name) {
+                *live = false;
+                unplugged.push(i);
+            }
+        }
+        let mut to_connect = Vec::new();
+        for (name, port) in &ports {
+            let dev = match devices.iter().position(|(n, _)| n == name) {
+                Some(i) if devices[i].1 => continue,
+                Some(i) => i,
+                None if devices.len() >= crate::engine::MAX_HW_DEVICES as usize => {
+                    // The engine routes Hardware(0..16) only: a 17th id would be mute.
+                    eprintln!("midi: {name} ignored — {} hardware devices is the limit", crate::engine::MAX_HW_DEVICES);
+                    continue;
+                }
+                None => {
+                    devices.push((name.clone(), false));
+                    devices.len() - 1
+                }
+            };
+            to_connect.push((dev, name.clone(), port.clone()));
+        }
+        (unplugged, to_connect)
+    };
+    let mut changed = !unplugged.is_empty();
+    for i in unplugged {
+        if let Some(c) = conns.get_mut(i).and_then(Option::take) { c.close(); }
+    }
+    for (dev, name, port) in to_connect {
+        if conns.len() <= dev { conns.resize_with(dev + 1, || None); }
+        conns[dev] = connect_hw_input(&port, dev as u32, q, cc_q, direct);
+        if conns[dev].is_some() {
+            if let Ok(mut devices) = hw.devices.lock() {
+                if let Some(d) = devices.get_mut(dev) { d.1 = true; }
+            }
+            eprintln!("midi: connected {name}");
             changed = true;
         }
-    }
-    for (name, port) in &ports {
-        let dev = match devices.iter().position(|(n, _)| n == name) {
-            Some(i) if devices[i].1 => continue,
-            Some(i) => i,
-            None => {
-                devices.push((name.clone(), false));
-                devices.len() - 1
-            }
-        };
-        if conns.len() < devices.len() { conns.resize_with(devices.len(), || None); }
-        conns[dev] = connect_hw_input(port, dev as u32, q, cc_q, direct);
-        devices[dev].1 = conns[dev].is_some();
-        changed = true;
-        eprintln!("midi: {} {name}", if devices[dev].1 { "connected" } else { "failed to connect" });
     }
     if changed {
         hw.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -3423,7 +3444,9 @@ impl DemoApp {
                     None => self.edit_rigs_named(None, name),
                 }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
-                let sound = match args.get("sound").and_then(|v| v.as_str()) {
+                // A Surge patch query means nothing to another plugin.
+                let sound_query = if args.get("plugin_id").is_some() { None } else { args.get("sound").and_then(|v| v.as_str()) };
+                let sound = match sound_query {
                     Some(q) => match self.load_sound(self.active_rig, q) {
                         Ok(p) => format!(" Sound: {p}."),
                         Err(e) => format!(" Sound not loaded: {e}."),

@@ -283,6 +283,12 @@ Learned so far (2026-11-15, UI polish pass):
     fell back to the laptop mic. List sources via `pactl -f json` (monitors
     out), capture with `pw-record --target <node>`, and a missing device is
     "not available" — never another input.
+61. **A MIDI device is live only while ALSA still lists our subscription:**
+    after a USB re-plug the MIDIMATE came back under the identical name
+    ("… 28:0") but without the subscription, so the name check said
+    "connected" and the keyboard stayed dead. The hot-plug pass reads
+    /proc/asound/seq/clients (`alsa_port_subscribed`) and reconnects stale
+    ports.
 
 ## Working on kabelsalat
 

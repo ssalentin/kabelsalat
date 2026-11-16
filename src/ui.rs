@@ -280,6 +280,52 @@ fn match_midi_device(devices: &[(String, bool)], name: &str) -> Result<Option<us
     Ok(devices.iter().position(|(n, live)| !*live && midi_port_key(n) == key))
 }
 
+/// Is ALSA port `name` ("…  28:0") still subscribed by one of our
+/// `kabelsalat-hw` clients, per the text of /proc/asound/seq/clients?
+/// None = cannot tell (no "client:port" suffix, port not listed). A USB
+/// re-plug that brings the device back under the SAME name drops the
+/// subscription silently; the name alone said "still connected" and the
+/// keyboard stayed dead.
+fn alsa_port_subscribed(seq_clients: &str, name: &str) -> Option<bool> {
+    let (c, p) = name.rsplit_once(' ')?.1.split_once(':')?;
+    let (c, p): (u32, u32) = (c.parse().ok()?, p.parse().ok()?);
+    let mut ours = Vec::new();
+    let mut client: Option<u32> = None;
+    for line in seq_clients.lines() {
+        if let Some(rest) = line.strip_prefix("Client") {
+            let n = rest.trim_start().split(|ch: char| !ch.is_ascii_digit()).next().and_then(|x| x.parse().ok());
+            if let Some(n) = n { if line.contains("\"kabelsalat-hw\"") { ours.push(n); } }
+            client = n;
+        }
+    }
+    let mut in_port = false;
+    let mut found = false;
+    for line in seq_clients.lines() {
+        if let Some(rest) = line.strip_prefix("Client") {
+            let n: Option<u32> = rest.trim_start().split(|ch: char| !ch.is_ascii_digit()).next().and_then(|x| x.parse().ok());
+            client = n;
+            in_port = false;
+            continue;
+        }
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Port") {
+            let n: Option<u32> = rest.trim_start().split(|ch: char| !ch.is_ascii_digit()).next().and_then(|x| x.parse().ok());
+            in_port = client == Some(c) && n == Some(p);
+            if in_port { found = true; }
+            continue;
+        }
+        if in_port {
+            if let Some(targets) = t.strip_prefix("Connecting To:") {
+                let to_us = targets.split(',').any(|x| {
+                    x.trim().split(':').next().and_then(|n| n.trim().parse::<u32>().ok()).is_some_and(|n| ours.contains(&n))
+                });
+                if to_us { return Some(true); }
+            }
+        }
+    }
+    found.then_some(false)
+}
+
 fn rescan_hw_midi(
     hw: &HwMidi,
     conns: &mut Vec<Option<midir::MidiInputConnection<()>>>,
@@ -303,8 +349,13 @@ fn rescan_hw_midi(
     let (unplugged, to_connect) = {
         let Ok(mut devices) = hw.devices.lock() else { return };
         let mut unplugged = Vec::new();
+        // A device re-plugged under the same name lost our subscription:
+        // treat it as unplugged so this pass reconnects it.
+        let seq = std::fs::read_to_string("/proc/asound/seq/clients").unwrap_or_default();
         for (i, (name, live)) in devices.iter_mut().enumerate() {
-            if *live && !ports.iter().any(|(n, _)| n == name) {
+            let stale = *live && alsa_port_subscribed(&seq, name) == Some(false);
+            if stale { eprintln!("midi: {name} lost its subscription (re-plugged?) — reconnecting"); }
+            if *live && (stale || !ports.iter().any(|(n, _)| n == name)) {
                 *live = false;
                 unplugged.push(i);
             }
@@ -15043,6 +15094,24 @@ mod face_layout_tests {
 #[cfg(test)]
 mod midi_hotplug_tests {
     use super::*;
+
+    #[test]
+    fn a_replug_under_the_same_name_is_detected_as_unsubscribed() {
+        // Real /proc/asound/seq/clients text after a USB re-plug: the M2 is
+        // still connected to us (129), the MIDIMATE's ports lost theirs.
+        let seq = "Client  24 : \"M2\" [Kernel Legacy]\n  Port   0 : \"M2 MIDI 1\" (RWeX) [In/Out]\n    Connecting To: 129:0\n\
+Client  28 : \"ESI MIDIMATE eX\" [Kernel Legacy]\n  Port   0 : \"ESI MIDIMATE eX MIDI 1\" (RWeX) [In/Out]\n  Port   1 : \"ESI MIDIMATE eX MIDI 2\" (RWeX) [In/Out]\n\
+Client 129 : \"kabelsalat-hw\" [User Legacy]\n  Port   0 : \"kabelsalat-hw   \" (-We-) [Out]\n    Connected From: 24:0\n\
+Client 130 : \"kabelsalat-hw\" [User Legacy]\n  Port   0 : \"kabelsalat-hw   \" (-We-) [Out]\n";
+        assert_eq!(alsa_port_subscribed(seq, "M2:M2 MIDI 1 24:0"), Some(true));
+        assert_eq!(alsa_port_subscribed(seq, "ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0"), Some(false), "stale → reconnect");
+        assert_eq!(alsa_port_subscribed(seq, "ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 2 28:1"), Some(false));
+        assert_eq!(alsa_port_subscribed(seq, "Gone:Gone 40:0"), None, "unknown port: no verdict");
+        assert_eq!(alsa_port_subscribed(seq, "No numbers"), None);
+        // Subscribed to someone else only (e.g. PipeWire) is not ours.
+        let other = "Client  28 : \"X\" [Kernel]\n  Port   0 : \"X\" (RWeX)\n    Connecting To: 142:0\n";
+        assert_eq!(alsa_port_subscribed(other, "X:X 28:0"), Some(false));
+    }
 
     #[test]
     fn replugged_device_keeps_its_index_even_with_a_new_client_number() {

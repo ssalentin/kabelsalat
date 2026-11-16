@@ -459,6 +459,51 @@ struct SavedRule {
     edit: RuleEdit,
 }
 
+/// `s` moved onto `graph`, every node id mapped by `remap` (None drops it):
+/// knobs, plugin states and matrix routes follow their node.
+fn remap_session(
+    s: &crate::session::Session,
+    graph: Graph,
+    remap: impl Fn(u32) -> Option<u32>,
+) -> crate::session::Session {
+    let mut ns = crate::session::Session::new(s.name.clone(), graph);
+    for p in s.params() {
+        if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
+    }
+    for st in s.plugin_states() {
+        if let Some(nid) = remap(st.node) { ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone()); }
+    }
+    let rules: Vec<SavedRule> = s.matrix()
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let rules: Vec<SavedRule> = rules.into_iter()
+        .filter_map(|mut r| { r.dest = remap(r.dest)?; Some(r) })
+        .collect();
+    if !rules.is_empty() {
+        ns.set_matrix(serde_json::to_value(&rules).ok());
+    }
+    ns
+}
+
+/// A multi-rig session in the id layout the engine's LoadRigs produces
+/// (split → merge). Gaps left by removed or added nodes shift a later rig's
+/// ids there, so everything keyed on node ids is remapped first.
+fn canonical_rig_session(s: &crate::session::Session) -> crate::session::Session {
+    if s.graph.nodes.iter().all(|n| n.rig == 0) {
+        return s.clone();
+    }
+    let (graphs, old_bases) = crate::control::split_rigs(&s.graph);
+    let rigs: Vec<crate::control::Rig> = graphs.into_iter()
+        .map(|g| crate::control::Rig::new(String::new(), g, None))
+        .collect();
+    let new_bases = crate::control::rig_bases(&rigs);
+    let merged = crate::control::merge_rigs(&rigs);
+    remap_session(s, merged, |old| {
+        let rig = s.graph.node(old)?.rig as usize;
+        Some(new_bases[rig] + (old - old_bases[rig]))
+    })
+}
+
 impl Default for RuleEdit {
     fn default() -> Self {
         Self {
@@ -2328,6 +2373,7 @@ impl DemoApp {
         }
         // Shaped matrix routes and CC/MIDI-learn bindings (rule 33 mirror).
         let mut rules: Vec<SavedRule> = self.rule_edits.iter()
+            .filter(|((_, dest), _)| s.graph.node(*dest).is_some())
             .map(|(&(source, dest), e)| SavedRule { source, dest, edit: e.clone() })
             .collect();
         rules.sort_by_key(|r| (format!("{:?}", r.source), r.dest));
@@ -2343,7 +2389,7 @@ impl DemoApp {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
         self.rule_edits.clear();
-        for r in rules {
+        for r in rules.into_iter().filter(|r| s.graph.node(r.dest).is_some()) {
             if let Some(bus) = &self.bus {
                 let mut b = bus.lock().unwrap();
                 if !r.edit.cc_only {
@@ -2442,6 +2488,8 @@ impl DemoApp {
     /// state, and rewire the engine. Works for any topology (templates, saved
     /// sessions, the demo patch).
     fn apply_session(&mut self, s: &crate::session::Session) -> anyhow::Result<()> {
+        let canonical = canonical_rig_session(s);
+        let s = &canonical;
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
         self.sync_clap_slots(&s.graph);
@@ -3808,7 +3856,15 @@ impl DemoApp {
 
     fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>) {
         let cc = cc & 0x7F;
-        let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_default();
+        let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_else(|| {
+            // Mirror what the engine will do: binding on a pair without a rule
+            // creates a CC-only rule (MatrixCcMap), never a note route.
+            let routed = match self.graph_pub.as_ref().and_then(|p| p.lock().ok()) {
+                Some(g) => g.rules.iter().any(|r| r.source == source && r.dest == dest),
+                None => true,
+            };
+            RuleEdit { cc_only: !routed, ..RuleEdit::default() }
+        });
         match param {
             Some(p) => e.set_cc(cc, p),
             None => e.unmap_cc(cc),
@@ -4052,6 +4108,7 @@ impl DemoApp {
             self.set_cc_binding(src, node, cc, Some(param));
         }
         if changed {
+            edit.cc_only = false; // a shaped route routes notes (engine MatrixRule)
             let cmd = edit.to_command(src, node);
             if edit.is_default() { self.rule_edits.remove(&(src, node)); }
             else { self.rule_edits.insert((src, node), edit); }
@@ -4305,13 +4362,7 @@ impl DemoApp {
             let i = rigs.iter().position(|(k, _)| *k == Some(o))?;
             Some(new_bases[i] + (old - old_bases[o]))
         };
-        let mut ns = crate::session::Session::new(s.name.clone(), merged);
-        for p in s.params() {
-            if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
-        }
-        for st in s.plugin_states() {
-            if let Some(nid) = remap(st.node) { ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone()); }
-        }
+        let ns = remap_session(&s, merged, remap);
         // Mixer follows its rig; the new rig starts at unity (applied after
         // the reload — build_rack resets the mixer).
         let mut mix = [crate::engine::RigMix::DEFAULT; 8];
@@ -9137,6 +9188,47 @@ mod rig_switch_tests {
         assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
         assert_eq!(learned.param_for_cc(7), Some(43));
         assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
+    }
+
+    #[test]
+    fn a_multi_rig_session_with_an_id_gap_keeps_routes_on_their_synth() {
+        let mut demo_app = DemoApp::new_with_sink(None);
+        demo_app.load_multi_rig_demo();
+        let mut s = demo_app.capture_session("gap").unwrap();
+        // Remove a rig-A unit: rig B's ids shift in the engine's LoadRigs layout.
+        let gap = s.graph.nodes.iter()
+            .find(|n| n.rig == 0 && !matches!(n.kind, NodeKind::Keys | NodeKind::MasterOut | NodeKind::Clap { .. }))
+            .map(|n| n.id).expect("a removable rig-A unit");
+        s.graph.remove_node(gap);
+        let surge_b = s.graph.nodes.iter()
+            .find(|n| n.rig == 1 && matches!(n.kind, NodeKind::Clap { .. })).unwrap().id;
+        let rule = SavedRule { source: SourceId::Keys, dest: surge_b, edit: RuleEdit { transpose: 7, ..RuleEdit::default() } };
+        s.set_matrix(Some(serde_json::to_value(vec![rule]).unwrap()));
+
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        app.graph_pub = Some(pub_.clone());
+        let mut pump = |drain: &mut crate::control::CommandDrain| {
+            drain.drain(|c| { ebus.send(c); });
+            let mut buf = vec![0.0f32; 64 * 2];
+            engine.render(&mut buf, 2);
+        };
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+        app.apply_session(&s).unwrap();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); pump(&mut drain); }
+        let g = pub_.lock().unwrap();
+        let r = g.rules.iter().find(|r| r.transpose == 7).expect("route restored");
+        let dest = g.graph.node(r.dest).expect("route points at a live node");
+        assert!(matches!(dest.kind, NodeKind::Clap { .. }) && dest.rig == 1, "route landed on {:?} (rig {})", dest.kind, dest.rig);
+        assert!(app.units.iter().any(|u| u.node_id == r.dest && matches!(u.node_kind, UnitKind::Clap)), "UI and engine agree on the synth's id");
+        assert_ne!(app.session_msg, "Patch updated from MCP/CLI", "no divergence rebuild after loading");
     }
 
     #[test]

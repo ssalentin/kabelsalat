@@ -201,6 +201,11 @@ Learned so far (2026-11-15, UI polish pass):
     tempo change mid-beat left its click 1/16 beat off the beats a
     tempo-synced plugin sees. Check with `kabelsalat transport-test` (real
     Surge) and `cargo test --bin kabelsalat song_clock master_started`.
+44. **Node-id keyed session data goes through `remap_session`:** a rig-tagged
+    session is canonicalized (`canonical_rig_session`: split → merge, the
+    layout LoadRigs produces) before `apply_session` uses it; knobs, plugin
+    states and matrix routes follow their node via one remap. A removed
+    rig-A unit shifted rig B's ids, and a restored route landed on Master.
 
 ## Ground rules
 

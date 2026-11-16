@@ -956,6 +956,25 @@ enum Hit {
     Background,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum StageView {
+    #[default]
+    Rack,
+    Matrix,
+    Mixer,
+    Sessions,
+    Plugins,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum PluginCategory {
+    #[default]
+    All,
+    Clap,
+    Lv2,
+    BuiltIn,
+}
+
 enum Drag {
     None,
     Knob { unit: usize, idx: usize, start_val: f32, press_y: f32 },
@@ -1040,15 +1059,14 @@ struct DemoApp {
 
     show_help: bool,
     show_stats: bool,
-    show_sessions: bool,
     session_name: String,
     session_msg: String,
+    confirm_delete_session: Option<String>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
     rig_chip_rects: Vec<Rect>,
     // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
-    show_plugins: bool,
     plugins_loaded: bool,
     plugins_clap: Vec<ClapPluginInfo>,
     plugins_lv2: Vec<Lv2PluginInfo>,
@@ -1056,6 +1074,7 @@ struct DemoApp {
     /// lilv load take seconds); adopted by `poll_plugin_scan`.
     plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>)>>,
     plugin_filter: String,
+    plugin_category: PluginCategory,
     plugin_msg: String,
     fps: f32,
     stats_timer: f32,
@@ -1121,12 +1140,8 @@ struct DemoApp {
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
     rig_levels: Vec<f32>,
-    /// Hot-wire MIDI matrix — a MAIN-STAGE view, not a window (2026-11-15).
-    show_matrix: bool,
-    /// Mixer stage (main-stage view like the matrix): every source → its rig
-    /// bus → Master out. Owns the per-rig vol/pan/mute/solo (2026-11-15, user:
-    /// "volume of the rigs at the top doesn't make sense").
-    show_mixer: bool,
+    /// Active main-stage view: Rack, Matrix, Mixer, Sessions, or Plugins.
+    stage_view: StageView,
     /// Ctrl-drag of a unit: last rack-local cursor (drives the live layout
     /// preview) and the slot rect the dragged unit would land in.
     drag_cursor: Option<Vec2>,
@@ -1307,17 +1322,17 @@ impl DemoApp {
             meter_peak: 0.0,
             show_help: false,
             show_stats: false,
-            show_sessions: false,
             session_name: String::new(),
             session_msg: String::new(),
+            confirm_delete_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
-            show_plugins: false,
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
             plugin_scan: None,
             plugin_filter: String::new(),
+            plugin_category: PluginCategory::All,
             plugin_msg: String::new(),
             fps: 60.0,
             stats_timer: 0.0,
@@ -1355,8 +1370,7 @@ impl DemoApp {
             current_source: SourceId::Keys,
             active_rig: 0,
             rig_levels: Vec::new(),
-            show_matrix: false,
-            show_mixer: false,
+            stage_view: StageView::Rack,
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
@@ -2432,6 +2446,53 @@ impl DemoApp {
         dir
     }
 
+    fn list_saved_sessions(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let p = e.path();
+                        if p.extension().map(|x| x == "ksalat").unwrap_or(false) {
+                            p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn delete_saved_session(dir: &std::path::Path, name: &str) -> Result<(), String> {
+        let path = crate::session::Session::package_path(dir, name).map_err(|e| e.to_string())?;
+        if !path.exists() {
+            return Err(format!("session '{name}' does not exist"));
+        }
+        std::fs::remove_dir_all(&path).map_err(|e| e.to_string())
+    }
+
+    fn toggle_stage(&mut self, view: StageView) {
+        self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
+        if self.stage_view != StageView::Sessions {
+            self.confirm_delete_session = None;
+        }
+        if self.stage_view == StageView::Plugins && !self.plugins_loaded {
+            self.refresh_plugins();
+        }
+    }
+
+    fn stage_sheet_rects(&self, rect: Rect, min_h: f32) -> (Rect, Rect) {
+        let top = self.toolbar_top + 20.0;
+        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min((rect.width() - 16.0).max(200.0));
+        let sheet = Rect::from_min_max(
+            Pos2::new(rect.center().x - w / 2.0, top),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + min_h)),
+        );
+        (sheet, sheet.shrink2(Vec2::new(32.0, 26.0)))
+    }
+
     /// Snapshot the current patch + knobs + plugin state into a Session.
     fn capture_session(&mut self, name: &str) -> anyhow::Result<crate::session::Session> {
         // Nodes come from the loaded graph; edges from the living cables.
@@ -2822,22 +2883,7 @@ impl DemoApp {
                 }
             }
             "list_sessions" => {
-                let dir = Self::sessions_dir();
-                let mut names: Vec<String> = std::fs::read_dir(&dir)
-                    .map(|rd| {
-                        rd.filter_map(|e| e.ok())
-                            .filter_map(|e| {
-                                let p = e.path();
-                                if p.extension().map(|x| x == "ksalat").unwrap_or(false) {
-                                    p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                names.sort();
+                let names = Self::list_saved_sessions(&Self::sessions_dir());
                 if names.is_empty() {
                     "no saved sessions yet".into()
                 } else {
@@ -4713,25 +4759,20 @@ impl DemoApp {
                     }
                     nav_separator(ui);
                     ui.add_space(6.0);
-                    if nav_button(ui, "Sessions", self.show_sessions) {
-                        self.show_sessions = !self.show_sessions;
+                    if nav_button(ui, "Sessions", self.stage_view == StageView::Sessions) {
+                        self.toggle_stage(StageView::Sessions);
                     }
                     ui.add_space(6.0);
-                    if nav_button(ui, "Plugins", self.show_plugins) {
-                        self.show_plugins = !self.show_plugins;
-                        if self.show_plugins && !self.plugins_loaded {
-                            self.refresh_plugins();
-                        }
+                    if nav_button(ui, "Plugins", self.stage_view == StageView::Plugins) {
+                        self.toggle_stage(StageView::Plugins);
                     }
                     ui.add_space(6.0);
-                    if nav_button(ui, "Matrix", self.show_matrix) {
-                        self.show_matrix = !self.show_matrix;
-                        if self.show_matrix { self.show_mixer = false; }
+                    if nav_button(ui, "Matrix", self.stage_view == StageView::Matrix) {
+                        self.toggle_stage(StageView::Matrix);
                     }
                     ui.add_space(6.0);
-                    if nav_button(ui, "Mixer", self.show_mixer) {
-                        self.show_mixer = !self.show_mixer;
-                        if self.show_mixer { self.show_matrix = false; }
+                    if nav_button(ui, "Mixer", self.stage_view == StageView::Mixer) {
+                        self.toggle_stage(StageView::Mixer);
                     }
                     ui.add_space(6.0);
                     if nav_button(ui, "Assistant", self.show_assistant) {
@@ -4772,102 +4813,393 @@ impl DemoApp {
             });
     }
 
-    /// Visual save/load for sessions (no assistant needed).
-    fn sessions_window(&mut self, ctx: &egui::Context) {
-        if !self.show_sessions {
-            return;
+    fn recessed_input(ui: &mut egui::Ui, text: &mut String, width: f32, hint: &str) -> egui::Response {
+        egui::Frame::new()
+            .fill(theme::PAPER_SINK)
+            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(text)
+                        .frame(egui::Frame::NONE)
+                        .desired_width(width)
+                        .hint_text(hint),
+                )
+            })
+            .inner
+    }
+
+    fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Response {
+        ui.scope(|ui| {
+            let (fill, stroke, txt) = if filled {
+                (theme::CLIP_RED, theme::CLIP_RED, theme::ON_ACCENT)
+            } else {
+                (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CLIP_BRIGHT)
+            };
+            let base = egui::style::WidgetVisuals {
+                bg_fill: fill,
+                weak_bg_fill: fill,
+                bg_stroke: Stroke::new(1.0, stroke),
+                corner_radius: 2.0.into(),
+                fg_stroke: Stroke::new(1.0, txt),
+                expansion: 0.0,
+            };
+            let hot_fill = if filled {
+                theme::mix(theme::CLIP_RED, theme::INK, 0.08)
+            } else {
+                theme::mix(theme::DARK_PANEL_HI, theme::CLIP_RED, 0.14)
+            };
+            let hot = egui::style::WidgetVisuals {
+                bg_fill: hot_fill,
+                weak_bg_fill: hot_fill,
+                bg_stroke: Stroke::new(1.0, if filled { hot_fill } else { theme::CLIP_RED }),
+                ..base
+            };
+            let v = ui.visuals_mut();
+            v.widgets.inactive = base;
+            v.widgets.hovered = hot;
+            v.widgets.active = hot;
+            v.widgets.open = base;
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            ui.add(
+                egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
+                    .corner_radius(2.0)
+                    .min_size(egui::vec2(0.0, 26.0)),
+            )
+        })
+        .inner
+    }
+
+    fn stage_hairline(ui: &mut egui::Ui) {
+        let w = ui.available_width().max(1.0);
+        let (r, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
+        ui.painter().line_segment([r.left_center(), r.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+    }
+
+    fn save_current_session(&mut self, dir: &std::path::Path) {
+        let name = if self.session_name.trim().is_empty() {
+            "Untitled".to_string()
+        } else {
+            self.session_name.trim().to_string()
+        };
+        match self.capture_session(&name) {
+            Ok(s) => {
+                let path = crate::session::Session::package_path(dir, &name);
+                match path.and_then(|p| s.save(&p).map(|_| p)) {
+                    Ok(_) => {
+                        self.confirm_delete_session = None;
+                        self.session_msg = format!("Saved '{name}'");
+                    }
+                    Err(e) => self.session_msg = format!("Save failed: {e}"),
+                }
+            }
+            Err(e) => self.session_msg = format!("Capture failed: {e}"),
         }
-        let mut open = self.show_sessions;
-        egui::Window::new("Sessions")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
-            .show(ctx, |ui| {
-                theme::section_label(ui, "Starter templates");
-                ui.horizontal(|ui| {
-                    for t in Template::ALL {
-                        if ui.button(t.title()).on_hover_text("load a playable pre-wired rack").clicked() {
-                            self.load_template(t);
-                        }
+    }
+
+    fn sessions_stage(&mut self, ui: &mut egui::Ui) {
+        let dir = Self::sessions_dir();
+        self.sessions_stage_in(ui, &dir);
+    }
+
+    /// Main-stage view for sessions and starter templates (one-window rule).
+    fn sessions_stage_in(&mut self, ui: &mut egui::Ui, dir: &std::path::Path) {
+        let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let help = self.show_help;
+        let names = Self::list_saved_sessions(dir);
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("save and load patches · starter templates · Tab / Esc: back to the rack")
+                            .size(13.0)
+                            .color(theme::INK_2),
+                    );
+                    if !self.session_msg.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let col = if self.session_msg.contains("failed") {
+                                theme::CLIP_BRIGHT
+                            } else {
+                                theme::LIVE_TEAL
+                            };
+                            ui.label(egui::RichText::new(&self.session_msg).size(12.5).color(col));
+                        });
                     }
                 });
-                if ui.button("Demo patch (2 stacks)").clicked() {
+                ui.add_space(12.0);
+                Self::stage_hairline(ui);
+                ui.add_space(14.0);
+
+                let avail_w = ui.available_width();
+                let h = ui.available_height().max(80.0);
+                let two_col = avail_w >= 680.0;
+                let left_w = if two_col { (avail_w * 0.40).clamp(270.0, 410.0) } else { avail_w };
+                let right_w = if two_col { (avail_w - left_w - 25.0).max(240.0) } else { avail_w };
+
+                let mut load_session: Option<String> = None;
+                let mut delete_session: Option<String> = None;
+                let mut do_save = false;
+                let mut load_tpl: Option<Template> = None;
+                let mut load_demo = false;
+                let mut load_multi = false;
+
+                let draw_left = |ui: &mut egui::Ui,
+                                 session_name: &mut String,
+                                 do_save: &mut bool,
+                                 load_tpl: &mut Option<Template>,
+                                 load_demo: &mut bool,
+                                 load_multi: &mut bool| {
+                    theme::section_label(ui, "Save current patch");
+                    ui.add_space(8.0);
+                    let field_w = (ui.available_width() - 12.0).max(120.0);
+                    let edit = Self::recessed_input(ui, session_name, field_w, "Session name…");
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        *do_save = true;
+                    }
+                    ui.add_space(8.0);
+                    if theme::primary_button(ui, "Save current patch").clicked() {
+                        *do_save = true;
+                    }
+                    ui.add_space(16.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(14.0);
+                    theme::section_label(ui, "Starter templates");
+                    ui.add_space(8.0);
+
+                    let template_row = |ui: &mut egui::Ui, title: &str, desc: &str, hover: &str| -> bool {
+                        let mut clicked = false;
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(egui::RichText::new(title).font(theme::medium_font(13.5)).color(theme::INK));
+                                ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if theme::chip_button(ui, "Load", false).on_hover_text(hover).clicked() {
+                                    clicked = true;
+                                }
+                            });
+                        });
+                        clicked
+                    };
+
+                    for (idx, t) in Template::ALL.iter().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(6.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(6.0);
+                        }
+                        let (desc, key_hint) = match t {
+                            Template::LeadReverb => ("Keys → Surge → Reverb", "F5"),
+                            Template::DrumsBass => ("Dual Surge layers", "F6"),
+                            Template::AmbientPad => ("Surge → Delay → Reverb", "F7"),
+                        };
+                        if template_row(ui, t.title(), &format!("{desc} · {key_hint}"), "load a playable pre-wired rack") {
+                            *load_tpl = Some(*t);
+                        }
+                    }
+                    ui.add_space(6.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(6.0);
+                    if template_row(ui, "Demo patch (2 stacks)", "2 Surge + Delay stacks · F8", "restore the two-stack demo patch") {
+                        *load_demo = true;
+                    }
+                    ui.add_space(6.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(6.0);
+                    if template_row(
+                        ui,
+                        "Multi-rig demo (2 rigs)",
+                        "2 independent rigs, 1–9 switch · F4",
+                        "two independent rigs, both sounding — switch the view with 1–9 / ←→ (F4)",
+                    ) {
+                        *load_multi = true;
+                    }
+                };
+
+                let draw_right = |ui: &mut egui::Ui,
+                                  names: &[String],
+                                  confirm_delete: &mut Option<String>,
+                                  load_session: &mut Option<String>,
+                                  delete_session: &mut Option<String>,
+                                  list_h: f32| {
+                    theme::section_label(ui, &format!("Saved sessions ({})", names.len()));
+                    ui.add_space(8.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("sessions_list_scroll")
+                        .min_scrolled_height(list_h)
+                        .max_height(list_h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if names.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("No saved sessions yet — name your patch on the left and click Save.")
+                                        .size(13.0)
+                                        .color(theme::INK_2),
+                                );
+                                return;
+                            }
+                            for (i, name) in names.iter().enumerate() {
+                                if i > 0 {
+                                    Self::stage_hairline(ui);
+                                }
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{:02}", i + 1))
+                                            .font(theme::medium_font(12.5))
+                                            .color(theme::INK_2),
+                                    );
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        egui::RichText::new(name)
+                                            .font(theme::medium_font(14.5))
+                                            .color(theme::INK),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let confirming = confirm_delete.as_deref() == Some(name.as_str());
+                                        if confirming {
+                                            if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                *confirm_delete = None;
+                                            }
+                                            ui.add_space(6.0);
+                                            if Self::danger_button(ui, "Confirm delete", true).clicked() {
+                                                *delete_session = Some(name.clone());
+                                            }
+                                        } else {
+                                            if Self::danger_button(ui, "Delete", false)
+                                                .on_hover_text(format!("delete '{name}' from disk"))
+                                                .clicked()
+                                            {
+                                                *confirm_delete = Some(name.clone());
+                                            }
+                                            ui.add_space(6.0);
+                                            if theme::primary_button(ui, "Load").clicked() {
+                                                *load_session = Some(name.clone());
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.add_space(8.0);
+                            }
+                        });
+                };
+
+                if two_col {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(left_w, h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("sessions_left_scroll")
+                                    .min_scrolled_height(h)
+                                    .max_height(h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        draw_left(
+                                            ui,
+                                            &mut self.session_name,
+                                            &mut do_save,
+                                            &mut load_tpl,
+                                            &mut load_demo,
+                                            &mut load_multi,
+                                        );
+                                    });
+                            },
+                        );
+                        ui.add_space(12.0);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
+                        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                        ui.add_space(12.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(right_w, h),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                let list_h = (h - 24.0).max(64.0);
+                                draw_right(
+                                    ui,
+                                    &names,
+                                    &mut self.confirm_delete_session,
+                                    &mut load_session,
+                                    &mut delete_session,
+                                    list_h,
+                                );
+                            },
+                        );
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("sessions_narrow_scroll")
+                        .min_scrolled_height(h)
+                        .max_height(h)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            draw_left(
+                                ui,
+                                &mut self.session_name,
+                                &mut do_save,
+                                &mut load_tpl,
+                                &mut load_demo,
+                                &mut load_multi,
+                            );
+                            ui.add_space(14.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(14.0);
+                            draw_right(
+                                ui,
+                                &names,
+                                &mut self.confirm_delete_session,
+                                &mut load_session,
+                                &mut delete_session,
+                                200.0,
+                            );
+                        });
+                }
+
+                if do_save {
+                    self.save_current_session(dir);
+                }
+                if let Some(t) = load_tpl {
+                    self.load_template(t);
+                }
+                if load_demo {
                     self.load_demo_patch();
                 }
-                if ui.button("Multi-rig demo (2 rigs)")
-                    .on_hover_text("two independent rigs, both sounding — switch the view with 1–9 / ←→ (F4)")
-                    .clicked()
-                {
+                if load_multi {
                     self.load_multi_rig_demo();
                 }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Name:");
-                    ui.text_edit_singleline(&mut self.session_name);
-                });
-                if theme::primary_button(ui, "Save current patch").clicked() {
-                    let name = if self.session_name.trim().is_empty() {
-                        "Untitled".to_string()
-                    } else {
-                        self.session_name.clone()
-                    };
-                    match self.capture_session(&name) {
-                        Ok(s) => {
-                            let path = crate::session::Session::package_path(&Self::sessions_dir(), &name);
-                            match path.and_then(|p| s.save(&p).map(|_| p)) {
-                                Ok(_) => self.session_msg = format!("Saved '{name}'"),
-                                Err(e) => self.session_msg = format!("Save failed: {e}"),
-                            }
-                        }
-                        Err(e) => self.session_msg = format!("Capture failed: {e}"),
+                if let Some(name) = load_session {
+                    self.confirm_delete_session = None;
+                    let path = crate::session::Session::package_path(dir, &name);
+                    match path.and_then(|p| crate::session::Session::load(&p)) {
+                        Ok(s) => match self.apply_session(&s) {
+                            Ok(_) => self.session_msg = format!("Loaded '{name}'"),
+                            Err(e) => self.session_msg = format!("Apply failed: {e}"),
+                        },
+                        Err(e) => self.session_msg = format!("Load failed: {e}"),
                     }
                 }
-                ui.separator();
-                theme::section_label(ui, "Saved sessions");
-                let dir = Self::sessions_dir();
-                let mut names: Vec<String> = std::fs::read_dir(&dir)
-                    .map(|rd| {
-                        rd.filter_map(|e| e.ok())
-                            .filter_map(|e| {
-                                let p = e.path();
-                                if p.extension().map(|x| x == "ksalat").unwrap_or(false) {
-                                    p.file_stem().map(|s| s.to_string_lossy().into_owned())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                names.sort();
-                if names.is_empty() {
-                    ui.label(egui::RichText::new("none yet — save one above").size(12.0).color(theme::INK_2));
-                }
-                // Service-list rows (§4.18): 1px hairline separators.
-                for (i, name) in names.iter().enumerate() {
-                    if i > 0 { ui.separator(); }
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(name).size(13.0));
-                        if theme::primary_button(ui, "Load").clicked() {
-                            let path = crate::session::Session::package_path(&dir, name);
-                            match path.and_then(|p| crate::session::Session::load(&p)) {
-                                Ok(s) => match self.apply_session(&s) {
-                                    Ok(_) => self.session_msg = format!("Loaded '{name}'"),
-                                    Err(e) => self.session_msg = format!("Apply failed: {e}"),
-                                },
-                                Err(e) => self.session_msg = format!("Load failed: {e}"),
-                            }
-                        }
-                    });
-                }
-                if !self.session_msg.is_empty() {
-                    ui.separator();
-                    let col = if self.session_msg.contains("failed") { theme::CLIP_TEXT } else { theme::LIVE_TEAL_DEEP };
-                    ui.label(egui::RichText::new(&self.session_msg).size(12.0).color(col));
+                if let Some(name) = delete_session {
+                    self.confirm_delete_session = None;
+                    match Self::delete_saved_session(dir, &name) {
+                        Ok(()) => self.session_msg = format!("Deleted '{name}'"),
+                        Err(e) => self.session_msg = format!("Delete failed: {e}"),
+                    }
                 }
             });
-        self.show_sessions = open;
+        });
+
+        if self.show_help { self.draw_help(&painter, rect); }
     }
 
     // -- plugin browser (task-18) -------------------------------------------
@@ -5026,106 +5358,316 @@ impl DemoApp {
         self.add_clap_rig(SURGE_ID, "Surge");
     }
 
-    /// Browse installed plugins and add them to a rig (no assistant needed).
-    fn plugins_window(&mut self, ctx: &egui::Context) {
-        if !self.show_plugins { return; }
-        let mut open = self.show_plugins;
-        egui::Window::new("Plugins")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_width(520.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Filter:");
-                    ui.text_edit_singleline(&mut self.plugin_filter);
-                    if ui.button("Refresh").on_hover_text("rescan, retrying plugins that failed before").clicked() {
-                        self.refresh_plugins_with(true);
+    fn plugin_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
+        let inner_w = (width - 30.0).max(160.0);
+        egui::Frame::new()
+            .fill(theme::DARK_PANEL_HI)
+            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(14, 12))
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inner_w, 92.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(inner_w);
+                        ui.set_min_height(92.0);
+                        body(ui, inner_w);
+                    },
+                );
+            });
+    }
+
+    /// Main-stage plugin browser (one-window rule, F9 / B / Plugins chip).
+    fn plugins_stage(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let help = self.show_help;
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
+                            .size(13.0)
+                            .color(theme::INK_2),
+                    );
+                    if !self.plugin_msg.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let col = if self.plugin_msg.contains("failed") {
+                                theme::CLIP_BRIGHT
+                            } else {
+                                theme::LIVE_TEAL
+                            };
+                            ui.label(egui::RichText::new(&self.plugin_msg).size(12.5).color(col));
+                        });
                     }
                 });
-                ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").size(12.0).color(theme::INK_2));
-                let filter = self.plugin_filter.to_lowercase();
-                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                    if filter.is_empty() || "metronome".contains(&filter) {
-                        theme::section_label(ui, "Built-in");
-                        let mut add_metro = false;
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Metronome").size(13.0));
-                            ui.label(egui::RichText::new("tempo · tap · count-in").size(11.0).color(theme::INK_2));
-                            if theme::primary_button(ui, "Add to rig").clicked() {
-                                add_metro = true;
-                            }
-                        });
-                        if add_metro {
-                            self.add_metronome_to_active_rig();
+                ui.add_space(12.0);
+
+                let mut do_refresh = false;
+                ui.horizontal_wrapped(|ui| {
+                    let search_w = (ui.available_width() * 0.28).clamp(180.0, 320.0);
+                    Self::recessed_input(ui, &mut self.plugin_filter, search_w, "Search plugins by name or vendor…");
+                    if !self.plugin_filter.is_empty() && theme::chip_button(ui, "Clear", false).clicked() {
+                        self.plugin_filter.clear();
+                    }
+                    ui.add_space(6.0);
+                    for (cat, label) in [
+                        (PluginCategory::All, "All".to_string()),
+                        (PluginCategory::BuiltIn, "Built-in (1)".to_string()),
+                        (PluginCategory::Clap, format!("CLAP ({})", self.plugins_clap.len())),
+                        (PluginCategory::Lv2, format!("LV2 ({})", self.plugins_lv2.len())),
+                    ] {
+                        if theme::chip_button(ui, &label, self.plugin_category == cat).clicked() {
+                            self.plugin_category = cat;
                         }
-                        ui.separator();
                     }
-                    if self.plugin_scan.is_some() {
-                        ui.label(egui::RichText::new("Scanning plugins…").color(theme::CREAM_DIM));
-                    }
-                    theme::section_label(ui, &format!("LV2 plugins ({})", self.plugins_lv2.len()));
-                    let mut added: Option<(String, String, bool)> = None;
-                    let mut first_row = true;
-                    for p in &self.plugins_lv2 {
-                        if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
-                        if !first_row { ui.separator(); }
-                        first_row = false;
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&p.name).size(13.0));
-                            if p.is_instrument {
-                                ui.label(egui::RichText::new("inst").size(11.0).color(theme::LIVE_TEAL_DEEP));
-                            }
-                            // Offer BOTH roles; the likely one is the primary
-                            // action (the is_instrument hint is permissive).
-                            let inst_resp = if p.is_instrument {
-                                theme::primary_button(ui, "Add instrument")
-                            } else {
-                                ui.button("Add instrument")
-                            };
-                            if inst_resp.on_hover_text(&p.uri).clicked() {
-                                added = Some((p.uri.clone(), p.name.clone(), true));
-                            }
-                            let fx_resp = if p.is_instrument {
-                                ui.button("Add effect")
-                            } else {
-                                theme::primary_button(ui, "Add effect")
-                            };
-                            if fx_resp.on_hover_text(&p.uri).clicked() {
-                                added = Some((p.uri.clone(), p.name.clone(), false));
-                            }
-                        });
-                    }
-                    if let Some((uri, name, as_inst)) = added {
-                        if as_inst { self.add_lv2_instrument(&uri, &name); } else { self.add_lv2_effect(&uri, &name); }
-                    }
-                    ui.separator();
-                    theme::section_label(ui, &format!("CLAP instruments ({})", self.plugins_clap.len()));
-                    let mut add_clap: Option<(String, String)> = None;
-                    let mut first_row = true;
-                    for p in &self.plugins_clap {
-                        if !filter.is_empty() && !p.name.to_lowercase().contains(&filter) { continue; }
-                        if !first_row { ui.separator(); }
-                        first_row = false;
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&p.name).size(13.0));
-                            if !p.vendor.is_empty() && p.vendor != "?" {
-                                ui.label(egui::RichText::new(&p.vendor).size(11.0).color(theme::INK_2));
-                            }
-                            if theme::primary_button(ui, "New rig").on_hover_text(&p.id).clicked() {
-                                add_clap = Some((p.id.clone(), p.name.clone()));
-                            }
-                        });
-                    }
-                    if let Some((id, name)) = add_clap { self.add_clap_rig(&id, &name); }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::chip_button(ui, "Refresh", false)
+                            .on_hover_text("rescan, retrying plugins that failed before")
+                            .clicked()
+                        {
+                            do_refresh = true;
+                        }
+                    });
                 });
-                if !self.plugin_msg.is_empty() {
-                    ui.separator();
-                    let col = if self.plugin_msg.contains("failed") { theme::CLIP_TEXT } else { theme::LIVE_TEAL_DEEP };
-                    ui.label(egui::RichText::new(&self.plugin_msg).size(12.0).color(col));
+                if do_refresh {
+                    self.refresh_plugins_with(true);
+                }
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome adds to the active rig")
+                        .size(12.0)
+                        .color(theme::INK_2),
+                );
+                if self.plugin_scan.is_some() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Scanning plugins…").size(12.0).color(theme::CREAM_DIM));
+                }
+                ui.add_space(10.0);
+                Self::stage_hairline(ui);
+                ui.add_space(12.0);
+
+                let filter = self.plugin_filter.trim().to_lowercase();
+                let list_h = ui.available_height().max(80.0);
+                let mut add_metro = false;
+                let mut add_clap: Option<(String, String)> = None;
+                let mut add_lv2: Option<(String, String, bool)> = None;
+
+                egui::ScrollArea::vertical()
+                    .id_salt("plugins_scroll")
+                    .min_scrolled_height(list_h)
+                    .max_height(list_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let avail_w = (ui.available_width() - 14.0).max(200.0);
+                        let gap = 12.0;
+                        let cols = ((avail_w + gap) / 340.0).floor().clamp(1.0, 3.0) as usize;
+                        let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
+
+                        let show_builtin = matches!(self.plugin_category, PluginCategory::All | PluginCategory::BuiltIn)
+                            && (filter.is_empty() || "metronome".contains(&filter) || "tempo tap count-in".contains(&filter));
+                        let clap_matches: Vec<&ClapPluginInfo> = if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Clap) {
+                            self.plugins_clap
+                                .iter()
+                                .filter(|p| {
+                                    filter.is_empty()
+                                        || p.name.to_lowercase().contains(&filter)
+                                        || p.vendor.to_lowercase().contains(&filter)
+                                        || p.id.to_lowercase().contains(&filter)
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let lv2_matches: Vec<&Lv2PluginInfo> = if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Lv2) {
+                            self.plugins_lv2
+                                .iter()
+                                .filter(|p| {
+                                    filter.is_empty()
+                                        || p.name.to_lowercase().contains(&filter)
+                                        || p.uri.to_lowercase().contains(&filter)
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+
+                        if !show_builtin && clap_matches.is_empty() && lv2_matches.is_empty() {
+                            ui.add_space(12.0);
+                            let empty = if filter.is_empty() {
+                                "No plugins found in this category.".to_string()
+                            } else {
+                                format!("No plugins match '{filter}'.")
+                            };
+                            ui.label(egui::RichText::new(empty).size(13.0).color(theme::INK_2));
+                            return;
+                        }
+
+                        let mut need_divider = false;
+
+                        let card_header = |ui: &mut egui::Ui, title: &str, badge: &str, badge_col: Color32, inner_w: f32| {
+                            ui.horizontal(|ui| {
+                                ui.set_width(inner_w);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    theme::tracked_label(ui, badge, 9.5, 0.12, badge_col);
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title)
+                                                    .font(theme::medium_font(14.0))
+                                                    .color(theme::INK),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
+                            });
+                        };
+
+                        if show_builtin {
+                            theme::section_label(ui, "Built-in");
+                            ui.add_space(8.0);
+                            Self::plugin_card(ui, card_w, |ui, iw| {
+                                card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
+                                ui.add_space(12.0);
+                                if theme::primary_button(ui, "Add to rig").clicked() {
+                                    add_metro = true;
+                                }
+                            });
+                            need_divider = true;
+                        }
+
+                        if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Clap)
+                            && (!clap_matches.is_empty() || filter.is_empty())
+                        {
+                            if need_divider {
+                                ui.add_space(14.0);
+                                Self::stage_hairline(ui);
+                                ui.add_space(14.0);
+                            }
+                            theme::section_label(ui, &format!("CLAP instruments ({})", clap_matches.len()));
+                            ui.add_space(8.0);
+                            if clap_matches.is_empty() {
+                                ui.label(egui::RichText::new("No CLAP plugins found.").size(12.5).color(theme::INK_2));
+                            } else {
+                                for row in clap_matches.chunks(cols) {
+                                    ui.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = gap;
+                                        for p in row {
+                                            Self::plugin_card(ui, card_w, |ui, iw| {
+                                                card_header(ui, &p.name, "CLAP", theme::ACCENT_BRIGHT, iw);
+                                                ui.add_space(4.0);
+                                                let vendor = if !p.vendor.is_empty() && p.vendor != "?" {
+                                                    p.vendor.as_str()
+                                                } else {
+                                                    "instrument plugin"
+                                                };
+                                                ui.add(
+                                                    egui::Label::new(egui::RichText::new(vendor).size(12.0).color(theme::INK_2))
+                                                        .truncate(),
+                                                );
+                                                ui.add_space(12.0);
+                                                if theme::primary_button(ui, "New rig")
+                                                    .on_hover_text(format!("{} · create Keys → {} → Master", p.id, p.name))
+                                                    .clicked()
+                                                {
+                                                    add_clap = Some((p.id.clone(), p.name.clone()));
+                                                }
+                                            });
+                                        }
+                                    });
+                                    ui.add_space(gap);
+                                }
+                            }
+                            need_divider = true;
+                        }
+
+                        if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Lv2)
+                            && (!lv2_matches.is_empty() || filter.is_empty())
+                        {
+                            if need_divider {
+                                ui.add_space(14.0);
+                                Self::stage_hairline(ui);
+                                ui.add_space(14.0);
+                            }
+                            theme::section_label(ui, &format!("LV2 plugins ({})", lv2_matches.len()));
+                            ui.add_space(8.0);
+                            if lv2_matches.is_empty() {
+                                ui.label(egui::RichText::new("No LV2 plugins found.").size(12.5).color(theme::INK_2));
+                            } else {
+                                for row in lv2_matches.chunks(cols) {
+                                    ui.horizontal_top(|ui| {
+                                        ui.spacing_mut().item_spacing.x = gap;
+                                        for p in row {
+                                            Self::plugin_card(ui, card_w, |ui, iw| {
+                                                let (badge, bcol) = if p.is_instrument {
+                                                    ("INST", theme::LIVE_TEAL)
+                                                } else {
+                                                    ("FX", theme::INK_2)
+                                                };
+                                                card_header(ui, &p.name, badge, bcol, iw);
+                                                ui.add_space(4.0);
+                                                ui.add(
+                                                    egui::Label::new(egui::RichText::new(&p.uri).size(11.0).color(theme::INK_2))
+                                                        .truncate(),
+                                                );
+                                                ui.add_space(12.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                                    let inst_resp = if p.is_instrument {
+                                                        theme::primary_button(ui, "Add instrument")
+                                                    } else {
+                                                        theme::chip_button(ui, "Add instrument", false)
+                                                    };
+                                                    if inst_resp.on_hover_text(&p.uri).clicked() {
+                                                        add_lv2 = Some((p.uri.clone(), p.name.clone(), true));
+                                                    }
+                                                    let fx_resp = if p.is_instrument {
+                                                        theme::chip_button(ui, "Add effect", false)
+                                                    } else {
+                                                        theme::primary_button(ui, "Add effect")
+                                                    };
+                                                    if fx_resp.on_hover_text(&p.uri).clicked() {
+                                                        add_lv2 = Some((p.uri.clone(), p.name.clone(), false));
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                                    ui.add_space(gap);
+                                }
+                            }
+                        }
+                    });
+
+                if add_metro {
+                    self.add_metronome_to_active_rig();
+                }
+                if let Some((id, name)) = add_clap {
+                    self.add_clap_rig(&id, &name);
+                }
+                if let Some((uri, name, as_inst)) = add_lv2 {
+                    if as_inst {
+                        self.add_lv2_instrument(&uri, &name);
+                    } else {
+                        self.add_lv2_effect(&uri, &name);
+                    }
                 }
             });
-        self.show_plugins = open;
+        });
+
+        if self.show_help { self.draw_help(&painter, rect); }
     }
 
     /// Assistant: a toggleable WIDE bottom panel (chip / F12, hidden by
@@ -6246,7 +6788,7 @@ impl DemoApp {
         // Pan an overflowing rack with the wheel / trackpad — only over the
         // bare stage (never over a panel or window that scrolls itself).
         let ov = self.rack_overflow;
-        if !self.show_matrix && !self.show_mixer && (ov.x > 0.0 || ov.y > 0.0) {
+        if self.stage_view == StageView::Rack && (ov.x > 0.0 || ov.y > 0.0) {
             let over_stage = ctx.pointer_hover_pos().is_some_and(|p| self.stage_rect.contains(p)
                 && ctx.layer_id_at(p).map_or(true, |l| l.order == egui::Order::Background));
             let d = ctx.input(|i| i.smooth_scroll_delta());
@@ -6278,32 +6820,26 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
             // Plugin browser (task-18).
             if i.consume_key(Modifiers::NONE, Key::F9) {
-                self.show_plugins = !self.show_plugins;
-                if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
+                self.toggle_stage(StageView::Plugins);
             }
             // Hot-wire MIDI matrix (PLAN §13).
             if i.consume_key(Modifiers::NONE, Key::F11) {
-                self.show_matrix = !self.show_matrix;
-                if self.show_matrix { self.show_mixer = false; }
+                self.toggle_stage(StageView::Matrix);
             }
             // Letter shortcuts to the views (user 2026-11-15) — letters the
             // laptop piano does not use: M mixer · N matrix · C chat · B browser.
             if i.consume_key(Modifiers::NONE, Key::M) {
-                self.show_mixer = !self.show_mixer;
-                if self.show_mixer { self.show_matrix = false; }
+                self.toggle_stage(StageView::Mixer);
             }
             if i.consume_key(Modifiers::NONE, Key::N) {
-                self.show_matrix = !self.show_matrix;
-                if self.show_matrix { self.show_mixer = false; }
+                self.toggle_stage(StageView::Matrix);
             }
             if i.consume_key(Modifiers::NONE, Key::C) { self.show_assistant = !self.show_assistant; }
             if i.consume_key(Modifiers::NONE, Key::B) {
-                self.show_plugins = !self.show_plugins;
-                if self.show_plugins && !self.plugins_loaded { self.refresh_plugins(); }
+                self.toggle_stage(StageView::Plugins);
             }
             if i.consume_key(Modifiers::NONE, Key::F10) {
-                self.show_mixer = !self.show_mixer;
-                if self.show_mixer { self.show_matrix = false; }
+                self.toggle_stage(StageView::Mixer);
             }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
@@ -6311,10 +6847,10 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.pending.is_some() { self.pending = None; }
-                else if self.show_matrix && self.cc_learn.is_some() { self.cc_learn = None; }
-                else if self.show_matrix && self.rule_editor.is_some() { self.rule_editor = None; }
-                else if self.show_matrix { self.show_matrix = false; }
-                else if self.show_mixer { self.show_mixer = false; }
+                else if self.stage_view == StageView::Matrix && self.cc_learn.is_some() { self.cc_learn = None; }
+                else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
+                else if self.confirm_delete_session.is_some() { self.confirm_delete_session = None; }
+                else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
                 else { self.selected = None; }
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
@@ -6362,10 +6898,10 @@ impl DemoApp {
             return;
         };
 
-        // Matrix mode: the rack is not on screen, so its hit-testing is inert
+        // Stage view mode: the rack is not on screen, so its hit-testing is inert
         // except the masthead's Play circle (Tab returns to the rack). The
         // stage's egui widgets handle their own input.
-        if self.show_matrix || self.show_mixer {
+        if self.stage_view != StageView::Rack {
             let hit = if self.show_help { Hit::Background } else {
                 match self.hit_test(s) { Hit::Play => Hit::Play, _ => Hit::Background }
             };
@@ -6761,17 +7297,12 @@ impl DemoApp {
     /// is being edited — the inline rule editor on the right.
     fn matrix_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
 
-        let top = self.toolbar_top + 20.0;
-        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
-        let sheet = Rect::from_min_max(
-            Pos2::new(rect.center().x - w / 2.0, top),
-            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + 160.0)),
-        );
+        let (sheet, inner) = self.stage_sheet_rects(rect, 160.0);
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
-        let inner = sheet.shrink2(Vec2::new(32.0, 26.0));
         let help = self.show_help;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.add_enabled_ui(!help, |ui| {
@@ -6864,16 +7395,11 @@ impl DemoApp {
     /// matrix (rule 8) — Tab / Esc return to the rack.
     fn mixer_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
-        let top = self.toolbar_top + 20.0;
-        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min(rect.width() - 16.0);
-        let sheet = Rect::from_min_max(
-            Pos2::new(rect.center().x - w / 2.0, top),
-            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + 200.0)),
-        );
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
-        let inner = sheet.shrink2(Vec2::new(32.0, 26.0));
         let help = self.show_help;
         let n = self.rig_count();
         self.mixer_fader_rects.clear();
@@ -7029,11 +7555,14 @@ impl DemoApp {
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
-    /// Tab: in matrix mode it returns to the rack; otherwise it flips the rack.
+    /// Tab: in any non-rack stage view it returns to the rack; otherwise it flips the rack.
     fn on_tab(&mut self) {
-        if self.show_matrix { self.show_matrix = false; }
-        else if self.show_mixer { self.show_mixer = false; }
-        else { self.start_flip(); }
+        if self.stage_view != StageView::Rack {
+            self.confirm_delete_session = None;
+            self.stage_view = StageView::Rack;
+        } else {
+            self.start_flip();
+        }
     }
 
     fn draw_rails(&self, painter: &egui::Painter) {
@@ -8163,11 +8692,13 @@ impl DemoApp {
         self.publish_pins();
 
         self.tessellate();
-        if self.show_matrix { self.matrix_stage(ui); }
-        else if self.show_mixer { self.mixer_stage(ui); }
-        else { self.draw(ui); }
-        self.sessions_window(&ctx);
-        self.plugins_window(&ctx);
+        match self.stage_view {
+            StageView::Rack => self.draw(ui),
+            StageView::Matrix => self.matrix_stage(ui),
+            StageView::Mixer => self.mixer_stage(ui),
+            StageView::Sessions => self.sessions_stage(ui),
+            StageView::Plugins => self.plugins_stage(ui),
+        }
         self.delete_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
@@ -8946,10 +9477,10 @@ mod matrix_ui_tests {
     #[test]
     fn tab_in_matrix_returns_to_rack_without_flipping() {
         let mut app = demo_app();
-        app.show_matrix = true;
+        app.stage_view = StageView::Matrix;
         let side = app.side;
         app.on_tab();
-        assert!(!app.show_matrix);
+        assert_eq!(app.stage_view, StageView::Rack);
         assert!(!app.flipping && app.side == side, "Tab must not flip while leaving the matrix");
         app.on_tab();
         assert!(app.flipping, "Tab in rack mode flips");
@@ -8959,14 +9490,14 @@ mod matrix_ui_tests {
     fn escape_chain_closes_rule_editor_then_matrix() {
         let mut app = demo_app();
         let inst = app.matrix_sinks()[0];
-        app.show_matrix = true;
+        app.stage_view = StageView::Matrix;
         app.rule_editor = Some((inst, MatrixRow::Keys));
         press_keys(&mut app, &[Key::Escape]);
-        assert!(app.rule_editor.is_none() && app.show_matrix, "first Esc closes the rule editor");
+        assert!(app.rule_editor.is_none() && app.stage_view == StageView::Matrix, "first Esc closes the rule editor");
         press_keys(&mut app, &[Key::Escape]);
-        assert!(!app.show_matrix, "second Esc leaves the matrix");
+        assert_eq!(app.stage_view, StageView::Rack, "second Esc leaves the matrix");
         press_keys(&mut app, &[Key::F11]);
-        assert!(app.show_matrix, "F11 toggles the matrix stage");
+        assert_eq!(app.stage_view, StageView::Matrix, "F11 toggles the matrix stage");
     }
 
     #[test]
@@ -9815,7 +10346,7 @@ mod rig_switch_tests {
     #[test]
     fn matrix_block_is_centered_in_its_sheet() {
         let (mut app, ctx) = two_rigs();
-        app.show_matrix = true;
+        app.stage_view = StageView::Matrix;
         for _ in 0..4 { frame(&mut app, &ctx, vec![]); }
         // The grid's widgets (cells) and the measured block: equal margins.
         let block_w = app.matrix_block_w;
@@ -9873,9 +10404,11 @@ mod rig_switch_tests {
     fn letter_shortcuts_open_the_views() {
         let (mut app, ctx) = two_rigs();
         frame(&mut app, &ctx, key(Key::M));
-        assert!(app.show_mixer && !app.show_matrix);
+        assert_eq!(app.stage_view, StageView::Mixer);
         frame(&mut app, &ctx, key(Key::N));
-        assert!(app.show_matrix && !app.show_mixer);
+        assert_eq!(app.stage_view, StageView::Matrix);
+        frame(&mut app, &ctx, key(Key::B));
+        assert_eq!(app.stage_view, StageView::Plugins);
         frame(&mut app, &ctx, key(Key::C));
         assert!(app.show_assistant);
     }
@@ -10068,7 +10601,7 @@ mod rig_switch_tests {
     }
 
     fn open_mixer(app: &mut DemoApp, ctx: &egui::Context) {
-        app.show_mixer = true;
+        app.stage_view = StageView::Mixer;
         for _ in 0..2 { frame(app, ctx, vec![]); }
         assert_eq!(app.mixer_fader_rects.len(), 2, "one bus strip per rig");
     }
@@ -10112,7 +10645,7 @@ mod rig_switch_tests {
         assert!(app.rig_mix[0].vol > 0.5, "dragging up raises rig volume ({})", app.rig_mix[0].vol);
         assert_eq!(app.rig_mix[1].vol, 1.0, "the other rig is untouched");
         frame(&mut app, &ctx, key(Key::Escape));
-        assert!(!app.show_mixer, "Esc leaves the mixer");
+        assert_eq!(app.stage_view, StageView::Rack, "Esc leaves the mixer");
     }
 
     #[test]
@@ -10740,7 +11273,7 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![f10(true), f10(false)]);
         let texts = frame(&mut app, &ctx, vec![]);
         assert!(!texts.iter().any(|t| t == "Transport"), "F10 opens no Transport window");
-        assert!(app.show_mixer, "F10 opens the mixer");
+        assert_eq!(app.stage_view, StageView::Mixer, "F10 opens the mixer");
         assert!(texts.iter().any(|t| t == "Mixer"), "Mixer nav chip is painted");
     }
 
@@ -10979,7 +11512,7 @@ mod split_bpm_tests {
         let inst = app.matrix_sinks()[0];
         let node = app.units[inst].node_id;
         app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "keys", "cc": 74, "param": 7}));
-        app.show_matrix = true;
+        app.stage_view = StageView::Matrix;
         app.rule_editor = Some((inst, MatrixRow::Keys));
         let texts = frame(&mut app, &ctx, vec![]);
         assert!(texts.iter().any(|t| t.contains("whitelist active")), "CC Maps hint painted: {texts:?}");
@@ -11064,5 +11597,208 @@ mod split_bpm_tests {
         assert_eq!(st["count_in_enabled"], serde_json::json!(true));
         assert_eq!(st["count_in_bars"], serde_json::json!(2));
         assert_eq!(st["bpm"], serde_json::json!(120.0));
+    }
+}
+
+#[cfg(test)]
+mod stage_views_tests {
+    use super::*;
+
+    fn key(k: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    fn walk_texts(shape: &Shape, texts: &mut Vec<String>) {
+        match shape {
+            Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+            Shape::Vec(v) => for s in v { walk_texts(s, texts) },
+            _ => {}
+        }
+    }
+
+    fn run_frame(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> (Vec<String>, Vec<egui::LayerId>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let mut bg = Vec::new();
+        for cs in &out.shapes {
+            walk_texts(&cs.shape, &mut bg);
+        }
+        let middle_layers = ctx.memory(|m| {
+            m.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Middle)
+                .collect::<Vec<_>>()
+        });
+        (bg, middle_layers)
+    }
+
+    #[test]
+    fn stage_views_are_mutually_exclusive_and_never_open_floating_windows() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: SURGE_ID.into(),
+            name: "Surge XT".into(),
+            vendor: "Surge Synth Team".into(),
+            features: vec!["instrument".into()],
+        }];
+        app.plugins_lv2 = vec![Lv2PluginInfo {
+            uri: "http://example.org/lv2/verb".into(),
+            name: "Lush Verb".into(),
+            num_ports: 4,
+            is_instrument: false,
+        }];
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        run_frame(&mut app, &ctx, size, vec![]);
+
+        let mut sessions_btns = ctx.viewport(|v| {
+            v.prev_pass.widgets.get_layer(egui::LayerId::background())
+                .filter(|w| w.sense.senses_click() && w.rect.top() < 50.0)
+                .map(|w| w.rect)
+                .collect::<Vec<_>>()
+        });
+        sessions_btns.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        assert!(!sessions_btns.is_empty(), "top bar buttons laid out");
+        let s_pos = sessions_btns[0].center();
+        let ptr = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(s_pos), ptr(s_pos, true), ptr(s_pos, false)]);
+        assert_eq!(app.stage_view, StageView::Sessions, "Sessions chip opens Sessions stage");
+
+        let (bg, middle) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(middle.is_empty(), "Sessions must not open a floating egui::Window: {middle:?}");
+        assert!(bg.iter().any(|t| t == "Lead + Reverb"), "Sessions renders templates in main stage: {bg:?}");
+        assert!(bg.iter().any(|t| t == "Save current patch"), "Sessions save action painted");
+
+        run_frame(&mut app, &ctx, size, key(Key::F9));
+        assert_eq!(app.stage_view, StageView::Plugins, "F9 opens Plugins stage and excludes Sessions");
+        let (bg, middle) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(middle.is_empty(), "Plugins must not open a floating egui::Window: {middle:?}");
+        assert!(bg.iter().any(|t| t == "Metronome"), "Plugins renders Built-in in stage");
+        assert!(bg.iter().any(|t| t == "Surge XT"), "Plugins renders CLAP in stage");
+        assert!(bg.iter().any(|t| t == "Lush Verb"), "Plugins renders LV2 in stage");
+
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack, "Esc returns from Plugins to Rack");
+        run_frame(&mut app, &ctx, size, key(Key::B));
+        assert_eq!(app.stage_view, StageView::Plugins, "B opens Plugins stage");
+        run_frame(&mut app, &ctx, size, key(Key::B));
+        assert_eq!(app.stage_view, StageView::Rack, "B toggles Plugins back to Rack");
+
+        let side = app.side;
+        app.toggle_stage(StageView::Sessions);
+        run_frame(&mut app, &ctx, size, key(Key::Tab));
+        assert_eq!(app.stage_view, StageView::Rack, "Tab returns from Sessions to Rack");
+        assert!(app.side == side, "Tab from Sessions does not flip the rack");
+        assert!(!app.flipping);
+
+        run_frame(&mut app, &ctx, size, key(Key::F9));
+        assert_eq!(app.stage_view, StageView::Plugins);
+        run_frame(&mut app, &ctx, size, key(Key::Tab));
+        assert_eq!(app.stage_view, StageView::Rack, "Tab returns from Plugins to Rack");
+        assert!(app.side == side, "Tab from Plugins does not flip the rack");
+
+        run_frame(&mut app, &ctx, size, key(Key::F10));
+        assert_eq!(app.stage_view, StageView::Mixer);
+        run_frame(&mut app, &ctx, size, key(Key::F11));
+        assert_eq!(app.stage_view, StageView::Matrix);
+        run_frame(&mut app, &ctx, size, key(Key::F9));
+        assert_eq!(app.stage_view, StageView::Plugins);
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack);
+
+        let min_size = Vec2::new(760.0, 520.0);
+        app.toggle_stage(StageView::Sessions);
+        run_frame(&mut app, &ctx, min_size, vec![]);
+        app.toggle_stage(StageView::Plugins);
+        run_frame(&mut app, &ctx, min_size, vec![]);
+    }
+
+    #[test]
+    fn f9_loads_plugins_on_first_open() {
+        let mut app = DemoApp::new_with_sink(None);
+        assert!(!app.plugins_loaded);
+        let ctx = egui::Context::default();
+        run_frame(&mut app, &ctx, Vec2::new(1280.0, 800.0), key(Key::F9));
+        assert_eq!(app.stage_view, StageView::Plugins);
+        assert!(app.plugins_loaded, "opening Plugins scans plugins on first open");
+    }
+
+    #[test]
+    fn plugins_stage_filters_by_text_and_category() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: SURGE_ID.into(),
+            name: "Surge XT".into(),
+            vendor: "Surge Synth Team".into(),
+            features: vec!["instrument".into()],
+        }];
+        app.plugins_lv2 = vec![Lv2PluginInfo {
+            uri: "http://example.org/lv2/reverb".into(),
+            name: "Room Reverb".into(),
+            num_ports: 4,
+            is_instrument: false,
+        }];
+        app.stage_view = StageView::Plugins;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+
+        app.plugin_filter = "room".into();
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Room Reverb"));
+        assert!(!bg.iter().any(|t| t == "Surge XT"));
+        assert!(!bg.iter().any(|t| t == "Metronome"));
+
+        app.plugin_filter.clear();
+        app.plugin_category = PluginCategory::Clap;
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Surge XT"));
+        assert!(!bg.iter().any(|t| t == "Room Reverb"));
+        assert!(!bg.iter().any(|t| t == "Metronome"));
+    }
+
+    #[test]
+    fn sessions_stage_save_load_delete_and_escape_confirm() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = std::env::temp_dir().join(format!("ksalat-stage-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        app.stage_view = StageView::Sessions;
+        app.session_name = "Stage Jam".into();
+        app.save_current_session(&dir);
+        assert!(app.session_msg.contains("Saved 'Stage Jam'"), "{}", app.session_msg);
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Stage Jam".to_string()]);
+
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        let mut out = ctx.run_ui(raw, |ui| app.sessions_stage_in(ui, &dir));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk_texts(&cs.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|t| t == "Stage Jam"), "saved session rendered: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Delete"), "delete action rendered");
+
+        app.confirm_delete_session = Some("Stage Jam".into());
+        run_frame(&mut app, &ctx, Vec2::new(1280.0, 800.0), key(Key::Escape));
+        assert!(app.confirm_delete_session.is_none());
+        assert_eq!(app.stage_view, StageView::Sessions, "first Esc cancels delete confirm");
+
+        DemoApp::delete_saved_session(&dir, "Stage Jam").unwrap();
+        assert!(DemoApp::list_saved_sessions(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

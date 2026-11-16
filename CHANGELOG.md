@@ -8,6 +8,8 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Rename rigs:** double-click a rig chip; agent tool `rename_rig`. Rig names
+  are saved with the session (#33).
 - **System audio in the mixer:** every other app that is playing (YouTube in
   the browser, …) gets a strip with volume and mute (#31).
 - **Output device selection** at Master out (e.g. MOTU M2 vs. speakers):

@@ -128,6 +128,15 @@ struct AddRigArgs {
     plugin_id: Option<String>,
 }
 
+/// Arguments for `rename_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameRigArgs {
+    /// Rig index (0-based, see get_rigs).
+    rig: usize,
+    /// New name (up to 24 characters).
+    name: String,
+}
+
 /// Arguments for `delete_rig`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteRigArgs {
@@ -1639,6 +1648,21 @@ impl McpServer {
             return tool_err("add_rig with plugin_id needs the running app (kabelsalat mcp --attach)");
         }
         self.edit_rigs(None, args.name)
+    }
+
+    /// Rename one rig.
+    #[tool(name = "rename_rig", description = "Rename rig `rig` (index from get_rigs), e.g. 'Bass'. Up to 24 characters; kept in saved sessions.")]
+    fn rename_rig(&self, Parameters(args): Parameters<RenameRigArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("rename_rig", json!({"rig": args.rig, "name": args.name}));
+        }
+        let name: String = args.name.trim().chars().take(24).collect();
+        if name.is_empty() { return tool_err("a rig name cannot be empty"); }
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::RenameRig { rig: args.rig.min(255) as u8, name: name_bytes(&name) }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"rig": args.rig, "name": name}))
     }
 
     /// Delete one rig.

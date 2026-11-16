@@ -1390,6 +1390,16 @@ impl GraphEngine {
                     s.src_hw = hardware;
                 }
             }
+            Command::RenameRig { rig, name } => {
+                // Structural metadata (block boundary; never the render path).
+                if let Some(m) = self.rig_meta.get_mut(rig as usize) {
+                    let n = crate::control::name_str(&name).trim().to_string();
+                    if !n.is_empty() {
+                        m.name = n;
+                        self.publish_rig_snapshot();
+                    }
+                }
+            }
             Command::SetRigDevice { node, device } => {
                 self.release_all(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
@@ -2965,6 +2975,23 @@ mod tests {
         assert_eq!(engine.rig_meta()[1].name, "B");
         assert_eq!(engine.rig_meta()[1].midi_device, None);
         assert_eq!(engine.active_rig(), 1);
+    }
+
+    #[test]
+    fn rename_rig_changes_only_the_published_name() {
+        let (mut engine, mut bus) = load_two_rigs(Some(2), None);
+        let snap = std::sync::Arc::new(std::sync::Mutex::new(crate::control::RigSnapshot::default()));
+        engine.set_rig_snapshot(snap.clone());
+        let before = engine.graph.clone();
+        bus.send(Command::RenameRig { rig: 1, name: crate::control::name_bytes("Bass") });
+        bus.send(Command::RenameRig { rig: 9, name: crate::control::name_bytes("nope") });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.rig_meta()[1].name, "Bass");
+        assert_eq!(engine.rig_meta()[0].name, "A", "other rigs keep their names");
+        assert_eq!(engine.rig_meta()[0].midi_device, Some(2), "device binding untouched");
+        assert_eq!(snap.lock().unwrap().rigs[1].name, "Bass", "published to frontends");
+        assert_eq!(format!("{:?}", engine.graph), format!("{before:?}"), "routing untouched");
     }
 
     #[test]

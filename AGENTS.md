@@ -307,6 +307,12 @@ Learned so far (2026-11-15, UI polish pass):
     compact mode flipped between frames and its buttons jumped under the
     mouse (clicks missed). Decide from `ctx.content_rect()`; test narrow
     windows by clicking, not only by measuring.
+65. **Session-level metadata travels the whole load path:** rig names were
+    never saved, and a single rig loads via LoadGraph (no rig list), so
+    renamed rigs came back as "Rig A/B". Anything stored beside the graph
+    goes through `capture_session` → `remap_session` → the LoadRigs/LoadGraph
+    decision, is used once (never leaks into a later load), and the UI
+    mirror (`rig_snapshot`) follows what the engine will publish.
 
 ## Working on kabelsalat
 

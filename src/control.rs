@@ -576,6 +576,9 @@ pub enum Command {
     /// Per-rig hardware device selection: None = any device, Some(id) = only
     /// that device (AUM: a different keyboard per rig).
     SetRigDevice { node: NodeId, device: Option<u32> },
+    /// Rename rig `rig` (index in the rig list). Metadata only — routing and
+    /// sound are untouched; the new name is published with the rig snapshot.
+    RenameRig { rig: u8, name: Name },
     /// Per-rig mixer (AUM overview strip): volume (0..1), pan (-1..1),
     /// mute/solo. Applied at the rig's MasterOut when summing to the physical
     /// output. Omitted fields keep their current value. Solo mutes every
@@ -712,7 +715,7 @@ impl Command {
         matches!(self,
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
-            | Command::SetRigDevice { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
+            | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. })
     }

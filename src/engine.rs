@@ -1233,6 +1233,9 @@ fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sampl
 }
 
 #[cfg(test)]
+mod held_notes;
+
+#[cfg(test)]
 mod tests {
     use crate::matrix::{Matrix, MidiMsg, SourceId};
 

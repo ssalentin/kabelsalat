@@ -1034,11 +1034,16 @@ fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
 
 fn discover_surge() -> Result<(PluginEntry, CString)> {
     // Resolved once per process: the voice pool asks for Surge several times.
-    static SURGE: OnceLock<Option<(PathBuf, String)>> = OnceLock::new();
-    let (path, id) = SURGE
-        .get_or_init(|| bundle_with(|p| p.name == "Surge XT" && p.features.iter().any(|f| f == "instrument")))
-        .clone()
-        .ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))?;
+    // Only a hit is remembered, so a later install is still found.
+    static SURGE: OnceLock<(PathBuf, String)> = OnceLock::new();
+    let (path, id) = match SURGE.get() {
+        Some(hit) => hit.clone(),
+        None => {
+            let hit = bundle_with(|p| p.name == "Surge XT" && p.features.iter().any(|f| f == "instrument"))
+                .ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))?;
+            SURGE.get_or_init(|| hit).clone()
+        }
+    };
     load_bundle(&path, &id)
 }
 
@@ -1754,7 +1759,7 @@ fn run_scan_subprocess(
     // Wait for the exit WITHOUT reaping (WNOWAIT): the zombie keeps the pid
     // and its process group reserved, so kill(-pid) below can never hit a
     // recycled group, whatever helpers the plugin started or detached.
-    loop {
+    let info = loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
         if r != 0 {
@@ -1766,29 +1771,23 @@ fn run_scan_subprocess(
             return Err(ScanFail::Setup(format!("failed waiting on scanner: {e}")));
         }
         if unsafe { info.si_pid() } != 0 {
-            break;
+            break info;
         }
         if Instant::now() >= deadline {
             kill_child_tree(&mut child);
             return Err(timed_out());
         }
         std::thread::sleep(Duration::from_millis(15));
-    }
+    };
     // A short grace even at the deadline: the readers may not have sent yet.
     let remaining = || deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(200));
     let stdout = stdout_rx.recv_timeout(remaining());
-    // Exit status, peeked (still unreaped).
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
     let exited_ok = info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0;
     // stderr only matters for a failure; a helper holding it must not fail a good scan.
     let stderr = if exited_ok { None } else { stderr_rx.recv_timeout(remaining()).ok() };
     // Helpers the plugin left behind die with the group; then reap.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
     let status = child.wait().map_err(|e| ScanFail::Setup(format!("failed reaping scanner: {e}")))?;
-    let Ok((stdout, stdout_truncated)) = stdout else {
-        return Err(timed_out());
-    };
     if !status.success() {
         let (err, truncated) = stderr.unwrap_or_default();
         let err_tail = String::from_utf8_lossy(&err).trim().to_string();
@@ -1798,6 +1797,9 @@ fn run_scan_subprocess(
         let more = if truncated { "…" } else { "" };
         return Err(ScanFail::Verdict(format!("scanner exited with {status}: {more}{err_tail}")));
     }
+    let Ok((stdout, stdout_truncated)) = stdout else {
+        return Err(timed_out());
+    };
     if stdout_truncated {
         return Err(ScanFail::Verdict(format!("scanner stdout exceeded {} bytes", SCAN_STDOUT_MAX)));
     }
@@ -1978,9 +1980,15 @@ fn bundle_with(wanted: impl Fn(&ClapPluginInfo) -> bool) -> Option<(PathBuf, Str
 /// process, so it stays safe with crashing or hanging bundles on CLAP_PATH.
 pub fn run_clap_scan_test() -> Result<()> {
     // A private cache, so "cold" is cold and the user's cache stays untouched.
-    let tmp = std::env::temp_dir().join(format!("kabelsalat-clap-scan-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::env::set_var("XDG_CACHE_HOME", &tmp);
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let tmp = RemoveOnDrop(std::env::temp_dir().join(format!("kabelsalat-clap-scan-test-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&tmp.0);
+    std::env::set_var("XDG_CACHE_HOME", &tmp.0);
     let t0 = Instant::now();
     let first = list_clap_plugins();
     let d1 = t0.elapsed();
@@ -2002,7 +2010,6 @@ pub fn run_clap_scan_test() -> Result<()> {
     let retried = list_clap_plugins_retry_failed();
     println!("clap-scan-test: retry of cached failures took {:.2} ms", t2.elapsed().as_secs_f64() * 1000.0);
     anyhow::ensure!(retried == first, "retrying failures changed the listing");
-    let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
 

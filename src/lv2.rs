@@ -82,6 +82,175 @@ struct Lv2Option {
     value: *const c_void,
 }
 
+// ---------------------------------------------------------------------------
+// LV2 Worker extension (lv2/ext/worker) — non-RT work scheduled from run().
+// ---------------------------------------------------------------------------
+
+const LV2_WORKER_INTERFACE_URI: &[u8] = b"http://lv2plug.in/ns/ext/worker#interface\0";
+const LV2_WORKER_SCHEDULE_URI: &[u8] = b"http://lv2plug.in/ns/ext/worker#schedule\0";
+
+const WORKER_SUCCESS: u32 = 0;
+const WORKER_ERR_NO_SPACE: u32 = 2;
+
+/// Fixed-size worker message slot. A larger message is rejected with
+/// `LV2_WORKER_ERR_NO_SPACE`. setBfree's `struct worknfo { int cmd; int status;
+/// char msg[1024]; }` is 1032 bytes; 2048 leaves a comfortable margin.
+const WORKER_MSG_MAX: usize = 2048;
+const WORKER_RING_CAP: usize = 64;
+
+#[derive(Clone, Copy)]
+struct WorkerMsg {
+    len: u32,
+    data: [u8; WORKER_MSG_MAX],
+}
+
+type Lv2WorkerRespondHandle = *mut c_void;
+type Lv2WorkerScheduleHandle = *mut c_void;
+type Lv2WorkerRespondFn = extern "C" fn(Lv2WorkerRespondHandle, u32, *const c_void) -> u32;
+
+/// Plugin Worker Interface (`extension_data(worker#interface)`). Field order
+/// matches the C struct in lv2/worker/worker.h exactly.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Lv2WorkerInterface {
+    work: extern "C" fn(Lv2Handle, Lv2WorkerRespondFn, Lv2WorkerRespondHandle, u32, *const c_void) -> u32,
+    work_response: extern "C" fn(Lv2Handle, u32, *const c_void) -> u32,
+    end_run: Option<extern "C" fn(Lv2Handle) -> u32>,
+}
+
+/// Schedule Worker Host Feature (`work:schedule`). `handle` must be callable
+/// from `run()` without blocking; the plugin calls `schedule_work` from its
+/// audio callback.
+#[repr(C)]
+struct Lv2WorkerSchedule {
+    handle: Lv2WorkerScheduleHandle,
+    schedule_work: extern "C" fn(Lv2WorkerScheduleHandle, u32, *const c_void) -> u32,
+}
+
+/// Everything the `schedule_work` callback reaches through the feature handle.
+/// Box'd and never moved while the instance lives, so its address is stable
+/// even though `Lv2Plugin` itself moves between the loader and audio threads.
+struct WorkerShared {
+    /// Producer half of the request ring; `None` until a worker thread exists.
+    req: Option<rtrb::Producer<WorkerMsg>>,
+    /// The worker thread, `unpark`-ed by `schedule_work` to wake it.
+    thread: std::thread::Thread,
+}
+
+/// What the spawned worker thread needs. Raw `instance` is `!Send`, so this is
+/// declared `Send` explicitly: the plugin keeps the instance alive until the
+/// worker is joined in `Drop`.
+struct WorkerCtx {
+    iface: Lv2WorkerInterface,
+    instance: Lv2Handle,
+}
+
+// SAFETY: `instance` points into the plugin, which joins this thread before the
+// lilv instance is freed (or, for never-free plugins, keeps it parked forever).
+unsafe impl Send for WorkerCtx {}
+
+/// Per-instance worker: a non-RT thread that executes `interface->work()` on
+/// requests the audio thread queues via `schedule_work` (rule 46 — never on the
+/// audio thread, and rule 47 — it parks, never spins).
+struct Lv2Worker {
+    iface: Lv2WorkerInterface,
+    instance: Lv2Handle,
+    resp_rx: rtrb::Consumer<WorkerMsg>,
+    join: Option<std::thread::JoinHandle<()>>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn copy_worker_msg(size: u32, data: *const c_void) -> WorkerMsg {
+    let size = size as usize;
+    let mut msg = WorkerMsg { len: size as u32, data: [0u8; WORKER_MSG_MAX] };
+    if size > 0 && !data.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(data as *const u8, msg.data.as_mut_ptr(), size) };
+    }
+    msg
+}
+
+extern "C" fn schedule_work_cb(handle: Lv2WorkerScheduleHandle, size: u32, data: *const c_void) -> u32 {
+    if handle.is_null() || size as usize > WORKER_MSG_MAX {
+        return WORKER_ERR_NO_SPACE;
+    }
+    let msg = copy_worker_msg(size, data);
+    // SAFETY: `handle` is the WorkerShared boxed in the instance and kept alive
+    // for its whole life; schedule_work is the sole writer of `req`.
+    let shared = unsafe { &mut *(handle as *mut WorkerShared) };
+    match shared.req.as_mut() {
+        Some(req) => match req.push(msg) {
+            Ok(()) => {
+                shared.thread.unpark();
+                WORKER_SUCCESS
+            }
+            Err(_) => WORKER_ERR_NO_SPACE,
+        },
+        None => WORKER_ERR_NO_SPACE,
+    }
+}
+
+extern "C" fn respond_cb(handle: Lv2WorkerRespondHandle, size: u32, data: *const c_void) -> u32 {
+    if handle.is_null() || size as usize > WORKER_MSG_MAX {
+        return WORKER_ERR_NO_SPACE;
+    }
+    let msg = copy_worker_msg(size, data);
+    // SAFETY: `handle` is the worker thread's response producer, alive while
+    // that thread runs (it never outlives the plugin).
+    let tx = unsafe { &mut *(handle as *mut rtrb::Producer<WorkerMsg>) };
+    match tx.push(msg) {
+        Ok(()) => WORKER_SUCCESS,
+        Err(_) => WORKER_ERR_NO_SPACE,
+    }
+}
+
+/// Non-RT worker loop: runs `work()`, forwards its `respond()` calls into the
+/// response ring. Parks when idle (bounded, so a lost wakeup cannot stall).
+fn worker_loop(
+    mut req_rx: rtrb::Consumer<WorkerMsg>,
+    mut resp_tx: rtrb::Producer<WorkerMsg>,
+    ctx: WorkerCtx,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let msg = match req_rx.pop() {
+            Ok(m) => m,
+            Err(rtrb::PopError::Empty) => {
+                if req_rx.is_abandoned() {
+                    return;
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        let resp_ptr = &mut resp_tx as *mut rtrb::Producer<WorkerMsg> as *mut c_void;
+        (ctx.iface.work)(ctx.instance, respond_cb, resp_ptr, msg.len, msg.data.as_ptr() as *const c_void);
+    }
+}
+
+impl Lv2Worker {
+    /// Deliver queued worker responses on the audio thread (before `run()`).
+    fn drain_responses(&mut self) {
+        loop {
+            match self.resp_rx.pop() {
+                Ok(msg) => {
+                    (self.iface.work_response)(self.instance, msg.len, msg.data.as_ptr() as *const c_void);
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Must be called after every `run()`, whether or not a response arrived.
+    fn end_run(&self) {
+        if let Some(end_run) = self.iface.end_run {
+            (end_run)(self.instance);
+        }
+    }
+}
+
 /// Host-side URID map: assigns a stable u32 to each URI string.
 struct UridMap {
     map: std::collections::HashMap<String, u32>,
@@ -534,6 +703,17 @@ pub fn host_test() -> anyhow::Result<()> {
     }
 }
 
+/// Read the plugin's `worker#interface` from its descriptor, if any.
+unsafe fn query_worker_interface(desc: &Lv2Descriptor) -> Option<Lv2WorkerInterface> {
+    let ext = desc.extension_data?;
+    let ptr = ext(LV2_WORKER_INTERFACE_URI.as_ptr() as *const c_char);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(std::ptr::read(ptr as *const Lv2WorkerInterface))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reusable LV2 plugin wrapper (foundation for engine rig nodes)
 // ---------------------------------------------------------------------------
@@ -561,6 +741,12 @@ pub struct Lv2Plugin {
     is_inst: bool,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
+    // Worker extension: the schedule feature handed to instantiate, the shared
+    // handle it points into (kept alive for the instance's life), and the
+    // per-instance worker thread when the plugin exposes `worker#interface`.
+    _worker_schedule: Option<Box<Lv2WorkerSchedule>>,
+    _worker_shared: Option<Box<WorkerShared>>,
+    worker: Option<Box<Lv2Worker>>,
     block: usize,
     uri: String,
     sample_rate: f64,
@@ -643,11 +829,47 @@ impl Lv2Plugin {
                 uri: b"http://lv2plug.in/ns/ext/options#options\0".as_ptr() as *const c_char,
                 data: options.as_ptr() as *mut c_void,
             };
-            let features: [*const Lv2Feature; 3] = [&map_feature, &options_feature, std::ptr::null()];
+
+            // Worker schedule feature: the handle points at a heap block that
+            // stays put for the instance's life; the request ring is filled in
+            // below once we know the plugin exposes the worker interface.
+            let mut worker_shared = Box::new(WorkerShared {
+                req: None,
+                thread: std::thread::current(),
+            });
+            let worker_shared_ptr = &mut *worker_shared as *mut WorkerShared as *mut c_void;
+            let worker_schedule = Box::new(Lv2WorkerSchedule {
+                handle: worker_shared_ptr,
+                schedule_work: schedule_work_cb,
+            });
+            let worker_feature = Lv2Feature {
+                uri: LV2_WORKER_SCHEDULE_URI.as_ptr() as *const c_char,
+                data: &*worker_schedule as *const Lv2WorkerSchedule as *mut c_void,
+            };
+            let features: [*const Lv2Feature; 4] = [&map_feature, &options_feature, &worker_feature, std::ptr::null()];
 
             let instance = lilv_plugin_instantiate(plugin, sample_rate, features.as_ptr());
             anyhow::ensure!(!instance.is_null(), "instantiate failed for {uri}");
             pin_plugin_library(plugin);
+
+            // If the plugin exposes worker#interface, start its worker thread
+            // and point the schedule handle's request ring and wake at it.
+            let desc0 = &*(*instance).lv2_descriptor;
+            let h0 = (*instance).lv2_handle;
+            let worker = query_worker_interface(desc0).map(|iface| {
+                let (req_tx, req_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
+                let (resp_tx, resp_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
+                let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let shutdown2 = std::sync::Arc::clone(&shutdown);
+                let ctx = WorkerCtx { iface, instance: h0 };
+                let join = std::thread::Builder::new()
+                    .name("kabelsalat-lv2-worker".into())
+                    .spawn(move || worker_loop(req_rx, resp_tx, ctx, shutdown2))
+                    .expect("spawn lv2 worker");
+                worker_shared.req = Some(req_tx);
+                worker_shared.thread = join.thread().clone();
+                Box::new(Lv2Worker { iface, instance: h0, resp_rx, join: Some(join), shutdown })
+            });
 
             let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
             let control = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#ControlPort\0".as_ptr() as *const c_char);
@@ -712,7 +934,7 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, block, uri, sample_rate })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
         }
     }
 
@@ -832,6 +1054,12 @@ impl Lv2Plugin {
     /// Process a stereo-interleaved block (allocation-free).
     pub fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize) {
         let frames = frames.min(self.block);
+        // Worker spec: deliver any responses queued by the worker thread before
+        // run(), then call end_run() after every run() (rule 46 — the plugin's
+        // work_response/end_run run on the audio thread, in the run() context).
+        if let Some(w) = self.worker.as_mut() {
+            w.drain_responses();
+        }
         unsafe {
             for &i in &self.audio_in {
                 for f in 0..frames {
@@ -840,13 +1068,16 @@ impl Lv2Plugin {
             }
             let desc = &*(*self.instance).lv2_descriptor;
             (desc.run.expect("no run"))((*self.instance).lv2_handle, frames as u32);
-            for f in 0..frames {
-                let l = self.audio_out.first().map(|&i| self.buffers[i][f]).unwrap_or(0.0);
-                let r = self.audio_out.get(1).map(|&i| self.buffers[i][f]).unwrap_or(l);
-                if f * 2 + 1 < output.len() {
-                    output[f * 2] = l;
-                    output[f * 2 + 1] = r;
-                }
+        }
+        if let Some(w) = self.worker.as_ref() {
+            w.end_run();
+        }
+        for f in 0..frames {
+            let l = self.audio_out.first().map(|&i| self.buffers[i][f]).unwrap_or(0.0);
+            let r = self.audio_out.get(1).map(|&i| self.buffers[i][f]).unwrap_or(l);
+            if f * 2 + 1 < output.len() {
+                output[f * 2] = l;
+                output[f * 2 + 1] = r;
             }
         }
     }
@@ -863,7 +1094,24 @@ impl Drop for Lv2Plugin {
             std::mem::forget(std::mem::replace(&mut self._map_data, Box::new(Lv2UridMap { handle: std::ptr::null_mut(), map: urid_map_cb })));
             std::mem::forget(std::mem::take(&mut self.buffers));
             std::mem::forget(std::mem::take(&mut self.atom_buf));
+            // A parked never-free instance keeps its worker thread alive too.
+            std::mem::forget(self.worker.take());
+            std::mem::forget(self._worker_shared.take());
+            std::mem::forget(self._worker_schedule.take());
             return;
+        }
+        // Stop the worker thread (set the flag, wake it, join) before the lilv
+        // instance is freed, so work()/work_response() can never run on a
+        // dangling handle.
+        let wake = self._worker_shared.as_ref().map(|s| s.thread.clone());
+        if let Some(mut w) = self.worker.take() {
+            w.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(t) = &wake {
+                t.unpark();
+            }
+            if let Some(join) = w.join.take() {
+                let _ = join.join();
+            }
         }
         let _lilv = lilv_guard();
         unsafe {
@@ -1525,6 +1773,118 @@ mod tests {
         }
         assert!(peak > 1e-4, "a reused instance still plays: peak={peak}");
         retire(again);
+    }
+
+    // -- LV2 worker plumbing -------------------------------------------------
+
+    #[derive(Default)]
+    struct TestInstanceState {
+        work_data: std::sync::Mutex<Vec<u8>>,
+        response_data: std::sync::Mutex<Vec<u8>>,
+        end_run_count: std::sync::atomic::AtomicU32,
+    }
+
+    extern "C" fn fake_work(
+        instance: Lv2Handle,
+        respond: Lv2WorkerRespondFn,
+        handle: Lv2WorkerRespondHandle,
+        size: u32,
+        data: *const c_void,
+    ) -> u32 {
+        unsafe {
+            let st = &*(instance as *const TestInstanceState);
+            if size > 0 && !data.is_null() {
+                *st.work_data.lock().unwrap() = std::slice::from_raw_parts(data as *const u8, size as usize).to_vec();
+            }
+            respond(handle, size, data);
+        }
+        WORKER_SUCCESS
+    }
+
+    extern "C" fn fake_work_response(instance: Lv2Handle, size: u32, body: *const c_void) -> u32 {
+        unsafe {
+            let st = &*(instance as *const TestInstanceState);
+            if size > 0 && !body.is_null() {
+                *st.response_data.lock().unwrap() = std::slice::from_raw_parts(body as *const u8, size as usize).to_vec();
+            }
+        }
+        WORKER_SUCCESS
+    }
+
+    extern "C" fn fake_end_run(instance: Lv2Handle) -> u32 {
+        unsafe {
+            let st = &*(instance as *const TestInstanceState);
+            st.end_run_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        WORKER_SUCCESS
+    }
+
+    #[test]
+    fn worker_ring_roundtrips_schedule_work_and_respond() {
+        let state = Box::new(TestInstanceState::default());
+        let instance = &*state as *const TestInstanceState as Lv2Handle;
+
+        let mut shared = Box::new(WorkerShared { req: None, thread: std::thread::current() });
+        let shared_ptr = &mut *shared as *mut WorkerShared as *mut c_void;
+        let iface = Lv2WorkerInterface { work: fake_work, work_response: fake_work_response, end_run: Some(fake_end_run) };
+
+        let (req_tx, req_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
+        let (resp_tx, resp_rx) = rtrb::RingBuffer::<WorkerMsg>::new(WORKER_RING_CAP);
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown2 = std::sync::Arc::clone(&shutdown);
+        let ctx = WorkerCtx { iface, instance };
+        let join = std::thread::spawn(move || worker_loop(req_rx, resp_tx, ctx, shutdown2));
+        shared.req = Some(req_tx);
+        shared.thread = join.thread().clone();
+        let mut worker = Lv2Worker { iface, instance, resp_rx, join: Some(join), shutdown };
+
+        // Audio thread: schedule a request through the feature callback.
+        let payload = [0x90u8, 60, 100, 0x42];
+        assert_eq!(schedule_work_cb(shared_ptr, payload.len() as u32, payload.as_ptr() as *const c_void), WORKER_SUCCESS);
+
+        // Wait for the worker to run work() and deliver its response.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while worker.resp_rx.slots() == 0 {
+            assert!(std::time::Instant::now() < deadline, "worker never responded");
+            std::thread::yield_now();
+        }
+        assert_eq!(state.work_data.lock().unwrap().as_slice(), &payload, "work() got the scheduled data");
+
+        // Audio thread: drain the response -> work_response() sees the data.
+        worker.drain_responses();
+        assert_eq!(state.response_data.lock().unwrap().as_slice(), &payload, "work_response() got the response");
+
+        // end_run() must be callable after every run cycle.
+        worker.end_run();
+        assert_eq!(state.end_run_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Clean shutdown: flag + wake + join.
+        worker.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        shared.thread.unpark();
+        let _ = worker.join.take().unwrap().join();
+    }
+
+    #[test]
+    fn setbfree_plays_a_note() {
+        let uri = "http://gareus.org/oss/lv2/b_synth";
+        // Skip cleanly when the organ is not installed (not a failure).
+        if !discover().iter().any(|p| p.uri == uri) {
+            return;
+        }
+        let mut plugin = Lv2Plugin::load(uri, 48000.0, 256).expect("setBfree is installed but failed to load");
+        assert!(plugin.is_instrument(), "setBfree must classify as an instrument");
+        plugin.note_on(60, 100);
+        let input = vec![0.0f32; 256 * 2];
+        let mut output = vec![0.0f32; 256 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..120 {
+            plugin.process(&input, &mut output, 256);
+            peak = peak.max(output.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+        }
+        plugin.note_off(60);
+        retire(plugin);
+        eprintln!("setbfree note peak: {peak:.4}");
+        assert!(peak > 1e-3, "setBfree produced no audio while a key was held: peak={peak}");
     }
 }
 

@@ -1397,6 +1397,16 @@ struct UndoSnap {
     rig_sources: [(bool, bool); VOICE_POOL],
 }
 
+/// Tools the running app serves to `kabelsalat mcp --attach` over the UI
+/// bridge (they need the app's UI-thread state). Every MCP tool that calls
+/// `ui_bridge_tool("…")` must be listed — `ui_bridge_tools_cover_mcp` checks.
+const UI_BRIDGE_TOOLS: &[&str] = &[
+    "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
+    "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
+    "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
+    "list_instruments", "install_instrument",
+];
+
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
 const UNDO_LIMIT: usize = 32;
 /// Remote (MCP) calls closer than this belong to one job / one undo step.
@@ -5899,22 +5909,7 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
-                "load_sound"
-                | "list_sounds"
-                | "list_params"
-                | "list_cc_maps"
-                | "set_cc_map"
-                | "clear_cc_map"
-                | "learn_cc"
-                | "get_matrix"
-                | "undo"
-                | "redo"
-                | "rename_rig"
-                | "list_audio_outputs"
-                | "set_audio_output"
-                | "list_app_streams"
-                | "set_app_stream"
-                | "add_rig" => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
+                t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
                     "ok".into()
@@ -13632,6 +13627,20 @@ mod rig_switch_tests {
     fn descs_has_mixer(app: &DemoApp) -> bool {
         app.help_cols.iter().flat_map(|c| c.rows.iter())
             .any(|r| r.keys.iter().any(|g| g.text() == "F10") && r.desc.text().contains("mixer"))
+    }
+
+    #[test]
+    fn ui_bridge_tools_cover_mcp() {
+        // Rule 6 for the attached path: an MCP tool forwarded to the app that
+        // the app does not serve answers "not served over the UI bridge"
+        // (list_instruments/install_instrument shipped like that once).
+        let src = include_str!("mcp.rs");
+        let mut missing = Vec::new();
+        for part in src.split("ui_bridge_tool(\"").skip(1) {
+            let name = part.split('"').next().unwrap_or("");
+            if !name.is_empty() && !UI_BRIDGE_TOOLS.contains(&name) { missing.push(name.to_string()); }
+        }
+        assert!(missing.is_empty(), "MCP forwards these to the app, which does not serve them: {missing:?}");
     }
 
     #[test]

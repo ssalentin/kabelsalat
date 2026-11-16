@@ -1052,6 +1052,9 @@ struct DemoApp {
     plugins_loaded: bool,
     plugins_clap: Vec<ClapPluginInfo>,
     plugins_lv2: Vec<Lv2PluginInfo>,
+    /// Plugin discovery running on a background thread (CLAP scan + LV2
+    /// lilv load take seconds); adopted by `poll_plugin_scan`.
+    plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>)>>,
     plugin_filter: String,
     plugin_msg: String,
     fps: f32,
@@ -1313,6 +1316,7 @@ impl DemoApp {
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
+            plugin_scan: None,
             plugin_filter: String::new(),
             plugin_msg: String::new(),
             fps: 60.0,
@@ -4876,9 +4880,45 @@ impl DemoApp {
 
     /// `retry_failed`: rescan CLAP bundles whose failure is cached (Refresh).
     fn refresh_plugins_with(&mut self, retry_failed: bool) {
-        self.plugins_clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
-        self.plugins_lv2 = lv2_discover();
-        self.plugins_loaded = true;
+        self.start_plugin_scan(retry_failed);
+        self.poll_plugin_scan();
+    }
+
+    /// Discover CLAP + LV2 plugins off the UI thread (inline under test).
+    fn start_plugin_scan(&mut self, retry_failed: bool) {
+        let scan = move || {
+            let clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
+            (clap, lv2_discover())
+        };
+        if cfg!(test) {
+            (self.plugins_clap, self.plugins_lv2) = scan();
+            self.plugins_loaded = true;
+            return;
+        }
+        if self.plugin_scan.is_some() && !retry_failed {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("kabelsalat-plugin-scan".into())
+            .spawn(move || { let _ = tx.send(scan()); })
+            .expect("spawn plugin scan");
+        self.plugin_scan = Some(rx);
+    }
+
+    /// Adopt a finished background scan (cheap; called every frame).
+    fn poll_plugin_scan(&mut self) {
+        let Some(rx) = &self.plugin_scan else { return };
+        match rx.try_recv() {
+            Ok((clap, lv2)) => {
+                self.plugins_clap = clap;
+                self.plugins_lv2 = lv2;
+                self.plugins_loaded = true;
+                self.plugin_scan = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.plugin_scan = None,
+        }
     }
 
     /// The proven LV2 effect chain: Keys → Surge → <lv2> → Master (+ dry path).
@@ -5020,6 +5060,9 @@ impl DemoApp {
                             self.add_metronome_to_active_rig();
                         }
                         ui.separator();
+                    }
+                    if self.plugin_scan.is_some() {
+                        ui.label(egui::RichText::new("Scanning plugins…").color(theme::CREAM_DIM));
                     }
                     theme::section_label(ui, &format!("LV2 plugins ({})", self.plugins_lv2.len()));
                     let mut added: Option<(String, String, bool)> = None;
@@ -8056,6 +8099,10 @@ impl DemoApp {
         self.poll_assistant();
         self.serve_ui_inbox();
         self.sync_from_engine();
+        self.poll_plugin_scan();
+        if self.plugin_scan.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // Scheduled note-offs (assistant play_note tool).
         let now = std::time::Instant::now();
@@ -8459,6 +8506,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
+    engine.spawn_lv2_loader();
     let mut rt_tried = false;
     let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
     let stream = device.build_output_stream(
@@ -8664,6 +8712,9 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                 }
             }
             let mut app = DemoApp::new_with_sink(sink);
+            // Scan plugins in the background from the start, so the browser
+            // opens instantly.
+            app.start_plugin_scan(false);
             let app = match audio {
                 Some((
                     mains,

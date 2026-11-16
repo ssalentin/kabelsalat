@@ -218,7 +218,17 @@ unsafe fn read_control_meta(world: *mut LilvWorld, plugin: *const LilvPlugin) ->
 }
 
 /// Inspect control-input port descriptions for a plugin URI without instantiating it.
+/// Serializes every lilv world build/load, plugin instantiation and free:
+/// the app now does these from several threads (plugin scan, LV2 loader,
+/// editor), and plugin libraries keep process-global state.
+static LILV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lilv_guard() -> std::sync::MutexGuard<'static, ()> {
+    LILV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
+    let _lilv = lilv_guard();
     unsafe {
         let world = lilv_world_new();
         if world.is_null() {
@@ -303,6 +313,7 @@ unsafe fn node_owned(node: *mut LilvNode) -> String {
 
 /// Discover all installed LV2 plugins (loads the lilv world, enumerates, frees).
 pub fn discover() -> Vec<Lv2PluginInfo> {
+    let _lilv = lilv_guard();
     unsafe {
         let world = lilv_world_new();
         if world.is_null() {
@@ -534,6 +545,7 @@ impl Lv2Plugin {
     /// Load the first plugin whose URI contains `needle`, instantiate it with
     /// urid-map + options features, classify ports, and connect buffers.
     pub fn load(needle: &str, sample_rate: f64, block: usize) -> anyhow::Result<Self> {
+        let _lilv = lilv_guard();
         unsafe {
             let world = lilv_world_new();
             anyhow::ensure!(!world.is_null(), "lilv_world_new failed");
@@ -741,6 +753,7 @@ impl Lv2Plugin {
 
 impl Drop for Lv2Plugin {
     fn drop(&mut self) {
+        let _lilv = lilv_guard();
         unsafe {
             if !self.instance.is_null() {
                 let desc = &*(*self.instance).lv2_descriptor;

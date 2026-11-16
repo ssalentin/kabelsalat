@@ -210,6 +210,12 @@ Learned so far (2026-11-15, UI polish pass):
     L/R push can split across two ring drains, so `n / channels` per drain
     under-counted the header by 2–151 frames while the data was right.
     `record-test` reads the file back and compares it sample for sample.
+46. **Plugin I/O never runs on the audio or UI thread:** LV2 instantiation
+    (~170 ms for Vitalium), preset parsing and instance frees go through the
+    engine's LV2 loader thread (`spawn_lv2_loader`), and plugin discovery
+    runs on a background scan (`start_plugin_scan`). Every lilv world
+    build/load/instantiate/free holds `LILV_LOCK` — concurrent lilv use from
+    two threads corrupted the heap. Check with `kabelsalat lv2-async-test`.
 
 ## Ground rules
 

@@ -1616,6 +1616,7 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
 
     let (bus, drain) = control::command_bus();
     let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
+    engine.spawn_lv2_loader();
     engine.set_rig_snapshot(rigs);
     let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());

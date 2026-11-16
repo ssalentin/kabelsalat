@@ -242,6 +242,16 @@ Learned so far (2026-11-15, UI polish pass):
     `MatrixCcMap`, so the knob adopts the value WITHOUT setting `sent` and
     publish sends one catch-up SetParam. Skipping it left sound and knob at
     the old value until the controller moved again.
+52. **Faces use the face grid, never per-face offsets:** content starts at
+    `FACE_X` (the title's left edge), keeps `FACE_PAD_R`/`FACE_PAD_B`, and the
+    knob row sits on `knob_row_y` (unit bottom) so rows line up across
+    columns. Per-face magic numbers put Master's meter on its border and
+    labels against the bottom edge. `face_layout_tests` audits every face
+    for padding and overlaps at three window sizes — extend `items()` when
+    adding a face element.
+53. **Rig meters are post-fader:** a muted rig, or any rig while another is
+    soloed, reads silent in the rig strip (pre-fader edge levels made a
+    working solo look broken).
 
 ## Ground rules
 

@@ -62,6 +62,22 @@ const TEXT: Color32 = theme::CREAM;
 const SUBTEXT: Color32 = theme::CREAM_MID;
 /// Knob radius on unit faces (labels and display captions share its baseline).
 const KNOB_R: f32 = 17.0;
+const METER_SEGS: usize = 14;
+/// Face grid (rack-local px), shared by every unit face: content starts on
+/// the title's left edge, keeps FACE_PAD_R from the right border and
+/// FACE_PAD_B under the lowest label. The knob row sits on the bottom of
+/// every unit, so rows line up across columns and tall units (Keys, Master)
+/// share the bottom stack row's knob line.
+const FACE_X: f32 = 34.0;
+const FACE_PAD_R: f32 = 20.0;
+const FACE_PAD_B: f32 = 14.0;
+/// Knob label: top sits KNOB_R + KNOB_LABEL_GAP under the knob center.
+const KNOB_LABEL_GAP: f32 = 10.0;
+const KNOB_LABEL_H: f32 = 12.0;
+/// Horizontal knob pitch and the half-slot reserved right of the last knob
+/// (wide labels like VOLUME stay clear of the border).
+const KNOB_PITCH: f32 = 56.0;
+const KNOB_SLOT_HALF: f32 = 26.0;
 const WHITE: Color32 = theme::ON_ACCENT; // #FFFBFA
 const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fills
 
@@ -867,7 +883,7 @@ fn make_unit(node: &Node) -> Unit {
         UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
     ) = match &node.kind {
         NodeKind::Keys => (
-            UnitKind::Keys, "midi source · click the keys".into(),
+            UnitKind::Keys, "midi source".into(),
             vec![], vec![PortKind::Midi, PortKind::Midi],
             vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
             keys_jacks(node.split),
@@ -1121,7 +1137,6 @@ struct HelpCol {
 enum Hit {
     Play,
     Knob { unit: usize, idx: usize },
-    Key(usize), // semitone
     Jack { unit: usize, jack: usize },
     /// Cable id (not index — `update()` retains dying cables, which shifts
     /// indices mid-gesture; AGENTS.md rule 10) + grab parameter.
@@ -1422,6 +1437,7 @@ struct DemoApp {
     /// echo dots) — unlabeled they read as broken meters (vision review).
     caption_output_g: Option<Arc<theme::TrackedLabel>>,
     caption_echoes_g: Option<Arc<theme::TrackedLabel>>,
+    caption_notes_g: Option<Arc<theme::TrackedLabel>>,
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
@@ -1691,6 +1707,7 @@ impl DemoApp {
             state_play_g: None,
             caption_output_g: None,
             caption_echoes_g: None,
+            caption_notes_g: None,
             state_pause_g: None,
             hint_front_g: None,
             hint_back_g: None,
@@ -2127,10 +2144,11 @@ impl DemoApp {
         self.state_play_g = Some(tracked("PLAYING", 10.0, 0.14));
         self.caption_output_g = Some(tracked("OUTPUT", 10.0, 0.14));
         self.caption_echoes_g = Some(tracked("ECHOES", 10.0, 0.14));
+        self.caption_notes_g = Some(tracked("NOTES", 10.0, 0.14));
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
         // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
-            "perform: drag knobs · click the keys · Space starts/stops · Tab flips the rack to patch",
+            "perform: drag knobs · play on the keyboard (C) · Space starts/stops · Tab flips the rack to patch",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
             "patch: drag jack to jack · drag a plug to another jack to move it · tug off to unplug · Tab flips back",
@@ -7421,8 +7439,8 @@ impl DemoApp {
         if !u.transport { return None; }
         let r = *self.unit_rects.get(unit)?;
         if r.width() < 140.0 { return None; }
-        let top = (r.top() + 56.0).max(r.center().y - 16.0).min(r.bottom() - 28.0);
-        Some(Rect::from_min_size(Pos2::new(r.left() + 34.0, top), Vec2::new(72.0, 24.0)))
+        let top = (r.top() + 64.0).max(r.center().y - 16.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H);
+        Some(Rect::from_min_size(Pos2::new(r.left() + FACE_X, top), Vec2::new(72.0, 24.0)))
     }
 
     /// Keys-face split controls (rack-local): the SPLIT chip and, right of
@@ -7435,8 +7453,8 @@ impl DemoApp {
         if !matches!(u.node_kind, UnitKind::Keys) { return None; }
         let r = *self.unit_rects.get(unit)?;
         if !(r.width() > 0.0) { return None; } // hidden (Rect::NOTHING) or unlaid
-        let y = r.top() + 10.0;
-        let readout = Rect::from_min_size(Pos2::new(r.right() - 30.0 - SPLIT_READOUT_W, y), Vec2::new(SPLIT_READOUT_W, FACE_CTL_H));
+        let y = r.top() + 14.0;
+        let readout = Rect::from_min_size(Pos2::new(r.right() - 36.0 - SPLIT_READOUT_W, y), Vec2::new(SPLIT_READOUT_W, FACE_CTL_H));
         // Chip + state field abut: ONE segmented control ("SPLIT | OFF"), not two buttons.
         let chip = Rect::from_min_size(Pos2::new(readout.left() - 1.0 - SPLIT_CHIP_W, y), Vec2::new(SPLIT_CHIP_W, FACE_CTL_H));
         let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
@@ -7554,7 +7572,7 @@ impl DemoApp {
     fn bpm_rects(&self, unit: usize) -> Option<BpmRects> {
         let chip = self.transport_chip_rect(unit)?;
         let r = *self.unit_rects.get(unit)?;
-        let right = r.right() - 14.0;
+        let right = r.right() - FACE_PAD_R;
         let full = 2.0 * (BPM_STEP_W + 4.0) + BPM_VALUE_W;
         let row = |x: f32, y: f32, steppers: bool| -> BpmRects {
             let sz = |w: f32| Vec2::new(w, FACE_CTL_H);
@@ -7570,7 +7588,7 @@ impl DemoApp {
         let x_row = chip.right() + 32.0; // past the beat LED
         if x_row + full <= right { return Some(row(x_row, chip.top(), true)); }
         let y_under = chip.bottom() + 4.0;
-        if y_under + FACE_CTL_H <= r.bottom() - 4.0 {
+        if y_under + FACE_CTL_H <= r.bottom() - FACE_PAD_B {
             if chip.left() + full <= right { return Some(row(chip.left(), y_under, true)); }
             if chip.left() + BPM_VALUE_W <= right { return Some(row(chip.left(), y_under, false)); }
         }
@@ -7583,18 +7601,18 @@ impl DemoApp {
     fn metro_action_rects(&self, unit: usize) -> Option<MetroActionRects> {
         let chip = self.transport_chip_rect(unit)?;
         let r = *self.unit_rects.get(unit)?;
-        let right = r.right() - 14.0;
+        let right = r.right() - FACE_PAD_R;
         let base_bottom = match self.bpm_rects(unit) {
             Some(b) if b.value.top() > chip.top() + 1.0 => b.value.bottom(),
             _ => chip.bottom(),
         };
         let y = base_bottom + 4.0;
-        if y + FACE_CTL_H > r.bottom() - 4.0 { return None; }
+        if y + FACE_CTL_H > r.bottom() - FACE_PAD_B { return None; }
         let avail = right - chip.left();
         let (tap_w, gap, ci_w, compact) = if avail >= METRO_TAP_W + 6.0 + METRO_COUNT_IN_W {
             (METRO_TAP_W, 6.0, METRO_COUNT_IN_W, false)
-        } else if avail >= 44.0 + 4.0 + 50.0 {
-            (44.0, 4.0, 50.0, true)
+        } else if avail >= 44.0 + 4.0 + 46.0 {
+            (44.0, 4.0, 46.0, true)
         } else {
             return None;
         };
@@ -7731,8 +7749,14 @@ impl DemoApp {
         // view, while the keyboard can play every rig that listens to it.
         // Read the levels directly: a hidden rig's cables are not simulated.
         let heard = self.edge_levels.clone();
+        // Post-fader, like the engine's rig bus: a muted rig, or any rig
+        // while another is soloed, reads silent (rule 16 — never show a
+        // silenced path as live).
+        let any_solo = self.rig_mix.iter().take(n_rigs).any(|m| m.solo);
         for r in 0..n_rigs {
-            let target = if let Some(l) = &heard {
+            let m = self.rig_mix[r.min(7)];
+            let bus_gain = if m.mute || (any_solo && !m.solo) { 0.0 } else { m.vol };
+            let target = bus_gain * if let Some(l) = &heard {
                 self.cables.iter()
                     .filter(|c| c.kind == PortKind::Audio && c.dying < 0.0)
                     .filter(|c| self.units.get(c.src).map_or(false, |u| u.rig == r as u8))
@@ -7950,64 +7974,41 @@ impl DemoApp {
 
     // -- hit testing ----------------------------------------------------------
 
+    /// Knob row center y: anchored to the unit bottom (face grid).
+    fn knob_row_y(&self, unit: usize) -> f32 {
+        self.unit_rects[unit].bottom() - FACE_PAD_B - KNOB_LABEL_H - KNOB_LABEL_GAP - KNOB_R
+    }
+
+    /// Right-to-left knob slot: pairs fill from the right (idx 0,1 = the
+    /// rightmost pair, pinned knobs add pairs to the LEFT); a pair with one
+    /// knob takes the slot next to its neighbours, never leaving a gap.
+    fn knob_slot(n: usize, idx: usize) -> usize {
+        let pair = idx / 2;
+        let full = pair * 2 + 1 < n;
+        pair * 2 + if full { 1 - idx % 2 } else { 0 }
+    }
+
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
-        let tall = self.units.get(unit)
-            .map(|u| matches!(u.node_kind, UnitKind::Keys | UnitKind::Master))
-            .unwrap_or(false);
-        if tall {
-            // Tall shared units: knobs along the bottom (offset clear of Master's meter).
-            let fx = if idx == 0 { 0.36 } else { 0.72 };
-            Vec2::new(r.left() + r.width() * fx, r.bottom() - 40.0)
-        } else {
-            // Stack units: knob pairs on the right; pinned knobs add pairs
-            // to the LEFT (idx 2,3 → one pair left, …).
-            Vec2::new(r.right() - 86.0 + (idx % 2) as f32 * 56.0 - (idx / 2) as f32 * 112.0, r.center().y + 14.0)
-        }
+        let n = self.units.get(unit).map_or(2, |u| u.knobs.len());
+        let slot = Self::knob_slot(n, idx);
+        Vec2::new(r.right() - FACE_PAD_R - KNOB_SLOT_HALF - slot as f32 * KNOB_PITCH, self.knob_row_y(unit))
     }
 
-    /// Display space left of the knob column on stack units.
+    /// Display space left of the knob row (rack-local x start, width).
     fn display_area(&self, unit: usize) -> (f32, f32) {
         let r = self.unit_rects[unit];
-        let start = r.left() + 20.0;
-        let pairs = self.units.get(unit).map_or(1, |u| u.knobs.len().div_ceil(2).max(1));
-        let width = (r.right() - 112.0 * pairs as f32 - start).max(0.0);
-        (start, width)
+        let start = r.left() + FACE_X;
+        let n = self.units.get(unit).map_or(0, |u| u.knobs.len());
+        let end = if n == 0 {
+            r.right() - FACE_PAD_R
+        } else {
+            let slots = (0..n).map(|i| Self::knob_slot(n, i)).max().unwrap_or(0);
+            r.right() - FACE_PAD_R - (slots + 1) as f32 * KNOB_PITCH - 8.0
+        };
+        (start, (end - start).max(0.0))
     }
 
-    fn key_w(&self) -> f32 {
-        let Some(k) = self.keys_unit else { return 0.0 };
-        let r = self.unit_rects[k];
-        let avail = r.width() - 40.0;
-        if avail < 96.0 { return 0.0; } // too narrow: hide the keyboard
-        // Up to 44px: the playable octave scales with the face instead of
-        // sitting small in a large Keys unit (vision review).
-        (avail / 8.0).clamp(12.0, 44.0)
-    }
-
-    /// White-key height: proportional to the key width, bounded by the face.
-    fn key_h(&self) -> f32 {
-        let r = self.unit_rects[self.keys_idx()];
-        (self.key_w() * 2.6).min((r.height() - 210.0).max(60.0)).clamp(60.0, 130.0)
-    }
-
-    fn key_rect(&self, white_idx: usize) -> Rect {
-        let r = self.unit_rects[self.keys_idx()];
-        let kw = self.key_w();
-        let kh = self.key_h();
-        let x0 = r.center().x - kw * 4.0;
-        Rect::from_min_size(
-            Pos2::new(x0 + white_idx as f32 * kw, r.center().y - kh / 2.0),
-            Vec2::new(kw - 1.0, kh),
-        )
-    }
-
-    /// Black key `bi` (0..5), drawn over the white key it follows.
-    fn black_key_rect(&self, bi: usize) -> Rect {
-        let base = self.key_rect(BLACK_AFTER[bi]);
-        let bw = self.key_w() * 0.62;
-        Rect::from_min_size(Pos2::new(base.right() - bw / 2.0 + 0.5, base.top()), Vec2::new(bw, base.height() * 0.62))
-    }
 
     fn hit_test(&self, s: Pos2) -> Hit {
         if self.flipping || self.xf.sy < 0.9 { return Hit::Background; }
@@ -8024,17 +8025,6 @@ impl DemoApp {
                         if (l - self.knob_center(ui, ki)).length() < 23.0 {
                             return Hit::Knob { unit: ui, idx: ki };
                         }
-                    }
-                }
-                // Keys keyboard (only when the active rig has a Keys unit).
-                if self.keys_unit.map_or(false, |k| self.visible(k)) {
-                    // Black keys first: they lie ON the whites (before, a
-                    // click on a black key played the white under it).
-                    for bi in 0..5 {
-                        if self.black_key_rect(bi).contains(lp) { return Hit::Key(BLACK_SEMI[bi]); }
-                    }
-                    for wi in 0..8 {
-                        if self.key_rect(wi).contains(lp) { return Hit::Key(WHITE_SEMI[wi]); }
                     }
                 }
                 for (ui, _) in self.units.iter().enumerate() {
@@ -8315,7 +8305,6 @@ impl DemoApp {
                     Hit::Knob { unit, idx } => {
                         self.drag = Drag::Knob { unit, idx, start_val: self.units[unit].knobs[idx].value, press_y: s.y };
                     }
-                    Hit::Key(semi) => self.click_note(60 + semi),
                     Hit::Jack { unit, jack } if self.side == Side::Back => {
                         let j = &self.units[unit].jacks[jack];
                         // Shift on an occupied output = fan out a new cable
@@ -8581,7 +8570,7 @@ impl DemoApp {
             CursorIcon::ResizeVertical
         } else {
             match self.hover {
-                Some(Hit::Play) | Some(Hit::Jack { .. }) | Some(Hit::Key(_)) => CursorIcon::PointingHand,
+                Some(Hit::Play) | Some(Hit::Jack { .. }) => CursorIcon::PointingHand,
                 Some(Hit::Knob { .. }) => CursorIcon::ResizeVertical,
                 Some(Hit::Cable(..)) => match self.drag {
                     Drag::Cable { .. } => CursorIcon::Grabbing,
@@ -8998,11 +8987,11 @@ impl DemoApp {
                 painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
 
-            // Label strip: 2px rule, accent when active/dragged (§4.3), or teal
-            // when touched by an agent.
-            let active = u.led > 0.05 || dragging;
+            // Label strip: 2px rule, accent while dragged (§4.3), teal when
+            // touched by an agent. Activity is the LED's job alone — the
+            // strip no longer flashes with it (one signal, not two).
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
-            let strip_col = if active {
+            let strip_col = if dragging {
                 theme::ACCENT
             } else if agent_t > 0.01 {
                 mix(BORDER, theme::AGENT_COLOR, agent_t)
@@ -9019,21 +9008,21 @@ impl DemoApp {
 
             // Activity LED: flat teal disc (+ optional flat halo), accent
             // while dragged. No glow stack.
-            let led = (r.right_top() + Vec2::new(-16.0, 16.0)).to_vec2();
+            let led = (r.right_top() + Vec2::new(-20.0, 20.0)).to_vec2();
             let led_col = if dragging { theme::ACCENT } else { GREEN };
             if u.led > 0.03 { self.ell(painter, led, 7.5, alpha(led_col, 0.15 * u.led), Stroke::NONE); }
             self.ell(painter, led, 3.2, alpha(led_col, 0.25 + 0.75 * u.led), Stroke::NONE);
 
             match &u.node_kind {
                 UnitKind::Keys => {
-                    self.draw_keyboard(painter);
+                    self.draw_notes_display(painter, ui);
                     self.draw_split_face(painter, ui);
                 }
                 UnitKind::Clap => self.draw_surge_display(painter, ui),
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
-                UnitKind::Master => self.draw_meter(painter, r),
+                UnitKind::Master => self.draw_meter(painter, ui),
             }
 
             for ki in 0..u.knobs.len() {
@@ -9044,7 +9033,7 @@ impl DemoApp {
                 let badge = if self.split_rects(ui).is_some() {
                     Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
                 } else {
-                    Rect::from_min_size(Pos2::new(r.right() - 74.0, r.top() + 8.0), Vec2::new(46.0, 16.0))
+                    Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0))
                 };
                 self.draw_agent_badge(painter, badge, agent_t);
             }
@@ -9243,13 +9232,12 @@ impl DemoApp {
 
     /// Generic DSP face: a small activity bar that breathes with the unit's LED.
     fn draw_dsp_display(&self, painter: &egui::Painter, unit: usize) {
-        let r = self.unit_rects[unit];
         let u = &self.units[unit];
         let (start, width) = self.display_area(unit);
         if width < 40.0 { return; }
         let level = u.led.clamp(0.0, 1.0);
         let bar_w = width * 0.8;
-        let y = r.center().y + 16.0;
+        let y = self.knob_row_y(unit);
         // Generic DSP bar (§4.9): METER_TRACK track, flat accent fill.
         let track = Rect::from_min_size(Pos2::new(start, y - 4.0), Vec2::new(bar_w, 8.0));
         painter.rect_filled(self.xf.rect(track), 4.0, theme::METER_TRACK);
@@ -9257,51 +9245,27 @@ impl DemoApp {
         painter.rect_filled(self.xf.rect(fill), 4.0, alpha(theme::ACCENT, 0.5 + 0.5 * level));
     }
 
-    fn draw_keyboard(&self, painter: &egui::Painter) {
-        if self.key_w() < 8.0 { return; }
-        let xf = &self.xf;
-        // Flat keys (§4.7): cream whites with a 1px ink hairline gap, ink
-        // blacks with a dark hairline; lit keys go solid accent. No gloss.
-        for wi in 0..8 {
-            let kr = self.key_rect(wi);
-            let semi = WHITE_SEMI[wi];
-            let lit = self.key_leds[semi];
-            let hovered = matches!(self.hover, Some(Hit::Key(s)) if s == semi);
-            let fill = if lit > 0.02 { theme::ACCENT }
-                else if hovered { Color32::from_rgb(0xF0, 0xED, 0xE6) }
-                else { WHITE };
-            painter.rect_filled(xf.rect(kr), 2.0, fill);
-            painter.rect_stroke(xf.rect(kr), 2.0, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
-        }
-        for bi in 0..5 {
-            let kr = self.black_key_rect(bi);
-            let lit = self.key_leds[BLACK_SEMI[bi]];
-            let fill = if lit > 0.02 { theme::ACCENT } else { BLACK };
-            painter.rect_filled(xf.rect(kr), 1.5, fill);
-            painter.rect_stroke(xf.rect(kr), 1.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
-        }
-        // Split marker: a cream hairline at the LOW|HIGH boundary when the
-        // split point falls inside the on-screen octave (C4..C5 = 60..72).
-        if let Some(p) = self.keys_unit.and_then(|k| self.shown_split(k)) {
-            let semi = p as i32 - 60;
-            if (1..=12).contains(&semi) {
-                let semi = semi as usize;
-                let x = match WHITE_SEMI.iter().position(|&w| w == semi) {
-                    Some(wi) => self.key_rect(wi).left() - 0.5,
-                    None => {
-                        let bi = BLACK_SEMI.iter().position(|&b| b == semi).unwrap_or(0);
-                        self.key_rect(BLACK_AFTER[bi]).right() - self.key_w() * 0.31
-                    }
-                };
-                let top = self.key_rect(0).top() - 6.0;
-                let bot = self.key_rect(0).bottom() + 6.0;
-                painter.line_segment([xf.p(Vec2::new(x, top)), xf.p(Vec2::new(x, bot))], Stroke::new(2.0, theme::CREAM));
+    /// Keys face: the 12 pitch classes as a one-octave dot strip (sharps
+    /// raised, like a keyboard silhouette) lit by the played notes. Playing
+    /// happens on the dock keyboard; the face only shows activity.
+    fn draw_notes_display(&self, painter: &egui::Painter, unit: usize) {
+        let (start, width) = self.display_area(unit);
+        if width < 60.0 { return; }
+        let y = self.knob_row_y(unit) + 4.0;
+        let pitch = (width / 12.0).min(14.0);
+        for pc in 0..12 {
+            let sharp = matches!(pc, 1 | 3 | 6 | 8 | 10);
+            let c = Vec2::new(start + pitch * (pc as f32 + 0.5), if sharp { y - 9.0 } else { y });
+            let lit = self.key_leds[pc];
+            self.ell(painter, c, 3.4, theme::METER_TRACK, Stroke::NONE);
+            if lit > 0.02 {
+                self.ell(painter, c, 3.4 + 1.6 * lit, alpha(theme::ACCENT, 0.35 + 0.65 * lit), Stroke::NONE);
             }
         }
+        self.display_caption(painter, unit, start + pitch * 6.0, &self.caption_notes_g);
     }
 
     fn draw_surge_display(&self, painter: &egui::Painter, unit: usize) {
-        let r = self.unit_rects[unit];
         let vis = 0.25 + 0.75 * self.units[unit].led.max(
             self.cables.iter().filter(|c| c.src == unit && c.kind == PortKind::Audio).map(|c| c.level).fold(0.0, f32::max));
         let (start, width) = self.display_area(unit);
@@ -9310,7 +9274,7 @@ impl DemoApp {
         for i in 0..11 {
             let h = (0.25 + 0.75 * (self.ui_time * 2.6 + i as f32 * 0.55).sin().abs()) * 34.0 * vis;
             let bar = Rect::from_center_size(
-                Pos2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0),
+                Pos2::new(start + pitch * 0.5 + i as f32 * pitch, self.knob_row_y(unit)),
                 Vec2::new(pitch * 0.45, h.max(2.0)),
             );
             // Alternate cream / dim cream, flat (§4.9).
@@ -9325,38 +9289,44 @@ impl DemoApp {
     /// rack-local `cx`, on the same baseline as the unit's knob labels.
     fn display_caption(&self, painter: &egui::Painter, unit: usize, cx: f32, g: &Option<Arc<theme::TrackedLabel>>) {
         let w = g.as_ref().map_or(0.0, |g| g.size.x);
-        let y = self.knob_center(unit, 0).y + KNOB_R + 10.0;
+        let y = self.knob_row_y(unit) + KNOB_R + KNOB_LABEL_GAP;
         self.text_tracked(painter, Vec2::new(cx - w / 2.0, y), g, SUBTEXT);
     }
 
     fn draw_delay_display(&self, painter: &egui::Painter, unit: usize) {
-        let r = self.unit_rects[unit];
         let led = self.units[unit].led;
         let (start, width) = self.display_area(unit);
         if width < 40.0 { return; }
         let pitch = (width / 4.5).min(26.0);
         for i in 0..4 {
-            let c = Vec2::new(start + pitch * 0.5 + i as f32 * pitch, r.center().y + 16.0);
+            let c = Vec2::new(start + pitch * 0.5 + i as f32 * pitch, self.knob_row_y(unit));
             let a = 0.15 + 0.85 * led * (1.0 - i as f32 * 0.2);
             self.ell(painter, c, 6.0 - i as f32 * 1.1, alpha(theme::ACCENT, a), Stroke::NONE);
         }
         if led > 0.05 {
-            let c = Vec2::new(start + pitch * 0.5, r.center().y + 16.0);
+            let c = Vec2::new(start + pitch * 0.5, self.knob_row_y(unit));
             self.ell(painter, c, 10.0 + (1.0 - led) * 14.0, alpha(theme::ACCENT, 0.25 * led), Stroke::NONE);
         }
         self.display_caption(painter, unit, start + pitch * 2.0, &self.caption_echoes_g);
     }
 
+    /// Master meter column: left x (on the face grid), bottom y (level with
+    /// the knob rings' bottom), segment pitch (fits between the header and
+    /// the knob row, room left for the OUTPUT caption).
+    fn meter_geom(&self, unit: usize) -> (f32, f32, f32) {
+        let r = self.unit_rects[unit];
+        let x = r.left() + FACE_X;
+        let bottom = self.knob_row_y(unit) + KNOB_R;
+        let pitch = ((bottom - (r.top() + 84.0)) / METER_SEGS as f32).clamp(4.0, 17.0);
+        (x, bottom, pitch)
+    }
+
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
     /// Stepped cream→tomato→red (§4.8) with a slow-release peak-hold tick.
-    fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
-        let n = 14;
+    fn draw_meter(&self, painter: &egui::Painter, unit: usize) {
+        let (x, bottom, pitch) = self.meter_geom(unit);
+        let n = METER_SEGS;
         let lit = lit_segments(self.meter, n);
-        let x = r.left() + 22.0;
-        let bottom = r.bottom() - 62.0;
-        // Start below the title block (+ room for the OUTPUT caption): on a
-        // short unit a fixed pitch pushed the caption into the subtitle.
-        let pitch = ((bottom - (r.top() + 84.0)) / n as f32).clamp(4.0, 17.0);
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
@@ -9379,8 +9349,8 @@ impl DemoApp {
         // Caption ON the meter column (above its top segment): attached to
         // the meter, not floating on the knob-label row (vision review).
         let top = bottom - n as f32 * pitch;
-        let w = self.caption_output_g.as_ref().map_or(0.0, |g| g.size.x);
-        self.text_tracked(painter, Vec2::new(x + 11.0 - w / 2.0, top - 18.0), &self.caption_output_g, SUBTEXT);
+        // Left-aligned with the meter column and the title (face grid).
+        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
     }
 
     fn draw_knob(&self, painter: &egui::Painter, ui: usize, ki: usize) {
@@ -9426,7 +9396,7 @@ impl DemoApp {
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
         painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
-        self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
+        self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + KNOB_LABEL_GAP), &k.label_g, SUBTEXT);
 
         // Status plate (LEARN or CC nn) above the knob (rule 35 plate, rule 7 padding).
         let has_tag = (is_learning || bound.is_some()) && self.text_alpha > 0.01;
@@ -11316,12 +11286,10 @@ mod matrix_ui_tests {
         app.handle_laptop_key(Key::A, false, false);
         for _ in 0..120 { app.update(1.0 / 30.0); }
         assert!(app.keyboard_led() < 0.05, "LED decayed");
-        // On-screen click on the first white key (real hit-test + input path).
-        let key = app.xf.p(app.key_rect(0).center().to_vec2());
-        let btn = |pressed| egui::Event::PointerButton { pos: key, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        frame(&mut app, vec![egui::Event::PointerMoved(key), btn(true)]);
+        // On-screen click (the dock keyboard's click path).
+        app.click_note(60 + WHITE_SEMI[0]);
         assert!(app.keyboard_led() > 0.5, "on-screen click lights the same row");
-        frame(&mut app, vec![btn(false)]);
+        frame(&mut app, vec![]);
         let ev = events.lock().unwrap();
         assert!(ev.iter().any(|e| e.velocity > 0.0 && e.note == 60 + WHITE_SEMI[0] as u8), "click fired a note");
         assert!(ev.len() >= 3);
@@ -11913,17 +11881,16 @@ mod rig_switch_tests {
     }
 
     #[test]
-    fn black_keys_are_playable_and_the_octave_scales() {
+    fn keys_face_is_not_a_keyboard() {
+        // Playing moved to the dock keyboard: a click anywhere on the Keys
+        // face is the unit (drag/select), never a note.
         let (app, _ctx) = two_rigs();
-        assert!(app.key_w() > 30.0, "keys grow with the face: {}", app.key_w());
-        for bi in 0..5 {
-            let c = app.black_key_rect(bi).center();
-            assert!(matches!(app.hit_test(app.xf.p(c.to_vec2())), Hit::Key(s) if s == BLACK_SEMI[bi]),
-                "black key {bi} hits its own semitone");
+        let k = app.keys_unit.expect("keys");
+        let r = app.unit_rects[k];
+        for f in [0.3f32, 0.5, 0.7] {
+            let p = Pos2::new(r.left() + r.width() * f, r.top() + r.height() * f);
+            assert!(matches!(app.hit_test(app.xf.p(p.to_vec2())), Hit::Unit(u) if u == k));
         }
-        let low = app.key_rect(0);
-        let below_black = Pos2::new(low.right() - 2.0, low.bottom() - 4.0);
-        assert!(matches!(app.hit_test(app.xf.p(below_black.to_vec2())), Hit::Key(0)), "white below the black stays white");
     }
 
     #[test]
@@ -13984,5 +13951,139 @@ mod ui_polish_agent_tests {
         let notes: Vec<u8> = events.lock().unwrap().iter().map(|e| e.note).collect();
         assert!(notes.contains(&60), "white key C plays note 60: {notes:?}");
         assert!(notes.contains(&61), "black key C# plays note 61: {notes:?}");
+    }
+}
+
+/// Face-grid audit: every element on every unit face (title, LED, knobs and
+/// their labels, displays, meter, chips) stays inside its unit with padding
+/// and never overlaps another element — across window sizes and rack shapes.
+#[cfg(test)]
+mod face_layout_tests {
+    use super::*;
+
+    fn frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+    }
+
+    fn items(app: &DemoApp, ui: usize) -> Vec<(String, Rect)> {
+        let u = &app.units[ui];
+        let r = app.unit_rects[ui];
+        let mut v = Vec::new();
+        let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
+        let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
+        let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
+        v.push(("header".to_string(), title.union(sub)));
+        v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
+        for (ki, k) in u.knobs.iter().enumerate() {
+            let c = app.knob_center(ui, ki).to_pos2();
+            let lw = sz(&k.label_g).x;
+            let label = Rect::from_min_size(Pos2::new(c.x - lw / 2.0, c.y + KNOB_R + KNOB_LABEL_GAP), Vec2::new(lw, KNOB_LABEL_H));
+            let ring = Rect::from_center_size(c, Vec2::splat(2.0 * KNOB_R + 4.0));
+            v.push((format!("knob {}", k.label), ring.union(label)));
+        }
+        let has_display = matches!(u.node_kind, UnitKind::Keys | UnitKind::Clap)
+            || matches!(u.node_kind, UnitKind::Dsp(_)) && !u.transport;
+        if has_display {
+            let (start, width) = app.display_area(ui);
+            if width >= 40.0 {
+                let y = app.knob_row_y(ui);
+                v.push(("display".into(), Rect::from_min_max(
+                    Pos2::new(start, y - 20.0), Pos2::new(start + width, y + KNOB_R + KNOB_LABEL_GAP + KNOB_LABEL_H))));
+            }
+        }
+        if matches!(u.node_kind, UnitKind::Master) {
+            let (x, bottom, pitch) = app.meter_geom(ui);
+            let top = bottom - METER_SEGS as f32 * pitch - 18.0;
+            let w = sz(&app.caption_output_g).x.max(22.0);
+            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
+        }
+        if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
+        if let Some(c) = app.transport_chip_rect(ui) { v.push(("play".into(), c.expand2(Vec2::new(0.0, 0.0)).union(Rect::from_center_size(Pos2::new(c.right() + 16.0, c.center().y), Vec2::splat(14.0))))); }
+        if let Some(b) = app.bpm_rects(ui) {
+            let mut br = b.value;
+            if let Some(m) = b.minus { br = br.union(m); }
+            if let Some(p) = b.plus { br = br.union(p); }
+            v.push(("bpm".into(), br));
+        }
+        if let Some(m) = app.metro_action_rects(ui) { v.push(("metro".into(), m.tap.union(m.count_in))); }
+        v
+    }
+
+    /// Violations for the rig in view: out of the padded unit, or overlapping.
+    fn audit(app: &DemoApp) -> Vec<String> {
+        let mut bad = Vec::new();
+        for ui in 0..app.units.len() {
+            if !app.visible(ui) { continue; }
+            let r = app.unit_rects[ui];
+            if !(r.width() > 0.0) { continue; }
+            let inner = Rect::from_min_max(r.min + Vec2::new(20.0, 8.0), r.max - Vec2::new(10.0, 10.0));
+            let it = items(app, ui);
+            let name = &app.units[ui].name;
+            for (n, rr) in &it {
+                if !inner.contains_rect(*rr) {
+                    bad.push(format!("{name}: {n} {rr:?} leaves padded unit {inner:?}"));
+                }
+            }
+            for i in 0..it.len() {
+                for j in i + 1..it.len() {
+                    let (a, b) = (&it[i], &it[j]);
+                    if a.1.expand(2.0).intersects(b.1) {
+                        bad.push(format!("{name}: {} {:?} overlaps {} {:?}", a.0, a.1, b.0, b.1));
+                    }
+                }
+            }
+        }
+        bad
+    }
+
+    fn check(mut app: DemoApp, what: &str) {
+        let ctx = egui::Context::default();
+        let mut all = Vec::new();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            for v in audit(&app) { all.push(format!("[{what} {}x{}] {v}", size.x, size.y)); }
+        }
+        assert!(all.is_empty(), "face layout violations:\n{}", all.join("\n"));
+    }
+
+    #[test]
+    fn demo_faces_are_padded_and_clear() {
+        check(DemoApp::new_with_sink(None), "demo");
+    }
+
+    #[test]
+    fn multi_rig_faces_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        check(app, "two rigs");
+    }
+
+    #[test]
+    fn template_faces_are_padded_and_clear() {
+        for t in crate::session::Template::ALL {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_template(t);
+            check(app, t.title());
+        }
+    }
+
+    #[test]
+    fn knob_rows_line_up_across_columns() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0)); }
+        let bottom_row: Vec<f32> = (0..app.units.len())
+            .filter(|&u| app.visible(u) && !app.units[u].knobs.is_empty())
+            .filter(|&u| (app.unit_rects[u].bottom() - app.stack_tall_h - 0.0).abs() < 1e9)
+            .map(|u| (app.unit_rects[u].bottom(), app.knob_center(u, 0).y))
+            .filter(|(b, _)| (b - app.unit_rects.iter().map(|r| r.bottom()).filter(|b| b.is_finite()).fold(0.0, f32::max)).abs() < 0.5)
+            .map(|(_, y)| y)
+            .collect();
+        assert!(bottom_row.len() >= 3, "keys, a bottom stack and master share the bottom: {bottom_row:?}");
+        assert!(bottom_row.iter().all(|y| (y - bottom_row[0]).abs() < 0.5), "one knob line: {bottom_row:?}");
     }
 }

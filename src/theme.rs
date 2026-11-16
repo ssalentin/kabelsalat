@@ -59,6 +59,9 @@ pub const MIDI_BLUE: Color32 = Color32::from_rgb(0x5B, 0x8F, 0xD0); // MIDI on d
 pub const MIDI_BLUE_DEEP: Color32 = Color32::from_rgb(0x1C, 0x5A, 0x8B); // MIDI on paper / links
 pub const LIVE_TEAL: Color32 = Color32::from_rgb(0x2E, 0x9E, 0x9B); // active / playing on dark
 pub const LIVE_TEAL_DEEP: Color32 = Color32::from_rgb(0x1F, 0x7A, 0x70); // active text on paper
+/// Semantic agent highlight (consistent across rack, cables, matrix, and assistant).
+pub const AGENT_COLOR: Color32 = LIVE_TEAL;
+pub const AGENT_COLOR_TEXT: Color32 = DARK_PANEL;
 pub const CLIP_RED: Color32 = Color32::from_rgb(0xD9, 0x25, 0x1C); // clip graphics
 pub const CLIP_TEXT: Color32 = Color32::from_rgb(0xB9, 0x1C, 0x14); // danger text on paper
 #[allow(dead_code)] // reserved token (§3.1): danger text on dark, no call site yet
@@ -499,6 +502,61 @@ pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
         // force cream on the cream ON-fill (invisible label).
         ui.add(
             egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
+                .corner_radius(2.0)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+    }).inner
+}
+
+/// Action button for adding a rig in the rig strip: same 26px chip height and
+/// padding as [`chip_button`], distinguished by an accent-tinted hairline and
+/// tomato `+` glyph (Hurricane's accent-plus motif) while keeping cream label text.
+pub fn add_rig_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.scope(|ui| {
+        let base_stroke = mix(HAIRLINE, ACCENT, 0.45);
+        let base = egui::style::WidgetVisuals {
+            bg_fill: DARK_PANEL_HI,
+            weak_bg_fill: DARK_PANEL_HI,
+            bg_stroke: Stroke::new(1.0, base_stroke),
+            corner_radius: 2.0.into(),
+            fg_stroke: Stroke::new(1.0, CREAM),
+            expansion: 0.0,
+        };
+        let hot_fill = mix(DARK_PANEL_HI, CREAM, 0.07);
+        let hot = egui::style::WidgetVisuals {
+            bg_fill: hot_fill,
+            weak_bg_fill: hot_fill,
+            bg_stroke: Stroke::new(1.0, ACCENT),
+            fg_stroke: Stroke::new(1.0, CREAM),
+            ..base
+        };
+        let v = ui.visuals_mut();
+        v.widgets.inactive = base;
+        v.widgets.hovered = hot;
+        v.widgets.active = hot;
+        v.widgets.open = base;
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "+",
+            0.0,
+            egui::TextFormat {
+                font_id: medium_font(12.5),
+                color: ACCENT_BRIGHT,
+                ..Default::default()
+            },
+        );
+        job.append(
+            &format!(" {label}"),
+            0.0,
+            egui::TextFormat {
+                font_id: medium_font(12.5),
+                color: CREAM,
+                ..Default::default()
+            },
+        );
+        ui.add(
+            egui::Button::new(job)
                 .corner_radius(2.0)
                 .min_size(egui::vec2(0.0, 26.0)),
         )

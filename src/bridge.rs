@@ -45,6 +45,10 @@ pub type UiRequest = (String, Value, std::sync::mpsc::Sender<String>);
 pub static UI_INBOX: Mutex<Vec<UiRequest>> = Mutex::new(Vec::new());
 /// Set once a UI frame loop drains `UI_INBOX` (headless MCP has none).
 pub static UI_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Remote `Command`s received on the bridge socket (`op == "cmd"`), drained by
+/// the UI frame loop to adopt non-GraphPub updates (SetParam, SetRigSource/Device)
+/// and surface live agent activity in the rack.
+pub static REMOTE_CMDS: Mutex<Vec<Command>> = Mutex::new(Vec::new());
 
 fn ui_call(tool: String, args: Value) -> Result<String, String> {
     if !UI_ATTACHED.load(Ordering::Relaxed) { return Err("no app UI attached".into()); }
@@ -260,7 +264,14 @@ fn handle_line_with_pub(
                 Ok(b) => b,
                 Err(_) => return err_reply("command bus lock poisoned"),
             };
-            if b.send(cmd) {
+            if b.send(cmd.clone()) {
+                if UI_ATTACHED.load(Ordering::Relaxed) {
+                    if let Ok(mut q) = REMOTE_CMDS.lock() {
+                        if q.len() < 128 {
+                            q.push(cmd);
+                        }
+                    }
+                }
                 json!({"ok": true})
             } else {
                 err_reply("command bus full — try again")

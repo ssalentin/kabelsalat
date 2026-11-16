@@ -1417,6 +1417,8 @@ struct DemoApp {
     rig_chip_rects: Vec<Rect>,
     /// Last frame's "+ Rig" button rect in the overview strip (points).
     add_rig_rect: Rect,
+    /// Top-bar external-agent chip (tests).
+    agent_chip_rect: Rect,
     /// Agent undo/redo (one step per agent job) and the open job.
     undo_past: Vec<UndoSnap>,
     undo_future: Vec<UndoSnap>,
@@ -1716,6 +1718,7 @@ impl DemoApp {
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
+            agent_chip_rect: Rect::NOTHING,
             undo_past: Vec::new(),
             undo_future: Vec::new(),
             undo_job: None,
@@ -5867,6 +5870,29 @@ impl DemoApp {
                     ui.painter().rect_stroke(group.expand(3.0), 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
                     self.dock_group_rect = group;
                     if let Some(d) = dock { self.toggle_dock(d); }
+                    // External agent (MCP --attach): visible while it acts,
+                    // one click pauses it (Bravo item 7, without a per-start
+                    // consent prompt — the user drives the app from outside).
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let paused = crate::bridge::REMOTE_PAUSED.load(Relaxed);
+                        let last = crate::bridge::LAST_REMOTE_MS.load(Relaxed);
+                        let recent = last > 0 && crate::bridge::now_ms().saturating_sub(last) < 15_000;
+                        if paused || recent {
+                            ui.add_space(10.0);
+                            let (label, tip) = if paused {
+                                ("Agent paused", "external agents (MCP) may not change this rack — click to allow")
+                            } else {
+                                ("● Agent connected", "an external agent (MCP) is working on this rack — click to pause it")
+                            };
+                            let r = theme::chip_button(ui, label, paused).on_hover_text(tip);
+                            if !paused {
+                                ui.painter().rect_stroke(r.rect, 2.0, Stroke::new(1.2, theme::AGENT_COLOR), egui::StrokeKind::Inside);
+                            }
+                            self.agent_chip_rect = r.rect;
+                            if r.clicked() { crate::bridge::REMOTE_PAUSED.store(!paused, Relaxed); }
+                        }
+                    }
                     // Master recording (GitHub #6): a REC chip (tomato only
                     // while recording) + a sync-to-transport toggle + elapsed
                     // time while active. Start/stop go through the command bus.

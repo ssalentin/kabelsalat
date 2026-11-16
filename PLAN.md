@@ -751,7 +751,9 @@ Everything queued lives here; update this section as work lands.
      + per-bus meters, mirrored in the UI (rule 25), not free-wiring only.
   6. **Recorded agent recipes (M):** name a sequence of tool calls once ("my vocal
      chain"), replay it on any rig as one undo step.
-  7. **Attach consent (S):** `mcp --attach` asks once in the UI before an external
-     agent may change the live set; revocable.
+  7. **External agent visibility — done (2026-11-16):** instead of a consent prompt
+     on every start (the user drives the app from outside on purpose), the top bar
+     shows "● Agent connected" while an MCP client acts; one click pauses it
+     (commands and changing UI tools refused, queries still answer).
   Not adopted: timeline/arranger, ML stem separation, black-box auto-mix, cloud
   credits, multi-agent "musicians", foreign-DAW import.

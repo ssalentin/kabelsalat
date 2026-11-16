@@ -226,6 +226,11 @@ Learned so far (2026-11-15, UI polish pass):
     the window is idle. `spawn_hw_midi` owns the connections and rescans
     every 2 s; unplugged devices keep their index. Tests never scan the
     machine's hardware (a plugged keyboard broke a matrix layout test).
+49. **Gain staging before colour:** the master `tanh` warmth saw the raw sum
+    of every voice; 8–16 held notes spent 2.5–4.9 % of samples in hard
+    saturation ("burning crackle"). A zero-latency `MasterLimiter` holds the
+    sum at 0.7 first. Never add lookahead on the master (it adds to every
+    played note's latency).
 
 ## Ground rules
 

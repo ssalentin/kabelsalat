@@ -35,6 +35,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::control::{Command, CommandBus, Graph, RigSnapshot};
+use crate::engine::GraphPub;
 
 /// One UI-owned tool call queued for the app frame: (tool, args, reply).
 pub type UiRequest = (String, Value, std::sync::mpsc::Sender<String>);
@@ -127,7 +128,20 @@ pub fn spawn_with_rigs(
     sample_rate: f64,
     rigs: Arc<Mutex<RigSnapshot>>,
 ) -> anyhow::Result<()> {
-    spawn_at(socket_path(), bus, graph, level, sample_rate, rigs)
+    spawn_at(socket_path(), bus, graph, level, sample_rate, rigs, None)
+}
+
+/// Like [`spawn_with_rigs`], plus the engine's `GraphPub` so `get_status`
+/// reports live transport, tempo, and count-in state.
+pub fn spawn_with_state(
+    bus: Arc<Mutex<CommandBus>>,
+    graph: Arc<Mutex<Graph>>,
+    level: Arc<AtomicU32>,
+    sample_rate: f64,
+    rigs: Arc<Mutex<RigSnapshot>>,
+    graph_pub: Arc<Mutex<GraphPub>>,
+) -> anyhow::Result<()> {
+    spawn_at(socket_path(), bus, graph, level, sample_rate, rigs, Some(graph_pub))
 }
 
 fn spawn_at(
@@ -137,6 +151,7 @@ fn spawn_at(
     level: Arc<AtomicU32>,
     sample_rate: f64,
     rigs: Arc<Mutex<RigSnapshot>>,
+    graph_pub: Option<Arc<Mutex<GraphPub>>>,
 ) -> anyhow::Result<()> {
     if path.exists() {
         // Refuse to steal the socket from a live instance; clean up stale ones.
@@ -162,7 +177,7 @@ fn spawn_at(
             // many request lines. Accept errors are logged, never fatal.
             for conn in listener.incoming() {
                 match conn {
-                    Ok(stream) => handle_conn(stream, &bus, &graph, &level, sample_rate, &rigs),
+                    Ok(stream) => handle_conn(stream, &bus, &graph, &level, sample_rate, &rigs, graph_pub.as_ref()),
                     Err(e) => eprintln!("bridge: accept error: {e}"),
                 }
             }
@@ -178,6 +193,7 @@ fn handle_conn(
     level: &AtomicU32,
     sample_rate: f64,
     rigs: &Arc<Mutex<RigSnapshot>>,
+    graph_pub: Option<&Arc<Mutex<GraphPub>>>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut writer = match stream.try_clone() {
@@ -193,7 +209,7 @@ fn handle_conn(
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(&line, bus, graph, level, sample_rate, rigs);
+        let reply = handle_line_with_pub(&line, bus, graph, level, sample_rate, rigs, graph_pub);
         if writeln!(writer, "{reply}").is_err() || writer.flush().is_err() {
             return;
         }
@@ -206,6 +222,7 @@ fn err_reply(msg: impl Into<String>) -> Value {
 
 /// One request line → one reply value. Pure enough to unit-test; never panics
 /// on malformed input (every parse/lock failure becomes an error reply).
+#[cfg_attr(not(test), allow(dead_code))]
 fn handle_line(
     line: &str,
     bus: &Arc<Mutex<CommandBus>>,
@@ -213,6 +230,18 @@ fn handle_line(
     level: &AtomicU32,
     sample_rate: f64,
     rigs: &Arc<Mutex<RigSnapshot>>,
+) -> Value {
+    handle_line_with_pub(line, bus, graph, level, sample_rate, rigs, None)
+}
+
+fn handle_line_with_pub(
+    line: &str,
+    bus: &Arc<Mutex<CommandBus>>,
+    graph: &Arc<Mutex<Graph>>,
+    level: &AtomicU32,
+    sample_rate: f64,
+    rigs: &Arc<Mutex<RigSnapshot>>,
+    graph_pub: Option<&Arc<Mutex<GraphPub>>>,
 ) -> Value {
     let req: Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -279,12 +308,22 @@ fn handle_line(
                     Ok(s) => (s.rigs.len(), s.active),
                     Err(_) => (0, 0),
                 };
+                let tp = graph_pub
+                    .and_then(|p| p.lock().ok())
+                    .map(|g| g.transport)
+                    .unwrap_or_default();
                 json!({"ok": true, "data": {
                     "nodes": g.nodes.len(),
                     "edges": g.edges.len(),
                     "sample_rate": sample_rate,
                     "output_level": f32::from_bits(level.load(Ordering::Relaxed)),
                     "audio_live": true,
+                    "transport_playing": tp.playing,
+                    "counting_in": tp.counting_in,
+                    "count_in_beat": tp.count_in_beat,
+                    "count_in_enabled": tp.count_in_enabled,
+                    "count_in_bars": tp.count_in_bars,
+                    "bpm": tp.bpm,
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
                     "xruns": XRUNS.load(Ordering::Relaxed),
@@ -457,7 +496,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         // A stale (unbound) socket file must be replaced, not fatal.
         std::fs::write(&path, b"").unwrap();
-        spawn_at(path.clone(), bus.clone(), graph.clone(), level.clone(), 44100.0, rigs.clone()).unwrap();
+        spawn_at(path.clone(), bus.clone(), graph.clone(), level.clone(), 44100.0, rigs.clone(), None).unwrap();
 
         let mut stream = UnixStream::connect(&path).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -475,7 +514,38 @@ mod tests {
 
         // A second spawn while the first is live must fail, not steal.
         let (bus2, _d2, g2, lv2, rigs2) = fixtures();
-        assert!(spawn_at(path.clone(), bus2, g2, lv2, 48000.0, rigs2).is_err());
+        assert!(spawn_at(path.clone(), bus2, g2, lv2, 48000.0, rigs2, None).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_status_includes_transport_pub_state() {
+        let (bus, _drain, graph, level, rigs) = fixtures();
+        let pub_ = Arc::new(Mutex::new(GraphPub {
+            transport: crate::engine::TransportPub {
+                playing: false,
+                counting_in: true,
+                count_in_beat: 3,
+                count_in_enabled: true,
+                count_in_bars: 2,
+                bpm: 124.0,
+            },
+            ..Default::default()
+        }));
+        let reply = handle_line_with_pub(
+            r#"{"op":"query","name":"get_status"}"#,
+            &bus,
+            &graph,
+            &level,
+            48000.0,
+            &rigs,
+            Some(&pub_),
+        );
+        assert_eq!(reply["data"]["counting_in"], json!(true));
+        assert_eq!(reply["data"]["count_in_beat"], json!(3));
+        assert_eq!(reply["data"]["count_in_enabled"], json!(true));
+        assert_eq!(reply["data"]["count_in_bars"], json!(2));
+        assert_eq!(reply["data"]["bpm"], json!(124.0));
+        assert_eq!(reply["data"]["transport_playing"], json!(false));
     }
 }

@@ -46,26 +46,62 @@ pub fn load_model() -> String {
         .unwrap_or_else(|| DEFAULT_MODEL.into())
 }
 
+/// Merge key/value pairs into a config JSON file (mode 0600), preserving
+/// unrelated fields.
+fn save_config_values_to(path: &std::path::Path, pairs: &[(&str, Value)]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut v: Value = std::fs::read_to_string(path).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(|v: &Value| v.is_object())
+        .unwrap_or_else(|| json!({}));
+    for (k, val) in pairs {
+        v[*k] = val.clone();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v).unwrap())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Merge one string field into config.json (mode 0600) — never drops the
 /// other fields (writing the key used to overwrite the whole file).
 pub fn save_config_field(field: &str, value: &str) -> std::io::Result<()> {
     if cfg!(test) { return Ok(()); } // tests never touch the user's real config
-    let p = config_path();
-    if let Some(dir) = p.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut v: Value = std::fs::read_to_string(&p).ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .filter(|v: &Value| v.is_object())
-        .unwrap_or_else(|| json!({}));
-    v[field] = json!(value);
-    std::fs::write(&p, serde_json::to_string_pretty(&v).unwrap())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    save_config_values_to(&config_path(), &[(field, json!(value))])
+}
+
+/// Load persisted count-in `(enabled, bars)` from `path` (defaults: `(false, 1)`).
+pub fn load_count_in_from(path: &std::path::Path) -> (bool, u8) {
+    let v: Option<Value> = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok());
+    let enabled = v.as_ref().and_then(|v| v.get("count_in_enabled")).and_then(Value::as_bool).unwrap_or(false);
+    let bars = v
+        .as_ref()
+        .and_then(|v| v.get("count_in_bars"))
+        .and_then(Value::as_u64)
+        .map(|b| b.clamp(1, crate::transport::MAX_COUNT_IN_BARS as u64) as u8)
+        .unwrap_or(1);
+    (enabled, bars)
+}
+
+pub fn save_count_in_to(path: &std::path::Path, enabled: bool, bars: u8) -> std::io::Result<()> {
+    let bars = bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS);
+    save_config_values_to(path, &[("count_in_enabled", json!(enabled)), ("count_in_bars", json!(bars))])
+}
+
+/// Persisted count-in `(enabled, bars)` in config.json (test-safe no-op under cfg(test)).
+pub fn load_count_in() -> (bool, u8) {
+    if cfg!(test) { return (false, 1); }
+    load_count_in_from(&config_path())
+}
+
+pub fn save_count_in(enabled: bool, bars: u8) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_count_in_to(&config_path(), enabled, bars)
 }
 
 #[derive(Clone)]
@@ -208,7 +244,9 @@ fn system_prompt() -> String {
      (metronome today; get_graph marks them transport=true with their playing state). \
      set_node_playing(node, playing) starts/stops ONE instrument; transport_play/\
      transport_stop are the master and start/stop ALL of them. The master is also the \
-     song clock CLAP plugins follow: play runs it from beat 0, stop halts it.\n\
+     song clock CLAP plugins follow: play runs it from beat 0, stop halts it. \
+     set_count_in(enabled, bars) enables/configures a count-in bar of clicks before \
+     the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome).\n\
      - Sessions: save_session/load_session/list_sessions.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
@@ -390,6 +428,11 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"bpm":{"type":"number"}},"required":["bpm"]}
         }},
         {"type":"function","function":{
+            "name":"set_count_in",
+            "description":"Enable/disable master transport count-in or set its length in bars (1..=4). When enabled, master play plays N bars of metronome clicks before the song clock and plugins start at beat 0.",
+            "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"bars":{"type":"integer"}}}
+        }},
+        {"type":"function","function":{
             "name":"load_template",
             "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | demo | multi_rig (two independent rigs, switch view with 1-9).",
             "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","demo","multi_rig"]}},"required":["name"]}
@@ -567,5 +610,29 @@ fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Rece
             let _ = tx.send(FromWorker::Done);
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_in_persists_in_config_json_preserving_other_fields() {
+        let dir = std::env::temp_dir().join(format!("ksalat-cfg-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, r#"{"assistant_model":"deepseek-chat"}"#).unwrap();
+
+        assert_eq!(load_count_in_from(&p), (false, 1));
+        save_count_in_to(&p, true, 2).unwrap();
+        assert_eq!(load_count_in_from(&p), (true, 2));
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["assistant_model"], json!("deepseek-chat"));
+
+        save_count_in_to(&p, false, 9).unwrap();
+        assert_eq!(load_count_in_from(&p), (false, crate::transport::MAX_COUNT_IN_BARS));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

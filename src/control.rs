@@ -609,6 +609,9 @@ pub enum Command {
     SetNodePlaying { node: NodeId, playing: bool },
     /// Set the tempo (BPM) of the metronomes and of the song clock.
     SetBpm { bpm: f32 },
+    /// Configure master transport count-in: `bars` (1..=4) of metronome
+    /// clicks before the song clock starts at beat 0 when `enabled` is true.
+    SetCountIn { enabled: bool, bars: u8 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },
 }
@@ -715,6 +718,9 @@ mod tests {
             Command::TransportStop,
             Command::SetNodePlaying { node: 7, playing: true },
             Command::SetNodePlaying { node: 7, playing: false },
+            Command::SetBpm { bpm: 128.0 },
+            Command::SetCountIn { enabled: true, bars: 2 },
+            Command::SetCountIn { enabled: false, bars: 1 },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42) },
             Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None },

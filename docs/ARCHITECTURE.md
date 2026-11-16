@@ -30,6 +30,10 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
+- `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
+  short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
+  gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono
+  check, 4-band summary; allocation-free, published via `GraphPub.meter`.
 - `ui.rs` / `theme.rs` — eframe/egui app: rack with physics cables and flip,
   rigs strip, mixer, matrix, sessions, plugin browser, native plugin editors,
   bottom dock (keyboard or assistant); `theme.rs` is the single palette source

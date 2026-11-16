@@ -7,6 +7,22 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+### Added
+- **The agent can measure the mix** (`measure_mix`, also in `get_status`):
+  momentary, short-term and integrated loudness (LUFS), true peak, a bass
+  mono check and a 4-band balance. `kabelsalat meter-test` checks it with
+  real Surge audio (#11).
+- **Undo for agent changes:** one request (or one burst of MCP calls) is one
+  step; `undo`/`redo` tools and Ctrl+Z / Ctrl+Shift+Z.
+- **External agents are visible:** "● Agent connected" in the top bar while an
+  MCP client acts; one click pauses it.
+- After recording, the top bar names the saved take with **Play** and **Folder**.
+
+### Fixed
+- Recording file names use local time instead of UTC.
+- The file player reads 24-bit PCM and 32-bit float WAV (it can play the
+  app's own recordings).
+
 ## [0.1.0] — 2026-11-16
 
 The first tagged release: a working live rack for Linux.

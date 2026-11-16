@@ -31,6 +31,11 @@ releases may still change behaviour and session files.
   MCP client acts; one click pauses it.
 - After recording, the top bar names the saved take with **Play** and **Folder**.
 
+### Changed
+- **I** toggles the info line at the top right (was D, which is also a note
+  key); it now starts with the last incoming MIDI event — device, note and
+  velocity, or CC number and value.
+
 ### Fixed
 - Vitalium (LV2) could corrupt memory and crash the app when an instance was
   removed or reloaded; instances are now kept and reused (#14).

@@ -923,7 +923,9 @@ fn make_unit(node: &Node) -> Unit {
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
-            vec![knob("GAIN", 0.5, Some(0))],
+            // Visual only: capture gain changes via SetSystemAudio, which has
+            // no SetParam/CC path — a bindable knob here would look live but do nothing.
+            vec![knob("GAIN", 0.5, None)],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         ),
     };
@@ -4887,9 +4889,11 @@ impl DemoApp {
         }
     }
 
-    /// Mirror an incoming hardware CC onto matching rack knobs without re-sending
-    /// `Command::SetParam` back to the engine (no feedback loop).
-    fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8) {
+    /// Mirror an incoming hardware CC onto matching rack knobs. Normally the
+    /// engine already applied it, so `sent` is updated and nothing is re-sent
+    /// (no feedback loop). `resend` is for the CC that completed a learn: the
+    /// engine saw it before the binding existed, so publish must catch it up.
+    fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
         let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
@@ -4900,20 +4904,19 @@ impl DemoApp {
                 if m.cc != cc { continue; }
                 for u in &mut self.units {
                     if u.node_id != *dest { continue; }
+                    // On non-CLAP units plugin and knob params are the same
+                    // engine path (apply_engine_param), so both targets move the knob.
+                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
                     for k in &mut u.knobs {
-                        match m.target {
-                            crate::matrix::CcTarget::Knob => {
-                                if k.param == Some(m.param) {
+                        let by_param = matches!(m.target, crate::matrix::CcTarget::Knob) || !is_clap;
+                        if by_param && k.param == Some(m.param) {
+                            k.value = norm;
+                            if !resend { k.sent = Some(norm); }
+                        } else if matches!(m.target, crate::matrix::CcTarget::PluginParam) {
+                            if let Some(pin) = k.clap.as_mut() {
+                                if pin.id == m.param {
                                     k.value = norm;
-                                    k.sent = Some(norm);
-                                }
-                            }
-                            crate::matrix::CcTarget::PluginParam => {
-                                if let Some(pin) = k.clap.as_mut() {
-                                    if pin.id == m.param {
-                                        k.value = norm;
-                                        pin.sent = norm;
-                                    }
+                                    if !resend { pin.sent = norm; }
                                 }
                             }
                         }
@@ -10225,9 +10228,8 @@ impl DemoApp {
             if let SourceId::Hardware(d) = src {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
-            if !self.complete_cc_learn(src, cc) {
-                self.apply_cc_to_knobs(src, ch, cc, val);
-            }
+            let learned = self.complete_cc_learn(src, cc);
+            self.apply_cc_to_knobs(src, ch, cc, val, learned);
         }
 
         let rect = ui.available_rect_before_wrap();
@@ -13198,6 +13200,12 @@ mod split_bpm_tests {
                 target: crate::matrix::CcTarget::Knob,
             }
         )), "sent MatrixCcMap with CcTarget::Knob: {cmds:?}");
+        // The binding CC itself counts: the engine saw it before the mapping
+        // existed, so the knob adopts it and publish sends one catch-up SetParam.
+        assert!((app.units[surge_unit].knobs[level_idx].value - 50.0 / 127.0).abs() < 1e-6,
+            "knob adopts the CC that completed the learn");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetParam { node: 1, param: P_LEVEL, .. })),
+            "catch-up SetParam for the learn CC: {cmds:?}");
 
         // 5. Turning the bound hardware knob updates the on-screen knob without re-sending SetParam.
         let before_val = app.units[surge_unit].knobs[level_idx].value;

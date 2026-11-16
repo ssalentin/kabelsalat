@@ -237,6 +237,11 @@ Learned so far (2026-11-15, UI polish pass):
     `test result: ok` — never on `grep "test result"` (it also matches
     `FAILED`) and never with `;` between test and push. Twice a red run was
     pushed this way (f2659d7, ad36805).
+51. **The CC that completes a MIDI learn is applied, not swallowed:** the
+    engine sees a hardware CC (HwDirect) before the UI frame sends the new
+    `MatrixCcMap`, so the knob adopts the value WITHOUT setting `sent` and
+    publish sends one catch-up SetParam. Skipping it left sound and knob at
+    the old value until the controller moved again.
 
 ## Ground rules
 

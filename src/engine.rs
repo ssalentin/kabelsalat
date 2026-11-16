@@ -1307,11 +1307,7 @@ impl GraphEngine {
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
                         if self.apply_engine_param(dest, pid, norm) || is_clap_node {
                             #[cfg(test)]
-                            if self.voices.iter().any(|s| s.node == dest) || !is_clap_node {
-                                self.cc_log.push((dest, pid, norm));
-                            } else if is_clap_node {
-                                self.cc_log.push((dest, pid, norm));
-                            }
+                            self.cc_log.push((dest, pid, norm));
                         }
                         continue;
                     }

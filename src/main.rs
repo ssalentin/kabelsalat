@@ -11,6 +11,7 @@ mod audio_in;
 mod audio_out;
 mod bridge;
 mod capture;
+mod catalog;
 mod control;
 mod dsp;
 mod engine;

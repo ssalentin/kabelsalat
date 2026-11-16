@@ -10,6 +10,14 @@ releases may still change behaviour and session files.
 ### Added
 - **Rename rigs:** double-click a rig chip; agent tool `rename_rig`. Rig names
   are saved with the session (#33).
+- **Built-in instrument browser** (#10): an "Install" tab in the Plugins view
+  shows a hand-picked catalog — setBfree, Surge XT, Dexed, Vitalium and YANES —
+  each linked to its GitHub project. A distro package is preferred (prebuilt,
+  signed), otherwise the instrument is built from source into `~/.clap` /
+  `~/.lv2`. Installs run on a worker thread with a live log in the view and a
+  plugin rescan when they finish; "Installed" badges reflect the plugin scan or
+  the bundle on disk. Agent parity: `list_instruments` and `install_instrument`
+  (confirm-gated) in the assistant and MCP.
 - **System audio in the mixer:** every other app that is playing (YouTube in
   the browser, …) gets a strip with volume and mute (#31).
 - **Output device selection** at Master out (e.g. MOTU M2 vs. speakers):

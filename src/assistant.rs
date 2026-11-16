@@ -335,6 +335,31 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"channel":{"type":"integer"},"transpose":{"type":"integer"},"key_lo":{"type":"integer"},"key_hi":{"type":"integer"},"vel_lo":{"type":"integer"},"vel_hi":{"type":"integer"},"enabled":{"type":"boolean"}},"required":["node","source"]}
         }},
         {"type":"function","function":{
+            "name":"list_params",
+            "description":"List bindable parameters (id, name) on a node (CLAP/LV2/DSP/Master), optionally filtered by query words. Use the returned id with set_cc_map or learn_cc.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"query":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_cc_maps",
+            "description":"List active MIDI CC → parameter bindings across matrix rules (plus any armed MIDI-learn target). Filter optionally by node or source ('keys' | 'hw:<d>').",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_cc_map",
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id (omit param to remove). Non-empty cc_map acts as a whitelist for that rule.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"}},"required":["node","source","cc"]}
+        }},
+        {"type":"function","function":{
+            "name":"clear_cc_map",
+            "description":"Clear one CC binding (when cc is given) or ALL CC bindings (when cc is omitted) on source → node, returning the rule's CC handling to transparent passthrough when empty.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"}},"required":["node","source"]}
+        }},
+        {"type":"function","function":{
+            "name":"learn_cc",
+            "description":"Arm MIDI-learn for (source, node, param) so the next incoming hardware CC binds to that parameter. Pass cancel=true to disarm.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"cancel":{"type":"boolean"}},"required":["node","source","param"]}
+        }},
+        {"type":"function","function":{
             "name":"set_rig_mix",
             "description":"Per-rig mixer: rig index (0-based), vol 0..1, pan -1..1, mute, solo (solo mutes other rigs). Omitted fields keep their value. Example: rig 1 mute true.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"vol":{"type":"number"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["rig"]}

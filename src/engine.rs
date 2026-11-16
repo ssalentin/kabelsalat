@@ -81,6 +81,21 @@ fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
     }
 }
 
+/// Exposed engine param ids and labels for a built-in DSP node.
+pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
+    match kind {
+        DspKind::Delay => &[(P_TIME, "Time"), (P_MIX, "Mix")],
+        DspKind::Reverb => &[(0, "Mix"), (1, "Size")],
+        DspKind::Gain => &[(0, "Gain")],
+        DspKind::Filter => &[(0, "Cutoff"), (1, "Resonance")],
+        DspKind::Eq3 => &[(0, "Low"), (1, "High")],
+        DspKind::Limiter => &[(0, "Threshold"), (1, "Ceiling")],
+        DspKind::Saturation => &[(0, "Drive"), (1, "Mix")],
+        DspKind::Pan => &[(0, "Pan")],
+        DspKind::Metronome => &[],
+    }
+}
+
 struct VoiceSlot {
     node: NodeId,
     voice: ClapVoice,
@@ -311,6 +326,10 @@ pub struct GraphEngine {
     /// (incl. split-change releases), so routing is observable without voices.
     #[cfg(test)]
     note_log: Vec<(NodeId, u8, bool)>,
+    #[cfg(test)]
+    cc_log: Vec<(NodeId, ParamId, f64)>,
+    #[cfg(test)]
+    cc_passthrough_log: Vec<(NodeId, u8, u8)>,
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.
     rig_meta: Vec<RigMeta>,
     active_rig: usize,
@@ -408,6 +427,10 @@ impl GraphEngine {
             route_out: Vec::with_capacity(64),
             #[cfg(test)]
             note_log: Vec::new(),
+            #[cfg(test)]
+            cc_log: Vec::new(),
+            #[cfg(test)]
+            cc_passthrough_log: Vec::new(),
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
@@ -547,6 +570,32 @@ impl GraphEngine {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
     }
 
+    fn has_midi_cable(&self, dest: NodeId) -> bool {
+        self.graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == dest)
+    }
+
+    fn apply_dsp_or_master_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
+        match param {
+            P_VOL => {
+                self.master_vol = v;
+                true
+            }
+            P_WARM => {
+                self.master_warm = v;
+                true
+            }
+            _ => {
+                if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
+                    if let Some(native) = dsp_native_param(&s.kind, param) {
+                        s.proc.set_param(native, v);
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     /// MIDI-cable gate for one PLAYED note (before transpose): it reaches
     /// `dest` if ANY Keys node has a MIDI cable to `dest` from the port that
     /// note leaves on — port 0 when unsplit; LOW (0) below the split point,
@@ -668,29 +717,12 @@ impl GraphEngine {
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                     // LV2 knobs map param index → nth control port (normalized).
                     s.plugin.set_control_normalized(param as usize, v);
-                } else {
-                    match param {
-                        P_VOL => self.master_vol = v,
-                        P_WARM => self.master_warm = v,
-                        P_LEVEL => {
-                            // Voice level for instrument nodes; for DSP nodes param 0
-                            // is the node's first native knob (e.g. Reverb mix).
-                            if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
-                                s.level = v;
-                            } else if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
-                                if let Some(native) = dsp_native_param(&s.kind, P_LEVEL) {
-                                    s.proc.set_param(native, v);
-                                }
-                            }
-                        }
-                        _ => {
-                            if let Some(s) = self.dsp.iter_mut().find(|s| s.node == node) {
-                                if let Some(native) = dsp_native_param(&s.kind, param) {
-                                    s.proc.set_param(native, v);
-                                }
-                            }
-                        }
+                } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                        s.level = v;
                     }
+                } else {
+                    self.apply_dsp_or_master_param(node, param, v);
                 }
             }
             Command::LoadLv2Preset { node, preset_uri } => {
@@ -940,6 +972,88 @@ impl GraphEngine {
                 // so a range/transpose edit can't orphan a release (rare op).
                 self.release_all(dest);
                 self.publish_graph();
+            }
+            Command::Cc { source, channel, cc, value } => {
+                let msg = MidiMsg::cc(channel, cc, value);
+                self.matrix.route_into(source, msg, &mut self.route_out);
+                for i in 0..self.route_out.len() {
+                    let (dest, m) = self.route_out[i];
+                    let param = self
+                        .matrix
+                        .rules
+                        .iter()
+                        .find(|r| r.source == source && r.dest == dest && r.transform(msg).is_some())
+                        .and_then(|r| r.param_for_cc(m.data[0]));
+                    let has_midi = self.has_midi_cable(dest);
+                    let is_clap_node = self
+                        .graph
+                        .node(dest)
+                        .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
+                    let norm = m.data[1] as f64 / 127.0;
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        if !has_midi || !source_accepted(s, source) {
+                            continue;
+                        }
+                        if let Some(pid) = param {
+                            s.voice.set_param_normalized_rt(pid, norm);
+                            #[cfg(test)]
+                            self.cc_log.push((dest, pid, norm));
+                        } else {
+                            s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                            #[cfg(test)]
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    } else if is_clap_node {
+                        if !has_midi {
+                            continue;
+                        }
+                        #[cfg(test)]
+                        if let Some(pid) = param {
+                            self.cc_log.push((dest, pid, norm));
+                        } else {
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    } else if let Some(pid) = param {
+                        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                            if s.plugin.is_instrument() && !has_midi {
+                                continue;
+                            }
+                            s.plugin.set_control_normalized(pid as usize, norm as f32);
+                            #[cfg(test)]
+                            self.cc_log.push((dest, pid, norm));
+                        } else if self.apply_dsp_or_master_param(dest, pid, norm as f32) {
+                            #[cfg(test)]
+                            self.cc_log.push((dest, pid, norm));
+                        }
+                    }
+                }
+            }
+            Command::MatrixCcMap { source, dest, cc, param } => {
+                let changed = match param {
+                    Some(p) => match self
+                        .matrix
+                        .rules
+                        .iter_mut()
+                        .find(|r| r.source == source && r.dest == dest)
+                    {
+                        Some(r) => r.set_cc(cc, p),
+                        None => {
+                            let mut r = Rule::new(source, dest);
+                            r.set_cc(cc, p);
+                            self.matrix.add_rule(r);
+                            true
+                        }
+                    },
+                    None => self
+                        .matrix
+                        .rules
+                        .iter_mut()
+                        .find(|r| r.source == source && r.dest == dest)
+                        .map_or(false, |r| r.unmap_cc(cc)),
+                };
+                if changed {
+                    self.publish_graph();
+                }
             }
             Command::SetSystemAudio { gain } => {
                 self.system_gain = gain.clamp(0.0, 1.0);
@@ -1919,6 +2033,113 @@ mod tests {
         assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_TIME), None);
         assert_eq!(dsp_native_param(&DspKind::Metronome, super::P_MIX), None);
     }
+
+    #[test]
+    fn cc_routes_to_mapped_param_and_whitelists() {
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::demo_patch();
+        let filter = g.add_node(NodeKind::Dsp(crate::control::DspKind::Filter), name_bytes("FILTER"));
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+
+        // 1. Empty cc_map: CCs pass through to CLAP unchanged.
+        engine.cc_log.clear();
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 64 });
+        engine.render(&mut buf, 2);
+        assert!(engine.cc_log.is_empty());
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 74, 64), (4, 74, 64)]);
+
+        // 2. Bind CC 74 -> param 42 on Hardware(0) -> node 1.
+        let rev_before = pub_.lock().unwrap().rev;
+        bus.send(Command::MatrixCcMap {
+            source: SourceId::Hardware(0),
+            dest: 1,
+            cc: 74,
+            param: Some(42),
+        });
+        engine.render(&mut buf, 2);
+        let rev_after = pub_.lock().unwrap().rev;
+        assert_eq!(rev_after, rev_before + 1, "MatrixCcMap must publish cc_map");
+        let r = pub_.lock().unwrap().rules.iter().find(|r| r.source == SourceId::Hardware(0) && r.dest == 1).cloned().unwrap();
+        assert_eq!(r.param_for_cc(74), Some(42));
+
+        // Duplicate MatrixCcMap does not bump rev.
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(42) });
+        engine.render(&mut buf, 2);
+        assert_eq!(pub_.lock().unwrap().rev, rev_after);
+
+        // 3. Whitelist active on Hardware(0)->1: CC 74 maps to param 42; CC 1 is dropped on node 1 (still transparent on node 4).
+        engine.cc_log.clear();
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 127 });
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 1, value: 90 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_log, vec![(1, 42, 1.0)]);
+        assert!(!engine.cc_passthrough_log.iter().any(|&(d, _, _)| d == 1), "node 1 whitelist must filter unmapped CC 1");
+        assert_eq!(engine.cc_passthrough_log, vec![(4, 74, 127), (4, 1, 90)]);
+
+        // 4. Replace CC 74 -> param 99, and bind CC 7 -> Filter cutoff (param 0).
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(99) });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: filter, cc: 7, param: Some(0) });
+        engine.cc_log.clear();
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 0 });
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 7, value: 64 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_log[0], (1, 99, 0.0));
+        assert_eq!(engine.cc_log[1].0, filter);
+        assert_eq!(engine.cc_log[1].1, 0);
+        assert!((engine.cc_log[1].2 - 64.0 / 127.0).abs() < 1e-6);
+
+        // 5. Remove CC 74 -> node 1 returns to empty-map transparency.
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: None });
+        engine.cc_log.clear();
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 1, value: 55 });
+        engine.render(&mut buf, 2);
+        assert!(engine.cc_log.is_empty());
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 1, 55), (4, 1, 55)]);
+    }
+
+    #[test]
+    fn surge_cc_moves_real_param() {
+        let Ok((voice, mut main)) = crate::host::ClapVoice::new(48000.0) else {
+            return;
+        };
+        let params = main.param_list();
+        let cutoff = params
+            .iter()
+            .find(|p| p.automatable && !p.hidden && !p.readonly && p.name.to_lowercase().contains("cutoff") && p.max > p.min)
+            .expect("Surge XT exposes filter cutoff");
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![(surge, voice)]);
+        bus.send(Command::MatrixCcMap {
+            source: SourceId::Hardware(0),
+            dest: surge,
+            cc: 74,
+            param: Some(cutoff.id),
+        });
+        let mut buf = vec![0.0f32; 256 * 2];
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 127 });
+        for _ in 0..4 { engine.render(&mut buf, 2); }
+        let at_max = main.param_value(cutoff.id).expect("cutoff readback");
+        assert!((at_max - cutoff.max).abs() < 1e-3, "CC 127 should reach max {}: got {at_max}", cutoff.max);
+
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 0 });
+        for _ in 0..4 { engine.render(&mut buf, 2); }
+        let at_min = main.param_value(cutoff.id).expect("cutoff readback");
+        assert!((at_min - cutoff.min).abs() < 1e-3, "CC 0 should reach min {}: got {at_min}", cutoff.min);
+    }
 }
 
 /// End-to-end LV2 engine test: Keys → Surge → LV2 effect → Master, render and
@@ -2369,6 +2590,117 @@ pub fn multi_rig_load_test() -> anyhow::Result<()> {
     anyhow::ensure!(both > b_only * 1.2, "rigs not summing (both {both} vs b_only {b_only})");
     println!(
         "multi-rig-load-test: OK — LoadRigs: keys→rig B only ({b_only:.4}), device 2 adds rig A (both {both:.4})"
+    );
+    Ok(())
+}
+
+/// Real-plugin CC-mapping self-test: maps CC 74 on Hardware(0) to Surge XT's
+/// Filter 1 Cutoff, sends CC 0 and CC 127, and verifies both parameter readback
+/// and rendered audio difference.
+pub fn cc_map_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    let sr = 48000.0;
+    let (voice, mut main) = ClapVoice::new(sr)?;
+    let params = main.param_list();
+    let cutoff = params
+        .iter()
+        .find(|p| {
+            p.automatable
+                && !p.hidden
+                && !p.readonly
+                && p.max > p.min
+                && p.module.to_lowercase().contains("filter")
+                && p.name.to_lowercase().contains("cutoff")
+        })
+        .or_else(|| {
+            params.iter().find(|p| {
+                p.automatable && !p.hidden && !p.readonly && p.max > p.min && p.name.to_lowercase().contains("cutoff")
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("Surge XT filter cutoff parameter not found"))?;
+    let gain_p = params
+        .iter()
+        .find(|p| {
+            p.automatable
+                && !p.hidden
+                && !p.readonly
+                && p.max > p.min
+                && p.name.to_lowercase().contains("volume")
+        })
+        .ok_or_else(|| anyhow::anyhow!("Surge XT volume parameter not found"))?;
+
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(surge, voice)]);
+    bus.send(Command::MatrixCcMap {
+        source: SourceId::Hardware(0),
+        dest: surge,
+        cc: 74,
+        param: Some(cutoff.id),
+    });
+    bus.send(Command::MatrixCcMap {
+        source: SourceId::Hardware(0),
+        dest: surge,
+        cc: 7,
+        param: Some(gain_p.id),
+    });
+    let mut buf = vec![0.0f32; 256 * 2];
+    let mut render_note = |engine: &mut GraphEngine, cc: u8, val: u8| -> Vec<f32> {
+        bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value: val });
+        for _ in 0..4 { engine.render(&mut buf, 2); }
+        bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Hardware(0) });
+        let mut out = Vec::with_capacity(256 * 2 * 16);
+        for _ in 0..16 {
+            engine.render(&mut buf, 2);
+            out.extend_from_slice(&buf);
+        }
+        bus.send(Command::NoteOff { note: 48, source: SourceId::Hardware(0) });
+        for _ in 0..8 { engine.render(&mut buf, 2); }
+        out
+    };
+    let rms = |s: &[f32]| -> f32 {
+        (s.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / s.len().max(1) as f64).sqrt() as f32
+    };
+
+    // 1. Cutoff param readback check (CC 74).
+    let _ = render_note(&mut engine, 74, 0);
+    let val_low = main.param_value(cutoff.id).unwrap_or(f64::NAN);
+    let _ = render_note(&mut engine, 74, 127);
+    let val_high = main.param_value(cutoff.id).unwrap_or(f64::NAN);
+    anyhow::ensure!(
+        (val_low - cutoff.min).abs() < 1e-3 && (val_high - cutoff.max).abs() < 1e-3,
+        "CC did not sweep {}/{} ({}..{}): low={val_low}, high={val_high}",
+        cutoff.module, cutoff.name, cutoff.min, cutoff.max
+    );
+
+    // 2. Volume param readback + audible RMS check (CC 7).
+    let quiet = render_note(&mut engine, 7, 0);
+    let g_low = main.param_value(gain_p.id).unwrap_or(f64::NAN);
+    let loud = render_note(&mut engine, 7, 127);
+    let g_high = main.param_value(gain_p.id).unwrap_or(f64::NAN);
+    let rms_low = rms(&quiet);
+    let rms_high = rms(&loud);
+    anyhow::ensure!(
+        (g_low - gain_p.min).abs() < 1e-3 && (g_high - gain_p.max).abs() < 1e-3,
+        "CC did not sweep {}/{} ({}..{}): low={g_low}, high={g_high}",
+        gain_p.module, gain_p.name, gain_p.min, gain_p.max
+    );
+    anyhow::ensure!(
+        rms_high > rms_low * 1.5 + 1e-4,
+        "Volume CC sweep did not change audio energy: low_rms={rms_low}, high_rms={rms_high}"
+    );
+    println!(
+        "cc-map-test: OK — Surge XT '{}/{}' (id {}) CC74 0→127 moved {:.2}→{:.2}; '{}/{}' (id {}) CC7 0→127 moved {:.2}→{:.2}, RMS {:.4}→{:.4}",
+        cutoff.module, cutoff.name, cutoff.id, val_low, val_high,
+        gain_p.module, gain_p.name, gain_p.id, g_low, g_high, rms_low, rms_high
     );
     Ok(())
 }

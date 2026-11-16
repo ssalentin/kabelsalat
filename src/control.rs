@@ -558,7 +558,7 @@ pub enum Command {
     /// releases held notes on every instrument the node feeds.
     SetNodeSplit { node: NodeId, point: Option<u8> },
     /// Live edit of ONE matrix rule (source → dest): channel filter, transpose,
-    /// key/velocity ranges, enabled. Fixed-size (CC maps arrive with MIDI-learn).
+    /// key/velocity ranges, enabled. Fixed-size; CC maps use `MatrixCcMap`.
     /// The engine applies it in place and releases held notes on the destination
     /// — the matrix is stateless, so range/transpose edits can orphan releases
     /// (docs/midi-matrix.md integration contract).
@@ -573,6 +573,21 @@ pub enum Command {
         vel_lo: u8,
         vel_hi: u8,
         enabled: bool,
+    },
+    /// Incoming MIDI Control Change routed through the matrix.
+    Cc {
+        source: SourceId,
+        channel: u8,
+        cc: u8,
+        value: u8,
+    },
+    /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
+    /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
+    MatrixCcMap {
+        source: SourceId,
+        dest: NodeId,
+        cc: u8,
+        param: Option<ParamId>,
     },
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
@@ -700,6 +715,9 @@ mod tests {
             Command::TransportStop,
             Command::SetNodePlaying { node: 7, playing: true },
             Command::SetNodePlaying { node: 7, playing: false },
+            Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42) },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None },
         ];
         for cmd in cmds {
             let s = serde_json::to_string(&cmd).unwrap();

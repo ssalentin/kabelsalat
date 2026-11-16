@@ -37,6 +37,7 @@ releases may still change behaviour and session files.
 - Agent tools no longer freeze the window while plugins are scanned for the
   first time (#15).
 - A re-plugged MIDI keyboard keeps its rig binding and matrix row (#16).
+- A MIDI interface re-plugged under the same name is reconnected instead of staying silent.
 - Undo keeps the keyboard/hardware source switches (#17).
 - Recording file names use local time instead of UTC.
 - The file player reads 24-bit PCM and 32-bit float WAV (it can play the

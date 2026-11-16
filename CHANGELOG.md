@@ -8,6 +8,11 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **setBfree plays** (#36): the LV2 host now provides the Worker extension
+  (`work:schedule`); each plugin with a `worker#interface` gets a non-RT worker
+  thread fed through two lock-free rings (requests and responses), with
+  `work_response`/`end_run` delivered in the next `run()` cycle. This unblocks
+  setBfree, which requires `urid:map` and `work:schedule` to instantiate.
 - **Rename rigs:** double-click a rig chip; agent tool `rename_rig`. Rig names
   are saved with the session (#33).
 - **Built-in instrument browser** (#10): an "Install" tab in the Plugins view

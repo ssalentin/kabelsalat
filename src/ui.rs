@@ -820,7 +820,7 @@ use crate::control::VOICE_POOL;
 
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
     // Hover names the letter shortcut (M / N / C / B).
-    let key = match name { "Mixer" => Some("M"), "Matrix" => Some("N"), "Assistant" => Some("C"), "Plugins" => Some("B"), _ => None };
+    let key = match name { "Mixer" => Some("M"), "Matrix" => Some("N"), "Assistant" => Some("C"), "Keyboard" => Some("V"), "Plugins" => Some("B"), _ => None };
     let r = theme::chip_button(ui, name, active);
     match key { Some(k) => r.on_hover_text(format!("{name} · key {k}")).clicked(), None => r.clicked() }
 }
@@ -1387,6 +1387,9 @@ struct DemoApp {
     rig_chip_rects: Vec<Rect>,
     /// Last frame's "+ Rig" button rect in the overview strip (points).
     add_rig_rect: Rect,
+    /// Top-bar groups (tests): the View segment and the Bottom panel toggles.
+    view_group_rect: Rect,
+    dock_group_rect: Rect,
     // Plugin browser (task-18): add hosted LV2/CLAP plugins to a rig.
     plugins_loaded: bool,
     plugins_clap: Vec<ClapPluginInfo>,
@@ -1677,6 +1680,8 @@ impl DemoApp {
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
+            view_group_rect: Rect::NOTHING,
+            dock_group_rect: Rect::NOTHING,
             plugins_loaded: false,
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
@@ -2103,7 +2108,7 @@ impl DemoApp {
         for (ui, u) in self.units.iter_mut().enumerate() {
             let w = self.unit_rects.get(ui).map_or(f32::NAN, |r| r.width());
             let fit_w = if w.is_finite() && w > 0.0 { w } else { f32::INFINITY };
-            let refit = u.name_g.is_none() || (fit_w - u.label_fit_w).abs() > 0.5;
+            let refit = u.name_g.is_none() || u.sub_g.is_none() || (fit_w - u.label_fit_w).abs() > 0.5;
             if refit {
                 // Name: Medium 16px, sentence case (§4.3), beside the LED.
                 // Subtitle: tracked micro-caps 10px (+0.14em), below it.
@@ -2148,7 +2153,7 @@ impl DemoApp {
         self.state_pause_g = Some(tracked("STOPPED", 10.0, 0.14));
         // Hints (§4.15): plain caption lines on paper, sentence case.
         self.hint_front_g = Some(layout(
-            "perform: drag knobs · play on the keyboard (C) · Space starts/stops · Tab flips the rack to patch",
+            "perform: drag knobs · play on the keyboard (V) · Space starts/stops · Tab flips the rack to patch",
             FontId::proportional(12.5), theme::INK_2, f32::INFINITY));
         self.hint_back_g = Some(layout(
             "patch: drag jack to jack · drag a plug to another jack to move it · tug off to unplug · Tab flips back",
@@ -5689,29 +5694,44 @@ impl DemoApp {
                     }
                     nav_separator(ui);
                     ui.add_space(6.0);
-                    if nav_button(ui, "Sessions", self.stage_view == StageView::Sessions) {
-                        self.toggle_stage(StageView::Sessions);
+                    // Two explicit groups (user): the VIEW decides what the
+                    // main stage shows — exactly one, Rack included — while
+                    // the BOTTOM PANEL toggles what docks under it.
+                    theme::section_label(ui, "View");
+                    ui.add_space(2.0);
+                    let views = [
+                        ("Rack", StageView::Rack),
+                        ("Sessions", StageView::Sessions),
+                        ("Plugins", StageView::Plugins),
+                        ("Matrix", StageView::Matrix),
+                        ("Mixer", StageView::Mixer),
+                    ];
+                    let mut pick = None;
+                    let group = ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (name, view) in views {
+                            if nav_button(ui, name, self.stage_view == view) { pick = Some(view); }
+                        }
+                    }).response.rect;
+                    ui.painter().rect_stroke(group.expand(3.0), 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
+                    self.view_group_rect = group;
+                    if let Some(view) = pick {
+                        if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
                     }
-                    ui.add_space(6.0);
-                    if nav_button(ui, "Plugins", self.stage_view == StageView::Plugins) {
-                        self.toggle_stage(StageView::Plugins);
-                    }
-                    ui.add_space(6.0);
-                    if nav_button(ui, "Matrix", self.stage_view == StageView::Matrix) {
-                        self.toggle_stage(StageView::Matrix);
-                    }
-                    ui.add_space(6.0);
-                    if nav_button(ui, "Mixer", self.stage_view == StageView::Mixer) {
-                        self.toggle_stage(StageView::Mixer);
-                    }
-                    ui.add_space(6.0);
-                    if nav_button(ui, "Keyboard", self.keyboard_open()) {
-                        self.toggle_dock(DockView::Keyboard);
-                    }
-                    ui.add_space(6.0);
-                    if nav_button(ui, "Assistant", self.assistant_open()) {
-                        self.toggle_dock(DockView::Assistant);
-                    }
+                    ui.add_space(12.0);
+                    nav_separator(ui);
+                    ui.add_space(10.0);
+                    theme::section_label(ui, "Bottom panel");
+                    ui.add_space(2.0);
+                    let mut dock = None;
+                    let group = ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if nav_button(ui, "Keyboard", self.keyboard_open()) { dock = Some(DockView::Keyboard); }
+                        if nav_button(ui, "Assistant", self.assistant_open()) { dock = Some(DockView::Assistant); }
+                    }).response.rect;
+                    ui.painter().rect_stroke(group.expand(3.0), 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
+                    self.dock_group_rect = group;
+                    if let Some(d) = dock { self.toggle_dock(d); }
                     // Master recording (GitHub #6): a REC chip (tomato only
                     // while recording) + a sync-to-transport toggle + elapsed
                     // time while active. Start/stop go through the command bus.
@@ -7111,6 +7131,46 @@ impl DemoApp {
 
     /// The instrument rigs (Clap units) in voice order: (rig index, node id).
     /// At most two — the engine owns two CLAP voices.
+    /// Display name of a hosted CLAP plugin: the scanned plugin name, else a
+    /// known id, else None (the caller keeps its generic subtitle).
+    fn plugin_display_name(&self, plugin_id: &str) -> Option<String> {
+        if let Some(p) = self.plugins_clap.iter().find(|p| p.id == plugin_id) {
+            return Some(p.name.clone());
+        }
+        (plugin_id == SURGE_ID || plugin_id == "Surge XT").then(|| "Surge XT".to_string())
+    }
+
+    /// Clap unit subtitles name what is really loaded: "Surge XT · Wurli"
+    /// (plugin · patch), not the generic "synth · clap" (user). Cheap per
+    /// frame: a few string compares; the galley is rebuilt only on change.
+    fn refresh_instrument_subs(&mut self) {
+        if self.plugins_clap.is_empty() && !self.plugins_loaded && !cfg!(test)
+            && self.units.iter().any(|u| matches!(u.node_kind, UnitKind::Clap))
+        {
+            self.start_plugin_scan(false); // background (rule 46); fills names when done
+        }
+        let ids: Vec<(u32, String)> = self.base_graph.nodes.iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Clap { plugin_id } => Some((n.id, name_str(plugin_id).to_string())),
+                _ => None,
+            })
+            .collect();
+        for (slot, node) in self.clap_rigs() {
+            let Some(pid) = ids.iter().find(|(id, _)| *id == node).map(|(_, p)| p.clone()) else { continue };
+            let Some(plugin) = self.plugin_display_name(&pid) else { continue };
+            let sub = match self.patch_names.get(slot).cloned().flatten() {
+                Some(patch) => format!("{plugin} · {patch}"),
+                None => plugin,
+            };
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
+                if u.sub != sub {
+                    u.sub = sub;
+                    u.sub_g = None;
+                }
+            }
+        }
+    }
+
     fn clap_rigs(&self) -> Vec<(usize, u32)> {
         self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
@@ -10073,6 +10133,8 @@ impl DemoApp {
     /// drive the exact runtime path through a plain `egui::Context`.
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // Subtitles first: a changed instrument name is laid out this frame.
+        self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
 
         // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
@@ -13118,6 +13180,40 @@ mod split_bpm_tests {
     }
 
     #[test]
+    fn clap_units_name_the_loaded_instrument_and_patch() {
+        let (mut app, ctx) = demo();
+        let (slot, node) = app.clap_rigs()[0];
+        app.patch_names[slot] = Some("Wurli".into());
+        let texts = frame(&mut app, &ctx, vec![]);
+        let u = app.units.iter().find(|u| u.node_id == node).unwrap();
+        assert_eq!(u.sub, "Surge XT · Wurli");
+        // Tracked captions paint one glyph per shape: join them.
+        assert!(texts.concat().contains("SURGE XT · WURLI"), "subtitle repainted: {texts:?}");
+    }
+
+    #[test]
+    fn top_bar_separates_views_from_bottom_panels() {
+        let (mut app, ctx) = demo();
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "Rack"), "Rack is an explicit view: {texts:?}");
+        let (v, d) = (app.view_group_rect, app.dock_group_rect);
+        assert!(v.is_positive() && d.is_positive() && v.right() < d.left(), "two separate groups: {v:?} {d:?}");
+        // Views are exclusive: Mixer, Mixer again (stays), then Rack.
+        let mixer = v.right_center() - Vec2::new(12.0, 0.0);
+        click(&mut app, &ctx, mixer);
+        assert_eq!(app.stage_view, StageView::Mixer);
+        click(&mut app, &ctx, mixer);
+        assert_eq!(app.stage_view, StageView::Mixer, "the active view stays selected");
+        let rack = app.view_group_rect.left_center() + Vec2::new(12.0, 0.0);
+        click(&mut app, &ctx, rack);
+        assert_eq!(app.stage_view, StageView::Rack, "Rack button returns to the rack");
+        // Bottom panel toggles independently of the view.
+        let kb = app.dock_group_rect.left_center() + Vec2::new(12.0, 0.0);
+        click(&mut app, &ctx, kb);
+        assert!(app.keyboard_open() && app.stage_view == StageView::Rack);
+    }
+
+    #[test]
     fn rack_knob_midi_learn_bind_follow_and_cancel() {
         let (mut app, ctx) = demo();
         let (bus, mut drain) = command_bus();
@@ -13466,7 +13562,8 @@ mod stage_views_tests {
         });
         sessions_btns.sort_by(|a, b| a.left().total_cmp(&b.left()));
         assert!(!sessions_btns.is_empty(), "top bar buttons laid out");
-        let s_pos = sessions_btns[0].center();
+        // [0] is Rack (the View group starts with it), [1] Sessions.
+        let s_pos = sessions_btns[1].center();
         let ptr = |p, pressed| egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
         run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(s_pos), ptr(s_pos, true), ptr(s_pos, false)]);
         assert_eq!(app.stage_view, StageView::Sessions, "Sessions chip opens Sessions stage");

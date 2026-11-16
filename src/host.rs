@@ -1017,82 +1017,25 @@ fn clap_bundle_paths() -> Vec<PathBuf> {
     paths
 }
 
+fn load_bundle(path: &std::path::Path, id: &str) -> Result<(PluginEntry, CString)> {
+    // SAFETY: loading a CLAP bundle executes its init code. Only the bundle
+    // the out-of-process scan found the plugin in is loaded here.
+    let entry = unsafe { PluginEntry::load(path) }
+        .with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    println!("bundle: {} (CLAP {})", path.display(), entry.version());
+    Ok((entry, CString::new(id)?))
+}
+
 fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
-    let paths = clap_bundle_paths();
-    if paths.is_empty() {
-        bail!("no .clap bundles found in CLAP search paths");
-    }
-    for path in &paths {
-        // SAFETY: loading a CLAP bundle executes its init code; only standard
-        // CLAP directories and CLAP_PATH are scanned.
-        let entry = match unsafe { PluginEntry::load(path) } {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skip {}: {e}", path.display());
-                continue;
-            }
-        };
-        let found = entry.get_plugin_factory().and_then(|factory| {
-            factory.plugin_descriptors().find_map(|d| {
-                let id = d.id()?;
-                (id.to_string_lossy() == target_id).then(|| id.to_owned())
-            })
-        });
-        if let Some(id) = found {
-            return Ok((entry, id));
-        }
-    }
-    bail!("CLAP plugin '{target_id}' not found in CLAP search paths")
+    let (path, id) = bundle_with(|p| p.id == target_id)
+        .ok_or_else(|| anyhow!("CLAP plugin '{target_id}' not found in CLAP search paths"))?;
+    load_bundle(&path, &id)
 }
 
 fn discover_surge() -> Result<(PluginEntry, CString)> {
-    let paths = clap_bundle_paths();
-    if paths.is_empty() {
-        bail!("no .clap bundles found in CLAP search paths");
-    }
-
-    let mut chosen: Option<(PluginEntry, CString)> = None;
-    for path in &paths {
-        // SAFETY: loading a CLAP bundle executes its init code; only standard
-        // CLAP directories and CLAP_PATH are scanned.
-        let entry = match unsafe { PluginEntry::load(path) } {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skip {}: {e}", path.display());
-                continue;
-            }
-        };
-        let Some(factory) = entry.get_plugin_factory() else {
-            eprintln!("skip {}: no plugin factory", path.display());
-            continue;
-        };
-        println!("bundle: {} (CLAP {})", path.display(), entry.version());
-        let mut found: Option<CString> = None;
-        for d in factory.plugin_descriptors() {
-            let id = d.id().unwrap_or(c"?");
-            let name = d.name().unwrap_or(c"?").to_string_lossy().into_owned();
-            let vendor = d.vendor().unwrap_or(c"?").to_string_lossy().into_owned();
-            let version = d.version().unwrap_or(c"?").to_string_lossy().into_owned();
-            let features: Vec<String> = d
-                .features()
-                .map(|f| f.to_string_lossy().into_owned())
-                .collect();
-            println!(
-                "  - {name} [{}] v{version} by {vendor} | {}",
-                id.to_string_lossy(),
-                features.join(", ")
-            );
-            if name == "Surge XT" && features.iter().any(|f| f == "instrument") {
-                found = Some(id.to_owned());
-            }
-        }
-        if let Some(id) = found {
-            if chosen.is_none() {
-                chosen = Some((entry, id));
-            }
-        }
-    }
-    chosen.ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))
+    let (path, id) = bundle_with(|p| p.name == "Surge XT" && p.features.iter().any(|f| f == "instrument"))
+        .ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))?;
+    load_bundle(&path, &id)
 }
 
 /// Metadata for an installed CLAP plugin (for the plugin browser).
@@ -1502,7 +1445,11 @@ pub fn load_dexed_patch(main: &mut ClapVoiceMain, patch: &DexedPatch) -> Result<
 
 const CLAP_SCAN_PARALLELISM: usize = 4;
 const CLAP_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
-const CLAP_SCAN_CACHE_VERSION: u32 = 1;
+const CLAP_SCAN_CACHE_VERSION: u32 = 2;
+/// Bytes of a failing scanner's stderr kept in the error (its tail).
+const SCAN_ERR_TAIL: usize = 2048;
+/// Upper bound on a scanner's JSON stdout.
+const SCAN_STDOUT_MAX: usize = 1 << 20;
 static SCAN_CACHE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1526,6 +1473,9 @@ struct CachedBundle {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ClapScanCache {
     version: u32,
+    /// App version that wrote it: an upgrade rescans cached failures.
+    #[serde(default)]
+    app_version: String,
     entries: std::collections::BTreeMap<String, CachedBundle>,
 }
 
@@ -1533,6 +1483,7 @@ impl Default for ClapScanCache {
     fn default() -> Self {
         Self {
             version: CLAP_SCAN_CACHE_VERSION,
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
             entries: std::collections::BTreeMap::new(),
         }
     }
@@ -1609,7 +1560,7 @@ fn load_scan_cache(path: &std::path::Path) -> ClapScanCache {
         return ClapScanCache::default();
     };
     match serde_json::from_str::<ClapScanCache>(&raw) {
-        Ok(c) if c.version == CLAP_SCAN_CACHE_VERSION => c,
+        Ok(c) if c.version == CLAP_SCAN_CACHE_VERSION && c.app_version == env!("CARGO_PKG_VERSION") => c,
         _ => ClapScanCache::default(),
     }
 }
@@ -1655,7 +1606,7 @@ pub fn scan_clap_bundle(path: &std::path::Path) -> Result<Vec<ClapPluginInfo>> {
 fn reroute_stdout_to_stderr() -> Result<std::fs::File> {
     use std::os::fd::FromRawFd;
     unsafe {
-        let saved = libc::dup(1);
+        let saved = libc::fcntl(1, libc::F_DUPFD_CLOEXEC, 3);
         if saved < 0 {
             bail!("dup(stdout) failed: {}", std::io::Error::last_os_error());
         }
@@ -1670,6 +1621,11 @@ fn reroute_stdout_to_stderr() -> Result<std::fs::File> {
 /// CLI entrypoint for `kabelsalat scan-clap <bundle-path>`.
 pub fn run_scan_clap(path: &std::path::Path) -> Result<()> {
     use std::io::Write;
+    // A scanner stuck in a hanging plugin must not outlive the app.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+        libc::alarm(30);
+    }
     let mut json_out = reroute_stdout_to_stderr()?;
     let plugins = scan_clap_bundle(path)?;
     let json = serde_json::to_string(&plugins)?;
@@ -1687,16 +1643,54 @@ fn parse_scan_output(stdout: &[u8]) -> Result<Vec<ClapPluginInfo>> {
     serde_json::from_str::<Vec<ClapPluginInfo>>(trimmed).context("scanner produced invalid JSON")
 }
 
+/// Read a pipe to EOF on its own thread, keeping at most `keep` bytes (the
+/// head when `tail` is false, else the tail), and hand the result over `tx`.
+/// The caller waits with a deadline: a helper process that inherited the
+/// pipe can hold it open forever, and that thread is then abandoned.
 fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
-    mut reader: Option<R>,
-) -> std::thread::JoinHandle<Vec<u8>> {
+    reader: Option<R>,
+    keep: usize,
+    tail: bool,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(ref mut r) = reader {
-            let _ = r.read_to_end(&mut buf);
+        if let Some(mut r) = reader {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = r.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > keep {
+                    if tail {
+                        buf.drain(..buf.len() - keep);
+                    } else {
+                        buf.truncate(keep);
+                    }
+                }
+            }
         }
-        buf
-    })
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Why a bundle produced no plugins. Only a `Verdict` (the scanner ran and
+/// exited badly, printed garbage or hung) says something about the bundle
+/// and may be cached; a `Setup` failure (spawn, wait) says nothing about it.
+#[derive(Debug)]
+enum ScanFail {
+    Verdict(String),
+    Setup(String),
+}
+
+impl std::fmt::Display for ScanFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanFail::Verdict(m) | ScanFail::Setup(m) => f.write_str(m),
+        }
+    }
 }
 
 fn kill_child_tree(child: &mut std::process::Child) {
@@ -1715,7 +1709,7 @@ fn run_scan_subprocess(
     prefix_args: &[String],
     bundle: &std::path::Path,
     timeout: Duration,
-) -> Result<Vec<ClapPluginInfo>> {
+) -> Result<Vec<ClapPluginInfo>, ScanFail> {
     use std::process::{Command, Stdio};
     let mut cmd = Command::new(program);
     cmd.args(prefix_args)
@@ -1730,68 +1724,81 @@ fn run_scan_subprocess(
     }
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn scanner {}", program.display()))?;
-    let stdout_rx = spawn_pipe_reader(child.stdout.take());
-    let stderr_rx = spawn_pipe_reader(child.stderr.take());
+        .map_err(|e| ScanFail::Setup(format!("failed to spawn scanner {}: {e}", program.display())))?;
+    let stdout_rx = spawn_pipe_reader(child.stdout.take(), SCAN_STDOUT_MAX, false);
+    let stderr_rx = spawn_pipe_reader(child.stderr.take(), SCAN_ERR_TAIL, true);
 
     let deadline = Instant::now() + timeout;
+    let timed_out = || ScanFail::Verdict(format!("timed out after {:.1}s", timeout.as_secs_f32()));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_child_tree(&mut child);
-                    let _ = stdout_rx.join();
-                    let _ = stderr_rx.join();
-                    bail!("timed out after {:.1}s", timeout.as_secs_f32());
+                    return Err(timed_out());
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
             Err(e) => {
                 kill_child_tree(&mut child);
-                return Err(e).context("failed waiting on scanner");
+                return Err(ScanFail::Setup(format!("failed waiting on scanner: {e}")));
             }
         }
     };
-
-    let stdout = stdout_rx.join().unwrap_or_default();
-    let stderr = stderr_rx.join().unwrap_or_default();
+    // The child is reaped, but a helper it started may still hold the pipes:
+    // it is in the child's process group (whose id stays reserved while any
+    // member lives), so kill the group if the pipes don't close in time.
+    // A short grace even at the deadline: the readers may not have sent yet.
+    let remaining = |d: Instant| d.saturating_duration_since(Instant::now()).max(Duration::from_millis(200));
+    let (stdout, stderr) = match (stdout_rx.recv_timeout(remaining(deadline)), stderr_rx.recv_timeout(remaining(deadline))) {
+        (Ok(o), Ok(e)) => (o, e),
+        _ => {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            return Err(timed_out());
+        }
+    };
     if !status.success() {
         let err_tail = String::from_utf8_lossy(&stderr).trim().to_string();
         if err_tail.is_empty() {
-            bail!("scanner exited with {status}");
+            return Err(ScanFail::Verdict(format!("scanner exited with {status}")));
         }
-        bail!("scanner exited with {status}: {err_tail}");
+        return Err(ScanFail::Verdict(format!("scanner exited with {status}: …{err_tail}")));
     }
-    parse_scan_output(&stdout)
+    parse_scan_output(&stdout).map_err(|e| ScanFail::Verdict(format!("{e:#}")))
 }
 
 fn scan_one_bundle(
     cmd: &ScannerCommand,
     bundle: &std::path::Path,
     timeout: Duration,
-) -> Result<Vec<ClapPluginInfo>> {
+) -> Result<Vec<ClapPluginInfo>, ScanFail> {
     match cmd {
+        // /proc/self/exe is this very binary even after it was replaced on
+        // disk (rebuild, package upgrade), where current_exe() is "(deleted)".
         ScannerCommand::CurrentExe => {
-            let exe = std::env::current_exe().context("cannot resolve current_exe")?;
             let args = vec!["scan-clap".to_string()];
-            run_scan_subprocess(&exe, &args, bundle, timeout)
+            run_scan_subprocess(std::path::Path::new("/proc/self/exe"), &args, bundle, timeout)
         }
         ScannerCommand::Custom { program, args } => {
             run_scan_subprocess(program, args, bundle, timeout)
         }
         #[cfg(test)]
-        ScannerCommand::InProcess => scan_clap_bundle(bundle),
+        ScannerCommand::InProcess => scan_clap_bundle(bundle).map_err(|e| ScanFail::Verdict(format!("{e:#}"))),
     }
 }
 
-fn list_clap_plugins_with(
+/// Scan every bundle (cache first, then out of process) and return what each
+/// one holds, `None` for a bundle that failed. `retry_failed` rescans bundles
+/// whose failure is cached (the plugin browser's Refresh).
+fn scan_bundles_with(
     paths: &[PathBuf],
     cmd: &ScannerCommand,
     cache_path: Option<&std::path::Path>,
     timeout: Duration,
     parallelism: usize,
-) -> Vec<ClapPluginInfo> {
+    retry_failed: bool,
+) -> Vec<Option<Vec<ClapPluginInfo>>> {
     let mut cache = cache_path.map(load_scan_cache).unwrap_or_default();
     let mut per_bundle: Vec<Option<Vec<ClapPluginInfo>>> = vec![None; paths.len()];
     let mut uncached: Vec<(usize, &PathBuf, Option<BundleStamp>)> = Vec::new();
@@ -1802,10 +1809,16 @@ fn list_clap_plugins_with(
         if let (Some(st), Some(cached)) = (&stamp, cache.entries.get(key.as_ref())) {
             if &cached.stamp == st {
                 match &cached.error {
-                    Some(e) => eprintln!("skip CLAP bundle {} (cached failure): {e}", path.display()),
-                    None => per_bundle[idx] = Some(cached.plugins.clone()),
+                    Some(_) if retry_failed => {}
+                    Some(e) => {
+                        eprintln!("skip CLAP bundle {} (cached failure): {e}", path.display());
+                        continue;
+                    }
+                    None => {
+                        per_bundle[idx] = Some(cached.plugins.clone());
+                        continue;
+                    }
                 }
-                continue;
             }
         }
         uncached.push((idx, path, stamp));
@@ -1814,7 +1827,7 @@ fn list_clap_plugins_with(
     if !uncached.is_empty() {
         let workers = uncached.len().min(parallelism.max(1));
         let cursor = AtomicUsize::new(0);
-        let results: Mutex<Vec<(usize, Option<BundleStamp>, Result<Vec<ClapPluginInfo>>)>> =
+        let results: Mutex<Vec<(usize, Option<BundleStamp>, Result<Vec<ClapPluginInfo>, ScanFail>)>> =
             Mutex::new(Vec::with_capacity(uncached.len()));
 
         std::thread::scope(|scope| {
@@ -1835,28 +1848,19 @@ fn list_clap_plugins_with(
         let mut cache_dirty = false;
         if let Ok(scanned) = results.into_inner() {
             for (idx, stamp, res) in scanned {
+                let key = paths[idx].to_string_lossy().into_owned();
                 match res {
                     Ok(plugins) => {
                         if let Some(st) = stamp {
-                            cache.entries.insert(
-                                paths[idx].to_string_lossy().into_owned(),
-                                CachedBundle {
-                                    stamp: st,
-                                    plugins: plugins.clone(),
-                                    error: None,
-                                },
-                            );
+                            cache.entries.insert(key, CachedBundle { stamp: st, plugins: plugins.clone(), error: None });
                             cache_dirty = true;
                         }
                         per_bundle[idx] = Some(plugins);
                     }
                     Err(e) => {
                         eprintln!("skip CLAP bundle {}: {e}", paths[idx].display());
-                        if let Some(st) = stamp {
-                            cache.entries.insert(
-                                paths[idx].to_string_lossy().into_owned(),
-                                CachedBundle { stamp: st, plugins: Vec::new(), error: Some(format!("{e}")) },
-                            );
+                        if let (ScanFail::Verdict(msg), Some(st)) = (e, stamp) {
+                            cache.entries.insert(key, CachedBundle { stamp: st, plugins: Vec::new(), error: Some(msg) });
                             cache_dirty = true;
                         }
                     }
@@ -1872,7 +1876,11 @@ fn list_clap_plugins_with(
             }
         }
     }
+    per_bundle
+}
 
+/// The plugins of every bundle, first-seen id wins, in bundle order.
+fn dedupe_plugins(per_bundle: Vec<Option<Vec<ClapPluginInfo>>>) -> Vec<ClapPluginInfo> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for plugins in per_bundle.into_iter().flatten() {
@@ -1885,22 +1893,58 @@ fn list_clap_plugins_with(
     out
 }
 
-pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
+#[cfg(test)]
+fn list_clap_plugins_with(
+    paths: &[PathBuf],
+    cmd: &ScannerCommand,
+    cache_path: Option<&std::path::Path>,
+    timeout: Duration,
+    parallelism: usize,
+) -> Vec<ClapPluginInfo> {
+    dedupe_plugins(scan_bundles_with(paths, cmd, cache_path, timeout, parallelism, false))
+}
+
+fn scan_installed_bundles(retry_failed: bool) -> Vec<(PathBuf, Option<Vec<ClapPluginInfo>>)> {
     let paths = clap_bundle_paths();
     let cache_path = clap_scan_cache_path();
-    list_clap_plugins_with(
+    let per_bundle = scan_bundles_with(
         &paths,
         &ScannerCommand::default_for_process(),
         cache_path.as_deref(),
         CLAP_SCAN_TIMEOUT,
         CLAP_SCAN_PARALLELISM,
-    )
+        retry_failed,
+    );
+    paths.into_iter().zip(per_bundle).collect()
+}
+
+/// Every installed CLAP plugin, scanned out of process (cached).
+pub fn list_clap_plugins() -> Vec<ClapPluginInfo> {
+    dedupe_plugins(scan_installed_bundles(false).into_iter().map(|(_, p)| p).collect())
+}
+
+/// Like [`list_clap_plugins`], but rescans bundles whose failure is cached.
+pub fn list_clap_plugins_retry_failed() -> Vec<ClapPluginInfo> {
+    dedupe_plugins(scan_installed_bundles(true).into_iter().map(|(_, p)| p).collect())
+}
+
+/// The first bundle holding a plugin that matches `wanted`, found from the
+/// out-of-process scan, so only that one bundle is ever loaded in the app.
+fn bundle_with(wanted: impl Fn(&ClapPluginInfo) -> bool) -> Option<(PathBuf, String)> {
+    scan_installed_bundles(false).into_iter().find_map(|(path, plugins)| {
+        let p = plugins?.into_iter().find(|p| wanted(p))?;
+        Some((path, p.id))
+    })
 }
 
 /// `clap-scan-test`: list CLAP plugins out of process (cold, then from the
 /// cache) and print timings + plugin ids. Never loads a bundle in this
 /// process, so it stays safe with crashing or hanging bundles on CLAP_PATH.
 pub fn run_clap_scan_test() -> Result<()> {
+    // A private cache, so "cold" is cold and the user's cache stays untouched.
+    let tmp = std::env::temp_dir().join(format!("kabelsalat-clap-scan-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::env::set_var("XDG_CACHE_HOME", &tmp);
     let t0 = Instant::now();
     let first = list_clap_plugins();
     let d1 = t0.elapsed();
@@ -1918,6 +1962,11 @@ pub fn run_clap_scan_test() -> Result<()> {
         d1.as_secs_f64() * 1000.0,
         d2.as_secs_f64() * 1000.0,
     );
+    let t2 = Instant::now();
+    let retried = list_clap_plugins_retry_failed();
+    println!("clap-scan-test: retry of cached failures took {:.2} ms", t2.elapsed().as_secs_f64() * 1000.0);
+    anyhow::ensure!(retried == first, "retrying failures changed the listing");
+    let _ = std::fs::remove_dir_all(&tmp);
     Ok(())
 }
 
@@ -3012,6 +3061,51 @@ mod clap_scan_tests {
             1,
         );
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_scanner_that_cannot_start_caches_nothing() {
+        let tmp = TempDir::new("setupfail");
+        let bundle = tmp.0.join("good.clap");
+        std::fs::write(&bundle, b"v1").unwrap();
+        let cache_file = tmp.0.join("cache").join("clap-scan.json");
+        let missing = ScannerCommand::Custom { program: tmp.0.join("no-such-scanner"), args: Vec::new() };
+        let none = list_clap_plugins_with(&[bundle.clone()], &missing, Some(&cache_file), Duration::from_secs(2), 1);
+        assert!(none.is_empty());
+        let good = sh_cmd(r#"printf '[{"id":"id.good","name":"G","vendor":"V","features":[]}]\n'"#);
+        let listed = list_clap_plugins_with(&[bundle], &good, Some(&cache_file), Duration::from_secs(2), 1);
+        assert_eq!(listed.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["id.good"], "a spawn error must not be cached against the bundle");
+    }
+
+    #[test]
+    fn a_helper_holding_the_pipes_cannot_stall_the_listing() {
+        let tmp = TempDir::new("helper");
+        let bundle = tmp.0.join("helper.clap");
+        std::fs::write(&bundle, b"v1").unwrap();
+        let start = Instant::now();
+        let out = list_clap_plugins_with(&[bundle], &sh_cmd("(sleep 6 &); printf '[]'"), None, Duration::from_millis(500), 1);
+        assert!(out.is_empty());
+        assert!(start.elapsed() < Duration::from_secs(2), "inherited pipe stalled the listing for {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn timeout_kills_the_scanners_whole_process_group() {
+        let tmp = TempDir::new("pgkill");
+        let bundle = tmp.0.join("hang.clap");
+        std::fs::write(&bundle, b"v1").unwrap();
+        let pid_file = tmp.0.join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait; true", pid_file.display());
+        list_clap_plugins_with(&[bundle], &sh_cmd(&script), None, Duration::from_millis(300), 1);
+        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        let dead = (0..50).any(|_| {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let gone = state.is_empty() || state.split(") ").nth(1).map_or(false, |r| r.starts_with('Z'));
+            if !gone {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            gone
+        });
+        assert!(dead, "grandchild {pid} survived the scanner timeout");
     }
 
     #[test]

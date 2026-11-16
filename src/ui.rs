@@ -4696,7 +4696,10 @@ impl DemoApp {
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.text_edit_singleline(&mut self.plugin_filter);
-                    if ui.button("Refresh").clicked() { self.refresh_plugins(); }
+                    if ui.button("Refresh").on_hover_text("rescan, retrying plugins that failed before").clicked() {
+                        crate::host::list_clap_plugins_retry_failed();
+                        self.refresh_plugins();
+                    }
                 });
                 ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").size(12.0).color(theme::INK_2));
                 let filter = self.plugin_filter.to_lowercase();

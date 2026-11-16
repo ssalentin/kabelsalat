@@ -27,8 +27,6 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
-#[cfg(not(test))]
-use midir::MidiInput;
 
 use crate::assistant::{Assistant, ChatLine, FromWorker};
 use crate::control::{
@@ -428,10 +426,24 @@ struct Knob {
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
+    /// Last value sent via `Command::SetParam` so `publish_patch` only sends on change
+    /// and never fights incoming hardware CCs.
+    sent: Option<f32>,
     /// A Surge parameter pinned from the synth editor: the knob drives the
     /// PLUGIN parameter (0..1 mapped onto min..max), sent only on change.
     clap: Option<ClapPin>,
     label_g: Option<Arc<theme::TrackedLabel>>,
+}
+
+impl Knob {
+    /// Engine or plugin target this knob controls, if bindable to MIDI CC.
+    fn cc_target(&self) -> Option<(u32, crate::matrix::CcTarget)> {
+        if let Some(pin) = self.clap {
+            Some((pin.id, crate::matrix::CcTarget::PluginParam))
+        } else {
+            self.param.map(|p| (p, crate::matrix::CcTarget::Knob))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -511,7 +523,7 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, clap: None, label_g: None }
+    Knob { label: label.to_string(), value: default, default, param, sent: None, clap: None, label_g: None }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -681,12 +693,13 @@ impl RuleEdit {
             && self.cc_map.is_empty()
             && !self.cc_only
     }
-    fn set_cc(&mut self, cc: u8, param: u32) {
+    fn set_cc(&mut self, cc: u8, param: u32, target: crate::matrix::CcTarget) {
         let cc = cc & 0x7F;
         if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
             m.param = param;
+            m.target = target;
         } else {
-            self.cc_map.push(crate::matrix::CcMapping { cc, param });
+            self.cc_map.push(crate::matrix::CcMapping { cc, param, target });
         }
     }
     fn unmap_cc(&mut self, cc: u8) {
@@ -731,6 +744,16 @@ struct CcLearn {
     source: SourceId,
     dest: u32,
     param: u32,
+    target: crate::matrix::CcTarget,
+    /// When armed from a rack knob, replace any prior binding for that knob on completion.
+    replace_existing: bool,
+}
+
+#[derive(Clone, Copy)]
+struct KnobMenu {
+    unit: usize,
+    idx: usize,
+    pos: Pos2,
 }
 
 /// MIDI note name for editor readouts (60 = C4).
@@ -1487,6 +1510,8 @@ struct DemoApp {
     /// The matrix cell whose rule editor is open: (sink unit, row).
     rule_editor: Option<(usize, MatrixRow)>,
     cc_learn: Option<CcLearn>,
+    knob_menu: Option<KnobMenu>,
+    knob_menu_rect: Rect,
     rule_cc_num: u8,
     rule_param_id: u32,
     rule_param_filter: String,
@@ -1710,6 +1735,8 @@ impl DemoApp {
             rule_edits: std::collections::HashMap::new(),
             rule_editor: None,
             cc_learn: None,
+            knob_menu: None,
+            knob_menu_rect: Rect::NOTHING,
             rule_cc_num: 74,
             rule_param_id: 0,
             rule_param_filter: String::new(),
@@ -1845,6 +1872,8 @@ impl DemoApp {
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
+        self.knob_menu = None;
+        self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
         self.graph_sig.clear(); // force shared-graph re-mirror
         // No load_fade reset here: build_rack also serves sync adoptions
@@ -1958,6 +1987,8 @@ impl DemoApp {
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
+        self.knob_menu = None;
+        self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
         // Keep MCP/bridge get_rigs consistent with the UI selection (the audio
         // render path never locks this snapshot).
@@ -3059,7 +3090,7 @@ impl DemoApp {
                     });
                 }
                 for m in &r.edit.cc_map {
-                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param) });
+                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param), target: m.target });
                 }
             }
             self.rule_edits.insert((r.source, r.dest), r.edit);
@@ -3178,10 +3209,12 @@ impl DemoApp {
         self.rig_device = [None; VOICE_POOL];
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
-            for u in &self.units {
-                for k in &u.knobs {
+            for u in &mut self.units {
+                for k in &mut u.knobs {
                     if let Some(p) = k.param {
-                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+                        if b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
+                            k.sent = Some(k.value);
+                        }
                     }
                 }
             }
@@ -3498,11 +3531,11 @@ impl DemoApp {
                             "channel": e.channel, "transpose": e.transpose,
                             "key_range": [e.key_lo, e.key_hi], "vel_range": [e.vel_lo, e.vel_hi],
                             "enabled": e.enabled,
-                            "cc_map": e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect::<Vec<_>>(),
+                            "cc_map": e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect::<Vec<_>>(),
                         })
                     }).collect::<Vec<_>>(),
                     "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
-                        "source": format!("{:?}", l.source), "node": l.dest, "param": l.param,
+                        "source": format!("{:?}", l.source), "node": l.dest, "param": l.param, "target": l.target.as_str(),
                     })),
                 }).to_string()
             }
@@ -3581,15 +3614,25 @@ impl DemoApp {
                 let Some(cc) = args.get("cc").and_then(|v| v.as_u64()).filter(|&c| c <= 127).map(|c| c as u8) else {
                     return "set_cc_map needs 'cc' (0..=127)".into();
                 };
-                let param = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32);
-                self.set_cc_binding(src, node, cc, param);
+                let mut target = match Self::parse_cc_target(args.get("target").and_then(|v| v.as_str())) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                let param = match args.get("knob").and_then(|v| v.as_str()) {
+                    Some(k) => match self.resolve_unit_knob(node, k) {
+                        Ok((p, t)) => { target = t; Some(p) }
+                        Err(e) => return e,
+                    },
+                    None => args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32),
+                };
+                self.set_cc_binding(src, node, cc, param, target);
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.touch_cell(src, node, now);
                 self.agent_activity.record(origin, format!("CC {cc} → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
-                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
                     .unwrap_or_default();
-                serde_json::json!({"node": node, "source": source, "cc": cc, "param": param, "cc_map": map}).to_string()
+                serde_json::json!({"node": node, "source": source, "cc": cc, "param": param, "target": target.as_str(), "cc_map": map}).to_string()
             }
             "clear_cc_map" => {
                 let Some(node) = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32) else {
@@ -3603,22 +3646,44 @@ impl DemoApp {
                     Ok(s) => s,
                     Err(e) => return e,
                 };
+                let target_filter = match args.get("target").and_then(|v| v.as_str()) {
+                    Some(t) => match Self::parse_cc_target(Some(t)) {
+                        Ok(tt) => Some(tt),
+                        Err(e) => return e,
+                    },
+                    None => None,
+                };
+                let knob_filter = match args.get("knob").and_then(|v| v.as_str()) {
+                    Some(k) => match self.resolve_unit_knob(node, k) {
+                        Ok(pair) => Some(pair),
+                        Err(e) => return e,
+                    },
+                    None => None,
+                };
                 if let Some(cc) = args.get("cc").and_then(|v| v.as_u64()) {
                     if cc > 127 { return "cc must be 0..=127".into(); }
-                    self.set_cc_binding(src, node, cc as u8, None);
+                    self.set_cc_binding(src, node, cc as u8, None, crate::matrix::CcTarget::PluginParam);
                 } else {
-                    let ccs: Vec<u8> = self.rule_edits.get(&(src, node))
-                        .map(|e| e.cc_map.iter().map(|m| m.cc).collect())
+                    let ccs: Vec<(u8, crate::matrix::CcTarget)> = self.rule_edits.get(&(src, node))
+                        .map(|e| {
+                            e.cc_map.iter()
+                                .filter(|m| {
+                                    knob_filter.map_or(true, |(kp, kt)| m.param == kp && m.target == kt)
+                                        && target_filter.map_or(true, |tf| m.target == tf)
+                                })
+                                .map(|m| (m.cc, m.target))
+                                .collect()
+                        })
                         .unwrap_or_default();
-                    for cc in ccs {
-                        self.set_cc_binding(src, node, cc, None);
+                    for (cc, tgt) in ccs {
+                        self.set_cc_binding(src, node, cc, None, tgt);
                     }
                 }
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.touch_cell(src, node, now);
                 self.agent_activity.record(origin, format!("Clear CC → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
-                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param})).collect())
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
                     .unwrap_or_default();
                 serde_json::json!({"node": node, "source": source, "cc_map": map}).to_string()
             }
@@ -3644,8 +3709,11 @@ impl DemoApp {
                     let choices = self.node_param_choices(node);
                     if let Some(e) = self.rule_edits.get(&(src, node)) {
                         let bindings: Vec<_> = e.cc_map.iter().map(|m| {
-                            let name = choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.as_str());
-                            serde_json::json!({"cc": m.cc, "param": m.param, "name": name})
+                            let name = match m.target {
+                                crate::matrix::CcTarget::Knob => self.knob_param_label(node, m.param),
+                                crate::matrix::CcTarget::PluginParam => choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.clone()),
+                            };
+                            serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name})
                         }).collect();
                         entries.push(serde_json::json!({
                             "source": Self::source_str(src),
@@ -3657,7 +3725,7 @@ impl DemoApp {
                 serde_json::json!({
                     "cc_maps": entries,
                     "cc_learn": self.cc_learn.as_ref().map(|l| serde_json::json!({
-                        "source": Self::source_str(l.source), "node": l.dest, "param": l.param,
+                        "source": Self::source_str(l.source), "node": l.dest, "param": l.param, "target": l.target.as_str(),
                     })),
                 }).to_string()
             }
@@ -3680,7 +3748,17 @@ impl DemoApp {
                     .take(50)
                     .map(|(id, name)| serde_json::json!({"id": id, "name": name}))
                     .collect();
-                serde_json::json!({"node": node, "total": total, "params": params}).to_string()
+                let knobs: Vec<_> = self.units.iter()
+                    .find(|u| u.node_id == node)
+                    .map(|u| {
+                        u.knobs.iter()
+                            .filter_map(|k| k.cc_target().map(|(id, tgt)| {
+                                serde_json::json!({"label": k.label, "param": id, "target": tgt.as_str()})
+                            }))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                serde_json::json!({"node": node, "total": total, "params": params, "knobs": knobs}).to_string()
             }
             "learn_cc" => {
                 if args.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
@@ -3698,11 +3776,23 @@ impl DemoApp {
                     Ok(s) => s,
                     Err(e) => return e,
                 };
-                let Some(param) = args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32) else {
-                    return "learn_cc needs 'param'".into();
+                let mut target = match Self::parse_cc_target(args.get("target").and_then(|v| v.as_str())) {
+                    Ok(t) => t,
+                    Err(e) => return e,
                 };
-                self.cc_learn = Some(CcLearn { source: src, dest: node, param });
-                serde_json::json!({"armed": true, "node": node, "source": Self::source_str(src), "param": param}).to_string()
+                let param = match args.get("knob").and_then(|v| v.as_str()) {
+                    Some(k) => match self.resolve_unit_knob(node, k) {
+                        Ok((p, t)) => { target = t; p }
+                        Err(e) => return e,
+                    },
+                    None => match args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32) {
+                        Some(p) => p,
+                        None => return "learn_cc needs 'param' or 'knob'".into(),
+                    },
+                };
+                let replace_existing = target == crate::matrix::CcTarget::Knob || args.get("knob").is_some();
+                self.cc_learn = Some(CcLearn { source: src, dest: node, param, target, replace_existing });
+                serde_json::json!({"armed": true, "node": node, "source": Self::source_str(src), "param": param, "target": target.as_str()}).to_string()
             }
             "set_rig_mix" => {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -4728,7 +4818,112 @@ impl DemoApp {
         }
     }
 
-    fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>) {
+    fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
+        match target.map(str::trim).map(str::to_lowercase).as_deref() {
+            None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => {
+                Ok(crate::matrix::CcTarget::PluginParam)
+            }
+            Some("knob") => Ok(crate::matrix::CcTarget::Knob),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin' or 'knob')")),
+        }
+    }
+
+    fn resolve_unit_knob(&self, node_id: u32, knob: &str) -> Result<(u32, crate::matrix::CcTarget), String> {
+        let u = self.units.iter().find(|u| u.node_id == node_id)
+            .ok_or_else(|| format!("no unit with node id {node_id}"))?;
+        let q = knob.trim().to_uppercase();
+        for k in &u.knobs {
+            if k.label.to_uppercase() == q {
+                return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
+            }
+        }
+        Err(format!("no knob '{knob}' on node {node_id}"))
+    }
+
+    fn knob_param_label(&self, node_id: u32, param: u32) -> Option<String> {
+        self.units.iter()
+            .find(|u| u.node_id == node_id)
+            .and_then(|u| u.knobs.iter().find(|k| k.param == Some(param)))
+            .map(|k| format!("{} (knob)", k.label))
+    }
+
+    fn source_sort_key(src: SourceId) -> (u8, u32) {
+        match src {
+            SourceId::Hardware(d) => (0, d),
+            SourceId::Keys => (1, 0),
+            SourceId::Virtual(v) => (2, v),
+            SourceId::FilePlayer(f) => (3, f),
+        }
+    }
+
+    /// Active CC binding for a rack knob (if any): `(source, cc)`.
+    fn knob_cc_binding(&self, node_id: u32, param: u32, target: crate::matrix::CcTarget) -> Option<(SourceId, u8)> {
+        let mut best: Option<(SourceId, u8)> = None;
+        for (&(src, dest), edit) in &self.rule_edits {
+            if dest != node_id { continue; }
+            for m in &edit.cc_map {
+                if m.param == param && m.target == target {
+                    if best.map_or(true, |(bs, bc)| (Self::source_sort_key(bs), bc) > (Self::source_sort_key(src), m.cc)) {
+                        best = Some((src, m.cc));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Clear every CC binding targeting this knob across all sources.
+    fn clear_knob_bindings(&mut self, node_id: u32, param: u32, target: crate::matrix::CcTarget) {
+        let matches: Vec<(SourceId, u8)> = self.rule_edits.iter()
+            .filter(|(&(_, dest), _)| dest == node_id)
+            .flat_map(|(&(src, _), edit)| {
+                edit.cc_map.iter()
+                    .filter(move |m| m.param == param && m.target == target)
+                    .map(move |m| (src, m.cc))
+            })
+            .collect();
+        for (src, cc) in matches {
+            self.set_cc_binding(src, node_id, cc, None, target);
+        }
+    }
+
+    /// Mirror an incoming hardware CC onto matching rack knobs without re-sending
+    /// `Command::SetParam` back to the engine (no feedback loop).
+    fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8) {
+        let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
+        for ((rule_src, dest), edit) in &self.rule_edits {
+            if *rule_src != src || !edit.enabled { continue; }
+            if let Some(rule_ch) = edit.channel {
+                if rule_ch != ch { continue; }
+            }
+            for m in &edit.cc_map {
+                if m.cc != cc { continue; }
+                for u in &mut self.units {
+                    if u.node_id != *dest { continue; }
+                    for k in &mut u.knobs {
+                        match m.target {
+                            crate::matrix::CcTarget::Knob => {
+                                if k.param == Some(m.param) {
+                                    k.value = norm;
+                                    k.sent = Some(norm);
+                                }
+                            }
+                            crate::matrix::CcTarget::PluginParam => {
+                                if let Some(pin) = k.clap.as_mut() {
+                                    if pin.id == m.param {
+                                        k.value = norm;
+                                        pin.sent = norm;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>, target: crate::matrix::CcTarget) {
         let cc = cc & 0x7F;
         let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_else(|| {
             // Mirror what the engine will do: binding on a pair without a rule
@@ -4740,7 +4935,7 @@ impl DemoApp {
             RuleEdit { cc_only: !routed, ..RuleEdit::default() }
         });
         match param {
-            Some(p) => e.set_cc(cc, p),
+            Some(p) => e.set_cc(cc, p, target),
             None => e.unmap_cc(cc),
         }
         if e.is_default() {
@@ -4749,7 +4944,7 @@ impl DemoApp {
             self.rule_edits.insert((source, dest), e);
         }
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param });
+            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param, target });
         }
     }
 
@@ -4762,7 +4957,10 @@ impl DemoApp {
             other if other == incoming_src => incoming_src,
             _ => return false,
         };
-        self.set_cc_binding(bind_src, learn.dest, cc, Some(learn.param));
+        if learn.replace_existing {
+            self.clear_knob_bindings(learn.dest, learn.param, learn.target);
+        }
+        self.set_cc_binding(bind_src, learn.dest, cc, Some(learn.param), learn.target);
         if learn.source == SourceId::Keys {
             if let SourceId::Hardware(d) = bind_src {
                 if let Some((unit, _)) = self.rule_editor {
@@ -4800,7 +4998,7 @@ impl DemoApp {
         let mut changed = false;
         let mut reset = false;
         let mut add_cc: Option<(u8, u32)> = None;
-        let mut remove_ccs: Vec<u8> = Vec::new();
+        let mut remove_ccs: Vec<(u8, crate::matrix::CcTarget)> = Vec::new();
         ui.label(egui::RichText::new(title).font(theme::medium_font(15.0)).color(theme::INK));
         ui.add_space(2.0);
         ui.label(egui::RichText::new("shapes this route live · releases held notes on change")
@@ -4862,11 +5060,15 @@ impl DemoApp {
         ui.add_space(4.0);
         let choices = self.rule_param_cache.as_ref().map(|(_, c)| c.as_slice()).unwrap_or(&[]);
         for m in &edit.cc_map {
-            let pname = choices
-                .iter()
-                .find(|(id, _)| *id == m.param)
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| format!("Param {}", m.param));
+            let pname = match m.target {
+                crate::matrix::CcTarget::Knob => self.knob_param_label(node, m.param)
+                    .unwrap_or_else(|| format!("Knob {}", m.param)),
+                crate::matrix::CcTarget::PluginParam => choices
+                    .iter()
+                    .find(|(id, _)| *id == m.param)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| format!("Param {}", m.param)),
+            };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
                 ui.label(egui::RichText::new("→").size(12.0).color(theme::INK_2));
@@ -4879,7 +5081,7 @@ impl DemoApp {
                     },
                 );
                 if theme::chip_button(ui, "×", false).on_hover_text("remove this CC binding").clicked() {
-                    remove_ccs.push(m.cc);
+                    remove_ccs.push((m.cc, m.target));
                 }
             });
         }
@@ -4949,7 +5151,13 @@ impl DemoApp {
                 .on_hover_text("arm MIDI-learn: the next hardware CC binds to the chosen parameter")
                 .clicked()
             {
-                self.cc_learn = Some(CcLearn { source: src, dest: node, param: self.rule_param_id });
+                self.cc_learn = Some(CcLearn {
+                    source: src,
+                    dest: node,
+                    param: self.rule_param_id,
+                    target: crate::matrix::CcTarget::PluginParam,
+                    replace_existing: false,
+                });
             }
         });
         if learning_here {
@@ -4967,19 +5175,19 @@ impl DemoApp {
             self.cc_learn = None;
         }
         if reset {
-            let old_ccs: Vec<u8> = edit.cc_map.iter().map(|m| m.cc).collect();
-            for cc in old_ccs {
-                self.set_cc_binding(src, node, cc, None);
+            let old_ccs: Vec<(u8, crate::matrix::CcTarget)> = edit.cc_map.iter().map(|m| (m.cc, m.target)).collect();
+            for (cc, tgt) in old_ccs {
+                self.set_cc_binding(src, node, cc, None, tgt);
             }
             edit = RuleEdit::default();
             changed = true;
             self.cc_learn = None;
         }
-        for cc in remove_ccs {
-            self.set_cc_binding(src, node, cc, None);
+        for (cc, tgt) in remove_ccs {
+            self.set_cc_binding(src, node, cc, None, tgt);
         }
         if let Some((cc, param)) = add_cc {
-            self.set_cc_binding(src, node, cc, Some(param));
+            self.set_cc_binding(src, node, cc, Some(param), crate::matrix::CcTarget::PluginParam);
         }
         if changed {
             edit.cc_only = false; // a shaped route routes notes (engine MatrixRule)
@@ -6992,7 +7200,7 @@ impl DemoApp {
         let label: String = p.name.to_uppercase().chars().take(9).collect();
         u.knobs.push(Knob {
             label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
+            param: None, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
         });
         format!("pinned {} to the face", p.name)
     }
@@ -7017,10 +7225,14 @@ impl DemoApp {
                     kind,
                 });
             }
-            for u in &self.units {
-                for k in &u.knobs {
+            for u in &mut self.units {
+                for k in &mut u.knobs {
                     if let Some(p) = k.param {
-                        let _ = b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+                        if k.sent.map_or(true, |s| (k.value - s).abs() > 1e-6) {
+                            if b.send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
+                                k.sent = Some(k.value);
+                            }
+                        }
                     }
                 }
             }
@@ -7114,6 +7326,8 @@ impl DemoApp {
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
+        self.knob_menu = None;
+        self.knob_menu_rect = Rect::NOTHING;
         eprintln!(
             "rack flip: {} -> {} (embedded editor stays in its fixed region)",
             if self.side == Side::Front { "front" } else { "back" },
@@ -7739,8 +7953,8 @@ impl DemoApp {
             .map(|u| matches!(u.node_kind, UnitKind::Keys | UnitKind::Master))
             .unwrap_or(false);
         if tall {
-            // Tall shared units: knobs along the bottom.
-            let fx = if idx == 0 { 0.32 } else { 0.68 };
+            // Tall shared units: knobs along the bottom (offset clear of Master's meter).
+            let fx = if idx == 0 { 0.36 } else { 0.72 };
             Vec2::new(r.left() + r.width() * fx, r.bottom() - 40.0)
         } else {
             // Stack units: knob pairs on the right; pinned knobs add pairs
@@ -7934,8 +8148,9 @@ impl DemoApp {
             }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
+                else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
-                else if self.stage_view == StageView::Matrix && self.cc_learn.is_some() { self.cc_learn = None; }
+                else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
                 else if self.confirm_delete_session.is_some() { self.confirm_delete_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
@@ -8025,9 +8240,51 @@ impl DemoApp {
         if right_clicked {
             if self.pending.is_some() {
                 self.pending = None;
-            } else if let Hit::Knob { unit, idx } = self.hit_test(s) {
-                self.units[unit].knobs[idx].value = self.units[unit].knobs[idx].default;
+            } else if self.side == Side::Front {
+                if let Hit::Knob { unit, idx } = self.hit_test(s) {
+                    let node_id = self.units[unit].node_id;
+                    let target = self.units[unit].knobs[idx].cc_target();
+                    if let Some((param, tgt)) = target {
+                        let same_learning = self.cc_learn.as_ref().is_some_and(|l| {
+                            l.dest == node_id && l.param == param && l.target == tgt
+                        });
+                        if same_learning {
+                            self.cc_learn = None;
+                            self.knob_menu = None;
+                        } else if self.knob_cc_binding(node_id, param, tgt).is_some() {
+                            self.cc_learn = None;
+                            self.knob_menu = Some(KnobMenu { unit, idx, pos: s });
+                        } else {
+                            self.knob_menu = None;
+                            self.cc_learn = Some(CcLearn {
+                                source: SourceId::Keys,
+                                dest: node_id,
+                                param,
+                                target: tgt,
+                                replace_existing: true,
+                            });
+                        }
+                    } else {
+                        self.knob_menu = None;
+                        self.units[unit].knobs[idx].value = self.units[unit].knobs[idx].default;
+                    }
+                } else {
+                    self.knob_menu = None;
+                    self.cc_learn = None;
+                }
+            } else {
+                self.knob_menu = None;
             }
+        }
+
+        if self.knob_menu.is_some() && self.knob_menu_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if pressed && self.knob_menu.is_some() {
+            self.knob_menu = None;
+            self.hover = Some(Hit::Background);
+            return;
         }
 
         let hit = if self.show_help { Hit::Background } else { self.hit_test(s) };
@@ -8485,7 +8742,9 @@ impl DemoApp {
         let Some(k) = u.knobs.get_mut(knob) else { return };
         k.value = v.clamp(0.0, 1.0);
         if let (Some(p), Some(bus)) = (k.param, &self.bus) {
-            let _ = bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 });
+            if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
+                k.sent = Some(k.value);
+            }
         }
     }
 
@@ -9090,7 +9349,7 @@ impl DemoApp {
     fn draw_meter(&self, painter: &egui::Painter, r: Rect) {
         let n = 14;
         let lit = lit_segments(self.meter, n);
-        let x = r.left() + 34.0;
+        let x = r.left() + 22.0;
         let bottom = r.bottom() - 62.0;
         // Start below the title block (+ room for the OUTPUT caption): on a
         // short unit a fixed pitch pushed the caption into the subtitle.
@@ -9129,15 +9388,27 @@ impl DemoApp {
         let r = KNOB_R;
         let hovered = matches!(self.hover, Some(Hit::Knob { unit, idx }) if unit == ui && idx == ki);
         let dragging = matches!(self.drag, Drag::Knob { unit, idx, .. } if unit == ui && idx == ki);
+        let target = k.cc_target();
+        let is_learning = target.is_some_and(|(p, t)| {
+            self.cc_learn.as_ref().is_some_and(|l| l.dest == u.node_id && l.param == p && l.target == t)
+        });
+        let bound = target.and_then(|(p, t)| self.knob_cc_binding(u.node_id, p, t));
+        let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
+        let learn_col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
 
-        // Unfilled disc (§4.6): 1.5px hairline ring, cream on hover. No fill
-        // bead, no gradient, no hover halo.
+        // Unfilled disc (§4.6): 1.5px hairline ring, cream on hover, MIDI pulse when learning.
         self.ell(painter, c, r, Color32::TRANSPARENT,
-            Stroke::new(1.5, if hovered || dragging { TEXT } else { BORDER }));
+            Stroke::new(1.5, if is_learning { learn_col } else if hovered || dragging { TEXT } else { BORDER }));
 
         // Flat value arc: hairline track + solid accent arc + flat end dot
         // (theme helper; the closure carries the flip transform).
         theme::value_arc(painter, |l| xf.p(l), c, r, k.value, theme::ACCENT);
+
+        // Pulsing non-tomato outline around the value arc while learning.
+        if is_learning {
+            self.ell(painter, c, r + 4.5, Color32::TRANSPARENT,
+                Stroke::new(2.2, alpha(learn_col, 0.70 + 0.30 * pulse)));
+        }
 
         // Active/dragging knob: the CTA inset-keyline motif as focus state.
         if dragging {
@@ -9154,17 +9425,138 @@ impl DemoApp {
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
         self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + 10.0), &k.label_g, SUBTEXT);
 
+        // Status plate (LEARN or CC nn) above the knob (rule 35 plate, rule 7 padding).
+        let has_tag = (is_learning || bound.is_some()) && self.text_alpha > 0.01;
+        if is_learning && self.text_alpha > 0.01 {
+            let g = painter.layout_no_wrap("LEARN".into(), theme::medium_font(9.5), theme::CREAM);
+            let box_sz = g.size() + Vec2::new(16.0, 8.0);
+            let local = Rect::from_min_size(Pos2::new(c.x - box_sz.x / 2.0, c.y - r - 6.5 - box_sz.y), box_sz);
+            let sr = xf.rect(local);
+            painter.rect_filled(sr, 2.0, theme::DARK_PANEL_HI);
+            painter.rect_stroke(sr, 2.0, Stroke::new(1.2, learn_col), egui::StrokeKind::Inside);
+            let mut tp = painter.clone();
+            tp.set_opacity(self.text_alpha);
+            tp.galley(xf.p(local.min.to_vec2() + Vec2::new(8.0, 4.0)), g, theme::CREAM);
+        } else if let Some((_, cc)) = bound {
+            if self.text_alpha > 0.01 {
+                let g = painter.layout_no_wrap(format!("CC {cc}"), theme::medium_font(9.5), theme::CREAM);
+                let box_sz = g.size() + Vec2::new(16.0, 8.0);
+                let local = Rect::from_min_size(Pos2::new(c.x - box_sz.x / 2.0, c.y - r - 6.5 - box_sz.y), box_sz);
+                let sr = xf.rect(local);
+                painter.rect_filled(sr, 2.0, theme::DARK_PANEL_HI);
+                painter.rect_stroke(sr, 2.0, Stroke::new(1.0, theme::MIDI_BLUE), egui::StrokeKind::Inside);
+                let mut tp = painter.clone();
+                tp.set_opacity(self.text_alpha);
+                tp.galley(xf.p(local.min.to_vec2() + Vec2::new(8.0, 4.0)), g, theme::CREAM);
+            }
+        }
+
         // Drag chip: a dark sticker with the value in Medium 13px cream.
         if dragging {
             let g = painter.layout(format!("{:.2}", k.value), theme::medium_font(13.0), theme::INK, f32::INFINITY);
+            let y_off = if has_tag { -r - 52.0 } else { -r - 30.0 };
             let chip = Rect::from_min_size(
-                xf.p(c + Vec2::new(-g.size().x / 2.0 - 8.0, -r - 30.0)),
+                xf.p(c + Vec2::new(-g.size().x / 2.0 - 8.0, y_off)),
                 g.size() + Vec2::new(16.0, 10.0),
             );
             theme::drop_shadow(painter, chip, 6.0);
             painter.rect_filled(chip, 6.0, theme::PAPER_SINK);
             painter.rect_stroke(chip, 6.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
             painter.galley(chip.min + Vec2::new(8.0, 5.0), g, theme::INK);
+        }
+    }
+
+    fn knob_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.knob_menu else {
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        };
+        if self.stage_view != StageView::Rack || self.side != Side::Front {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        }
+        let Some(u) = self.units.get(menu.unit) else {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let Some(k) = u.knobs.get(menu.idx) else {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let Some((param, target)) = k.cc_target() else {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let node_id = u.node_id;
+        let title = format!("{} · {}", sentence_case(&u.name), k.label);
+        let binding = self.knob_cc_binding(node_id, param, target);
+        let Some((src, cc)) = binding else {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        };
+        let mut relearn = false;
+        let mut clear = false;
+        let mut reset_val = false;
+        let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(170.0);
+                        ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
+                        ui.label(egui::RichText::new(format!("CC {cc} · {}", Self::source_str(src))).size(11.0).color(theme::MIDI_BLUE));
+                        ui.add_space(6.0);
+                        if theme::chip_button(ui, "MIDI learn again", false).clicked() {
+                            relearn = true;
+                        }
+                        ui.add_space(4.0);
+                        if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
+                            clear = true;
+                        }
+                        ui.add_space(4.0);
+                        if theme::chip_button(ui, "Reset to default", false).clicked() {
+                            reset_val = true;
+                        }
+                    });
+            });
+        self.knob_menu_rect = area.response.rect;
+        if relearn {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            self.cc_learn = Some(CcLearn {
+                source: SourceId::Keys,
+                dest: node_id,
+                param,
+                target,
+                replace_existing: true,
+            });
+        } else if clear {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            self.clear_knob_bindings(node_id, param, target);
+        } else if reset_val {
+            self.knob_menu = None;
+            self.knob_menu_rect = Rect::NOTHING;
+            if let Some(k) = self.units.get_mut(menu.unit).and_then(|u| u.knobs.get_mut(menu.idx)) {
+                k.value = k.default;
+            }
         }
     }
 
@@ -9829,11 +10221,13 @@ impl DemoApp {
             .lock()
             .map(|mut q| q.drain(..).collect())
             .unwrap_or_default();
-        for (src, _ch, cc, _val) in hw_ccs {
+        for (src, ch, cc, val) in hw_ccs {
             if let SourceId::Hardware(d) = src {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
-            self.complete_cc_learn(src, cc);
+            if !self.complete_cc_learn(src, cc) {
+                self.apply_cc_to_knobs(src, ch, cc, val);
+            }
         }
 
         let rect = ui.available_rect_before_wrap();
@@ -9857,6 +10251,7 @@ impl DemoApp {
             StageView::Sessions => self.sessions_stage(ui),
             StageView::Plugins => self.plugins_stage(ui),
         }
+        self.knob_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
@@ -11282,8 +11677,9 @@ mod rig_switch_tests {
                     key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: true,
                 });
             }
-            app.set_cc_binding(SourceId::Keys, 1, 74, Some(42));
-            app.set_cc_binding(dev, 1, 7, Some(43)); // learn on an unrouted device
+            app.set_cc_binding(SourceId::Keys, 1, 74, Some(42), crate::matrix::CcTarget::PluginParam);
+            app.set_cc_binding(dev, 1, 7, Some(43), crate::matrix::CcTarget::PluginParam); // learn on an unrouted device
+            app.set_cc_binding(dev, 1, 14, Some(P_LEVEL), crate::matrix::CcTarget::Knob);
         });
         let saved = app.capture_session("cc").unwrap();
         let json = serde_json::to_string(&saved.matrix()).unwrap();
@@ -11298,6 +11694,7 @@ mod rig_switch_tests {
         let learned = rules.iter().find(|r| r.source == dev && r.dest == 1).expect("learned rule restored");
         assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
         assert_eq!(learned.param_for_cc(7), Some(43));
+        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }));
         assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
     }
 
@@ -12677,7 +13074,7 @@ mod split_bpm_tests {
         app.graph_pub = Some(pub_);
         app.sync_from_engine();
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("remote cc_map mirrored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42 }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42, target: crate::matrix::CcTarget::PluginParam }]);
         assert_eq!(e.cell_code(), "1 CC");
     }
 
@@ -12693,10 +13090,10 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.cc_learn.is_none(), "MIDI-learn disarms after binding");
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("learned binding stored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123 }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam }]);
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
-        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123) })));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123), target: crate::matrix::CcTarget::PluginParam })));
     }
 
     #[test]
@@ -12737,6 +13134,185 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Add") && texts.iter().any(|t| t == "Learn"), "Add/Learn buttons painted: {texts:?}");
         assert!(texts.iter().any(|t| t.contains("74")), "CC 74 binding painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "1 CC"), "Matrix cell reflects 1 CC: {texts:?}");
+    }
+
+    fn rclick(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) -> Vec<String> {
+        let rp = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+        frame(app, ctx, vec![rp(true)]);
+        frame(app, ctx, vec![rp(false)])
+    }
+
+    #[test]
+    fn rack_knob_midi_learn_bind_follow_and_cancel() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+        drain.drain(|_| {}); // clear initial SetParam/Connect burst
+
+        // Surge A is unit 1, LEVEL knob is index 1 (param = Some(P_LEVEL)).
+        let surge_unit = 1usize;
+        let level_idx = 1usize;
+        let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
+
+        // 1. Right-click enters learning state and paints "LEARN".
+        let texts = rclick(&mut app, &ctx, level_pos);
+        assert!(app.cc_learn.is_some(), "right-click armed knob MIDI learn");
+        assert!(texts.iter().any(|t| t == "LEARN"), "LEARN badge painted: {texts:?}");
+
+        // 2. Right-click again cancels learning.
+        let texts = rclick(&mut app, &ctx, level_pos);
+        assert!(app.cc_learn.is_none(), "second right-click cancels learn");
+        assert!(!texts.iter().any(|t| t == "LEARN"));
+
+        // 3. Esc cancels learning on the rack.
+        rclick(&mut app, &ctx, level_pos);
+        assert!(app.cc_learn.is_some());
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert!(app.cc_learn.is_none(), "Esc cancels knob learn on Rack");
+
+        // 4. Arm and send CC 74 from Hardware(2): binds for Hardware(2) and paints "CC 74".
+        rclick(&mut app, &ctx, level_pos);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 50));
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "disarmed after binding");
+        assert!(texts.iter().any(|t| t == "CC 74"), "CC 74 tag painted: {texts:?}");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            Command::MatrixCcMap {
+                source: SourceId::Hardware(2),
+                dest: 1,
+                cc: 74,
+                param: Some(P_LEVEL),
+                target: crate::matrix::CcTarget::Knob,
+            }
+        )), "sent MatrixCcMap with CcTarget::Knob: {cmds:?}");
+
+        // 5. Turning the bound hardware knob updates the on-screen knob without re-sending SetParam.
+        let before_val = app.units[surge_unit].knobs[level_idx].value;
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 127));
+        frame(&mut app, &ctx, vec![]);
+        assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+        assert_ne!(before_val, 1.0);
+        let mut feedback_cmds = Vec::new();
+        drain.drain(|c| feedback_cmds.push(c));
+        assert!(!feedback_cmds.iter().any(|c| matches!(c, Command::SetParam { node: 1, param: P_LEVEL, .. })),
+            "adopting CC must not re-send SetParam: {feedback_cmds:?}");
+
+        // 6. Same CC from another hardware device does not move the Hardware(2)-bound knob.
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 0));
+        frame(&mut app, &ctx, vec![]);
+        assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rack_knob_bound_menu_relearn_and_clear() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+
+        let surge_unit = 1usize;
+        let level_idx = 1usize;
+        let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
+
+        // Bind CC 74 on Hardware(2).
+        rclick(&mut app, &ctx, level_pos);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 64));
+        frame(&mut app, &ctx, vec![]);
+
+        // Right-click bound knob opens the menu with "MIDI learn again" and "Clear MIDI map".
+        // The egui Area needs one extra frame after the sizing pass to paint.
+        rclick(&mut app, &ctx, level_pos);
+        assert!(app.knob_menu.is_some(), "bound knob opens context menu");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "MIDI learn again"), "menu shows relearn: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Clear MIDI map"), "menu shows clear: {texts:?}");
+
+        // Find and click "MIDI learn again" widget rect from the foreground layer.
+        // Buttons = click + focusable, no drag. Selectable labels drag; the Area
+        // move widget is click-only (not focusable).
+        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        let menu_buttons = || ctx.viewport(|v| {
+            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
+                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
+                .map(|w| w.rect)
+                .collect();
+            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            btns
+        });
+        let relearn_rect = menu_buttons()[0];
+        click(&mut app, &ctx, relearn_rect.center());
+        assert!(app.knob_menu.is_none());
+        assert!(app.cc_learn.is_some(), "MIDI learn again armed");
+
+        // Send CC 14 from Hardware(1): replaces old Hardware(2) CC 74 binding.
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 14, 90));
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "CC 14"), "replaced tag painted: {texts:?}");
+        assert!(!app.rule_edits.contains_key(&(SourceId::Hardware(2), 1)), "old binding cleared");
+
+        // Open menu again and click "Clear MIDI map" (2nd button vertically).
+        rclick(&mut app, &ctx, level_pos);
+        frame(&mut app, &ctx, vec![]);
+        let btns = menu_buttons();
+        assert!(btns.len() >= 2, "menu has >= 2 buttons");
+        drain.drain(|_| {});
+        click(&mut app, &ctx, btns[1].center());
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(!app.rule_edits.contains_key(&(SourceId::Hardware(1), 1)), "binding cleared");
+        assert!(!texts.iter().any(|t| t == "CC 14"));
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 14, param: None, .. })));
+    }
+
+    #[test]
+    fn rack_knob_bindings_show_in_matrix_and_survive_rig_edits_and_agent_tools() {
+        let (mut app, ctx) = demo();
+        let (bus, _) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+
+        // Agent parity: list_params exposes knobs, learn_cc / set_cc_map / clear_cc_map work with target="knob".
+        let lp: serde_json::Value = serde_json::from_str(&app.exec_tool("list_params", &serde_json::json!({"node": 1}))).unwrap();
+        assert!(lp["knobs"].as_array().unwrap().iter().any(|k| k["label"] == "LEVEL" && k["target"] == "knob"));
+        let arm = app.exec_tool("learn_cc", &serde_json::json!({"node": 1, "knob": "LEVEL"}));
+        assert!(arm.contains("\"target\":\"knob\"") && arm.contains("\"armed\":true"), "{arm}");
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 80));
+        frame(&mut app, &ctx, vec![]);
+
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("list_cc_maps", &serde_json::json!({}))).unwrap();
+        assert_eq!(listed["cc_maps"][0]["bindings"][0]["target"], serde_json::json!("knob"));
+        assert_eq!(listed["cc_maps"][0]["bindings"][0]["name"], serde_json::json!("LEVEL (knob)"));
+
+        // Matrix rule editor shows knob binding cleanly.
+        app.stage_view = StageView::Matrix;
+        app.rule_editor = Some((1, MatrixRow::HwDev(0)));
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.contains("74")), "CC 74 in rule editor: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains("LEVEL (knob)")), "knob label in rule editor: {texts:?}");
+
+        // Survives + Rig (edit_rigs) remapping.
+        app.stage_view = StageView::Rack;
+        app.edit_rigs(None);
+        let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("knob binding survived + Rig");
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }]);
+
+        // Clear via knob name.
+        app.exec_tool("clear_cc_map", &serde_json::json!({"node": 1, "source": "hw:0", "knob": "LEVEL"}));
+        assert!(!app.rule_edits.contains_key(&(SourceId::Hardware(0), 1)));
     }
 
     #[test]

@@ -319,8 +319,12 @@ struct SetCcMapArgs {
     source: String,
     /// MIDI CC number (0..=127).
     cc: u8,
-    /// Parameter id on the destination node; omit/null to remove the binding.
+    /// Parameter id on the destination node; omit/null to remove the binding (unless `knob` is set).
     param: Option<u32>,
+    /// Target parameter space: "plugin" (default, CLAP/LV2/DSP native) or "knob" (rack unit knob / SetParam).
+    target: Option<String>,
+    /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
+    knob: Option<String>,
 }
 
 /// Arguments for `clear_cc_map`.
@@ -330,8 +334,12 @@ struct ClearCcMapArgs {
     node: NodeId,
     /// Source: "keys" or "hw:<device index>".
     source: String,
-    /// Optional CC number (0..=127); omit to clear all bindings on this rule.
+    /// Optional CC number (0..=127); omit to clear all bindings on this rule (or matching `target`/`knob`).
     cc: Option<u8>,
+    /// Optional target filter ("plugin" | "knob") when `cc` is omitted.
+    target: Option<String>,
+    /// Optional rack knob label when `cc` is omitted.
+    knob: Option<String>,
 }
 
 /// Arguments for `list_cc_maps`.
@@ -355,12 +363,16 @@ struct ListParamsArgs {
 /// Arguments for `learn_cc`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LearnCcArgs {
-    /// Destination node id.
-    node: NodeId,
-    /// Source: "keys" or "hw:<device index>".
-    source: String,
-    /// Parameter id on the destination node to bind to the next hardware CC.
-    param: u32,
+    /// Destination node id (required unless `cancel` is true).
+    node: Option<NodeId>,
+    /// Source: "keys" (default, any hardware controller — records the sender) or "hw:<device index>".
+    source: Option<String>,
+    /// Parameter id on the destination node to bind to the next hardware CC (omit if `knob` or `cancel=true`).
+    param: Option<u32>,
+    /// Target parameter space: "plugin" (default) or "knob" (rack unit knob / SetParam).
+    target: Option<String>,
+    /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
+    knob: Option<String>,
     /// Set true to cancel any armed MIDI-learn instead of arming.
     cancel: Option<bool>,
 }
@@ -1065,73 +1077,166 @@ impl McpServer {
         ok_json(json!({"node": args.node, "source": args.source}))
     }
 
+    fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
+        match target.map(str::trim).map(str::to_lowercase).as_deref() {
+            None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => {
+                Ok(crate::matrix::CcTarget::PluginParam)
+            }
+            Some("knob") => Ok(crate::matrix::CcTarget::Knob),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin' or 'knob')")),
+        }
+    }
+
+    fn resolve_headless_knob(kind: &NodeKind, knob: &str) -> Result<u32, String> {
+        let q = knob.trim().to_uppercase();
+        match kind {
+            NodeKind::Clap { .. } if q == "LEVEL" => Ok(crate::engine::P_LEVEL),
+            NodeKind::MasterOut if q == "VOLUME" || q == "VOL" => Ok(crate::engine::P_VOL),
+            NodeKind::MasterOut if q == "WARM" || q == "WARMTH" => Ok(crate::engine::P_WARM),
+            NodeKind::Dsp(dk) => crate::engine::dsp_param_choices(dk)
+                .iter()
+                .find(|&&(_, name)| name.to_uppercase() == q)
+                .map(|&(id, _)| id)
+                .ok_or_else(|| format!("no knob '{knob}' on DSP node")),
+            NodeKind::Lv2 { .. } if q == "GAIN" => Ok(0),
+            _ => Err(format!("no knob '{knob}' on this node")),
+        }
+    }
+
     /// Bind or unbind one CC on a matrix rule.
-    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id (Command::MatrixCcMap). Omit param to unbind that CC. A non-empty map acts as a whitelist for that rule.")]
+    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL'). Omit param/knob to unbind that CC.")]
     fn set_cc_map(&self, Parameters(args): Parameters<SetCcMapArgs>) -> Result<CallToolResult, McpError> {
         if args.cc > 127 {
             return tool_err("cc must be 0..=127");
         }
+        let remote = {
+            let st = self.state.lock().unwrap();
+            matches!(st.backend, Backend::Remote)
+        };
+        if remote {
+            return Self::ui_bridge_tool(
+                "set_cc_map",
+                json!({
+                    "node": args.node,
+                    "source": args.source,
+                    "cc": args.cc,
+                    "param": args.param,
+                    "target": args.target,
+                    "knob": args.knob,
+                }),
+            );
+        }
         let source = match Self::parse_rule_source(&args.source) {
             Ok(s) => s,
+            Err(e) => return tool_err(e),
+        };
+        let mut target = match Self::parse_cc_target(args.target.as_deref()) {
+            Ok(t) => t,
             Err(e) => return tool_err(e),
         };
         let mut st = self.state.lock().unwrap();
         if let Err(e) = refresh_remote(&mut st) {
             return tool_err(e);
         }
-        if st.graph.node(args.node).is_none() {
+        let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
             return tool_err(format!("node {} does not exist", args.node));
-        }
-        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param: args.param }) {
+        };
+        let param = match args.knob.as_deref() {
+            Some(k) => match Self::resolve_headless_knob(&node_kind, k) {
+                Ok(p) => {
+                    target = crate::matrix::CcTarget::Knob;
+                    Some(p)
+                }
+                Err(e) => return tool_err(e),
+            },
+            None => args.param,
+        };
+        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target }) {
             return tool_err(e);
         }
         let entry = st.cc_maps.entry((source, args.node)).or_default();
-        match args.param {
+        match param {
             Some(p) => {
                 if let Some(m) = entry.iter_mut().find(|m| m.cc == args.cc) {
                     m.param = p;
+                    m.target = target;
                 } else {
-                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p });
+                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p, target });
                 }
             }
             None => entry.retain(|m| m.cc != args.cc),
         }
-        let map = st.cc_maps.get(&(source, args.node)).cloned().unwrap_or_default();
+        let map: Vec<Value> = st.cc_maps.get(&(source, args.node))
+            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
+            .unwrap_or_default();
         if map.is_empty() {
             st.cc_maps.remove(&(source, args.node));
         }
-        ok_json(json!({"node": args.node, "source": args.source, "cc": args.cc, "param": args.param, "cc_map": map}))
+        ok_json(json!({"node": args.node, "source": args.source, "cc": args.cc, "param": param, "target": target.as_str(), "cc_map": map}))
     }
 
     /// Clear one or all CC bindings on a matrix rule.
-    #[tool(name = "clear_cc_map", description = "Clear one CC binding (when cc is provided) or all CC bindings (when cc is omitted) on source → node.")]
+    #[tool(name = "clear_cc_map", description = "Clear one CC binding (when cc is provided) or all CC bindings (when cc is omitted, optionally filtered by target='plugin'|'knob' or knob='LEVEL') on source → node.")]
     fn clear_cc_map(&self, Parameters(args): Parameters<ClearCcMapArgs>) -> Result<CallToolResult, McpError> {
         if let Some(cc) = args.cc {
             if cc > 127 {
                 return tool_err("cc must be 0..=127");
             }
         }
-        let source = match Self::parse_rule_source(&args.source) {
-            Ok(s) => s,
-            Err(e) => return tool_err(e),
-        };
         let remote = {
             let st = self.state.lock().unwrap();
             matches!(st.backend, Backend::Remote)
         };
-        if remote && args.cc.is_none() {
-            return Self::ui_bridge_tool("clear_cc_map", json!({"node": args.node, "source": args.source}));
+        if remote {
+            return Self::ui_bridge_tool(
+                "clear_cc_map",
+                json!({
+                    "node": args.node,
+                    "source": args.source,
+                    "cc": args.cc,
+                    "target": args.target,
+                    "knob": args.knob,
+                }),
+            );
         }
+        let source = match Self::parse_rule_source(&args.source) {
+            Ok(s) => s,
+            Err(e) => return tool_err(e),
+        };
+        let target_filter = match args.target.as_deref() {
+            Some(t) => match Self::parse_cc_target(Some(t)) {
+                Ok(tt) => Some(tt),
+                Err(e) => return tool_err(e),
+            },
+            None => None,
+        };
         let mut st = self.state.lock().unwrap();
-        if st.graph.node(args.node).is_none() {
+        let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
             return tool_err(format!("node {} does not exist", args.node));
-        }
+        };
+        let knob_param = match args.knob.as_deref() {
+            Some(k) => match Self::resolve_headless_knob(&node_kind, k) {
+                Ok(p) => Some(p),
+                Err(e) => return tool_err(e),
+            },
+            None => None,
+        };
         let ccs: Vec<u8> = match args.cc {
             Some(c) => vec![c],
-            None => st.cc_maps.get(&(source, args.node)).map(|v| v.iter().map(|m| m.cc).collect()).unwrap_or_default(),
+            None => st.cc_maps.get(&(source, args.node))
+                .map(|v| {
+                    v.iter()
+                        .filter(|m| {
+                            knob_param.map_or(true, |kp| m.param == kp && m.target == crate::matrix::CcTarget::Knob)
+                                && target_filter.map_or(true, |tf| m.target == tf)
+                        })
+                        .map(|m| m.cc)
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
         for cc in ccs {
-            if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc, param: None }) {
+            if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc, param: None, target: crate::matrix::CcTarget::PluginParam }) {
                 return tool_err(e);
             }
             if let Some(v) = st.cc_maps.get_mut(&(source, args.node)) {
@@ -1141,12 +1246,14 @@ impl McpServer {
         if st.cc_maps.get(&(source, args.node)).is_some_and(|v| v.is_empty()) {
             st.cc_maps.remove(&(source, args.node));
         }
-        let map = st.cc_maps.get(&(source, args.node)).cloned().unwrap_or_default();
+        let map: Vec<Value> = st.cc_maps.get(&(source, args.node))
+            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
+            .unwrap_or_default();
         ok_json(json!({"node": args.node, "source": args.source, "cc_map": map}))
     }
 
     /// List active CC bindings.
-    #[tool(name = "list_cc_maps", description = "List active MIDI CC → parameter bindings (plus armed MIDI-learn state when attached to the GUI app).")]
+    #[tool(name = "list_cc_maps", description = "List active MIDI CC → parameter/knob bindings (plus armed MIDI-learn state when attached to the GUI app).")]
     fn list_cc_maps(&self, Parameters(args): Parameters<ListCcMapsArgs>) -> Result<CallToolResult, McpError> {
         let remote = {
             let st = self.state.lock().unwrap();
@@ -1176,7 +1283,7 @@ impl McpServer {
                     other => format!("{other:?}"),
                 },
                 "node": node,
-                "bindings": v,
+                "bindings": v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect::<Vec<_>>(),
             }))
             .collect();
         ok_json(json!({"cc_maps": entries}))
@@ -1227,11 +1334,18 @@ impl McpServer {
     }
 
     /// Arm MIDI-learn in the running GUI app.
-    #[tool(name = "learn_cc", description = "Arm MIDI-learn in the running GUI app for (source, node, param) so the next incoming hardware CC binds to that parameter. Pass cancel=true to disarm. Needs --attach.")]
+    #[tool(name = "learn_cc", description = "Arm MIDI-learn in the running GUI app for (source, node, param/target or knob) so the next incoming hardware CC binds to it. Pass cancel=true to disarm. Needs --attach.")]
     fn learn_cc(&self, Parameters(args): Parameters<LearnCcArgs>) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool(
             "learn_cc",
-            json!({"node": args.node, "source": args.source, "param": args.param, "cancel": args.cancel}),
+            json!({
+                "node": args.node,
+                "source": args.source,
+                "param": args.param,
+                "target": args.target,
+                "knob": args.knob,
+                "cancel": args.cancel,
+            }),
         )
     }
 
@@ -2088,11 +2202,28 @@ mod tests {
             source: "keys".into(),
             cc: 74,
             param: Some(42),
+            target: None,
+            knob: None,
         })));
         assert_eq!(res["cc"], json!(74));
         assert_eq!(res["param"], json!(42));
+        assert_eq!(res["target"], json!("plugin"));
+        let res_knob = tool_json(&server.set_cc_map(Parameters(SetCcMapArgs {
+            node: 1,
+            source: "hw:0".into(),
+            cc: 7,
+            param: None,
+            target: None,
+            knob: Some("LEVEL".into()),
+        })));
+        assert_eq!(res_knob["param"], json!(0));
+        assert_eq!(res_knob["target"], json!("knob"));
         let listed = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: None, source: None })));
-        assert_eq!(listed["cc_maps"][0]["bindings"][0]["cc"], json!(74));
+        let all_bindings: Vec<&Value> = listed["cc_maps"].as_array().unwrap().iter()
+            .flat_map(|e| e["bindings"].as_array().unwrap().iter())
+            .collect();
+        assert!(all_bindings.iter().any(|b| b["cc"] == json!(74) && b["target"] == json!("plugin")));
+        assert!(all_bindings.iter().any(|b| b["cc"] == json!(7) && b["target"] == json!("knob")));
         let dsp = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: Some("mix".into()) })));
         assert_eq!(dsp["params"][0]["name"], json!("Mix"));
         engine.render(&mut buf, 2);
@@ -2100,8 +2231,18 @@ mod tests {
             node: 1,
             source: "keys".into(),
             cc: None,
+            target: None,
+            knob: None,
         })));
         assert_eq!(cleared["cc_map"].as_array().unwrap().len(), 0);
+        let cleared_knob = tool_json(&server.clear_cc_map(Parameters(ClearCcMapArgs {
+            node: 1,
+            source: "hw:0".into(),
+            cc: None,
+            target: Some("knob".into()),
+            knob: None,
+        })));
+        assert_eq!(cleared_knob["cc_map"].as_array().unwrap().len(), 0);
         engine.render(&mut buf, 2);
         let empty = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: None, source: None })));
         assert_eq!(empty["cc_maps"].as_array().unwrap().len(), 0);

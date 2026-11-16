@@ -602,6 +602,8 @@ pub enum Command {
         dest: NodeId,
         cc: u8,
         param: Option<ParamId>,
+        #[serde(default)]
+        target: crate::matrix::CcTarget,
     },
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
@@ -747,8 +749,9 @@ mod tests {
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
-            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42) },
-            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None, target: crate::matrix::CcTarget::PluginParam },
             Command::RecordStart,
             Command::RecordStop,
             Command::SetRecordSync { on: true },
@@ -767,6 +770,8 @@ mod tests {
         assert!(matches!(c, Command::SetNodeSplit { node: 0, point: Some(60) }));
         let c: Command = serde_json::from_str(r#"{"SetNodeSplit":{"node":0,"point":null}}"#).unwrap();
         assert!(matches!(c, Command::SetNodeSplit { node: 0, point: None }));
+        let c: Command = serde_json::from_str(r#"{"MatrixCcMap":{"source":{"Hardware":1},"dest":1,"cc":74,"param":42}}"#).unwrap();
+        assert!(matches!(c, Command::MatrixCcMap { dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, .. }));
     }
 
     #[test]

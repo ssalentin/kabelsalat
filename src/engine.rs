@@ -21,7 +21,7 @@ use crate::control::{
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
-use crate::matrix::{Matrix, MidiMsg, Rule, SourceId};
+use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
 use crate::record::RecorderTap;
@@ -895,6 +895,25 @@ impl GraphEngine {
         }
     }
 
+    /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
+    /// and `CcTarget::Knob` CC bindings). Allocation-free.
+    fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
+        let v = value as f32;
+        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+            // LV2 knobs map param index → nth control port (normalized).
+            s.plugin.set_control_normalized(param as usize, v);
+            true
+        } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
+            if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                s.level = v;
+                return true;
+            }
+            false
+        } else {
+            self.apply_dsp_or_master_param(node, param, v)
+        }
+    }
+
     /// MIDI-cable gate for one PLAYED note (before transpose): it reaches
     /// `dest` if ANY Keys node has a MIDI cable to `dest` from the port that
     /// note leaves on — port 0 when unsplit; LOW (0) below the split point,
@@ -1003,17 +1022,7 @@ impl GraphEngine {
                 }
             }
             Command::SetParam { node, param, value } => {
-                let v = value as f32;
-                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
-                    // LV2 knobs map param index → nth control port (normalized).
-                    s.plugin.set_control_normalized(param as usize, v);
-                } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
-                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
-                        s.level = v;
-                    }
-                } else {
-                    self.apply_dsp_or_master_param(node, param, v);
-                }
+                self.apply_engine_param(node, param, value);
             }
             Command::LoadLv2Preset { node, preset_uri } => {
                 if let Some(NodeKind::Lv2 { uri }) = self.graph.nodes.iter().find(|n| n.id == node).map(|n| &n.kind) {
@@ -1284,18 +1293,30 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let param = self
+                    let mapping = self
                         .matrix
                         .rules
                         .iter()
                         .find(|r| r.source == source && r.dest == dest && r.transform(msg).is_some())
-                        .and_then(|r| r.param_for_cc(m.data[0]));
-                    let has_midi = self.has_midi_cable(dest);
+                        .and_then(|r| r.mapping_for_cc(m.data[0]));
                     let is_clap_node = self
                         .graph
                         .node(dest)
                         .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
                     let norm = m.data[1] as f64 / 127.0;
+                    if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
+                        if self.apply_engine_param(dest, pid, norm) || is_clap_node {
+                            #[cfg(test)]
+                            if self.voices.iter().any(|s| s.node == dest) || !is_clap_node {
+                                self.cc_log.push((dest, pid, norm));
+                            } else if is_clap_node {
+                                self.cc_log.push((dest, pid, norm));
+                            }
+                        }
+                        continue;
+                    }
+                    let has_midi = self.has_midi_cable(dest);
+                    let param = mapping.map(|m| m.param);
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if !has_midi || !source_accepted(s, source) {
                             continue;
@@ -1327,14 +1348,14 @@ impl GraphEngine {
                             s.plugin.set_control_normalized(pid as usize, norm as f32);
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
-                        } else if self.apply_dsp_or_master_param(dest, pid, norm as f32) {
+                        } else if self.apply_engine_param(dest, pid, norm) {
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
                         }
                     }
                 }
             }
-            Command::MatrixCcMap { source, dest, cc, param } => {
+            Command::MatrixCcMap { source, dest, cc, param, target } => {
                 let changed = match param {
                     Some(p) => match self
                         .matrix
@@ -1342,12 +1363,12 @@ impl GraphEngine {
                         .iter_mut()
                         .find(|r| r.source == source && r.dest == dest)
                     {
-                        Some(r) => r.set_cc(cc, p),
+                        Some(r) => r.set_cc_target(cc, p, target),
                         None => {
                             // Learning a knob must not also wire the keys.
                             let mut r = Rule::new(source, dest);
                             r.cc_only = true;
-                            r.set_cc(cc, p);
+                            r.set_cc_target(cc, p, target);
                             self.matrix.add_rule(r);
                             true
                         }
@@ -1929,7 +1950,7 @@ mod master_limiter_tests {
 
 #[cfg(test)]
 mod tests {
-    use crate::matrix::{Matrix, MidiMsg, SourceId};
+    use crate::matrix::{CcTarget, Matrix, MidiMsg, SourceId};
 
     fn dests(m: &Matrix, src: SourceId, msg: MidiMsg) -> Vec<u32> {
         let mut out = Vec::new();
@@ -2683,7 +2704,7 @@ mod tests {
         engine.render(&mut buf, 2);
         // Device 20 is beyond the pre-routed hardware range: no rule to Surge A.
         let dev = SourceId::Hardware(20);
-        bus.send(Command::MatrixCcMap { source: dev, dest: 1, cc: 74, param: Some(42) });
+        bus.send(Command::MatrixCcMap { source: dev, dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam });
         engine.render(&mut buf, 2);
         engine.note_log.clear();
         engine.cc_log.clear();
@@ -2726,6 +2747,7 @@ mod tests {
             dest: 1,
             cc: 74,
             param: Some(42),
+            target: CcTarget::PluginParam,
         });
         engine.render(&mut buf, 2);
         let rev_after = pub_.lock().unwrap().rev;
@@ -2734,7 +2756,7 @@ mod tests {
         assert_eq!(r.param_for_cc(74), Some(42));
 
         // Duplicate MatrixCcMap does not bump rev.
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(42) });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam });
         engine.render(&mut buf, 2);
         assert_eq!(pub_.lock().unwrap().rev, rev_after);
 
@@ -2749,8 +2771,8 @@ mod tests {
         assert_eq!(engine.cc_passthrough_log, vec![(4, 74, 127), (4, 1, 90)]);
 
         // 4. Replace CC 74 -> param 99, and bind CC 7 -> Filter cutoff (param 0).
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(99) });
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: filter, cc: 7, param: Some(0) });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(99), target: CcTarget::PluginParam });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: filter, cc: 7, param: Some(0), target: CcTarget::PluginParam });
         engine.cc_log.clear();
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 0 });
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 7, value: 64 });
@@ -2761,7 +2783,7 @@ mod tests {
         assert!((engine.cc_log[1].2 - 64.0 / 127.0).abs() < 1e-6);
 
         // 5. Remove CC 74 -> node 1 returns to empty-map transparency.
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: None });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: None, target: CcTarget::PluginParam });
         engine.cc_log.clear();
         engine.cc_passthrough_log.clear();
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 1, value: 55 });
@@ -2793,6 +2815,7 @@ mod tests {
             dest: surge,
             cc: 74,
             param: Some(cutoff.id),
+            target: CcTarget::PluginParam,
         });
         let mut buf = vec![0.0f32; 256 * 2];
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 127 });
@@ -2804,6 +2827,75 @@ mod tests {
         for _ in 0..4 { engine.render(&mut buf, 2); }
         let at_min = main.param_value(cutoff.id).expect("cutoff readback");
         assert!((at_min - cutoff.min).abs() < 1e-3, "CC 0 should reach min {}: got {at_min}", cutoff.min);
+    }
+
+    #[test]
+    fn cc_knob_target_matches_set_param_on_dsp_and_clap() {
+        // 1. DSP Delay knob: CC target Knob with P_MIX moves the exact same Delay mix as Command::SetParam.
+        let build_dsp = || {
+            let (mut bus, drain) = command_bus();
+            let mut g = crate::control::Graph::default();
+            let metro = g.add_node(NodeKind::Dsp(crate::control::DspKind::Metronome), name_bytes("METRO"));
+            let delay = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
+            let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+            g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: delay, port: 0 }, PortKind::Audio);
+            g.connect_with_id(2, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+            let engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+            bus.send(Command::SetNodePlaying { node: metro, playing: true });
+            (engine, bus, delay)
+        };
+        let (mut eng_cc, mut bus_cc, delay_cc) = build_dsp();
+        let (mut eng_sp, mut bus_sp, delay_sp) = build_dsp();
+        let val = 90u8;
+        let norm = val as f64 / 127.0;
+        bus_cc.send(Command::MatrixCcMap {
+            source: SourceId::Hardware(0),
+            dest: delay_cc,
+            cc: 12,
+            param: Some(super::P_MIX),
+            target: CcTarget::Knob,
+        });
+        bus_cc.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 12, value: val });
+        bus_sp.send(Command::SetParam { node: delay_sp, param: super::P_MIX, value: norm });
+        let mut buf_cc = vec![0.0f32; 256 * 2];
+        let mut buf_sp = vec![0.0f32; 256 * 2];
+        for _ in 0..8 {
+            eng_cc.render(&mut buf_cc, 2);
+            eng_sp.render(&mut buf_sp, 2);
+            assert_eq!(buf_cc, buf_sp, "DSP knob CC must match SetParam sample-for-sample");
+        }
+
+        // 2. CLAP unit knob (P_LEVEL): moves voice level without touching CLAP param 0.
+        let Ok((voice, mut main)) = crate::host::ClapVoice::new(48000.0) else {
+            return;
+        };
+        let params = main.param_list();
+        let p0_before = params.first().and_then(|p| main.param_value(p.id));
+        let p0_id = params.first().map(|p| p.id).unwrap_or(0);
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![(surge, voice)]);
+        // Even on an unrouted device (or if the voice rig_device differs), a Knob CC moves s.level.
+        bus.send(Command::MatrixCcMap {
+            source: SourceId::Hardware(3),
+            dest: surge,
+            cc: 7,
+            param: Some(super::P_LEVEL),
+            target: CcTarget::Knob,
+        });
+        bus.send(Command::Cc { source: SourceId::Hardware(3), channel: 0, cc: 7, value: 0 });
+        let mut buf = vec![0.0f32; 128 * 2];
+        for _ in 0..2 { engine.render(&mut buf, 2); }
+        assert!((engine.voices[0].level - 0.0).abs() < 1e-6, "CC 7=0 must set voice level to 0");
+        bus.send(Command::Cc { source: SourceId::Hardware(3), channel: 0, cc: 7, value: 64 });
+        for _ in 0..2 { engine.render(&mut buf, 2); }
+        assert!((engine.voices[0].level - 64.0 / 127.0).abs() < 1e-6, "CC 7=64 must match SetParam(P_LEVEL)");
+        assert_eq!(main.param_value(p0_id), p0_before, "Knob P_LEVEL binding must not touch CLAP param 0");
     }
 }
 
@@ -3363,12 +3455,14 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         dest: surge,
         cc: 74,
         param: Some(cutoff.id),
+        target: CcTarget::PluginParam,
     });
     bus.send(Command::MatrixCcMap {
         source: SourceId::Hardware(0),
         dest: surge,
         cc: 7,
         param: Some(gain_p.id),
+        target: CcTarget::PluginParam,
     });
     let mut buf = vec![0.0f32; 256 * 2];
     let mut render_note = |engine: &mut GraphEngine, cc: u8, val: u8| -> Vec<f32> {

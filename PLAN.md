@@ -725,5 +725,27 @@ Everything queued lives here; update this section as work lands.
     plugin on one path, the same sample on a dry path; the transients must line up
     sample-exact (cross-correlation peak at lag 0). Needed before sends/parallel buses.
   - Some checks stay by ear: the self-tests print what to listen for.
-- **Bravo** (https://obra.art/bravo, an "AI DAW"): research running — mixing model and
-  agent architecture compared with ours; findings and adopted items land here.
+- **Bravo** (https://obra.art/bravo, a closed-source "AI DAW"; report:
+  docs/research/bravo.md, inferred from its public guides — no source available).
+  Adopted, in order (S/M = size):
+  1. **Measure loop (M):** the agent is deaf beyond a peak meter. Add short-term and
+     integrated LUFS, true peak, low-end mono check and a band summary to the engine
+     (published like `GraphPub.mix`, rule 33); a `measure_mix` tool in assistant +
+     exec_tool + MCP (rule 6) so the agent can check its own mix moves. Pairs with
+     the audio-analysis testing item above (same meters).
+  2. **Agent undo (M):** `History` (session.rs) exists but is not agent-facing. One
+     agent job = one undo step (snapshot before its first mutating call), snapshot
+     also the per-rig mix; `undo`/`redo` tools in both frontends.
+  3. **Capability discovery (S):** `catalog` (every tool + args, derived from
+     `tools()`) and `can` (actions valid for the rig in view) to keep a growing tool
+     surface honest.
+  4. **Loudness target (S, after 1):** `set_master_target` (−14/−16/−8 LUFS or a
+     number, true peak ≤ −1 dBTP) driving master gain before the limiter (rule 49).
+  5. **Sends as a typed command (M, extends #5):** `set_send(rig|node, bus, amount)`
+     + per-bus meters, mirrored in the UI (rule 25), not free-wiring only.
+  6. **Recorded agent recipes (M):** name a sequence of tool calls once ("my vocal
+     chain"), replay it on any rig as one undo step.
+  7. **Attach consent (S):** `mcp --attach` asks once in the UI before an external
+     agent may change the live set; revocable.
+  Not adopted: timeline/arranger, ML stem separation, black-box auto-mix, cloud
+  credits, multi-agent "musicians", foreign-DAW import.

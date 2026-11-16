@@ -339,7 +339,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"play_file",
-            "description":"Play a backing-track audio file (16-bit WAV) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
+            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
             "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"}},"required":["path"]}
         }},
         {"type":"function","function":{

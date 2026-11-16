@@ -252,6 +252,10 @@ Learned so far (2026-11-15, UI polish pass):
 53. **Rig meters are post-fader:** a muted rig, or any rig while another is
     soloed, reads silent in the rig strip (pre-fader edge levels made a
     working solo look broken).
+54. **Names users read use local time; the app plays what it writes:** take
+    names were UTC (a 16:31 take named 15:31), and the file player read only
+    16-bit WAV while the recorder writes 32-bit float. Any file format the
+    app writes must round-trip through its own reader (wav_format_tests).
 
 ## Ground rules
 

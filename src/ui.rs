@@ -826,6 +826,14 @@ fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
 }
 
 /// 1px hairline vertical rule between nav items (§4.14).
+/// Open a folder in the desktop's file manager (detached; never in tests).
+fn open_folder(dir: &std::path::Path) {
+    if cfg!(test) { return; } // tests never touch the user's folders (rule 37)
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::process::Command::new("xdg-open").arg(dir)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+}
+
 fn nav_separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 14.0), egui::Sense::hover());
     ui.painter().line_segment(
@@ -1387,6 +1395,8 @@ struct DemoApp {
     rig_chip_rects: Vec<Rect>,
     /// Last frame's "+ Rig" button rect in the overview strip (points).
     add_rig_rect: Rect,
+    /// UI time until which the last take is playing (Play/Stop chip state).
+    take_play_until: f32,
     /// Top-bar groups (tests): the View segment and the Bottom panel toggles.
     view_group_rect: Rect,
     dock_group_rect: Rect,
@@ -1680,6 +1690,7 @@ impl DemoApp {
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
+            take_play_until: 0.0,
             view_group_rect: Rect::NOTHING,
             dock_group_rect: Rect::NOTHING,
             plugins_loaded: false,
@@ -3018,6 +3029,19 @@ impl DemoApp {
         }
     }
 
+    /// Play (or stop) the last recorded take through the file player.
+    fn toggle_take_playback(&mut self, path: &str, secs: f64) {
+        let playing = self.take_play_until > self.ui_time;
+        let gain = if playing { 0.0 } else { 0.8 };
+        if let Some(pc) = &self.player_ctrl {
+            if playing { pc.stop() } else { pc.play(path) }
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+        }
+        self.take_play_until = if playing { 0.0 } else { self.ui_time + secs as f32 + 0.2 };
+    }
+
     fn assistant_open(&self) -> bool { self.dock == DockView::Assistant }
 
     fn keyboard_open(&self) -> bool { self.dock == DockView::Keyboard }
@@ -3480,7 +3504,7 @@ impl DemoApp {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.8).clamp(0.0, 1.0) as f32;
                 if path.is_empty() {
-                    return "play_file needs a path to a 16-bit WAV file".into();
+                    return "play_file needs a path to a WAV file (16/24-bit PCM or 32-bit float)".into();
                 }
                 if let Some(pc) = &self.player_ctrl {
                     pc.play(path);
@@ -5759,6 +5783,28 @@ impl DemoApp {
                         self.ui_transport_grace = self.ui_time + 0.6;
                         if let Some(bus) = &self.bus {
                             let _ = bus.lock().unwrap().send(Command::SetRecordSync { on: self.record_sync });
+                        }
+                    }
+                    // Last take (user: "what does record even do?"): after a
+                    // stop, name the file and offer Play (through the file
+                    // player, into the master) and the folder.
+                    if !recording {
+                        if let Some(path) = snap.as_ref().filter(|s| s.takes > 0 && s.finalized).and_then(|s| s.path.clone()) {
+                            ui.add_space(6.0);
+                            let name = std::path::Path::new(&path).file_name()
+                                .map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                            ui.label(egui::RichText::new(format!("saved {name}")).size(11.5).color(theme::INK_2))
+                                .on_hover_text(path.clone());
+                            let playing = self.take_play_until > self.ui_time;
+                            if theme::chip_button(ui, if playing { "■ Stop" } else { "▶ Play" }, playing)
+                                .on_hover_text("play the last take through the master")
+                                .clicked()
+                            {
+                                self.toggle_take_playback(&path, secs);
+                            }
+                            if theme::chip_button(ui, "Folder", false).on_hover_text("open the recordings folder").clicked() {
+                                open_folder(&crate::record::record_dir());
+                            }
                         }
                     }
                     // Telemetry IN the page (D toggles): right-aligned bar text.

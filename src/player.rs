@@ -10,7 +10,7 @@
 //! `play(path)` / `stop()`. This keeps variable-length paths off the fixed-size
 //! control-plane command bus.
 //!
-//! First milestone: 16-bit PCM WAV (mono/stereo), linearly resampled to the
+//! First milestone: 16/24-bit PCM or 32-bit float WAV (mono/stereo), linearly resampled to the
 //! engine rate. Compressed formats (mp3/flac/ogg via symphonia) are a follow-up.
 
 use std::io::Read;
@@ -95,7 +95,7 @@ fn decode_loop(rx: Receiver<PlayerMsg>, mut producer: Producer<f32>, sr: u32, ch
     }
 }
 
-/// Decode a 16-bit PCM WAV, resample to `sr`, upmix to `ch`, push to the ring.
+/// Decode a WAV (16/24-bit PCM, 32-bit float), resample to `sr`, upmix to `ch`, push to the ring.
 /// Checks `rx` for Stop between blocks so playback can be interrupted.
 fn stream_wav(
     mut file: std::fs::File,
@@ -115,7 +115,7 @@ fn stream_wav(
     let file_sr = wav.sample_rate.max(1);
     let file_ch = wav.channels.max(1);
     let ratio = file_sr as f64 / sr as f64;
-    let frames = wav.data.len() / (2 * file_ch);
+    let frames = wav.data.len() / file_ch;
     let mut pos = 0.0f64;
     let mut block = [0.0f32; 1024];
     while *playing {
@@ -166,15 +166,15 @@ fn stream_wav(
     }
 }
 
-fn sample_at(data: &[i16], frame: usize, channel: usize, channels: usize) -> f32 {
-    let idx = frame * channels + channel;
-    data.get(idx).map(|&s| s as f32 / 32768.0).unwrap_or(0.0)
+fn sample_at(data: &[f32], frame: usize, channel: usize, channels: usize) -> f32 {
+    data.get(frame * channels + channel).copied().unwrap_or(0.0)
 }
 
 struct Wav {
     sample_rate: u32,
     channels: usize,
-    data: Vec<i16>,
+    /// Interleaved samples, normalized to -1..1.
+    data: Vec<f32>,
 }
 
 fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
@@ -186,23 +186,33 @@ fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
     let mut sample_rate = 0u32;
     let mut channels = 0usize;
     let mut bits = 0u16;
-    let mut data: Vec<i16> = Vec::new();
+    let mut format = 0u16;
+    let mut data: Vec<f32> = Vec::new();
     let mut i = 12;
     while i + 8 <= bytes.len() {
         let id = &bytes[i..i + 4];
         let size = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]]) as usize;
         let body = i + 8;
         if id == b"fmt " && body + 16 <= bytes.len() {
+            format = u16::from_le_bytes([bytes[body], bytes[body + 1]]);
+            // WAVE_FORMAT_EXTENSIBLE: the real format is the subformat GUID's first 2 bytes.
+            if format == 0xFFFE && body + 26 <= bytes.len() {
+                format = u16::from_le_bytes([bytes[body + 24], bytes[body + 25]]);
+            }
             channels = u16::from_le_bytes([bytes[body + 2], bytes[body + 3]]) as usize;
             sample_rate = u32::from_le_bytes([bytes[body + 4], bytes[body + 5], bytes[body + 6], bytes[body + 7]]);
             bits = u16::from_le_bytes([bytes[body + 14], bytes[body + 15]]);
         } else if id == b"data" {
             let end = (body + size).min(bytes.len());
-            if bits != 16 {
-                anyhow::bail!("only 16-bit PCM WAV supported (got {bits}-bit)");
-            }
-            for chunk in bytes[body..end].chunks_exact(2) {
-                data.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+            // 16/24-bit PCM and 32-bit float (kabelsalat's own recordings).
+            let raw = &bytes[body..end];
+            match (format, bits) {
+                (1, 16) => data.extend(raw.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)),
+                (1, 24) => data.extend(raw.chunks_exact(3).map(|c| {
+                    (i32::from_le_bytes([0, c[0], c[1], c[2]]) >> 8) as f32 / 8_388_608.0
+                })),
+                (3, 32) => data.extend(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
+                _ => anyhow::bail!("unsupported WAV (format {format}, {bits}-bit): 16/24-bit PCM or 32-bit float"),
             }
         }
         i = body + size + (size & 1);
@@ -236,4 +246,52 @@ pub fn run_test() -> anyhow::Result<()> {
     anyhow::ensure!(nonzero > 1000, "player produced no audio ({nonzero} nonzero of {total})");
     println!("player-test: OK — backing track decoded and streamed ({nonzero} nonzero samples of {total})");
     Ok(())
+}
+
+#[cfg(test)]
+mod wav_format_tests {
+    use super::*;
+
+    fn wav_bytes(format: u16, bits: u16, sr: u32, ch: u16, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(b"RIFF");
+        b.extend(((36 + data.len()) as u32).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend(format.to_le_bytes());
+        b.extend(ch.to_le_bytes());
+        b.extend(sr.to_le_bytes());
+        b.extend((sr * ch as u32 * bits as u32 / 8).to_le_bytes());
+        b.extend((ch * bits / 8).to_le_bytes());
+        b.extend(bits.to_le_bytes());
+        b.extend(b"data");
+        b.extend((data.len() as u32).to_le_bytes());
+        b.extend(data);
+        b
+    }
+
+    fn parse(bytes: &[u8]) -> anyhow::Result<Wav> {
+        let p = std::env::temp_dir().join(format!("ksalat-wav-{}-{}.wav", std::process::id(), bytes.len()));
+        std::fs::write(&p, bytes)?;
+        let r = parse_wav(&mut std::fs::File::open(&p)?);
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    #[test]
+    fn reads_float32_recordings_pcm24_and_pcm16() {
+        let floats: Vec<u8> = [0.5f32, -0.25, 1.0, -1.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let w = parse(&wav_bytes(3, 32, 48000, 2, &floats)).expect("float WAV (our own recordings)");
+        assert_eq!((w.sample_rate, w.channels), (48000, 2));
+        assert_eq!(w.data, vec![0.5, -0.25, 1.0, -1.0]);
+
+        // 24-bit: +0.5 = 0x400000, -0.5 = 0xC00000.
+        let w = parse(&wav_bytes(1, 24, 44100, 1, &[0x00, 0x00, 0x40, 0x00, 0x00, 0xC0])).expect("pcm24");
+        assert!((w.data[0] - 0.5).abs() < 1e-6 && (w.data[1] + 0.5).abs() < 1e-6, "{:?}", w.data);
+
+        let w = parse(&wav_bytes(1, 16, 44100, 1, &16384i16.to_le_bytes())).expect("pcm16");
+        assert!((w.data[0] - 0.5).abs() < 1e-6);
+
+        assert!(parse(&wav_bytes(1, 8, 44100, 1, &[128])).is_err(), "8-bit is refused with a reason");
+    }
 }

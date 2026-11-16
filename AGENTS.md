@@ -256,6 +256,11 @@ Learned so far (2026-11-15, UI polish pass):
     names were UTC (a 16:31 take named 15:31), and the file player read only
     16-bit WAV while the recorder writes 32-bit float. Any file format the
     app writes must round-trip through its own reader (wav_format_tests).
+55. **Window commands only on your own, focused window:** `hyprctl dispatch`
+    acts on the ACTIVE window — a probe fullscreened the user's editor. Check
+    `hyprctl activewindow` shows your pid immediately before any dispatch
+    (this Hyprland uses Lua: `hyprctl dispatch 'hl.dsp.window.fullscreen()'`),
+    and crop screenshots to the window geometry, not the whole output.
 
 ## Ground rules
 

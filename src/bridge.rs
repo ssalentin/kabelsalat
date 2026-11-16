@@ -61,6 +61,27 @@ fn ui_call_within(tool: String, args: Value, wait: Duration) -> Result<String, S
     rx.recv_timeout(wait).map_err(|_| format!("the app did not answer in {} ms", wait.as_millis()))
 }
 
+/// Wall-clock ms of the last bridge request (an external agent is active).
+pub static LAST_REMOTE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The user paused external agents in the app: commands and UI tools that
+/// change anything are refused; queries still answer.
+pub static REMOTE_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// While paused: commands and changing UI tools are refused; queries and
+/// read-only UI tools (get_/list_/search_) still answer.
+fn refused_while_paused(req: &Value) -> bool {
+    let op = req.get("op").and_then(Value::as_str);
+    let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
+    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_");
+    op == Some("cmd") || (op == Some("ui") && !reads)
+}
+
+const PAUSED_MSG: &str = "external agents are paused in the kabelsalat app — the user can allow them again with the 'Agent paused' chip in the top bar";
+
 /// UI inbox tool the bridge sends before forwarding a rack edit: the app
 /// snapshots the rack for agent undo while the engine has not seen the edit.
 pub const BEFORE_REMOTE_EDIT: &str = "__before_remote_edit";
@@ -259,6 +280,10 @@ fn handle_line_with_pub(
         Ok(v) => v,
         Err(e) => return err_reply(format!("invalid JSON: {e}")),
     };
+    LAST_REMOTE_MS.store(now_ms(), Ordering::Relaxed);
+    if REMOTE_PAUSED.load(Ordering::Relaxed) && refused_while_paused(&req) {
+        return err_reply(PAUSED_MSG);
+    }
     match req.get("op").and_then(Value::as_str) {
         Some("cmd") => {
             let Some(cmd_val) = req.get("cmd") else {
@@ -584,5 +609,13 @@ mod tests {
         assert_eq!(reply["data"]["count_in_bars"], json!(2));
         assert_eq!(reply["data"]["bpm"], json!(124.0));
         assert_eq!(reply["data"]["transport_playing"], json!(false));
+    }
+
+    #[test]
+    fn pausing_external_agents_blocks_changes_not_reads() {
+        assert!(refused_while_paused(&json!({"op": "cmd", "cmd": {"SetBpm": {"bpm": 90.0}}})));
+        assert!(refused_while_paused(&json!({"op": "ui", "tool": "add_rig", "args": {}})));
+        assert!(!refused_while_paused(&json!({"op": "ui", "tool": "list_sounds"})));
+        assert!(!refused_while_paused(&json!({"op": "query", "name": "get_graph"})));
     }
 }

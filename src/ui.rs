@@ -6453,8 +6453,21 @@ impl DemoApp {
         // Per-rig activity for the overview strip: instant attack, slow release.
         let n_rigs = self.rig_count();
         if self.rig_levels.len() != n_rigs { self.rig_levels.resize(n_rigs, 0.0); }
+        // With an engine, a rig is active when its audio actually sounds (the
+        // published per-edge levels, rule 16): UI LEDs only follow the rig in
+        // view, while the keyboard can play every rig that listens to it.
+        // Read the levels directly: a hidden rig's cables are not simulated.
+        let heard = self.edge_levels.clone();
         for r in 0..n_rigs {
-            let target = self.units.iter().filter(|u| u.rig == r as u8).map(|u| u.led).fold(0.0f32, f32::max);
+            let target = if let Some(l) = &heard {
+                self.cables.iter()
+                    .filter(|c| c.kind == PortKind::Audio && c.dying < 0.0)
+                    .filter(|c| self.units.get(c.src).map_or(false, |u| u.rig == r as u8))
+                    .map(|c| edge_display_level(l.load(c.id)).min(1.0))
+                    .fold(0.0f32, f32::max)
+            } else {
+                self.units.iter().filter(|u| u.rig == r as u8).map(|u| u.led).fold(0.0f32, f32::max)
+            };
             let cur = self.rig_levels[r];
             self.rig_levels[r] = if target > cur { target } else { cur + (target - cur) * (1.0 - (-dt / 0.25).exp()) };
         }
@@ -10915,6 +10928,25 @@ mod audio_viz_tests {
     }
 
     fn active_pulses(c: &Cable) -> usize { c.pulses.iter().filter(|p| p.active).count() }
+
+    #[test]
+    fn rig_strip_shows_every_rig_that_sounds_not_only_the_one_in_view() {
+        let (mut app, levels) = engine_app();
+        app.load_multi_rig_demo();
+        app.layout(SCREEN);
+        app.set_active_rig(0);
+        // The keyboard plays both rigs; only rig B's audio is published here.
+        let rig_b_audio: Vec<u32> = app.cables.iter()
+            .filter(|c| c.kind == PortKind::Audio && app.units.get(c.src).map_or(false, |u| u.rig == 1))
+            .map(|c| c.id).collect();
+        assert!(!rig_b_audio.is_empty(), "rig B has audio cables");
+        for _ in 0..30 {
+            for &id in &rig_b_audio { levels.store(id, 0.3); }
+            app.update(1.0 / 60.0);
+        }
+        assert!(app.rig_levels[1] > 0.3, "rig B sounds while rig A is in view: {:?}", app.rig_levels);
+        assert!(app.rig_levels[0] < 0.05, "rig A is silent: {:?}", app.rig_levels);
+    }
 
     #[test]
     fn published_edge_levels_make_the_whole_chain_flow() {

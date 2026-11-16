@@ -191,6 +191,10 @@ Learned so far (2026-11-15, UI polish pass):
     or loading a template while holding a key left Surge droning. Run the
     `verify-held-notes` check (`cargo test --bin kabelsalat held_notes`) on any
     routing change, and add new routing commands to its alphabet.
+42. **LV2 control inputs start at the plugin's declared `lv2:default`**
+    (clamped to the range; missing default = minimum), never a "0 → 1.0"
+    unity hack: it silenced Vitalium and the LSP oscillator through the
+    engine. `lv2-instrument-engine-test` must report an audible peak.
 
 ## Ground rules
 

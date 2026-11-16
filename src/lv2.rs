@@ -176,16 +176,18 @@ struct ControlMeta {
     default: f32,
 }
 
-/// Read `(default, min, max)` for a port, freeing the owned lilv nodes.
+/// Read `(default, min, max)` for a port, freeing the owned lilv nodes. A
+/// missing default falls back to the minimum, and the default is clamped to
+/// the range: a control input starts at the value the plugin declares.
 unsafe fn read_port_range(plugin: *const LilvPlugin, port: *const LilvPort) -> (f32, f32, f32) {
     let mut def: *mut LilvNode = std::ptr::null_mut();
     let mut min: *mut LilvNode = std::ptr::null_mut();
     let mut max: *mut LilvNode = std::ptr::null_mut();
     lilv_port_get_range(plugin, port, &mut def, &mut min, &mut max);
-    let d = if !def.is_null() { let f = lilv_node_as_float(def); lilv_node_free(def); f } else { 1.0 };
     let lo = if !min.is_null() { let f = lilv_node_as_float(min); lilv_node_free(min); f } else { 0.0 };
     let hi = if !max.is_null() { let f = lilv_node_as_float(max); lilv_node_free(max); f } else { 1.0 };
-    (d, lo, hi)
+    let d = if !def.is_null() { let f = lilv_node_as_float(def); lilv_node_free(def); f } else { lo };
+    (d.clamp(lo.min(hi), lo.max(hi)), lo, hi)
 }
 
 /// Read metadata for all control-input ports of `plugin`.
@@ -455,17 +457,7 @@ pub fn host_test() -> anyhow::Result<()> {
             } else if is_audio && !is_in {
                 audio_out.push(i as usize);
             } else if is_control && is_in {
-                // Set the control to its default (unity-ish for a gain plugin).
-                let mut def: *mut LilvNode = std::ptr::null_mut();
-                lilv_port_get_range(plugin, port, &mut def, std::ptr::null_mut(), std::ptr::null_mut());
-                let v = if !def.is_null() {
-                    let f = lilv_node_as_float(def);
-                    lilv_node_free(def);
-                    f
-                } else {
-                    1.0
-                };
-                buffers[i as usize][0] = if v == 0.0 { 1.0 } else { v };
+                buffers[i as usize][0] = read_port_range(plugin, port).0;
             }
             connect_port(handle, i, buffers[i as usize].as_mut_ptr() as *mut c_void);
         }
@@ -617,7 +609,7 @@ impl Lv2Plugin {
                     let (d, lo, hi) = read_port_range(plugin, port);
                     let symbol = node_borrowed(lilv_port_get_symbol(plugin, port));
                     let name = node_owned(lilv_port_get_name(plugin, port));
-                    buffers[i as usize][0] = if d == 0.0 { 1.0 } else { d };
+                    buffers[i as usize][0] = d;
                     control_in.push(i as usize);
                     control_ranges.push((lo, hi));
                     control_by_symbol.insert(symbol.clone(), i as usize);

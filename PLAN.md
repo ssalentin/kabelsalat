@@ -690,6 +690,10 @@ Everything queued lives here; update this section as work lands.
   loading. LV2 instruments can extend this.
 - LV2 instrument classification is a permissive port-based hint (the authoritative LV2
   class is a blank node lilv can't resolve here).
+- CLAP host hardening probes (2026-11-16): across host-test, audio-test and the
+  Dexed/Vitalium/Surge tests no plugin called `request_restart` or logged; Dexed
+  issues `request_callback` on the main thread only (already pumped). Restart
+  handling and an RT-safe log ring wait for a plugin that needs them.
 - System-audio capture of the output monitor can feed back if kabelsalat plays to the
   same sink (muted by default).
 

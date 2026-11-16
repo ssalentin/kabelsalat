@@ -79,6 +79,8 @@ const AUDIO_PULSE_MIN: f32 = 0.05;
 const AUDIO_PULSE_EVERY: f32 = 0.25;
 /// Key LED decay τ (s): 1.0 → the 0.02 lit threshold in ≈0.35 s.
 const KEY_LED_TAU: f32 = 0.09;
+/// How often hardware MIDI inputs are rescanned for hot-plugged devices.
+const HW_RESCAN_SECS: f32 = 2.0;
 /// Unit activity LED decay τ (s).
 const UNIT_LED_TAU: f32 = 0.12;
 
@@ -204,6 +206,129 @@ pub struct NoteEvent {
 /// Hardware MIDI → engine from the midir thread (see `DemoApp::hw_direct`).
 /// Same mapping as the note sink: velocity scaled by the Keys VEL knob
 /// (published lock-free by the UI), velocity 0 = NoteOff.
+/// Hardware MIDI devices as the MIDI thread sees them: (port name, plugged
+/// in) per device index = `SourceId::Hardware(index)`. An unplugged device
+/// keeps its index, so rig bindings and learned CCs survive a re-plug.
+#[derive(Default)]
+struct HwMidi {
+    devices: Mutex<Vec<(String, bool)>>,
+    rev: std::sync::atomic::AtomicU64,
+}
+
+/// The MIDI thread: connects every hardware input, rescans every
+/// `HW_RESCAN_SECS` for hot-plugged devices, and owns the connections, so
+/// sound never depends on UI frames (rule 31). Ends with the app.
+fn spawn_hw_midi(
+    hw: Arc<HwMidi>,
+    q: Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    cc_q: Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
+    direct: Arc<HwDirect>,
+) {
+    let spawned = std::thread::Builder::new().name("kabelsalat-midi".into()).spawn(move || {
+        let mut conns: Vec<Option<midir::MidiInputConnection<()>>> = Vec::new();
+        while Arc::strong_count(&hw) > 1 {
+            rescan_hw_midi(&hw, &mut conns, &q, &cc_q, &direct);
+            std::thread::sleep(std::time::Duration::from_secs_f32(HW_RESCAN_SECS));
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("midi: hot-plug thread failed to start: {e}");
+    }
+}
+
+fn rescan_hw_midi(
+    hw: &HwMidi,
+    conns: &mut Vec<Option<midir::MidiInputConnection<()>>>,
+    q: &Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
+    direct: &Arc<HwDirect>,
+) {
+    let Ok(probe) = MidiInput::new("kabelsalat-probe") else { return };
+    // KABELSALAT_MIDI_THROUGH=1 accepts the kernel's Midi Through port — a
+    // hardware-path self-test feed (aseqsend -p 14:0).
+    let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
+    let ports: Vec<(String, midir::MidiInputPort)> = probe.ports().into_iter()
+        .map(|p| (probe.port_name(&p).unwrap_or_default(), p))
+        .filter(|(name, _)| !(name.contains("kabelsalat")
+            || (name.contains("Midi Through") && !through_ok)
+            || name == "System"
+            || name == "Announce"))
+        .collect();
+    let Ok(mut devices) = hw.devices.lock() else { return };
+    let mut changed = false;
+    for (i, (name, live)) in devices.iter_mut().enumerate() {
+        if *live && !ports.iter().any(|(n, _)| n == name) {
+            if let Some(c) = conns.get_mut(i).and_then(Option::take) { c.close(); }
+            *live = false;
+            changed = true;
+        }
+    }
+    for (name, port) in &ports {
+        let dev = match devices.iter().position(|(n, _)| n == name) {
+            Some(i) if devices[i].1 => continue,
+            Some(i) => i,
+            None => {
+                devices.push((name.clone(), false));
+                devices.len() - 1
+            }
+        };
+        if conns.len() < devices.len() { conns.resize_with(devices.len(), || None); }
+        conns[dev] = connect_hw_input(port, dev as u32, q, cc_q, direct);
+        devices[dev].1 = conns[dev].is_some();
+        changed = true;
+        eprintln!("midi: {} {name}", if devices[dev].1 { "connected" } else { "failed to connect" });
+    }
+    if changed {
+        hw.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Open one hardware input. Events sound from the MIDI thread (rule 31) and
+/// queue for the UI animation.
+fn connect_hw_input(
+    port: &midir::MidiInputPort,
+    dev: u32,
+    q: &Arc<Mutex<VecDeque<(NoteEvent, bool)>>>,
+    cc_q: &Arc<Mutex<VecDeque<(SourceId, u8, u8, u8)>>>,
+    direct: &Arc<HwDirect>,
+) -> Option<midir::MidiInputConnection<()>> {
+    let mi = MidiInput::new("kabelsalat-hw").ok()?;
+    let (q, cc_q, direct) = (q.clone(), cc_q.clone(), direct.clone());
+    mi.connect(
+        port,
+        "kabelsalat-hw",
+        move |_stamp, msg: &[u8], _| {
+            if msg.len() >= 3 {
+                let st = msg[0] & 0xF0;
+                if st == 0x90 || st == 0x80 {
+                    let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
+                    let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
+                    let sounded = direct.send(&ev);
+                    if let Ok(mut q) = q.lock() {
+                        q.push_back((ev, sounded));
+                        while q.len() > 256 {
+                            q.pop_front();
+                        }
+                    }
+                } else if st == 0xB0 {
+                    let ch = msg[0] & 0x0F;
+                    let cc = msg[1] & 0x7F;
+                    let val = msg[2] & 0x7F;
+                    let src = SourceId::Hardware(dev);
+                    let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
+                    if let Ok(mut cq) = cc_q.lock() {
+                        cq.push_back((src, ch, cc, val));
+                        while cq.len() > 256 {
+                            cq.pop_front();
+                        }
+                    }
+                }
+            }
+        },
+        (),
+    ).ok()
+}
+
 struct HwDirect {
     bus: Mutex<Option<Arc<Mutex<CommandBus>>>>,
     /// Keys VEL knob as f32 bits (starts at the knob's 0.8 default).
@@ -1219,7 +1344,9 @@ struct DemoApp {
     /// Hardware MIDI → engine straight from the midir thread: sound never
     /// waits for a UI frame (16 ms focused, 33 ms when throttled unfocused).
     hw_direct: Arc<HwDirect>,
-    _hw_conns: Vec<midir::MidiInputConnection<()>>,
+    /// Hardware MIDI inputs, connected and hot-plugged by the MIDI thread.
+    hw_midi: Arc<HwMidi>,
+    hw_midi_rev: u64,
     hw_status: String,
     /// Connected hardware MIDI device names, indexed by device id.
     hw_devices: Vec<String>,
@@ -1412,7 +1539,8 @@ impl DemoApp {
             hw_queue: Arc::new(Mutex::new(VecDeque::new())),
             hw_cc_queue: Arc::new(Mutex::new(VecDeque::new())),
             hw_direct: Arc::new(HwDirect::default()),
-            _hw_conns: Vec::new(),
+            hw_midi: Arc::new(HwMidi::default()),
+            hw_midi_rev: u64::MAX,
             hw_status: String::new(),
             hw_devices: Vec::new(),
             rig_device: [None; VOICE_POOL],
@@ -1452,77 +1580,11 @@ impl DemoApp {
             last_unit_click: None,
         };
 
-        // Hardware MIDI auto-wire at startup: events queue here and are drained
-        // on the UI thread through fire_keys, so sound and cable animation stay
-        // in sync.
-        let mut hw_names = Vec::new();
-        let mut hw_devices: Vec<String> = Vec::new();
-        let mut dev_idx = 0u32;
-        if let Ok(probe) = MidiInput::new("kabelsalat-probe") {
-            for port in probe.ports() {
-                let name = probe.port_name(&port).unwrap_or_default();
-                // KABELSALAT_MIDI_THROUGH=1 accepts the kernel's Midi Through
-                // port — a hardware-path self-test feed (aseqsend -p 14:0).
-                let through_ok = std::env::var("KABELSALAT_MIDI_THROUGH").is_ok_and(|v| !v.is_empty() && v != "0");
-                if name.contains("kabelsalat")
-                    || (name.contains("Midi Through") && !through_ok)
-                    || name == "System"
-                    || name == "Announce"
-                {
-                    continue;
-                }
-                if let Ok(mi) = MidiInput::new("kabelsalat-hw") {
-                    let q = app.hw_queue.clone();
-                    let cc_q = app.hw_cc_queue.clone();
-                    let direct = app.hw_direct.clone();
-                    let dev = dev_idx;
-                    if let Ok(conn) = mi.connect(
-                        &port,
-                        "kabelsalat-hw",
-                        move |_stamp, msg: &[u8], _| {
-                            if msg.len() >= 3 {
-                                let st = msg[0] & 0xF0;
-                                if st == 0x90 || st == 0x80 {
-                                    let vel = if st == 0x90 { msg[2] as f32 / 127.0 } else { 0.0 };
-                                    let ev = NoteEvent { note: msg[1], velocity: vel, source: SourceId::Hardware(dev), created: std::time::Instant::now() };
-                                    let sounded = direct.send(&ev);
-                                    if let Ok(mut q) = q.lock() {
-                                        q.push_back((ev, sounded));
-                                        while q.len() > 256 {
-                                            q.pop_front();
-                                        }
-                                    }
-                                } else if st == 0xB0 {
-                                    let ch = msg[0] & 0x0F;
-                                    let cc = msg[1] & 0x7F;
-                                    let val = msg[2] & 0x7F;
-                                    let src = SourceId::Hardware(dev);
-                                    let _ = direct.send_cc(src, ch, cc, val, std::time::Instant::now());
-                                    if let Ok(mut cq) = cc_q.lock() {
-                                        cq.push_back((src, ch, cc, val));
-                                        while cq.len() > 256 {
-                                            cq.pop_front();
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        (),
-                    ) {
-                        app._hw_conns.push(conn);
-                        hw_names.push(name.clone());
-                        hw_devices.push(name);
-                        dev_idx += 1;
-                    }
-                }
-            }
+        // Hardware MIDI: a thread connects what is plugged in now and keeps
+        // rescanning, so devices plugged in later are picked up too.
+        if !cfg!(test) {
+            spawn_hw_midi(app.hw_midi.clone(), app.hw_queue.clone(), app.hw_cc_queue.clone(), app.hw_direct.clone());
         }
-        app.hw_devices = hw_devices;
-        app.hw_status = if hw_names.is_empty() {
-            "no hardware MIDI — laptop keys live".into()
-        } else {
-            format!("MIDI in: {}", hw_names.join(", "))
-        };
 
         // Default rack = the engine's demo patch (2 stacks). build_rack mirrors
         // its nodes/edges into units/cables; ids match so per-frame Connect
@@ -6450,6 +6512,20 @@ impl DemoApp {
         // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
         // the short tail starts on release.
         for &(_, semi) in &self.held_keys { self.key_leds[semi % 12] = 1.0; }
+        // Adopt hot-plug changes from the MIDI thread (one atomic load).
+        let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
+        if rev != self.hw_midi_rev {
+            self.hw_midi_rev = rev;
+            if let Ok(d) = self.hw_midi.devices.lock() {
+                self.hw_devices = d.iter().map(|(n, _)| n.clone()).collect();
+                let live: Vec<&str> = d.iter().filter(|(_, l)| *l).map(|(n, _)| n.as_str()).collect();
+                self.hw_status = if live.is_empty() {
+                    "no hardware MIDI — laptop keys live".into()
+                } else {
+                    format!("MIDI in: {}", live.join(", "))
+                };
+            }
+        }
         // Per-rig activity for the overview strip: instant attack, slow release.
         let n_rigs = self.rig_count();
         if self.rig_levels.len() != n_rigs { self.rig_levels.resize(n_rigs, 0.0); }

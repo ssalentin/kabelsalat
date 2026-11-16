@@ -469,6 +469,9 @@ pub struct GraphEngine {
     /// Bumped by every graph load: a plugin the loader finishes for an
     /// older graph is retired, not attached.
     lv2_gen: u64,
+    /// Slots waiting to be retired while the loader's queue is full
+    /// (preallocated: freeing one here would stall the audio thread).
+    lv2_retire_backlog: Vec<Lv2Slot>,
     voice_retire_tx: Option<rtrb::Producer<ClapVoice>>,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
@@ -572,6 +575,7 @@ impl GraphEngine {
             lv2_req: None,
             lv2_resp: None,
             lv2_gen: 0,
+            lv2_retire_backlog: Vec::new(),
             voice_retire_tx: None,
             recorder: None,
             record_sync: false,
@@ -592,15 +596,18 @@ impl GraphEngine {
         self.lv2_req = Some(req_tx);
         self.lv2_resp = Some(resp_rx);
         self.lv2.reserve(LV2_SLOT_CAP);
+        self.lv2_retire_backlog.reserve(LV2_SLOT_CAP);
     }
 
     /// Load `uri` for `node`: on the loader thread when there is one.
     fn request_lv2(&mut self, node: NodeId, uri: crate::control::Lv2Uri) {
         if let Some(tx) = self.lv2_req.as_mut() {
-            if tx.push(Lv2Request::Load { node, uri, gen: self.lv2_gen }).is_err() {
-                eprintln!("lv2 loader queue full: node {node} not loaded");
+            if tx.push(Lv2Request::Load { node, uri, gen: self.lv2_gen }).is_ok() {
+                return;
             }
-            return;
+            // Queue full (dozens of LV2 nodes at once): one stall beats a
+            // silently dead node.
+            eprintln!("lv2 loader queue full: loading node {node} inline");
         }
         if let Some(slot) = load_lv2_slot(node, uri.as_str(), self.sample_rate) {
             self.attach_lv2(slot);
@@ -635,13 +642,24 @@ impl GraphEngine {
     fn retire_lv2(&mut self, slot: Lv2Slot) {
         if let Some(tx) = self.lv2_req.as_mut() {
             if let Err(rtrb::PushError::Full(Lv2Request::Retire(slot))) = tx.push(Lv2Request::Retire(slot)) {
-                drop(slot); // queue full: free here rather than leak
+                if self.lv2_retire_backlog.len() < self.lv2_retire_backlog.capacity() {
+                    self.lv2_retire_backlog.push(slot); // handed over on a later block
+                } else {
+                    drop(slot); // last resort: never leak
+                }
             }
         }
     }
 
     /// Adopt what the loader finished (block boundary, allocation-free).
     fn drain_lv2_loader(&mut self) {
+        while let Some(slot) = self.lv2_retire_backlog.pop() {
+            let Some(tx) = self.lv2_req.as_mut() else { break };
+            if let Err(rtrb::PushError::Full(Lv2Request::Retire(slot))) = tx.push(Lv2Request::Retire(slot)) {
+                self.lv2_retire_backlog.push(slot);
+                break;
+            }
+        }
         loop {
             let msg = match self.lv2_resp.as_mut() {
                 Some(rx) => match rx.pop() {

@@ -44,7 +44,7 @@ use crate::control::{
     self, merge_rigs, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId,
     NodeKind, PortKind, PortRef, Rig, RigSnapshot,
 };
-use crate::engine::GraphEngine;
+use crate::engine::{GraphEngine, GraphPub};
 use crate::host::{ClapVoice, ClapVoiceMain};
 use crate::matrix::SourceId;
 
@@ -74,6 +74,10 @@ struct State {
     /// LoadRigs/LoadGraph at block boundaries). Remote: unused — get_rigs
     /// forwards to the app's bridge instead.
     rigs: Arc<Mutex<RigSnapshot>>,
+    /// Engine publication handle (Local: live transport/count-in/BPM status).
+    graph_pub: Option<Arc<Mutex<GraphPub>>>,
+    count_in_enabled: bool,
+    count_in_bars: u8,
     /// Headless CC binding mirror keyed by (source, dest).
     cc_maps: std::collections::HashMap<(SourceId, NodeId), Vec<crate::matrix::CcMapping>>,
 }
@@ -248,6 +252,15 @@ struct SetPlayerArgs {
 struct SetBpmArgs {
     /// Metronome tempo in BPM (20..300).
     bpm: f32,
+}
+
+/// Arguments for `set_count_in`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetCountInArgs {
+    /// Enable or disable count-in before master play (defaults to true when `bars >= 1`, or toggles if omitted).
+    enabled: Option<bool>,
+    /// Number of count-in bars (1..=4; 0 disables count-in).
+    bars: Option<u8>,
 }
 
 /// Arguments for `set_rig_device`.
@@ -754,13 +767,27 @@ impl McpServer {
             Ok(s) => (s.rigs.len(), s.active),
             Err(_) => (0, 0),
         };
+        let tp = st
+            .graph_pub
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map(|g| g.transport);
+        let (playing, counting_in, count_in_beat, count_in_enabled, count_in_bars, bpm) = match tp {
+            Some(t) => (t.playing, t.counting_in, t.count_in_beat, t.count_in_enabled, t.count_in_bars, t.bpm),
+            None => (st.playing, false, 0, st.count_in_enabled, st.count_in_bars, 96.0),
+        };
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
             "edges": st.graph.edges.len(),
             "sample_rate": st.sample_rate,
             "audio_live": st.audio_live,
             "output_level": level,
-            "transport_playing": st.playing,
+            "transport_playing": playing,
+            "counting_in": counting_in,
+            "count_in_beat": count_in_beat,
+            "count_in_enabled": count_in_enabled,
+            "count_in_bars": count_in_bars,
+            "bpm": bpm,
             "buffer_frames": bridge::BUFFER_FRAMES,
             "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,
             "xruns": bridge::XRUNS.load(Ordering::Relaxed),
@@ -1365,19 +1392,24 @@ impl McpServer {
     }
 
     /// Start the transport.
-    #[tool(name = "transport_play", description = "Master transport play (Command::TransportPlay): starts EVERY transport-capable node (all metronomes) and runs the song clock hosted CLAP plugins follow, from beat 0. Use set_node_playing to start/stop one instrument.")]
+    #[tool(name = "transport_play", description = "Master transport play (Command::TransportPlay): starts EVERY transport-capable node (all metronomes) and runs the song clock hosted CLAP plugins follow, from beat 0 (after the count-in bar if count-in is enabled). Use set_node_playing to start/stop one instrument.")]
     fn transport_play(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportPlay) {
             return tool_err(e);
         }
-        st.playing = true;
+        st.playing = !st.count_in_enabled;
         st.graph.set_all_playing(true);
-        ok_json(json!({"playing": true}))
+        ok_json(json!({
+            "playing": st.playing,
+            "counting_in": st.count_in_enabled,
+            "count_in_enabled": st.count_in_enabled,
+            "count_in_bars": st.count_in_bars,
+        }))
     }
 
     /// Stop the transport.
-    #[tool(name = "transport_stop", description = "Master transport stop (Command::TransportStop): stops EVERY transport-capable node and halts the song clock CLAP plugins follow.")]
+    #[tool(name = "transport_stop", description = "Master transport stop (Command::TransportStop): stops EVERY transport-capable node (cancelling any active count-in) and halts the song clock CLAP plugins follow.")]
     fn transport_stop(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::TransportStop) {
@@ -1385,7 +1417,7 @@ impl McpServer {
         }
         st.playing = false;
         st.graph.set_all_playing(false);
-        ok_json(json!({"playing": false}))
+        ok_json(json!({"playing": false, "counting_in": false}))
     }
 
     /// Per-instrument transport: start/stop one node.
@@ -1418,6 +1450,40 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"bpm": bpm}))
+    }
+
+    /// Configure master transport count-in.
+    #[tool(name = "set_count_in", description = "Configure master transport count-in (Command::SetCountIn): plays N bars (1..=4, default 1) of metronome clicks before the song clock starts at beat 0. Pass enabled (bool) and/or bars (0 disables, 1..=4 enables).")]
+    fn set_count_in(&self, Parameters(args): Parameters<SetCountInArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            if let Ok(reply) = bridge::request(&json!({"op": "query", "name": "get_status"})) {
+                if let Some(en) = reply.pointer("/data/count_in_enabled").and_then(Value::as_bool) {
+                    st.count_in_enabled = en;
+                }
+                if let Some(b) = reply.pointer("/data/count_in_bars").and_then(Value::as_u64) {
+                    st.count_in_bars = b.clamp(1, crate::transport::MAX_COUNT_IN_BARS as u64) as u8;
+                }
+            }
+        }
+        let (enabled, bars) = match args.bars {
+            Some(0) => (false, st.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS)),
+            Some(b) => (
+                args.enabled.unwrap_or(true),
+                b.clamp(1, crate::transport::MAX_COUNT_IN_BARS),
+            ),
+            None => (
+                args.enabled.unwrap_or(!st.count_in_enabled),
+                st.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS),
+            ),
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetCountIn { enabled, bars }) {
+            return tool_err(e);
+        }
+        st.count_in_enabled = enabled;
+        st.count_in_bars = bars;
+        let _ = crate::assistant::save_count_in(enabled, bars);
+        ok_json(json!({"enabled": enabled, "bars": bars}))
     }
 }
 
@@ -1456,6 +1522,7 @@ struct AudioHandles {
     stream: Option<cpal::Stream>,
     bus: CommandBus,
     level: Arc<AtomicU32>,
+    graph_pub: Arc<Mutex<GraphPub>>,
     sample_rate: f64,
     live: bool,
 }
@@ -1510,6 +1577,8 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     let (bus, drain) = control::command_bus();
     let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
     engine.set_rig_snapshot(rigs);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -1520,7 +1589,7 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
         None,
     )?;
     stream.play()?;
-    Ok(AudioHandles { mains, stream: Some(stream), bus, level, sample_rate, live: true })
+    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, sample_rate, live: true })
 }
 
 /// No audio device (or plugin failure): keep the engine rendering into a
@@ -1530,6 +1599,8 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     let (bus, drain) = control::command_bus();
     let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, vec![]);
     engine.set_rig_snapshot(rigs);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())
@@ -1541,7 +1612,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
             }
         })
         .expect("spawning dummy audio thread");
-    AudioHandles { mains: vec![], stream: None, bus, level, sample_rate, live: false }
+    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, sample_rate, live: false }
 }
 
 fn build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
@@ -1593,7 +1664,11 @@ pub fn run() -> anyhow::Result<()> {
     let rpc_stdout = reroute_stdout()?;
     eprintln!("kabelsalat mcp: headless control-plane server (MCP over stdio)");
     let rigs = Arc::new(Mutex::new(RigSnapshot::default()));
-    let audio = build_audio(rigs.clone());
+    let mut audio = build_audio(rigs.clone());
+    let (ci_enabled, ci_bars) = crate::assistant::load_count_in();
+    if ci_enabled || ci_bars != 1 {
+        let _ = audio.bus.send(Command::SetCountIn { enabled: ci_enabled, bars: ci_bars });
+    }
     let state = Arc::new(Mutex::new(State {
         graph: Graph::demo_patch(),
         backend: Backend::Local(audio.bus),
@@ -1602,6 +1677,9 @@ pub fn run() -> anyhow::Result<()> {
         audio_live: audio.live,
         playing: false,
         rigs,
+        graph_pub: Some(audio.graph_pub),
+        count_in_enabled: ci_enabled,
+        count_in_bars: ci_bars,
         cc_maps: std::collections::HashMap::new(),
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
@@ -1628,6 +1706,9 @@ pub fn run_attach() -> anyhow::Result<()> {
         audio_live: true,
         playing: false,
         rigs: Arc::new(Mutex::new(RigSnapshot::default())),
+        graph_pub: None,
+        count_in_enabled: false,
+        count_in_bars: 1,
         cc_maps: std::collections::HashMap::new(),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
@@ -1636,6 +1717,12 @@ pub fn run_attach() -> anyhow::Result<()> {
     if let Ok(reply) = bridge::request(&json!({"op": "query", "name": "get_status"})) {
         if let Some(sr) = reply.pointer("/data/sample_rate").and_then(Value::as_f64) {
             state.sample_rate = sr;
+        }
+        if let Some(en) = reply.pointer("/data/count_in_enabled").and_then(Value::as_bool) {
+            state.count_in_enabled = en;
+        }
+        if let Some(bars) = reply.pointer("/data/count_in_bars").and_then(Value::as_u64) {
+            state.count_in_bars = bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS as u64) as u8;
         }
     }
     let server = McpServer {
@@ -1684,6 +1771,8 @@ mod tests {
         let mut engine = GraphEngine::new(Graph::demo_patch(), drain, 48000.0, vec![]);
         let rigs = Arc::new(Mutex::new(RigSnapshot::default()));
         engine.set_rig_snapshot(rigs.clone());
+        let graph_pub = Arc::new(Mutex::new(GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
         let state = State {
             graph: Graph::demo_patch(),
             backend: Backend::Local(bus),
@@ -1692,6 +1781,9 @@ mod tests {
             audio_live: false,
             playing: false,
             rigs,
+            graph_pub: Some(graph_pub),
+            count_in_enabled: false,
+            count_in_bars: 1,
             cc_maps: std::collections::HashMap::new(),
         };
         let server = McpServer {
@@ -1918,5 +2010,34 @@ mod tests {
         engine.render(&mut buf, 2);
         let empty = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: None, source: None })));
         assert_eq!(empty["cc_maps"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn set_count_in_and_status_drive_engine_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 480 * 2];
+
+        let cfg = tool_json(&server.set_count_in(Parameters(SetCountInArgs { enabled: Some(true), bars: Some(1) })));
+        assert_eq!(cfg, json!({"enabled": true, "bars": 1}));
+        engine.render(&mut buf, 2);
+        let st = tool_json(&server.get_status());
+        assert_eq!(st["count_in_enabled"], json!(true));
+        assert_eq!(st["count_in_bars"], json!(1));
+        assert_eq!(st["counting_in"], json!(false));
+
+        let played = tool_json(&server.transport_play());
+        assert_eq!(played["counting_in"], json!(true));
+        engine.render(&mut buf, 2);
+        let st2 = tool_json(&server.get_status());
+        assert_eq!(st2["counting_in"], json!(true));
+        assert_eq!(st2["transport_playing"], json!(false));
+        assert_eq!(st2["count_in_beat"], json!(1));
+
+        let stopped = tool_json(&server.transport_stop());
+        assert_eq!(stopped["counting_in"], json!(false));
+        engine.render(&mut buf, 2);
+        let st3 = tool_json(&server.get_status());
+        assert_eq!(st3["counting_in"], json!(false));
+        assert_eq!(st3["transport_playing"], json!(false));
     }
 }

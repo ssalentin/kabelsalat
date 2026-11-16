@@ -4,6 +4,133 @@
 /// Time signature reported to plugins (kabelsalat has no meter setting yet).
 pub const BEATS_PER_BAR: u16 = 4;
 
+pub const MIN_BPM: f32 = 20.0;
+pub const MAX_BPM: f32 = 300.0;
+pub const TAP_RESET_SECS: f64 = 2.0;
+pub const MAX_TAP_SAMPLES: usize = 8;
+pub const MAX_COUNT_IN_BARS: u8 = 4;
+
+/// Count-in configuration: off by default, 1..=4 bars when enabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountInConfig {
+    pub enabled: bool,
+    pub bars: u8,
+}
+
+impl Default for CountInConfig {
+    fn default() -> Self {
+        Self { enabled: false, bars: 1 }
+    }
+}
+
+impl CountInConfig {
+    pub fn normalized(enabled: bool, bars: u8) -> Self {
+        Self { enabled, bars: bars.clamp(1, MAX_COUNT_IN_BARS) }
+    }
+
+    pub fn total_beats(self) -> f64 {
+        if self.enabled {
+            self.bars.clamp(1, MAX_COUNT_IN_BARS) as f64 * BEATS_PER_BAR as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Master transport lifecycle: stopped, counting in before beat 0, or playing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MasterClock {
+    Stopped,
+    CountingIn { remaining_beats: f64, total_beats: f64 },
+    Playing,
+}
+
+impl MasterClock {
+    pub fn is_counting_in(self) -> bool {
+        matches!(self, Self::CountingIn { .. })
+    }
+
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+
+    /// 1-based beat index within the count-in (1..=total_beats), or 0 when not counting in.
+    pub fn count_in_beat(self) -> u8 {
+        match self {
+            Self::CountingIn { remaining_beats, total_beats } => {
+                let elapsed = (total_beats - remaining_beats).max(0.0);
+                (elapsed.floor() as u8).saturating_add(1).min(total_beats.round() as u8)
+            }
+            _ => 0,
+        }
+    }
+}
+
+/// Pure tap-tempo estimator: averages recent tap intervals, resets after
+/// `TAP_RESET_SECS` idle, rejects outlier intervals around the median, and
+/// clamps the resulting tempo to `20..=300` BPM.
+#[derive(Clone, Debug, Default)]
+pub struct TapTempo {
+    taps: Vec<f64>,
+}
+
+impl TapTempo {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn reset(&mut self) {
+        self.taps.clear();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn tap_count(&self) -> usize {
+        self.taps.len()
+    }
+
+    /// Record a tap at `now_secs` (monotonic seconds) and return the estimated BPM
+    /// once at least two taps have been recorded in the active window.
+    pub fn tap(&mut self, now_secs: f64) -> Option<f32> {
+        if !now_secs.is_finite() {
+            self.taps.clear();
+            return None;
+        }
+        if let Some(&prev) = self.taps.last() {
+            let dt = now_secs - prev;
+            if dt < 0.0 || dt > TAP_RESET_SECS {
+                self.taps.clear();
+            } else if dt < 1e-6 {
+                return None;
+            }
+        }
+        self.taps.push(now_secs);
+        if self.taps.len() > MAX_TAP_SAMPLES {
+            let drop_n = self.taps.len() - MAX_TAP_SAMPLES;
+            self.taps.drain(..drop_n);
+        }
+        if self.taps.len() < 2 {
+            return None;
+        }
+        let mut intervals: Vec<f64> = self.taps.windows(2).map(|w| w[1] - w[0]).collect();
+        let avg = if intervals.len() >= 3 {
+            let mut sorted = intervals.clone();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            let median = sorted[sorted.len() / 2];
+            let lo = median * 0.65;
+            let hi = median * 1.5;
+            let kept: Vec<f64> = intervals.drain(..).filter(|dt| *dt >= lo && *dt <= hi).collect();
+            kept.iter().sum::<f64>() / kept.len().max(1) as f64
+        } else {
+            intervals.iter().sum::<f64>() / intervals.len() as f64
+        };
+        if avg <= 0.0 {
+            return None;
+        }
+        Some((60.0 / avg).round().clamp(MIN_BPM as f64, MAX_BPM as f64) as f32)
+    }
+}
+
 /// Song clock as of a block's first frame. Plain `Copy` state: the engine
 /// owns one, the audio thread advances it, nothing allocates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -233,7 +360,55 @@ pub fn run_test() -> anyhow::Result<()> {
             "Surge ignores the engine's song position or play state: sequencer on step {step}, not {want}"
         );
     }
-    println!("transport-test: OK — Surge follows the engine's tempo (4 steps per beat at 120/60/90 BPM), song position and play/stop");
+
+    // Count-in (1 bar at 120 BPM = 2.0 s = 200 blocks of 480 frames):
+    // during all 200 blocks of the count-in, the voice clock stays stopped at
+    // beat 0; at block 200 the song clock starts from beat 0 and Surge's
+    // sequencer starts on step 0 (step 2 after 0.5 song beats).
+    bus.send(Command::SetBpm { bpm: 120.0 });
+    bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+    bus.send(Command::TransportPlay);
+    let mut buf = [0.0f32; BLOCK * 2];
+    for blk in 0..200 {
+        engine.render(&mut buf, 2);
+        let t = engine.transport();
+        if blk < 199 {
+            anyhow::ensure!(
+                !t.playing && t.beats == 0.0,
+                "count-in leaked song playback at block {blk}: {t:?}"
+            );
+        }
+    }
+    let after_count_in = engine.transport();
+    anyhow::ensure!(
+        after_count_in.playing && after_count_in.beats == 0.0,
+        "song clock did not start at beat 0 after count-in: {after_count_in:?}"
+    );
+    let (step0, share0) = sequencer_step_at_start(&hold_note(&mut engine, &mut bus, 4.0), SR, STEP_HZ);
+    println!(
+        "transport-test: after 4-beat count-in at engine beat {:.2} (playing) → Surge's sequencer on step {step0:>2} ({:.0}% on trigger steps)",
+        after_count_in.beats,
+        share0 * 100.0
+    );
+    anyhow::ensure!(step0 == 0, "expected Surge on step 0 after count-in, got {step0}");
+    bus.send(Command::TransportStop);
+    bus.send(Command::TransportPlay);
+    render(&mut engine, 2.25, None); // 2.0 s count-in + 0.25 s (0.5 beat) song
+    let after_half = engine.transport();
+    anyhow::ensure!(
+        after_half.playing && (after_half.beats - 0.5).abs() < 1e-6,
+        "expected beat 0.5 after count-in + 0.25s, got {after_half:?}"
+    );
+    let (step2, share2) = sequencer_step_at_start(&hold_note(&mut engine, &mut bus, 4.0), SR, STEP_HZ);
+    println!(
+        "transport-test: count-in + 0.50 song beats (playing) → Surge's sequencer on step {step2:>2} ({:.0}% on trigger steps)",
+        share2 * 100.0
+    );
+    anyhow::ensure!(step2 == 2, "expected Surge on step 2 after count-in + 0.5 beat, got {step2}");
+    bus.send(Command::TransportStop);
+    bus.send(Command::SetCountIn { enabled: false, bars: 1 });
+
+    println!("transport-test: OK — Surge follows the engine's tempo (4 steps per beat at 120/60/90 BPM), song position, play/stop, and count-in");
     Ok(())
 }
 
@@ -300,5 +475,88 @@ mod tests {
         assert_eq!(t.bar(), (0, 0.0));
         t.beats = 9.5;
         assert_eq!(t.bar(), (2, 8.0));
+    }
+
+    #[test]
+    fn tap_tempo_steady_and_jitter() {
+        let mut tap = TapTempo::new();
+        assert_eq!(tap.tap(0.0), None);
+        assert_eq!(tap.tap(0.5), Some(120.0));
+        assert_eq!(tap.tap(1.0), Some(120.0));
+        assert_eq!(tap.tap(1.5), Some(120.0));
+
+        // Slight human jitter around 100 BPM (0.600 s/beat) averages within ±1.
+        let mut jitter = TapTempo::new();
+        let times = [0.0, 0.612, 1.190, 1.805, 2.398];
+        let mut last = None;
+        for t in times {
+            last = jitter.tap(t);
+        }
+        let bpm = last.expect("estimated BPM");
+        assert!((bpm - 100.0).abs() <= 1.0, "expected ~100 BPM, got {bpm}");
+    }
+
+    #[test]
+    fn tap_tempo_resets_after_idle() {
+        let mut tap = TapTempo::new();
+        assert_eq!(tap.tap(0.0), None);
+        assert_eq!(tap.tap(0.5), Some(120.0));
+        // Idle > 2.0 s resets history; first tap after pause returns None.
+        assert_eq!(tap.tap(2.6), None);
+        assert_eq!(tap.tap_count(), 1);
+        // Subsequent tap uses the new tempo (90 BPM = 0.6667 s).
+        assert_eq!(tap.tap(2.6 + 60.0 / 90.0), Some(90.0));
+    }
+
+    #[test]
+    fn tap_tempo_ignores_outliers() {
+        let mut tap = TapTempo::new();
+        // 120 BPM steady (0.5 s) with one skipped beat (1.0 s gap) -> median 0.5 rejects 1.0.
+        for t in [0.0, 0.5, 1.0, 2.0, 2.5, 3.0] {
+            let _ = tap.tap(t);
+        }
+        assert_eq!(tap.tap(3.5), Some(120.0));
+
+        // Fast accidental double-tap (0.08 s) inside a 100 BPM (0.6 s) sequence.
+        let mut bounce = TapTempo::new();
+        for t in [0.0, 0.6, 1.2, 1.28, 1.8, 2.4] {
+            let _ = bounce.tap(t);
+        }
+        let bpm = bounce.tap(3.0).unwrap();
+        assert!((bpm - 100.0).abs() <= 3.0, "outlier should not yank tempo, got {bpm}");
+    }
+
+    #[test]
+    fn tap_tempo_clamps_range() {
+        let mut tap = TapTempo::new();
+        assert_eq!(tap.tap(0.0), None);
+        // 0.05 s interval = 1200 BPM -> clamped to 300.
+        assert_eq!(tap.tap(0.05), Some(300.0));
+
+        // Max non-reset interval is 2.0 s -> 30 BPM; verify clamping helper covers 20..=300.
+        let mut slow = TapTempo::new();
+        assert_eq!(slow.tap(0.0), None);
+        assert_eq!(slow.tap(2.0), Some(30.0));
+        assert_eq!((60.0f64 / 4.0).round().clamp(MIN_BPM as f64, MAX_BPM as f64), 20.0);
+    }
+
+    #[test]
+    fn count_in_config_and_master_clock_beats() {
+        let def = CountInConfig::default();
+        assert!(!def.enabled);
+        assert_eq!(def.bars, 1);
+        assert_eq!(def.total_beats(), 0.0);
+
+        let one = CountInConfig::normalized(true, 1);
+        assert_eq!(one.total_beats(), 4.0);
+        assert_eq!(CountInConfig::normalized(true, 9).bars, MAX_COUNT_IN_BARS);
+
+        let c = MasterClock::CountingIn { remaining_beats: 4.0, total_beats: 4.0 };
+        assert_eq!(c.count_in_beat(), 1);
+        let c2 = MasterClock::CountingIn { remaining_beats: 2.1, total_beats: 4.0 };
+        assert_eq!(c2.count_in_beat(), 2);
+        let c4 = MasterClock::CountingIn { remaining_beats: 0.2, total_beats: 4.0 };
+        assert_eq!(c4.count_in_beat(), 4);
+        assert_eq!(MasterClock::Playing.count_in_beat(), 0);
     }
 }

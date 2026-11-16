@@ -24,7 +24,7 @@ use crate::host::ClapVoice;
 use crate::matrix::{Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::player::PlayerSink;
-use crate::transport::Transport;
+use crate::transport::{CountInConfig, MasterClock, Transport};
 
 /// Max hardware MIDI device ids pre-routed in the matrix (per-rig filter selects).
 pub const MAX_HW_DEVICES: u32 = 16;
@@ -279,6 +279,30 @@ impl Default for RigMix {
     fn default() -> Self { Self::DEFAULT }
 }
 
+/// Published engine transport + count-in state (copied under `try_lock`, zero allocation).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TransportPub {
+    pub playing: bool,
+    pub counting_in: bool,
+    pub count_in_beat: u8,
+    pub count_in_enabled: bool,
+    pub count_in_bars: u8,
+    pub bpm: f32,
+}
+
+impl Default for TransportPub {
+    fn default() -> Self {
+        Self {
+            playing: false,
+            counting_in: false,
+            count_in_beat: 0,
+            count_in_enabled: false,
+            count_in_bars: 1,
+            bpm: 96.0,
+        }
+    }
+}
+
 /// Shared graph publication for frontends (MCP→UI live sync, PLAN §13).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
@@ -297,6 +321,9 @@ pub struct GraphPub {
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
     pub mix_rev: u64,
+    /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
+    pub transport: TransportPub,
+    pub transport_rev: u64,
 }
 
 pub struct GraphEngine {
@@ -313,6 +340,12 @@ pub struct GraphEngine {
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
     transport: Transport,
+    master_clock: MasterClock,
+    count_in: CountInConfig,
+    count_in_slot: SlotTransport,
+    count_in_buf: Vec<f32>,
+    last_count_in_beat: u8,
+    transport_dirty: bool,
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
@@ -421,6 +454,12 @@ impl GraphEngine {
             master_vol: 0.8,
             master_warm: 0.15,
             transport: Transport::stopped(96.0),
+            master_clock: MasterClock::Stopped,
+            count_in: CountInConfig::default(),
+            count_in_slot: SlotTransport::default(),
+            count_in_buf: vec![0.0; 8192 * 2],
+            last_count_in_beat: 0,
+            transport_dirty: false,
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
             matrix,
@@ -477,6 +516,27 @@ impl GraphEngine {
         self.transport
     }
 
+    #[cfg(test)]
+    pub fn master_clock(&self) -> MasterClock {
+        self.master_clock
+    }
+
+    #[cfg(test)]
+    pub fn count_in(&self) -> CountInConfig {
+        self.count_in
+    }
+
+    pub fn transport_pub(&self) -> TransportPub {
+        TransportPub {
+            playing: self.transport.playing,
+            counting_in: self.master_clock.is_counting_in(),
+            count_in_beat: self.master_clock.count_in_beat(),
+            count_in_enabled: self.count_in.enabled,
+            count_in_bars: self.count_in.bars,
+            bpm: self.transport.bpm as f32,
+        }
+    }
+
     /// Rig list from the last `LoadRigs` (empty for single-graph loads).
     #[allow(dead_code)] // public query API for the UI (task-22 integration)
     pub fn rig_meta(&self) -> &[RigMeta] {
@@ -518,6 +578,7 @@ impl GraphEngine {
     /// Publish the current graph (structural ops only). A poisoned lock is
     /// skipped, not fatal — the publication is advisory frontend state.
     fn publish_graph(&mut self) {
+        let tp = self.transport_pub();
         if let Some(p) = &self.graph_pub {
             if let Ok(mut g) = p.lock() {
                 g.rev = g.rev.wrapping_add(1);
@@ -525,6 +586,8 @@ impl GraphEngine {
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
+                g.transport = tp;
+                g.transport_rev = g.transport_rev.wrapping_add(1);
             }
         }
     }
@@ -800,6 +863,13 @@ impl GraphEngine {
                 self.rig_meta.clear();
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
+                if self.master_clock.is_counting_in() {
+                    self.master_clock = MasterClock::Stopped;
+                    self.transport.set_playing(false);
+                    self.count_in_slot.set_playing(false);
+                    self.last_count_in_beat = 0;
+                    self.transport_dirty = true;
+                }
                 self.publish_rig_snapshot();
                 self.publish_graph();
             }
@@ -1082,30 +1152,75 @@ impl GraphEngine {
                 }
             }
             Command::SetBpm { bpm } => {
-                self.transport.bpm = bpm.clamp(20.0, 300.0) as f64;
+                let clamped = bpm.clamp(20.0, 300.0) as f64;
+                if (self.transport.bpm - clamped).abs() > 1e-6 {
+                    self.transport.bpm = clamped;
+                    self.transport_dirty = true;
+                }
+            }
+            Command::SetCountIn { enabled, bars } => {
+                let next = CountInConfig::normalized(enabled, bars);
+                if self.count_in != next {
+                    self.count_in = next;
+                    self.transport_dirty = true;
+                }
             }
         }
     }
 
-    /// Master transport (TransportPlay/Stop): run or halt the song clock and
-    /// set every transport-capable node's flag and slot clock; publish only
-    /// when a flag actually changed (frontends mirror it from GraphPub).
+    /// Master transport (TransportPlay/Stop): run or halt the song clock (with
+    /// optional count-in bar before beat 0) and set every transport-capable
+    /// node's flag and slot clock; publish only when state actually changed.
     fn master_transport(&mut self, playing: bool) {
-        // The song starts at beat 0: a metronome already running on its own
-        // restarts with it, or it would click off the plugins' beats.
-        let song_starts = playing && !self.transport.playing;
-        self.transport.set_playing(playing);
-        let changed = self.graph.set_all_playing(playing);
-        for d in &mut self.dsp {
-            if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
-                if song_starts {
+        if playing {
+            if self.master_clock.is_active() {
+                return;
+            }
+            self.transport = Transport::stopped(self.transport.bpm);
+            if self.count_in.enabled {
+                let total = self.count_in.total_beats();
+                self.master_clock = MasterClock::CountingIn {
+                    remaining_beats: total,
+                    total_beats: total,
+                };
+                self.last_count_in_beat = self.master_clock.count_in_beat();
+                self.count_in_slot.set_playing(false);
+                self.count_in_slot.set_playing(true);
+            } else {
+                self.master_clock = MasterClock::Playing;
+                self.last_count_in_beat = 0;
+                self.transport.set_playing(true);
+                self.count_in_slot.set_playing(false);
+            }
+            let changed = self.graph.set_all_playing(true);
+            for d in &mut self.dsp {
+                if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
+                    d.transport.set_playing(false);
+                    d.transport.set_playing(true);
+                }
+            }
+            self.transport_dirty = true;
+            if changed {
+                self.publish_graph();
+            }
+        } else {
+            let was_active = self.master_clock.is_active() || self.transport.playing;
+            self.master_clock = MasterClock::Stopped;
+            self.last_count_in_beat = 0;
+            self.transport.set_playing(false);
+            self.count_in_slot.set_playing(false);
+            let changed = self.graph.set_all_playing(false);
+            for d in &mut self.dsp {
+                if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport()) {
                     d.transport.set_playing(false);
                 }
-                d.transport.set_playing(playing);
             }
-        }
-        if changed {
-            self.publish_graph();
+            if was_active {
+                self.transport_dirty = true;
+            }
+            if changed {
+                self.publish_graph();
+            }
         }
     }
 
@@ -1201,12 +1316,61 @@ impl GraphEngine {
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
         let (sr, bpm) = (self.sample_rate, self.transport.bpm);
+        let beat_inc = Transport::beats_per_frame(bpm, sr);
+        let block_beats = frames as f64 * beat_inc;
+        let counting_in_this_block = self.master_clock.is_counting_in();
+        let suppress_wrap_click = matches!(
+            self.master_clock,
+            MasterClock::CountingIn { remaining_beats, .. } if remaining_beats <= block_beats + 1e-9
+        );
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
-                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm);
+                render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
             }
         }
-        self.transport.advance(frames, sr);
+        if counting_in_this_block {
+            render_metronome(&mut self.count_in_slot, &mut self.count_in_buf[..n2], frames, sr, bpm, suppress_wrap_click);
+        }
+        match self.master_clock {
+            MasterClock::Stopped => {}
+            MasterClock::Playing => self.transport.advance(frames, sr),
+            MasterClock::CountingIn { remaining_beats, total_beats } => {
+                let rem = remaining_beats - block_beats;
+                if rem <= 1e-9 {
+                    self.master_clock = MasterClock::Playing;
+                    self.last_count_in_beat = 0;
+                    self.transport.set_playing(true);
+                    self.count_in_slot.set_playing(false);
+                    for d in &mut self.dsp {
+                        if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport())
+                            && d.transport.playing
+                        {
+                            d.transport.set_playing(false);
+                            d.transport.set_playing(true);
+                        }
+                    }
+                    self.transport_dirty = true;
+                } else {
+                    self.master_clock = MasterClock::CountingIn { remaining_beats: rem, total_beats };
+                    let beat = self.master_clock.count_in_beat();
+                    if beat != self.last_count_in_beat {
+                        self.last_count_in_beat = beat;
+                        self.transport_dirty = true;
+                    }
+                }
+            }
+        }
+        if self.transport_dirty {
+            let tp = self.transport_pub();
+            match &self.graph_pub {
+                Some(p) => if let Ok(mut g) = p.try_lock() {
+                    g.transport = tp;
+                    g.transport_rev = g.transport_rev.wrapping_add(1);
+                    self.transport_dirty = false;
+                },
+                None => self.transport_dirty = false,
+            }
+        }
 
         // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
         for slot in &mut self.lv2 {
@@ -1322,6 +1486,23 @@ impl GraphEngine {
                     }
                 }
             }
+            if counting_in_this_block {
+                let mut has_routed_metro = false;
+                for d in &self.dsp {
+                    if d.kind == DspKind::Metronome
+                        && d.transport.playing
+                        && masters[..n_masters].iter().any(|&m| self.graph.has_route(d.node, m, PortKind::Audio))
+                    {
+                        has_routed_metro = true;
+                        break;
+                    }
+                }
+                if !has_routed_metro {
+                    for i in 0..n2 {
+                        acc[i] += self.count_in_buf[i];
+                    }
+                }
+            }
             if sys {
                 let g = self.system_gain;
                 for i in 0..n2 {
@@ -1357,7 +1538,14 @@ impl GraphEngine {
 /// Generate one metronome's click into `buf` (stereo-interleaved): a
 /// decaying 1 kHz burst on each beat while ITS transport plays. Driven by
 /// SetNodePlaying / master TransportPlay·Stop / SetBpm; allocation-free.
-fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sample_rate: f64, bpm: f64) {
+fn render_metronome(
+    t: &mut SlotTransport,
+    buf: &mut [f32],
+    frames: usize,
+    sample_rate: f64,
+    bpm: f64,
+    suppress_wrap_click: bool,
+) {
     let frames = frames.min(buf.len() / 2);
     let n2 = frames * 2;
     for x in buf[..n2].iter_mut() {
@@ -1371,8 +1559,10 @@ fn render_metronome(t: &mut SlotTransport, buf: &mut [f32], frames: usize, sampl
             t.phase += beat_inc;
             if t.phase >= 1.0 {
                 t.phase -= 1.0;
-                t.click_remaining = CLICK_FRAMES;
-                t.click_phase = 0.0;
+                if !suppress_wrap_click {
+                    t.click_remaining = CLICK_FRAMES;
+                    t.click_phase = 0.0;
+                }
             }
         }
         if t.click_remaining > 0 {
@@ -1866,6 +2056,107 @@ mod tests {
             let off_beat = (beats - beats.round()).abs();
             assert!(off_beat < 3.0 * 120.0 / (60.0 * 48000.0), "click at frame {frame} is {off_beat:.5} beats off the beat ({beats:.5})");
         }
+    }
+
+    #[test]
+    fn count_in_clicks_for_one_bar_then_starts_song_at_beat_zero() {
+        let (mut engine, mut bus, _m1, _m2, pub_) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = vec![0.0f32; 480 * 2];
+        let mut clicks = Vec::new();
+        let mut was_quiet = true;
+        // 200 blocks of 480 frames @ 48 kHz = 2.0 s = 4 beats @ 120 BPM.
+        for blk in 0..300 {
+            let pre_t = engine.transport();
+            engine.render(&mut buf, 2);
+            if blk < 200 {
+                assert!(!pre_t.playing && pre_t.beats == 0.0, "block {blk} leaked song start: {pre_t:?}");
+            }
+            for f in 0..480 {
+                let frame = blk * 480 + f;
+                let loud = buf[f * 2].abs() > 1e-4;
+                if loud && was_quiet && clicks.last().map_or(true, |&prev| frame - prev > super::CLICK_FRAMES) {
+                    clicks.push(frame);
+                }
+                was_quiet = !loud;
+            }
+            if blk == 199 {
+                let t = engine.transport();
+                assert!(t.playing && t.beats == 0.0, "song clock must start at beat 0 right after count-in: {t:?}");
+                assert!(!engine.master_clock().is_counting_in());
+                let pub_t = pub_.lock().unwrap().transport;
+                assert!(pub_t.playing && !pub_t.counting_in && pub_t.count_in_beat == 0);
+            }
+            if blk == 50 {
+                let pub_t = pub_.lock().unwrap().transport;
+                assert!(!pub_t.playing && pub_t.counting_in && pub_t.count_in_beat == 2, "expected count-in beat 2: {pub_t:?}");
+            }
+        }
+        // 4 count-in clicks (frames ~0, 24000, 48000, 72000) + song beat 0 (~96000) + beat 1 (~120000).
+        assert_eq!(clicks.len(), 6, "expected 4 count-in + 2 song clicks, got {clicks:?}");
+        for (i, &frame) in clicks.iter().enumerate() {
+            let expected = i * 24000;
+            assert!((frame as isize - expected as isize).abs() <= 3, "click {i} at {frame}, expected ~{expected}");
+        }
+        // 100 song blocks = 1.0 s @ 120 BPM = 2.0 beats.
+        let end_t = engine.transport();
+        assert!(end_t.playing && (end_t.beats - 2.0).abs() < 1e-9, "song beats after 1s: {end_t:?}");
+    }
+
+    #[test]
+    fn count_in_stop_cancels_before_song_starts() {
+        let (mut engine, mut bus, _m1, _m2, pub_) = two_metronomes();
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = vec![0.0f32; 480 * 2];
+        for _ in 0..100 {
+            engine.render(&mut buf, 2); // 1.0 s (halfway through 1-bar count-in)
+        }
+        assert!(engine.master_clock().is_counting_in());
+        bus.send(Command::TransportStop);
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.master_clock(), super::MasterClock::Stopped);
+        assert!(!engine.transport().playing && engine.transport().beats == 0.0);
+        let pub_t = pub_.lock().unwrap().transport;
+        assert!(!pub_t.playing && !pub_t.counting_in && pub_t.count_in_beat == 0);
+        // Subsequent blocks past where count-in would have ended stay silent and stopped.
+        let mut peak = 0.0f32;
+        for _ in 0..150 {
+            engine.render(&mut buf, 2);
+            for &s in &buf { peak = peak.max(s.abs()); }
+        }
+        assert!(!engine.transport().playing && engine.transport().beats == 0.0);
+        assert!(peak < 1e-4, "expected silence after cancel, got peak {peak}");
+    }
+
+    #[test]
+    fn count_in_works_without_metronome_node() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![]);
+        bus.send(Command::SetBpm { bpm: 120.0 });
+        bus.send(Command::SetCountIn { enabled: true, bars: 1 });
+        bus.send(Command::TransportPlay);
+        let mut buf = vec![0.0f32; 480 * 2];
+        let mut clicks = Vec::new();
+        let mut was_quiet = true;
+        for blk in 0..250 {
+            engine.render(&mut buf, 2);
+            for f in 0..480 {
+                let frame = blk * 480 + f;
+                let loud = buf[f * 2].abs() > 1e-4;
+                if loud && was_quiet && clicks.last().map_or(true, |&prev| frame - prev > super::CLICK_FRAMES) {
+                    clicks.push(frame);
+                }
+                was_quiet = !loud;
+            }
+            if blk == 199 {
+                assert!(engine.transport().playing && engine.transport().beats == 0.0);
+            }
+        }
+        assert_eq!(clicks.len(), 4, "expected 4 count-in clicks without a metronome node, got {clicks:?}");
     }
 
     #[test]

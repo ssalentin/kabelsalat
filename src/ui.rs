@@ -865,6 +865,8 @@ const SPLIT_CHIP_W: f32 = 58.0;
 const SPLIT_READOUT_W: f32 = 46.0;
 const BPM_STEP_W: f32 = 22.0;
 const BPM_VALUE_W: f32 = 66.0;
+const METRO_TAP_W: f32 = 48.0;
+const METRO_COUNT_IN_W: f32 = 84.0;
 
 /// Metronome-face BPM control rects (rack-local).
 #[derive(Clone, Copy, Debug)]
@@ -872,6 +874,14 @@ struct BpmRects {
     minus: Option<Rect>,
     value: Rect,
     plus: Option<Rect>,
+}
+
+/// Metronome-face tap-tempo + count-in chip rects (rack-local).
+#[derive(Clone, Copy, Debug)]
+struct MetroActionRects {
+    tap: Rect,
+    count_in: Rect,
+    compact: bool,
 }
 
 const HELP_CHIP_PAD: Vec2 = Vec2::new(8.0, 4.0);
@@ -969,6 +979,14 @@ struct DemoApp {
     ui_time: f32, // wall clock for idle breathing / affordances
     playing: bool, // transport state: engine metronome running
     bpm: f32,      // metronome tempo (20..=300), mirrors Command::SetBpm
+    tap_tempo: crate::transport::TapTempo,
+    tap_origin: std::time::Instant,
+    tap_flash_t: f32,
+    count_in_enabled: bool,
+    count_in_bars: u8,
+    counting_in: bool,
+    count_in_beat: u8,
+    last_transport_rev: u64,
 
     drag: Drag,
     press: Option<(Hit, Pos2)>,
@@ -1222,6 +1240,14 @@ impl DemoApp {
             ui_time: 0.0,
             playing: false,
             bpm: 96.0,
+            tap_tempo: crate::transport::TapTempo::new(),
+            tap_origin: std::time::Instant::now(),
+            tap_flash_t: 0.0,
+            count_in_enabled: false,
+            count_in_bars: 1,
+            counting_in: false,
+            count_in_beat: 0,
+            last_transport_rev: 0,
             drag: Drag::None,
             press: None,
             pending: None,
@@ -1435,6 +1461,9 @@ impl DemoApp {
         // Default rack = the engine's demo patch (2 stacks). build_rack mirrors
         // its nodes/edges into units/cables; ids match so per-frame Connect
         // publishes are engine-side duplicates.
+        let (ci_enabled, ci_bars) = crate::assistant::load_count_in();
+        app.count_in_enabled = ci_enabled;
+        app.count_in_bars = ci_bars;
         app.build_rack(&Graph::demo_patch(), &[]);
         app.begin_load_fade(); // startup rack fades in
         app
@@ -1776,6 +1805,7 @@ impl DemoApp {
             col("Play", &[
                 (&["Tab"], "flip the rack · front plays, back patches"),
                 (&["Space"], "master play / stop (every metronome)"),
+                (&["Shift", "T"], "tap tempo (or TAP on a metronome)"),
                 (&["drag"], "the BPM on a metronome to set the tempo"),
                 (&["SPLIT"], "on the keys: LOW / HIGH MIDI outs"),
                 (&["drag"], "a knob to shape the sound"),
@@ -2138,6 +2168,12 @@ impl DemoApp {
         self.voice_retire_rx = Some(voice_retire_rx);
         self._audio_stream = Some(stream);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
+        if self.count_in_enabled || self.count_in_bars != 1 {
+            let _ = bus.lock().unwrap().send(Command::SetCountIn {
+                enabled: self.count_in_enabled,
+                bars: self.count_in_bars,
+            });
+        }
         self.bus = Some(bus);
         self.out_level = Some(level);
         self.surge_status = "Surge loaded — play!".into();
@@ -2202,6 +2238,22 @@ impl DemoApp {
         if g.mix_rev != self.last_mix_rev {
             self.last_mix_rev = g.mix_rev;
             self.rig_mix = g.mix;
+        }
+        if g.transport_rev != self.last_transport_rev {
+            self.last_transport_rev = g.transport_rev;
+            let was_counting = self.counting_in;
+            self.counting_in = g.transport.counting_in;
+            self.count_in_beat = g.transport.count_in_beat;
+            self.count_in_enabled = g.transport.count_in_enabled;
+            self.count_in_bars = g.transport.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS);
+            if !matches!(self.drag, Drag::Bpm { .. }) {
+                self.bpm = g.transport.bpm;
+            }
+            let now_playing = g.transport.playing || g.transport.counting_in;
+            if (now_playing && !self.playing) || (was_counting && !self.counting_in && g.transport.playing) {
+                self.time = 0.0;
+            }
+            self.playing = now_playing;
         }
         if g.rev == self.last_graph_rev { return; }
         self.last_graph_rev = g.rev;
@@ -2621,7 +2673,12 @@ impl DemoApp {
                 "midi_in": self.hw_status,
                 "octave": self.octave,
                 "rack_side": match self.side { Side::Front => "front", Side::Back => "back" },
-                "playing": self.playing,
+                "playing": self.playing && !self.counting_in,
+                "counting_in": self.counting_in,
+                "count_in_beat": self.count_in_beat,
+                "count_in_enabled": self.count_in_enabled,
+                "count_in_bars": self.count_in_bars,
+                "bpm": self.bpm,
                 "cables": self.cables.len(),
                 "fps": self.fps,
                 "buffer_frames": crate::bridge::BUFFER_FRAMES,
@@ -3039,13 +3096,25 @@ impl DemoApp {
                 s
             }
             "transport_play" => {
-                self.playing = true;
-                self.time = 0.0;
-                self.master_transport(true);
-                "master transport started (every metronome plays)".into()
+                if !self.playing {
+                    self.playing = true;
+                    self.time = 0.0;
+                    if self.graph_pub.is_none() && self.count_in_enabled {
+                        self.counting_in = true;
+                        self.count_in_beat = 1;
+                    }
+                    self.master_transport(true);
+                }
+                if self.count_in_enabled {
+                    format!("master transport count-in started ({} bar)", self.count_in_bars)
+                } else {
+                    "master transport started (every metronome plays)".into()
+                }
             }
             "transport_stop" => {
                 self.playing = false;
+                self.counting_in = false;
+                self.count_in_beat = 0;
                 self.master_transport(false);
                 "master transport stopped (every metronome stops)".into()
             }
@@ -3064,6 +3133,17 @@ impl DemoApp {
                 let bpm = args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(96.0).clamp(20.0, 300.0) as f32;
                 self.set_bpm(bpm);
                 format!("tempo set to {bpm:.0} BPM")
+            }
+            "set_count_in" => {
+                let bars_arg = args.get("bars").and_then(|v| v.as_u64()).map(|b| b.min(255) as u8);
+                let enabled_arg = args.get("enabled").and_then(|v| v.as_bool());
+                let (enabled, bars) = match bars_arg {
+                    Some(0) => (false, self.count_in_bars),
+                    Some(b) => (enabled_arg.unwrap_or(true), b.clamp(1, crate::transport::MAX_COUNT_IN_BARS)),
+                    None => (enabled_arg.unwrap_or(!self.count_in_enabled), self.count_in_bars),
+                };
+                self.set_count_in(enabled, bars);
+                serde_json::json!({"enabled": self.count_in_enabled, "bars": self.count_in_bars}).to_string()
             }
             "load_template" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("demo").to_lowercase();
@@ -4782,6 +4862,37 @@ impl DemoApp {
         }
     }
 
+    /// Add a Metronome node to the active rig and wire it to that rig's MasterOut.
+    fn add_metronome_to_active_rig(&mut self) {
+        let rig = self.active_rig as u8;
+        let master = self.units.iter()
+            .find(|u| matches!(u.node_kind, UnitKind::Master) && (self.rig_count() <= 1 || u.rig == rig))
+            .map(|u| u.node_id);
+        let mut g = self.base_graph.clone();
+        // Rebuild edges from living cables so user rewires survive.
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            if let (Some(sn), Some(dn)) = (self.units.get(c.src).map(|u| u.node_id), self.units.get(c.dst).map(|u| u.node_id)) {
+                let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+                g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+            }
+        }
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+        g.set_rig(metro, rig);
+        if let Some(m) = master {
+            let eid = g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            g.connect_with_id(eid, PortRef { node: metro, port: 0 }, PortRef { node: m, port: 0 }, CPortKind::Audio);
+        }
+        let keep_rig = self.active_rig;
+        let keep_mix = self.rig_mix;
+        self.load_graph_into_engine(&g);
+        self.build_rack(&g, &[]);
+        self.rig_mix = keep_mix;
+        self.set_active_rig(keep_rig);
+        self.plugin_msg = "Added Metronome — wired to Master".into();
+    }
+
     /// Start a fresh single-Surge rig.
     fn add_surge_rig(&mut self) {
         self.add_clap_rig(SURGE_ID, "Surge");
@@ -4807,6 +4918,21 @@ impl DemoApp {
                 ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").size(12.0).color(theme::INK_2));
                 let filter = self.plugin_filter.to_lowercase();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    if filter.is_empty() || "metronome".contains(&filter) {
+                        theme::section_label(ui, "Built-in");
+                        let mut add_metro = false;
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Metronome").size(13.0));
+                            ui.label(egui::RichText::new("tempo · tap · count-in").size(11.0).color(theme::INK_2));
+                            if theme::primary_button(ui, "Add to rig").clicked() {
+                                add_metro = true;
+                            }
+                        });
+                        if add_metro {
+                            self.add_metronome_to_active_rig();
+                        }
+                        ui.separator();
+                    }
                     theme::section_label(ui, &format!("LV2 plugins ({})", self.plugins_lv2.len()));
                     let mut added: Option<(String, String, bool)> = None;
                     let mut first_row = true;
@@ -5288,14 +5414,21 @@ impl DemoApp {
         self.playing = !self.playing;
         // Global transport = MASTER: Play/Stop fans out to every
         // transport-capable rack instrument; per-node chips override after.
-        self.master_transport(self.playing);
         if self.playing {
             self.time = 0.0; // restart the visual beat phase on Play
+            if self.graph_pub.is_none() && self.count_in_enabled {
+                self.counting_in = true;
+                self.count_in_beat = 1;
+            }
             for c in &mut self.cables {
                 c.next_event = self.time + 0.08;
                 c.pat_idx = 0;
             }
+        } else {
+            self.counting_in = false;
+            self.count_in_beat = 0;
         }
+        self.master_transport(self.playing);
     }
 
     /// Master transport (Space, masthead circle, transport window, assistant
@@ -5344,7 +5477,7 @@ impl DemoApp {
         if !u.transport { return None; }
         let r = *self.unit_rects.get(unit)?;
         if r.width() < 140.0 { return None; }
-        let top = (r.top() + 60.0).max(r.center().y + 4.0).min(r.bottom() - 28.0);
+        let top = (r.top() + 56.0).max(r.center().y - 16.0).min(r.bottom() - 28.0);
         Some(Rect::from_min_size(Pos2::new(r.left() + 34.0, top), Vec2::new(72.0, 24.0)))
     }
 
@@ -5492,13 +5625,38 @@ impl DemoApp {
         };
         let x_row = chip.right() + 32.0; // past the beat LED
         if x_row + full <= right { return Some(row(x_row, chip.top(), true)); }
-        let y_under = chip.bottom() + 6.0;
-        if y_under + FACE_CTL_H <= r.bottom() - 6.0 {
+        let y_under = chip.bottom() + 4.0;
+        if y_under + FACE_CTL_H <= r.bottom() - 4.0 {
             if chip.left() + full <= right { return Some(row(chip.left(), y_under, true)); }
             if chip.left() + BPM_VALUE_W <= right { return Some(row(chip.left(), y_under, false)); }
         }
         if x_row + BPM_VALUE_W <= right { return Some(row(x_row, chip.top(), false)); }
         None
+    }
+
+    /// Metronome-face TAP + COUNT-IN controls (rack-local), placed below
+    /// the top Play/BPM row (or on row 3 when BPM wraps on narrow faces).
+    fn metro_action_rects(&self, unit: usize) -> Option<MetroActionRects> {
+        let chip = self.transport_chip_rect(unit)?;
+        let r = *self.unit_rects.get(unit)?;
+        let right = r.right() - 14.0;
+        let base_bottom = match self.bpm_rects(unit) {
+            Some(b) if b.value.top() > chip.top() + 1.0 => b.value.bottom(),
+            _ => chip.bottom(),
+        };
+        let y = base_bottom + 4.0;
+        if y + FACE_CTL_H > r.bottom() - 4.0 { return None; }
+        let avail = right - chip.left();
+        let (tap_w, gap, ci_w, compact) = if avail >= METRO_TAP_W + 6.0 + METRO_COUNT_IN_W {
+            (METRO_TAP_W, 6.0, METRO_COUNT_IN_W, false)
+        } else if avail >= 44.0 + 4.0 + 50.0 {
+            (44.0, 4.0, 50.0, true)
+        } else {
+            return None;
+        };
+        let tap = Rect::from_min_size(Pos2::new(chip.left(), y), Vec2::new(tap_w, FACE_CTL_H));
+        let count_in = Rect::from_min_size(Pos2::new(tap.right() + gap, y), Vec2::new(ci_w, FACE_CTL_H));
+        Some(MetroActionRects { tap, count_in, compact })
     }
 
     /// Is rack-local `lp` on one of a unit's face drag readouts (the split
@@ -5518,6 +5676,26 @@ impl DemoApp {
         }
     }
 
+    /// Record a tap-tempo event at monotonic timestamp `now_secs`, flashing
+    /// the TAP chip and updating BPM once >=2 taps establish an interval.
+    fn tap_tempo_at(&mut self, now_secs: f64) {
+        self.tap_flash_t = 1.0;
+        if let Some(bpm) = self.tap_tempo.tap(now_secs) {
+            self.set_bpm(bpm);
+        }
+    }
+
+    /// Update count-in configuration, persist it, and notify the engine.
+    fn set_count_in(&mut self, enabled: bool, bars: u8) {
+        let bars = bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS);
+        self.count_in_enabled = enabled;
+        self.count_in_bars = bars;
+        let _ = crate::assistant::save_count_in(enabled, bars);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetCountIn { enabled, bars });
+        }
+    }
+
     // -- simulation -----------------------------------------------------------
 
     fn step_spring(c: &mut Vec2, v: &mut Vec2, target: Vec2, h: f32) {
@@ -5528,7 +5706,22 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
-        if self.playing { self.time += dt as f64; }
+        self.tap_flash_t = (self.tap_flash_t - dt * 5.0).max(0.0);
+        if self.playing {
+            self.time += dt as f64;
+            if self.graph_pub.is_none() && self.counting_in {
+                let beats = self.time * self.bpm.max(1.0) as f64 / 60.0;
+                let total = self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS) as f64
+                    * crate::transport::BEATS_PER_BAR as f64;
+                if beats >= total {
+                    self.counting_in = false;
+                    self.count_in_beat = 0;
+                    self.time = 0.0;
+                } else {
+                    self.count_in_beat = (beats.floor() as u8).saturating_add(1).min(total as u8);
+                }
+            }
+        }
 
         // Flip animation.
         if self.flipping {
@@ -5901,6 +6094,7 @@ impl DemoApp {
         // the rack's cable shortcuts).
         if self.confirm_delete_rig.is_some() { return; }
         let mut toggle_play = false;
+        let mut tap_tempo = false;
         let mut flip = false;
         let mut reset_knobs = false;
         let mut load_tpl: Option<Template> = None;
@@ -5923,6 +6117,7 @@ impl DemoApp {
         }
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::NONE, Key::Space) { toggle_play = true; }
+            if i.consume_key(Modifiers::SHIFT, Key::T) { tap_tempo = true; }
             if i.consume_key(Modifiers::NONE, Key::Tab) { flip = true; }
             if i.consume_key(Modifiers::NONE, Key::R) { reset_knobs = true; }
             if i.consume_key(Modifiers::NONE, Key::D) { self.show_stats = !self.show_stats; }
@@ -5991,6 +6186,7 @@ impl DemoApp {
             }
         });
         if toggle_play { self.toggle_play(); }
+        if tap_tempo { self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64()); }
         if flip { self.on_tab(); }
         if let Some(t) = load_tpl { self.load_template(t); }
         if load_demo { self.load_demo_patch(); }
@@ -6282,6 +6478,14 @@ impl DemoApp {
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.bpm_rects(ui).map_or(false, |b| b.plus.map_or(false, |r| r.contains(l.to_pos2()))) => {
                         self.set_bpm(self.bpm.round() + 1.0);
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.metro_action_rects(ui).map_or(false, |m| m.tap.contains(l.to_pos2())) => {
+                        self.tap_tempo_at(self.tap_origin.elapsed().as_secs_f64());
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.metro_action_rects(ui).map_or(false, |m| m.count_in.contains(l.to_pos2())) => {
+                        self.set_count_in(!self.count_in_enabled, self.count_in_bars);
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.transport_chip_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
@@ -6898,19 +7102,47 @@ impl DemoApp {
             tp.set_opacity(self.text_alpha);
             tp.galley(pos, g, txt);
         }
-        // State LED: teal while this instrument plays (thumps on the beat
-        // when the master clock runs), dim track when stopped.
+        // State LED: tomato while counting in, teal while playing normally,
+        // dim track when stopped.
         let led = Vec2::new(chip.right() + 16.0, chip.center().y);
         if u.playing {
             let beat = 60.0 / self.bpm.max(1.0) as f64;
             let phase = ((self.time / beat).fract() as f32).clamp(0.0, 1.0);
             let thump = if self.playing { (1.0 - phase).powi(3) } else { 0.0 };
-            self.ell(painter, led, 7.0 + 2.0 * thump, alpha(GREEN, 0.15 + 0.15 * thump), Stroke::NONE);
-            self.ell(painter, led, 4.0, GREEN, Stroke::NONE);
+            let led_col = if self.counting_in { theme::ACCENT } else { GREEN };
+            self.ell(painter, led, 7.0 + 2.0 * thump, alpha(led_col, 0.15 + 0.15 * thump), Stroke::NONE);
+            self.ell(painter, led, 4.0, led_col, Stroke::NONE);
         } else {
             self.ell(painter, led, 4.0, theme::METER_TRACK, Stroke::NONE);
         }
         self.draw_bpm_control(painter, unit);
+        self.draw_metro_actions(painter, unit);
+    }
+
+    /// Metronome-face TAP + COUNT-IN chips below the Play/BPM row.
+    fn draw_metro_actions(&self, painter: &egui::Painter, unit: usize) {
+        let Some(m) = self.metro_action_rects(unit) else { return };
+        let tap_hov = self.face_hovered(painter, unit, m.tap);
+        self.paint_face_chip(painter, m.tap, "TAP", self.tap_flash_t > 0.15, tap_hov);
+
+        let ci_hov = self.face_hovered(painter, unit, m.count_in);
+        let ci_on = self.count_in_enabled || self.counting_in;
+        let total_beats = self.count_in_bars.clamp(1, crate::transport::MAX_COUNT_IN_BARS)
+            * crate::transport::BEATS_PER_BAR as u8;
+        let ci_label = if self.counting_in {
+            if m.compact {
+                format!("IN {}", self.count_in_beat.max(1))
+            } else {
+                format!("IN {}/{}", self.count_in_beat.max(1), total_beats)
+            }
+        } else if m.compact {
+            if self.count_in_bars > 1 { format!("{} BAR", self.count_in_bars) } else { "1 BAR".into() }
+        } else if self.count_in_bars > 1 {
+            format!("COUNT · {}", self.count_in_bars)
+        } else {
+            "COUNT-IN".into()
+        };
+        self.paint_face_chip(painter, m.count_in, &ci_label, ci_on, ci_hov);
     }
 
     /// Metronome-face tempo: −/+ steppers around a drag readout ("96 BPM").
@@ -7716,8 +7948,10 @@ impl DemoApp {
         if !typing(&ctx) {
             let events = ctx.input(|i| i.events.clone());
             for ev in events {
-                if let egui::Event::Key { key, pressed, repeat, .. } = ev {
-                    self.handle_laptop_key(key, pressed, repeat);
+                if let egui::Event::Key { key, pressed, repeat, modifiers, .. } = ev {
+                    if !pressed || modifiers.is_none() {
+                        self.handle_laptop_key(key, pressed, repeat);
+                    }
                 }
             }
         }
@@ -8279,12 +8513,13 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                         // the same bus + a live graph mirror. Additive — if the
                         // socket is unavailable the app just runs without it.
                         let shared_graph = Arc::new(Mutex::new(Graph::demo_patch()));
-                        if let Err(e) = crate::bridge::spawn_with_rigs(
+                        if let Err(e) = crate::bridge::spawn_with_state(
                             bus.clone(),
                             shared_graph.clone(),
                             level.clone(),
                             sample_rate,
                             rig_snapshot.clone(),
+                            graph_pub.clone(),
                         ) {
                             eprintln!("bridge: control socket unavailable: {e:#}");
                         }
@@ -8356,7 +8591,12 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                         level,
                     )
                 }
-                None => app,
+                None => {
+                    if std::env::args().any(|a| a == "--metro") {
+                        app.add_metronome_to_active_rig();
+                    }
+                    app
+                }
             };
             Ok(Box::new(app))
         }),
@@ -10586,5 +10826,83 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Add") && texts.iter().any(|t| t == "Learn"), "Add/Learn buttons painted: {texts:?}");
         assert!(texts.iter().any(|t| t.contains("74")), "CC 74 binding painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "1 CC"), "Matrix cell reflects 1 CC: {texts:?}");
+    }
+
+    #[test]
+    fn metronome_face_tap_and_count_in_controls_work_and_fit() {
+        let (mut app, ctx, m1, _m2) = metro_app();
+        let (tx, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let u1 = unit_of(&app, m1);
+
+        // Controls are painted, inside the face, and disjoint from Play/BPM across widths.
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "TAP"), "TAP chip painted: {texts:?}");
+        assert!(texts.iter().any(|t| t == "COUNT-IN"), "COUNT-IN chip painted: {texts:?}");
+
+        let r_orig = app.unit_rects[u1];
+        for w in [150.0f32, 200.0, 240.0, 320.0, 420.0] {
+            app.unit_rects[u1] = Rect::from_min_size(r_orig.min, Vec2::new(w, r_orig.height()));
+            let chip = app.transport_chip_rect(u1).expect("chip");
+            let b = app.bpm_rects(u1).expect("bpm");
+            let m = app.metro_action_rects(u1).unwrap_or_else(|| panic!("tap/count-in at width {w}"));
+            assert!(!m.tap.intersects(chip) && !m.count_in.intersects(chip), "w={w}: overlaps Play");
+            assert!(!m.tap.intersects(b.value) && !m.count_in.intersects(b.value), "w={w}: overlaps BPM");
+            assert!(!m.tap.intersects(m.count_in), "w={w}: TAP overlaps COUNT-IN");
+            assert!(app.unit_rects[u1].contains_rect(m.tap), "w={w}: TAP outside face");
+            assert!(app.unit_rects[u1].contains_rect(m.count_in), "w={w}: COUNT-IN outside face");
+        }
+        app.unit_rects[u1] = r_orig;
+        frame(&mut app, &ctx, vec![]);
+
+        // Clicking COUNT-IN toggles count_in_enabled and sends SetCountIn.
+        let ci_pos = screen(&app, app.metro_action_rects(u1).unwrap().count_in);
+        click(&mut app, &ctx, ci_pos);
+        assert!(app.count_in_enabled);
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetCountIn { enabled: true, bars: 1 })), "sent SetCountIn: {cmds:?}");
+
+        // Shift+T taps tempo without firing laptop piano F#4 (Key::T).
+        let (note_tx, note_log) = {
+            let log = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let l = log.clone();
+            let sink: NoteSink = Box::new(move |ev| {
+                if ev.velocity > 0.0 { l.lock().unwrap().push(ev.note); }
+            });
+            (sink, log)
+        };
+        app.note_sink = Some(note_tx);
+        let shift_t = vec![egui::Event::Key {
+            key: Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        }];
+        frame(&mut app, &ctx, shift_t);
+        assert!(note_log.lock().unwrap().is_empty(), "Shift+T must not trigger laptop piano note");
+        assert!(app.tap_flash_t > 0.5, "Shift+T flashes TAP control");
+
+        // Deterministic tap tempo averaging updates BPM and sends SetBpm.
+        app.tap_tempo.reset();
+        app.tap_tempo_at(10.0);
+        app.tap_tempo_at(10.5);
+        app.tap_tempo_at(11.0);
+        assert_eq!(app.bpm, 120.0);
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetBpm { bpm } if (*bpm - 120.0).abs() < 1e-3)));
+
+        // Assistant set_count_in + get_status tool parity.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        assert!(names.contains(&"set_count_in"), "assistant tools missing set_count_in");
+        let res = app.exec_tool("set_count_in", &serde_json::json!({"enabled": true, "bars": 2}));
+        assert!(res.contains("\"enabled\":true") && res.contains("\"bars\":2"), "{res}");
+        let st: serde_json::Value = serde_json::from_str(&app.exec_tool("get_status", &serde_json::json!({}))).unwrap();
+        assert_eq!(st["count_in_enabled"], serde_json::json!(true));
+        assert_eq!(st["count_in_bars"], serde_json::json!(2));
+        assert_eq!(st["bpm"], serde_json::json!(120.0));
     }
 }

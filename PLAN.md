@@ -692,7 +692,8 @@ Everything queued lives here; update this section as work lands.
   class is a blank node lilv can't resolve here).
 - A cold CLAP scan (first launch, or Refresh with a hanging bundle) runs on the UI
   thread: up to 5 s per wave of 4 hanging bundles. Move to a background thread.
-- `transport-test` flaked once in 11 runs (Surge step 4 instead of 2); cause unknown.
+- `transport-test` flaked 2 of ~20 runs, both the first run right after a fresh build
+  (guess: Surge loads its patch asynchronously on a cold cache); rerun before blaming code.
 - CLAP host hardening probes (2026-11-16): across host-test, audio-test and the
   Dexed/Vitalium/Surge tests no plugin called `request_restart` or logged; Dexed
   issues `request_callback` on the main thread only (already pumped). Restart

@@ -1749,6 +1749,8 @@ struct DemoApp {
     hw_devices: Vec<String>,
     /// Last hardware MIDI event for the info line ("eX MIDI 1 · C4 v100").
     last_midi: Option<String>,
+    /// The info line is shown in the hint row (no room in the top bar).
+    info_in_hint: bool,
     /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
     rig_device: [Option<u32>; VOICE_POOL],
     surge_status: String,
@@ -1784,6 +1786,15 @@ struct DemoApp {
     audio_in_tuners: std::collections::HashMap<u32, (rtrb::Consumer<f32>, crate::audio_in::Tuner, Option<crate::audio_in::Pitch>)>,
     /// Discovered input devices (name, channels, default), rescanned off-frame.
     input_devices: std::sync::Arc<Mutex<Vec<crate::audio_in::InputDevice>>>,
+    /// Outputs, our current sink and other apps' streams (scan thread).
+    audio_out: std::sync::Arc<Mutex<crate::audio_out::OutputState>>,
+    /// The output the user chose (None = follow PipeWire's default).
+    wanted_output: std::sync::Arc<Mutex<Option<String>>>,
+    /// Volume/mute changes for other apps' streams → scan thread.
+    stream_cmds: Option<std::sync::mpsc::Sender<crate::audio_out::StreamCmd>>,
+    /// Fader values the user is moving (stream index → (value, until)), so
+    /// a fader does not jump back before the next scan sees the change.
+    stream_grace: Vec<(u64, f32, f32)>,
     /// Time accumulator for the periodic capture re-sync (hot-plug, rule 48).
     audio_in_sync_timer: f32,
     /// Per-node "stream is alive" flag (false after cpal's error callback).
@@ -1985,6 +1996,7 @@ impl DemoApp {
             hw_status: String::new(),
             hw_devices: Vec::new(),
             last_midi: None,
+            info_in_hint: false,
             rig_device: [None; VOICE_POOL],
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
@@ -2005,6 +2017,10 @@ impl DemoApp {
             audio_in_opened: std::collections::HashMap::new(),
             audio_in_tuners: std::collections::HashMap::new(),
             input_devices: std::sync::Arc::new(Mutex::new(Vec::new())),
+            audio_out: std::sync::Arc::new(Mutex::new(Default::default())),
+            wanted_output: std::sync::Arc::new(Mutex::new(crate::assistant::load_config_str("audio_output"))),
+            stream_cmds: None,
+            stream_grace: Vec::new(),
             audio_in_sync_timer: 0.0,
             audio_in_live: std::collections::HashMap::new(),
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
@@ -2763,7 +2779,68 @@ impl DemoApp {
         self.out_level = Some(level);
         self.surge_status = "Surge loaded — play!".into();
         self.start_input_device_scan();
+        self.start_audio_out_thread();
         self
+    }
+
+    /// Output selection + other apps' streams: scan every second (sooner when
+    /// a command arrives), move our stream to the chosen output, apply
+    /// volume/mute changes. All pactl I/O lives here (rule 48).
+    fn start_audio_out_thread(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<crate::audio_out::StreamCmd>();
+        self.stream_cmds = Some(tx);
+        let state = self.audio_out.clone();
+        let wanted = self.wanted_output.clone();
+        std::thread::Builder::new()
+            .name("kabelsalat-audio-out".into())
+            .spawn(move || loop {
+                let mut cmds = Vec::new();
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(c) => { cmds.push(c); while let Ok(c) = rx.try_recv() { cmds.push(c); } }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                crate::audio_out::apply_stream_cmds(cmds);
+                let w = wanted.lock().ok().and_then(|w| w.clone());
+                let st = crate::audio_out::scan_and_apply(w.as_deref());
+                if let Ok(mut s) = state.lock() { *s = st; }
+            })
+            .ok();
+    }
+
+    /// Choose the output (None = PipeWire default); remembered in config.
+    fn set_audio_output(&mut self, output: Option<String>) {
+        let _ = crate::assistant::save_config_field("audio_output", output.as_deref().unwrap_or(""));
+        if let Ok(mut w) = self.wanted_output.lock() { *w = output; }
+    }
+
+    /// Set another app's stream volume/mute (applied by the scan thread).
+    fn set_app_stream(&mut self, index: u64, volume: Option<f32>, muted: Option<bool>) {
+        let until = self.ui_time + 2.5;
+        if let Some(v) = volume {
+            let v = v.clamp(0.0, 1.5);
+            self.stream_grace.retain(|(i, _, _)| *i != index);
+            self.stream_grace.push((index, v, until));
+            if let Some(tx) = &self.stream_cmds { let _ = tx.send(crate::audio_out::StreamCmd::Volume(index, v)); }
+        }
+        if let Some(m) = muted {
+            if let Some(tx) = &self.stream_cmds { let _ = tx.send(crate::audio_out::StreamCmd::Mute(index, m)); }
+            if let Ok(mut st) = self.audio_out.lock() {
+                if let Some(s) = st.streams.iter_mut().find(|s| s.index == index) { s.muted = m; }
+            }
+        }
+    }
+
+    /// Other apps' streams as shown: the scan's values, with faders the user
+    /// is moving held at their new value until the scan catches up.
+    fn app_streams_shown(&mut self) -> Vec<crate::audio_out::AppStream> {
+        let now = self.ui_time;
+        self.stream_grace.retain(|(_, _, until)| *until > now);
+        let mut v = self.audio_out.lock().map(|s| s.streams.clone()).unwrap_or_default();
+        for s in &mut v {
+            if let Some((_, val, _)) = self.stream_grace.iter().find(|(i, _, _)| *i == s.index) { s.volume = *val; }
+        }
+        v
     }
 
     fn laptop_key_offset(key: Key) -> Option<usize> {
@@ -3836,6 +3913,47 @@ impl DemoApp {
                 } else {
                     "system audio muted".into()
                 }
+            }
+            "list_audio_outputs" => {
+                let st = self.audio_out.lock().map(|s| s.clone()).unwrap_or_default();
+                let wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
+                serde_json::json!({
+                    "outputs": st.outputs.iter().map(|o| serde_json::json!({"name": o.raw, "label": o.name, "default": o.default})).collect::<Vec<_>>(),
+                    "current": st.current,
+                    "selected": wanted,
+                }).to_string()
+            }
+            "set_audio_output" => {
+                let out = args.get("output").and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty());
+                let known = self.audio_out.lock().map(|s| s.outputs.clone()).unwrap_or_default();
+                if let Some(o) = &out {
+                    if !known.iter().any(|k| &k.raw == o) {
+                        return format!("no output named '{o}' (see list_audio_outputs)");
+                    }
+                }
+                self.set_audio_output(out.clone());
+                match out {
+                    Some(o) => format!("kabelsalat plays to {o} (moved within a second; remembered)"),
+                    None => "kabelsalat follows the system default output".into(),
+                }
+            }
+            "list_app_streams" => {
+                let streams = self.app_streams_shown();
+                serde_json::json!({"streams": streams.iter().map(|s| serde_json::json!({
+                    "index": s.index, "app": s.app, "title": s.title, "volume": s.volume, "muted": s.muted,
+                })).collect::<Vec<_>>()}).to_string()
+            }
+            "set_app_stream" => {
+                let Some(index) = args.get("index").and_then(|v| v.as_u64()) else {
+                    return "set_app_stream needs 'index' (see list_app_streams)".into();
+                };
+                if !self.app_streams_shown().iter().any(|s| s.index == index) {
+                    return format!("no playing app stream {index} (see list_app_streams)");
+                }
+                let volume = args.get("volume").and_then(|v| v.as_f64()).map(|v| v as f32);
+                let muted = args.get("muted").and_then(|v| v.as_bool());
+                self.set_app_stream(index, volume, muted);
+                format!("app stream {index}: volume {volume:?} muted {muted:?}")
             }
             "list_audio_devices" => {
                 let devs: Vec<crate::audio_in::InputDevice> = self.input_devices.lock().map(|d| d.clone()).unwrap_or_default();
@@ -5673,6 +5791,10 @@ impl DemoApp {
                 | "get_matrix"
                 | "undo"
                 | "redo"
+                | "list_audio_outputs"
+                | "set_audio_output"
+                | "list_app_streams"
+                | "set_app_stream"
                 | "add_rig" => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
@@ -6081,9 +6203,18 @@ impl DemoApp {
                     // without the play button). Per-synth Keyboard/Hardware
                     // routing lives in the MIDI matrix (same toggles).
                     ui.add_space(4.0);
+                    // Narrow window (< 1000 px): drop the wordmark text and the
+                    // group captions so REC/SYNC never run past the window
+                    // edge; the framed groups still say what belongs together.
+                    // The WINDOW width decides, never ui.available_width(): the
+                    // latter follows the bar's previous-frame width, so the mode
+                    // flipped between frames and buttons jumped under the mouse.
+                    let compact = ui.ctx().content_rect().width() < 1000.0;
                     let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
                     ui.add_space(4.0);
-                    if let Some(g) = self.topbar_word_g.clone() {
+                    if compact {
+                        theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
+                    } else if let Some(g) = self.topbar_word_g.clone() {
                         let (r, _) = ui.allocate_exact_size(g.size, egui::Sense::hover());
                         theme::paint_tracked(ui.painter(), r.min, &g, theme::INK);
                         // Optical alignment: center the mark on the wordmark's
@@ -6107,7 +6238,7 @@ impl DemoApp {
                     // Two explicit groups (user): the VIEW decides what the
                     // main stage shows — exactly one, Rack included — while
                     // the BOTTOM PANEL toggles what docks under it.
-                    theme::section_label(ui, "View");
+                    if !compact { theme::section_label(ui, "View"); }
                     ui.add_space(2.0);
                     let views = [
                         ("Rack", StageView::Rack),
@@ -6131,7 +6262,7 @@ impl DemoApp {
                     ui.add_space(12.0);
                     nav_separator(ui);
                     ui.add_space(10.0);
-                    theme::section_label(ui, "Bottom panel");
+                    if !compact { theme::section_label(ui, "Bottom panel"); }
                     ui.add_space(2.0);
                     let mut dock = None;
                     let group = ui.scope(|ui| {
@@ -6152,10 +6283,11 @@ impl DemoApp {
                         let recent = last > 0 && crate::bridge::now_ms().saturating_sub(last) < 15_000;
                         if paused || recent {
                             ui.add_space(10.0);
-                            let (label, tip) = if paused {
-                                ("Agent paused", "external agents (MCP) may not change this rack — click to allow")
-                            } else {
-                                ("● Agent connected", "an external agent (MCP) is working on this rack — click to pause it")
+                            let (label, tip) = match (paused, compact) {
+                                (true, false) => ("Agent paused", "external agents (MCP) may not change this rack — click to allow"),
+                                (true, true) => ("Paused", "external agents (MCP) may not change this rack — click to allow"),
+                                (false, false) => ("● Agent connected", "an external agent (MCP) is working on this rack — click to pause it"),
+                                (false, true) => ("●", "an external agent (MCP) is working on this rack — click to pause it"),
                             };
                             let r = theme::chip_button(ui, label, paused).on_hover_text(tip);
                             if !paused {
@@ -6217,12 +6349,18 @@ impl DemoApp {
                         }
                     }
                     // MIDI + performance info IN the page (I toggles): right-aligned bar text.
-                    if self.show_stats {
+                    // Too little room left in the bar (narrow window): the line
+                    // moves to the rack's hint row instead of overflowing.
+                    self.info_in_hint = self.show_stats && ui.available_width() < 140.0;
+                    if self.info_in_hint { let _ = self.stats_text(); }
+                    if self.show_stats && !self.info_in_hint {
                         let line = self.stats_text();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(6.0);
-                            ui.label(egui::RichText::new(line).monospace().size(11.0).color(theme::INK_2))
-                                .on_hover_text("last MIDI event · audio · frame rate · patch · MIDI input latency (I hides)");
+                            // Truncated to the room left in the bar (it ran over the
+                            // nav buttons on narrow windows); the hover has it all.
+                            ui.add(egui::Label::new(egui::RichText::new(&line).monospace().size(11.0).color(theme::INK_2)).truncate())
+                                .on_hover_text(format!("{line}\n(I hides)"));
                         });
                     }
                 });
@@ -9311,6 +9449,13 @@ impl DemoApp {
         let n = self.rig_count();
         self.mixer_fader_rects.clear();
         let mut switch: Option<usize> = None;
+        // System audio (#31): other apps' streams + the output choice.
+        let app_streams = self.app_streams_shown();
+        let mut stream_changes: Vec<(u64, Option<f32>, Option<bool>)> = Vec::new();
+        let mut out_pick: Option<Option<String>> = None;
+        let (outputs, out_current) = self.audio_out.lock()
+            .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
+        let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -9330,7 +9475,8 @@ impl DemoApp {
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
                         let strips: usize = (0..n).map(|r| self.mixer_sources(r as u8).len() + 1).sum();
-                        let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + 96.0 + 2.0 * gap;
+                        let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
+                        let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -9424,13 +9570,81 @@ impl DemoApp {
                                         });
                                     });
                                 }
+                                // System audio: every other app that is playing
+                                // (YouTube in the browser, …) gets a strip —
+                                // its PipeWire stream volume and mute.
+                                if !app_streams.is_empty() {
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                    ui.vertical(|ui| {
+                                        let gap = ui.spacing().item_spacing.x;
+                                        let group_w = app_streams.len() as f32 * (STRIP_W + gap) - gap;
+                                        ui.allocate_ui_with_layout(egui::vec2(group_w, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("System audio").font(theme::medium_font(14.0)).color(theme::INK));
+                                            theme::tracked_label(ui, "OTHER APPS", 9.0, 0.14, theme::CREAM_DIM);
+                                        });
+                                        let (rule, _) = ui.allocate_exact_size(egui::vec2(group_w, 5.0), egui::Sense::hover());
+                                        ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+                                        ui.add_space(4.0);
+                                        ui.horizontal_top(|ui| {
+                                            for st in &app_streams {
+                                                ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                                    // "(2) Neo Soul … - YouTube" → "Neo Soul …": the tab counter is noise.
+                                                    let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
+                                                    let shown = st.volume.min(1.0);
+                                                    let mut v = Some(shown);
+                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, 0.0, fader_h);
+                                                    ui.interact(fr, egui::Id::new(("app_stream_tip", st.index)), egui::Sense::hover())
+                                                        .on_hover_text(format!("{} — {}", st.app, st.title));
+                                                    if let Some(nv) = v {
+                                                        if (nv - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(nv), None)); }
+                                                    }
+                                                    ui.add_space(4.0);
+                                                    let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
+                                                            .color(if st.muted { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                                                        .fill(if st.muted { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
+                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                                                    if ui.add(mb).on_hover_text("mute this app").clicked() {
+                                                        stream_changes.push((st.index, None, Some(!st.muted)));
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    });
+                                }
                                 // Master out sits right after the last rig bus
                                 // (the sum they feed) — not pinned far away.
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
                                 ui.vertical(|ui| {
-                                    ui.set_width(96.0);
+                                    ui.set_width(170.0);
                                     theme::section_label(ui, "Master out");
+                                    // Output device (#31): which sound card kabelsalat plays to.
+                                    let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
+                                        .map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
+                                    let selected = match &out_wanted {
+                                        Some(w) => label_of(w),
+                                        None => "System default".to_string(),
+                                    };
+                                    egui::ComboBox::from_id_salt("audio_output")
+                                        .width(160.0)
+                                        .selected_text(egui::RichText::new(selected).size(11.5).color(theme::INK))
+                                        .show_ui(ui, |ui| {
+                                            if ui.selectable_label(out_wanted.is_none(),
+                                                egui::RichText::new("System default").color(theme::INK)).clicked() {
+                                                out_pick = Some(None);
+                                            }
+                                            for o in &outputs {
+                                                if ui.selectable_label(out_wanted.as_deref() == Some(o.raw.as_str()),
+                                                    egui::RichText::new(&o.name).color(theme::INK)).clicked() {
+                                                    out_pick = Some(Some(o.raw.clone()));
+                                                }
+                                            }
+                                        })
+                                        .response.on_hover_text("the sound card kabelsalat plays to");
+                                    if let Some(c) = &out_current {
+                                        ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
+                                    }
                                     ui.add_space(4.0);
                                     let rigs = if n == 1 { "1 rig · peak meter".to_string() } else { format!("sum of {n} rigs · peak meter") };
                                     ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
@@ -9460,6 +9674,8 @@ impl DemoApp {
             });
         });
         if let Some(r) = switch { self.set_active_rig(r); }
+        for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
+        if let Some(o) = out_pick { self.set_audio_output(o); }
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
@@ -10663,7 +10879,18 @@ impl DemoApp {
                 return;
             }
         }
+        let hint_right = pos.x + g.size().x;
         painter.galley(pos, g.clone(), theme::INK_2);
+        // Info line fallback (narrow window): right-aligned on the hint row,
+        // clipped so it never runs into the hint text.
+        if self.info_in_hint && !self.stats_line.is_empty() {
+            let ig = painter.layout_no_wrap(self.stats_line.clone(), FontId::monospace(11.0), theme::INK_2);
+            let clip = Rect::from_min_max(Pos2::new(hint_right + 24.0, pos.y - 4.0), Pos2::new(rect.right() - 16.0, pos.y + 20.0));
+            if clip.width() > 60.0 {
+                let x = (rect.right() - 16.0 - ig.size().x).max(clip.left());
+                painter.with_clip_rect(clip).galley(Pos2::new(x, pos.y + 1.0), ig, theme::INK_2);
+            }
+        }
     }
 
     /// Telemetry line for the top bar (user: in the page, not an overlay;
@@ -10693,8 +10920,8 @@ impl DemoApp {
                 format!("{:.1} kHz · {frames} fr ({:.1} ms)", sr as f64 / 1000.0, frames as f64 / sr as f64 * 1000.0)
             } else { "no audio".into() };
             let midi = self.last_midi.as_deref().unwrap_or("no MIDI yet");
-            self.stats_line = format!("MIDI {midi}  |  {audio} · {:.0} fps · {} cables · {} pulses · midi {:.1} ms",
-                self.fps, self.cables.len(), pulses, midi_ms);
+            let _ = pulses;
+            self.stats_line = format!("{midi} | {audio} · midi {midi_ms:.1} ms · {:.0} fps", self.fps);
         }
         self.stats_line.clone()
     }
@@ -12989,6 +13216,50 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn info_line_never_runs_over_the_top_bar_buttons() {
+        // A long MIDI event in narrow windows (down to the 760 px minimum):
+        // nothing in the top bar — buttons or the info line — may run past
+        // the window edge (REC/SYNC did at ~780 px).
+        // Sizes in points (egui's screen_rect unit): the minimum window, the
+        // user's ~780-point tile, and a full screen.
+        // Worst case on purpose: an external agent is connected, so its chip
+        // shows too (a global the bridge tests also set in parallel).
+        crate::bridge::LAST_REMOTE_MS.store(crate::bridge::now_ms() + 600_000, std::sync::atomic::Ordering::Relaxed);
+        for width in [760.0f32, 900.0, 1600.0] {
+            let mut app = DemoApp::new_with_sink(None);
+            let ctx = egui::Context::default();
+            app.show_stats = true;
+            app.last_midi = Some("ESI MIDIMATE eX MIDI 1 · C4 v100 · a very long device name that keeps going and going".into());
+            let size = Vec2::new(width, 700.0);
+            for _ in 0..3 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+                out.textures_delta.clear();
+            }
+            let bar: Vec<Rect> = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+                .filter(|w| w.rect.top() < 40.0 && w.rect.height() < 40.0).map(|w| w.rect).collect());
+            let right = bar.iter().map(|r| r.right()).fold(0.0f32, f32::max);
+            assert!(app.dock_group_rect.is_positive());
+            assert!(right <= width + 0.5, "{width} pt window: rightmost top-bar element at {right}");
+            // And the bar still works there: Sessions (the 2nd View button) opens.
+            let mut btns: Vec<Rect> = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+                .filter(|w| w.sense.senses_click() && w.rect.top() < 40.0).map(|w| w.rect).collect());
+            btns.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            let at = btns[1].center();
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.events = vec![egui::Event::PointerMoved(at),
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }];
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            assert_eq!(app.stage_view, StageView::Sessions, "{width} pt: the View buttons stay clickable");
+        }
+        crate::bridge::LAST_REMOTE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
     fn i_toggles_the_info_line_with_the_last_midi_event() {
         let (mut app, ctx) = two_rigs();
         assert!(!app.show_stats);
@@ -13001,7 +13272,7 @@ mod rig_switch_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 64));
         frame(&mut app, &ctx, vec![]);
         app.stats_timer = 0.0;
-        assert!(app.stats_text().starts_with("MIDI ESI MIDIMATE eX MIDI 1 · CC74 64"), "{}", app.stats_line);
+        assert!(app.stats_text().starts_with("ESI MIDIMATE eX MIDI 1 · CC74 64 |"), "{}", app.stats_line);
         frame(&mut app, &ctx, key(Key::I));
         assert!(!app.show_stats, "I hides it again");
     }
@@ -14498,6 +14769,9 @@ mod stage_views_tests {
         }];
         let ctx = egui::Context::default();
         let size = Vec2::new(1600.0, 1000.0);
+        run_frame(&mut app, &ctx, size, vec![]);
+        // Frame 1 runs at ppp 1.0; the app corrects to the monitor scale
+        // (1.6) for every later frame — measure the bar once it settled.
         run_frame(&mut app, &ctx, size, vec![]);
 
         let mut sessions_btns = ctx.viewport(|v| {

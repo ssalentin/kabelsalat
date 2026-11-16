@@ -8,6 +8,7 @@
 mod assistant;
 mod audio;
 mod audio_in;
+mod audio_out;
 mod bridge;
 mod capture;
 mod control;

@@ -269,6 +269,24 @@ struct SetAudioInArgs {
     monitor: Option<bool>,
 }
 
+/// Arguments for `set_audio_output`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetAudioOutputArgs {
+    /// PipeWire sink name from list_audio_outputs; omit or empty = system default.
+    output: Option<String>,
+}
+
+/// Arguments for `set_app_stream`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetAppStreamArgs {
+    /// Stream index from list_app_streams.
+    index: u64,
+    /// Volume 0..1.5 (1.0 = 100 %).
+    volume: Option<f32>,
+    /// Mute on/off.
+    muted: Option<bool>,
+}
+
 /// Arguments for `set_player`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetPlayerArgs {
@@ -1141,6 +1159,26 @@ impl McpServer {
             _ => serde_json::json!({}),
         }).unwrap_or(serde_json::json!({}));
         ok_json(summary)
+    }
+
+    #[tool(name = "list_audio_outputs", description = "List the sound cards kabelsalat can play to (PipeWire sinks), the one it plays to now and the user's choice. Needs the running app (kabelsalat mcp --attach).")]
+    fn list_audio_outputs(&self) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("list_audio_outputs", json!({}))
+    }
+
+    #[tool(name = "set_audio_output", description = "Choose the sound card kabelsalat plays to (name from list_audio_outputs; omit/empty = system default). Moves the live stream, remembered across restarts. Needs the running app.")]
+    fn set_audio_output(&self, Parameters(args): Parameters<SetAudioOutputArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_audio_output", json!({"output": args.output}))
+    }
+
+    #[tool(name = "list_app_streams", description = "List other apps playing audio right now (YouTube, Spotify, …): index, app, title, volume, muted — the mixer's System audio strips. Needs the running app.")]
+    fn list_app_streams(&self) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("list_app_streams", json!({}))
+    }
+
+    #[tool(name = "set_app_stream", description = "Set another app's playback volume (0..1.5, 1.0 = 100 %) and/or mute, by index from list_app_streams. Needs the running app.")]
+    fn set_app_stream(&self, Parameters(args): Parameters<SetAppStreamArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_app_stream", json!({"index": args.index, "volume": args.volume, "muted": args.muted}))
     }
 
     /// List live audio input devices.

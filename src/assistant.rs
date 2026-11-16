@@ -37,6 +37,16 @@ pub fn save_key(key: &str) -> std::io::Result<()> {
 /// Default chat model when none is stored.
 pub const DEFAULT_MODEL: &str = "deepseek-chat";
 
+/// A string field of config.json (None in tests — they never read the
+/// user's config, rule 37).
+pub fn load_config_str(field: &str) -> Option<String> {
+    if cfg!(test) { return None; }
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get(field).and_then(|m| m.as_str()).map(str::to_string))
+        .filter(|m| !m.is_empty())
+}
+
 /// The stored assistant model (config `assistant_model`), else the default.
 pub fn load_model() -> String {
     std::fs::read_to_string(config_path()).ok()
@@ -468,6 +478,26 @@ pub(crate) fn tools() -> Value {
             "name":"add_node",
             "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). Added dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
             "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_audio_outputs",
+            "description":"List the sound cards kabelsalat can play to (PipeWire sinks: name to pass, readable label, which is the system default), the one it plays to now, and the user's choice (null = follow the system default).",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_audio_output",
+            "description":"Choose the sound card kabelsalat plays to (e.g. the MOTU M2 instead of the laptop speakers). output: a name from list_audio_outputs; null or empty = follow the system default. Moves the live stream without a dropout and is remembered across restarts.",
+            "parameters":{"type":"object","properties":{"output":{"type":["string","null"]}}}
+        }},
+        {"type":"function","function":{
+            "name":"list_app_streams",
+            "description":"List other apps that are playing audio right now (YouTube in the browser, Spotify, …): index, app, title, volume (1.0 = 100 %), muted. These are the strips in the mixer's System audio section.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_app_stream",
+            "description":"Set another app's playback volume and/or mute (e.g. turn YouTube down under the live rigs). index from list_app_streams; volume 0..1.5 (1.0 = 100 %); muted true/false.",
+            "parameters":{"type":"object","properties":{"index":{"type":"integer"},"volume":{"type":"number"},"muted":{"type":"boolean"}},"required":["index"]}
         }},
         {"type":"function","function":{
             "name":"list_audio_devices",

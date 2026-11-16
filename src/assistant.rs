@@ -226,7 +226,8 @@ fn system_prompt() -> String {
      (AUM-style routing, Reason-style rack flip, written in Rust). You help with setup, \
      routing, sound design, and troubleshooting (PipeWire, ALSA MIDI, latency, xruns).\n\n\
      The app is a graph of nodes — Keys, Surge XT synth, built-in DSP (delay/reverb/EQ/\
-     filter/limiter/etc.), LV2 effects, system-audio capture, file player, Master — wired \
+     filter/limiter/etc.), LV2 effects, an Audio In unit (live mic/guitar/interface with \
+     a tuner), system-audio capture, file player, Master — wired \
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
@@ -465,8 +466,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id. rig: which rig it joins (index from get_rigs; default = the rig in view). Added dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
-            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (cpal name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). Added dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_audio_devices",
+            "description":"List live audio input devices (mics, guitars, interfaces) for Audio In units: readable name, cpal name (the 'device' to pass), channel count, and which is default.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_audio_in",
+            "description":"Configure a live Audio In rack unit (mic/guitar/interface) so the user can sing or play through it. node: the AudioIn node id (get_graph). device: a cpal name from list_audio_devices (null/empty = default input). channels: in_1 (left/mic), in_2 (right/guitar), or stereo. gain: 0..1 input gain. monitor: true wires the input straight to the master for low-latency monitoring, false relies on its OUT jack. Wire the OUT jack to effects/master with connect to shape it.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"gain":{"type":"number"},"monitor":{"type":"boolean"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"list_sounds",

@@ -566,10 +566,21 @@ fn parse_wav_header(bytes: &[u8]) -> Option<WavHeader> {
     })
 }
 
+/// Take names use LOCAL wall-clock time (the user reads them in a file
+/// manager); a 16:31 take named 15:31 looked like someone else's file.
 fn timestamp() -> String {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
+    let (y, mo, d, h, mi, s) = civil_from_unix(secs + local_utc_offset(secs));
     format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{s:02}")
+}
+
+/// Seconds east of UTC for `secs` in the system time zone (0 if unknown).
+fn local_utc_offset(secs: i64) -> i64 {
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: localtime_r writes only into `tm`; both pointers are valid.
+    let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    if ok { tm.tm_gmtoff as i64 } else { 0 }
 }
 
 /// Civil (year, month, day, h, m, s) from a unix timestamp (Hinnant's algorithm).

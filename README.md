@@ -11,9 +11,15 @@ routing workflow with GarageBand's approachability. Wire plugins and audio sourc
 into a graph, route MIDI anywhere, and play live — while the signal flows through
 cables that **sag, swing, and glow**.
 
-> **Status: working dev preview.** Two playable channel stacks, embedded Surge
-> editor, system-audio capture, and an MCP server are live. Still evolving — the
-> plan and progress are public: [PLAN.md](PLAN.md).
+> **Status: working dev preview.** Multiple independent rigs, a live MIDI matrix
+> and mixer, CLAP + LV2 hosting with native editors, and an MCP server are live.
+> Still evolving. The plan and progress are public: [PLAN.md](PLAN.md).
+
+<p align="center">
+  <img src="docs/shots/rack-front.png" width="49%" alt="kabelsalat rack front: keys, two Surge XT synths with delays, master out"/>
+  <img src="docs/shots/rack-back.png" width="49%" alt="kabelsalat rack back: the same rack flipped, MIDI and audio patch cables between the jacks"/>
+</p>
+<p align="center"><em>Front (perform) and back (patch). <strong>Tab</strong> flips the rack.</em></p>
 
 ## The idea
 
@@ -30,14 +36,14 @@ interface. kabelsalat is that gap:
 - **Agent-native** — a full MCP server gives AI agents 1:1 access to every feature,
   through the same control plane the UI uses. Plus a **built-in assistant**
   (DeepSeek, bring-your-own-key) that can inspect, play, and help set things up.
-- **One window, no scatter** — plugin editors open embedded inside the app
-  (AUM-style), never as disconnected windows.
+- **One window, no scatter** — plugin parameters open in a native editor inside
+  the app, never as disconnected plugin windows.
 - **System audio in the mix** — wire YouTube/browser playback straight into a
   channel (PipeWire monitor capture).
 - **MIDI matrix** — route any source to any destination with channel filters,
   transpose, and key-range **splits & layers** for live playing.
 - **Mixer channels** — source nodes, insert FX (pre/post fader), sends, and buses.
-- **CLAP-first plugin hosting** (Surge XT is the reference plugin), LV2 next.
+- **CLAP + LV2 plugin hosting** (Surge XT is the reference plugin).
 - **Built for ARM64 too** — developed on Asahi Linux (M1), native plugins only.
 - Follows the [Omarchy](https://omarchy.org) desktop theme, keyboard-first.
 
@@ -45,61 +51,70 @@ No timeline, no arranger. The graph is the instrument.
 
 ## What works today
 
-- **Data-driven rack** — a graph of nodes wired by physical, animated cables.
-  **Tab** flips front (perform) ↔ back (patch bay). Starts as two channel stacks
-  (Surge + Delay each) mixed to a shared master; the layout adapts to any patch.
-- **Starter templates** — **F5** Lead+Reverb, **F6** Drums+Bass, **F7** Ambient
-  Pad, **F8** demo. Instant, playable starting points (GarageBand-style).
-- **Play immediately** — laptop keyboard (A W S E D… row), on-screen keys, or a
-  hardware MIDI keyboard (auto-connected). Native Surge XT voices.
-- **Per-rig MIDI routing** — choose which sources (keys/laptop/hardware) and which
-  specific device feed each rig; split the keyboard across rigs; the MIDI matrix
-  handles filters/transpose.
-- **CLAP + LV2 hosting** — Surge XT (CLAP) plus LV2 effects in the live mix, with
-  knob control. **F9** opens a plugin browser to add them; **F2/F3** embed the
-  Surge editor *inside* the main window (X11 reparenting), not a floating window.
-- **Real built-in DSP** — 8 allocation-proven nodes (gain, pan, 3-band EQ, resonant
-  filter, lookahead limiter, saturation, delay, reverb).
-- **System audio + backing tracks** — capture your output's monitor (YouTube/
-  browser) into the mix, and play WAV file players.
-- **Metronome** — BPM click track with play/stop/tempo control.
-- **Sessions** — save/load patch + knobs + plugin state, with a passing round-trip
-  self-test; full-topology recall.
-- **Built-in assistant** — DeepSeek, bring-your-own-key (stored locally `0600`),
-  with tool access to play, route, split, save, capture audio, and more.
-- **MCP server** — `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
-  the running app) exposes 17 tools, 1:1 with the control plane; `kabelsalat send`
-  is a one-shot CLI client.
-- Low-latency audio (PipeWire, 512-frame buffer ≈ 10.7 ms), native fractional-HiDPI.
+- **Data-driven rack.** A graph of nodes wired by physical, animated cables.
+  **Tab** flips front (perform) and back (patch bay). Drag jack to jack to patch,
+  drag a plug to move it, **Ctrl**+drag a unit to rearrange.
+- **Multiple rigs.** **+ Rig** adds an independent, playable rig (Keys → Surge →
+  Master). Each rig has its own MIDI source and device, all rigs sound at once.
+  **1–9** / **← →** switch the rig in view, **F4** loads a two-rig demo.
+- **MIDI matrix** (**F11**). Sources × rigs grid with live per-cell rules:
+  channel, transpose, key and velocity ranges. **SPLIT** on the keys gives LOW /
+  HIGH MIDI outs for keyboard splits. Held notes are always released when routing
+  changes under them (checked exhaustively by the `verify-held-notes` test).
+- **Mixer** (**F10** / **M**). Per-rig volume, pan, mute and solo.
+- **Starter templates.** **F5–F8**: Lead+Reverb, Drums+Bass, Ambient Pad, demo.
+- **Play immediately.** Laptop keyboard, on-screen keys, or hardware MIDI
+  (auto-connected, played from its own thread so sound never waits for a frame).
+- **CLAP + LV2 hosting.** Surge XT voices, any CLAP instrument via the plugin
+  browser (**F9**), LV2 effects and instruments (e.g. Vitalium) with presets.
+  Double-click a synth for its native parameter editor and sound browser
+  (Surge patches, Dexed `.syx` banks, LV2 presets).
+- **Built-in DSP.** Gain, pan, 3-band EQ, filter, limiter, saturation, delay,
+  reverb, and a metronome node (**Space** = master play/stop).
+- **System audio + backing tracks.** Capture your output's monitor (YouTube,
+  browser) into the mix, and play WAV files.
+- **Sessions.** Save/load patch, knobs and plugin state, including multi-rig.
+- **Built-in assistant** (**F12**). DeepSeek, bring-your-own-key (stored locally
+  `0600`), with tools to inspect the graph, play, route, add rigs and save.
+- **MCP server.** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
+  the running app) exposes 27 tools, 1:1 with the control plane.
+  `kabelsalat send '<json>'` is a one-shot CLI client.
+- **Low latency.** Realtime render thread (rtkit), 256-frame buffer
+  (≈ 5.3 ms at 48 kHz), native fractional HiDPI.
 
-Self-tests: `cargo run -- session-test`, `cargo run -- capture-test`,
-`cargo run -- player-test`, `cargo run -- metro-test`, `cargo run -- lv2-test`,
-`cargo run -- lv2-host-test`, `cargo run -- lv2-voice-test`,
-`cargo run -- lv2-engine-test`, `cargo run -- audio-test`, `cargo run -- host-test`.
+Press **?** in the app for every shortcut. Self-tests are listed in
+[PLAN.md §0.1](PLAN.md).
+
+## Install (Arch / Omarchy)
+
+```sh
+git clone https://github.com/ssalentin/kabelsalat.git
+cd kabelsalat/packaging
+makepkg -si            # builds kabelsalat-git, adds the launcher entry + icon
+```
+
+Optional: `surge-xt-clap` (default synth voices), `dexed-clap`, `lv2-plugins`.
 
 ## Build & run
 
-Requires Rust (rustup), ALSA development headers (`alsa-lib`), and PipeWire or
-ALSA. Surge XT CLAP is the reference instrument (installed to `~/.clap`).
+Requires Rust (rustup), `alsa-lib`, `lilv`, and PipeWire or ALSA. Surge XT CLAP
+is the reference instrument.
 
 ```sh
 git clone git@github.com:ssalentin/kabelsalat.git
 cd kabelsalat
-cargo run        # opens the app: two stacks, play with your laptop keyboard
+cargo run        # opens the app; play with your laptop keyboard
 ```
-
-The app runs under XWayland (needed for embedded plugin editors and sharp
-fractional-HiDPI rendering); it forces this automatically.
 
 ## Roadmap
 
 | Phase | Milestone |
 |---|---|
 | **P0** ✅ | Spike: audio I/O, Surge XT CLAP hosted via [clack](https://github.com/prokopyl/clack), MIDI in, animated-cable prototype |
-| **P1** 🔨 | Live core: two-stack rack + flip, multi-voice engine, DSP, MIDI matrix + splits, per-rig inputs, sessions, embedded editor |
-| **P2** | Performance: file players, transport/metronome, synchronized recorder, MIDI-learn, system-audio capture ✅ |
-| **P3** 🔨 | Ecosystem: MCP server ✅, MCP→GUI bridge, LV2 hosting, plugin browser |
-| **P4** | Polish: scenes/setlist, theming, packaging for the app launcher |
+| **P1** ✅ | Live core: rack + flip, multi-rig engine, DSP, MIDI matrix + splits, per-rig inputs and mixer, sessions, native editor |
+| **P2** 🔨 | Performance: file players ✅, transport/metronome ✅, system-audio capture ✅, recorder, MIDI-learn, tap tempo |
+| **P3** 🔨 | Ecosystem: MCP server + GUI bridge ✅, LV2 hosting ✅, plugin browser ✅, dynamic CLAP loading, in-app plugin installer |
+| **P4** 🔨 | Polish: packaging ✅, bottom keyboard, scenes/setlist, theming |
 
 Architecture, prior-art survey, and risk notes live in [PLAN.md](PLAN.md).
 

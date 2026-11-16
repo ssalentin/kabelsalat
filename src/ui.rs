@@ -4604,7 +4604,12 @@ impl DemoApp {
     /// Scan installed CLAP + LV2 plugins. Filesystem / lilv work — done only on
     /// open / refresh, never on the per-frame path.
     fn refresh_plugins(&mut self) {
-        self.plugins_clap = list_clap_plugins();
+        self.refresh_plugins_with(false);
+    }
+
+    /// `retry_failed`: rescan CLAP bundles whose failure is cached (Refresh).
+    fn refresh_plugins_with(&mut self, retry_failed: bool) {
+        self.plugins_clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
         self.plugins_lv2 = lv2_discover();
         self.plugins_loaded = true;
     }
@@ -4697,8 +4702,7 @@ impl DemoApp {
                     ui.label("Filter:");
                     ui.text_edit_singleline(&mut self.plugin_filter);
                     if ui.button("Refresh").on_hover_text("rescan, retrying plugins that failed before").clicked() {
-                        crate::host::list_clap_plugins_retry_failed();
-                        self.refresh_plugins();
+                        self.refresh_plugins_with(true);
                     }
                 });
                 ui.label(egui::RichText::new("adding a plugin rebuilds the current patch").size(12.0).color(theme::INK_2));

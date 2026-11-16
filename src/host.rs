@@ -1033,7 +1033,11 @@ fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
 }
 
 fn discover_surge() -> Result<(PluginEntry, CString)> {
-    let (path, id) = bundle_with(|p| p.name == "Surge XT" && p.features.iter().any(|f| f == "instrument"))
+    // Resolved once per process: the voice pool asks for Surge several times.
+    static SURGE: OnceLock<Option<(PathBuf, String)>> = OnceLock::new();
+    let (path, id) = SURGE
+        .get_or_init(|| bundle_with(|p| p.name == "Surge XT" && p.features.iter().any(|f| f == "instrument")))
+        .clone()
         .ok_or_else(|| anyhow!("Surge XT (instrument) not found in CLAP search paths"))?;
     load_bundle(&path, &id)
 }
@@ -1560,7 +1564,14 @@ fn load_scan_cache(path: &std::path::Path) -> ClapScanCache {
         return ClapScanCache::default();
     };
     match serde_json::from_str::<ClapScanCache>(&raw) {
-        Ok(c) if c.version == CLAP_SCAN_CACHE_VERSION && c.app_version == env!("CARGO_PKG_VERSION") => c,
+        Ok(mut c) if c.version == CLAP_SCAN_CACHE_VERSION => {
+            if c.app_version != env!("CARGO_PKG_VERSION") {
+                // A new app version retries what failed; good entries stay.
+                c.entries.retain(|_, e| e.error.is_none());
+                c.app_version = env!("CARGO_PKG_VERSION").to_string();
+            }
+            c
+        }
         _ => ClapScanCache::default(),
     }
 }
@@ -1644,34 +1655,43 @@ fn parse_scan_output(stdout: &[u8]) -> Result<Vec<ClapPluginInfo>> {
 }
 
 /// Read a pipe to EOF on its own thread, keeping at most `keep` bytes (the
-/// head when `tail` is false, else the tail), and hand the result over `tx`.
-/// The caller waits with a deadline: a helper process that inherited the
-/// pipe can hold it open forever, and that thread is then abandoned.
+/// head when `tail` is false, else the tail), and hand `(bytes, truncated)`
+/// over the channel. The caller waits with a deadline: a helper process that
+/// inherited the pipe can hold it open forever, and that thread is then
+/// abandoned.
 fn spawn_pipe_reader<R: std::io::Read + Send + 'static>(
     reader: Option<R>,
     keep: usize,
     tail: bool,
-) -> std::sync::mpsc::Receiver<Vec<u8>> {
+) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut buf = Vec::new();
+        let (mut buf, mut truncated) = (Vec::new(), false);
         if let Some(mut r) = reader {
             let mut chunk = [0u8; 8192];
-            while let Ok(n) = r.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if buf.len() > keep {
-                    if tail {
+            loop {
+                let n = match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                if tail {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > keep {
                         buf.drain(..buf.len() - keep);
-                    } else {
-                        buf.truncate(keep);
+                        truncated = true;
                     }
+                } else if buf.len() < keep {
+                    let take = n.min(keep - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                    truncated |= take < n;
+                } else {
+                    truncated = true; // keep draining so the child never blocks
                 }
             }
         }
-        let _ = tx.send(buf);
+        let _ = tx.send((buf, truncated));
     });
     rx
 }
@@ -1730,40 +1750,56 @@ fn run_scan_subprocess(
 
     let deadline = Instant::now() + timeout;
     let timed_out = || ScanFail::Verdict(format!("timed out after {:.1}s", timeout.as_secs_f32()));
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    kill_child_tree(&mut child);
-                    return Err(timed_out());
-                }
-                std::thread::sleep(Duration::from_millis(15));
+    let pid = child.id() as libc::pid_t;
+    // Wait for the exit WITHOUT reaping (WNOWAIT): the zombie keeps the pid
+    // and its process group reserved, so kill(-pid) below can never hit a
+    // recycled group, whatever helpers the plugin started or detached.
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+        if r != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            Err(e) => {
-                kill_child_tree(&mut child);
-                return Err(ScanFail::Setup(format!("failed waiting on scanner: {e}")));
-            }
+            kill_child_tree(&mut child);
+            return Err(ScanFail::Setup(format!("failed waiting on scanner: {e}")));
         }
-    };
-    // The child is reaped, but a helper it started may still hold the pipes:
-    // it is in the child's process group (whose id stays reserved while any
-    // member lives), so kill the group if the pipes don't close in time.
-    // A short grace even at the deadline: the readers may not have sent yet.
-    let remaining = |d: Instant| d.saturating_duration_since(Instant::now()).max(Duration::from_millis(200));
-    let (stdout, stderr) = match (stdout_rx.recv_timeout(remaining(deadline)), stderr_rx.recv_timeout(remaining(deadline))) {
-        (Ok(o), Ok(e)) => (o, e),
-        _ => {
-            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        if unsafe { info.si_pid() } != 0 {
+            break;
+        }
+        if Instant::now() >= deadline {
+            kill_child_tree(&mut child);
             return Err(timed_out());
         }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    // A short grace even at the deadline: the readers may not have sent yet.
+    let remaining = || deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(200));
+    let stdout = stdout_rx.recv_timeout(remaining());
+    // Exit status, peeked (still unreaped).
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT) };
+    let exited_ok = info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0;
+    // stderr only matters for a failure; a helper holding it must not fail a good scan.
+    let stderr = if exited_ok { None } else { stderr_rx.recv_timeout(remaining()).ok() };
+    // Helpers the plugin left behind die with the group; then reap.
+    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    let status = child.wait().map_err(|e| ScanFail::Setup(format!("failed reaping scanner: {e}")))?;
+    let Ok((stdout, stdout_truncated)) = stdout else {
+        return Err(timed_out());
     };
     if !status.success() {
-        let err_tail = String::from_utf8_lossy(&stderr).trim().to_string();
+        let (err, truncated) = stderr.unwrap_or_default();
+        let err_tail = String::from_utf8_lossy(&err).trim().to_string();
         if err_tail.is_empty() {
             return Err(ScanFail::Verdict(format!("scanner exited with {status}")));
         }
-        return Err(ScanFail::Verdict(format!("scanner exited with {status}: …{err_tail}")));
+        let more = if truncated { "…" } else { "" };
+        return Err(ScanFail::Verdict(format!("scanner exited with {status}: {more}{err_tail}")));
+    }
+    if stdout_truncated {
+        return Err(ScanFail::Verdict(format!("scanner stdout exceeded {} bytes", SCAN_STDOUT_MAX)));
     }
     parse_scan_output(&stdout).map_err(|e| ScanFail::Verdict(format!("{e:#}")))
 }
@@ -3086,6 +3122,33 @@ mod clap_scan_tests {
         let out = list_clap_plugins_with(&[bundle], &sh_cmd("(sleep 6 &); printf '[]'"), None, Duration::from_millis(500), 1);
         assert!(out.is_empty());
         assert!(start.elapsed() < Duration::from_secs(2), "inherited pipe stalled the listing for {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_helper_holding_only_stderr_does_not_fail_a_good_scan() {
+        let tmp = TempDir::new("stderrhelper");
+        let bundle = tmp.0.join("ok.clap");
+        std::fs::write(&bundle, b"v1").unwrap();
+        let start = Instant::now();
+        let cmd = sh_cmd(r#"(sleep 6 >/dev/null &); printf '[{"id":"id.ok","name":"O","vendor":"V","features":[]}]\n'"#);
+        let out = list_clap_plugins_with(&[bundle], &cmd, None, Duration::from_secs(2), 1);
+        assert_eq!(out.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["id.ok"]);
+        assert!(start.elapsed() < Duration::from_secs(1), "waited on stderr for {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn a_new_app_version_keeps_good_entries_and_retries_failures() {
+        let tmp = TempDir::new("appver");
+        let cache_file = tmp.0.join("clap-scan.json");
+        let stamp = BundleStamp { mtime_secs: 1, mtime_nanos: 0, size: 1 };
+        let mut old = ClapScanCache { app_version: "0.0.0-old".into(), ..Default::default() };
+        let good = ClapPluginInfo { id: "id.g".into(), name: "G".into(), vendor: "V".into(), features: vec![] };
+        old.entries.insert("good".into(), CachedBundle { stamp: stamp.clone(), plugins: vec![good], error: None });
+        old.entries.insert("bad".into(), CachedBundle { stamp, plugins: vec![], error: Some("timed out".into()) });
+        save_scan_cache(&cache_file, &old).unwrap();
+        let loaded = load_scan_cache(&cache_file);
+        assert_eq!(loaded.entries.keys().collect::<Vec<_>>(), vec!["good"]);
+        assert_eq!(loaded.app_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

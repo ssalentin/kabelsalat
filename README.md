@@ -58,7 +58,7 @@ The MIDI matrix decides which keyboard plays which rig. Each connection can be
 shaped: only some keys (keyboard splits), another MIDI channel, transposed, or
 only loud notes.
 
-<p align="center"><img src="docs/shots/matrix.png" width="85%" alt="The MIDI matrix: the keyboard and each hardware MIDI device, badged and grouped by port, routed to two synths"/></p>
+<p align="center"><img src="docs/shots/matrix.png" width="85%" alt="The MIDI matrix: keyboard and hardware sources routed to two rigs"/></p>
 
 ### Control knobs from your controller
 Right-click any knob, turn a knob on your MIDI controller — bound. The knob

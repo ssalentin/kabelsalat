@@ -27,6 +27,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - name: Every image is reviewed (AGENTS.md rule 108)
+        run: scripts/check-images.sh
       - name: Install build dependencies
         run: scripts/ci/ubuntu-deps.sh
       # A real LV2 instrument, so lv2::tests::setbfree_plays_a_note runs

@@ -16,7 +16,8 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
 ```
 
 - Environment: `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000`
-  (the harness sets these itself). Single frames of the real app: `grim -o eDP-1 out.png`.
+  (the harness sets these itself). Single frames of the real app: `scripts/shot.sh out.png [pid]`
+  (window buffer only; never `grim -o`/`-g`, rule 108).
 - Key injection: `scripts/xtest_key.py` (XTEST; F11/F12 = keycodes 95/96, F4 = 0xffc1).
 - Visual review = DeepSeek vision via the app's BYOK key
   (`~/.config/kabelsalat/config.json`, field `deepseek_api_key` — NEVER print or
@@ -63,9 +64,9 @@ Learned so far (2026-11-15, UI polish pass):
    floating windows; secondary panels (assistant) are toggleable and hidden
    by default, with a layout suited to their content (wide bottom panel for
    chat text, not a narrow column).
-9. **Screenshot captures:** `grim -o eDP-1` grabs the whole output — focus the
-   target window first (hyprctl) or the shot shows whatever is on top; verify
-   the frame actually shows the app before claiming evidence.
+9. **Screenshot captures:** take them with `scripts/shot.sh` (`grim -T`, the
+   window's own buffer); `grim -o eDP-1` grabbed the whole output with whatever
+   lay on top. Verify the frame actually shows the app before claiming evidence.
 10. **Interaction state holds ids, not indices:** `update()` retains/removes
     dying cables, which shifts `self.cables` indices mid-gesture — Drag/Hit
     state must store cable ids and resolve them at each use, or the wrong
@@ -565,6 +566,44 @@ Learned so far (2026-11-15, UI polish pass):
     dropped a replaced voice's buffer in `render` and went silent past 32
     voices. Voice messages are drained before every structural command,
     so what the host sent before a load is in place when the load binds.
+108. **No pixel of another window reaches the repo:** `grim -o eDP-1` and
+    region crops captured browser tabs with the user's e-mail address,
+    chat transcripts, desktop crash notifications, and other apps' audio
+    streams in the mixer; they were pushed to the public repo. Capture with
+    `scripts/shot.sh` only (`grim -T` on the kabelsalat window: no other
+    window, bar or notification can appear). Every committed image is listed
+    by hash in `docs/images.sha256`; `scripts/check-images.sh` fails the
+    pre-commit hook (`git config core.hooksPath .githooks`, once per clone)
+    and CI for any other image. Add a hash only after opening the image and
+    seeing kabelsalat and nothing else (also no device, account or file
+    names that are not the app's). Evidence screenshots for replies stay in
+    the scratchpad, never in the repo; never `git add -A` an image.
+109. **A knob the hardware moves moves on screen too:** the face draws
+    `display_value`, which only advances during a glide; `apply_cc_to_knobs`
+    set `value` alone, so every CC-learned knob (Master WARM, Surge LEVEL, …)
+    changed the sound while it stood still. Move it with `Knob::set_immediate`
+    and assert `display_value` in tests, never `value` alone
+    (`a_learned_cc_moves_the_drawn_master_warm_knob`).
+110. **A colour stage keeps its loudness:** WARM's make-up pinned only the
+    full-scale peak, but below the limiter ceiling `tanh` is almost linear, so
+    WARM 0→100 % raised quiet playing by 7.7 dB and read as a volume knob.
+    `MasterLimiter::process` matches the output RMS to the default-WARM chain
+    (200 ms window); check any drive/saturation change with
+    `warm_keeps_the_loudness_of_the_default_warm`, not only with peaks.
+111. **An adoption is not a load:** `build_rack` clears `rule_edits` (loads
+    start fresh), but `sync_from_engine` also rebuilds through it after any
+    agent/MCP edit, right after mirroring the engine's rules. The UI lost every
+    CC binding and route edit; learned knobs stopped following, and the next
+    rig add/delete captured an empty matrix and loaded it into the engine.
+    The sync rebuild keeps the rules it mirrored
+    (`cc_bindings_survive_an_agent_edit_and_a_rig_add`).
+112. **The master never passes DC:** a source stuck at a constant (Surge on
+    rig 3's MONO input held ~1.0) pinned the shared limiter, so the meter and
+    cables read full while every rig was ducked to silence, and the speakers
+    got the offset. `MasterLimiter::process` high-passes each channel at 5 Hz
+    before the limiter (`a_stuck_constant_is_blocked_and_does_not_duck_the_music`).
+    When the output meter is full and nothing is heard, compare `get_status`
+    `band_db` (all energy below 120 Hz = DC) and mute rigs one at a time.
 
 ## Working on kabelsalat
 
@@ -612,7 +651,8 @@ Learned so far (2026-11-15, UI polish pass):
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
   shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
   (rule 55), inject keys with `scripts/xtest_key.py` (F4 = 0xffc1, F1–F10 = X
-  keycodes 67–76, F11/F12 = 95/96 — the script handles it), `grim -o eDP-1`.
+  keycodes 67–76, F11/F12 = 95/96 — the script handles it), then
+  `scripts/shot.sh out.png <pid>` (rule 108).
   Mouse clicks need screen coords: window origin × monitor scale + egui pos.
 - **Hyprland window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).

@@ -26,6 +26,7 @@ mod midi;
 mod player;
 mod preview;
 mod record;
+mod rope;
 mod session;
 mod sounds;
 mod theme;

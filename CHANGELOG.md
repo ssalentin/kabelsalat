@@ -15,6 +15,10 @@ releases may still change behaviour and session files.
   a DIN socket in MIDI blue), hardware sits under a "Hardware MIDI · n of m
   ports live" header, and unplugged devices dim with an UNPLUGGED chip. The rig
   strip uses the same device names.
+- **Rope cables:** patch cables are now Verlet ropes (gravity, slack, plugged
+  ends pinned, a free end falls) instead of spring-driven Bézier curves.
+  Grabbing a cable pulls its nearest point; the ghost wire while patching is a
+  rope too. Stepped at a fixed 120 Hz, so the feel is frame-rate independent.
 - **Themed dropdowns (`theme::Dropdown`):** replaced all three `egui::ComboBox`
   selectors (MIDI matrix CC parameter picker, assistant header chat-model
   picker, mixer audio output) with a Hurricane-styled dropdown matching the
@@ -23,6 +27,18 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **A stuck source could silence everything:** an instrument outputting a
+  constant (DC) filled the master meter while every rig went quiet, and sent
+  the offset to the speakers. The master now blocks DC.
+- **Matrix routes and MIDI-learn bindings were lost after agent edits:** an
+  agent change to the rack dropped them from the app, and the next rig add or
+  delete removed them from the engine too. They now survive both.
+- **MIDI-learned knobs did not move on screen:** a hardware CC bound to a
+  knob changed the sound, but the knob stood still. It now follows the
+  controller.
+- **Master WARM acted like a volume knob:** turning it up made quiet playing
+  up to 7.7 dB louder. WARM now changes only the colour (saturation); the
+  loudness stays that of the default setting.
 - **Plugin knobs that drove the wrong thing or nothing:** every LV2 unit had
   a `GAIN` knob wired to the plugin's first control port, whatever that port
   was (Vitalium: its freewheel switch; setBfree: nothing), and a CLAP synth

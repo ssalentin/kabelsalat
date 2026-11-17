@@ -13602,7 +13602,17 @@ enum EvalStart {
     TwoRigs,
     /// Keys → Surge → Master, plus a wired metronome that is not running.
     OneRigMetronome,
+    /// Rig A: Keys → Surge → Master. Rig B "YANES": Keys → YANES → Master.
+    SurgeAndYanes,
+    /// Rig A: Keys → Surge → Master. Rig B "Organ": Keys → setBfree → Master.
+    SurgeAndOrgan,
 }
+
+const EVAL_YANES: &str = "org.yanes.native";
+const EVAL_ORGAN: &str = "http://gareus.org/oss/lv2/b_synth";
+/// setBfree's programmes a "jazz" registration may be: Jazz 1 all, Jimmy
+/// Smith, Jimmy Smith Plus (its MIDNAM document, programme change numbers).
+const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
 
 /// One scripted request and what the app must look like afterwards.
 struct EvalTask {
@@ -13611,8 +13621,9 @@ struct EvalTask {
     /// An image the user attaches to the request (a path in the repository).
     image: Option<&'static str>,
     prompt: &'static str,
-    /// Err says what is off. Gets the agent's final reply for questions.
-    check: fn(&mut DemoApp, &str) -> Result<(), String>,
+    /// Err says what is off. Gets the engine (what reached a plugin) and
+    /// the agent's final reply for questions.
+    check: fn(&mut DemoApp, &GraphEngine, &str) -> Result<(), String>,
 }
 
 fn eval_ensure(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
@@ -13684,21 +13695,34 @@ fn eval_effect_in_chain(g: &Graph, rig: u8, kind: DspKind) -> Result<(), String>
     eval_ensure(eval_audio_path(g, fx, master), || format!("the {kind:?} does not reach the master"))
 }
 
+/// The value text of the "Preset" parameter of the CLAP synth in `rig`
+/// (YANES keeps its sounds there), read from the live plugin.
+fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let main = app.clap_pool_idx(slot).and_then(|i| app._surge_main.get_mut(i))
+        .ok_or_else(|| format!("rig {}'s synth is not running", rig + 1))?;
+    let preset = main.param_list().into_iter().find(|p| p.name == "Preset")
+        .ok_or_else(|| format!("rig {}'s synth has no Preset parameter", rig + 1))?;
+    Ok(main.param_text(preset.id, preset.value))
+}
+
 const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
-        check: |app, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+        check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
         name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
             eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
         },
     },
     EvalTask {
         name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
-        check: |app, _| {
+        check: |app, _, _| {
             let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
             eval_ensure(split == Some(60), || format!("split point is {split:?}"))
         },
@@ -13706,7 +13730,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "split_zones", start: EvalStart::Demo, image: None,
         prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
             let (a, b) = (eval_named(&g, "SURGE A")?, eval_named(&g, "SURGE B")?);
@@ -13720,14 +13744,42 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
-        check: |app, _| {
+        check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
         },
     },
     EvalTask {
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        check: |app, _, _| {
+            let preset = eval_preset_param(app, 1)?;
+            eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        check: |app, engine, _| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(matches!(last, Some([0xC0, p, _]) if EVAL_JAZZ_PROGRAMS.contains(&p)),
+                || format!("the organ's last MIDI event is {last:?}, not a programme change to a jazz registration"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        check: |app, engine, reply| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(last.is_none(), || format!("the organ got {last:?}: it has no pad to load"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))?;
+            eval_ensure(!reply.trim().is_empty(), || "no reply".into())
+        },
+    },
+    EvalTask {
         name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 1 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 2 got a reverb too".into())
@@ -13735,11 +13787,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
-        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
     },
     EvalTask {
         name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
             let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
@@ -13751,7 +13803,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
             let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
@@ -13761,25 +13813,25 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
-        check: |app, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
+        check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
     },
     EvalTask {
         name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
         name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
     },
     EvalTask {
         name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
             let asked = app.pending_confirm.as_ref()
                 .is_some_and(|p| p.tool == "delete_rig" && p.args.get("rig").and_then(|r| r.as_u64()) == Some(1));
@@ -13788,7 +13840,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("the new rig plays {patch}, not a bass"))?;
@@ -13798,21 +13850,21 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
         name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
             eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
         },
     },
     EvalTask {
         name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 1 got a reverb too".into())
@@ -13820,11 +13872,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
-        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
     },
     EvalTask {
         name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
             eval_ensure(eval_patch(app, 0).is_err(), || "rig 1's sound changed too".into())
@@ -13832,7 +13884,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
             eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
@@ -13840,11 +13892,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
-        check: |app, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
+        check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
         name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
@@ -13852,12 +13904,12 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
         prompt: "Do what the note says.",
-        check: |app, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
         name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
         prompt: "Do what the note says.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
@@ -13865,7 +13917,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
         prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
             eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
         },
@@ -13873,7 +13925,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "look_at_rack", start: EvalStart::Demo, image: None,
         prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
             eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
         },
@@ -13972,6 +14024,8 @@ impl EvalRig {
                 self.app.apply_session(&s)?;
             }
             EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+            EvalStart::SurgeAndYanes => self.load_two_rigs("YANES", crate::control::plugin_rig_graph(EVAL_YANES, "YANES")),
+            EvalStart::SurgeAndOrgan => self.load_two_rigs("Organ", DemoApp::build_lv2_instrument_graph(EVAL_ORGAN, "setBfree")),
             EvalStart::OneRigMetronome => {
                 let mut g = crate::control::standard_rig_graph(true);
                 let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut)).map_err(anyhow::Error::msg)?;
@@ -13982,6 +14036,24 @@ impl EvalRig {
         }
         self.settle();
         Ok(())
+    }
+
+    /// Rig A: Keys → Surge → Master. Rig B, named `name`: `second`. Runs
+    /// frames until the second rig's plugin had time to load.
+    fn load_two_rigs(&mut self, name: &str, second: Graph) {
+        let rigs = vec![
+            crate::control::Rig::new("Rig A", crate::control::standard_rig_graph(true), None),
+            crate::control::Rig::new(name, second, None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        if let Some(bus) = &self.app.bus {
+            let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
+        }
+        self.app.build_rack(&merged, &[]);
+        for _ in 0..100 {
+            self.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -14030,7 +14102,7 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     } else if let Some(e) = turn.errors.first() {
         Err(format!("agent error: {e}"))
     } else {
-        (task.check)(&mut rig.app, &reply)
+        (task.check)(&mut rig.app, &rig.engine, &reply)
     };
     if let Some(recorder) = rig.app.recorder.take() { recorder.shutdown(); }
     let _ = std::fs::remove_dir_all(eval_takes_dir());

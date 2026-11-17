@@ -69,6 +69,10 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- **Effect chains are audible:** an LV2 instrument into a built-in effect
+  (setBfree → Drive) and any effect into another effect (Delay → Reverb) were
+  silent at the master. Effects now run in signal-flow order and hear every
+  source wired into them.
 - **Hanging LV2 notes** (setBfree): a note-off and a note-on in the same
   audio block (legato) lost the note-off, and chords played only one note.
   Every event now reaches the plugin once; atom outputs get a real buffer

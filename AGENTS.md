@@ -578,6 +578,32 @@ Learned so far (2026-11-15, UI polish pass):
     seeing kabelsalat and nothing else (also no device, account or file
     names that are not the app's). Evidence screenshots for replies stay in
     the scratchpad, never in the repo; never `git add -A` an image.
+109. **A knob the hardware moves moves on screen too:** the face draws
+    `display_value`, which only advances during a glide; `apply_cc_to_knobs`
+    set `value` alone, so every CC-learned knob (Master WARM, Surge LEVEL, …)
+    changed the sound while it stood still. Move it with `Knob::set_immediate`
+    and assert `display_value` in tests, never `value` alone
+    (`a_learned_cc_moves_the_drawn_master_warm_knob`).
+110. **A colour stage keeps its loudness:** WARM's make-up pinned only the
+    full-scale peak, but below the limiter ceiling `tanh` is almost linear, so
+    WARM 0→100 % raised quiet playing by 7.7 dB and read as a volume knob.
+    `MasterLimiter::process` matches the output RMS to the default-WARM chain
+    (200 ms window); check any drive/saturation change with
+    `warm_keeps_the_loudness_of_the_default_warm`, not only with peaks.
+111. **An adoption is not a load:** `build_rack` clears `rule_edits` (loads
+    start fresh), but `sync_from_engine` also rebuilds through it after any
+    agent/MCP edit, right after mirroring the engine's rules. The UI lost every
+    CC binding and route edit; learned knobs stopped following, and the next
+    rig add/delete captured an empty matrix and loaded it into the engine.
+    The sync rebuild keeps the rules it mirrored
+    (`cc_bindings_survive_an_agent_edit_and_a_rig_add`).
+112. **The master never passes DC:** a source stuck at a constant (Surge on
+    rig 3's MONO input held ~1.0) pinned the shared limiter, so the meter and
+    cables read full while every rig was ducked to silence, and the speakers
+    got the offset. `MasterLimiter::process` high-passes each channel at 5 Hz
+    before the limiter (`a_stuck_constant_is_blocked_and_does_not_duck_the_music`).
+    When the output meter is full and nothing is heard, compare `get_status`
+    `band_db` (all energy below 120 Hz = DC) and mute rigs one at a time.
 
 ## Working on kabelsalat
 

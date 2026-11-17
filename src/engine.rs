@@ -2387,12 +2387,10 @@ impl GraphEngine {
                 }
             }
             let drive = 1.0 + self.master_warm * 3.0;
-            let vol = self.master_vol * MasterLimiter::makeup(drive);
+            let vol = self.master_vol;
             let lim = &mut self.master_lim;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
-                let g = lim.gain_for(acc[i * 2], acc[i * 2 + 1]);
-                let l = MasterLimiter::knee((acc[i * 2] * g * drive).tanh() * vol);
-                let r = MasterLimiter::knee((acc[i * 2 + 1] * g * drive).tanh() * vol);
+                let (l, r) = lim.process(acc[i * 2], acc[i * 2 + 1], drive, vol);
                 peak = peak.max(l.abs()).max(r.abs());
                 frame[0] = l;
                 if ch > 1 {
@@ -2430,6 +2428,15 @@ struct MasterLimiter {
     gain: f32,
     rel: f32,
     atk: f32,
+    /// Mean square of the reference chain (`tanh` at `DRIVE_REF`, made up)
+    /// and of the chain at the current WARM, over `LOUDNESS_SECS`.
+    ms_ref: f32,
+    ms_cur: f32,
+    ms_coef: f32,
+    /// DC blocker state per channel (previous input, previous output) and
+    /// its pole.
+    dc: [(f32, f32); 2],
+    dc_pole: f32,
 }
 
 impl MasterLimiter {
@@ -2462,9 +2469,62 @@ impl MasterLimiter {
         (Self::KNEE + room * ((a - Self::KNEE) / room).tanh()).copysign(y)
     }
 
+    /// Drive at the default WARM (0.15): the loudness every WARM setting keeps.
+    const DRIVE_REF: f32 = 1.0 + 0.15 * 3.0;
+    /// Window of the loudness match. Long against a waveform cycle (no
+    /// gain ripple), short enough to follow a WARM turn.
+    const LOUDNESS_SECS: f64 = 0.2;
+
     fn new(sample_rate: f64) -> Self {
         let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
-        Self { env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001) }
+        Self {
+            env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001),
+            ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
+            dc: [(0.0, 0.0); 2],
+            dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
+        }
+    }
+
+    /// Corner of the master's DC blocker: far below any note (the lowest
+    /// piano key is 27.5 Hz), high enough to settle within a second.
+    const DC_CUTOFF_HZ: f64 = 5.0;
+
+    /// One-pole DC blocker, `y = x - x[-1] + pole * y[-1]`. A source stuck at
+    /// a constant (a Surge instance on a MONO input once held the sum near
+    /// 1) pinned the limiter: the meter read full while every rig was turned
+    /// down to silence, and the speakers got a DC offset.
+    #[inline]
+    fn block_dc(&mut self, ch: usize, x: f32) -> f32 {
+        let (px, py) = self.dc[ch];
+        let y = x - px + self.dc_pole * py;
+        // Flush denormals: a silent tail must not cost the CPU.
+        self.dc[ch] = (x, if y.abs() < 1e-20 { 0.0 } else { y });
+        y
+    }
+
+    /// The whole master chain for one stereo frame: DC blocker → limiter → `tanh(drive)`
+    /// warmth → loudness match → volume → knee. WARM colours, it does not
+    /// turn up: below the ceiling `tanh` is almost linear, so a make-up that
+    /// only pins the full-scale peak (`makeup(drive)`) left quiet playing
+    /// +7.7 dB louder at WARM 100 % than at 0 %. The output is held at the
+    /// RMS the default-WARM chain would have for the same input; at the
+    /// default WARM that is exactly `makeup(DRIVE_REF)`. Allocation-free.
+    #[inline]
+    fn process(&mut self, l: f32, r: f32, drive: f32, vol: f32) -> (f32, f32) {
+        let (l, r) = (self.block_dc(0, l), self.block_dc(1, r));
+        let g = self.gain_for(l, r);
+        let (l, r) = (l * g, r * g);
+        let (yl, yr) = ((l * drive).tanh(), (r * drive).tanh());
+        let m = Self::makeup(Self::DRIVE_REF);
+        let (rl, rr) = ((l * Self::DRIVE_REF).tanh() * m, (r * Self::DRIVE_REF).tanh() * m);
+        let c = self.ms_coef;
+        self.ms_ref = c * self.ms_ref + (1.0 - c) * (rl * rl + rr * rr);
+        self.ms_cur = c * self.ms_cur + (1.0 - c) * (yl * yl + yr * yr);
+        // Both means follow the same input, so their ratio is right from a
+        // note's first samples; the floor only keeps silence finite.
+        let auto = ((self.ms_ref + 1e-12) / (self.ms_cur + 1e-12)).sqrt();
+        let k = auto * vol;
+        (Self::knee(yl * k), Self::knee(yr * k))
     }
 
     fn gain_for(&mut self, l: f32, r: f32) -> f32 {
@@ -2552,28 +2612,85 @@ mod master_limiter_tests {
         assert!((x * g - MasterLimiter::CEILING).abs() < 0.02, "after 10 ms the sum is held: {}", x * g);
     }
 
+    /// Peak and RMS (dBFS) of the whole chain at VOLUME 100 % over the last
+    /// half of one second of a 440 Hz sine of `amp` on both channels.
+    fn chain(amp: f32, warm: f32) -> (f32, f32) {
+        let drive = 1.0 + warm * 3.0;
+        let mut lim = MasterLimiter::new(48000.0);
+        let (mut peak, mut sq, mut n) = (0.0f32, 0.0f64, 0usize);
+        for i in 0..48000 {
+            let x = amp * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin();
+            let (l, _) = lim.process(x, x, drive, 1.0);
+            if i >= 24000 {
+                peak = peak.max(l.abs());
+                sq += (l * l) as f64;
+                n += 1;
+            }
+        }
+        (20.0 * peak.log10(), 10.0 * (sq / n as f64).log10() as f32)
+    }
+
     #[test]
     fn full_volume_reaches_minus_one_dbfs_and_never_beyond() {
-        // The whole master chain at VOLUME 100%: limiter → tanh(WARM) → make-up.
+        // A chord far above the ceiling: never past −1 dBFS at any WARM, and
+        // at the default WARM it reaches it (was −2.3…−4.4 before make-up).
         for warm in [0.0f32, 0.15, 0.5, 1.0] {
-            let drive = 1.0 + warm * 3.0;
-            let makeup = MasterLimiter::makeup(drive);
-            let mut lim = MasterLimiter::new(48000.0);
-            let mut peak = 0.0f32;
-            for i in 0..48000 {
-                let x = 4.0 * (i as f32 * 0.05).sin(); // a chord far above the ceiling
-                let g = lim.gain_for(x, x);
-                peak = peak.max(MasterLimiter::knee((x * g * drive).tanh() * makeup).abs());
-            }
-            let db = 20.0 * peak.log10();
-            assert!(db <= -0.99 && db > -1.6, "warm {warm}: master peak {db:.2} dBFS (was −2.3…−4.4 before make-up)");
+            let (peak, _) = chain(4.0, warm);
+            assert!(peak <= -0.99, "warm {warm}: master peak {peak:.2} dBFS");
         }
+        let (peak, _) = chain(4.0, 0.15);
+        assert!(peak > -1.6, "default warm reaches −1 dBFS: {peak:.2}");
         // A quiet single voice gets the make-up too (no longer 2–4 dB down).
-        let quiet = 0.1f32;
-        let out = MasterLimiter::knee((quiet * 1.45).tanh() * MasterLimiter::makeup(1.45));
-        assert!(out > quiet * 1.6, "make-up lifts a quiet voice: {out}");
+        let (quiet, _) = chain(0.1, 0.15);
+        assert!(quiet > 20.0 * (0.1f32 * 1.6).log10(), "make-up lifts a quiet voice: {quiet:.2} dBFS");
         assert_eq!(MasterLimiter::knee(0.5), 0.5, "the knee is transparent below −3 dBFS");
         assert!(MasterLimiter::knee(5.0) <= MasterLimiter::OUT_PEAK && MasterLimiter::knee(-5.0) >= -MasterLimiter::OUT_PEAK, "bounded both ways");
+    }
+
+    /// WARM is colour, not volume: from a quiet voice to a held chord the
+    /// loudness stays within 0.5 dB of the default WARM's over the whole
+    /// knob (the old peak-only make-up gave +7.7 dB from 0 % to 100 %).
+    #[test]
+    fn warm_keeps_the_loudness_of_the_default_warm() {
+        for amp in [0.05f32, 0.2, 0.5, 1.0, 4.0] {
+            let (_, reference) = chain(amp, 0.15);
+            for warm in [0.0f32, 0.3, 0.6, 1.0] {
+                let (_, rms) = chain(amp, warm);
+                assert!((rms - reference).abs() < 0.5,
+                    "amp {amp} warm {warm}: {rms:.2} dB RMS vs {reference:.2} at the default WARM");
+            }
+        }
+    }
+
+    /// A source stuck at a constant must not reach the output or pin the
+    /// limiter: after a second the DC is gone, and a tone on top of it plays
+    /// at its normal level instead of being turned down to nothing.
+    #[test]
+    fn a_stuck_constant_is_blocked_and_does_not_duck_the_music() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let (mut sum, mut n, mut tone_peak) = (0.0f64, 0usize, 0.0f32);
+        for i in 0..96000 {
+            let tone = 0.2 * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin();
+            let (l, _) = lim.process(3.0 + tone, 3.0 + tone, 1.45, 1.0);
+            if i >= 48000 {
+                sum += l as f64;
+                n += 1;
+                tone_peak = tone_peak.max(l.abs());
+            }
+        }
+        let mean = sum / n as f64;
+        assert!(mean.abs() < 1e-3, "DC left after a second: {mean}");
+        let (_, alone) = chain(0.2, 0.15);
+        assert!(20.0 * tone_peak.log10() > alone - 1.0,
+            "the tone keeps its level over a stuck DC: {:.2} dBFS vs {alone:.2}", 20.0 * tone_peak.log10());
+    }
+
+    /// Turning WARM up still adds harmonics: a loud sine comes out with a
+    /// lower crest factor (flatter tops) than at WARM 0.
+    #[test]
+    fn warm_still_saturates() {
+        let crest = |warm| { let (p, r) = chain(0.6, warm); p - r };
+        assert!(crest(1.0) < crest(0.0) - 1.0, "crest at WARM 100 % {:.2} dB vs 0 % {:.2} dB", crest(1.0), crest(0.0));
     }
 
     #[test]

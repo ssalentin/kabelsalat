@@ -3882,7 +3882,13 @@ impl DemoApp {
             }
         }
         let carried = self.lv2_main_values();
+        // build_rack starts loads with no rule edits, but this is an adoption:
+        // the engine kept its matrix, and the rules mirrored above are it.
+        // Dropping them stopped learned knobs from following, and the next
+        // rig edit captured (and loaded) an empty matrix.
+        let rules = std::mem::take(&mut self.rule_edits);
         self.build_rack(&adopted, &[]);
+        self.rule_edits = rules;
         self.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
         for (nid, param, ki, disp, from, gt) in knob_glides {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
@@ -6640,16 +6646,17 @@ impl DemoApp {
                     let is_clap = matches!(u.node_kind, UnitKind::Clap);
                     for k in &mut u.knobs {
                         let by_param = matches!(m.target, crate::matrix::CcTarget::Knob) || !is_clap;
+                        // A hardware knob is followed at once: the face draws
+                        // display_value, so setting only `value` left the
+                        // on-screen knob where it was.
                         if by_param && k.param == Some(m.param) {
-                            k.value = norm;
+                            k.set_immediate(norm);
                             if !resend { k.sent = Some(norm); }
                         } else if matches!(m.target, crate::matrix::CcTarget::PluginParam) {
-                            if let Some(pin) = k.clap.as_mut() {
-                                if pin.id == m.param {
-                                    k.value = norm;
-                                    pin.hold_until = hold_until;
-                                    if !resend { pin.sent = norm; }
-                                }
+                            if let Some(pin) = k.clap.as_mut().filter(|p| p.id == m.param) {
+                                pin.hold_until = hold_until;
+                                if !resend { pin.sent = norm; }
+                                k.set_immediate(norm);
                             }
                         }
                     }
@@ -16396,6 +16403,64 @@ mod rig_switch_tests {
         assert!((app.units[u].knobs[k].value - 0.123).abs() < 1e-6, "knobs survive the engine echo");
     }
 
+    /// An agent edit (any structural change the engine publishes) rebuilt
+    /// the rack, and build_rack cleared the rules sync had just mirrored: the
+    /// learned knob stopped following, and the next rig add captured an empty
+    /// matrix and loaded it into the engine — the binding was gone for good.
+    #[test]
+    fn cc_bindings_survive_an_agent_edit_and_a_rig_add() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        app.graph_pub = Some(pub_.clone());
+        let mut pump = |app: &mut DemoApp, drain: &mut crate::control::CommandDrain, n: usize| {
+            for _ in 0..n {
+                frame(app, &ctx, vec![]);
+                drain.drain(|c| { ebus.send(c); });
+                let mut buf = vec![0.0f32; 64 * 2];
+                engine.render(&mut buf, 2);
+            }
+        };
+        pump(&mut app, &mut drain, 2);
+        let master = app.units[app.master_idx().unwrap()].node_id;
+        app.set_cc_binding(SourceId::Hardware(1), master, 11, Some(P_WARM), crate::matrix::CcTarget::Knob);
+        pump(&mut app, &mut drain, 3);
+        let bound = |app: &DemoApp| app.rule_edits.iter().any(|((src, dest), e)| {
+            *src == SourceId::Hardware(1) && app.base_graph.node(*dest).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut))
+                && e.cc_map.iter().any(|m| m.cc == 11 && m.param == P_WARM)
+        });
+        assert!(bound(&app), "the binding is mirrored");
+
+        // The agent adds a unit: the engine publishes, the app adopts it.
+        assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::AddNode {
+            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0 }));
+        pump(&mut app, &mut drain, 4);
+        assert!(app.base_graph.nodes.iter().any(|n| n.name == name_bytes("DELAY C")), "the agent edit was adopted");
+        assert!(bound(&app), "the binding survives the agent edit");
+        let m = app.master_idx().unwrap();
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 127));
+        pump(&mut app, &mut drain, 1);
+        assert!((app.units[m].knobs[wi].display_value - 1.0).abs() < 1e-6, "the knob still follows CC 11");
+
+        // A rig add reloads the engine from the captured session.
+        app.edit_rigs(None);
+        pump(&mut app, &mut drain, 4);
+        assert_eq!(app.rig_count(), 2);
+        let rules = pub_.lock().unwrap().rules.clone();
+        assert!(rules.iter().any(|r| r.source == SourceId::Hardware(1)
+            && app.base_graph.node(r.dest).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut) && n.rig == 0)
+            && r.cc_map.iter().any(|m| m.cc == 11 && m.param == P_WARM)),
+            "the engine keeps the binding after the rig add: {rules:?}");
+        assert!(bound(&app), "and the app still shows it");
+    }
+
     #[test]
     fn matrix_rules_and_cc_bindings_survive_a_session_round_trip() {
         // Live app + engine; returns the engine's published rules after `f`.
@@ -18507,6 +18572,8 @@ mod split_bpm_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 127));
         frame(&mut app, &ctx, vec![]);
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+        assert!((app.units[surge_unit].knobs[level_idx].display_value - 1.0).abs() < 1e-6,
+            "the drawn knob follows the hardware knob too");
         assert_ne!(before_val, 1.0);
         let mut feedback_cmds = Vec::new();
         drain.drain(|c| feedback_cmds.push(c));
@@ -18517,6 +18584,33 @@ mod split_bpm_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 0));
         frame(&mut app, &ctx, vec![]);
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+    }
+
+    /// A CC learned to Master WARM moves the knob the face draws: only
+    /// `value` followed, `display_value` stayed put, so the knob looked dead
+    /// while the sound changed.
+    #[test]
+    fn a_learned_cc_moves_the_drawn_master_warm_knob() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+        drain.drain(|_| {});
+        let m = app.master_idx().unwrap();
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let pos = app.xf.p(app.knob_center(m, wi));
+        rclick(&mut app, &ctx, pos);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 30));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "CC 11 completed the learn");
+        for v in [100u8, 10, 127] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, v));
+            frame(&mut app, &ctx, vec![]);
+            let k = &app.units[m].knobs[wi];
+            let want = v as f32 / 127.0;
+            assert!((k.value - want).abs() < 1e-6 && (k.display_value - want).abs() < 1e-6,
+                "CC 11 = {v}: value {} drawn {}", k.value, k.display_value);
+        }
     }
 
     /// Buttons of the knob context menu, top to bottom (previous pass).

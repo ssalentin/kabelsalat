@@ -110,9 +110,19 @@ jobs:
         run: packaging/appimage.sh "$SRC/target/release/kabelsalat" "$VERSION" dist
       - name: Smoke test
         run: |
+          # Tags before --version existed (v0.1.0) print their usage ("modes:")
+          # for it and exit 1; that still proves the binary loads and starts.
+          smoke() {
+            if [ -n "${{ inputs.tag }}" ]; then
+              out=$("$@" --version 2>&1 || true); echo "$out"
+              grep -qE "^(kabelsalat $VERSION|modes:)" <<<"$out"
+            else
+              "$@" --version
+            fi
+          }
           tar -xzf "dist/kabelsalat-$VERSION-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat" --version
-          "dist/kabelsalat-$VERSION-${{ matrix.arch }}.AppImage" --appimage-extract-and-run --version
+          smoke "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat"
+          smoke "dist/kabelsalat-$VERSION-${{ matrix.arch }}.AppImage" --appimage-extract-and-run
       - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}

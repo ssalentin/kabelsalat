@@ -78,16 +78,24 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.version.outputs.version }}
-      # The packaging scripts come from this ref; the source from the
-      # backfilled tag when there is one.
-      SRC: ${{ inputs.tag && 'src' || '.' }}
     steps:
       - uses: actions/checkout@v7
       - if: inputs.tag
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag }}
-          path: src
+          path: tag-src
+      # The packaging scripts come from this ref; the source from the
+      # backfilled tag when there is one. The tag's tree moves out of this
+      # checkout, or cargo takes ./Cargo.toml for its workspace root.
+      - name: Source tree
+        run: |
+          if [ -d tag-src ]; then
+            mv tag-src "$RUNNER_TEMP/src"
+            echo "SRC=$RUNNER_TEMP/src" >> "$GITHUB_ENV"
+          else
+            echo "SRC=$PWD" >> "$GITHUB_ENV"
+          fi
       - name: Install build dependencies
         run: scripts/ci/ubuntu-deps.sh
       - uses: dtolnay/rust-toolchain@stable

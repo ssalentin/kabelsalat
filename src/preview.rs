@@ -663,7 +663,7 @@ impl eframe::App for PreviewApp {
         }
         // Assistant events (tool calls execute here, on the UI thread).
         for batch in self.assistant.poll() {
-            let results = batch.iter().map(|call| self.exec_tool(&call.name, &call.args)).collect();
+            let results = batch.iter().map(|call| self.exec_tool(&call.name, &call.args).into()).collect();
             self.assistant.send_tool_results(results);
         }
         self.assistant_panel(root);

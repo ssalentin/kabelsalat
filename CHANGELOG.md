@@ -33,11 +33,23 @@ releases may still change behaviour and session files.
   with `agent-eval` at 0.3–0.4 s per request instead of 2–6 s. A request
   Jev is unsure of, a question, or a request for two changes still goes to
   the chat model.
+- **Images for the assistant:** drop a PNG or JPEG on the window, or paste
+  one into the open chat. It shows as a chip above the input (a click
+  removes it) and goes out with the next message. A turn with an image is
+  answered by the seeing model (`agent_perceive_model`, default
+  `google/gemini-3.8-flash` on OpenRouter), which has the same tools. An
+  image is sent only during its own turn; later turns keep one line that
+  names it.
+- **`look_at_rack`:** the assistant and MCP agents (`kabelsalat mcp
+  --attach`) can ask for a screenshot of the app window, scaled to at most
+  1400 px and PNG-encoded off the UI thread. MCP gets it as image content.
+- **`kabelsalat jev-test --image <file> <request>`** asks Jev about one
+  request without and with an image.
 - **Model routes per role** in `config.json`: `agent_decide_model`,
   `agent_act_model` (also set by `/model` in the chat) and
   `agent_perceive_model`. Ids with a vendor prefix (`vendor/model`) go to
   OpenRouter, bare ids to DeepSeek.
-- **`kabelsalat agent-eval`** runs the real agent loop over 22 scripted
+- **`kabelsalat agent-eval`** runs the real agent loop over 26 scripted
   requests on a headless app with an offline engine and reports pass rate,
   model steps, tool calls, wall time and the models that answered.
   **`kabelsalat jev-test`** shows what Jev decides for sample requests.

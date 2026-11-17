@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::vision::Image;
+
 /// An OpenAI-compatible chat-completions service.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Endpoint {
@@ -59,8 +61,8 @@ pub enum Role {
     /// Act: a chat model reads the request and calls tools, for everything
     /// the decision alone does not settle.
     Act,
-    /// Look and listen: a multimodal model that describes the rack or the
-    /// master signal for the acting model.
+    /// See: a multimodal chat model that acts in place of the acting model
+    /// for a turn that carries an image.
     Perceive,
 }
 
@@ -337,12 +339,18 @@ impl<T: Transport> Client<T> {
     }
 
     /// Ask a decisions model typed `questions` (noul, choice, score) about
-    /// `state`: one request, one probability-backed answer per question.
-    pub fn decide(&mut self, route: &Route, key: &str, state: Value, questions: Value) -> Result<Decisions, LlmError> {
+    /// `request`, and about `image` when one is attached: one request, one
+    /// probability-backed answer per question.
+    pub fn decide(&mut self, route: &Route, key: &str, request: &str, image: Option<&Image>, questions: Value) -> Result<Decisions, LlmError> {
         let spec = route.endpoint.spec();
         let url = spec.decisions_url
             .ok_or_else(|| LlmError::Request(format!("{} has no decisions endpoint (model {})", spec.label, route.model)))?;
-        let body = serde_json::json!({ "model": route.model, "state": state, "questions": questions });
+        let mut body = serde_json::json!({ "model": route.model, "state": request, "questions": questions });
+        if let Some(image) = image {
+            // Jev reads an asset where the state names its key.
+            body["state"] = serde_json::json!({ "request": request, "image": IMAGE_ASSET });
+            body["assets"] = serde_json::json!({ IMAGE_ASSET: image.decision_asset() });
+        }
         let started = std::time::Instant::now();
         let (answer, attempts) = self.post(spec.label, url, key, &body)?;
         let answers = answer.get("answers").and_then(|a| a.as_object())
@@ -351,6 +359,9 @@ impl<T: Transport> Client<T> {
         Ok(Decisions { answers, model: model_of(&answer), ms: started.elapsed().as_millis() as u64, attempts })
     }
 }
+
+/// The key a decisions request's image goes under in `assets`.
+const IMAGE_ASSET: &str = "attached_image";
 
 fn model_of(answer: &Value) -> String {
     answer.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string()
@@ -446,7 +457,7 @@ mod tests {
             "id":"gen-dec-1","model":"typesafe/jev-1.13-20260917","provider":"TypeSafe","usage":{"cost":0.00002,"input_tokens":476,"output_tokens":70}}"#;
         let probe = FakeTransport::new(vec![status(503, "{}"), status(200, body)]);
         let out = Client::new(probe.clone())
-            .decide(&Route::for_model(JEV), "k", json!("My checkout page is blank."), json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
+            .decide(&Route::for_model(JEV), "k", "My checkout page is blank.", None, json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
             .unwrap();
         assert_eq!(out.answers["is_bug"], Answer::Noul(0.96));
         assert_eq!(out.choice("team"), Some(("payments", 0.84)));
@@ -460,9 +471,19 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_about_an_image_sends_it_once_as_an_asset_the_state_names() {
+        let probe = FakeTransport::new(vec![status(200, r#"{"answers":{},"model":"m"}"#)]);
+        let image = Image { name: "note.png".into(), format: crate::vision::Format::Png, bytes: vec![1, 2, 3].into(), size: Some([4, 2]) };
+        Client::new(probe.clone()).decide(&Route::for_model(JEV), "k", "Do what the note says.", Some(&image), json!({})).unwrap();
+        let (_, _, sent) = &probe.requests()[0];
+        assert_eq!(sent["state"], json!({"request": "Do what the note says.", "image": "attached_image"}));
+        assert_eq!(sent["assets"], json!({"attached_image": {"type": "image", "format": "png", "data_base64": "AQID"}}));
+    }
+
+    #[test]
     fn a_decision_needs_an_endpoint_that_has_decisions() {
         let probe = FakeTransport::new(vec![]);
-        let out = Client::new(probe.clone()).decide(&Route::for_model(DEEPSEEK_CHAT), "k", json!("x"), json!({}));
+        let out = Client::new(probe.clone()).decide(&Route::for_model(DEEPSEEK_CHAT), "k", "x", None, json!({}));
         assert!(matches!(out, Err(LlmError::Request(m)) if m.contains("no decisions endpoint")));
         assert!(probe.requests().is_empty());
     }

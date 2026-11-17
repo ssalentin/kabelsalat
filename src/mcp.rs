@@ -1299,12 +1299,23 @@ impl McpServer {
         }
     }
 
+    /// See the app window (the in-app agent's look_at_rack).
+    #[tool(name = "look_at_rack", description = "See the app: a PNG screenshot of the whole kabelsalat window as the user sees it right now (rack side in view, units, cables, mixer, open panels). Needs the running app (kabelsalat mcp --attach) with its window visible. Use it for how something looks, what is selected or where something is; get_graph is the faster source for nodes and cables.")]
+    fn look_at_rack(&self) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("look_at_rack", json!({}))
+    }
+
     fn ui_bridge_tool(tool: &str, args: Value) -> Result<CallToolResult, McpError> {
         match bridge::request(&json!({"op": "ui", "tool": tool, "args": args})) {
             Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let data = reply.get("data").cloned().unwrap_or(Value::Null);
                 if let Some(s) = data.as_str() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                        // A tool that shows something answers with a picture.
+                        if let Some(png) = parsed.get("png_base64").and_then(Value::as_str) {
+                            let text = parsed.get("text").and_then(Value::as_str).unwrap_or("");
+                            return Ok(CallToolResult::success(vec![ContentBlock::text(text), ContentBlock::image(png, "image/png")]));
+                        }
                         return ok_json(parsed);
                     }
                 }

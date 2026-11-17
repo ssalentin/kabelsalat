@@ -10,15 +10,15 @@
 //!   on the *caller* side, so call them from non-RT threads (UI). For cross-thread
 //!   use grab a `VoiceController` before moving the voice.
 //! - `ClapVoiceMain` stays on the creating (main) thread: state save/restore,
-//!   params, embedded GUI, deactivation (CLAP [main-thread] rules).
+//!   params, deactivation (CLAP [main-thread] rules). Plugin editors are
+//!   native egui (parameter lists), never the plugin's own window.
 //!
 //! `run_test` is a demo built entirely on this API: discover ~/.clap, enumerate
 //! params, play an audible arpeggio through the default cpal output,
-//! save/restore state, and EMBED the plugin GUI into a host-owned X11 window
-//! (XWayland) — no detached plugin windows.
+//! save/restore state.
 //!
 //! Architecture (matches docs/ARCHITECTURE.md §7):
-//! - main thread: plugin instance lifecycle, params/state/GUI (CLAP [main-thread])
+//! - main thread: plugin instance lifecycle, params/state (CLAP [main-thread])
 //! - audio thread: owns `ClapVoice` (the `StartedPluginAudioProcessor`), renders
 //!   blocks (CLAP [audio-thread])
 //! - cpal callback: drains a lock-free `rtrb` ring into the device buffer
@@ -34,9 +34,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
-use clack_extensions::gui::{
-    GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window as ClapWindow,
-};
 use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
 use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
 use clack_extensions::params::{
@@ -49,26 +46,18 @@ use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match};
-use clack_host::host::{HostError, HostExtensions};
+use clack_host::host::HostExtensions;
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
 use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::transport::{Transport, BEATS_PER_BAR};
 
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
-    EventMask, PropMode, WindowClass,
-};
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
-
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
 /// Upper bound on output ports (Surge XT: main + Scene A + Scene B = 3).
 const MAX_OUT_PORTS: usize = 8;
-/// How long the arpeggio + GUI demo runs.
+/// How long the arpeggio demo runs.
 const DEMO_SECONDS: u64 = 9;
 
 // ---------------------------------------------------------------------------
@@ -80,7 +69,6 @@ struct HostShared {
     // Plugin extensions, queried during initialization.
     params: OnceLock<Option<PluginParams>>,
     state: OnceLock<Option<PluginState>>,
-    gui: OnceLock<Option<PluginGui>>,
     latency: OnceLock<Option<PluginLatency>>,
     audio_ports: OnceLock<Option<PluginAudioPorts>>,
     remote_controls: OnceLock<Option<PluginRemoteControls>>,
@@ -89,20 +77,12 @@ struct HostShared {
     restart_requested: AtomicBool,
     process_requested: AtomicBool,
     flush_requested: AtomicBool,
-    // GUI requests. clack-extensions dispatches ALL HostGuiImpl callbacks to
-    // the *shared* handler (they may arrive off the main thread), so this
-    // state must be Send + Sync.
-    resize_request: Mutex<Option<GuiSize>>,
-    show_request: AtomicBool,
-    hide_request: AtomicBool,
-    gui_closed: AtomicBool,
 }
 
 impl<'a> SharedHandler<'a> for HostShared {
     fn initializing(&self, instance: InitializingPluginHandle<'a>) {
         let _ = self.params.set(instance.get_extension());
         let _ = self.state.set(instance.get_extension());
-        let _ = self.gui.set(instance.get_extension());
         let _ = self.latency.set(instance.get_extension());
         let _ = self.audio_ports.set(instance.get_extension());
         let _ = self.remote_controls.set(instance.get_extension());
@@ -128,25 +108,6 @@ impl HostLogImpl for HostShared {
 impl HostParamsImplShared for HostShared {
     fn request_flush(&self) {
         self.flush_requested.store(true, Ordering::SeqCst);
-    }
-}
-
-impl HostGuiImpl for HostShared {
-    fn resize_hints_changed(&self) {}
-    fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
-        *self.resize_request.lock().unwrap() = Some(new_size);
-        Ok(())
-    }
-    fn request_show(&self) -> Result<(), HostError> {
-        self.show_request.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-    fn request_hide(&self) -> Result<(), HostError> {
-        self.hide_request.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-    fn closed(&self, _was_destroyed: bool) {
-        self.gui_closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -199,8 +160,7 @@ impl HostHandlers for TestHost {
             .register::<HostLog>()
             .register::<HostParams>()
             .register::<HostState>()
-            .register::<HostLatency>()
-            .register::<HostGui>();
+            .register::<HostLatency>();
     }
 }
 
@@ -208,7 +168,6 @@ impl HostHandlers for TestHost {
 struct Exts {
     params: Option<PluginParams>,
     state: Option<PluginState>,
-    gui: Option<PluginGui>,
     latency: Option<PluginLatency>,
     audio_ports: Option<PluginAudioPorts>,
     remote_controls: Option<PluginRemoteControls>,
@@ -349,16 +308,14 @@ impl ClapVoice {
         let exts = plugin.access_shared_handler(|h| Exts {
             params: h.params.get().copied().flatten(),
             state: h.state.get().copied().flatten(),
-            gui: h.gui.get().copied().flatten(),
             latency: h.latency.get().copied().flatten(),
             audio_ports: h.audio_ports.get().copied().flatten(),
             remote_controls: h.remote_controls.get().copied().flatten(),
         });
         println!(
-            "extensions: params={} state={} gui={} latency={} audio-ports={} remote-controls={}",
+            "extensions: params={} state={} latency={} audio-ports={} remote-controls={}",
             exts.params.is_some(),
             exts.state.is_some(),
-            exts.gui.is_some(),
             exts.latency.is_some(),
             exts.audio_ports.is_some(),
             exts.remote_controls.is_some()
@@ -700,7 +657,7 @@ mod transport_event_tests {
 const MAIN_CONTROLS_RECHECKS: u8 = 10;
 
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
-/// `!Send`), state save/restore, GUI access and deactivation. Must stay on the
+/// `!Send`), state save/restore and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
 pub struct ClapVoiceMain {
     instance: PluginInstance<TestHost>,
@@ -714,14 +671,9 @@ pub struct ClapVoiceMain {
 }
 
 impl ClapVoiceMain {
-    /// Direct access for params inspection / embedded GUI (main thread only).
+    /// Direct access for params inspection (main thread only).
     pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
         &mut self.instance
-    }
-
-    /// The plugin's GUI extension, if any (for embedded-editor setup).
-    pub fn gui(&self) -> Option<PluginGui> {
-        self.exts.gui
     }
 
     /// Plugin-reported latency in samples (meaningful once active).
@@ -986,13 +938,10 @@ pub fn run_test() -> Result<()> {
         )?
     };
     stream.play()?;
-    println!("playing arpeggio (A3 C4 E4 A4 C5 ...) for {DEMO_SECONDS}s — GUI embedded below");
+    println!("playing arpeggio (A3 C4 E4 A4 C5 ...) for {DEMO_SECONDS}s");
 
-    // 8. Embedded GUI (X11/XWayland). No detached-window fallback by design.
-    ensure_display();
-    let gui_ext = main.gui();
-    let gui_report = run_embedded_gui(main.instance_mut(), gui_ext, Duration::from_secs(DEMO_SECONDS));
-    println!("GUI: {gui_report}");
+    // 8. Let the arpeggio play.
+    std::thread::sleep(Duration::from_secs(DEMO_SECONDS));
 
     // 9. State round-trip, part 2 — while processing is still running, like a
     //    real host restoring a session during playback. Surge applies loaded
@@ -1075,7 +1024,6 @@ pub fn run_test() -> Result<()> {
     // 11. Deactivate on the main thread, then drop everything.
     main.deactivate(stopped);
     println!("=== host-test PASS: Surge XT loads, plays, state round-trips ===");
-    println!("GUI result: {gui_report}");
     Ok(())
 }
 
@@ -2242,693 +2190,6 @@ fn voice_render_loop(
     let stopped = voice.stop();
     let _ = tx.send(stopped);
     Ok(errors)
-}
-
-// ---------------------------------------------------------------------------
-// Embedded GUI (X11 / XWayland) — host-owned parent window, no floating fallback
-// ---------------------------------------------------------------------------
-
-/// The tool shells may lack DISPLAY even though XWayland is running; find the
-/// socket and point DISPLAY at it (no-op when already set).
-fn ensure_display() {
-    if std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false) {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if let Some(num) = name.strip_prefix('X') {
-                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-                    std::env::set_var("DISPLAY", format!(":{num}"));
-                    println!("DISPLAY was unset; using :{num} (XWayland socket)");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-struct ParentWindow {
-    conn: RustConnection,
-    win: u32,
-}
-
-impl ParentWindow {
-    fn new(title: &str, width: u32, height: u32) -> Result<Self> {
-        let (conn, screen_num) = x11rb::connect(None).context("connecting to X server (DISPLAY)")?;
-        let screen = &conn.setup().roots[screen_num];
-        let win = conn.generate_id()?;
-        conn.create_window(
-            screen.root_depth,
-            win,
-            screen.root,
-            40,
-            40,
-            width.min(u16::MAX as u32) as u16,
-            height.min(u16::MAX as u32) as u16,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .background_pixel(0x0020_2020)
-                .event_mask(
-                    EventMask::EXPOSURE
-                        | EventMask::STRUCTURE_NOTIFY
-                        | EventMask::SUBSTRUCTURE_NOTIFY, // observe the plugin reparenting into us
-                ),
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            win,
-            AtomEnum::WM_NAME,
-            AtomEnum::STRING,
-            title.as_bytes(),
-        )?;
-        conn.map_window(win)?;
-        conn.flush()?;
-        Ok(Self { conn, win })
-    }
-
-    fn resize(&self, width: u32, height: u32) -> Result<()> {
-        self.conn.configure_window(
-            self.win,
-            &ConfigureWindowAux::new()
-                .width(width.min(u16::MAX as u32))
-                .height(height.min(u16::MAX as u32)),
-        )?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
-    /// Drain pending X events; flags reparent/create of children into us.
-    fn pump(&self, reparented: &mut bool, created: &mut bool) -> Result<()> {
-        while let Some(event) = self.conn.poll_for_event()? {
-            match event {
-                x11rb::protocol::Event::ReparentNotify(ev) => {
-                    if ev.parent == self.win {
-                        *reparented = true;
-                        println!(
-                            "X11: plugin window {} reparented into host window {} (embedding confirmed)",
-                            ev.window, self.win
-                        );
-                    }
-                }
-                x11rb::protocol::Event::CreateNotify(ev) => {
-                    if ev.parent == self.win {
-                        *created = true;
-                        println!(
-                            "X11: plugin window {} created directly inside host window {}",
-                            ev.window, self.win
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Enumerate child windows with their WM_CLASS — hard evidence that the
-    /// plugin editor lives inside our host window.
-    fn describe_children(&self) -> Result<Vec<(u32, String)>> {
-        let tree = self.conn.query_tree(self.win)?.reply()?;
-        let mut out = Vec::new();
-        for &child in &tree.children {
-            let reply = self
-                .conn
-                .get_property(false, child, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)?
-                .reply()?;
-            let class = String::from_utf8_lossy(&reply.value).replace('\0', " ");
-            out.push((child, class.trim().to_string()));
-        }
-        Ok(out)
-    }
-}
-
-impl Drop for ParentWindow {
-    fn drop(&mut self) {
-        let _ = self.conn.destroy_window(self.win);
-        let _ = self.conn.flush();
-    }
-}
-
-fn run_embedded_gui(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: Option<PluginGui>,
-    duration: Duration,
-) -> String {
-    let Some(gui) = gui else {
-        return "FAILED: plugin exposes no GUI extension".into();
-    };
-    match embed_gui(plugin, &gui, duration) {
-        Ok(summary) => summary,
-        Err(e) => format!("FAILED: {e:#}"),
-    }
-}
-
-fn embed_gui(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: &PluginGui,
-    duration: Duration,
-) -> Result<String> {
-    let cfg = GuiConfiguration {
-        api_type: GuiApiType::X11,
-        is_floating: false, // embedded, per requirement — never floating
-    };
-    if let Some(pref) = gui.get_preferred_api(&plugin.plugin_handle()) {
-        println!(
-            "GUI preferred api: {} (floating={})",
-            pref.api_type.0.to_string_lossy(),
-            pref.is_floating
-        );
-    }
-    if !gui.is_api_supported(&plugin.plugin_handle(), cfg) {
-        bail!("step=is_api_supported: Surge rejected x11 embedded configuration");
-    }
-    gui.create(&plugin.plugin_handle(), cfg)
-        .context("step=create(x11, embedded)")?;
-
-    // From here on the GUI exists; make sure we destroy it on every exit path.
-    // The host parent window must outlive gui.destroy(): destroying the X11
-    // parent first would tear down the plugin's reparented child window.
-    let size = gui
-        .get_size(&plugin.plugin_handle())
-        .unwrap_or(GuiSize { width: 900, height: 600 });
-    println!("GUI initial size: {}x{}", size.width, size.height);
-    let parent = ParentWindow::new("kabelsalat P0 — Surge XT (embedded)", size.width, size.height)
-        .context("step=create host X11 parent window");
-    let result = match &parent {
-        Ok(parent) => embed_gui_inner(plugin, gui, duration, parent),
-        Err(e) => Err(anyhow!("{e:#}")),
-    };
-    let _ = gui.hide(&plugin.plugin_handle());
-    gui.destroy(&plugin.plugin_handle());
-    drop(parent); // destroys the X11 window only after the plugin GUI is gone
-    result
-}
-
-fn embed_gui_inner(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: &PluginGui,
-    duration: Duration,
-    parent: &ParentWindow,
-) -> Result<String> {
-    let can_resize = gui.can_resize(&plugin.plugin_handle());
-    println!("GUI can_resize: {can_resize}");
-
-    // CLAP X11 embedding: hand the plugin our window handle; the plugin
-    // reparents its editor into it (XReparentWindow on the plugin side).
-    // SAFETY: `parent` outlives the GUI (destroyed before ParentWindow::drop).
-    unsafe {
-        gui.set_parent(&plugin.plugin_handle(), ClapWindow::from_x11_handle(parent.win as _))
-            .context("step=set_parent(x11)")?;
-    }
-    gui.show(&plugin.plugin_handle()).context("step=show")?;
-    println!("GUI embedded; running event loop for {}s", duration.as_secs());
-
-    let deadline = Instant::now() + duration;
-    let mut reparented = false;
-    let mut created = false;
-    let mut resizes = 0u32;
-    let mut children_seen = false;
-    let mut next_inspect = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        parent.pump(&mut reparented, &mut created)?;
-        if !children_seen && Instant::now() >= next_inspect {
-            let children = parent.describe_children()?;
-            if !children.is_empty() {
-                children_seen = true;
-                println!("X11: host window {} children: {children:?}", parent.win);
-            }
-            next_inspect = Instant::now() + Duration::from_secs(1);
-        }
-
-        // Plugin-initiated resize: adjust the host window, then confirm.
-        if let Some(req) = plugin.access_shared_handler(|h| h.resize_request.lock().unwrap().take()) {
-            let adjusted = gui.adjust_size(&plugin.plugin_handle(), req).unwrap_or(req);
-            parent.resize(adjusted.width, adjusted.height)?;
-            let _ = gui.set_size(&plugin.plugin_handle(), adjusted);
-            resizes += 1;
-        }
-        if plugin.access_shared_handler(|h| h.show_request.swap(false, Ordering::SeqCst)) {
-            let _ = gui.show(&plugin.plugin_handle());
-        }
-        if plugin.access_shared_handler(|h| h.hide_request.swap(false, Ordering::SeqCst)) {
-            let _ = gui.hide(&plugin.plugin_handle());
-        }
-        if plugin.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst)) {
-            bail!("step=event-loop: plugin reported GUI closed unexpectedly");
-        }
-        if plugin.access_shared_handler(|h| h.callback_requested.swap(false, Ordering::SeqCst)) {
-            plugin.call_on_main_thread_callback();
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    let final_size = gui.get_size(&plugin.plugin_handle());
-    let evidence = if reparented || created || children_seen {
-        "child window confirmed in host window"
-    } else {
-        "WARNING: no child window observed"
-    };
-    Ok(format!(
-        "EMBEDDED OK (x11/XWayland, {evidence}; reparented={reparented}, created={created}, resize requests={resizes}, final size={final_size:?})"
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// EmbeddedEditor — plugin GUI inside the app's MAIN window (P1, task-15)
-// ---------------------------------------------------------------------------
-//
-// Same CLAP sequence as the P0 spike (create → set_parent → show → resize
-// pump), but the parent is the egui main window itself (X11 id obtained from
-// eframe via raw-window-handle), not a host-owned top-level. The editor is an
-// X11 CHILD of the main window, positioned by the UI into a reserved region
-// (physical pixels). One dedicated x11rb connection per editor discovers and
-// configures the child; CLAP gui requests are drained from HostShared.
-//
-// The parent window is NOT owned here — never destroy it. Teardown order is
-// gui.hide() → gui.destroy() (the plugin destroys its child itself); the X
-// connection may go away at any time afterwards.
-
-/// A rectangle in the main window's X11 coordinate space (physical pixels).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EditorRect {
-    pub x: i16,
-    pub y: i16,
-    pub w: u16,
-    pub h: u16,
-}
-
-/// Result of [`EmbeddedEditor::pump`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EditorStatus {
-    Ok,
-    /// The plugin closed/destroyed its own GUI; the UI should drop the editor.
-    Closed,
-}
-
-pub struct EmbeddedEditor {
-    conn: RustConnection,
-    /// Main app window (borrowed, NOT owned).
-    parent: u32,
-    gui: PluginGui,
-    /// The plugin's editor window inside `parent`, once discovered.
-    child: Option<u32>,
-    /// Main-window children present before set_parent (discovery baseline).
-    baseline: Vec<u32>,
-    /// Plugin-side editor size (what Surge draws, physical px).
-    size: GuiSize,
-    /// Last region requested by the UI + when it last changed (debounce).
-    last_rect: Option<EditorRect>,
-    rect_changed: Instant,
-    /// Last geometry actually applied to the child (avoid configure spam).
-    last_geom: Option<(i16, i16, u16, u16)>,
-    mapped: bool,
-    /// Plugin reported closed/destroyed — skip hide/destroy on teardown.
-    gui_gone: bool,
-    next_evidence: Instant,
-}
-
-impl EmbeddedEditor {
-    /// Create the plugin GUI and embed it into `parent` (the main window's
-    /// X11 id), fitted to `rect`. Call on the main thread. On success the
-    /// editor is shown and (usually) already positioned; [`Self::pump`] keeps
-    /// it in sync afterwards.
-    pub fn open(main: &mut ClapVoiceMain, parent: u32, rect: EditorRect) -> Result<Self> {
-        ensure_display();
-        let gui = main
-            .gui()
-            .ok_or_else(|| anyhow!("plugin exposes no GUI extension"))?;
-        let cfg = GuiConfiguration {
-            api_type: GuiApiType::X11,
-            is_floating: false, // embedded into the main window — never floating
-        };
-        if !gui.is_api_supported(&main.instance_mut().plugin_handle(), cfg) {
-            bail!("Surge rejected x11 embedded GUI configuration");
-        }
-        gui.create(&main.instance_mut().plugin_handle(), cfg)
-            .context("step=create(x11, embedded)")?;
-        // GUI exists from here on: destroy it on every error path.
-        let result = Self::open_inner(main, gui, parent, rect);
-        if result.is_err() {
-            let _ = gui.hide(&main.instance_mut().plugin_handle());
-            gui.destroy(&main.instance_mut().plugin_handle());
-        }
-        result
-    }
-
-    fn open_inner(
-        main: &mut ClapVoiceMain,
-        gui: PluginGui,
-        parent: u32,
-        rect: EditorRect,
-    ) -> Result<Self> {
-        let (conn, _screen) = x11rb::connect(None).context("connecting to X server (DISPLAY)")?;
-        let baseline = conn
-            .query_tree(parent)
-            .context("query_tree(main window)")?
-            .reply()
-            .context("query_tree reply")?
-            .children;
-
-        // CLAP X11 embedding: hand Surge the MAIN window's id. Surge creates
-        // its editor directly as a child of it (P0: CreateNotify, no reparent).
-        // SAFETY: the main window outlives the GUI (eframe owns it; the editor
-        // is destroyed on toggle-off / app exit before the window goes away).
-        unsafe {
-            gui.set_parent(
-                &main.instance_mut().plugin_handle(),
-                ClapWindow::from_x11_handle(parent as _),
-            )
-            .context("step=set_parent(main window)")?;
-        }
-        gui.show(&main.instance_mut().plugin_handle())
-            .context("step=show")?;
-
-        let mut ed = Self {
-            conn,
-            parent,
-            gui,
-            child: None,
-            baseline,
-            size: GuiSize { width: 900, height: 600 },
-            last_rect: None,
-            rect_changed: Instant::now(),
-            last_geom: None,
-            mapped: true,
-            gui_gone: false,
-            next_evidence: Instant::now(),
-        };
-
-        // Discover the child synchronously (Surge creates it during
-        // set_parent/show) so it can be positioned before the first frame.
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while ed.child.is_none() && Instant::now() < deadline {
-            ed.discover_child();
-            if ed.child.is_none() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if ed.child.is_none() {
-            eprintln!("editor: no child window yet after 600 ms — will keep looking in pump()");
-        }
-        ed.fit_and_place(main, rect, true);
-        ed.log_evidence("open");
-        Ok(ed)
-    }
-
-    /// The plugin's editor X11 window, once discovered (for UI status).
-    pub fn child(&self) -> Option<u32> {
-        self.child
-    }
-
-    /// Per-frame maintenance: drain X events + CLAP gui requests, keep the
-    /// child fitted to `rect` (physical px in the main window). Main thread.
-    pub fn pump(&mut self, main: &mut ClapVoiceMain, rect: EditorRect) -> EditorStatus {
-        if self.gui_gone {
-            return EditorStatus::Closed;
-        }
-        // 1. X events on our dedicated connection (child StructureNotify).
-        loop {
-            match self.conn.poll_for_event() {
-                Ok(Some(event)) => match event {
-                    x11rb::protocol::Event::CreateNotify(ev) if ev.parent == self.parent => {
-                        if self.child.is_none() {
-                            self.adopt_child(ev.window);
-                        }
-                    }
-                    x11rb::protocol::Event::ReparentNotify(ev) if ev.parent == self.parent => {
-                        if self.child.is_none() {
-                            self.adopt_child(ev.window);
-                        }
-                    }
-                    x11rb::protocol::Event::DestroyNotify(ev) if Some(ev.window) == self.child => {
-                        eprintln!("editor: child window {} destroyed by plugin", ev.window);
-                        self.child = None;
-                        self.gui_gone = true;
-                        return EditorStatus::Closed;
-                    }
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("editor: X event poll failed: {e}");
-                    break;
-                }
-            }
-        }
-        // 2. Child not seen yet? Poll the tree (covers missed events).
-        if self.child.is_none() {
-            self.discover_child();
-        }
-        // 3. CLAP gui requests (dispatched to the shared handler by clack).
-        let req = main
-            .instance_mut()
-            .access_shared_handler(|h| h.resize_request.lock().unwrap().take());
-        if let Some(req) = req {
-            let target = self.adjusted_fit(main, clamp_size(req, rect), rect);
-            let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
-            self.size = self
-                .gui
-                .get_size(&main.instance_mut().plugin_handle())
-                .unwrap_or(target);
-            self.last_geom = None; // force reconfigure
-            eprintln!("editor: request_resize {req:?} -> {target:?}");
-        }
-        if main.instance_mut().access_shared_handler(|h| h.show_request.swap(false, Ordering::SeqCst)) {
-            let _ = self.gui.show(&main.instance_mut().plugin_handle());
-            self.set_mapped(true);
-        }
-        if main.instance_mut().access_shared_handler(|h| h.hide_request.swap(false, Ordering::SeqCst)) {
-            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
-            self.set_mapped(false);
-        }
-        if main.instance_mut().access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst)) {
-            self.gui_gone = true;
-            return EditorStatus::Closed;
-        }
-        if main.instance_mut().access_shared_handler(|h| h.callback_requested.swap(false, Ordering::SeqCst)) {
-            main.instance_mut().call_on_main_thread_callback();
-        }
-        // 4. Keep the child fitted + centered in the reserved region.
-        self.fit_and_place(main, rect, false);
-        // 5. Periodic hard evidence: the main window's child list.
-        if Instant::now() >= self.next_evidence {
-            self.log_evidence("pump");
-            self.next_evidence = Instant::now() + Duration::from_secs(5);
-        }
-        EditorStatus::Ok
-    }
-
-    /// Hide + destroy the plugin GUI (the plugin destroys its X11 child).
-    /// Consumes the editor; the X connection is dropped afterwards.
-    pub fn close(mut self, main: &mut ClapVoiceMain) {
-        if !self.gui_gone {
-            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
-            self.gui.destroy(&main.instance_mut().plugin_handle());
-        }
-        self.child = None;
-        eprintln!("editor: closed (gui destroyed, main window {} untouched)", self.parent);
-    }
-
-    // -- internals ----------------------------------------------------------
-
-    /// Find a new child of the main window (vs. the pre-embed baseline) and
-    /// adopt it as the editor. Prefer Surge's WM_CLASS; else the largest new
-    /// window. Selects StructureNotify on the child to observe its lifecycle.
-    fn discover_child(&mut self) {
-        let Ok(reply) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
-            return;
-        };
-        let Ok(tree) = reply else { return };
-        let mut best: Option<(u32, u32)> = None; // (window, area)
-        for &child in &tree.children {
-            if self.baseline.contains(&child) {
-                continue;
-            }
-            let class = self.window_class(child);
-            let area = self
-                .conn
-                .get_geometry(child)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|g| g.width as u32 * g.height as u32)
-                .unwrap_or(0);
-            if class.to_lowercase().contains("surge") {
-                self.adopt_child(child);
-                return;
-            }
-            if best.map_or(true, |(_, a)| area > a) {
-                best = Some((child, area));
-            }
-        }
-        if let Some((child, _)) = best {
-            self.adopt_child(child);
-        }
-    }
-
-    fn adopt_child(&mut self, child: u32) {
-        self.child = Some(child);
-        self.baseline.push(child); // never re-adopt
-        // Observe the child's own lifecycle (destroy/configure). This does not
-        // touch the main window's event mask (winit owns that).
-        let _ = self.conn.change_window_attributes(
-            child,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
-        );
-        let _ = self.conn.flush();
-        eprintln!(
-            "editor: X11 child {} (WM_CLASS {:?}) lives INSIDE main window {} — embedded",
-            child,
-            self.window_class(child),
-            self.parent
-        );
-    }
-
-    fn window_class(&self, win: u32) -> String {
-        self.conn
-            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| String::from_utf8_lossy(&r.value).replace('\0', " ").trim().to_string())
-            .unwrap_or_default()
-    }
-
-    fn set_mapped(&mut self, mapped: bool) {
-        if self.mapped == mapped {
-            return;
-        }
-        self.mapped = mapped;
-        if let Some(child) = self.child {
-            let _ = if mapped {
-                self.conn.map_window(child)
-            } else {
-                self.conn.unmap_window(child)
-            };
-            let _ = self.conn.flush();
-        }
-    }
-
-    /// Fit the editor to the region (debounced while the region is actively
-    /// resizing) and center the child in it. `force` skips the debounce.
-    fn fit_and_place(&mut self, main: &mut ClapVoiceMain, rect: EditorRect, force: bool) {
-        if rect.w < 16 || rect.h < 16 {
-            return;
-        }
-        let region_changed = self.last_rect != Some(rect);
-        if region_changed {
-            if force {
-                self.rect_changed = Instant::now() - Duration::from_secs(1);
-            } else if self.last_rect.is_none() {
-                self.rect_changed = Instant::now();
-            }
-            self.last_rect = Some(rect);
-        }
-        // Re-fit the plugin size only once the region settles (150 ms), so
-        // live window resizes don't re-zoom Surge every frame.
-        let settled = self.rect_changed.elapsed() >= Duration::from_millis(150);
-        if (region_changed && settled) || force {
-            let desired = GuiSize { width: rect.w as u32, height: rect.h as u32 };
-            let target = self.adjusted_fit(main, desired, rect);
-            if target != self.size || force {
-                let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
-                self.size = self
-                    .gui
-                    .get_size(&main.instance_mut().plugin_handle())
-                    .unwrap_or(target);
-            }
-            self.last_geom = None;
-        }
-        // Center the child in the region; never exceed it (X children are
-        // only clipped by the main window, not by our reserved region).
-        let Some(child) = self.child else { return };
-        let cw = self.size.width.min(rect.w as u32) as u16;
-        let ch = self.size.height.min(rect.h as u32) as u16;
-        let cx = rect.x + ((rect.w.saturating_sub(cw)) / 2) as i16;
-        let cy = rect.y + ((rect.h.saturating_sub(ch)) / 2) as i16;
-        let geom = (cx, cy, cw, ch);
-        if self.last_geom != Some(geom) {
-            let _ = self.conn.configure_window(
-                child,
-                &ConfigureWindowAux::new()
-                    .x(cx as i32)
-                    .y(cy as i32)
-                    .width(cw as u32)
-                    .height(ch as u32),
-            );
-            let _ = self.conn.flush();
-            self.last_geom = Some(geom);
-        }
-        if !self.mapped {
-            self.set_mapped(true);
-        }
-    }
-
-    /// CLAP-correct size fitting: `set_size` must receive a size approved by
-    /// `adjust_size` (Surge snaps to its zoom steps and may round UP). Shrink
-    /// the request proportionally and re-adjust until it fits the region.
-    fn adjusted_fit(&self, main: &mut ClapVoiceMain, desired: GuiSize, rect: EditorRect) -> GuiSize {
-        let mut want = desired;
-        let mut last = desired;
-        for _ in 0..8 {
-            let adj = self
-                .gui
-                .adjust_size(&main.instance_mut().plugin_handle(), want)
-                .unwrap_or(want);
-            last = adj;
-            if adj.width <= rect.w as u32 && adj.height <= rect.h as u32 {
-                return adj;
-            }
-            let s = (rect.w as f64 / adj.width as f64).min(rect.h as f64 / adj.height as f64);
-            want = GuiSize {
-                width: ((want.width as f64 * s) as u32).max(1),
-                height: ((want.height as f64 * s) as u32).max(1),
-            };
-        }
-        last // zoom granularity may leave a few px overflow; centered anyway
-    }
-
-    /// Hard evidence: enumerate the main window's children with WM_CLASS and
-    /// geometry (x11rb query_tree — the xwininfo -tree equivalent).
-    fn log_evidence(&self, when: &str) {
-        let Ok(tree) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
-            return;
-        };
-        let Ok(tree) = tree else { return };
-        let mut lines = Vec::new();
-        for &child in &tree.children {
-            let geom = self
-                .conn
-                .get_geometry(child)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|g| format!("{}x{}+{}+{}", g.width, g.height, g.x, g.y))
-                .unwrap_or_else(|| "?".into());
-            lines.push(format!(
-                "    child {} WM_CLASS {:?} geom {}{}",
-                child,
-                self.window_class(child),
-                geom,
-                if Some(child) == self.child { "  <-- Surge editor" } else { "" }
-            ));
-        }
-        eprintln!(
-            "editor evidence [{when}]: main window {} has {} child window(s):\n{}",
-            self.parent,
-            tree.children.len(),
-            lines.join("\n")
-        );
-    }
-}
-
-/// Clamp a plugin size to the reserved region (never cover the rack).
-fn clamp_size(size: GuiSize, rect: EditorRect) -> GuiSize {
-    GuiSize {
-        width: size.width.min(rect.w as u32).max(1),
-        height: size.height.min(rect.h as u32).max(1),
-    }
 }
 
 #[cfg(test)]

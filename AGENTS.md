@@ -708,8 +708,28 @@ Learned so far (2026-11-15, UI polish pass):
   `pwd` before editing. When the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
-  and shows the evidence. Never leave finished work only on the local
-  machine or only on a branch. Remove the worktree once its PR is merged.
+  and shows the evidence, then queue it with `gh pr merge --auto --squash`
+  (see "Merging"). Never leave finished work only on the local machine or
+  only on a branch. Remove the worktree once its PR is merged.
+- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
+  (admins included), the branch must be up to date, and the required checks
+  `test (x86_64)`, `test (aarch64)`, `flatpak cargo-sources.json is current`
+  and `human gate` must pass. GitHub merges a queued auto-merge PR once they
+  do; never merge by hand around a red or pending check, and never
+  `gh pr merge` without `--auto`. `human gate` (`scripts/ci/human-gate.sh`)
+  holds every PR that touches what CI cannot judge: UI and visuals
+  (`src/ui*`, `src/theme.rs`, `assets/`, `docs/images.sha256`), real-time
+  audio, plugins and MIDI (`src/engine*`, `src/audio*`, `dsp`, `host`, `lv2`,
+  `juce`, `organ`, `midi`, `record`, `player`, `capture`, `meter`,
+  `transport`), and releases and repo rules (`Cargo.toml`, `AGENTS.md`,
+  `.github/`, `.githooks/`, `packaging/`, `scripts/ci/`). Add the
+  `needs-human` label to any other PR whose risk the tests do not cover.
+  Such a PR waits until the user adds `human-approved`; **agents never add
+  or remove `human-approved`**, and a PR body for one lists the evidence the
+  user needs (screenshots, self-test output). Self-tests with real plugins
+  and audio do not run in CI, so their output belongs in every PR body that
+  changes the code they cover. When `main` moves, update the branch
+  (`gh pr update-branch`) so the queued merge can proceed.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

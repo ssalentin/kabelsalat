@@ -9,9 +9,6 @@ rename-desktop-file: kabelsalat.desktop
 rename-icon: kabelsalat
 
 finish-args:
-  # The app prefers X11 (XWayland renders it 1:1, see ui.rs run_app) and falls
-  # back to native Wayland when no X server is reachable.
-  - --socket=x11
   - --socket=wayland
   - --share=ipc
   - --device=dri

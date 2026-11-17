@@ -33,6 +33,11 @@ releases may still change behaviour and session files.
   when it puts a bass there. Saved with the session.
 
 ### Changed
+- **Native Wayland:** the app no longer forces XWayland and needs no X
+  server. It renders at the compositor's fractional scale (sharp at 1.6x),
+  opens maximized as it asks to, and text input goes through the Wayland
+  input method instead of fcitx's X bridge. The Flatpak drops its X11
+  socket. `KABELSALAT_UI_SCALE` still overrides the scale.
 - **MIDI matrix sources read like devices:** hardware rows show the device name
   ("ESI MIDIMATE eX") instead of ALSA's "client:port 24:0" string, with a port
   chip only when a device has several ports and further ports joined to the

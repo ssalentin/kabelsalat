@@ -98,8 +98,8 @@ flatpak run io.github.ssalentin.kabelsalat
 
 Sandbox permissions, and what they are for:
 
-- X11 and Wayland, `dri`: the window. The app prefers X11 (XWayland renders
-  it 1:1) and uses Wayland when no X server is reachable.
+- Wayland and `dri`: the window. The app is a native Wayland client; it
+  needs no X server.
 - `pulseaudio` socket and `xdg-run/pipewire-0`: the runtime's `pactl`, `parec`,
   `paplay` and `pw-record` (system-audio capture, audio inputs, app streams)
   run inside the sandbox and talk to the host's sound server. No

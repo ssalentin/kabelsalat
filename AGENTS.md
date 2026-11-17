@@ -15,10 +15,10 @@ cargo build
 scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transport
 ```
 
-- Environment: `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000`
+- Environment: `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000`
   (the harness sets these itself). Single frames of the real app: `scripts/shot.sh out.png [pid]`
   (window buffer only; never `grim -o`/`-g`, rule 108).
-- Key injection: `scripts/xtest_key.py` (XTEST; F11/F12 = keycodes 95/96, F4 = 0xffc1).
+- Key injection: `wtype` (Wayland virtual keyboard): `wtype -k F4`, `wtype -k Tab`, `wtype "text"`.
 - Visual review = DeepSeek vision via the app's BYOK key
   (`~/.config/kabelsalat/config.json`, field `deepseek_api_key` — NEVER print or
   commit it). POST `https://api.deepseek.com/chat/completions`, model
@@ -117,16 +117,18 @@ Learned so far (2026-11-15, UI polish pass):
     `assistant::tools()` + `exec_tool` + MCP; destructive ones need
     `confirm=true` after asking the user.
 24. **Live-app automation is focus-guarded:** the user may be using the
-    desktop — send XTEST keys/clicks and take `grim` evidence only after
+    desktop — send `wtype` keys and take `grim` evidence only after
     checking `hyprctl activewindow` is kabelsalat (scripts must abort
     otherwise); a stray F12 went to another window once.
 25. **Routing tools update the UI mirror too:** every tool that changes
     engine routing (`set_rig_source`, …) must also update the UI state it
     drives (`rig_sources`), or chips and matrix show stale state.
-26. **UI scale = the compositor's monitor scale (`ui_scale_target`):**
-    never trust winit's XWayland DPI guess (2.33 on the 1.6x eDP-1) —
-    it inflated every element ~46% and squished the rack. Check
-    `ui scale: first-frame ppp=` in the log; `KABELSALAT_UI_SCALE` overrides.
+26. **UI scale = the compositor's scale, as winit reports it on Wayland:**
+    the app is a native Wayland client and never forces XWayland, whose DPI
+    guess (2.33 on the 1.6x eDP-1) inflated every element ~46% and squished
+    the rack. Only `KABELSALAT_UI_SCALE`, tests and windowless renders (1.6)
+    override it (`ui_scale_override`). Check `ui scale: first-frame ppp=` in
+    the log and the window's buffer size (2560x1600 maximized on eDP-1).
 27. **Size scroll areas explicitly in fixed-height panels:** set
     `min_scrolled_height` AND `max_height` to the measured remainder —
     egui's default 64px minimum pushed the assistant header out of its
@@ -660,7 +662,7 @@ Learned so far (2026-11-15, UI polish pass):
   publishes the GitHub release from that version's CHANGELOG block; the steps
   before the tag are in `docs/PACKAGING.md` ("Cut a release").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
-  `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+  `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
@@ -689,10 +691,9 @@ Learned so far (2026-11-15, UI polish pass):
   the running app); one-shot: `kabelsalat send '<json>'`.
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
   shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
-  (rule 55), inject keys with `scripts/xtest_key.py` (F4 = 0xffc1, F1–F10 = X
-  keycodes 67–76, F11/F12 = 95/96 — the script handles it), then
-  `scripts/shot.sh out.png <pid>` (rule 108).
-  Mouse clicks need screen coords: window origin × monitor scale + egui pos.
+  (rule 55), inject keys with `wtype -k F4` (rule 24), then
+  `scripts/shot.sh out.png <pid>` (rule 108). No live click tool is
+  installed; test clicks in egui tests (`click_at`, rule 101).
 - **Hyprland window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
 

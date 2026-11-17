@@ -9419,7 +9419,7 @@ impl DemoApp {
         let reduce_motion = self.reduce_motion;
         let count_in_enabled = self.count_in_enabled;
         let count_in_bars = self.count_in_bars;
-        let detected_scale = ui_scale_target();
+        let detected_scale = ui.ctx().pixels_per_point();
         let mut actions: Vec<SettingsAction> = Vec::new();
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
@@ -9752,7 +9752,7 @@ impl DemoApp {
                             );
                         });
                     });
-                    ui.label(egui::RichText::new("Detected from display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
+                    ui.label(egui::RichText::new("From the display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
                 };
 
                 egui::ScrollArea::vertical()
@@ -14506,21 +14506,18 @@ impl DemoApp {
         self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
 
-        // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
-        // output, and eframe re-applies it AFTER the app creator runs — so the
-        // correction must live here, on the frame path, not in the creator.
-        // The target is the COMPOSITOR's monitor scale (ui_scale_target):
-        // winit-under-XWayland derives 2.33 from the panel's physical DPI on
-        // a 1.6x Hyprland output, which inflated every element by ~46% and
-        // squished the rack (user report 2026-11-15).
-        let target = ui_scale_target();
-        if (ctx.pixels_per_point() - target).abs() > 0.01 {
-            ctx.set_pixels_per_point(target);
-            eprintln!("ui scale: corrected to {target:.2} on frame path");
+        // eframe applies the window's scale after the app creator runs, so an
+        // override lives here, on the frame path.
+        let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+        if let Some(target) = ui_scale_override(native) {
+            if (ctx.pixels_per_point() - target).abs() > 0.01 {
+                ctx.set_pixels_per_point(target);
+                eprintln!("ui scale: set to {target:.2} on frame path");
+            }
         }
         static SCALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SCALE_LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!("ui scale: first-frame ppp={:.2}", ctx.pixels_per_point());
+            eprintln!("ui scale: first-frame ppp={:.2} native={native:?}", ctx.pixels_per_point());
         }
 
         if self.flip_requested {
@@ -15425,8 +15422,6 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
     let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
     anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
         EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
-    // The frame path asks the compositor for its scale otherwise.
-    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
     let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
 
     let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
@@ -15703,36 +15698,21 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     })
 }
 
-/// UI scale (egui pixels_per_point): KABELSALAT_UI_SCALE overrides; else the
-/// focused Hyprland monitor's scale (what every native app on this output
-/// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
-/// Computed once — the hyprctl query never runs on the frame path again.
 /// Width a recessed text field's frame adds around its text: 8px inner
 /// margin and a 1px stroke on each side.
 const RECESSED_INPUT_CHROME: f32 = 18.0;
 
-fn ui_scale_target() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let valid = |s: f32| (1.0..=3.0).contains(&s);
-        if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
-            return s;
-        }
-        if cfg!(test) { return 1.6; }
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let out = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
-            if let Ok(out) = out {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    let mons = v.as_array().cloned().unwrap_or_default();
-                    let pick = mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first());
-                    if let Some(s) = pick.and_then(|m| m["scale"].as_f64()).map(|s| s as f32).filter(|s| valid(*s)) {
-                        return s;
-                    }
-                }
-            }
-        }
-        1.6
-    })
+/// UI scale (egui pixels_per_point) when the compositor's is not used:
+/// KABELSALAT_UI_SCALE, or 1.6 (the design target, 1600x1000 points on a
+/// 2560x1600 panel) without a window (tests, headless renders). A window
+/// keeps the scale the compositor gives it (fractional on Wayland).
+fn ui_scale_override(native: Option<f32>) -> Option<f32> {
+    let valid = |s: f32| (1.0..=3.0).contains(&s);
+    std::env::var("KABELSALAT_UI_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|s| valid(*s))
+        .or((cfg!(test) || native.is_none()).then_some(1.6))
 }
 
 impl DemoApp {
@@ -15844,35 +15824,6 @@ impl DemoApp {
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
-    // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
-    // must reparent into our window; (2) winit has no fractional-scale support,
-    // so native Wayland on a 1.6x Hyprland output renders a logical-resolution
-    // buffer that the compositor upscales (blurry). With Omarchy's
-    // xwayland force_zero_scaling, X11 renders 1:1 at native pixels — sharp —
-    // and egui's pixels_per_point handles element sizing.
-    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-    }
-    // winit >= 0.29 REMOVED WINIT_UNIX_BACKEND: it picks Wayland whenever
-    // WAYLAND_DISPLAY is set, else X11 via DISPLAY. To actually force X11
-    // (required for editor embedding), hide the Wayland socket — but only
-    // when an X display is available, so we never strand the app backend-less.
-    let have_x = std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-        || std::fs::read_dir("/tmp/.X11-unix").map(|mut d| d.next().is_some()).unwrap_or(false);
-    if have_x && std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        std::env::remove_var("WAYLAND_DISPLAY");
-        eprintln!("ui: forcing X11 backend (WAYLAND_DISPLAY hidden; embedding needs XWayland)");
-    }
-    // Text input without an input-method server (#30): with XMODIFIERS
-    // =@im=fcitx every typed character goes through fcitx5's XIM bridge, which
-    // under XWayland stopped delivering text after a while — every text field
-    // went dead while shortcuts (plain key events) kept working. The rack
-    // needs no IME (umlauts come straight from the XKB layout), so use X's
-    // local input method. KABELSALAT_IME=1 keeps the system IME.
-    if std::env::var_os("KABELSALAT_IME").is_none() && std::env::var_os("XMODIFIERS").is_some() {
-        std::env::remove_var("XMODIFIERS");
-        eprintln!("ui: text input via the local X input method (XMODIFIERS cleared; KABELSALAT_IME=1 keeps fcitx/ibus)");
-    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
@@ -15893,15 +15844,6 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
         "kabelsalat",
         options,
         Box::new(move |cc| {
-            // Trust eframe's detected scale (1.6 on the fractional-HiDPI eDP-1).
-            // Only fall back to the native 1.6 if detection reports ~1.0 —
-            // forcing a higher value makes elements oversized.
-            let ppp = cc.egui_ctx.pixels_per_point();
-            cc.egui_ctx.set_pixels_per_point(ui_scale_target());
-            eprintln!(
-                "ui scale: detected={ppp:.2} used={:.2}",
-                cc.egui_ctx.pixels_per_point()
-            );
             cc.egui_ctx.set_visuals(theme::visuals());
             theme::install_spacing(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);

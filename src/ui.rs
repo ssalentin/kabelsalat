@@ -518,9 +518,19 @@ impl PortKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side { Front, Back }
 
+const KNOB_GLIDE_SECS: f32 = 0.20;
+const CABLE_DRAW_IN_SECS: f32 = 0.28;
+const UNIT_FADE_SECS: f32 = 0.24;
+const AGENT_PULSE_SECS: f32 = 0.38;
+
 struct Knob {
     label: String,
+    /// Target/logical value published immediately to the engine (rule 31).
     value: f32,
+    /// Visual needle/arc value (equals `value` on drag/load, glides on agent edits).
+    display_value: f32,
+    glide_from: f32,
+    glide_t: f32,
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
@@ -537,6 +547,27 @@ struct Knob {
 }
 
 impl Knob {
+    fn set_immediate(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        self.display_value = v;
+        self.glide_from = v;
+        self.glide_t = 1.0;
+    }
+
+    fn glide_to(&mut self, v: f32, reduce_motion: bool) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        if reduce_motion || (self.display_value - v).abs() < 1e-4 {
+            self.display_value = v;
+            self.glide_from = v;
+            self.glide_t = 1.0;
+        } else {
+            self.glide_from = self.display_value;
+            self.glide_t = 0.0;
+        }
+    }
+
     /// Engine or plugin target this knob controls, if bindable to MIDI CC.
     fn cc_target(&self) -> Option<(u32, crate::matrix::CcTarget)> {
         if let Some(pin) = self.clap {
@@ -630,13 +661,37 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: false, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: false,
+        sent: None,
+        clap: None,
+        label_g: None,
+    }
 }
 
 /// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
 /// and persisted; the face renders its state as a chip instead.
 fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: true, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: true,
+        sent: None,
+        clap: None,
+        label_g: None,
+    }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -1286,6 +1341,8 @@ struct Cable {
     audio_tick: f32,
 
     age: f32,
+    /// Visual draw-in progress (0..1 from src to dst for agent-added cables).
+    draw_in: f32,
     dying: f32, // < 0 alive; else unplug-fall progress (seconds)
     detach_dst: bool,
     drift: f32,
@@ -1308,7 +1365,7 @@ impl Cable {
             n: 0, total_len: 0.0, curve: [Pos2::ZERO; 4],
             pulses: [dead; MAX_PULSES],
             level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
-            age: 0.0, dying: -1.0, detach_dst: true, drift: 0.0,
+            age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true, drift: 0.0,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
     }
@@ -1585,12 +1642,29 @@ struct AgentAction {
     nodes: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct FadingUnit {
+    rect: Rect,
+    alpha: f32,
+    agent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FadingCable {
+    curve: [Pos2; 4],
+    color: Color32,
+    width: f32,
+    alpha: f32,
+    agent: bool,
+}
+
 /// Model-first store of recent agent edits, keyed by stable domain IDs
 /// (`NodeId`, `EdgeId`, `(SourceId, NodeId)`, rig index) so `build_rack`
 /// rebuilds never drop or shift highlights.
 #[derive(Default)]
 struct AgentActivity {
     nodes: std::collections::HashMap<u32, f32>,
+    node_pulse_at: std::collections::HashMap<u32, f32>,
     edges: std::collections::HashMap<u32, f32>,
     matrix_cells: std::collections::HashMap<(SourceId, u32), f32>,
     rigs: std::collections::HashMap<usize, f32>,
@@ -1599,6 +1673,14 @@ struct AgentActivity {
 
 impl AgentActivity {
     fn touch_node(&mut self, node: u32, now: f32) {
+        if self.nodes.get(&node).is_none_or(|&exp| exp <= now) {
+            self.node_pulse_at.insert(node, now);
+        }
+        self.nodes.insert(node, now + AGENT_TOUCH_SECS);
+    }
+
+    fn trigger_node_pulse(&mut self, node: u32, now: f32) {
+        self.node_pulse_at.insert(node, now);
         self.nodes.insert(node, now + AGENT_TOUCH_SECS);
     }
 
@@ -1616,7 +1698,7 @@ impl AgentActivity {
 
     fn record(&mut self, origin: AgentOrigin, summary: impl Into<String>, nodes: Vec<u32>, now: f32) {
         for &n in &nodes {
-            self.touch_node(n, now);
+            self.trigger_node_pulse(n, now);
         }
         self.log.push_front(AgentAction {
             origin,
@@ -1640,6 +1722,13 @@ impl AgentActivity {
         Self::strength(self.nodes.get(&node), now)
     }
 
+    fn node_pulse(&self, node: u32, now: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion { return 0.0; }
+        let Some(&start) = self.node_pulse_at.get(&node) else { return 0.0 };
+        let t = (now - start) / AGENT_PULSE_SECS;
+        if (0.0..1.0).contains(&t) { (t * std::f32::consts::PI).sin() } else { 0.0 }
+    }
+
     fn edge_alpha(&self, edge: u32, now: f32) -> f32 {
         Self::strength(self.edges.get(&edge), now)
     }
@@ -1661,6 +1750,7 @@ impl AgentActivity {
 
     fn prune(&mut self, now: f32) {
         self.nodes.retain(|_, exp| *exp > now);
+        self.node_pulse_at.retain(|id, _| self.nodes.contains_key(id));
         self.edges.retain(|_, exp| *exp > now);
         self.matrix_cells.retain(|_, exp| *exp > now);
         self.rigs.retain(|_, exp| *exp > now);
@@ -1858,6 +1948,10 @@ struct DemoApp {
     /// `--demo-agent` screenshot hook: keeps the demo agent's touch fresh every
     /// frame so the rack highlight stays visible instead of fading after 2.6s.
     demo_agent_hold: bool,
+    /// Disables rack animations (`ui_reduce_motion` in config.json).
+    reduce_motion: bool,
+    fading_units: Vec<FadingUnit>,
+    fading_cables: Vec<FadingCable>,
     /// Last frame's dock panel rect (tests + keyboard hit-testing).
     dock_rect: Rect,
     /// Last frame's key area inside the dock keyboard (points).
@@ -2169,6 +2263,9 @@ impl DemoApp {
             dock: DockView::None,
             focus_chat_request: false,
             demo_agent_hold: false,
+            reduce_motion: crate::assistant::load_reduce_motion(),
+            fading_units: Vec::new(),
+            fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
             dock_kb_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
@@ -2331,7 +2428,7 @@ impl DemoApp {
         for p in params {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
                 if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(p.param)) {
-                    k.value = p.value as f32;
+                    k.set_immediate(p.value as f32);
                     k.default = p.value as f32;
                 }
             }
@@ -3163,11 +3260,12 @@ impl DemoApp {
             for cmd in remote_cmds {
                 match cmd {
                     Command::SetParam { node, param, value } => {
-                        let v = value as f32;
+                        let v = (value as f32).clamp(0.0, 1.0);
+                        let rm = self.reduce_motion;
                         if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
                             for k in &mut u.knobs {
                                 if k.param == Some(param) {
-                                    k.value = v.clamp(0.0, 1.0);
+                                    k.glide_to(v, rm);
                                 }
                             }
                         }
@@ -3218,7 +3316,7 @@ impl DemoApp {
                 for u in &mut self.units {
                     for k in &mut u.knobs {
                         if k.param == Some(crate::engine::P_SYSTEM_GAIN) && (k.value - g.system_gain).abs() > 1e-4 {
-                            k.value = g.system_gain;
+                            k.glide_to(g.system_gain, self.reduce_motion);
                             k.sent = Some(g.system_gain);
                         }
                     }
@@ -3511,7 +3609,72 @@ impl DemoApp {
             self.sync_clap_slots(&adopted);
             return;
         }
+        // Preserve in-flight knob glides & cable draw-ins across the structural rebuild,
+        // and snapshot removed visible units/cables so they fade out instead of vanishing.
+        let mut knob_glides: Vec<(u32, Option<u32>, usize, f32, f32, f32)> = Vec::new();
+        for u in &self.units {
+            for (ki, k) in u.knobs.iter().enumerate() {
+                if k.glide_t < 1.0 {
+                    knob_glides.push((u.node_id, k.param, ki, k.display_value, k.glide_from, k.glide_t));
+                }
+            }
+        }
+        let mut cable_draws: Vec<(u32, f32)> = self.cables.iter()
+            .filter(|c| c.draw_in < 1.0)
+            .map(|c| (c.id, c.draw_in))
+            .collect();
+        if !self.reduce_motion {
+            for (ui, u) in self.units.iter().enumerate() {
+                if !adopted.nodes.iter().any(|n| n.id == u.node_id) && self.visible(ui) {
+                    if let Some(&r) = self.unit_rects.get(ui) {
+                        if r.width().is_finite() && r.height().is_finite() && r.is_positive() {
+                            self.fading_units.push(FadingUnit {
+                                rect: r,
+                                alpha: 1.0,
+                                agent: origin != AgentOrigin::Remote || self.agent_activity.node_alpha(u.node_id, now) > 0.01,
+                            });
+                        }
+                    }
+                }
+            }
+            for c in &self.cables {
+                if c.dying < 0.0
+                    && !adopted.edges.iter().any(|e| e.id == c.id)
+                    && self.visible(c.src)
+                    && self.visible(c.dst)
+                    && c.curve[0].x.is_finite()
+                    && c.curve[3].x.is_finite()
+                {
+                    let width = match c.kind { PortKind::Midi => 2.8, PortKind::Audio => 3.2 };
+                    self.fading_cables.push(FadingCable {
+                        curve: c.curve,
+                        color: self.cable_color(c),
+                        width,
+                        alpha: 1.0,
+                        agent: origin != AgentOrigin::Remote || self.agent_activity.edge_alpha(c.id, now) > 0.01,
+                    });
+                }
+            }
+        }
         self.build_rack(&adopted, &[]);
+        for (nid, param, ki, disp, from, gt) in knob_glides {
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
+                let pos = param.and_then(|p| u.knobs.iter().position(|k| k.param == Some(p))).unwrap_or(ki);
+                if let Some(k) = u.knobs.get_mut(pos) {
+                    k.display_value = disp;
+                    k.glide_from = from;
+                    k.glide_t = gt;
+                }
+            }
+        }
+        for c in &mut self.cables {
+            if let Some(&(_, d)) = cable_draws.iter().find(|&&(id, _)| id == c.id) {
+                c.draw_in = d;
+            } else if !self.reduce_motion && diff_edges.contains(&c.id) {
+                c.draw_in = 0.0;
+            }
+        }
+        cable_draws.clear();
         self.sync_clap_slots(&adopted);
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
@@ -4436,6 +4599,19 @@ impl DemoApp {
             }
             "system_audio" => {
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                let rm = self.reduce_motion;
+                let mut touched = Vec::new();
+                for u in &mut self.units {
+                    for k in &mut u.knobs {
+                        if k.param == Some(crate::engine::P_SYSTEM_GAIN) {
+                            k.glide_to(gain, rm);
+                            touched.push(u.node_id);
+                        }
+                    }
+                }
+                if !touched.is_empty() {
+                    self.agent_activity.record(origin, format!("System audio → {gain:.2}"), touched, now);
+                }
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetSystemAudio { gain });
                 }
@@ -4502,8 +4678,9 @@ impl DemoApp {
                 let channels = args.get("channels").and_then(|v| v.as_str()).map(parse_audio_channel);
                 if let Some(gain) = args.get("gain").and_then(|v| v.as_f64()) {
                     let g = gain.clamp(0.0, 1.0);
+                    let rm = self.reduce_motion;
                     if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_GAIN)) {
-                        k.value = g as f32;
+                        k.glide_to(g as f32, rm);
                     }
                     if let Some(bus) = &self.bus {
                         let _ = bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_GAIN, value: g });
@@ -9514,7 +9691,8 @@ impl DemoApp {
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
         let label: String = p.name.to_uppercase().chars().take(9).collect();
         u.knobs.push(Knob {
-            label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
+            label, value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
+            default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
             param: None, hidden: false, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
         });
         format!("pinned {} to the face", p.name)
@@ -10023,7 +10201,39 @@ impl DemoApp {
             }
         }
 
-        for u in &mut self.units { u.led *= (-dt / UNIT_LED_TAU).exp(); }
+        let rm = self.reduce_motion;
+        for u in &mut self.units {
+            u.led *= (-dt / UNIT_LED_TAU).exp();
+            for k in &mut u.knobs {
+                if k.glide_t < 1.0 {
+                    if rm {
+                        k.glide_t = 1.0;
+                        k.display_value = k.value;
+                    } else {
+                        k.glide_t = (k.glide_t + dt / KNOB_GLIDE_SECS).min(1.0);
+                        let e = 1.0 - (1.0 - k.glide_t).powi(3);
+                        k.display_value = if k.glide_t >= 1.0 {
+                            k.value
+                        } else {
+                            k.glide_from + (k.value - k.glide_from) * e
+                        };
+                    }
+                }
+            }
+        }
+        if rm {
+            self.fading_units.clear();
+            self.fading_cables.clear();
+        } else {
+            for f in &mut self.fading_units {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_units.retain(|f| f.alpha > 0.01);
+            for f in &mut self.fading_cables {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_cables.retain(|f| f.alpha > 0.01);
+        }
         for k in &mut self.key_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         for k in &mut self.note_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
@@ -10092,8 +10302,12 @@ impl DemoApp {
         for ci in 0..self.cables.len() {
             let ea = self.endpoint(&self.cables[ci], Dir::Out);
             let eb = self.endpoint(&self.cables[ci], Dir::In);
+            let rm = self.reduce_motion;
             let c = &mut self.cables[ci];
             c.age += dt;
+            if c.draw_in < 1.0 {
+                c.draw_in = if rm { 1.0 } else { (c.draw_in + dt / CABLE_DRAW_IN_SECS).min(1.0) };
+            }
             if c.dying >= 0.0 { c.dying += dt; }
             // Endpoints without a laid-out rect (a hidden rig's units, or a
             // rack rebuilt by a key handler AFTER this frame's layout) are
@@ -10497,7 +10711,7 @@ impl DemoApp {
         }
         if reset_knobs {
             for u in &mut self.units {
-                for k in &mut u.knobs { k.value = k.default; }
+                for k in &mut u.knobs { k.set_immediate(k.default); }
             }
         }
 
@@ -10661,7 +10875,7 @@ impl DemoApp {
             match self.drag {
                 Drag::Knob { unit, idx, start_val, press_y } => {
                     let v = (start_val + (press_y - s.y) * 0.006).clamp(0.0, 1.0);
-                    self.units[unit].knobs[idx].value = v;
+                    self.units[unit].knobs[idx].set_immediate(v);
                 }
                 Drag::Plug { id, end } => {
                     match self.live_cable(id) {
@@ -11066,7 +11280,7 @@ impl DemoApp {
     fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
         let Some(u) = self.units.get_mut(unit) else { return };
         let Some(k) = u.knobs.get_mut(knob) else { return };
-        k.value = v.clamp(0.0, 1.0);
+        k.set_immediate(v);
         if let (Some(p), Some(bus)) = (k.param, &self.bus) {
             if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
                 k.sent = Some(k.value);
@@ -11384,6 +11598,18 @@ impl DemoApp {
         self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
     }
 
+    fn draw_fading_units(&self, painter: &egui::Painter) {
+        let xf = &self.xf;
+        for f in &self.fading_units {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let sr = xf.rect(f.rect);
+            painter.rect_filled(sr, 2.0, alpha(CHASSIS, a));
+            let col = if f.agent { theme::AGENT_COLOR } else { BORDER };
+            painter.rect_stroke(sr, 2.0, Stroke::new(1.4, alpha(col, a)), egui::StrokeKind::Inside);
+        }
+    }
+
     fn draw_front(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
@@ -11392,6 +11618,7 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Single near-black family (§2.4): plates are the chassis color;
             // zones are drawn with 1px hairline rules that brighten on hover
             // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
@@ -11400,7 +11627,9 @@ impl DemoApp {
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -11461,6 +11690,7 @@ impl DemoApp {
                 self.draw_agent_badge(painter, badge, agent_t);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     /// Is the pointer over rack-local `rect` of `unit` (front face hover)?
@@ -11970,7 +12200,7 @@ impl DemoApp {
         let node = u.node_id;
         let v = if on { 1.0f32 } else { 0.0f32 };
         if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_MONITOR)) {
-            k.value = v;
+            k.set_immediate(v);
         }
         if let Some(bus) = &self.bus {
             if bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_MONITOR, value: v as f64 }) {
@@ -12067,7 +12297,7 @@ impl DemoApp {
 
         // Flat value arc: hairline track + solid accent arc + flat end dot
         // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, theme::ACCENT);
+        theme::value_arc(painter, |l| xf.p(l), c, r, k.display_value, theme::ACCENT);
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -12084,7 +12314,7 @@ impl DemoApp {
         // Pointer: center → 0.62r needle, 2px cream.
         let a0 = 135.0f32.to_radians();
         let sweep = 270.0f32.to_radians();
-        let ang = a0 + sweep * k.value;
+        let ang = a0 + sweep * k.display_value;
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
         painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
@@ -12232,7 +12462,7 @@ impl DemoApp {
             self.clear_knob_bindings(node_id, param, target);
         } else if reset_val {
             let k = &mut self.units[unit].knobs[idx];
-            k.value = k.default;
+            k.set_immediate(k.default);
         }
     }
 
@@ -12244,13 +12474,16 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -12331,6 +12564,7 @@ impl DemoApp {
                 self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     fn cable_alpha(c: &Cable, has_sel: bool, highlighted: bool) -> f32 {
@@ -12383,8 +12617,26 @@ impl DemoApp {
 
             let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
+            let draw_t = if c.draw_in >= 1.0 {
+                1.0
+            } else {
+                let t = c.draw_in.clamp(0.0, 1.0);
+                1.0 - (1.0 - t).powi(3)
+            };
+            if draw_t <= 0.01 { continue; }
             let mut col = self.cable_color(c);
             let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
+            let cable_shape = |w: f32, col: Color32| -> Shape {
+                if draw_t >= 0.999 {
+                    bezier_shape(curve, w, col)
+                } else {
+                    Shape::CubicBezier(
+                        egui::epaint::CubicBezierShape::from_points_stroke(
+                            curve, false, Color32::TRANSPARENT, Stroke::new(w, col),
+                        ).split_range(0.0..draw_t),
+                    )
+                }
+            };
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
@@ -12393,10 +12645,18 @@ impl DemoApp {
                 col = theme::ACCENT;
                 width += 0.5;
             } else if edge_at > 0.01 {
-                painter.add(bezier_shape(curve, width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
+                painter.add(cable_shape(width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
                 col = mix(col, theme::AGENT_COLOR, edge_at * 0.85);
             }
-            painter.add(bezier_shape(curve, width, alpha(col, a)));
+            painter.add(cable_shape(width, alpha(col, a)));
+        }
+        for f in &self.fading_cables {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let curve = [xf.p(f.curve[0].to_vec2()), xf.p(f.curve[1].to_vec2()),
+                         xf.p(f.curve[2].to_vec2()), xf.p(f.curve[3].to_vec2())];
+            let col = if f.agent { mix(f.color, theme::AGENT_COLOR, 0.7) } else { f.color };
+            painter.add(bezier_shape(curve, f.width, alpha(col, a)));
         }
     }
 
@@ -12456,6 +12716,12 @@ impl DemoApp {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, false, true);
             for end in [Dir::Out, Dir::In] {
+                let plug_a = if end == Dir::In && c.draw_in < 1.0 {
+                    a * ((c.draw_in - 0.55) / 0.45).clamp(0.0, 1.0)
+                } else {
+                    a
+                };
+                if plug_a <= 0.01 { continue; }
                 let over = if end == Dir::Out { c.over_a } else { c.over_b };
                 let base = if end == Dir::Out { c.prev_a } else { c.prev_b };
                 // Fan-in: stacked plugs on one jack spread slightly.
@@ -12480,10 +12746,10 @@ impl DemoApp {
                 let pr = match c.kind { PortKind::Audio => 8.0, PortKind::Midi => 1.0 };
                 let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
                 let stroke_col = if edge_at > 0.01 { mix(BORDER, theme::AGENT_COLOR, edge_at) } else { BORDER };
-                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, a));
-                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, a)), egui::StrokeKind::Inside);
+                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, plug_a));
+                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, plug_a)), egui::StrokeKind::Inside);
                 let band = Rect::from_min_size(body.min + Vec2::new(2.0, 3.0), Vec2::new(16.0, 3.5));
-                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), a));
+                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), plug_a));
             }
         }
     }
@@ -18413,6 +18679,96 @@ mod ui_polish_agent_tests {
         assert!(expanded_texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "expanded 4th chip missing: {expanded_texts:?}");
         assert_eq!(DemoApp::classify_tool_result("unknown tool: foo"), ToolChipState::Failed);
         assert_eq!(DemoApp::classify_tool_result("octave set to C4"), ToolChipState::Done);
+    }
+
+    #[test]
+    fn step3_knob_glides_visually_while_logical_value_updates_immediately() {
+        let (tx, mut drain) = crate::control::command_bus();
+        let mut app = DemoApp::new_with_sink(None);
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.reduce_motion = false;
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = app.units[synth_ui].node_id;
+        let (ki, param, start) = {
+            let (ki, k) = app.units[synth_ui].knobs.iter().enumerate().find(|(_, k)| k.param.is_some()).unwrap();
+            (ki, k.param.unwrap(), k.value)
+        };
+        let target = if start < 0.5 { 0.88 } else { 0.14 };
+
+        // Direct agent/remote param edit updates logical value (sound first) and glides display_value.
+        app.units[synth_ui].knobs[ki].glide_to(target, app.reduce_motion);
+        app.publish_patch();
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node: n, param: p, value } if *n == node && *p == param && (*value as f32 - target).abs() < 1e-5)),
+            "sound command must publish target immediately (rule 31): {cmds:?}"
+        );
+        let k = &app.units[synth_ui].knobs[ki];
+        assert!((k.value - target).abs() < 1e-6);
+        assert!((k.display_value - start).abs() < 1e-6);
+        assert!(k.glide_t == 0.0);
+
+        app.update(0.10); // halfway through 200ms glide
+        let mid = app.units[synth_ui].knobs[ki].display_value;
+        assert!(
+            (mid - start).abs() > 0.05 && (mid - target).abs() > 0.01,
+            "display_value must ease between {start} and {target}: {mid}"
+        );
+
+        app.update(0.15); // past 200ms -> exact convergence
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - target).abs() < 1e-6, "converged exactly: {}", k.display_value);
+
+        // reduce_motion disables glide and snaps immediately.
+        app.reduce_motion = true;
+        app.units[synth_ui].knobs[ki].glide_to(start, app.reduce_motion);
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - start).abs() < 1e-6);
+    }
+
+    #[test]
+    fn step3_cable_draw_in_unit_pulse_and_removed_unit_fade_respect_reduce_motion() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let node = app.units[0].node_id;
+
+        // 1. Cable draw-in starts at 0, advances smoothly, converges to 1.0.
+        app.cables[0].draw_in = 0.0;
+        app.update(0.14);
+        assert!(app.cables[0].draw_in > 0.3 && app.cables[0].draw_in < 0.7, "draw_in mid: {}", app.cables[0].draw_in);
+        app.update(0.20);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+
+        // 2. Unit pulse triggers once, fades after AGENT_PULSE_SECS, does not re-trigger on touch_node hold.
+        let t0 = app.ui_time;
+        app.agent_activity.trigger_node_pulse(node, t0);
+        app.update(0.19);
+        let p_mid = app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion);
+        assert!(p_mid > 0.5, "pulse active near midpoint: {p_mid}");
+        app.agent_activity.touch_node(node, app.ui_time); // hold while active must not reset pulse
+        app.update(0.25);
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+
+        // 3. Fading units & cables decay and clear cleanly; reduce_motion snaps them clear.
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.fading_cables.push(FadingCable { curve: [Pos2::ZERO; 4], color: theme::AUDIO_CREAM, width: 3.0, alpha: 1.0, agent: true });
+        app.update(0.12);
+        assert_eq!(app.fading_units.len(), 1);
+        assert!(app.fading_units[0].alpha < 0.6 && app.fading_units[0].alpha > 0.3);
+        app.update(0.20);
+        assert!(app.fading_units.is_empty());
+        assert!(app.fading_cables.is_empty());
+
+        app.reduce_motion = true;
+        app.cables[0].draw_in = 0.0;
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.update(0.01);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+        assert!(app.fading_units.is_empty());
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
     }
 }
 

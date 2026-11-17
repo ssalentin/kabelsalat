@@ -75,6 +75,7 @@ fn main() -> anyhow::Result<()> {
         "clap-scan-test" => host::run_clap_scan_test(),
         "catalog-install-test" => catalog::install_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-test" => ui::run_session_test(),
+        "session-load-bench" => ui::run_session_load_bench(&std::env::args().skip(2).collect::<Vec<_>>()),
         "agent-eval" => ui::run_agent_eval(),
         "jev-test" => assistant::run_jev_test(),
         "capture-test" => capture::run_test(),

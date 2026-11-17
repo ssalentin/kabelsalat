@@ -642,6 +642,12 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **A rack rebuild never scans plugins:** `build_rack` called
+    `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
+    load (and every agent edit) of a rack with an LV2 unit classified all
+    ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
+    `classify_lv2_units` reads the background scan's list and runs again when
+    the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
 
 ## Working on kabelsalat
 

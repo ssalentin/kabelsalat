@@ -2658,20 +2658,7 @@ impl DemoApp {
             self.units.push(make_unit(node));
         }
         self.fit_voice_tables(&old_clap_nodes);
-        // Classify LV2 instruments (hot-wire matrix sink columns). Rare
-        // structural op: the discovery scan runs only when LV2 nodes exist.
-        if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
-            let infos = lv2_discover();
-            for u in &mut self.units {
-                if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
-                    u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-                    if u.lv2_inst {
-                        u.sub = "lv2 synth".into();
-                        u.sub_g = None;
-                    }
-                }
-            }
-        }
+        self.classify_lv2_units();
         // Size the rect slots before adding cables (add_cable_id reads them to
         // seed the spring rest shape; layout() fills real rects on frame 1).
         self.unit_rects = vec![Rect::NOTHING; self.units.len()];
@@ -2724,6 +2711,22 @@ impl DemoApp {
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
         // Open/refresh input captures for every AudioIn node (structural only).
         self.sync_audio_in_captures();
+    }
+
+    /// Mark LV2 units that are instruments (matrix sink columns) from the
+    /// background plugin scan (rule 57); `poll_plugin_scan` calls this again
+    /// when a scan still running lands.
+    fn classify_lv2_units(&mut self) {
+        if !self.base_graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) { return; }
+        if !self.plugin_lists_ready() { return; }
+        for u in &mut self.units {
+            let Some(NodeKind::Lv2 { uri }) = self.base_graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) else { continue };
+            u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+            if u.lv2_inst {
+                u.sub = "lv2 synth".into();
+                u.sub_g = None;
+            }
+        }
     }
 
     /// Staged ~0.45s fade-in for an explicitly loaded rack (template,
@@ -8682,6 +8685,7 @@ impl DemoApp {
                 self.plugins_lv2 = lv2;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
+                self.classify_lv2_units();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.plugin_scan = None,
@@ -18832,6 +18836,30 @@ mod split_bpm_tests {
         assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
     }
 
+    /// Rule 118: a session load classifies LV2 units from the background
+    /// scan, never a scan of its own, and a scan that lands later fixes them.
+    #[test]
+    fn session_load_classifies_lv2_from_the_background_scan() {
+        let uri = "urn:test:organ";
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst };
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = vec![info(false)];
+        app.plugins_loaded = true;
+        let s = crate::session::Session::new("organ", DemoApp::build_lv2_instrument_graph(uri, "Organ"));
+        app.apply_session(&s).unwrap();
+        let node = s.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Lv2 { .. })).unwrap().id;
+        let organ = |app: &DemoApp| app.units.iter().position(|u| u.node_id == node).expect("organ unit");
+        assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((Vec::new(), vec![info(true)])).unwrap();
+        app.plugin_scan = Some(rx);
+        app.poll_plugin_scan();
+        let u = &app.units[organ(&app)];
+        assert!(u.lv2_inst, "a landing scan reclassifies the loaded rack");
+        assert_eq!(u.sub, "lv2 synth");
+    }
+
     #[test]
     fn sync_mirrors_remote_cc_maps() {
         let mut app = DemoApp::new_with_sink(None);
@@ -22230,4 +22258,31 @@ mod voice_host_tests {
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
+}
+
+/// Times loading saved session packages (args: package paths) on the
+/// offline-engine app with real plugins: the UI-thread `apply_session`, and
+/// the slowest of the frames that follow while plugins load.
+pub fn run_session_load_bench(paths: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "usage: kabelsalat session-load-bench <package.ksalat>...");
+    let mut rig = EvalRig::new(Assistant::new(), &(Vec::new(), crate::lv2::discover()))?;
+    rig.settle();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for round in 0..2 {
+        for p in paths {
+            let s = crate::session::Session::load(std::path::Path::new(p))?;
+            let t = std::time::Instant::now();
+            rig.app.apply_session(&s)?;
+            let apply = ms(t.elapsed());
+            let mut worst = 0.0f64;
+            for _ in 0..100 {
+                let f = std::time::Instant::now();
+                rig.frame();
+                worst = worst.max(ms(f.elapsed()));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("session-load-bench round {round} {p}: apply_session {apply:.1} ms, slowest next frame {worst:.1} ms");
+        }
+    }
+    Ok(())
 }

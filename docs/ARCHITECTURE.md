@@ -20,9 +20,20 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   allocation- and lock-free, structural ops apply at block boundaries.
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
-  plugin scan with a cache, Surge/Dexed patch helpers.
+  plugin scan with a cache, Surge/Dexed patch files.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
-  loader thread, `LILV_LOCK`.
+  MIDNAM programme names, loader thread, `LILV_LOCK`.
+- `sounds.rs` — one sound library per instrument a rig can hold. The
+  instrument (`Instrument`: a CLAP id or an LV2 URI) is the key and
+  `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
+  voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
+  MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
+  parameter (YANES). Each `Sound` carries its `Load` (plugin state, parameter
+  value, LV2 preset, programme change), and `load` sends each along its own
+  path. `Libraries` scans on a thread of its own and keeps the results;
+  `search` / `find` are the one search for every library, and the
+  `list_sounds` / `load_sound` tools of the app, MCP and the Jev plan all
+  answer from here.
 - `dsp.rs` — built-in processors (gain, pan, EQ, filter, limiter, saturation,
   delay, reverb, metronome).
 - `matrix.rs` — MIDI routing: sources × destinations, per-cell rules (channel,

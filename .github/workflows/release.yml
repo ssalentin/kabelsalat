@@ -128,7 +128,8 @@ jobs:
     container: ${{ matrix.image }}
     steps:
       # actions/checkout needs git for a real clone; makepkg reads its history.
-      - run: pacman -Syu --noconfirm --needed git
+      # pacman 7's Landlock sandbox cannot be applied inside a container.
+      - run: pacman --disable-sandbox -Syu --noconfirm --needed git
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -136,7 +137,7 @@ jobs:
         run: packaging/arch-makepkg.sh dist
       - name: Smoke test
         run: |
-          pacman -U --noconfirm dist/*.pkg.tar.*
+          pacman --disable-sandbox -U --noconfirm dist/*.pkg.tar.*
           kabelsalat --version
       - uses: actions/upload-artifact@v7
         with:

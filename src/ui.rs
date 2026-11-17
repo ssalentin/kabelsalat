@@ -8847,19 +8847,19 @@ impl DemoApp {
         job
     }
 
-    fn paint_busy_dots(ui: &mut egui::Ui, ui_time: f32) {
+    fn paint_busy_dots(ui: &mut egui::Ui, ui_time: f32, reduce_motion: bool) {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 14.0), egui::Sense::hover());
         let p = ui.painter();
         for i in 0..3 {
-            let wave = (ui_time * 5.0 - i as f32 * 0.95).sin() * 0.5 + 0.5;
+            let wave = if reduce_motion { 0.6 } else { (ui_time * 5.0 - i as f32 * 0.95).sin() * 0.5 + 0.5 };
             let a = 0.25 + 0.75 * wave;
             let x = rect.left() + 4.0 + i as f32 * 6.5;
             p.circle_filled(Pos2::new(x, rect.center().y), 2.2 + 0.5 * wave, theme::alpha(theme::AGENT_COLOR, a));
         }
     }
 
-    fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32) {
-        let pulse = 0.45 + 0.45 * ((ui_time * 5.5).sin() * 0.5 + 0.5);
+    fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32, reduce_motion: bool) {
+        let pulse = if reduce_motion { 0.8 } else { 0.45 + 0.45 * ((ui_time * 5.5).sin() * 0.5 + 0.5) };
         let (fill, border, glyph, glyph_color, txt_color, suffix) = match chip.state {
             ToolChipState::Running => (
                 theme::alpha(theme::AGENT_COLOR, 0.14),
@@ -8935,6 +8935,7 @@ impl DemoApp {
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
         let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
         let ui_time = self.ui_time;
+        let reduce_motion = self.reduce_motion;
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
@@ -8965,7 +8966,7 @@ impl DemoApp {
                         }
                         if self.assistant.busy {
                             ui.add_space(8.0);
-                            Self::paint_busy_dots(ui, ui_time);
+                            Self::paint_busy_dots(ui, ui_time, reduce_motion);
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(self.assistant.phase_label())
@@ -9020,8 +9021,8 @@ impl DemoApp {
                 let avail_w = ui.available_width();
                 let avail_h = ui.available_height().max(40.0);
                 let two_col = avail_w >= 860.0;
-                let side_w = if two_col { (avail_w * 0.30).clamp(260.0, 360.0) } else { 0.0 };
-                let main_w = if two_col { (avail_w - side_w - 25.0).max(340.0) } else { avail_w };
+                let side_w = if two_col { (avail_w * 0.30).round().clamp(260.0, 360.0) } else { 0.0 };
+                let main_w = if two_col { (avail_w - side_w - 25.0).round().max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
                 let confirm_label = self.pending_confirm.as_ref().map(|p| p.label.clone());
 
@@ -9166,7 +9167,7 @@ impl DemoApp {
                                                     total
                                                 };
                                                 for chip in &run.chips[..show_n] {
-                                                    Self::tool_chip_ui(ui, chip, ui_time);
+                                                    Self::tool_chip_ui(ui, chip, ui_time, reduce_motion);
                                                 }
                                                 if show_n < total {
                                                     let more = total - show_n;
@@ -9194,7 +9195,7 @@ impl DemoApp {
                             if assistant.busy {
                                 ui.horizontal(|ui| {
                                     ui.add_space(78.0);
-                                    Self::paint_busy_dots(ui, ui_time);
+                                    Self::paint_busy_dots(ui, ui_time, reduce_motion);
                                     ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_COLOR));
                                 });
                             } else if let Some(label) = &confirm_label {
@@ -13073,6 +13074,21 @@ fn drag_only(r: egui::Response) -> egui::Response {
 impl DemoApp {
     /// One app frame minus eframe plumbing (`ui()` delegates here) — tests
     /// drive the exact runtime path through a plain `egui::Context`.
+    fn has_active_animations(&self) -> bool {
+        if self.flipping || self.assistant.busy || self.agent_activity.has_active(self.ui_time) {
+            return true;
+        }
+        if self.reduce_motion {
+            return false;
+        }
+        self.load_fade < 1.0
+            || self.tap_flash_t > 0.0
+            || !self.fading_units.is_empty()
+            || !self.fading_cables.is_empty()
+            || self.units.iter().any(|u| u.knobs.iter().any(|k| k.glide_t < 1.0))
+            || self.cables.iter().any(|c| c.draw_in < 1.0 || c.dying >= 0.0 || c.age < 0.4)
+    }
+
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Subtitles first: a changed instrument name is laid out this frame.
@@ -13251,10 +13267,9 @@ impl DemoApp {
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
-        // Full frame rate while focused (the cables are the show); ~30 fps in
-        // the background — meters and cables still move, at a third of the
-        // UI thread's CPU when the user works in another window.
-        if ctx.input(|i| i.focused) || self.agent_activity.has_active(self.ui_time) {
+        // Full frame rate while focused (the cables are the show) or while an
+        // animation / agent run is active; ~30 fps when unfocused and idle.
+        if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -18769,6 +18784,65 @@ mod ui_polish_agent_tests {
         assert_eq!(app.cables[0].draw_in, 1.0);
         assert!(app.fading_units.is_empty());
         assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+    }
+
+    #[test]
+    fn step4_animations_request_repaint_while_active_and_stop_on_converge() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 800.0);
+
+        // Settle initial cable age / load_fade and egui's first-frame UI scale / layout passes.
+        for _ in 0..30 {
+            app.update(0.05);
+        }
+        let mut t = 1.0f64;
+        let mut run_unfocused = |app: &mut DemoApp| -> std::time::Duration {
+            t += 0.1;
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.focused = false;
+            raw.time = Some(t);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+        };
+        for _ in 0..8 {
+            let _ = run_unfocused(&mut app);
+        }
+
+        // Idle + unfocused -> 30 fps throttled (>= 33ms delay), no immediate repaint.
+        assert!(!app.has_active_animations());
+        let idle_delay = run_unfocused(&mut app);
+        assert!(
+            idle_delay >= std::time::Duration::from_millis(30),
+            "idle delay: {idle_delay:?}, focused={}, causes={:?}",
+            ctx.input(|i| i.focused),
+            ctx.repaint_causes()
+        );
+
+        // Trigger a knob glide -> immediate repaint requested even while unfocused.
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let start = app.units[synth_ui].knobs[0].value;
+        app.units[synth_ui].knobs[0].glide_to(if start < 0.5 { 0.85 } else { 0.15 }, false);
+        assert!(app.has_active_animations());
+        let active_delay = run_unfocused(&mut app);
+        assert_eq!(active_delay, std::time::Duration::ZERO, "active animation must request immediate repaint");
+
+        // Advance past glide duration -> converges and drops back to throttled repaint
+        // once the prior active frame's 1-pass egui outstanding repaint drains.
+        for _ in 0..10 {
+            app.update(0.05);
+        }
+        assert!(!app.has_active_animations());
+        let _ = run_unfocused(&mut app);
+        let settled_delay = run_unfocused(&mut app);
+        assert!(settled_delay >= std::time::Duration::from_millis(30), "settled delay: {settled_delay:?}");
     }
 }
 

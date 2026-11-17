@@ -624,6 +624,14 @@ Learned so far (2026-11-15, UI polish pass):
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
 
+116. **Every instrument column of the matrix has one route per cell:** an
+    LV2 instrument column drew every row from its MIDI cable, so one click
+    lit or cleared the whole column. LV2 cells are the enabled flags of their
+    `(source, node)` matrix rules, shown and toggled with the same keyboard
+    switch + hardware radio group as CLAP cells (`matrix_cell_on`,
+    `toggled_sources`). Test a new column kind with
+    `an_lv2_column_toggles_one_cell_like_a_clap_column`.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

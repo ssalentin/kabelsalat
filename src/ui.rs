@@ -28,7 +28,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, FromWorker};
+use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
@@ -876,6 +876,31 @@ struct PendingConfirm {
 /// Tools that change things the user cannot undo — they need confirm=true
 /// after asking (rule 23), and the in-app chat offers Confirm / Cancel.
 const CONFIRM_TOOLS: &[&str] = &["delete_rig", "install_instrument"];
+
+/// Tools whose edit the ENGINE applies: the rack only follows once the
+/// engine published it (rule 70).
+const ENGINE_EDIT_TOOLS: &[&str] = &["add_node", "connect", "disconnect", "remove_node"];
+/// How long a tool batch waits for the engine to publish one edit.
+const ENGINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One model step's tool calls, run in call order. An engine edit is a
+/// barrier: the next call runs only after the engine published the edit and
+/// the rack adopted it, so every later call — and the model's next step —
+/// sees what the calls before it really did.
+struct ToolBatch {
+    todo: VecDeque<ToolCall>,
+    results: Vec<String>,
+    waiting: Option<EngineEdit>,
+}
+
+/// An engine edit whose effect on the rack is still awaited.
+struct EngineEdit {
+    /// What the tool said when it sent the command.
+    result: String,
+    /// Node and cable ids before the edit.
+    before: (Vec<u32>, Vec<u32>),
+    deadline: std::time::Instant,
+}
 
 #[derive(Clone, Copy)]
 struct KnobMenu {
@@ -1767,6 +1792,8 @@ struct DemoApp {
     /// A destructive assistant action waiting for the chat's Confirm /
     /// Cancel buttons (#32).
     pending_confirm: Option<PendingConfirm>,
+    /// The assistant's tool calls in flight (one model step).
+    tool_batch: Option<ToolBatch>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Rig names of the session being applied (load path names its rigs).
@@ -2045,6 +2072,7 @@ impl DemoApp {
             master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
             pending_confirm: None,
+            tool_batch: None,
             rename_rig_dialog: None,
             session_rig_names: Vec::new(),
             load_as_rigs: None,
@@ -3374,31 +3402,68 @@ impl DemoApp {
         self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
+    /// Take in the worker's events and run its tool calls. The worker sends
+    /// one batch per model step and waits for all of its results.
     fn poll_assistant(&mut self) {
-        for ev in self.assistant.poll() {
-            match ev {
-                FromWorker::Text(t) => self
-                    .assistant
-                    .history
-                    .push(ChatLine { role: "assistant".into(), text: t }),
-                FromWorker::ToolCall { id, name, args } => {
-                    let result = self.run_assistant_tool(&name, &args);
-                    self.assistant.send_tool_result(id, result);
-                }
-                FromWorker::Models(list) => {
-                    // Chat-capable models only (embedding ids etc. stay out).
-                    let chat: Vec<String> = list.into_iter().filter(|m| m.contains("chat") || m.contains("reason") || m.contains("flash") || m.contains("v3") || m.contains("v4")).collect();
-                    if !chat.is_empty() { self.assistant.models = chat; }
-                }
-                FromWorker::Step(_) => {}
-                FromWorker::Done => self.assistant.busy = false,
-                FromWorker::Error(e) => {
-                    self.assistant.busy = false;
-                    self.assistant
-                        .history
-                        .push(ChatLine { role: "error".into(), text: e });
+        if let Some(batch) = self.assistant.poll().pop() {
+            self.tool_batch = Some(ToolBatch { todo: batch.into(), results: Vec::new(), waiting: None });
+        }
+        let Some(mut batch) = self.tool_batch.take() else { return };
+        if let Some(edit) = batch.waiting.take() {
+            match self.engine_edit_outcome(&edit) {
+                Some(result) => batch.results.push(result),
+                None => {
+                    batch.waiting = Some(edit);
+                    self.tool_batch = Some(batch);
+                    return;
                 }
             }
+        }
+        while let Some(call) = batch.todo.pop_front() {
+            let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
+            let before = engine_edit.then(|| self.rack_ids());
+            let result = self.run_assistant_tool(&call.name, &call.args);
+            let Some(before) = before else {
+                batch.results.push(result);
+                continue;
+            };
+            batch.waiting = Some(EngineEdit { result, before, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT });
+            self.tool_batch = Some(batch);
+            return;
+        }
+        self.assistant.send_tool_results(batch.results);
+    }
+
+    /// Node ids and living cable ids of the rack.
+    fn rack_ids(&self) -> (Vec<u32>, Vec<u32>) {
+        (
+            self.units.iter().map(|u| u.node_id).collect(),
+            self.cables.iter().filter(|c| c.dying < 0.0).map(|c| c.id).collect(),
+        )
+    }
+
+    /// What an engine edit did to the rack, appended to the tool's result:
+    /// the ids it created or removed, or that nothing changed. None = the
+    /// engine has not published it yet (and may still).
+    fn engine_edit_outcome(&self, edit: &EngineEdit) -> Option<String> {
+        let (nodes, cables) = self.rack_ids();
+        let (nodes_before, cables_before) = &edit.before;
+        let list = |what: &str, now: &[u32], then: &[u32]| {
+            let ids: Vec<String> = now.iter().filter(|id| !then.contains(id)).map(|id| id.to_string()).collect();
+            (!ids.is_empty()).then(|| format!("{what} {}", ids.join(", ")))
+        };
+        let changes: Vec<String> = [
+            list("new node id", &nodes, nodes_before),
+            list("removed node", nodes_before, &nodes),
+            list("new cable id", &cables, cables_before),
+            list("removed cable", cables_before, &cables),
+        ].into_iter().flatten().collect();
+        if !changes.is_empty() {
+            Some(format!("{} [applied: {}]", edit.result, changes.join("; ")))
+        } else if std::time::Instant::now() < edit.deadline {
+            None
+        } else {
+            Some(format!("{} — NOT applied: the engine changed nothing (check the ids with get_graph)", edit.result))
         }
     }
 
@@ -4883,10 +4948,15 @@ impl DemoApp {
                         v
                     })
                     .unwrap_or_default();
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::Disconnect(id));
-                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                // Unplug it in the rack too: a cable the rack still shows is
+                // re-sent to the engine every frame (publish_patch).
+                match self.live_cable(id) {
+                    Some(ci) => self.unplug_cable(ci, true),
+                    None => if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::Disconnect(id));
+                    },
                 }
+                if self.bus.is_some() && self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.record(origin, format!("Unplug cable {id}"), endpoints, now);
                 format!("disconnected cable {id}")
             }
@@ -6125,7 +6195,8 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
+                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
+                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
@@ -6137,9 +6208,7 @@ impl DemoApp {
     }
 
     fn switch_model(&mut self, m: &str) -> String {
-        self.assistant.set_model(m);
-        let line = format!("model switched to {m} (the conversation continues)");
-        line
+        self.assistant.set_model(m)
     }
 
     /// Every rig for the agent: index, name, device, units (node ids), mix.
@@ -7870,7 +7939,7 @@ impl DemoApp {
                                     let k = key_input.trim().to_string();
                                     match crate::assistant::save_key(&k) {
                                         Ok(()) => {
-                                            assistant.set_key(k);
+                                            assistant.key_saved();
                                             key_input.clear();
                                         }
                                         Err(e) => assistant.history.push(ChatLine {
@@ -8043,7 +8112,13 @@ impl DemoApp {
                                 ui.add_space(8.0);
                                 Self::stage_hairline(ui);
                                 ui.add_space(6.0);
-                                theme::section_label(ui, "Agent Activity");
+                                ui.horizontal(|ui| {
+                                    theme::section_label(ui, "Agent Activity");
+                                    // What the last request cost: model steps, model time, answering model.
+                                    if let Some(cost) = self.assistant.turn.summary() {
+                                        ui.add(egui::Label::new(egui::RichText::new(cost).size(10.5).color(theme::INK_2)).truncate());
+                                    }
+                                });
                                 ui.add_space(4.0);
                                 let act_h = ui.available_height().max(24.0);
                                 egui::ScrollArea::vertical()
@@ -12348,9 +12423,11 @@ struct EvalRun {
     verdict: Result<(), String>,
     /// Wall time from the request to the agent's last word.
     secs: f64,
-    /// The part of `secs` spent waiting for the model (sum of its steps).
-    model_secs: f64,
-    steps: usize,
+    /// Seconds each model step took; their sum is the part of `secs` spent
+    /// waiting for the model.
+    step_secs: Vec<f64>,
+    /// Tool calls the worker refused (unknown tool, arguments off-schema).
+    rejected: usize,
     tools: Vec<String>,
     routed: Vec<String>,
     reply: String,
@@ -12359,9 +12436,10 @@ struct EvalRun {
 /// Longest a turn may take before the run counts as failed.
 const EVAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
-fn run_eval_task(task: &EvalTask, model: &str, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
-    let mut rig = EvalRig::new(Assistant::with_model(model.to_string()), plugins)?;
-    anyhow::ensure!(rig.app.assistant.key_set, "no API key for the agent in {}", crate::assistant::config_path().display());
+fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
+    let mut rig = EvalRig::new(Assistant::with_model(model, jev), plugins)?;
+    let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
+    anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
     rig.load(task.start)?;
     rig.app.submit_chat(task.prompt.to_string());
     let sent = std::time::Instant::now();
@@ -12386,8 +12464,8 @@ fn run_eval_task(task: &EvalTask, model: &str, plugins: &EvalPlugins) -> anyhow:
     Ok(EvalRun {
         verdict,
         secs: turn.wall.unwrap_or_else(|| sent.elapsed()).as_secs_f64(),
-        model_secs: turn.steps.iter().map(|s| s.ms as f64 / 1000.0).sum(),
-        steps: turn.steps.len(),
+        step_secs: turn.steps.iter().map(|s| s.ms as f64 / 1000.0).collect(),
+        rejected: turn.steps.iter().map(|s| s.rejected).sum(),
         tools: turn.tools,
         routed,
         reply,
@@ -12406,15 +12484,18 @@ fn eval_median(mut xs: Vec<f64>) -> f64 {
     if n == 0 { 0.0 } else if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
 }
 
-/// `kabelsalat agent-eval [--model <id>] [--runs N] [--task <name>]`: run the
-/// real agent loop over the scripted tasks and report pass rate, model steps,
-/// tool calls, wall time and the model that answered.
+/// `kabelsalat agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev]`:
+/// run the real agent loop over the scripted tasks and report pass rate,
+/// model steps, tool calls, wall time and the models that answered.
+/// `--model` picks the acting chat model; `--no-jev` takes the decisions
+/// model out of the loop.
 pub fn run_agent_eval() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let model = opt("--model").unwrap_or_else(crate::assistant::load_model);
+    let model = opt("--model").unwrap_or_else(|| crate::llm::Route::configured(crate::llm::Role::Act).model);
     let runs: usize = opt("--runs").map(|r| r.parse()).transpose()?.unwrap_or(1).max(1);
     let only = opt("--task");
+    let jev = !args.iter().any(|a| a == "--no-jev");
     let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
     anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
         EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
@@ -12422,15 +12503,18 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
     if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
     let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
 
-    println!("agent-eval: model {model} · {} task(s) x {runs} run(s)", tasks.len());
+    let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
+    println!("agent-eval: decisions {front} · acting model {model} · {} task(s) x {runs} run(s)", tasks.len());
     let mut results: Vec<(&EvalTask, Vec<EvalRun>)> = Vec::new();
     for task in tasks {
         let mut task_runs = Vec::with_capacity(runs);
         for _ in 0..runs {
-            let run = run_eval_task(task, &model, &plugins)?;
+            let run = run_eval_task(task, &model, jev, &plugins)?;
             let verdict = match &run.verdict { Ok(()) => "PASS".to_string(), Err(why) => format!("FAIL ({why})") };
-            println!("  {:<18} {:>6.2} s ({:.2} s model)  {} step(s)  {} tool(s) [{}]  {}  {verdict}",
-                task.name, run.secs, run.model_secs, run.steps, run.tools.len(), run.tools.join(", "), run.routed.join("+"));
+            let steps: Vec<String> = run.step_secs.iter().map(|s| format!("{s:.1}")).collect();
+            let rejected = if run.rejected > 0 { format!("  {} call(s) refused", run.rejected) } else { String::new() };
+            println!("  {:<18} {:>6.2} s  {} step(s) [{} s]  {} tool(s) [{}]{rejected}  {}  {verdict}",
+                task.name, run.secs, steps.len(), steps.join(" "), run.tools.len(), run.tools.join(", "), run.routed.join("+"));
             if run.verdict.is_err() {
                 println!("    reply: {}", run.reply.replace('\n', " ").chars().take(240).collect::<String>());
             }
@@ -12451,14 +12535,14 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
         routed.dedup();
         println!("| {} | {ok}/{} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {} |",
             task.name, task_runs.len(), eval_median(secs.clone()), eval_percentile(&secs, 0.9),
-            eval_median(task_runs.iter().map(|r| r.model_secs).collect()),
-            eval_median(task_runs.iter().map(|r| r.steps as f64).collect()),
+            eval_median(task_runs.iter().map(|r| r.step_secs.iter().sum()).collect()),
+            eval_median(task_runs.iter().map(|r| r.step_secs.len() as f64).collect()),
             eval_median(task_runs.iter().map(|r| r.tools.len() as f64).collect()),
             routed.join(", "));
         passed += ok;
         total += task_runs.len();
         all_secs.extend(secs);
-        all_model += task_runs.iter().map(|r| r.model_secs).sum::<f64>();
+        all_model += task_runs.iter().flat_map(|r| &r.step_secs).sum::<f64>();
     }
     all_secs.sort_by(f64::total_cmp);
     let wall: f64 = all_secs.iter().sum();
@@ -13834,6 +13918,8 @@ mod rig_switch_tests {
         let (mut app, ctx) = two_rigs();
         app.assistant.key_set = true; // chat layout (history + input row)
         app.dock = DockView::Assistant;
+        // The activity header shows the last request's cost line too.
+        app.assistant.turn.steps.push(crate::assistant::StepStat { ms: 1200, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 });
         // A short window clamps the panel to its 150px minimum — the case
         // where a fixed input-row reserve overflowed the panel's top edge.
         for _ in 0..4 {
@@ -16180,6 +16266,138 @@ mod ui_polish_agent_tests {
         for ev in [vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]] {
             run_frame(app, ctx, size, ev);
         }
+    }
+
+    const WINDOW: Vec2 = Vec2 { x: 1600.0, y: 1000.0 };
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall { name: name.into(), args }
+    }
+
+    /// An app whose assistant worker is the test, on a real (voiceless)
+    /// engine: each frame renders one engine block.
+    struct Live {
+        app: DemoApp,
+        ctx: egui::Context,
+        engine: GraphEngine,
+        worker_tx: std::sync::mpsc::Sender<crate::assistant::FromWorker>,
+        worker_rx: std::sync::mpsc::Receiver<crate::assistant::ToWorker>,
+    }
+
+    impl Live {
+        fn new() -> Self {
+            let mut app = DemoApp::new_with_sink(None);
+            let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+            app.assistant = assistant;
+            let (bus, drain) = command_bus();
+            let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+            let published = Arc::new(Mutex::new(crate::engine::GraphPub { graph: app.base_graph.clone(), ..Default::default() }));
+            engine.set_graph_pub(published.clone());
+            engine.set_rig_snapshot(app.rig_snapshot.clone());
+            app.graph_pub = Some(published);
+            app.bus = Some(Arc::new(Mutex::new(bus)));
+            let mut live = Self { app, ctx: egui::Context::default(), engine, worker_tx, worker_rx };
+            for _ in 0..3 { live.frame(); }
+            live
+        }
+
+        fn frame(&mut self) {
+            run_frame(&mut self.app, &self.ctx, WINDOW, vec![]);
+            let mut buf = vec![0.0f32; 64 * 2];
+            self.engine.render(&mut buf, 2);
+        }
+
+        /// Send one model step's calls and run frames until the app answers.
+        fn run_batch(&mut self, calls: Vec<ToolCall>) -> Vec<String> {
+            self.worker_tx.send(crate::assistant::FromWorker::ToolCalls(calls)).unwrap();
+            for _ in 0..400 {
+                self.frame();
+                match self.worker_rx.try_recv() {
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results,
+                    Ok(_) => panic!("the app sent something other than tool results"),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            }
+            panic!("the app never answered the batch");
+        }
+    }
+
+    #[test]
+    fn a_tool_batch_runs_in_one_frame_and_is_answered_once() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("set_bpm", serde_json::json!({"bpm": 100})),
+            call("set_rig_mix", serde_json::json!({"rig": 0, "vol": 0.5})),
+            call("frobnicate", serde_json::json!({})),
+        ])).unwrap();
+        app.poll_assistant();
+        assert_eq!(app.bpm, 100.0);
+        assert_eq!(app.rig_mix[0].vol, 0.5);
+        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
+        assert_eq!(results.len(), 3, "one result per call, in call order");
+        assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
+        assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
+    }
+
+    #[test]
+    fn an_engine_edit_names_what_it_created_and_the_next_call_sees_it() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "dsp", "dsp": "reverb"})),
+            call("get_graph", serde_json::json!({})),
+        ]);
+        let id: u64 = results[0].split("new node id ").nth(1).and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .unwrap_or_else(|| panic!("add_node does not name the new node: {}", results[0]));
+        let graph: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+        let node = graph["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id)
+            .unwrap_or_else(|| panic!("get_graph in the same batch misses node {id}"));
+        assert_eq!(node["kind"]["Dsp"], "Reverb");
+
+        // Two cables in one step: each connect sees the cable before it.
+        let master = live.app.units[live.app.master_unit.unwrap()].node_id;
+        let results = live.run_batch(vec![
+            call("connect", serde_json::json!({"from_node": 1, "to_node": id})),
+            call("connect", serde_json::json!({"from_node": id, "to_node": master, "to_port": 1})),
+        ]);
+        assert!(results.iter().all(|r| r.contains("new cable id")), "{results:?}");
+        let wired = |from: u32, to: u32| live.app.cables.iter().any(|c| live.app.units[c.src].node_id == from && live.app.units[c.dst].node_id == to);
+        assert!(wired(1, id as u32) && wired(id as u32, master), "both cables exist");
+    }
+
+    #[test]
+    fn the_disconnect_tool_removes_the_cable_for_good() {
+        let mut live = Live::new();
+        let id = live.app.cables[0].id;
+        let results = live.run_batch(vec![call("disconnect", serde_json::json!({"id": id}))]);
+        assert!(results[0].contains(&format!("removed cable {id}")), "{}", results[0]);
+        for _ in 0..4 { live.frame(); }
+        let engine_has = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().any(|e| e.id == id);
+        assert!(!engine_has, "the engine still routes cable {id}");
+        assert!(live.app.live_cable(id).is_none(), "the rack still shows cable {id}");
+    }
+
+    #[test]
+    fn an_engine_edit_that_changes_nothing_says_so() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![call("remove_node", serde_json::json!({"node": 900}))]);
+        assert!(results[0].contains("NOT applied"), "{}", results[0]);
+    }
+
+    #[test]
+    fn the_activity_panel_shows_what_the_last_request_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let step = |ms| crate::assistant::StepStat { ms, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 };
+        app.assistant.turn.steps = vec![step(700), step(500)];
+        let mut texts = Vec::new();
+        for _ in 0..3 { texts = run_frame(&mut app, &ctx, WINDOW, vec![]); }
+        let (_, at) = texts.iter().find(|(t, _)| t == "2 steps · 1.2 s · claude-opus-5.5")
+            .unwrap_or_else(|| panic!("no cost line painted: {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()));
+        assert!(app.assistant_rect.contains_rect(*at), "cost line {at:?} outside the panel {:?}", app.assistant_rect);
     }
 
     #[test]

@@ -413,6 +413,10 @@ Learned so far (2026-11-15, UI polish pass):
 83. **Assistant dock uses `exact_size`, a 176 px floor, and a clipped single-row header:**
     `default_size` froze the panel at its first-frame height and `150` px left
     one transcript line clipped by the header (`bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950`).
+84. **Fade `AGENT` badges out before their dark text vanishes:**
+    painting `AGENT_COLOR_TEXT` (`#1C1C1C`) on `alpha(AGENT_COLOR, t)` over a
+    `#1C1C1C` plate leaves an empty dark rectangle for `t <= 0.38`
+    (`bug2_untouched_units_paint_no_agent_badge_rect`).
 
 ## Working on kabelsalat
 

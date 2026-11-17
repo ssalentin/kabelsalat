@@ -138,7 +138,8 @@ macro_rules! knobs {
 pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
     match kind {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
-        NodeKind::Clap { .. } => knobs!(ks("TONE", 0.35, None, &[]), ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
+        // The plugin's main controls join LEVEL on the face (`main_controls`).
+        NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
         NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),

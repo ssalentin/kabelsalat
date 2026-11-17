@@ -106,7 +106,7 @@ pub struct RemotePage {
 pub fn resolve(pages: &[RemotePage], params: &[Candidate]) -> MainControls {
     let ok = |c: &&Candidate| c.usable && c.max > c.min;
     let mut controls: Vec<MainControl> = Vec::new();
-    let mut push = |controls: &mut Vec<MainControl>, c: &Candidate, page: &str| {
+    let push = |controls: &mut Vec<MainControl>, c: &Candidate, page: &str| {
         if controls.len() < MAX_MAIN_CONTROLS && !controls.iter().any(|m| m.id == c.id) {
             controls.push(MainControl {
                 id: c.id,
@@ -143,11 +143,15 @@ pub fn resolve(pages: &[RemotePage], params: &[Candidate]) -> MainControls {
     MainControls { source, controls }
 }
 
-/// A name that names nothing: no letter or digit after its last colon
-/// ("M1: -", "-", "").
+/// What a name says after its index tag: the text after the last colon
+/// ("M1: Cutoff" → "Cutoff").
+fn untagged(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name).trim()
+}
+
+/// A name that names nothing: no letter or digit after its tag ("M1: -", "-", "").
 fn is_placeholder(name: &str) -> bool {
-    let tail = name.rsplit(':').next().unwrap_or(name);
-    !tail.chars().any(char::is_alphanumeric)
+    !untagged(name).chars().any(char::is_alphanumeric)
 }
 
 /// Long words a knob label shortens, as hardware panels print them.
@@ -162,11 +166,11 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
     ("WAVESHAPER", "SHAPER"),
 ];
 
-/// A knob label for a control name: upper case, at most `max_chars`. Long
-/// names keep their LAST words ("A Filter 1 Cutoff" → "1 CUTOFF"), which say
-/// what the control does; a single long word is cut.
+/// A knob label for a control name: upper case, without its index tag, at
+/// most `max_chars`. Long names keep their LAST words ("A Filter 1 Cutoff" →
+/// "1 CUTOFF"), which say what the control does; a single long word is cut.
 pub fn knob_label(name: &str, max_chars: usize) -> String {
-    let words: Vec<String> = name
+    let words: Vec<String> = untagged(name)
         .to_uppercase()
         .split_whitespace()
         .map(|w| ABBREVIATIONS.iter().find(|(long, _)| *long == w).map_or(w.to_string(), |(_, short)| short.to_string()))
@@ -309,6 +313,7 @@ mod tests {
         assert_eq!(knob_label("A Filter 1 Cutoff", 9), "1 CUTOFF");
         assert_eq!(knob_label("A Osc 1 Volume", 9), "OSC 1 VOL");
         assert_eq!(knob_label("M1: Cutoff", 9), "CUTOFF", "the macro index is not the name");
+        assert_eq!(knob_label("M2: Resonance", 9), "RESO");
         assert_eq!(knob_label("M5: Vibrato Rate", 9), "RATE");
         assert_eq!(knob_label("Macro 1", 9), "MACRO 1");
         assert_eq!(knob_label("Resonance", 9), "RESO");

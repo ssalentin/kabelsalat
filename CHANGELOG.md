@@ -7,6 +7,14 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+### Changed
+- **Themed dropdowns (`theme::Dropdown`):** replaced all three `egui::ComboBox`
+  selectors (MIDI matrix CC parameter picker, assistant header chat-model
+  picker, mixer audio output) with a Hurricane-styled dropdown matching the
+  knob context menu (`DARK_PANEL`, `1px HAIRLINE` border, 4 px radius, soft
+  shadow, `LIVE_TEAL` selection mark, scrollable list, Esc-to-close, truncated
+  labels with full hover tooltips).
+
 ### Fixed
 - **Crash with more synths than voices:** an undo (or a source/device edit)
   in a session with five or more CLAP units panicked. Units past the voice
@@ -16,6 +24,13 @@ releases may still change behaviour and session files.
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.
 
 ### Added
+- **Settings view (`,` / top bar `Settings`):** added a main-stage Settings view
+  for configuring per-role agent models (`agent_decide_model` with On/Off switch,
+  `agent_act_model`, `agent_perceive_model`) via themed dropdowns or custom model
+  IDs with effective route and key status, saving/removing DeepSeek and
+  OpenRouter API keys (masked, restarting the assistant worker immediately),
+  and editing preferences (`ui_reduce_motion`, count-in on/bars, audio output,
+  plus read-only detected UI scale).
 - **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in

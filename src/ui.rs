@@ -28,7 +28,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, FromWorker};
+use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
@@ -876,6 +876,31 @@ struct PendingConfirm {
 /// Tools that change things the user cannot undo — they need confirm=true
 /// after asking (rule 23), and the in-app chat offers Confirm / Cancel.
 const CONFIRM_TOOLS: &[&str] = &["delete_rig", "install_instrument"];
+
+/// Tools whose edit the ENGINE applies: the rack only follows once the
+/// engine published it (rule 70).
+const ENGINE_EDIT_TOOLS: &[&str] = &["add_node", "connect", "disconnect", "remove_node"];
+/// How long a tool batch waits for the engine to publish one edit.
+const ENGINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// One model step's tool calls, run in call order. An engine edit is a
+/// barrier: the next call runs only after the engine published the edit and
+/// the rack adopted it, so every later call — and the model's next step —
+/// sees what the calls before it really did.
+struct ToolBatch {
+    todo: VecDeque<ToolCall>,
+    results: Vec<String>,
+    waiting: Option<EngineEdit>,
+}
+
+/// An engine edit whose effect on the rack is still awaited.
+struct EngineEdit {
+    /// What the tool said when it sent the command.
+    result: String,
+    /// Node and cable ids before the edit.
+    before: (Vec<u32>, Vec<u32>),
+    deadline: std::time::Instant,
+}
 
 #[derive(Clone, Copy)]
 struct KnobMenu {
@@ -1768,6 +1793,8 @@ struct DemoApp {
     /// A destructive assistant action waiting for the chat's Confirm /
     /// Cancel buttons (#32).
     pending_confirm: Option<PendingConfirm>,
+    /// The assistant's tool calls in flight (one model step).
+    tool_batch: Option<ToolBatch>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Save-rig-preset modal: (rig index, preset name being edited).
@@ -1911,6 +1938,12 @@ struct DemoApp {
 
 impl DemoApp {
     fn new_with_sink(note_sink: Option<NoteSink>) -> Self {
+        Self::new_app(note_sink, !cfg!(test), Assistant::new())
+    }
+
+    /// `hw_scan` false = no hardware MIDI thread (tests and agent-eval never
+    /// scan the machine's devices, rule 48).
+    fn new_app(note_sink: Option<NoteSink>, hw_scan: bool, assistant: Assistant) -> Self {
         let mut app = Self {
             units: Vec::new(),
             cables: Vec::with_capacity(MAX_CABLES),
@@ -2046,6 +2079,7 @@ impl DemoApp {
             master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
             pending_confirm: None,
+            tool_batch: None,
             rename_rig_dialog: None,
             save_rig_dialog: None,
             load_rig_dialog: None,
@@ -2054,7 +2088,7 @@ impl DemoApp {
             load_as_rigs: None,
             had_kb_focus: true,
             rig_sources: [(true, true); VOICE_POOL],
-            assistant: Assistant::new(),
+            assistant,
             key_input: String::new(),
             chat_input: String::new(),
             octave: 4,
@@ -2121,7 +2155,7 @@ impl DemoApp {
 
         // Hardware MIDI: a thread connects what is plugged in now and keeps
         // rescanning, so devices plugged in later are picked up too.
-        if !cfg!(test) {
+        if hw_scan {
             spawn_hw_midi(app.hw_midi.clone(), app.hw_queue.clone(), app.hw_cc_queue.clone(), app.hw_direct.clone());
         }
 
@@ -2832,14 +2866,6 @@ impl DemoApp {
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
-        self.clap_voice_ids = voice_ids;
-        self.clap_slot_map = (0..mains.len()).map(Some).collect();
-        self._surge_main = mains;
-        self.surge_controllers = controllers;
-        self.sample_rate = sample_rate;
-        self.voice_tx = Some(voice_tx);
-        self.voice_retire_rx = Some(voice_retire_rx);
         self._audio_stream = Some(stream);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         if self.count_in_enabled || self.count_in_bars != 1 {
@@ -2848,12 +2874,37 @@ impl DemoApp {
                 bars: self.count_in_bars,
             });
         }
-        self.bus = Some(bus);
+        self.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, voice_retire_rx, bus);
         self.out_level = Some(level);
-        self.surge_status = "Surge loaded — play!".into();
         self.start_input_device_scan();
         self.start_audio_out_thread();
         self
+    }
+
+    /// Bind the app to an engine and its synth voice pool: everything the
+    /// agent's tools need (command bus, voice mains for load_sound/sessions).
+    /// The real app adds the audio stream and device threads on top;
+    /// agent-eval runs on exactly this with an offline engine.
+    fn attach_engine(
+        &mut self,
+        mains: Vec<ClapVoiceMain>,
+        controllers: Vec<VoiceController>,
+        voice_ids: Vec<u64>,
+        sample_rate: f64,
+        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
+        voice_retire_rx: rtrb::Consumer<ClapVoice>,
+        bus: Arc<Mutex<CommandBus>>,
+    ) {
+        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
+        self.clap_voice_ids = voice_ids;
+        self.clap_slot_map = (0..mains.len()).map(Some).collect();
+        self._surge_main = mains;
+        self.surge_controllers = controllers;
+        self.sample_rate = sample_rate;
+        self.voice_tx = Some(voice_tx);
+        self.voice_retire_rx = Some(voice_retire_rx);
+        self.bus = Some(bus);
+        self.surge_status = "Surge loaded — play!".into();
     }
 
     /// Output selection + other apps' streams: scan every second (sooner when
@@ -3361,30 +3412,68 @@ impl DemoApp {
         self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
+    /// Take in the worker's events and run its tool calls. The worker sends
+    /// one batch per model step and waits for all of its results.
     fn poll_assistant(&mut self) {
-        for ev in self.assistant.poll() {
-            match ev {
-                FromWorker::Text(t) => self
-                    .assistant
-                    .history
-                    .push(ChatLine { role: "assistant".into(), text: t }),
-                FromWorker::ToolCall { id, name, args } => {
-                    let result = self.run_assistant_tool(&name, &args);
-                    self.assistant.send_tool_result(id, result);
-                }
-                FromWorker::Models(list) => {
-                    // Chat-capable models only (embedding ids etc. stay out).
-                    let chat: Vec<String> = list.into_iter().filter(|m| m.contains("chat") || m.contains("reason") || m.contains("flash") || m.contains("v3") || m.contains("v4")).collect();
-                    if !chat.is_empty() { self.assistant.models = chat; }
-                }
-                FromWorker::Done => self.assistant.busy = false,
-                FromWorker::Error(e) => {
-                    self.assistant.busy = false;
-                    self.assistant
-                        .history
-                        .push(ChatLine { role: "error".into(), text: e });
+        if let Some(batch) = self.assistant.poll().pop() {
+            self.tool_batch = Some(ToolBatch { todo: batch.into(), results: Vec::new(), waiting: None });
+        }
+        let Some(mut batch) = self.tool_batch.take() else { return };
+        if let Some(edit) = batch.waiting.take() {
+            match self.engine_edit_outcome(&edit) {
+                Some(result) => batch.results.push(result),
+                None => {
+                    batch.waiting = Some(edit);
+                    self.tool_batch = Some(batch);
+                    return;
                 }
             }
+        }
+        while let Some(call) = batch.todo.pop_front() {
+            let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
+            let before = engine_edit.then(|| self.rack_ids());
+            let result = self.run_assistant_tool(&call.name, &call.args);
+            let Some(before) = before else {
+                batch.results.push(result);
+                continue;
+            };
+            batch.waiting = Some(EngineEdit { result, before, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT });
+            self.tool_batch = Some(batch);
+            return;
+        }
+        self.assistant.send_tool_results(batch.results);
+    }
+
+    /// Node ids and living cable ids of the rack.
+    fn rack_ids(&self) -> (Vec<u32>, Vec<u32>) {
+        (
+            self.units.iter().map(|u| u.node_id).collect(),
+            self.cables.iter().filter(|c| c.dying < 0.0).map(|c| c.id).collect(),
+        )
+    }
+
+    /// What an engine edit did to the rack, appended to the tool's result:
+    /// the ids it created or removed, or that nothing changed. None = the
+    /// engine has not published it yet (and may still).
+    fn engine_edit_outcome(&self, edit: &EngineEdit) -> Option<String> {
+        let (nodes, cables) = self.rack_ids();
+        let (nodes_before, cables_before) = &edit.before;
+        let list = |what: &str, now: &[u32], then: &[u32]| {
+            let ids: Vec<String> = now.iter().filter(|id| !then.contains(id)).map(|id| id.to_string()).collect();
+            (!ids.is_empty()).then(|| format!("{what} {}", ids.join(", ")))
+        };
+        let changes: Vec<String> = [
+            list("new node id", &nodes, nodes_before),
+            list("removed node", nodes_before, &nodes),
+            list("new cable id", &cables, cables_before),
+            list("removed cable", cables_before, &cables),
+        ].into_iter().flatten().collect();
+        if !changes.is_empty() {
+            Some(format!("{} [applied: {}]", edit.result, changes.join("; ")))
+        } else if std::time::Instant::now() < edit.deadline {
+            None
+        } else {
+            Some(format!("{} — NOT applied: the engine changed nothing (check the ids with get_graph)", edit.result))
         }
     }
 
@@ -4904,10 +4993,15 @@ impl DemoApp {
                         v
                     })
                     .unwrap_or_default();
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::Disconnect(id));
-                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                // Unplug it in the rack too: a cable the rack still shows is
+                // re-sent to the engine every frame (publish_patch).
+                match self.live_cable(id) {
+                    Some(ci) => self.unplug_cable(ci, true),
+                    None => if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::Disconnect(id));
+                    },
                 }
+                if self.bus.is_some() && self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.record(origin, format!("Unplug cable {id}"), endpoints, now);
                 format!("disconnected cable {id}")
             }
@@ -6146,7 +6240,8 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
+                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
+                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
@@ -6158,9 +6253,7 @@ impl DemoApp {
     }
 
     fn switch_model(&mut self, m: &str) -> String {
-        self.assistant.set_model(m);
-        let line = format!("model switched to {m} (the conversation continues)");
-        line
+        self.assistant.set_model(m)
     }
 
     /// Every rig for the agent: index, name, device, units (node ids), mix.
@@ -8286,7 +8379,7 @@ impl DemoApp {
                                     let k = key_input.trim().to_string();
                                     match crate::assistant::save_key(&k) {
                                         Ok(()) => {
-                                            assistant.set_key(k);
+                                            assistant.key_saved();
                                             key_input.clear();
                                         }
                                         Err(e) => assistant.history.push(ChatLine {
@@ -8459,7 +8552,13 @@ impl DemoApp {
                                 ui.add_space(8.0);
                                 Self::stage_hairline(ui);
                                 ui.add_space(6.0);
-                                theme::section_label(ui, "Agent Activity");
+                                ui.horizontal(|ui| {
+                                    theme::section_label(ui, "Agent Activity");
+                                    // What the last request cost: model steps, model time, answering model.
+                                    if let Some(cost) = self.assistant.turn.summary() {
+                                        ui.add(egui::Label::new(egui::RichText::new(cost).size(10.5).color(theme::INK_2)).truncate());
+                                    }
+                                });
                                 ui.add_space(4.0);
                                 let act_h = ui.available_height().max(24.0);
                                 egui::ScrollArea::vertical()
@@ -12488,6 +12587,417 @@ pub fn run_session_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// agent-eval: the real agent loop against a headless app + offline engine
+// ---------------------------------------------------------------------------
+
+/// The patch a task starts from.
+#[derive(Clone, Copy)]
+enum EvalStart {
+    /// What the app opens with: one rig, Keys → Surge A/B → Delay A/B → Master.
+    Demo,
+    /// Keys → Surge → Master.
+    OneRig,
+    /// Rig A: Keys → Surge → Delay → Master. Rig B: Keys → Surge → Master.
+    TwoRigs,
+}
+
+/// One scripted request and what the app must look like afterwards.
+struct EvalTask {
+    name: &'static str,
+    start: EvalStart,
+    prompt: &'static str,
+    /// Err says what is off. Gets the agent's final reply for questions.
+    check: fn(&mut DemoApp, &str) -> Result<(), String>,
+}
+
+fn eval_ensure(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(why()) }
+}
+
+fn eval_graph(app: &DemoApp) -> Graph {
+    app.shared_graph.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn eval_node(g: &Graph, rig: u8, what: &str, is: impl Fn(&NodeKind) -> bool) -> Result<u32, String> {
+    g.nodes.iter().find(|n| n.rig == rig && is(&n.kind)).map(|n| n.id)
+        .ok_or_else(|| format!("no {what} in rig {}", rig + 1))
+}
+
+fn eval_named(g: &Graph, name: &str) -> Result<u32, String> {
+    g.nodes.iter().find(|n| name_str(&n.name) == name).map(|n| n.id).ok_or_else(|| format!("no node named {name}"))
+}
+
+/// Does audio flow from `from` to `to` along the cables?
+fn eval_audio_path(g: &Graph, from: u32, to: u32) -> bool {
+    let mut seen = vec![from];
+    let mut i = 0;
+    while i < seen.len() {
+        let at = seen[i];
+        if at == to { return true; }
+        for e in g.edges.iter().filter(|e| e.kind == CPortKind::Audio && e.from.node == at) {
+            if !seen.contains(&e.to.node) { seen.push(e.to.node); }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn eval_midi_cable(g: &Graph, from: u32, port: u8, to: u32) -> bool {
+    g.edges.iter().any(|e| e.kind == CPortKind::Midi && e.from.node == from && e.from.port == port && e.to.node == to)
+}
+
+/// "category/name" (lower case) of the patch loaded into `rig`'s synth.
+fn eval_patch(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let multi = app.rig_count() > 1;
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| !multi || u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let name = app.patch_names.get(slot).cloned().flatten()
+        .ok_or_else(|| format!("rig {} still plays the init patch", rig + 1))?;
+    let category = app.surge_patches().iter().find(|p| p.name == name).map(|p| p.category.clone()).unwrap_or_default();
+    Ok(format!("{category}/{name}").to_lowercase())
+}
+
+/// The rig's one unit of `kind` (asking for "a delay" must not leave two).
+fn eval_one_dsp(g: &Graph, rig: u8, kind: &DspKind) -> Result<u32, String> {
+    let found: Vec<u32> = g.nodes.iter().filter(|n| n.rig == rig && n.kind == NodeKind::Dsp(kind.clone())).map(|n| n.id).collect();
+    match found[..] {
+        [one] => Ok(one),
+        _ => Err(format!("rig {} has {} {kind:?} unit(s), expected 1", rig + 1, found.len())),
+    }
+}
+
+/// One effect of `kind` that the rig's synth feeds and that reaches the master.
+fn eval_effect_in_chain(g: &Graph, rig: u8, kind: DspKind) -> Result<(), String> {
+    let fx = eval_one_dsp(g, rig, &kind)?;
+    let synth = eval_node(g, rig, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+    let master = eval_node(g, rig, "master", |k| matches!(k, NodeKind::MasterOut))?;
+    eval_ensure(eval_audio_path(g, synth, fx), || format!("the synth does not feed the {kind:?}"))?;
+    eval_ensure(eval_audio_path(g, fx, master), || format!("the {kind:?} does not reach the master"))
+}
+
+const EVAL_TASKS: &[EvalTask] = &[
+    EvalTask {
+        name: "tempo", start: EvalStart::Demo, prompt: "Set the tempo to 100 BPM.",
+        check: |app, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+    },
+    EvalTask {
+        name: "ask_tempo", start: EvalStart::Demo, prompt: "What tempo are we at?",
+        check: |app, reply| {
+            eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
+            eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
+        },
+    },
+    EvalTask {
+        name: "split_c4", start: EvalStart::Demo, prompt: "Split the keyboard at C4.",
+        check: |app, _| {
+            let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))
+        },
+    },
+    EvalTask {
+        name: "split_zones", start: EvalStart::Demo,
+        prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
+            let (a, b) = (eval_named(&g, "SURGE A")?, eval_named(&g, "SURGE B")?);
+            let split = g.node(keys).and_then(|n| n.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, a), || "LOW is not wired to Surge A".into())?;
+            eval_ensure(eval_midi_cable(&g, keys, 1, b), || "HIGH is not wired to Surge B".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 0, b), || "Surge B still plays the low half".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 1, a), || "Surge A also plays the high half".into())
+        },
+    },
+    EvalTask {
+        name: "warm_pad", start: EvalStart::OneRig, prompt: "Load a warm pad.",
+        check: |app, _| {
+            let patch = eval_patch(app, 0)?;
+            eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
+        },
+    },
+    EvalTask {
+        name: "add_reverb", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and wire it in.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 1 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 2 got a reverb too".into())
+        },
+    },
+    EvalTask {
+        name: "delay_after_synth", start: EvalStart::OneRig, prompt: "Put a delay after the synth.",
+        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
+    },
+    EvalTask {
+        name: "remove_delay", start: EvalStart::TwoRigs, prompt: "Remove the delay from rig 1.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
+            let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, synth, master), || "rig 1's synth no longer reaches its master".into())?;
+            let rig_b = g.nodes.iter().filter(|n| n.rig == 1).count();
+            eval_ensure(rig_b == 3, || format!("rig 2 changed ({rig_b} units)"))
+        },
+    },
+    EvalTask {
+        name: "metronome", start: EvalStart::OneRig, prompt: "Add a metronome and start it.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, metro, master), || "the metronome is not wired to the master".into())?;
+            eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
+        },
+    },
+    EvalTask {
+        name: "add_rig", start: EvalStart::Demo, prompt: "Add a new rig.",
+        check: |app, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
+    },
+    EvalTask {
+        name: "rig2_volume", start: EvalStart::TwoRigs, prompt: "Set rig 2 volume to 50 %.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "mute_rig1", start: EvalStart::TwoRigs, prompt: "Mute rig 1.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
+            eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
+        },
+    },
+    EvalTask {
+        name: "delete_rig2", start: EvalStart::TwoRigs, prompt: "Delete rig 2.",
+        check: |app, _| {
+            eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
+            let asked = app.pending_confirm.as_ref()
+                .is_some_and(|p| p.tool == "delete_rig" && p.args.get("rig").and_then(|r| r.as_u64()) == Some(1));
+            eval_ensure(asked, || format!("no Confirm prompt for rig 2 (pending: {:?})", app.pending_confirm.as_ref().map(|p| &p.label)))
+        },
+    },
+    EvalTask {
+        name: "bass_rig", start: EvalStart::OneRig, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        check: |app, _| {
+            eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
+            let patch = eval_patch(app, 1)?;
+            eval_ensure(patch.contains("bass"), || format!("the new rig plays {patch}, not a bass"))?;
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure(b < a, || format!("the new rig is not quieter (rig 1 {a:.2}, rig 2 {b:.2})"))
+        },
+    },
+];
+
+/// A headless app on an offline engine: no window, no audio device, no
+/// hardware scan. Frames run the app's real frame path; each frame renders
+/// one engine block so commands and publications flow as in the live app.
+struct EvalRig {
+    // Declared first so it drops first: it owns the voices' audio halves.
+    engine: GraphEngine,
+    app: DemoApp,
+    ctx: egui::Context,
+    buf: Vec<f32>,
+    started: std::time::Instant,
+}
+
+type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
+
+impl EvalRig {
+    fn new(assistant: Assistant, plugins: &EvalPlugins) -> anyhow::Result<Self> {
+        let sample_rate = 48000.0;
+        let mut voices = Vec::with_capacity(VOICE_POOL);
+        let mut mains = Vec::with_capacity(VOICE_POOL);
+        for i in 0..VOICE_POOL {
+            let (v, m) = ClapVoice::new(sample_rate)?;
+            voices.push((match i { 0 => 1, 1 => 4, _ => u32::MAX }, v));
+            mains.push(m);
+        }
+        let controllers = voices.iter().map(|(_, v)| v.controller()).collect();
+        let voice_ids = voices.iter().map(|(_, v)| v.voice_id()).collect();
+        let (bus, drain) = crate::control::command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
+        let mut app = DemoApp::new_app(None, false, assistant);
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
+        let (voice_tx, voice_rx) = rtrb::RingBuffer::new(16);
+        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(16);
+        engine.set_voice_channels(voice_rx, retire_tx);
+        engine.spawn_lv2_loader();
+        app.graph_pub = Some(graph_pub);
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        (app.plugins_clap, app.plugins_lv2) = plugins.clone();
+        app.plugins_loaded = true;
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
+    }
+
+    fn frame(&mut self) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.time = Some(self.started.elapsed().as_secs_f64());
+        let app = &mut self.app;
+        let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        self.engine.render(&mut self.buf, 2);
+    }
+
+    /// Enough frames for the engine to apply what the app sent and for the
+    /// app to adopt what the engine published.
+    fn settle(&mut self) {
+        for _ in 0..8 { self.frame(); }
+    }
+
+    fn load(&mut self, start: EvalStart) -> anyhow::Result<()> {
+        self.settle();
+        match start {
+            EvalStart::Demo => {}
+            EvalStart::OneRig => {
+                let s = crate::session::Session::new("One rig", crate::control::standard_rig_graph(true));
+                self.app.apply_session(&s)?;
+            }
+            EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+        }
+        self.settle();
+        Ok(())
+    }
+}
+
+/// What one run of one task cost and whether the app ended up right.
+struct EvalRun {
+    verdict: Result<(), String>,
+    /// Wall time from the request to the agent's last word.
+    secs: f64,
+    /// Seconds each model step took; their sum is the part of `secs` spent
+    /// waiting for the model.
+    step_secs: Vec<f64>,
+    /// Tool calls the worker refused (unknown tool, arguments off-schema).
+    rejected: usize,
+    tools: Vec<String>,
+    routed: Vec<String>,
+    reply: String,
+}
+
+/// Longest a turn may take before the run counts as failed.
+const EVAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
+    let mut rig = EvalRig::new(Assistant::with_model(model, jev), plugins)?;
+    let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
+    anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
+    rig.load(task.start)?;
+    rig.app.submit_chat(task.prompt.to_string());
+    let sent = std::time::Instant::now();
+    while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
+        rig.frame();
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let timed_out = rig.app.assistant.busy;
+    rig.settle();
+    let turn = rig.app.assistant.turn.clone();
+    let reply = rig.app.assistant.history.iter().rev().find(|l| l.role == "assistant").map(|l| l.text.clone()).unwrap_or_default();
+    let verdict = if timed_out {
+        Err(format!("no answer within {} s", EVAL_TURN_TIMEOUT.as_secs()))
+    } else if let Some(e) = turn.errors.first() {
+        Err(format!("agent error: {e}"))
+    } else {
+        (task.check)(&mut rig.app, &reply)
+    };
+    let mut routed: Vec<String> = turn.steps.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
+    routed.sort();
+    routed.dedup();
+    Ok(EvalRun {
+        verdict,
+        secs: turn.wall.unwrap_or_else(|| sent.elapsed()).as_secs_f64(),
+        step_secs: turn.steps.iter().map(|s| s.ms as f64 / 1000.0).collect(),
+        rejected: turn.steps.iter().map(|s| s.rejected).sum(),
+        tools: turn.tools,
+        routed,
+        reply,
+    })
+}
+
+/// Nearest-rank percentile of a non-empty sample (`q` in 0..=1).
+fn eval_percentile(sorted: &[f64], q: f64) -> f64 {
+    let rank = (q * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+fn eval_median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    if n == 0 { 0.0 } else if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
+}
+
+/// `kabelsalat agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev]`:
+/// run the real agent loop over the scripted tasks and report pass rate,
+/// model steps, tool calls, wall time and the models that answered.
+/// `--model` picks the acting chat model; `--no-jev` takes the decisions
+/// model out of the loop.
+pub fn run_agent_eval() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let model = opt("--model").unwrap_or_else(|| crate::llm::Route::configured(crate::llm::Role::Act).model);
+    let runs: usize = opt("--runs").map(|r| r.parse()).transpose()?.unwrap_or(1).max(1);
+    let only = opt("--task");
+    let jev = !args.iter().any(|a| a == "--no-jev");
+    let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
+    anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
+        EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
+    // The frame path asks the compositor for its scale otherwise.
+    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
+    let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
+
+    let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
+    println!("agent-eval: decisions {front} · acting model {model} · {} task(s) x {runs} run(s)", tasks.len());
+    let mut results: Vec<(&EvalTask, Vec<EvalRun>)> = Vec::new();
+    for task in tasks {
+        let mut task_runs = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let run = run_eval_task(task, &model, jev, &plugins)?;
+            let verdict = match &run.verdict { Ok(()) => "PASS".to_string(), Err(why) => format!("FAIL ({why})") };
+            let steps: Vec<String> = run.step_secs.iter().map(|s| format!("{s:.1}")).collect();
+            let rejected = if run.rejected > 0 { format!("  {} call(s) refused", run.rejected) } else { String::new() };
+            println!("  {:<18} {:>6.2} s  {} step(s) [{} s]  {} tool(s) [{}]{rejected}  {}  {verdict}",
+                task.name, run.secs, steps.len(), steps.join(" "), run.tools.len(), run.tools.join(", "), run.routed.join("+"));
+            if run.verdict.is_err() {
+                println!("    reply: {}", run.reply.replace('\n', " ").chars().take(240).collect::<String>());
+            }
+            task_runs.push(run);
+        }
+        results.push((task, task_runs));
+    }
+
+    println!("\n| task | pass | median s | p90 s | model s | steps | tools | answered by |");
+    println!("|---|---|---|---|---|---|---|---|");
+    let (mut passed, mut total, mut all_secs, mut all_model) = (0, 0, Vec::new(), 0.0);
+    for (task, task_runs) in &results {
+        let ok = task_runs.iter().filter(|r| r.verdict.is_ok()).count();
+        let mut secs: Vec<f64> = task_runs.iter().map(|r| r.secs).collect();
+        secs.sort_by(f64::total_cmp);
+        let mut routed: Vec<String> = task_runs.iter().flat_map(|r| r.routed.clone()).collect();
+        routed.sort();
+        routed.dedup();
+        println!("| {} | {ok}/{} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {} |",
+            task.name, task_runs.len(), eval_median(secs.clone()), eval_percentile(&secs, 0.9),
+            eval_median(task_runs.iter().map(|r| r.step_secs.iter().sum()).collect()),
+            eval_median(task_runs.iter().map(|r| r.step_secs.len() as f64).collect()),
+            eval_median(task_runs.iter().map(|r| r.tools.len() as f64).collect()),
+            routed.join(", "));
+        passed += ok;
+        total += task_runs.len();
+        all_secs.extend(secs);
+        all_model += task_runs.iter().flat_map(|r| &r.step_secs).sum::<f64>();
+    }
+    all_secs.sort_by(f64::total_cmp);
+    let wall: f64 = all_secs.iter().sum();
+    println!("\nagent-eval: {model} passed {passed}/{total} ({:.0} %) · wall time per request: median {:.2} s, p90 {:.2} s · total {wall:.1} s, {:.0} % of it waiting for the model",
+        100.0 * passed as f64 / total as f64, eval_median(all_secs.clone()), eval_percentile(&all_secs, 0.9), 100.0 * all_model / wall);
+    Ok(())
+}
+
 pub fn run_demo() -> anyhow::Result<()> {
     run_inner(None, false)
 }
@@ -13855,6 +14365,8 @@ mod rig_switch_tests {
         let (mut app, ctx) = two_rigs();
         app.assistant.key_set = true; // chat layout (history + input row)
         app.dock = DockView::Assistant;
+        // The activity header shows the last request's cost line too.
+        app.assistant.turn.steps.push(crate::assistant::StepStat { ms: 1200, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 });
         // A short window clamps the panel to its 150px minimum — the case
         // where a fixed input-row reserve overflowed the panel's top edge.
         for _ in 0..4 {
@@ -16293,6 +16805,138 @@ mod ui_polish_agent_tests {
         for ev in [vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]] {
             run_frame(app, ctx, size, ev);
         }
+    }
+
+    const WINDOW: Vec2 = Vec2 { x: 1600.0, y: 1000.0 };
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall { name: name.into(), args }
+    }
+
+    /// An app whose assistant worker is the test, on a real (voiceless)
+    /// engine: each frame renders one engine block.
+    struct Live {
+        app: DemoApp,
+        ctx: egui::Context,
+        engine: GraphEngine,
+        worker_tx: std::sync::mpsc::Sender<crate::assistant::FromWorker>,
+        worker_rx: std::sync::mpsc::Receiver<crate::assistant::ToWorker>,
+    }
+
+    impl Live {
+        fn new() -> Self {
+            let mut app = DemoApp::new_with_sink(None);
+            let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+            app.assistant = assistant;
+            let (bus, drain) = command_bus();
+            let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+            let published = Arc::new(Mutex::new(crate::engine::GraphPub { graph: app.base_graph.clone(), ..Default::default() }));
+            engine.set_graph_pub(published.clone());
+            engine.set_rig_snapshot(app.rig_snapshot.clone());
+            app.graph_pub = Some(published);
+            app.bus = Some(Arc::new(Mutex::new(bus)));
+            let mut live = Self { app, ctx: egui::Context::default(), engine, worker_tx, worker_rx };
+            for _ in 0..3 { live.frame(); }
+            live
+        }
+
+        fn frame(&mut self) {
+            run_frame(&mut self.app, &self.ctx, WINDOW, vec![]);
+            let mut buf = vec![0.0f32; 64 * 2];
+            self.engine.render(&mut buf, 2);
+        }
+
+        /// Send one model step's calls and run frames until the app answers.
+        fn run_batch(&mut self, calls: Vec<ToolCall>) -> Vec<String> {
+            self.worker_tx.send(crate::assistant::FromWorker::ToolCalls(calls)).unwrap();
+            for _ in 0..400 {
+                self.frame();
+                match self.worker_rx.try_recv() {
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results,
+                    Ok(_) => panic!("the app sent something other than tool results"),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            }
+            panic!("the app never answered the batch");
+        }
+    }
+
+    #[test]
+    fn a_tool_batch_runs_in_one_frame_and_is_answered_once() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("set_bpm", serde_json::json!({"bpm": 100})),
+            call("set_rig_mix", serde_json::json!({"rig": 0, "vol": 0.5})),
+            call("frobnicate", serde_json::json!({})),
+        ])).unwrap();
+        app.poll_assistant();
+        assert_eq!(app.bpm, 100.0);
+        assert_eq!(app.rig_mix[0].vol, 0.5);
+        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
+        assert_eq!(results.len(), 3, "one result per call, in call order");
+        assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
+        assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
+    }
+
+    #[test]
+    fn an_engine_edit_names_what_it_created_and_the_next_call_sees_it() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "dsp", "dsp": "reverb"})),
+            call("get_graph", serde_json::json!({})),
+        ]);
+        let id: u64 = results[0].split("new node id ").nth(1).and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .unwrap_or_else(|| panic!("add_node does not name the new node: {}", results[0]));
+        let graph: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+        let node = graph["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id)
+            .unwrap_or_else(|| panic!("get_graph in the same batch misses node {id}"));
+        assert_eq!(node["kind"]["Dsp"], "Reverb");
+
+        // Two cables in one step: each connect sees the cable before it.
+        let master = live.app.units[live.app.master_unit.unwrap()].node_id;
+        let results = live.run_batch(vec![
+            call("connect", serde_json::json!({"from_node": 1, "to_node": id})),
+            call("connect", serde_json::json!({"from_node": id, "to_node": master, "to_port": 1})),
+        ]);
+        assert!(results.iter().all(|r| r.contains("new cable id")), "{results:?}");
+        let wired = |from: u32, to: u32| live.app.cables.iter().any(|c| live.app.units[c.src].node_id == from && live.app.units[c.dst].node_id == to);
+        assert!(wired(1, id as u32) && wired(id as u32, master), "both cables exist");
+    }
+
+    #[test]
+    fn the_disconnect_tool_removes_the_cable_for_good() {
+        let mut live = Live::new();
+        let id = live.app.cables[0].id;
+        let results = live.run_batch(vec![call("disconnect", serde_json::json!({"id": id}))]);
+        assert!(results[0].contains(&format!("removed cable {id}")), "{}", results[0]);
+        for _ in 0..4 { live.frame(); }
+        let engine_has = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().any(|e| e.id == id);
+        assert!(!engine_has, "the engine still routes cable {id}");
+        assert!(live.app.live_cable(id).is_none(), "the rack still shows cable {id}");
+    }
+
+    #[test]
+    fn an_engine_edit_that_changes_nothing_says_so() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![call("remove_node", serde_json::json!({"node": 900}))]);
+        assert!(results[0].contains("NOT applied"), "{}", results[0]);
+    }
+
+    #[test]
+    fn the_activity_panel_shows_what_the_last_request_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let step = |ms| crate::assistant::StepStat { ms, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 };
+        app.assistant.turn.steps = vec![step(700), step(500)];
+        let mut texts = Vec::new();
+        for _ in 0..3 { texts = run_frame(&mut app, &ctx, WINDOW, vec![]); }
+        let (_, at) = texts.iter().find(|(t, _)| t == "2 steps · 1.2 s · claude-opus-5.5")
+            .unwrap_or_else(|| panic!("no cost line painted: {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()));
+        assert!(app.assistant_rect.contains_rect(*at), "cost line {at:?} outside the panel {:?}", app.assistant_rect);
     }
 
     #[test]

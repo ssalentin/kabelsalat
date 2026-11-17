@@ -358,6 +358,37 @@ Learned so far (2026-11-15, UI polish pass):
     delay (~8% of onset energy), so treating bit 12 as silent shrank the
     rotation margin until free-running unison phases flipped steps (#18).
     Verify step/gate masks against actual rendered energy before shipping.
+75. **Agent tool calls wait for the engine:** `add_node`, `connect`,
+    `disconnect` and `remove_node` are applied by the engine, so in
+    `poll_assistant` each is a barrier: the next call of the batch and the
+    result wait until the rack adopted the publication, and the result names
+    the ids it created or removed, or says `NOT applied`. A `get_graph` right
+    after `add_node` read the stale mirror and the model added the unit twice.
+    Add any new engine-applied tool to `ENGINE_EDIT_TOOLS`.
+76. **A tool that removes a cable unplugs it in the rack too:**
+    `publish_patch` re-sends every living rack cable each frame, so the
+    assistant's `disconnect` (a bus command only) was undone in the same
+    engine block while it reported success. Use `unplug_cable`
+    (`the_disconnect_tool_removes_the_cable_for_good`).
+77. **Model tool calls are checked against the tool table, never defaulted:**
+    the worker's `parse_tool_call` answers an unknown tool or off-schema
+    arguments with an `error:` result the model can correct; `exec_tool`
+    silently used defaults. A tool's `required` list must match the flow the
+    prompt describes: `delete_rig` required `confirm` although the Confirm
+    flow starts without it (`the_tool_table_fits_the_argument_checker`).
+78. **Know what a model id is before it becomes a default:**
+    `typesafe/jev-router` is a router to chat models (answers came from Kimi
+    and Haiku at 1.2–9.6 s per step); Jev itself (`~typesafe/jev-latest`) is
+    a DECISIONS model on `/api/alpha/decisions` (typed questions in,
+    probabilities out, about 0.2 s) and rejects chat completions. Read the
+    provider's model entry (`architecture.output_modalities`), then run
+    `kabelsalat jev-test` and `kabelsalat agent-eval` before changing a
+    route's default. Never claim an agent speedup that agent-eval did not
+    measure.
+79. **Build output never goes to tmpfs, also not as a copy:** a 690 MB debug
+    binary copied into a scratch directory under `/tmp` filled the volume
+    and every command lost its output. Keep binaries and eval output under
+    `~/.cache/ksalat-*` and strip copies.
 
 ## Working on kabelsalat
 
@@ -385,6 +416,13 @@ Learned so far (2026-11-15, UI polish pass):
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
   (`./target/debug/kabelsalat <name>`).
+- **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
+  [--task <name>] [--no-jev]` runs the in-app agent over 14 scripted requests
+  (headless app, offline engine, real Surge voices; it calls the configured
+  model APIs and costs a few cents) and `kabelsalat jev-test` shows Jev's
+  decisions. Surge logs to stdout: filter with
+  `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
+  `llm::fake::FakeTransport` (rule 37).
 - **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
   the running app); one-shot: `kabelsalat send '<json>'`.
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`

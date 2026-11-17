@@ -1,14 +1,15 @@
-//! Built-in assistant — DeepSeek-powered, bring-your-own-key.
+//! Built-in assistant: the agent loop behind the chat, bring-your-own-key.
 //!
-//! The assistant talks to the same control surface the UI uses: today the dev
-//! preview exposes status/note/octave tools; with the P1 control plane it gains
-//! full rewiring powers (and the MCP server exposes the identical toolset).
-//! The key is stored locally in ~/.config/kabelsalat/config.json (mode 0600)
-//! and is only ever sent to api.deepseek.com.
+//! The assistant talks to the same control surface the UI uses (the MCP
+//! server exposes the identical toolset). Which model answers is a route
+//! (`llm::Route`); keys are stored locally in ~/.config/kabelsalat/config.json
+//! (mode 0600) and only ever sent to the endpoint they belong to.
 
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 
 use serde_json::{json, Value};
+
+use crate::llm::{self, Endpoint, LlmError, Role, Route, Transport};
 
 pub fn config_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -18,24 +19,9 @@ pub fn config_path() -> std::path::PathBuf {
         .join("config.json")
 }
 
-pub fn load_key() -> Option<String> {
-    // Tests never read the user's key: every DemoApp would start a worker
-    // that calls the real API (and its threads aborted the test binary at exit).
-    if cfg!(test) { return None; }
-    let s = std::fs::read_to_string(config_path()).ok()?;
-    let v: Value = serde_json::from_str(&s).ok()?;
-    v.get("deepseek_api_key")?
-        .as_str()
-        .map(str::to_string)
-        .filter(|s| !s.is_empty())
-}
-
 pub fn save_key(key: &str) -> std::io::Result<()> {
     save_config_field("deepseek_api_key", key)
 }
-
-/// Default chat model when none is stored.
-pub const DEFAULT_MODEL: &str = "deepseek-chat";
 
 /// A string field of config.json (None in tests — they never read the
 /// user's config, rule 37).
@@ -45,15 +31,6 @@ pub fn load_config_str(field: &str) -> Option<String> {
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.get(field).and_then(|m| m.as_str()).map(str::to_string))
         .filter(|m| !m.is_empty())
-}
-
-/// The stored assistant model (config `assistant_model`), else the default.
-pub fn load_model() -> String {
-    std::fs::read_to_string(config_path()).ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("assistant_model").and_then(|m| m.as_str()).map(str::to_string))
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.into())
 }
 
 /// Merge key/value pairs into a config JSON file (mode 0600), preserving
@@ -120,85 +97,180 @@ pub struct ChatLine {
     pub text: String,
 }
 
-pub enum ToWorker {
-    User(String),
-    ToolResult { id: String, content: String },
+/// A tool call the model made. `args` passed the tool's schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolCall {
+    pub name: String,
+    pub args: Value,
 }
 
+pub enum ToWorker {
+    User(String),
+    /// One result per call of the last `FromWorker::ToolCalls`, in call order.
+    ToolResults(Vec<String>),
+}
+
+#[derive(Debug)]
 pub enum FromWorker {
-    /// Chat models the API key can use (GET /models), fetched once at start.
+    /// Chat models the DeepSeek key can use (GET /models), fetched once.
     Models(Vec<String>),
     Text(String),
-    ToolCall { id: String, name: String, args: Value },
+    /// Every valid tool call of one model step, in call order. The host runs
+    /// them and answers with one `ToWorker::ToolResults`.
+    ToolCalls(Vec<ToolCall>),
+    Step(StepStat),
     Done,
     Error(String),
 }
+
+/// One model round trip of a turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepStat {
+    /// Wall time, retries included.
+    pub ms: u64,
+    /// The model that answered (a router reports the one it picked).
+    pub model: String,
+    pub attempts: u32,
+    /// Tool calls of this step the worker sent back as errors (unknown
+    /// tool, arguments that do not fit the schema).
+    pub rejected: usize,
+}
+
+/// What the current (or last) turn cost: tallied as worker events pass
+/// through `Assistant::poll`, shown in the Agent Activity panel and read by
+/// agent-eval.
+#[derive(Clone, Debug, Default)]
+pub struct TurnStats {
+    pub started: Option<std::time::Instant>,
+    /// Wall time from the user's message to the worker's Done.
+    pub wall: Option<std::time::Duration>,
+    pub steps: Vec<StepStat>,
+    /// Tools that ran, in call order.
+    pub tools: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+impl TurnStats {
+    /// One line for the activity panel, e.g. "3 steps · 4.2 s · claude-opus-5.5".
+    /// None before the first model answer.
+    pub fn summary(&self) -> Option<String> {
+        let last = self.steps.last()?;
+        let n = self.steps.len();
+        let secs = self.steps.iter().map(|s| s.ms).sum::<u64>() as f64 / 1000.0;
+        let model = last.model.rsplit('/').next().unwrap_or(&last.model);
+        let retries: u32 = self.steps.iter().map(|s| s.attempts - 1).sum();
+        let retried = if retries > 0 { format!(" · {retries} retr{}", if retries == 1 { "y" } else { "ies" }) } else { String::new() };
+        Some(format!("{n} step{} · {secs:.1} s · {model}{retried}", if n == 1 { "" } else { "s" }))
+    }
+}
+
+type SharedRoute = std::sync::Arc<std::sync::Mutex<Route>>;
 
 pub struct Assistant {
     pub history: Vec<ChatLine>,
     pub busy: bool,
     pub key_set: bool,
-    /// Current chat model, read by the worker on every request — switching
-    /// takes effect with the next message, the conversation is kept.
-    model: std::sync::Arc<std::sync::Mutex<String>>,
-    /// Models offered by the API (filled by the worker; a sane default list
-    /// until it answers).
+    /// Where the acting model's requests go, read by the worker on every
+    /// request: switching takes effect with the next step, the conversation
+    /// is kept.
+    route: SharedRoute,
+    /// The decisions model asked first about every request; None = every
+    /// request goes straight to the acting model.
+    decide: Option<Route>,
+    /// Models offered in the picker.
     pub models: Vec<String>,
+    pub turn: TurnStats,
     tx: Option<Sender<ToWorker>>,
     rx: Option<Receiver<FromWorker>>,
 }
 
 impl Assistant {
     pub fn new() -> Self {
-        let key = load_key();
+        Self::on_route(Route::configured(Role::Act), true)
+    }
+
+    /// An assistant on `model` for this process only: nothing is written to
+    /// the user's config (agent-eval compares models without changing the
+    /// one the app uses). `decide` false = no decisions model in front.
+    pub fn with_model(model: &str, decide: bool) -> Self {
+        Self::on_route(Route::for_model(model), decide)
+    }
+
+    fn on_route(route: Route, decide: bool) -> Self {
+        // A decide model whose endpoint has no decisions API (or no key)
+        // switches the front off, e.g. agent_decide_model = "off".
+        let decide = Some(Route::configured(Role::Decide))
+            .filter(|r| decide && r.endpoint.spec().decisions_url.is_some() && r.endpoint.key().is_some());
+        let mut models: Vec<String> = Vec::new();
+        if Endpoint::OpenRouter.key().is_some() { models.push(llm::JEV_ROUTER.into()); }
+        models.extend([llm::DEEPSEEK_CHAT.to_string(), "deepseek-reasoner".to_string()]);
+        if !models.contains(&route.model) { models.insert(0, route.model.clone()); }
         let mut a = Self {
             history: Vec::new(),
             busy: false,
-            key_set: key.is_some(),
-            model: std::sync::Arc::new(std::sync::Mutex::new(load_model())),
-            models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
+            key_set: route.endpoint.key().is_some(),
+            route: std::sync::Arc::new(std::sync::Mutex::new(route)),
+            decide,
+            models,
+            turn: TurnStats::default(),
             tx: None,
             rx: None,
         };
-        if let Some(k) = key {
-            a.start_worker(k);
+        if a.key_set {
+            a.start_worker();
         }
         a
     }
 
-    pub fn set_key(&mut self, key: String) {
+    /// The user just stored a DeepSeek key. A route that still has no key
+    /// (an OpenRouter model without an OpenRouter key) falls back to it.
+    pub fn key_saved(&mut self) {
+        if let Ok(mut route) = self.route.lock() {
+            if route.endpoint.key().is_none() { *route = Route::for_model(llm::DEEPSEEK_CHAT); }
+        }
         self.key_set = true;
-        self.start_worker(key);
+        self.start_worker();
     }
 
-    fn start_worker(&mut self, key: String) {
+    fn start_worker(&mut self) {
         let (tx_in, rx_in) = channel::<ToWorker>();
         let (tx_out, rx_out) = channel::<FromWorker>();
         self.tx = Some(tx_in);
         self.rx = Some(rx_out);
-        let model = self.model.clone();
-        std::thread::spawn(move || worker(key, model, rx_in, tx_out));
+        let (route, decide) = (self.route.clone(), self.decide.clone());
+        // Its own thread: a slow model list must not delay the first request.
+        let list_tx = tx_out.clone();
+        std::thread::spawn(move || {
+            if let Some(ids) = fetch_deepseek_models() { let _ = list_tx.send(FromWorker::Models(ids)); }
+        });
+        std::thread::spawn(move || match llm::HttpTransport::new() {
+            Ok(transport) => worker(llm::Client::new(transport), route, decide, Endpoint::key, rx_in, tx_out),
+            Err(e) => { let _ = tx_out.send(FromWorker::Error(e)); }
+        });
     }
 
     pub fn model(&self) -> String {
-        self.model.lock().map(|m| m.clone()).unwrap_or_else(|_| DEFAULT_MODEL.into())
+        self.route.lock().map(|r| r.model.clone()).unwrap_or_default()
     }
 
-    /// Switch the chat model (persisted; applies from the next request).
-    pub fn set_model(&mut self, m: &str) {
-        if let Ok(mut cur) = self.model.lock() { *cur = m.to_string(); }
-        let _ = save_config_field("assistant_model", m);
+    /// Switch the acting model (persisted; applies from the next request).
+    /// Returns the line for the chat.
+    pub fn set_model(&mut self, m: &str) -> String {
+        let route = Route::for_model(m);
+        let spec = route.endpoint.spec();
+        let missing_key = route.endpoint.key().is_none() && !cfg!(test);
+        if let Ok(mut cur) = self.route.lock() { *cur = route; }
+        let _ = save_config_field(Role::Act.model_field(), m);
+        if !self.models.iter().any(|x| x == m) { self.models.push(m.to_string()); }
+        if missing_key {
+            format!("model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
+        } else {
+            format!("model switched to {m} (the conversation continues)")
+        }
     }
 
     pub fn send_user(&mut self, text: String) {
-        self.history.push(ChatLine {
-            role: "user".into(),
-            text: text.clone(),
-        });
-        self.busy = true;
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(ToWorker::User(text));
-        }
+        self.send_user_display(text.clone(), text);
     }
 
     /// Show `shown` in the transcript but send `sent` (e.g. with a state
@@ -206,29 +278,70 @@ impl Assistant {
     pub fn send_user_display(&mut self, shown: String, sent: String) {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
+        self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::User(sent));
         }
     }
 
-    pub fn send_tool_result(&mut self, id: String, content: String) {
+    /// Answer a batch from `poll`: one result per call, in call order.
+    pub fn send_tool_results(&mut self, results: Vec<String>) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(ToWorker::ToolResult { id, content });
+            let _ = tx.send(ToWorker::ToolResults(results));
         }
     }
 
-    pub fn poll(&mut self) -> Vec<FromWorker> {
-        let mut out = Vec::new();
-        if let Some(rx) = &self.rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(ev) => out.push(ev),
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+    /// Take in what the worker sent (replies, errors, stats land in
+    /// `history` / `turn`) and hand back the tool-call batches the host has
+    /// to run, one per model step.
+    pub fn poll(&mut self) -> Vec<Vec<ToolCall>> {
+        let mut batches = Vec::new();
+        while let Some(ev) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            match ev {
+                FromWorker::Text(t) => self.history.push(ChatLine { role: "assistant".into(), text: t }),
+                FromWorker::ToolCalls(batch) => {
+                    self.turn.tools.extend(batch.iter().map(|c| c.name.clone()));
+                    batches.push(batch);
+                }
+                FromWorker::Step(s) => self.turn.steps.push(s),
+                FromWorker::Models(list) => {
+                    for m in list.into_iter().filter(|m| is_chat_model(m)) {
+                        if !self.models.contains(&m) { self.models.push(m); }
+                    }
+                }
+                FromWorker::Done => {
+                    self.busy = false;
+                    self.turn.wall = self.turn.started.map(|t| t.elapsed());
+                }
+                FromWorker::Error(e) => {
+                    self.busy = false;
+                    self.turn.errors.push(e.clone());
+                    self.history.push(ChatLine { role: "error".into(), text: e });
                 }
             }
         }
-        out
+        batches
     }
+}
+
+#[cfg(test)]
+impl Assistant {
+    /// An assistant whose worker is the test: returns the worker's ends of
+    /// both channels.
+    pub fn with_test_worker() -> (Self, Sender<FromWorker>, Receiver<ToWorker>) {
+        let (tx_in, rx_in) = channel::<ToWorker>();
+        let (tx_out, rx_out) = channel::<FromWorker>();
+        let mut a = Self::with_model(llm::DEEPSEEK_CHAT, false);
+        a.key_set = true;
+        a.tx = Some(tx_in);
+        a.rx = Some(rx_out);
+        (a, tx_out, rx_in)
+    }
+}
+
+/// Chat-capable ids only (embedding models etc. stay out of the picker).
+fn is_chat_model(id: &str) -> bool {
+    ["chat", "reason", "flash", "v3", "v4"].iter().any(|k| id.contains(k))
 }
 
 fn system_prompt() -> String {
@@ -275,6 +388,13 @@ fn system_prompt() -> String {
      UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
      Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\
+     WORK IN FEW STEPS: every round trip costs the user seconds. Call several \
+     tools in ONE step when they do not need each other's results (e.g. every \
+     connect and disconnect of a rewiring). The [context: …] line already gives \
+     the node ids of the units in view, and add_node/connect report the ids they \
+     created — call get_graph only when you need cable ids or other rigs' nodes. \
+     A tool result that starts with \"error:\" or says \"NOT applied\" means \
+     nothing changed: correct the call, do not report success.\n\
      WHERE TO WORK: every user message starts with a [context: …] line naming \
      the rig in view and its units. When the user does not name a rig, act on \
      the rig IN VIEW (load_sound/add_node default to it) — never on another rig, \
@@ -560,8 +680,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"delete_rig",
-            "description":"Delete a rig and everything in it (units, cables, synth settings). DESTRUCTIVE: ask the user and only then call with confirm=true. The last rig cannot be deleted.",
-            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"confirm":{"type":"boolean"}},"required":["rig","confirm"]}
+            "description":"Delete a rig and everything in it (units, cables, synth settings). DESTRUCTIVE: call it without confirm first (the chat then shows Confirm / Cancel buttons); confirm=true only after the user said yes in text. The last rig cannot be deleted.",
+            "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"confirm":{"type":"boolean"}},"required":["rig"]}
         }},
         {"type":"function","function":{
             "name":"select_rig",
@@ -601,127 +721,525 @@ pub(crate) fn tools() -> Value {
     ])
 }
 
-fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(FromWorker::Error(format!("http client: {e}")));
-            return;
+/// Which chat models can the DeepSeek key use? (once, for the picker)
+fn fetch_deepseek_models() -> Option<Vec<String>> {
+    let key = Endpoint::DeepSeek.key()?;
+    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
+    let url = format!("{}/models", Endpoint::DeepSeek.spec().base_url);
+    let v: Value = client.get(url).bearer_auth(key).send().ok()?.json().ok()?;
+    let ids: Vec<String> = v.get("data")?.as_array()?
+        .iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
+/// Check one tool call from the model against the tool table and return
+/// the arguments the tool will read. Err is the message the model gets
+/// back, worded so it can correct the call — a call that does not fit is
+/// never run with defaults in place of what the model meant.
+fn parse_tool_call(tools: &Value, name: &str, raw_args: &str) -> Result<Value, String> {
+    let all = tools.as_array().map(Vec::as_slice).unwrap_or_default();
+    let tool_name = |t: &Value| t.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+    let Some(tool) = all.iter().find(|t| tool_name(t) == name) else {
+        // "set_tempo" finds set_bpm through its description.
+        let words: Vec<&str> = name.split('_').filter(|w| !["set", "get", "list", "add"].contains(w) && w.len() > 2).collect();
+        let about = |t: &Value| format!("{} {}", tool_name(t), t.pointer("/function/description").and_then(|d| d.as_str()).unwrap_or("")).to_lowercase();
+        let near: Vec<String> = all.iter().filter(|t| words.iter().any(|w| about(t).contains(&w.to_lowercase()))).map(tool_name).take(6).collect();
+        let hint = if near.is_empty() { "use only tools from the tool list".to_string() } else { format!("did you mean: {}?", near.join(", ")) };
+        return Err(format!("error: there is no tool '{name}' — {hint}"));
+    };
+    let raw = if raw_args.trim().is_empty() { "{}" } else { raw_args };
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|e| format!("error: the arguments of {name} are not valid JSON ({e}) — send one JSON object"))?;
+    let Value::Object(given) = parsed else {
+        return Err(format!("error: the arguments of {name} must be one JSON object, got {parsed}"));
+    };
+    let empty = serde_json::Map::new();
+    let props = tool.pointer("/function/parameters/properties").and_then(|p| p.as_object()).unwrap_or(&empty);
+    let takes = || if props.is_empty() { "no arguments".to_string() } else { props.keys().cloned().collect::<Vec<_>>().join(", ") };
+    let mut args = serde_json::Map::new();
+    for (key, value) in given {
+        let Some(schema) = props.get(&key) else {
+            return Err(format!("error: {name} has no argument '{key}' — it takes: {}", takes()));
+        };
+        if value.is_null() { continue; } // an explicit null means "not given"
+        let value = coerce_arg(schema, value).map_err(|why| format!("error: argument '{key}' of {name} {why}"))?;
+        args.insert(key, value);
+    }
+    let required = tool.pointer("/function/parameters/required").and_then(|r| r.as_array()).map(Vec::as_slice).unwrap_or_default();
+    if let Some(missing) = required.iter().filter_map(|r| r.as_str()).find(|r| !args.contains_key(*r)) {
+        return Err(format!("error: {name} needs the argument '{missing}' — it takes: {}", takes()));
+    }
+    Ok(Value::Object(args))
+}
+
+/// Fit one argument to its schema type. Models often send "60" or 60.0
+/// for an integer; those are read as meant, anything else is an error.
+fn coerce_arg(schema: &Value, value: Value) -> Result<Value, String> {
+    let types: Vec<&str> = match schema.get("type") {
+        Some(Value::String(t)) => vec![t.as_str()],
+        Some(Value::Array(ts)) => ts.iter().filter_map(|t| t.as_str()).collect(),
+        _ => return Ok(value),
+    };
+    let fitted = types.iter().find_map(|t| match (*t, &value) {
+        ("integer", Value::Number(n)) if n.is_i64() || n.is_u64() => Some(value.clone()),
+        ("integer", Value::Number(n)) => n.as_f64().filter(|f| f.fract() == 0.0).map(|f| json!(f as i64)),
+        ("integer", Value::String(s)) => s.trim().parse::<i64>().ok().map(|i| json!(i)),
+        ("number", Value::Number(_)) => Some(value.clone()),
+        ("number", Value::String(s)) => s.trim().parse::<f64>().ok().map(|f| json!(f)),
+        ("boolean", Value::Bool(_)) => Some(value.clone()),
+        ("boolean", Value::String(s)) => s.trim().parse::<bool>().ok().map(|b| json!(b)),
+        ("string", Value::String(_)) => Some(value.clone()),
+        ("string", Value::Number(_) | Value::Bool(_)) => Some(json!(value.to_string())),
+        _ => None,
+    });
+    let fitted = fitted.ok_or_else(|| format!("must be {}, got {value}", types.join(" or ")))?;
+    match schema.get("enum").and_then(|e| e.as_array()) {
+        Some(allowed) if !allowed.contains(&fitted) => {
+            Err(format!("must be one of {}, got {fitted}", Value::Array(allowed.clone())))
+        }
+        _ => Ok(fitted),
+    }
+}
+
+/// What the user's own words spell out, plus the rig Jev read from them.
+struct Facts<'a> {
+    request: &'a str,
+    /// 0-based index of the rig the request names.
+    rig: Option<u64>,
+}
+
+impl Facts<'_> {
+    fn numbers(&self) -> Vec<f64> {
+        self.request
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .filter_map(|t| t.trim_matches('.').parse::<f64>().ok())
+            .collect()
+    }
+
+    /// A tempo the request states, e.g. "100 BPM".
+    fn bpm(&self) -> Option<f64> {
+        self.numbers().into_iter().find(|n| (20.0..=300.0).contains(n))
+    }
+
+    /// A level the request states in percent, as 0..1.
+    fn percent(&self) -> Option<f64> {
+        let lower = self.request.to_lowercase();
+        let at = lower.find('%').or_else(|| lower.find("percent"))?;
+        let digits: String = lower[..at].trim_end().chars().rev().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let pct: f64 = digits.chars().rev().collect::<String>().parse().ok()?;
+        (0.0..=100.0).contains(&pct).then_some(pct / 100.0)
+    }
+
+    /// A note the request names ("C4", "f#3", "middle C") as a MIDI note.
+    fn note(&self) -> Option<u64> {
+        let lower = self.request.to_lowercase();
+        if lower.contains("middle c") { return Some(60); }
+        lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '#')).find_map(|word| {
+            let mut chars = word.chars();
+            let pitch = match chars.next()? { 'c' => 0, 'd' => 2, 'e' => 4, 'f' => 5, 'g' => 7, 'a' => 9, 'b' => 11, _ => return None };
+            let rest = chars.as_str();
+            let (accidental, octave) = match rest.strip_prefix('#') {
+                Some(o) => (1, o),
+                None => match rest.strip_prefix('b').filter(|o| !o.is_empty()) { Some(o) => (-1, o), None => (0, rest) },
+            };
+            let octave: i64 = octave.parse().ok().filter(|o| (0..=8).contains(o))?;
+            Some((12 * (octave + 1) + pitch + accidental) as u64)
+        })
+    }
+}
+
+/// A request Jev settles alone: one tool call, built from its typed answers
+/// and from what the request spells out. No chat model is involved.
+struct Shortcut {
+    key: &'static str,
+    /// The criterion Jev matches the request against.
+    means: &'static str,
+    /// The tool call; None when the request leaves open what the tool needs
+    /// (the chat model takes over).
+    call: fn(&Facts) -> Option<ToolCall>,
+    /// What the agent says afterwards, given the tool's result line.
+    say: fn(&Facts, &str) -> String,
+}
+
+/// The tool's own result line as a sentence.
+fn say_result(_: &Facts, result: &str) -> String {
+    let mut chars = result.chars();
+    let sentence: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
+    if sentence.ends_with(['.', '!', '?']) { sentence } else { format!("{sentence}.") }
+}
+
+/// A mixer change, naming the rig the way the app shows it (1-based). The
+/// tool's line is passed on instead when it reports a problem.
+fn say_mix(f: &Facts, result: &str, what: &str) -> String {
+    match f.rig {
+        Some(rig) if result.starts_with(&format!("rig {rig}:")) => format!("Rig {} {what}.", rig + 1),
+        _ => say_result(f, result),
+    }
+}
+
+fn shortcut_call(name: &str, args: Value) -> Option<ToolCall> {
+    Some(ToolCall { name: name.to_string(), args })
+}
+
+const SHORTCUTS: &[Shortcut] = &[
+    Shortcut { key: "tempo", means: "Set the tempo to a stated BPM value.", say: say_result,
+        call: |f| shortcut_call("set_bpm", json!({ "bpm": f.bpm()? })) },
+    Shortcut { key: "volume", means: "Set one named rig's volume to a stated percentage.",
+        say: |f, r| say_mix(f, r, &format!("is at {:.0} %", f.percent().unwrap_or(0.0) * 100.0)),
+        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "vol": f.percent()? })) },
+    Shortcut { key: "mute", means: "Mute one named rig.", say: |f, r| say_mix(f, r, "is muted"),
+        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "mute": true })) },
+    Shortcut { key: "unmute", means: "Unmute one named rig.", say: |f, r| say_mix(f, r, "is unmuted"),
+        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "mute": false })) },
+    Shortcut { key: "solo", means: "Solo one named rig.", say: |f, r| say_mix(f, r, "is soloed"),
+        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "solo": true })) },
+    Shortcut { key: "unsolo", means: "Take one named rig out of solo.", say: |f, r| say_mix(f, r, "is out of solo"),
+        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "solo": false })) },
+    Shortcut { key: "split", means: "Split the keyboard at a stated note, and nothing more (no word about which instrument plays which half).", say: say_result,
+        call: |f| shortcut_call("set_split", json!({ "point": f.note()? })) },
+    Shortcut { key: "unsplit", means: "Remove the keyboard split.", say: say_result,
+        call: |_| shortcut_call("set_split", json!({})) },
+    Shortcut { key: "add_rig", means: "Add a new, plain rig (no sound, name or level asked for).",
+        // The tool appends the rig list as JSON for a model to read.
+        say: |f, r| say_result(f, r.split(" {").next().unwrap_or(r).trim()),
+        call: |_| shortcut_call("add_rig", json!({})) },
+    Shortcut { key: "delete_rig", means: "Delete one named rig.",
+        say: |f, r| if r.contains("Confirm / Cancel") {
+            "That deletes the rig and everything in it. Confirm or cancel below.".to_string()
+        } else {
+            say_result(f, r)
+        },
+        call: |f| shortcut_call("delete_rig", json!({ "rig": f.rig? })) },
+    Shortcut { key: "play", means: "Start the transport / the metronome that is already there.", say: say_result,
+        call: |_| shortcut_call("transport_play", json!({})) },
+    Shortcut { key: "stop", means: "Stop the transport.", say: say_result,
+        call: |_| shortcut_call("transport_stop", json!({})) },
+    Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.", say: say_result,
+        call: |f| shortcut_call("select_rig", json!({ "rig": f.rig? })) },
+    Shortcut { key: "undo", means: "Undo the last change.", say: say_result,
+        call: |_| shortcut_call("undo", json!({})) },
+    Shortcut { key: "redo", means: "Redo the change that was just undone.", say: say_result,
+        call: |_| shortcut_call("redo", json!({})) },
+    Shortcut { key: "flip", means: "Flip the rack to its other side (front / back).", say: say_result,
+        call: |_| shortcut_call("flip_rack", json!({})) },
+];
+
+/// The answer that hands the request to the chat model.
+const NOT_A_SHORTCUT: &str = "other";
+/// Below this probability Jev's pick is not acted on.
+const DECISION_CONFIDENCE: f64 = 0.85;
+const MAX_RIGS: u64 = 8;
+
+/// The typed questions Jev answers about a request.
+fn decision_questions() -> Value {
+    let mut actions = serde_json::Map::new();
+    for s in SHORTCUTS { actions.insert(s.key.to_string(), json!(s.means)); }
+    actions.insert(NOT_A_SHORTCUT.to_string(), json!(
+        "Anything else: a question, a request for more than one change, adding, removing or wiring units, \
+         loading or choosing sounds, relative changes such as 'a bit quieter', or anything unclear."));
+    let mut rigs = serde_json::Map::new();
+    for n in 1..=MAX_RIGS { rigs.insert(format!("rig_{n}"), json!(format!("The request names rig {n} (by number, letter or name; see 'all rigs' in the context)."))); }
+    rigs.insert("none".to_string(), json!("The request names no rig."));
+    json!({
+        "action": { "type": "choice", "instructions": "Which ONE action does the user's request (the text after the [context] line) ask for?", "criteria": actions },
+        "rig": { "type": "choice", "instructions": "Which rig does the user's request name?", "criteria": rigs },
+    })
+}
+
+/// What Jev's answers settle: the shortcut and its tool call, when Jev is
+/// sure of one and the request spells out what the tool needs.
+fn settle(decision: &llm::Decisions, user: &str) -> Option<(&'static Shortcut, ToolCall)> {
+    let (action, p) = decision.choice("action")?;
+    if p < DECISION_CONFIDENCE { return None; }
+    let shortcut = SHORTCUTS.iter().find(|s| s.key == action)?;
+    let rig = decision.choice("rig")
+        .filter(|(_, p)| *p >= DECISION_CONFIDENCE)
+        .and_then(|(rig, _)| rig.strip_prefix("rig_")?.parse::<u64>().ok())
+        .map(|n| n - 1);
+    // The app prepends a [context: …] line; numbers and notes come from the
+    // user's own words only.
+    let request = match user.split_once('\n') {
+        Some((context, rest)) if context.starts_with("[context:") => rest,
+        _ => user,
+    };
+    let call = (shortcut.call)(&Facts { request, rig })?;
+    Some((shortcut, call))
+}
+
+/// `kabelsalat jev-test`: ask the configured decisions model about sample
+/// requests and print what it decides, how sure it is and how long it took.
+pub fn run_jev_test() -> anyhow::Result<()> {
+    let route = Route::configured(Role::Decide);
+    let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
+    let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
+    let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B]";
+    let samples = [
+        "Set the tempo to 100 BPM.", "What tempo are we at?", "Split the keyboard at C4.",
+        "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.", "Load a warm pad.",
+        "Add a reverb to rig 1 and wire it in.", "Put a delay after the synth.", "Remove the delay from rig 1.",
+        "Add a metronome and start it.", "Add a new rig.", "Set rig 2 volume to 50 %.", "Mute rig 1.", "Delete rig 2.",
+        "Make a new rig with a bass sound, quieter than rig 1.", "make rig B a bit quieter", "solo the second rig", "undo that", "stop",
+    ];
+    println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
+    for request in samples {
+        let user = format!("{context}\n{request}");
+        let d = client.decide(&route, &key, json!(user), decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let show = |q: &str| d.choice(q).map_or("refused".to_string(), |(c, p)| format!("{c} {p:.2}"));
+        let settled = settle(&d, &user).map_or("-> chat model".to_string(), |(_, call)| format!("-> {}({})", call.name, call.args));
+        println!("  {:>5} ms  action {:<16} rig {:<11} {settled:<44} {request}", d.ms, show("action"), show("rig"));
+    }
+    println!("jev-test: answered by {}", client.decide(&route, &key, json!("stop"), decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?.model);
+    Ok(())
+}
+
+/// Characters of conversation (beyond the system prompt and the tool
+/// table) a request may carry: about 15k tokens.
+const CONTEXT_BUDGET: usize = 60_000;
+/// What is left of a tool result once it is old. Results describe the patch
+/// at the time of the call; the model asks again when it needs fresh data.
+const OLD_RESULT_CHARS: usize = 300;
+
+/// The conversation as whole turns: a user message followed by the model's
+/// messages and their tool results. Trimming drops whole turns from the
+/// front, so a tool result can never lose the call it answers.
+#[derive(Default)]
+struct Conversation {
+    turns: std::collections::VecDeque<Vec<Value>>,
+}
+
+impl Conversation {
+    /// A new user message. Tool results of earlier turns are shortened.
+    fn start_turn(&mut self, user: String) {
+        for turn in &mut self.turns {
+            for msg in turn.iter_mut() { shorten_tool_result(msg); }
+        }
+        self.turns.push_back(vec![json!({ "role": "user", "content": user })]);
+    }
+
+    /// Append a message to the current turn.
+    fn push(&mut self, msg: Value) {
+        if let Some(turn) = self.turns.back_mut() { turn.push(msg); }
+    }
+
+    fn chars(&self) -> usize {
+        self.turns.iter().flatten().map(|m| m.to_string().len()).sum()
+    }
+
+    /// Bring the conversation under `budget`: drop the oldest turns first;
+    /// when only the current turn is left, shorten its tool results, oldest
+    /// first, sparing those of the latest step.
+    fn fit(&mut self, budget: usize) {
+        while self.chars() > budget && self.turns.len() > 1 {
+            self.turns.pop_front();
+        }
+        let Some(turn) = self.turns.back_mut() else { return };
+        let latest_step = turn.iter().rposition(|m| m["role"] == "assistant").unwrap_or(turn.len());
+        for i in 0..latest_step {
+            if turn.iter().map(|m| m.to_string().len()).sum::<usize>() <= budget { break; }
+            shorten_tool_result(&mut turn[i]);
+        }
+    }
+
+    /// The messages of a request: the system prompt, then every turn.
+    fn request(&self, system: &str) -> Vec<Value> {
+        std::iter::once(json!({ "role": "system", "content": system }))
+            .chain(self.turns.iter().flatten().cloned())
+            .collect()
+    }
+}
+
+fn shorten_tool_result(msg: &mut Value) {
+    if msg["role"] != "tool" { return; }
+    let Some(content) = msg["content"].as_str() else { return };
+    if content.chars().count() <= OLD_RESULT_CHARS { return; }
+    let head: String = content.chars().take(OLD_RESULT_CHARS).collect();
+    msg["content"] = json!(format!("{head}… [shortened — call the tool again for current data]"));
+}
+
+/// Model round trips one request may take. A patch built from scratch needs
+/// about a dozen; past this the model is going in circles.
+const MAX_STEPS: usize = 24;
+/// How long the app may take to run one step's tool calls.
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How a turn ended.
+enum TurnEnd {
+    Answered,
+    Failed(String),
+    /// The user wrote again while tool calls were out: that message is next.
+    Interrupted(String),
+    /// The app is gone.
+    Closed,
+}
+
+/// The agent loop: one turn per user message. A decisions model (Jev) is
+/// asked first and settles a simple request with one tool call; everything
+/// else goes to the acting chat model, whose tool calls travel to the app as
+/// ONE batch per model step and come back as one batch of results.
+fn worker<T: Transport>(
+    mut client: llm::Client<T>,
+    route: SharedRoute,
+    decide: Option<Route>,
+    key_for: fn(Endpoint) -> Option<String>,
+    rx: Receiver<ToWorker>,
+    tx: Sender<FromWorker>,
+) {
+    let system = system_prompt();
+    let tools = tools();
+    let mut convo = Conversation::default();
+    let mut next_user: Option<String> = None;
+    loop {
+        let user = match next_user.take() {
+            Some(text) => text,
+            None => match rx.recv() {
+                Ok(ToWorker::User(text)) => text,
+                Ok(ToWorker::ToolResults(_)) => continue, // results of a turn that already ended
+                Err(_) => break,
+            },
+        };
+        convo.start_turn(user.clone());
+        let end = match decide.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
+            Some(end) => end,
+            None => run_turn(&mut client, &route, key_for, &system, &tools, &mut convo, &rx, &tx),
+        };
+        match end {
+            TurnEnd::Answered => {}
+            TurnEnd::Failed(why) => { let _ = tx.send(FromWorker::Error(why)); }
+            TurnEnd::Interrupted(text) => { next_user = Some(text); continue; }
+            TurnEnd::Closed => break,
+        }
+        let _ = tx.send(FromWorker::Done);
+    }
+}
+
+/// Send one batch of tool calls to the app and take its results (one per
+/// call, in call order). Err = the turn ends here.
+fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWorker>) -> Result<Vec<String>, TurnEnd> {
+    let _ = tx.send(FromWorker::ToolCalls(batch));
+    match rx.recv_timeout(TOOL_TIMEOUT) {
+        Ok(ToWorker::ToolResults(ran)) => Ok(ran),
+        Ok(ToWorker::User(text)) => Err(TurnEnd::Interrupted(text)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(TurnEnd::Failed(format!("the app did not run the tool calls within {} s", TOOL_TIMEOUT.as_secs())))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(TurnEnd::Closed),
+    }
+}
+
+const NOT_RUN: &str = "no result: the call did not run";
+
+/// Ask Jev about the request. When it is sure of a shortcut, run that one
+/// tool call and answer; None = the acting model takes the turn (also when
+/// the decision itself fails: the fast path must never cost a request).
+fn decide_turn<T: Transport>(
+    client: &mut llm::Client<T>,
+    jev: &Route,
+    key_for: fn(Endpoint) -> Option<String>,
+    user: &str,
+    convo: &mut Conversation,
+    rx: &Receiver<ToWorker>,
+    tx: &Sender<FromWorker>,
+) -> Option<TurnEnd> {
+    let decision = client.decide(jev, &key_for(jev.endpoint)?, json!(user), decision_questions()).ok()?;
+    let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
+    let (shortcut, call) = settle(&decision, user)?;
+    // The conversation records the call like a chat model's, so a later
+    // chat step knows what was done.
+    convo.push(json!({ "role": "assistant", "content": null, "tool_calls": [{
+        "id": "jev", "type": "function", "function": { "name": call.name, "arguments": call.args.to_string() },
+    }]}));
+    let tool_message = |content: &str| json!({ "role": "tool", "tool_call_id": "jev", "content": content });
+    let result = match run_batch(vec![call.clone()], rx, tx) {
+        Ok(ran) => ran.into_iter().next().unwrap_or_else(|| NOT_RUN.to_string()),
+        Err(end) => {
+            convo.push(tool_message(NOT_RUN));
+            return Some(end);
         }
     };
-    // Which models can this key use? (once; the UI falls back to defaults)
-    if let Ok(r) = client.get("https://api.deepseek.com/models").bearer_auth(&key).send() {
-        if let Ok(v) = r.json::<Value>() {
-            let ids: Vec<String> = v.get("data").and_then(|d| d.as_array())
-                .map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect())
-                .unwrap_or_default();
-            if !ids.is_empty() { let _ = tx.send(FromWorker::Models(ids)); }
-        }
-    }
-    let mut msgs: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt() })];
-    loop {
-        let user_text = match rx.recv() {
-            Ok(ToWorker::User(t)) => t,
-            _ => break,
+    convo.push(tool_message(&result));
+    let request = user.split_once('\n').map_or(user, |(_, rest)| rest);
+    let rig = call.args.get("rig").and_then(|r| r.as_u64());
+    let text = (shortcut.say)(&Facts { request, rig }, &result);
+    convo.push(json!({ "role": "assistant", "content": text }));
+    let _ = tx.send(FromWorker::Text(text));
+    Some(TurnEnd::Answered)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_turn<T: Transport>(
+    client: &mut llm::Client<T>,
+    route: &SharedRoute,
+    key_for: fn(Endpoint) -> Option<String>,
+    system: &str,
+    tools: &Value,
+    convo: &mut Conversation,
+    rx: &Receiver<ToWorker>,
+    tx: &Sender<FromWorker>,
+) -> TurnEnd {
+    for _ in 0..MAX_STEPS {
+        convo.fit(CONTEXT_BUDGET);
+        let route = route.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT));
+        let spec = route.endpoint.spec();
+        let Some(key) = key_for(route.endpoint) else {
+            return TurnEnd::Failed(format!("no {} API key: add {} to {}", spec.label, spec.key_field, config_path().display()));
         };
-        msgs.push(json!({ "role": "user", "content": user_text }));
-        loop {
-            let body = json!({
-                "model": model.lock().map(|m| m.clone()).unwrap_or_else(|_| DEFAULT_MODEL.into()),
-                "messages": msgs,
-                "tools": tools(),
-                "tool_choice": "auto",
-            });
-            let resp = client
-                .post("https://api.deepseek.com/chat/completions")
-                .bearer_auth(&key)
-                .json(&body)
-                .send();
-            let resp = match resp {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(FromWorker::Error(format!("request failed: {e}")));
-                    let _ = tx.send(FromWorker::Done);
-                    break;
-                }
-            };
-            let status = resp.status();
-            let v: Value = match resp.json() {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = tx.send(FromWorker::Error(format!("bad response ({status}): {e}")));
-                    let _ = tx.send(FromWorker::Done);
-                    break;
-                }
-            };
-            if !status.is_success() {
-                let m = v
-                    .pointer("/error/message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("unknown API error");
-                let _ = tx.send(FromWorker::Error(format!("DeepSeek API: {m}")));
-                let _ = tx.send(FromWorker::Done);
-                break;
+        let body = json!({ "messages": convo.request(system), "tools": tools, "tool_choice": "auto" });
+        let done = match client.chat(&route, &key, body) {
+            Ok(done) => done,
+            Err(LlmError::Transient { message, .. }) => {
+                return TurnEnd::Failed(format!("{message} — gave up after {} attempts, try again in a moment", llm::MAX_ATTEMPTS));
             }
-            let msg = match v.pointer("/choices/0/message") {
-                Some(m) => m.clone(),
-                None => {
-                    let _ = tx.send(FromWorker::Error("empty response".into()));
-                    let _ = tx.send(FromWorker::Done);
-                    break;
-                }
-            };
-            let calls = msg.get("tool_calls").and_then(|c| c.as_array()).cloned();
-            if let Some(calls) = calls.filter(|c| !c.is_empty()) {
-                msgs.push(msg.clone());
-                let mut ok = true;
-                for tc in calls {
-                    let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                    let name = tc
-                        .pointer("/function/name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let args: Value = tc
-                        .pointer("/function/arguments")
-                        .and_then(|a| a.as_str())
-                        .and_then(|s| serde_json::from_str(s).ok())
-                        .unwrap_or(json!({}));
-                    let _ = tx.send(FromWorker::ToolCall {
-                        id: id.clone(),
-                        name,
-                        args,
-                    });
-                    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-                        Ok(ToWorker::ToolResult { id: rid, content }) => {
-                            msgs.push(json!({ "role": "tool", "tool_call_id": rid, "content": content }));
-                        }
-                        _ => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok {
-                    continue;
-                }
-                let _ = tx.send(FromWorker::Done);
-                break;
-            }
-            let text = msg
-                .get("content")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            msgs.push(json!({ "role": "assistant", "content": text }));
+            Err(e) => return TurnEnd::Failed(e.to_string()),
+        };
+        let step = |rejected| FromWorker::Step(StepStat { ms: done.ms, model: done.model.clone(), attempts: done.attempts, rejected });
+        let calls: Vec<Value> = done.message.get("tool_calls").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+        if calls.is_empty() {
+            let text = done.message.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+            convo.push(json!({ "role": "assistant", "content": text }));
+            let _ = tx.send(step(0));
             let _ = tx.send(FromWorker::Text(text));
-            let _ = tx.send(FromWorker::Done);
-            break;
+            return TurnEnd::Answered;
         }
+        convo.push(assistant_message(&done.message));
+
+        // Each call is answered either here (it does not fit its tool) or
+        // by the app (it ran).
+        let mut results: Vec<Option<String>> = Vec::with_capacity(calls.len());
+        let mut batch: Vec<ToolCall> = Vec::new();
+        for call in &calls {
+            let name = call.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
+            let raw = call.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("");
+            match parse_tool_call(tools, name, raw) {
+                Ok(args) => { batch.push(ToolCall { name: name.to_string(), args }); results.push(None); }
+                Err(why) => results.push(Some(why)),
+            }
+        }
+        let _ = tx.send(step(calls.len() - batch.len()));
+        // Every call gets its tool message, even when the turn stops here:
+        // an unanswered call makes the next request invalid.
+        let (ran, stopped) = match if batch.is_empty() { Ok(Vec::new()) } else { run_batch(batch, rx, tx) } {
+            Ok(ran) => (ran, None),
+            Err(end) => (Vec::new(), Some(end)),
+        };
+        let mut ran = ran.into_iter();
+        for (call, rejected) in calls.iter().zip(results) {
+            let content = rejected.or_else(|| ran.next()).unwrap_or_else(|| NOT_RUN.to_string());
+            convo.push(json!({ "role": "tool", "tool_call_id": call.get("id").cloned().unwrap_or(Value::Null), "content": content }));
+        }
+        if let Some(end) = stopped { return end; }
     }
+    TurnEnd::Failed(format!("stopped after {MAX_STEPS} model steps without a final answer — say \"continue\" to carry on"))
+}
+
+/// The model's tool-call message as it goes back into the conversation.
+/// Reasoning text is dropped: DeepSeek rejects `reasoning_content` in input.
+fn assistant_message(message: &Value) -> Value {
+    let mut msg = message.clone();
+    if let Some(o) = msg.as_object_mut() {
+        o.remove("reasoning_content");
+        o.remove("reasoning");
+    }
+    msg
 }
 
 #[cfg(test)]
@@ -745,5 +1263,415 @@ mod tests {
         save_count_in_to(&p, false, 9).unwrap();
         assert_eq!(load_count_in_from(&p), (false, crate::transport::MAX_COUNT_IN_BARS));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use crate::llm::fake::{answer, status, text, FakeTransport};
+    use crate::llm::Reply;
+
+    fn calls(calls: &[(&str, &str, &str)]) -> Result<Reply, String> {
+        let tool_calls: Vec<Value> = calls.iter()
+            .map(|(id, name, args)| json!({"id": id, "type": "function", "function": {"name": name, "arguments": args}}))
+            .collect();
+        answer("router/picked", json!({"role": "assistant", "content": null, "tool_calls": tool_calls}))
+    }
+
+    /// Run the worker to the end of `inbox` on scripted model replies.
+    /// Returns what it sent to the app and every request it made.
+    fn drive(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>) -> (Vec<FromWorker>, Vec<Value>) {
+        drive_with(replies, inbox, None, |_| Some("test-key".to_string()))
+    }
+
+    /// The same with Jev in front: the first reply of each turn is its decision.
+    fn drive_with_jev(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>) -> (Vec<FromWorker>, Vec<Value>) {
+        drive_with(replies, inbox, Some(Route::for_model(llm::JEV)), |_| Some("test-key".to_string()))
+    }
+
+    fn drive_with(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>, decide: Option<Route>, key_for: fn(Endpoint) -> Option<String>) -> (Vec<FromWorker>, Vec<Value>) {
+        let probe = FakeTransport::new(replies);
+        let (tx_in, rx_in) = channel();
+        let (tx_out, rx_out) = channel();
+        for msg in inbox { tx_in.send(msg).unwrap(); }
+        drop(tx_in);
+        let route = std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER)));
+        worker(llm::Client::new(probe.clone()), route, decide, key_for, rx_in, tx_out);
+        (rx_out.try_iter().collect(), probe.requests().into_iter().map(|(_, _, body)| body).collect())
+    }
+
+    fn user(text: &str) -> ToWorker { ToWorker::User(text.to_string()) }
+
+    fn results(r: &[&str]) -> ToWorker { ToWorker::ToolResults(r.iter().map(|s| s.to_string()).collect()) }
+
+    fn messages(request: &Value) -> &Vec<Value> { request["messages"].as_array().unwrap() }
+
+    /// Every tool message must directly follow the assistant message (or a
+    /// sibling tool message) whose tool_calls name its id.
+    fn assert_no_orphans(msgs: &[Value]) {
+        let mut open: Vec<String> = Vec::new();
+        for m in msgs {
+            match m["role"].as_str().unwrap() {
+                "assistant" => {
+                    assert!(open.is_empty(), "calls {open:?} were never answered");
+                    open = m["tool_calls"].as_array().map(|c| c.iter().map(|c| c["id"].as_str().unwrap().to_string()).collect()).unwrap_or_default();
+                }
+                "tool" => {
+                    let id = m["tool_call_id"].as_str().unwrap();
+                    let at = open.iter().position(|o| o == id).unwrap_or_else(|| panic!("tool message {id} has no call before it"));
+                    open.remove(at);
+                }
+                _ => assert!(open.is_empty(), "calls {open:?} were never answered"),
+            }
+        }
+        assert!(open.is_empty(), "calls {open:?} were never answered");
+    }
+
+    #[test]
+    fn a_model_step_sends_its_tool_calls_as_one_batch_and_takes_one_batch_back() {
+        let (events, requests) = drive(
+            vec![calls(&[("c1", "set_bpm", r#"{"bpm":100}"#), ("c2", "set_rig_mix", r#"{"rig":1,"vol":0.5}"#)]), text("router/picked", "Done.")],
+            vec![user("faster, and rig 2 quieter"), results(&["tempo set to 100 BPM", "rig 1: vol 0.50"])],
+        );
+        let batches: Vec<&Vec<ToolCall>> = events.iter().filter_map(|e| match e { FromWorker::ToolCalls(b) => Some(b), _ => None }).collect();
+        assert_eq!(batches.len(), 1, "one batch for the step");
+        assert_eq!(*batches[0], vec![
+            ToolCall { name: "set_bpm".into(), args: json!({"bpm": 100}) },
+            ToolCall { name: "set_rig_mix".into(), args: json!({"rig": 1, "vol": 0.5}) },
+        ]);
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(t), FromWorker::Done] if t == "Done."));
+        // The second request carries each result under its call's id.
+        let msgs = messages(&requests[1]);
+        assert_no_orphans(msgs);
+        let tool: Vec<(&str, &str)> = msgs.iter().filter(|m| m["role"] == "tool")
+            .map(|m| (m["tool_call_id"].as_str().unwrap(), m["content"].as_str().unwrap())).collect();
+        assert_eq!(tool, vec![("c1", "tempo set to 100 BPM"), ("c2", "rig 1: vol 0.50")]);
+    }
+
+    #[test]
+    fn a_call_that_does_not_fit_its_tool_gets_an_error_the_model_can_correct_and_never_runs() {
+        let (events, requests) = drive(
+            vec![
+                calls(&[
+                    ("c1", "set_bpm", r#"{"bpm": 100"#),
+                    ("c2", "set_tempo", r#"{"bpm":100}"#),
+                    ("c3", "set_rig_mix", r#"{"rig":0,"volume":0.5}"#),
+                    ("c4", "set_bpm", "{}"),
+                    ("c5", "set_split", r#"{"point":"60"}"#),
+                ]),
+                text("m", "ok"),
+            ],
+            vec![user("go"), results(&["split at C4"])],
+        );
+        let batch = events.iter().find_map(|e| match e { FromWorker::ToolCalls(b) => Some(b.clone()), _ => None }).unwrap();
+        assert_eq!(batch, vec![ToolCall { name: "set_split".into(), args: json!({"point": 60}) }], "only the valid call runs, \"60\" read as 60");
+        let rejected = events.iter().find_map(|e| match e { FromWorker::Step(s) => Some(s.rejected), _ => None }).unwrap();
+        assert_eq!(rejected, 4);
+        let msgs = messages(&requests[1]);
+        assert_no_orphans(msgs);
+        let said: Vec<&str> = msgs.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap()).collect();
+        assert!(said[0].starts_with("error:") && said[0].contains("not valid JSON"), "{}", said[0]);
+        assert!(said[1].contains("no tool 'set_tempo'") && said[1].contains("set_bpm"), "{}", said[1]);
+        assert!(said[2].contains("no argument 'volume'") && said[2].contains("vol"), "{}", said[2]);
+        assert!(said[3].contains("needs the argument 'bpm'"), "{}", said[3]);
+        assert_eq!(said[4], "split at C4");
+    }
+
+    #[test]
+    fn a_step_whose_calls_are_all_rejected_does_not_ask_the_app() {
+        let (events, requests) = drive(vec![calls(&[("c1", "frobnicate", "{}")]), text("m", "sorry")], vec![user("go")]);
+        assert!(!events.iter().any(|e| matches!(e, FromWorker::ToolCalls(_))));
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(_), FromWorker::Done]));
+        assert_no_orphans(messages(&requests[1]));
+    }
+
+    #[test]
+    fn arguments_are_read_as_meant_or_refused() {
+        let tools = tools();
+        let ok = |name: &str, raw: &str| parse_tool_call(&tools, name, raw).unwrap();
+        assert_eq!(ok("get_graph", ""), json!({}), "no arguments may come as an empty string");
+        assert_eq!(ok("set_rig_mix", r#"{"rig":1.0,"mute":"true","pan":"-0.5"}"#), json!({"rig": 1, "mute": true, "pan": -0.5}));
+        assert_eq!(ok("add_node", r#"{"kind":"dsp","dsp":"reverb","rig":null}"#), json!({"kind": "dsp", "dsp": "reverb"}), "null = not given");
+        assert_eq!(ok("delete_rig", r#"{"rig":1}"#), json!({"rig": 1}), "the Confirm flow starts without confirm");
+        let err = |name: &str, raw: &str| parse_tool_call(&tools, name, raw).unwrap_err();
+        assert!(err("set_rig_mix", r#"{"rig":"second"}"#).contains("must be integer"));
+        assert!(err("set_rig_mix", r#"{"rig":1.5}"#).contains("must be integer"));
+        assert!(err("connect", r#"{"from_node":1,"to_node":2,"kind":"usb"}"#).contains("must be one of"));
+        assert!(err("set_bpm", "[100]").contains("one JSON object"));
+    }
+
+    /// The argument checker reads the tool table: a required argument that
+    /// is not a property could never be given.
+    #[test]
+    fn the_tool_table_fits_the_argument_checker() {
+        for tool in tools().as_array().unwrap() {
+            let name = tool["function"]["name"].as_str().unwrap();
+            let props = tool["function"]["parameters"]["properties"].as_object().unwrap_or_else(|| panic!("{name}: no properties object"));
+            for (key, schema) in props {
+                let types: Vec<String> = match &schema["type"] {
+                    Value::String(t) => vec![t.clone()],
+                    Value::Array(ts) => ts.iter().map(|t| t.as_str().unwrap().to_string()).collect(),
+                    other => panic!("{name}.{key}: type {other}"),
+                };
+                assert!(types.iter().all(|t| ["integer", "number", "boolean", "string", "null"].contains(&t.as_str())), "{name}.{key}: {types:?}");
+            }
+            for required in tool["function"]["parameters"]["required"].as_array().into_iter().flatten() {
+                assert!(props.contains_key(required.as_str().unwrap()), "{name}: required {required} is not a property");
+            }
+        }
+    }
+
+    fn tool_step(id: &str, result: &str) -> Vec<Value> {
+        vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function", "function": {"name": "get_graph", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": id, "content": result}),
+        ]
+    }
+
+    #[test]
+    fn old_turns_keep_a_short_form_of_their_tool_results() {
+        let mut c = Conversation::default();
+        c.start_turn("first".into());
+        for m in tool_step("c1", &"g".repeat(5_000)) { c.push(m); }
+        c.push(json!({"role": "assistant", "content": "done"}));
+        let result = |msgs: &[Value]| msgs.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
+        assert_eq!(result(&c.request("sys")).len(), 5_000, "the current turn keeps its results whole");
+        c.start_turn("second".into());
+        let msgs = c.request("sys");
+        assert_no_orphans(&msgs);
+        let old = result(&msgs);
+        assert!(old.chars().count() < OLD_RESULT_CHARS + 80 && old.contains("shortened"), "{} chars", old.len());
+        assert_eq!(msgs.last().unwrap()["content"], "second");
+    }
+
+    #[test]
+    fn over_budget_the_oldest_turns_go_whole_and_the_current_turn_stays() {
+        let mut c = Conversation::default();
+        for i in 0..6 {
+            c.start_turn(format!("request {i}"));
+            for m in tool_step(&format!("c{i}"), "ok") { c.push(m); }
+            c.push(json!({"role": "assistant", "content": "x".repeat(900)}));
+        }
+        c.fit(2_500);
+        let msgs = c.request("sys");
+        assert_no_orphans(&msgs);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user", "a kept turn starts with its user message");
+        let users: Vec<&str> = msgs.iter().filter(|m| m["role"] == "user").map(|m| m["content"].as_str().unwrap()).collect();
+        assert_eq!(users, vec!["request 4", "request 5"]);
+        assert!(c.chars() <= 2_500);
+    }
+
+    #[test]
+    fn a_turn_too_big_on_its_own_shortens_its_earlier_results_not_the_latest() {
+        let mut c = Conversation::default();
+        c.start_turn("build it".into());
+        for i in 0..3 {
+            for m in tool_step(&format!("c{i}"), &format!("{i}").repeat(4_000)) { c.push(m); }
+        }
+        c.fit(6_000);
+        let msgs = c.request("sys");
+        assert_no_orphans(&msgs);
+        let tool: Vec<&str> = msgs.iter().filter(|m| m["role"] == "tool").map(|m| m["content"].as_str().unwrap()).collect();
+        assert!(tool[0].contains("shortened") && tool[1].contains("shortened"));
+        assert_eq!(tool[2].len(), 4_000, "the model still needs the results of its latest step");
+    }
+
+    #[test]
+    fn a_long_conversation_stays_within_the_budget() {
+        let turns = 12;
+        let big = "n".repeat(20_000);
+        let mut replies = Vec::new();
+        let mut inbox = Vec::new();
+        for i in 0..turns {
+            replies.push(calls(&[(&format!("c{i}"), "get_graph", "{}")]));
+            replies.push(text("m", &"a".repeat(6_000)));
+            inbox.push(user(&format!("request {i}")));
+            inbox.push(results(&[&big]));
+        }
+        let (_, requests) = drive(replies, inbox);
+        assert_eq!(requests.len(), turns * 2);
+        for r in &requests {
+            let msgs = messages(r);
+            assert_eq!(msgs[0]["role"], "system");
+            assert_no_orphans(&msgs[1..]);
+            let chars: usize = msgs[1..].iter().map(|m| m.to_string().len()).sum();
+            assert!(chars <= CONTEXT_BUDGET, "{chars} chars sent");
+        }
+        let last = messages(requests.last().unwrap());
+        assert!(!last.iter().any(|m| m["content"] == "request 0"), "the oldest turn is gone");
+        assert!(last.iter().any(|m| m["content"] == "request 11"));
+        assert_eq!(last.last().unwrap()["content"].as_str().unwrap().len(), 20_000, "the latest result is whole");
+    }
+
+    #[test]
+    fn a_turn_stops_at_the_step_cap_and_says_so() {
+        let replies = (0..MAX_STEPS).map(|i| calls(&[(&format!("c{i}"), "get_status", "{}")])).collect();
+        let mut inbox = vec![user("loop")];
+        inbox.extend((0..MAX_STEPS).map(|_| results(&["{}"])));
+        let (events, requests) = drive(replies, inbox);
+        assert_eq!(requests.len(), MAX_STEPS, "no request past the cap");
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Error(e), FromWorker::Done] if e.contains("24 model steps")), "{events:?}");
+    }
+
+    #[test]
+    fn a_busy_server_is_retried_inside_the_step() {
+        let (events, requests) = drive(vec![status(503, "{}"), text("m", "hello")], vec![user("hi")]);
+        assert_eq!(requests.len(), 2);
+        let step = events.iter().find_map(|e| match e { FromWorker::Step(s) => Some(s.clone()), _ => None }).unwrap();
+        assert_eq!((step.attempts, step.model.as_str()), (2, "m"));
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(t), FromWorker::Done] if t == "hello"));
+    }
+
+    #[test]
+    fn a_request_that_keeps_failing_ends_the_turn_and_the_next_turn_works() {
+        let down = || Err("connection refused".to_string());
+        let (events, requests) = drive(vec![down(), down(), down(), text("m", "back")], vec![user("one"), user("two")]);
+        assert!(matches!(&events[..2], [FromWorker::Error(e), FromWorker::Done] if e.contains("connection refused") && e.contains("3 attempts")), "{events:?}");
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(t), FromWorker::Done] if t == "back"));
+        let users: Vec<&str> = messages(&requests[3]).iter().filter(|m| m["role"] == "user").map(|m| m["content"].as_str().unwrap()).collect();
+        assert_eq!(users, vec!["one", "two"], "the failed request stays in the conversation");
+    }
+
+    #[test]
+    fn a_missing_key_is_named_and_nothing_is_sent() {
+        let (events, requests) = drive_with(vec![], vec![user("hi")], None, |_| None);
+        assert!(requests.is_empty());
+        assert!(matches!(&events[..], [FromWorker::Error(e), FromWorker::Done] if e.contains("OpenRouter") && e.contains("openrouter_api_key")), "{events:?}");
+    }
+
+    #[test]
+    fn a_new_message_while_tool_calls_are_out_leaves_no_call_unanswered() {
+        let (events, requests) = drive(
+            vec![calls(&[("c1", "get_graph", "{}")]), text("m", "second answer")],
+            vec![user("first"), user("second")],
+        );
+        let msgs = messages(&requests[1]);
+        assert_no_orphans(msgs);
+        assert!(msgs.iter().any(|m| m["role"] == "tool" && m["content"].as_str().unwrap().contains("did not run")));
+        assert_eq!(msgs.last().unwrap()["content"], "second");
+        assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(t), FromWorker::Done] if t == "second answer"));
+    }
+
+    #[test]
+    fn poll_keeps_transcript_and_cost_and_hands_out_tool_batches() {
+        let (mut a, worker_tx, _worker_rx) = Assistant::with_test_worker();
+        a.send_user_display("hi".into(), "[context] hi".into());
+        assert!(a.busy);
+        let step = |ms, model: &str| FromWorker::Step(StepStat { ms, model: model.into(), attempts: 1, rejected: 0 });
+        worker_tx.send(step(700, "anthropic/claude-opus-5.5")).unwrap();
+        worker_tx.send(FromWorker::ToolCalls(vec![ToolCall { name: "set_bpm".into(), args: json!({"bpm": 90}) }])).unwrap();
+        let batches = a.poll();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0][0].name, "set_bpm");
+        assert!(a.busy, "the turn is still running");
+        worker_tx.send(step(500, "anthropic/claude-opus-5.5")).unwrap();
+        worker_tx.send(FromWorker::Text("Tempo is 90.".into())).unwrap();
+        worker_tx.send(FromWorker::Done).unwrap();
+        assert!(a.poll().is_empty());
+        assert!(!a.busy);
+        assert_eq!(a.history.last().unwrap().text, "Tempo is 90.");
+        assert_eq!(a.turn.tools, vec!["set_bpm"]);
+        assert_eq!(a.turn.summary().as_deref(), Some("2 steps · 1.2 s · claude-opus-5.5"));
+        assert!(a.turn.wall.is_some());
+    }
+
+    /// Jev's answer to the two decision questions.
+    fn decision(action: &str, p: f64, rig: &str) -> Result<Reply, String> {
+        status(200, &json!({"model": "typesafe/jev-1.14", "answers": {
+            "action": {"type": "choice", "choice": action, "probabilities": {action: p}},
+            "rig": {"type": "choice", "choice": rig, "probabilities": {rig: 0.97}},
+        }}).to_string())
+    }
+
+    fn asked(context_free: &str) -> ToWorker {
+        user(&format!("[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0) · all rigs: 1 · Rig A, 2 · Rig B]\n{context_free}"))
+    }
+
+    fn said(events: &[FromWorker]) -> Vec<&str> {
+        events.iter().filter_map(|e| match e { FromWorker::Text(t) => Some(t.as_str()), _ => None }).collect()
+    }
+
+    fn ran(events: &[FromWorker]) -> Vec<ToolCall> {
+        events.iter().filter_map(|e| match e { FromWorker::ToolCalls(b) => Some(b.clone()), _ => None }).flatten().collect()
+    }
+
+    #[test]
+    fn jev_settles_a_simple_request_with_one_decision_and_no_chat_model() {
+        let (events, requests) = drive_with_jev(
+            vec![decision("volume", 0.99, "rig_2")],
+            vec![asked("Set rig 2 volume to 50 %."), results(&["rig 1: vol 0.50 pan 0.00 mute false solo false"])],
+        );
+        assert_eq!(requests.len(), 1, "one request for the whole turn");
+        assert!(requests[0]["questions"]["action"]["criteria"]["volume"].is_string(), "it is a decisions request");
+        assert_eq!(requests[0]["model"], "~typesafe/jev-latest");
+        assert_eq!(ran(&events), vec![ToolCall { name: "set_rig_mix".into(), args: json!({"rig": 1, "vol": 0.5}) }]);
+        assert_eq!(said(&events), vec!["Rig 2 is at 50 %."]);
+        let step = events.iter().find_map(|e| match e { FromWorker::Step(s) => Some(s.model.clone()), _ => None });
+        assert_eq!(step.as_deref(), Some("typesafe/jev-1.14"));
+        assert!(matches!(events.last(), Some(FromWorker::Done)));
+    }
+
+    #[test]
+    fn what_jev_does_not_settle_goes_to_the_chat_model() {
+        let chat = |replies: Vec<Result<Reply, String>>, request: &str| {
+            let (events, requests) = drive_with_jev(replies, vec![asked(request)]);
+            assert!(ran(&events).is_empty(), "{request}: nothing runs on a decision that settles nothing");
+            assert_eq!(said(&events), vec!["from the chat model"], "{request}");
+            assert!(requests.last().unwrap()["messages"].is_array(), "{request}: the last request is a chat completion");
+        };
+        let answer = || text("m", "from the chat model");
+        chat(vec![decision("other", 0.99, "none"), answer()], "Put a delay after the synth.");
+        chat(vec![decision("tempo", 0.6, "none"), answer()], "something about tempo 100");
+        chat(vec![decision("volume", 0.99, "rig_2"), answer()], "make rig 2 quieter");
+        chat(vec![decision("mute", 0.99, "none"), answer()], "mute it");
+        chat(vec![status(401, "{}"), answer()], "Set the tempo to 100 BPM.");
+        chat(vec![status(200, r#"{"answers":{"action":{"type":"refusal"}}}"#), answer()], "Set the tempo to 100 BPM.");
+    }
+
+    #[test]
+    fn deleting_a_rig_through_jev_still_waits_for_the_users_confirm() {
+        let app_says = "not deleted: ask the user first. The chat now shows Confirm / Cancel buttons for this";
+        let (events, _) = drive_with_jev(vec![decision("delete_rig", 0.99, "rig_2")], vec![asked("Delete rig 2."), results(&[app_says])]);
+        assert_eq!(ran(&events), vec![ToolCall { name: "delete_rig".into(), args: json!({"rig": 1}) }], "no confirm=true from the shortcut");
+        assert!(said(&events)[0].contains("Confirm or cancel"));
+    }
+
+    #[test]
+    fn the_chat_model_later_sees_what_jev_did() {
+        let (_, requests) = drive_with_jev(
+            vec![decision("tempo", 1.0, "none"), decision("other", 1.0, "none"), text("m", "It is 100.")],
+            vec![asked("Set the tempo to 100 BPM."), results(&["tempo set to 100 BPM"]), asked("What tempo are we at?")],
+        );
+        let msgs = messages(&requests[2]);
+        assert_no_orphans(&msgs[1..]);
+        assert!(msgs.iter().any(|m| m["role"] == "tool" && m["content"] == "tempo set to 100 BPM"));
+        assert!(msgs.iter().any(|m| m["role"] == "assistant" && m["content"] == "Tempo set to 100 BPM."));
+    }
+
+    #[test]
+    fn values_come_from_the_users_own_words() {
+        let facts = |request| Facts { request, rig: None };
+        assert_eq!(facts("Set the tempo to 100 BPM.").bpm(), Some(100.0));
+        assert_eq!(facts("faster please").bpm(), None);
+        assert_eq!(facts("Set rig 2 volume to 50 %.").percent(), Some(0.5));
+        assert_eq!(facts("rig 2 at 75 percent").percent(), Some(0.75));
+        assert_eq!(facts("set rig 2 volume to 50").percent(), None, "a bare number is not a level");
+        assert_eq!(facts("Split the keyboard at C4.").note(), Some(60));
+        assert_eq!(facts("split at f#3").note(), Some(54));
+        assert_eq!(facts("split at Bb2").note(), Some(46));
+        assert_eq!(facts("split at middle C").note(), Some(60));
+        assert_eq!(facts("split the keyboard somewhere").note(), None);
+        // The [context] line holds numbers too; only the request counts.
+        let d = llm::Decisions { answers: [("action".to_string(), llm::Answer::Choice { choice: "tempo".into(), p: 1.0 })].into(), model: String::new(), ms: 0, attempts: 1 };
+        assert!(settle(&d, "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 100)]\nset the tempo").is_none());
+    }
+
+    #[test]
+    fn every_shortcut_calls_a_tool_that_exists_with_arguments_it_takes() {
+        let tools = tools();
+        let facts = Facts { request: "rig 2 to 50 % at C4, 100 BPM", rig: Some(1) };
+        for s in SHORTCUTS {
+            let call = (s.call)(&facts).unwrap_or_else(|| panic!("{}: no call from a request that states everything", s.key));
+            let checked = parse_tool_call(&tools, &call.name, &call.args.to_string()).unwrap_or_else(|e| panic!("{}: {e}", s.key));
+            assert_eq!(checked.as_object().unwrap().len(), call.args.as_object().unwrap().len(), "{}", s.key);
+        }
     }
 }

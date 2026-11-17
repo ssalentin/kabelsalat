@@ -2433,6 +2433,10 @@ struct MasterLimiter {
     ms_ref: f32,
     ms_cur: f32,
     ms_coef: f32,
+    /// DC blocker state per channel (previous input, previous output) and
+    /// its pole.
+    dc: [(f32, f32); 2],
+    dc_pole: f32,
 }
 
 impl MasterLimiter {
@@ -2476,10 +2480,29 @@ impl MasterLimiter {
         Self {
             env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001),
             ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
+            dc: [(0.0, 0.0); 2],
+            dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
         }
     }
 
-    /// The whole master chain for one stereo frame: limiter → `tanh(drive)`
+    /// Corner of the master's DC blocker: far below any note (the lowest
+    /// piano key is 27.5 Hz), high enough to settle within a second.
+    const DC_CUTOFF_HZ: f64 = 5.0;
+
+    /// One-pole DC blocker, `y = x - x[-1] + pole * y[-1]`. A source stuck at
+    /// a constant (a Surge instance on a MONO input once held the sum near
+    /// 1) pinned the limiter: the meter read full while every rig was turned
+    /// down to silence, and the speakers got a DC offset.
+    #[inline]
+    fn block_dc(&mut self, ch: usize, x: f32) -> f32 {
+        let (px, py) = self.dc[ch];
+        let y = x - px + self.dc_pole * py;
+        // Flush denormals: a silent tail must not cost the CPU.
+        self.dc[ch] = (x, if y.abs() < 1e-20 { 0.0 } else { y });
+        y
+    }
+
+    /// The whole master chain for one stereo frame: DC blocker → limiter → `tanh(drive)`
     /// warmth → loudness match → volume → knee. WARM colours, it does not
     /// turn up: below the ceiling `tanh` is almost linear, so a make-up that
     /// only pins the full-scale peak (`makeup(drive)`) left quiet playing
@@ -2488,6 +2511,7 @@ impl MasterLimiter {
     /// default WARM that is exactly `makeup(DRIVE_REF)`. Allocation-free.
     #[inline]
     fn process(&mut self, l: f32, r: f32, drive: f32, vol: f32) -> (f32, f32) {
+        let (l, r) = (self.block_dc(0, l), self.block_dc(1, r));
         let g = self.gain_for(l, r);
         let (l, r) = (l * g, r * g);
         let (yl, yr) = ((l * drive).tanh(), (r * drive).tanh());
@@ -2636,6 +2660,29 @@ mod master_limiter_tests {
                     "amp {amp} warm {warm}: {rms:.2} dB RMS vs {reference:.2} at the default WARM");
             }
         }
+    }
+
+    /// A source stuck at a constant must not reach the output or pin the
+    /// limiter: after a second the DC is gone, and a tone on top of it plays
+    /// at its normal level instead of being turned down to nothing.
+    #[test]
+    fn a_stuck_constant_is_blocked_and_does_not_duck_the_music() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let (mut sum, mut n, mut tone_peak) = (0.0f64, 0usize, 0.0f32);
+        for i in 0..96000 {
+            let tone = 0.2 * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin();
+            let (l, _) = lim.process(3.0 + tone, 3.0 + tone, 1.45, 1.0);
+            if i >= 48000 {
+                sum += l as f64;
+                n += 1;
+                tone_peak = tone_peak.max(l.abs());
+            }
+        }
+        let mean = sum / n as f64;
+        assert!(mean.abs() < 1e-3, "DC left after a second: {mean}");
+        let (_, alone) = chain(0.2, 0.15);
+        assert!(20.0 * tone_peak.log10() > alone - 1.0,
+            "the tone keeps its level over a stuck DC: {:.2} dBFS vs {alone:.2}", 20.0 * tone_peak.log10());
     }
 
     /// Turning WARM up still adds harmonics: a loud sine comes out with a

@@ -597,6 +597,13 @@ Learned so far (2026-11-15, UI polish pass):
     rig add/delete captured an empty matrix and loaded it into the engine.
     The sync rebuild keeps the rules it mirrored
     (`cc_bindings_survive_an_agent_edit_and_a_rig_add`).
+112. **The master never passes DC:** a source stuck at a constant (Surge on
+    rig 3's MONO input held ~1.0) pinned the shared limiter, so the meter and
+    cables read full while every rig was ducked to silence, and the speakers
+    got the offset. `MasterLimiter::process` high-passes each channel at 5 Hz
+    before the limiter (`a_stuck_constant_is_blocked_and_does_not_duck_the_music`).
+    When the output meter is full and nothing is heard, compare `get_status`
+    `band_db` (all energy below 120 Hz = DC) and mute rigs one at a time.
 
 ## Working on kabelsalat
 

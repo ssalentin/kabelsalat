@@ -2382,6 +2382,10 @@ struct DemoApp {
     lv2_editor_controls: Vec<crate::lv2::Lv2ControlDesc>,
     lv2_editor_presets: Vec<crate::lv2::Lv2Preset>,
     lv2_preset_name: Option<String>,
+    /// Plugin state the app restored into an LV2 node (a Vital patch), by
+    /// node id. The engine builds new LV2 instances on every graph load, so
+    /// sessions, rig edits and undo carry it and restore it.
+    lv2_states: HashMap<u32, Vec<u8>>,
     lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
     /// Last single click on a unit (unit, time) for double-click detection.
@@ -2624,6 +2628,7 @@ impl DemoApp {
             lv2_editor_controls: Vec::new(),
             lv2_editor_presets: Vec::new(),
             lv2_preset_name: None,
+            lv2_states: HashMap::new(),
             lv2_editor_request: None,
             editor_status: String::new(),
             last_unit_click: None,
@@ -2654,6 +2659,7 @@ impl DemoApp {
         self.units.clear();
         self.cables.clear();
         self.base_graph = graph.clone();
+        self.lv2_states.retain(|node, _| matches!(graph.node(*node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. })));
         for node in &graph.nodes {
             self.units.push(make_unit(node));
         }
@@ -4546,6 +4552,11 @@ impl DemoApp {
                 rig += 1;
             }
         }
+        for (&node, state) in &self.lv2_states {
+            if let Some(NodeKind::Lv2 { uri }) = s.graph.node(node).map(|n| n.kind.clone()) {
+                s.set_plugin_state(node, uri.as_str(), state.clone());
+            }
+        }
         // Shaped matrix routes and CC/MIDI-learn bindings (rule 33 mirror).
         let mut rules: Vec<SavedRule> = self.rule_edits.iter()
             .filter(|((_, dest), _)| s.graph.node(*dest).is_some())
@@ -4740,7 +4751,43 @@ impl DemoApp {
                 }
             }
         }
+        // After LoadGraph, so the loader builds each node's instance first and
+        // then the one with its state that replaces it.
+        self.lv2_states.clear();
+        let restored: Vec<(u32, Vec<u8>)> = s.graph.nodes.iter().filter_map(|n| match &n.kind {
+            NodeKind::Lv2 { uri } => s.plugin_state(n.id).filter(|st| st.plugin_id == uri.as_str()).map(|st| (n.id, st.data.clone())),
+            _ => None,
+        }).collect();
+        for (node, state) in restored {
+            if let Err(e) = self.restore_lv2_state(node, state) {
+                self.session_msg = format!("plugin state of node {node} not restored: {e}");
+            }
+        }
         self.restore_session_rules(s);
+        Ok(())
+    }
+
+    /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
+    /// sessions. The node gets a fresh instance with its controls at their
+    /// defaults, so its plugin knobs go back to their defaults too.
+    fn restore_lv2_state(&mut self, node: u32, state: Vec<u8>) -> Result<(), String> {
+        if let Some(bus) = &self.bus {
+            if !bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::LoadLv2State { node, state: state.clone() }) {
+                return Err("command bus full, try again".into());
+            }
+        }
+        self.lv2_states.insert(node, state);
+        if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
+            for k in u.knobs.iter_mut().filter(|k| k.source != KnobSource::BuiltIn && k.param.is_some()) {
+                k.set_immediate(k.default);
+                k.sent = Some(k.default);
+            }
+        }
+        if self.lv2_editor_node == Some(node) {
+            if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node).map(|n| n.kind.clone()) {
+                self.lv2_editor_controls = crate::lv2::control_descs_for_uri(uri.as_str());
+            }
+        }
         Ok(())
     }
 
@@ -6008,6 +6055,19 @@ impl DemoApp {
         if let Some(lv2_node) = self.lv2_editor_node {
             let mut open = self.editor_open;
             let mut chosen_preset: Option<crate::lv2::Lv2Preset> = None;
+            let mut chosen_patch: Option<crate::sounds::Sound> = None;
+            // Vital patches (`sounds::Source::VitalPatches`) list above the LV2
+            // presets; None while the library is scanned.
+            let patches: Option<Vec<crate::sounds::Sound>> = match self.base_graph.node(lv2_node).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) if uri.as_str() == crate::vital::URI => {
+                    match self.sounds.get(&crate::sounds::Instrument::Lv2(uri.as_str().to_string())) {
+                        crate::sounds::Lookup::Ready(library) => Some(library.sounds.iter()
+                            .filter(|s| matches!(s.load, crate::sounds::Load::VitalPatch(_))).cloned().collect()),
+                        _ => None,
+                    }
+                }
+                _ => Some(Vec::new()),
+            };
             let mut ctrl_changes: Vec<(usize, f32, f32)> = Vec::new();
             egui::Window::new(egui::RichText::new(format!("{} — presets & parameters", self.lv2_editor_name))
                     .font(theme::medium_font(16.0)).color(theme::INK))
@@ -6023,6 +6083,18 @@ impl DemoApp {
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
                     egui::ScrollArea::vertical().id_salt("lv2_preset_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
                         let mut shown = 0usize;
+                        match &patches {
+                            None => { ui.label(egui::RichText::new("scanning Vital patches…").size(12.0).color(theme::INK_2)); }
+                            Some(patches) => for s in patches {
+                                let text = if s.category.is_empty() { s.name.clone() } else { format!("{} · {}", s.category, s.name) };
+                                if !words.iter().all(|w| text.to_lowercase().contains(w.as_str())) { continue; }
+                                shown += 1;
+                                let selected = self.lv2_preset_name.as_deref() == Some(s.name.as_str());
+                                if ui.selectable_label(selected, egui::RichText::new(text).size(12.5).color(theme::CREAM)).clicked() {
+                                    chosen_patch = Some(s.clone());
+                                }
+                            },
+                        }
                         for p in &self.lv2_editor_presets {
                             let hay = p.name.to_lowercase();
                             if !words.iter().all(|w| hay.contains(w.as_str())) {
@@ -6086,6 +6158,13 @@ impl DemoApp {
             self.editor_open = open;
             if !open {
                 self.lv2_editor_node = None;
+            }
+            if let Some(patch) = chosen_patch {
+                let unit = self.instrument_units().into_iter().find(|u| u.node == lv2_node);
+                self.editor_status = match unit.ok_or_else(|| "that unit is not an instrument".to_string()).and_then(|u| self.load_sound_into(&u, &patch)) {
+                    Ok(()) => format!("loaded {}", patch.label()),
+                    Err(e) => format!("sound failed: {e}"),
+                };
             }
             if let Some(preset) = chosen_preset {
                 if let Some(bus) = &self.bus {
@@ -7248,9 +7327,14 @@ impl DemoApp {
     fn load_sound_into(&mut self, unit: &crate::sounds::Unit, sound: &crate::sounds::Sound) -> Result<(), String> {
         let pool = unit.slot.and_then(|s| self.clap_pool_idx(s));
         let clap = pool.and_then(|i| Some((self._surge_main.get_mut(i)?, self.surge_controllers.get(i)?)));
-        let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
-        crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
-        drop(bus);
+        if let crate::sounds::Load::VitalPatch(path) = &sound.load {
+            let state = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
+            crate::vital::check_patch(&state)?;
+            self.restore_lv2_state(unit.node, state)?;
+        } else {
+            let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
+        }
         if let crate::sounds::Load::MidiProgram(p) = sound.load {
             self.adopt_program_drawbars(unit.node, p);
         }
@@ -7358,13 +7442,21 @@ impl DemoApp {
         if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
     }
 
-    /// Images the user handed over this frame: a file dropped on the window,
-    /// or an image pasted while the assistant is open.
+    /// Files the user handed over this frame: a dropped Vital bank or patch
+    /// is imported; any other dropped file, or an image pasted while the
+    /// assistant is open, is attached to the chat.
     fn take_chat_images(&mut self, ctx: &egui::Context) {
         let (dropped, pasted) = ctx.input(|i| (
             i.raw.dropped_files.clone(),
             i.events.iter().find_map(|e| match e { egui::Event::PasteImage(image) => Some(image.clone()), _ => None }),
         ));
+        let (vital, dropped): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|f| {
+            let name = f.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x))
+        });
+        for file in vital {
+            self.import_vital(file.path());
+        }
         for file in dropped {
             let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
             let too_big = std::fs::metadata(file.path()).is_ok_and(|m| m.len() > crate::vision::MAX_FILE_BYTES);
@@ -7378,6 +7470,18 @@ impl DemoApp {
         if let Some(image) = pasted.filter(|_| self.assistant_open()) {
             self.attach_chat_image(Image::from_rgba("pasted image", image.size, image.as_raw()));
         }
+    }
+
+    /// Import a dropped Vital bank or patch where Vitalium reads presets,
+    /// and list it: the library is read again on its next use.
+    fn import_vital(&mut self, path: &std::path::Path) {
+        self.session_msg = match crate::vital::import(path, &crate::vital::data_dir()) {
+            Ok(added) => {
+                self.sounds.forget(&crate::sounds::Instrument::Lv2(crate::vital::URI.to_string()));
+                format!("{added}: Vitalium's sound list has them")
+            }
+            Err(e) => format!("not imported: {e}"),
+        };
     }
 
     fn switch_model(&mut self, m: &str) -> String {
@@ -18809,6 +18913,35 @@ mod split_bpm_tests {
         }
     }
 
+    /// Vitalium's editor lists its Vital patches by bank above its LV2 presets.
+    #[test]
+    fn vitaliums_editor_lists_its_vital_patches() {
+        fn library(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+            use crate::sounds::{Load, Sound};
+            let patch = |bank: &str, name: &str| Sound { category: bank.into(), name: name.into(), preferred: false, load: Load::VitalPatch(format!("/nowhere/{name}.vital").into()) };
+            match instrument {
+                crate::sounds::Instrument::Lv2(uri) if uri == crate::vital::URI => crate::sounds::Library {
+                    kind: "Vital patches".into(),
+                    sounds: vec![patch("ElectrowindsVol1", "Woody"), patch("ElectrowindsVol1_Dry", "Woody_Dry")],
+                    params: vec![],
+                },
+                _ => Default::default(),
+            }
+        }
+        let mut g = Graph::default();
+        g.reserve(4, 4);
+        let vital = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, name_bytes("VITALIUM"));
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(library);
+        app.build_rack(&g, &[]);
+        app.toggle_lv2_editor(vital, crate::vital::URI, "VITALIUM");
+        let ctx = egui::Context::default();
+        let texts = (0..3).map(|_| frame(&mut app, &ctx, vec![])).last().unwrap();
+        for listed in ["ElectrowindsVol1 · Woody", "ElectrowindsVol1_Dry · Woody_Dry"] {
+            assert!(texts.iter().any(|t| t == listed), "{listed} is listed: {texts:?}");
+        }
+    }
+
     #[test]
     fn vitalium_and_dexed_editor_support() {
         let _one_at_a_time = crate::lv2::VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -19924,6 +20057,94 @@ mod ui_polish_agent_tests {
             },
             Instrument::Lv2(_) => Library { kind: "LV2 presets".into(), sounds: vec![], params: vec!["Frequency".into(), "Waveform".into()] },
         }
+    }
+
+    fn vital_test_patch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ksalat-ui-vital-{}", std::process::id())).join("Woody.vital")
+    }
+
+    fn vital_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        use crate::sounds::{Instrument, Library, Load, Sound};
+        match instrument {
+            Instrument::Lv2(uri) if uri == crate::vital::URI => Library {
+                kind: "Vital patches".into(),
+                sounds: vec![Sound { category: "Winds".into(), name: "Woody".into(), preferred: false, load: Load::VitalPatch(vital_test_patch()) }],
+                params: vec![],
+            },
+            other => test_sounds(other),
+        }
+    }
+
+    /// A Vital patch is Vitalium's state: loading one sends it to the engine,
+    /// and it stays with its unit through a session save and load and a rig
+    /// edit that renumbers the unit, each of which loads new LV2 instances.
+    #[test]
+    fn a_loaded_vital_patch_survives_sessions_and_rig_edits() {
+        let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}}).to_string().into_bytes();
+        std::fs::create_dir_all(vital_test_patch().parent().unwrap()).unwrap();
+        std::fs::write(vital_test_patch(), &patch).unwrap();
+        let vital = (NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, "VITALIUM");
+        let rigs = vec![
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Winds", &[vital]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(vital_sounds);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        for u in app.units.iter_mut().filter(|u| u.name == "VITALIUM") { u.lv2_inst = true; }
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let node = node_named(&app, 1, "VITALIUM");
+
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "woody", "rig": 1}));
+        assert_eq!(out, format!("loaded 'Winds/Woody' into Vitalium (node {node}), rig 1 'Rig B'"));
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)), "{sent:?}");
+
+        let saved = app.capture_session("Winds").unwrap();
+        assert_eq!(saved.plugin_state(node).map(|s| (s.plugin_id.as_str(), &s.data)), Some((crate::vital::URI, &patch)));
+        let dir = vital_test_patch().parent().unwrap().join("session");
+        saved.save(&dir).expect("a session with a Vital patch saves");
+        let loaded = crate::session::Session::load(&dir).unwrap();
+        app.apply_session(&loaded).unwrap();
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        let load = sent.iter().position(|c| matches!(c, Command::LoadRigs { .. } | Command::LoadGraph { .. })).expect("the graph is loaded");
+        let state = sent.iter().position(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)).expect("the patch is restored");
+        assert!(load < state, "the patch follows the graph load that builds the node's instance: {sent:?}");
+
+        // Deleting rig A renumbers the Vitalium node.
+        app.edit_rigs(Some(0));
+        let moved = node_named(&app, 0, "VITALIUM");
+        assert_ne!(moved, node);
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == moved && *state == patch)), "{sent:?}");
+        assert_eq!(app.capture_session("after").unwrap().plugin_state(moved).map(|s| &s.data), Some(&patch));
+        let _ = std::fs::remove_dir_all(vital_test_patch().parent().unwrap());
+    }
+
+    /// A Vital bank dropped on the window lands where Vitalium reads presets.
+    #[test]
+    fn a_dropped_vital_bank_is_imported_not_attached() {
+        let dir = std::env::temp_dir().join(format!("ksalat-ui-vitalbank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bank = dir.join("Winds.vitalbank");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&bank).unwrap());
+            zip.start_file("Winds/Presets/Woody.vital", zip::write::SimpleFileOptions::default()).unwrap();
+            let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}});
+            std::io::Write::write_all(&mut zip, patch.to_string().as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        // SAFETY: only this test reads XDG_DATA_HOME (vital::data_dir).
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.join("data")) };
+        let mut app = DemoApp::new_with_sink(None);
+        app.import_vital(&bank);
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        assert_eq!(app.session_msg, "added 1 Vital patches (Winds): Vitalium's sound list has them");
+        assert!(dir.join("data/Vitalium/Winds/Presets/Woody.vital").exists());
+        assert!(app.chat_image.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn instrument_rig(name: &str, instruments: &[(NodeKind, &str)]) -> crate::control::Rig {

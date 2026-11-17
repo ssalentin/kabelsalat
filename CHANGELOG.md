@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
+  `.vital` patches, wavetables and modulation included. Its sound list in the
+  editor and the assistant's `list_sounds` / `load_sound` show every patch in
+  Vitalium's folder. Drop a `.vitalbank` or `.vital` file on the window to add
+  it (or run `kabelsalat vital-import <file>`). A loaded patch is kept in saved
+  sessions, through rig edits and through undo.
 - **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
   installs from its prebuilt release on x86_64 and builds from source on
   aarch64; its 260 factory patches are fetched too, so the assistant can list,

@@ -252,6 +252,14 @@ impl Session {
                         s.plugin_id,
                         name_str(plugin_id)
                     ),
+                    NodeKind::Lv2 { uri } if uri.as_str() == s.plugin_id => {}
+                    NodeKind::Lv2 { uri } => bail!(
+                        "The state blob for node {} was saved by '{}' but the node now \
+                         hosts '{}'.",
+                        s.node,
+                        s.plugin_id,
+                        uri.as_str()
+                    ),
                     _ => bail!(
                         "Node {} has a plugin state blob but is not a plugin.",
                         s.node

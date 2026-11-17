@@ -642,6 +642,13 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **Check a plugin state before the plugin restores it:** Vitalium opens a
+    modal alert box for a patch it cannot parse, and that box waits for a
+    message loop no thread here runs, so the restoring thread hung for good
+    (a hand-written patch without `sample`/`wavetables`/`lfos`). Every state
+    goes through its `lv2::state_format` check (`vital::check_patch`) on the
+    loader thread before `restore_state`; test patches start from the
+    plugin's own saved state, never a hand-written fragment.
 
 ## Working on kabelsalat
 
@@ -671,7 +678,8 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests

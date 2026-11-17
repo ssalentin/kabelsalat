@@ -8,6 +8,9 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Fixed
+- **Crash with more synths than voices:** an undo (or a source/device edit)
+  in a session with five or more CLAP units panicked. Units past the voice
+  pool now have no per-voice state, and agent tools say so.
 - **Held notes stay lit** on the software keyboard and the Keys unit for as
   long as they are pressed, from a hardware keyboard too (they only blinked).
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.

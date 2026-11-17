@@ -631,6 +631,18 @@ Learned so far (2026-11-15, UI polish pass):
     the cross alignment altogether). `ui.set_min_height(26.0)` before the
     label (`a_catalog_source_code_button_opens_the_repo` compares centres).
 
+114. **A release has its packages, or the workflow says why:** v0.1.0 was
+    tagged before `release.yml` existed, so its release shipped without one
+    file and nothing failed. Release notes link each AppImage by URL
+    (`release-notes.sh` fails when there is none); a tag without packages is
+    backfilled with `gh workflow run release.yml -f tag=vX.Y.Z`. After a
+    tag push, check `gh release view vX.Y.Z --json assets`.
+115. **Packaging scripts resolve their path arguments before any `cd`:**
+    `appimage.sh` changed into its work directory and then handed linuxdeploy
+    the caller's relative `./target/release/kabelsalat` ("No such file"), so
+    the first release run failed on both arches. Use `realpath` on every
+    path argument at the top of a script that changes directory.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

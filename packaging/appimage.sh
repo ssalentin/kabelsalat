@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# AppImage built with linuxdeploy: kabelsalat-<version>-<arch>.AppImage in <outdir>.
+# AppImage built with linuxdeploy: kabelsalat-<arch>.AppImage and its .zsync in
+# <outdir>. The name carries no version, so releases/latest/download/<name> is a
+# fixed link, and the embedded update information lets AppImageUpdate (Gear
+# Lever, AppImageLauncher) fetch the newest release's changed blocks.
 # Bundles lilv and its libraries; libasound, glibc and the display stack come
 # from the host (linuxdeploy's excludelist), so pipewire-alsa keeps working.
 # usage: packaging/appimage.sh <binary> <version> <outdir>
 set -euo pipefail
-bin=$1 version=$2 out=$3
+bin=$(realpath "$1") version=$2 out=$(mkdir -p "$3" && realpath "$3")
 root=$(cd "$(dirname "$0")/.." && pwd)
+repo=${GITHUB_REPOSITORY:-ssalentin/kabelsalat}
+repo_owner=${repo%%/*} repo_name=${repo#*/}
 arch=$(uname -m)
 tag=1-alpha-20251107-1
 case $arch in
@@ -24,10 +29,11 @@ mkdir -p "$out"
 (
   cd "$work"
   APPIMAGE_EXTRACT_AND_RUN=1 LINUXDEPLOY_OUTPUT_VERSION="$version" \
-    LDAI_OUTPUT="kabelsalat-$version-$arch.AppImage" \
+    LDAI_OUTPUT="kabelsalat-$arch.AppImage" \
+    LDAI_UPDATE_INFORMATION="gh-releases-zsync|$repo_owner|$repo_name|latest|kabelsalat-$arch.AppImage.zsync" \
     "$tool" --appdir AppDir --executable "$bin" \
       --desktop-file "$root/packaging/kabelsalat.desktop" \
       --icon-file kabelsalat.svg --output appimage
 )
-mv "$work/kabelsalat-$version-$arch.AppImage" "$out/"
-echo "$out/kabelsalat-$version-$arch.AppImage"
+mv "$work/kabelsalat-$arch.AppImage" "$work/kabelsalat-$arch.AppImage.zsync" "$out/"
+echo "$out/kabelsalat-$arch.AppImage"

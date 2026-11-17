@@ -83,14 +83,18 @@ Press **?** in the app for every shortcut.
 
 ## Install
 
-**AppImage (recommended)** — download `kabelsalat-<version>-<arch>.AppImage`
-(x86_64 or aarch64) from the
-[latest release](https://github.com/ssalentin/kabelsalat/releases/latest), then:
+**AppImage (recommended)** — download the latest release for your machine:
+
+- [kabelsalat-x86_64.AppImage](https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-x86_64.AppImage) (most PCs and laptops)
+- [kabelsalat-aarch64.AppImage](https://github.com/ssalentin/kabelsalat/releases/latest/download/kabelsalat-aarch64.AppImage) (ARM: Raspberry Pi 4/5, Asahi, Snapdragon)
 
 ```sh
 chmod +x kabelsalat-*.AppImage
 ./kabelsalat-*.AppImage
 ```
+
+Older versions and the other packages are on the
+[releases page](https://github.com/ssalentin/kabelsalat/releases).
 
 It runs unsandboxed, so it finds the CLAP/LV2 plugins installed on your system
 and gets realtime audio priority like a native install. Install the plugins

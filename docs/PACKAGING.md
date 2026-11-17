@@ -39,7 +39,7 @@ release). Each package is built natively for x86_64 and aarch64:
 | Package | Built by | Built on | Notes |
 | --- | --- | --- | --- |
 | `kabelsalat-<v>-linux-<arch>.tar.gz` | `packaging/tarball.sh` | Ubuntu 22.04 (glibc 2.35) | Binary, desktop file, icon, `INSTALL.md` with the runtime libraries to install. |
-| `kabelsalat-<v>-<arch>.AppImage` | `packaging/appimage.sh` ([linuxdeploy](https://github.com/linuxdeploy/linuxdeploy) `1-alpha-20251107-1`, checksum-pinned) | Ubuntu 22.04 | Bundles lilv, serd, sord, sratom; uses the host's glibc, ALSA (so `pipewire-alsa` works) and display stack. |
+| `kabelsalat-<arch>.AppImage` (+ `.zsync`) | `packaging/appimage.sh` ([linuxdeploy](https://github.com/linuxdeploy/linuxdeploy) `1-alpha-20251107-1`, checksum-pinned) | Ubuntu 22.04 | Bundles lilv, serd, sord, sratom; uses the host's glibc, ALSA (so `pipewire-alsa` works) and display stack. |
 | `kabelsalat-<v>-<arch>.flatpak` | `packaging/flatpak/build.sh` | `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` | Single-file bundle, see below. |
 | `kabelsalat-git-<v>.r<n>.g<sha>-1-<arch>.pkg.tar.*` | `packaging/arch-makepkg.sh` | `archlinux:base-devel`, `menci/archlinuxarm:base-devel` | `packaging/PKGBUILD` built from the tagged commit. |
 
@@ -52,9 +52,34 @@ than the runtime do not load, and host-side agents cannot attach. README and
 every release's notes point to the AppImage.
 
 Each job smoke-tests its package with `kabelsalat --version`. The release job
-adds `SHA256SUMS`, then creates the GitHub release with the tag's CHANGELOG
-block as notes (`scripts/ci/release-notes.sh`), or uploads to it when the
-release already exists.
+adds `SHA256SUMS`, then creates the GitHub release, or uploads to it when the
+release already exists. Its notes (`scripts/ci/release-notes.sh <v> dist <tag>
+<repo>`) are the tag's CHANGELOG block plus a **Download** section that links
+each AppImage directly (x86_64 first), then the other packages and
+`SHA256SUMS`; a release without an AppImage fails.
+
+The AppImage name carries no version (as Neovim's does not), so README's
+links to `releases/latest/download/kabelsalat-<arch>.AppImage` always fetch
+the newest; the version is the release tag and `kabelsalat --version`. Each
+AppImage embeds the update information
+`gh-releases-zsync|<owner>|<repo>|latest|kabelsalat-<arch>.AppImage.zsync` and
+ships its `.zsync`, so AppImageUpdate, Gear Lever and AppImageLauncher update
+an installed copy by downloading only the changed blocks. The smoke test
+checks both. The tarballs keep the version in their names.
+
+### Packages for an existing tag
+
+A tag pushed before this workflow existed (v0.1.0) has a release without
+packages. Run **Release** from the Actions tab with `tag` set to it, or:
+
+```sh
+gh workflow run release.yml -R ssalentin/kabelsalat --ref main -f tag=v0.1.0
+```
+
+The tarball and AppImage jobs build the tag's source with this ref's packaging
+scripts and attach the files to that release, rewriting its notes with the
+download links. Flatpak and Arch are skipped: their manifests build from the
+current tree, not from the tag.
 
 ## Flatpak
 

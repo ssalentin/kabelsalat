@@ -5515,25 +5515,7 @@ impl DemoApp {
                 let installing_id = self.install.as_ref().map(|i| i.id.clone());
                 let entries: Vec<serde_json::Value> = crate::catalog::CATALOG
                     .iter()
-                    .map(|e| {
-                        let inst = self.catalog_installed(e);
-                        let (route, pkg) = match e.route {
-                            crate::catalog::InstallRoute::DistroPackage { pkg } => ("distro", Some(pkg)),
-                            crate::catalog::InstallRoute::Source { repo, .. } => ("source", Some(repo)),
-                        };
-                        serde_json::json!({
-                            "id": e.id,
-                            "name": e.name,
-                            "format": e.format.label(),
-                            "description": e.description,
-                            "repo": e.repo,
-                            "route": route,
-                            "pkg_or_repo": pkg,
-                            "installed": inst,
-                            "installing": installing_id.as_deref() == Some(e.id),
-                            "url": crate::catalog::repo_url(e.repo),
-                        })
-                    })
+                    .map(|e| crate::catalog::entry_json(e, self.catalog_installed(e), installing_id.as_deref() == Some(e.id)))
                     .collect();
                 serde_json::json!({ "instruments": entries }).to_string()
             }
@@ -9065,7 +9047,7 @@ impl DemoApp {
                             theme::section_label(ui, &format!("Install from the catalog ({})", matches.len()));
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("Hand-picked instruments from GitHub — a distro package where one exists, else built into ~/.clap or ~/.lv2")
+                                egui::RichText::new("Hand-picked instruments from GitHub: a distro package where one exists, else a prebuilt release or a source build into ~/.clap or ~/.lv2")
                                     .size(12.0)
                                     .color(theme::INK_2),
                             );
@@ -9129,32 +9111,53 @@ impl DemoApp {
                                             });
                                             ui.add_space(4.0);
                                             ui.add(
-                                                egui::Label::new(egui::RichText::new(e.description).size(12.0).color(theme::INK_2))
+                                                egui::Label::new(egui::RichText::new(e.description).size(12.5).color(theme::INK))
                                                     .truncate(),
+                                            );
+                                            ui.add_space(4.0);
+                                            ui.add(egui::Label::new(egui::RichText::new(e.about).size(12.0).color(theme::INK_2)).wrap());
+                                            ui.add_space(6.0);
+                                            let route = crate::catalog::local_route(e);
+                                            let how = route.map_or_else(
+                                                || format!("No Linux build for {}", std::env::consts::ARCH),
+                                                |r| r.summary(),
                                             );
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format!("github.com/{}", e.repo))
-                                                        .size(11.0)
-                                                        .color(theme::MIDI_BLUE),
+                                                    egui::RichText::new(format!("License {} · {how}", e.license))
+                                                        .size(11.5)
+                                                        .color(theme::CREAM_DIM),
                                                 )
-                                                .truncate(),
-                                            )
-                                            .on_hover_text(crate::catalog::repo_url(e.repo));
+                                                .wrap(),
+                                            );
                                             ui.add_space(10.0);
-                                            if is_inst {
-                                                ui.label(egui::RichText::new("Installed").size(11.0).color(theme::LIVE_TEAL));
-                                            } else if running {
-                                                ui.label(egui::RichText::new("Installing…").size(12.0).color(theme::AGENT_COLOR));
-                                            } else if let Some(err) = failed {
-                                                ui.label(egui::RichText::new("Install failed").size(12.0).color(theme::CLIP_BRIGHT))
-                                                    .on_hover_text(err);
-                                            } else if theme::primary_button(ui, "Install")
-                                                .on_hover_text(crate::catalog::repo_url(e.repo))
-                                                .clicked()
-                                            {
-                                                install_request = Some(e.id.to_string());
-                                            }
+                                            ui.horizontal(|ui| {
+                                                // The status label comes first: give the row the buttons'
+                                                // height before it is placed, or it centres on a shorter row.
+                                                ui.set_min_height(26.0);
+                                                ui.spacing_mut().item_spacing.x = 8.0;
+                                                if is_inst {
+                                                    ui.label(egui::RichText::new("Installed").size(12.0).color(theme::LIVE_TEAL));
+                                                } else if running {
+                                                    ui.label(egui::RichText::new("Installing…").size(12.0).color(theme::AGENT_COLOR));
+                                                } else if let Some(err) = failed {
+                                                    ui.label(egui::RichText::new("Install failed").size(12.0).color(theme::CLIP_BRIGHT))
+                                                        .on_hover_text(err);
+                                                } else if route.is_some() {
+                                                    if theme::primary_button(ui, "Install").on_hover_text(&how).clicked() {
+                                                        install_request = Some(e.id.to_string());
+                                                    }
+                                                }
+                                                let source = crate::catalog::repo_url(e.repo);
+                                                if theme::chip_button(ui, "Source code", false).on_hover_text(&source).clicked() {
+                                                    ui.ctx().open_url(egui::OpenUrl::new_tab(source));
+                                                }
+                                                if let Some(site) = e.homepage {
+                                                    if theme::chip_button(ui, "Website", false).on_hover_text(site).clicked() {
+                                                        ui.ctx().open_url(egui::OpenUrl::new_tab(site));
+                                                    }
+                                                }
+                                            });
                                         });
                                     }
                                 });
@@ -18401,13 +18404,14 @@ mod split_bpm_tests {
 
         let v: serde_json::Value = serde_json::from_str(&app.exec_tool("list_instruments", &serde_json::json!({}))).unwrap();
         let instruments = v["instruments"].as_array().unwrap();
-        assert_eq!(instruments.len(), 5);
+        assert_eq!(instruments.len(), crate::catalog::CATALOG.len());
         let surge = instruments.iter().find(|e| e["id"] == "surge-xt").unwrap();
         assert_eq!(surge["installed"], serde_json::json!(true));
         assert_eq!(surge["format"], serde_json::json!("CLAP"));
         let yanes = instruments.iter().find(|e| e["id"] == "yanes").unwrap();
         assert_eq!(yanes["route"], serde_json::json!("source"));
-        assert_eq!(yanes["url"], serde_json::json!("https://github.com/andrewfader/yanes"));
+        assert_eq!(yanes["source_url"], serde_json::json!("https://github.com/andrewfader/yanes"));
+        assert_eq!(yanes["license"], serde_json::json!("Source-available"));
 
         // Refused without confirm, nothing starts.
         let r = app.exec_tool("install_instrument", &serde_json::json!({"id": "setbfree"}));
@@ -18437,11 +18441,56 @@ mod split_bpm_tests {
         let ctx = egui::Context::default();
         for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
         let texts = frame(&mut app, &ctx, vec![]);
-        for name in ["setBfree", "Surge XT", "Dexed", "Vitalium", "YANES"] {
-            assert!(texts.iter().any(|t| t == name), "catalog shows {name}: {texts:?}");
+        for e in crate::catalog::CATALOG {
+            assert!(texts.iter().any(|t| t == e.name), "catalog shows {}: {texts:?}", e.name);
         }
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("License GPL-3.0-or-later · ")), "Floe's card names its licence: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("Plays sample libraries")), "cards show the about text: {texts:?}");
+        let sources = texts.iter().filter(|t| *t == "Source code").count();
+        assert_eq!(sources, crate::catalog::CATALOG.len(), "every card has a Source code button");
+    }
+
+    #[test]
+    fn a_catalog_source_code_button_opens_the_repo() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: crate::sounds::ODIN_ID.into(), name: "Odin2".into(), vendor: "TheWaveWarden".into(), features: vec!["instrument".into()],
+        }];
+        app.catalog_roots = Some(vec![]);
+        app.stage_view = StageView::Plugins;
+        app.plugin_category = PluginCategory::Install;
+        app.plugin_filter = "odin".into();
+        let ctx = egui::Context::default();
+        let run = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            let mut texts = Vec::new();
+            for cs in &out.shapes {
+                if let Shape::Text(t) = &cs.shape {
+                    texts.push((t.galley.text().to_owned(), t.visual_bounding_rect()));
+                }
+            }
+            (texts, out.platform_output.commands)
+        };
+        for _ in 0..2 { run(&mut app, vec![]); }
+        let (texts, _) = run(&mut app, vec![]);
+        let center = |label: &str| texts.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("no '{label}'")).1.center();
+        let at = center("Source code");
+        assert!((center("Installed").y - at.y).abs() < 1.0, "the status sits on the buttons' line: {} vs {}", center("Installed").y, at.y);
+        run(&mut app, vec![egui::Event::PointerMoved(at)]);
+        run(&mut app, vec![ptr(at, true)]);
+        let (_, commands) = run(&mut app, vec![ptr(at, false)]);
+        let urls: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c { egui::OutputCommand::OpenUrl(u) => Some(u.url.as_str()), _ => None })
+            .collect();
+        assert_eq!(urls, ["https://github.com/TheWaveWarden/odin2"]);
     }
 
     #[test]

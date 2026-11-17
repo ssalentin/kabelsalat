@@ -8,6 +8,11 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Fixed
+- **Plugin knobs that drove the wrong thing or nothing:** every LV2 unit had
+  a `GAIN` knob wired to the plugin's first control port, whatever that port
+  was (Vitalium: its freewheel switch; setBfree: nothing), and a CLAP synth
+  had a `TONE` knob that only tinted its cable. Both are gone: a plugin knob
+  is now always one of the plugin's own controls, under the plugin's name.
 - **Crash with more synths than voices:** an undo (or a source/device edit)
   in a session with five or more CLAP units panicked. Units past the voice
   pool now have no per-voice state, and agent tools say so.
@@ -16,6 +21,18 @@ releases may still change behaviour and session files.
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.
 
 ### Added
+- **Main controls on every instrument:** a synth's face shows up to four of
+  the controls its designer marked as most important, left of `LEVEL`, as
+  many as the unit is wide. They come from the plugin's CLAP remote-controls
+  pages (Surge XT: the patch's named macros, else the scene mixer), from LV2
+  ports with a `param:` designation, or else from its first continuous
+  parameters, macros first (Dexed, YANES, Vitalium). The knobs drive the real
+  parameters, are MIDI-learnable, follow the plugin's value (a loaded patch
+  moves and renames them), and LV2 ones are saved with the session. The
+  agent's `list_params` returns the same list as `main_controls` ahead of the
+  full parameter list, and a control's name binds with
+  `set_cc_map knob=<name>`. `kabelsalat main-controls-test` prints each
+  installed instrument's main controls and moves one through the engine.
 - **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in

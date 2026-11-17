@@ -9970,10 +9970,6 @@ impl DemoApp {
         }
     }
 
-    /// Publish the patch through the control plane: living cables become
-    /// Connect commands (the engine rejects duplicates), knobs SetParam, and
-    /// the shared graph mirror is rebuilt when the cable set changed. Runs
-    /// once per frame after input, so a re-plug's Disconnect precedes it.
     /// The main controls of a unit's instrument, if its plugin is known.
     fn unit_main_controls(&self, unit: usize) -> Option<crate::main_controls::MainControls> {
         let u = self.units.get(unit)?;
@@ -10106,6 +10102,10 @@ impl DemoApp {
         format!("pinned {} to the face", p.name)
     }
 
+    /// Publish the patch through the control plane: living cables become
+    /// Connect commands (the engine rejects duplicates), knobs SetParam, and
+    /// the shared graph mirror is rebuilt when the cable set changed. Runs
+    /// once per frame after input, so a re-plug's Disconnect precedes it.
     fn publish_patch(&mut self) {
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();

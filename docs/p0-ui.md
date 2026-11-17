@@ -25,7 +25,7 @@ forcing a higher `pixels_per_point` makes elements oversized.
 | Unit | Role | Front | Back jacks |
 |---|---|---|---|
 | KEYS | MIDI source | clickable mini keyboard, RATE / VEL knobs | MIDI OUT |
-| SURGE XT | synth (CLAP stand-in) | animated waveform display, TONE / LEVEL | MIDI IN, OUT |
+| SURGE XT | synth (CLAP stand-in) | animated waveform display, main controls / LEVEL | MIDI IN, OUT |
 | DELAY | insert FX | echo-dot display, TIME / MIX | IN, MIDI, OUT |
 | MASTER OUT | stereo bus | live LED meter, VOLUME / WARM | L, R |
 
@@ -50,7 +50,7 @@ Surge→Delay, Delay→Master L, Surge→Master R (dry). MIDI cables are yellow
 
 - Drag a knob vertically to change it (right-click resets one knob).
   Knobs really drive the simulation: RATE = pattern speed, VEL = pulse
-  velocity, TONE/WARM = cable color warmth, LEVEL/MIX/VOLUME = cable levels
+  velocity, WARM = cable color warmth, LEVEL/MIX/VOLUME = cable levels
   and the master meter.
 - Click the piano keys on KEYS to fire pulses down the MIDI cables — you
   immediately see the signal path light up all the way to the master meter.

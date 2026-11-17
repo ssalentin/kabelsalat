@@ -2047,6 +2047,10 @@ struct DemoApp {
     /// Test-only override of the bundle-probe roots (None = real home + system
     /// dirs), so catalog "installed" assertions never depend on this machine.
     catalog_roots: Option<Vec<std::path::PathBuf>>,
+    /// GitHub stars per catalog repo, fetched once per run on a background
+    /// thread when the Install tab first shows; empty offline.
+    catalog_stars: std::collections::HashMap<&'static str, u32>,
+    catalog_stars_rx: Option<std::sync::mpsc::Receiver<(&'static str, u32)>>,
     fps: f32,
     stats_timer: f32,
     stats_line: String,
@@ -2450,6 +2454,8 @@ impl DemoApp {
             plugin_msg: String::new(),
             install: None,
             catalog_roots: None,
+            catalog_stars: std::collections::HashMap::new(),
+            catalog_stars_rx: None,
             fps: 60.0,
             stats_timer: 0.0,
             stats_line: String::new(),
@@ -8910,6 +8916,35 @@ impl DemoApp {
             });
     }
 
+    /// Starts the star fetch on first call, then adopts what has arrived.
+    /// Tests never reach the network (rule 37).
+    fn poll_catalog_stars(&mut self, ctx: &egui::Context) {
+        if self.catalog_stars_rx.is_none() && !cfg!(test) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name("catalog-stars".into())
+                .spawn(move || {
+                    let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else {
+                        return;
+                    };
+                    for e in crate::catalog::CATALOG {
+                        if let Some(n) = crate::catalog::fetch_stars(&client, e.repo) {
+                            if tx.send((e.repo, n)).is_err() {
+                                return;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                })
+                .ok();
+            self.catalog_stars_rx = Some(rx);
+        }
+        if let Some(rx) = &self.catalog_stars_rx {
+            self.catalog_stars.extend(rx.try_iter());
+        }
+    }
+
     /// A taller [`plugin_card`] for catalog entries: name, one-line
     /// description, repo link and an Install button / Installed badge.
     fn catalog_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
@@ -9030,6 +9065,7 @@ impl DemoApp {
                         let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
 
                         if self.plugin_category == PluginCategory::Install {
+                            self.poll_catalog_stars(ui.ctx());
                             let roots_raw = self.catalog_root_paths();
                             let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
                             let scan = self.catalog_scan();
@@ -9122,9 +9158,14 @@ impl DemoApp {
                                                 || format!("No Linux build for {}", std::env::consts::ARCH),
                                                 |r| r.summary(),
                                             );
+                                            let stars = self
+                                                .catalog_stars
+                                                .get(e.repo)
+                                                .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
+                                                .unwrap_or_default();
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format!("License {} · {how}", e.license))
+                                                    egui::RichText::new(format!("{stars}License {} · {how}", e.license))
                                                         .size(11.5)
                                                         .color(theme::CREAM_DIM),
                                                 )
@@ -18447,6 +18488,13 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("License GPL-3.0-or-later · ")), "Floe's card names its licence: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains('★')), "no stars without a fetched count: {texts:?}");
+        app.catalog_stars.insert("pantherb/setBfree", 235);
+        app.catalog_stars.insert("surge-synthesizer/surge", 3870);
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.starts_with("★ 235 · License ")), "setBfree's card shows its stars: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("★ 3.9k · License ")), "Surge's card shows its stars: {texts:?}");
+        assert_eq!(texts.iter().filter(|t| t.contains('★')).count(), 2, "only fetched repos show stars: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("Plays sample libraries")), "cards show the about text: {texts:?}");
         let sources = texts.iter().filter(|t| *t == "Source code").count();
         assert_eq!(sources, crate::catalog::CATALOG.len(), "every card has a Source code button");

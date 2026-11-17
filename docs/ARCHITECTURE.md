@@ -34,6 +34,9 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   `search` / `find` are the one search for every library, and the
   `list_sounds` / `load_sound` tools of the app, MCP and the Jev plan all
   answer from here.
+- `main_controls.rs` — the few parameters a plugin's designer marked as most
+  important: one `MainControls` list per plugin, the rule that finds it
+  (`resolve`), knob labels, and name lookup for agents and CC bindings.
 - `dsp.rs` — built-in processors (gain, pan, EQ, filter, limiter, saturation,
   delay, reverb, metronome).
 - `matrix.rs` — MIDI routing: sources × destinations, per-cell rules (channel,
@@ -223,6 +226,13 @@ The graph is presented as a **rack of labeled hardware-style units** (Reason):
   synth + reverb); friendly empty states with big, obvious "add" affordances.
 - **Smart controls:** per-instrument macro knobs — many plugin parameters mapped to
   a few expressive controls. Made for live playing; MIDI-learn binds them.
+  The knobs are the plugin's own main controls (`main_controls::resolve`):
+  CLAP remote-controls pages first, then LV2 `param:` designations, then the
+  first usable continuous parameters with macros in front. A CLAP list is
+  read on the plugin's main thread when the instance is created and again
+  after a state load; an LV2 list is read per URI on a worker thread. The
+  face polls CLAP values back at 10 Hz. An LV2 port is not read back, so its
+  knob mirrors what the app sent (the engine does not publish port values).
 - **Big, friendly controls:** touch-sized targets, rounded cards, playful visual
   feedback — instruments and cables react visibly when played.
 - **Templates:** one-click starting points ("Lead + Reverb", "Drums + Bass",

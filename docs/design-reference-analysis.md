@@ -48,7 +48,7 @@ structure, typography, shape scarcity and the rack's internal painting):
    MIDI jackets: blue/cyan/violet (cool) — `CABLE_AUDIO_PALETTE` /
    `CABLE_MIDI_PALETTE`, keyed on RIG-RELATIVE node ids (stable across
    reloads). Terminal shape (round/square) stays the primary audio≠MIDI cue.
-   The TONE/WARM warming shift applies ONLY to the cream jacket. Selection
+   The WARM warming shift applies ONLY to the cream jacket. Selection
    still swaps to ACCENT and dims the rest.
 5. **One window.** The MIDI matrix is a MAIN-STAGE view (Matrix chip / F11
    switches rack ↔ matrix; rule editor inline beside the grid), not a
@@ -401,8 +401,9 @@ treatment on dark, and the flip pill's signature detail.
 - **One flat stroke per cable, round caps. Delete all layered glow strokes.**
 - Audio: `AUDIO_CREAM`, width 3.0 + 1.0·level (keep level-responsive breathing).
   MIDI: `MIDI_BLUE`, width 2.8. Hover/grab: +0.8 width (keep).
-- `cable_color` warming (TONE/WARM knobs): mix audio cream toward `ACCENT` by
-  `tone*0.20 + warm*0.15` (subtle flat warm shift; keeps the knob feedback).
+- `cable_color` warming (WARM knob): mix audio cream toward `ACCENT` by
+  `0.07 + warm*0.15` for an instrument's cable (subtle flat warm shift; the
+  fixed part is the former TONE knob's default).
 - Selection: selected cable = solid `ACCENT`, width +0.5; **all other cables drop
   to α 0.28** when a selection exists (keep `cable_alpha`). Delete the violet
   under-glow and the bright centerline — the color swap + dimming is the highlight.

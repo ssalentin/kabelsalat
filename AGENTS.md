@@ -94,9 +94,11 @@ Learned so far (2026-11-15, UI polish pass):
     claimed (hidden-rig) units when it opens instrument columns — another
     rig's synth left an empty gap column and shoved stacks against Master.
 19. **A new rig is playable or says why:** "+ Rig"/add_rig builds
-    `standard_rig_graph` (Keys→Surge→Master, wired) from the voice pool
-    (`VOICE_POOL`); idle pool voices skip `render`. Never ship a bare
-    Keys+Master just because the startup voices are used up.
+    `standard_rig_graph` (Keys→Surge→Master, wired) and the app hosts a
+    voice for its synth on demand (`sync_clap_slots`; there is no voice
+    pool and no cap). A plugin that cannot load says so (`plugin_msg`).
+    Never ship a bare Keys+Master, and never keep spare voices: a voice no
+    unit plays is retired.
 20. **`build_rack` resets view + mixer (active_rig = 0, rig_mix = unity):**
     restore remapped mix / the active rig AFTER `apply_session`/`build_rack`,
     never before — and the engine-sync rebuild restores the snapshot's
@@ -432,14 +434,7 @@ Learned so far (2026-11-15, UI polish pass):
     still sounded. `notes_down` keeps one bit per source per note, set on
     note-on and cleared on note-off in `fire_keys_with`
     (`held_notes_stay_lit_on_the_dock_until_released`).
-89. **Per-voice state is indexed by voice slot, and only a voice has one:**
-    `clap_rigs()` numbers every CLAP unit, but `rig_sources` / `rig_device`
-    / `patch_names` hold `VOICE_POOL` entries. With 5+ CLAP units an undo
-    restored sources for slot 4 and the app panicked (live crash); unknown
-    nodes silently mapped to slot 0. Resolve with `voice_slot_of_node`
-    (None past the pool or for non-CLAP nodes), never index by a rig index
-    (`clap_units_past_the_voice_pool_never_index_voice_state`).
-90. **A plugin knob is one of the plugin's own controls, under the plugin's
+89. **A plugin knob is one of the plugin's own controls, under the plugin's
     name:** every LV2 unit had a `GAIN` knob on control port 0, whatever that
     port was (Vitalium: `lv2_freewheel`; setBfree has no control port, so the
     knob moved nothing), and a CLAP unit had a visual-only `TONE`. Plugin
@@ -448,23 +443,23 @@ Learned so far (2026-11-15, UI polish pass):
     macros first); a port with any other designation (`lv2:freeWheeling`,
     `lv2:enabled`) is the host's and is never offered to the player. Check
     with `kabelsalat main-controls-test`.
-91. **Re-read a plugin's controls after a state load, without waiting to be
+90. **Re-read a plugin's controls after a state load, without waiting to be
     told:** Surge XT names its macros per patch ("M1: Cutoff") and announces
     no `params.rescan`, so the list read at instantiation kept "M1: -" after
     a patch load. `ClapVoiceMain::load_state` arms the next
     `poll_main_controls` calls, and the face rebuilds its main knobs when the
     list changed (`real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin`).
-92. **A control the plugin left unnamed is not a main control:** only 274 of
+91. **A control the plugin left unnamed is not a main control:** only 274 of
     3008 installed Surge patches name a macro; the others report "M1: -",
     which moves nothing. `resolve` skips a slot whose name has no letter or
     digit after its tag and continues with the next remote-controls page.
-93. **Find a knob by label or id, never by position:** plugin knobs sit in
+92. **Find a knob by label or id, never by position:** plugin knobs sit in
     front of a unit's own knobs, and how many there are follows the plugin
     and the unit's width. `units[1].knobs[1]` stopped being LEVEL; use
     `Unit::knob_index("LEVEL")` or `cc_target()`, and never rebuild a unit's
     knob row while one of its knobs is dragged (rule 10).
 
-94. **A sound tool works in the library of the rig's own instrument:**
+93. **A sound tool works in the library of the rig's own instrument:**
     `list_sounds` / `load_sound` searched Surge patches for every rig, so a
     YANES or setBfree rig got Surge results and a load went into the wrong
     plugin. The instrument is the key (`sounds::Instrument`, from the node's
@@ -474,24 +469,24 @@ Learned so far (2026-11-15, UI polish pass):
     with `kabelsalat sound-library-test` (every installed catalog instrument
     lists, searches, loads one sound through the engine and sounds
     different) and `agent-eval --task yanes_bass` / `organ_jazz`.
-95. **Find out where a plugin keeps its sounds before writing a browser:**
+94. **Find out where a plugin keeps its sounds before writing a browser:**
     YANES has no preset files and no CLAP preset-discovery factory; its 146
     presets are the values of a stepped "Preset" parameter. setBfree has no
     LV2 presets; its 110 registrations are MIDI programmes it names in a
     MIDNAM document (`lv2::midi_programs`). Instantiate the plugin, list its
     parameters with their value texts and its extension data, and read its
     source, before assuming a file format.
-96. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
+95. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
     label before any preference. Factory patches were preferred first, so
     the listed "Third/Pads/Warm Pad" loaded the factory "Pads/Warm Pad"
     (`a_listed_label_loads_exactly_that_sound`).
-97. **A search word no sound of the library holds is left out, never
+96. **A search word no sound of the library holds is left out, never
     fuzzy-ranked:** every setBfree programme is an organ and none is called
     one, so "jazz organ" found nothing. `sounds::search` drops such words
     (and reports them as `words_no_sound_has`) only when the full query
     finds nothing; words the library does hold are never dropped, so a
     "wobbly growling bass" still falls back to the kind as before.
-98. **A library scan never runs on the UI thread, and an agent call waits
+97. **A library scan never runs on the UI thread, and an agent call waits
     for it:** `sounds::Libraries` scans on its own thread (the first
     `list_sounds` walked about 3000 patch files on the UI thread) and
     `build_rack` starts the scans of the rack's instruments. In
@@ -500,14 +495,14 @@ Learned so far (2026-11-15, UI polish pass):
     cost a model step. A preset parameter is read from the live plugin on
     the UI thread, which is the CLAP main thread
     (`a_sound_tool_waits_for_the_library_scan`).
-99. **A request that names one sound is not "a kind of sound":** widening
+98. **A request that names one sound is not "a kind of sound":** widening
     the Jev `load_sound` criterion (so "a jazz drawbar preset" settles
     there) also pulled in "Load the patch Pads/Dreamscape", whose plan would
     fall back to any pad. The plan hands a request with a `Category/Name`
     label to the chat model. Compare `jev-test` outcomes for every sample
     before and after changing a criterion.
 
-100. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
+99. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
     that hands over after running tools puts its calls into the
     conversation; DeepSeek's thinking models (`deepseek-flash`) answer 400
     ("reasoning_content … must be passed back") to an assistant tool call
@@ -515,7 +510,7 @@ Learned so far (2026-11-15, UI polish pass):
     enough; measured against the API, and OpenRouter's Gemini accepts it).
     Every hand-over from a plan failed this way, for Surge too. `agent-eval
     --task organ_no_pad` runs that path.
-101. **Rows in a fixed-width column take their widths from the column:**
+100. **Rows in a fixed-width column take their widths from the column:**
     size a flexible field as the remaining width minus the measured buttons
     (`theme::chip_button_width` / `primary_button_width`), never a fixed
     width in `horizontal_wrapped`. In Settings at 781 px, the model row
@@ -526,12 +521,50 @@ Learned so far (2026-11-15, UI polish pass):
     at the row's left edge (`leading_space`) and overlap.
     `assert_settings_text_layout` checks containment and no overlap at
     781x950, 760x520 and 1280x900.
-102. **egui tests that read popup paint advance `RawInput::time`:** an
+101. **egui tests that read popup paint advance `RawInput::time`:** an
     Area fades in, so a popup's first frames paint its fill alpha-scaled
     (`DARK_PANEL` read as `#0707073C` and looked like a wrong fill). Set
     `raw.time` past `animation_time` each frame. Click as a user does
     (move, press, release on separate frames, `click_at`): egui ignores a
     click that lands on the frame right after its popup closed.
+102. **Per-voice state is a slot table with one entry per CLAP unit:**
+    `rig_sources` / `rig_device` / `patch_names` are refit to the CLAP
+    units by `fit_voice_tables` (in `build_rack`), any number of them.
+    Resolve a node with `voice_slot_of_node` (None only for non-CLAP
+    nodes), never index by a rig index or assume a size: fixed
+    `[_; VOICE_POOL]` arrays panicked on an undo with 5+ CLAP units, and
+    unknown nodes silently mapped to slot 0
+    (`any_number_of_clap_units_have_their_own_voice_state`).
+103. **The engine binds voices, the app follows:** which hosted voice plays
+    which Clap node is the engine's decision (`bind_free_voices`),
+    published as `GraphPub::voices`; `sync_clap_slots` maps units from it.
+    The app matched plugin ids in its own order, so after a remote
+    RemoveNode it edited the freed voice while the engine played the other
+    one. Where the app must know the binding before the engine answers (a
+    load it sends, to restore plugin state), it uses the engine's rule
+    `control::bind_voices`, never a guess of its own
+    (`the_app_follows_the_engines_binding_after_remote_edits`).
+104. **Engine state of a node starts over when a voice is bound to it:**
+    level, keyboard/hardware switches and device live in the `VoiceSlot`
+    but belong to the node; `VoiceSlot::bind` resets them. A voice kept
+    "keyboard off" across a template load while the UI showed it on.
+105. **MIDI routes belong to the Clap node, not to its voice:**
+    `GraphEngine::new` wired routes per startup voice, so a node whose
+    voice is hosted later never got a note (found by `many-voices-test`).
+    LoadGraph, AddNode and the constructor all route per Clap node.
+106. **Per-voice UI state travels by node id through every reload:** a rig
+    add/delete renumbers nodes and `apply_session` resets the switches, so
+    `edit_rigs` carries `VoiceRow`s through its id remap and the undo
+    snapshot holds them (device included). Adding a rig silently turned
+    every switched-off keyboard back on (rule 59 class).
+107. **The audio thread neither allocates nor frees for a voice:** the host
+    builds each `VoiceSlot` (with its render buffer), sends
+    `VoiceMsg::Grow` with a larger table ahead of the `Add` that would not
+    fit (and reserves the published list, `GraphPub::reserve_voices`), and
+    frees whatever comes back through `VoiceBack`. The old path
+    dropped a replaced voice's buffer in `render` and went silent past 32
+    voices. Voice messages are drained before every structural command,
+    so what the host sent before a load is in place when the load binds.
 
 ## Working on kabelsalat
 
@@ -554,7 +587,7 @@ Learned so far (2026-11-15, UI polish pass):
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
   real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
-  `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
+  `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,

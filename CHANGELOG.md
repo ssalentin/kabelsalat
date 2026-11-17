@@ -48,6 +48,27 @@ releases may still change behaviour and session files.
 - **Sound libraries are scanned off the UI thread** (rule 46): the first
   `list_sounds` walked about 3000 patch files on it. An agent call that
   arrives during a scan waits for it.
+- **Any number of CLAP instruments** (#2): every Surge XT, Dexed, YANES or
+  other CLAP unit in the rack gets its own sounding voice. The app hosts a
+  voice when a unit appears (add rig, add instrument, template, session or
+  rig preset load, undo) and frees it when the unit goes. The fixed pool of
+  four Surge voices is gone: a fifth synth is no longer silent, "+ Rig"
+  always builds Keys → Surge → Master, and the keyboard/hardware switches,
+  the pinned MIDI device and the patch name work for every CLAP unit.
+  `kabelsalat many-voices-test` hosts eight Surge XT plus Dexed and YANES,
+  plays them all and frees them.
+
+### Fixed
+- **The app and the engine could disagree on which synth plays which unit:**
+  after a CLAP unit was removed (agent, MCP), sounds, parameter edits and
+  saved state of the remaining synth went to the freed instance. The engine
+  now publishes which voice plays which unit and the app follows it.
+- **Input switches survive rig edits and undo:** adding or deleting a rig
+  turned every synth's keyboard/hardware switch back on, and undo lost a
+  synth's pinned MIDI device. A synth that had its keyboard switched off
+  no longer stays deaf after a template or session load.
+- **Crash with more synths than voices:** an undo (or a source/device edit)
+  in a session with five or more CLAP units panicked.
 - **Held notes stay lit** on the software keyboard and the Keys unit for as
   long as they are pressed, from a hardware keyboard too (they only blinked).
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.

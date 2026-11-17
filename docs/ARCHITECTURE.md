@@ -16,11 +16,22 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   `RigSnapshot`, `merge_rigs`/`split_rigs`, the lock-free `command_bus()` (rtrb).
 - `engine.rs` — `GraphEngine`: voices → DSP → LV2 → per-rig mix → master
   limiter → master saturation. Sums every MasterOut (one per rig). Publishes
-  `GraphPub` (graph, rules, mix) and edge levels to the UI; the render path is
-  allocation- and lock-free, structural ops apply at block boundaries.
+  `GraphPub` (graph, rules, mix, voice binding) and edge levels to the UI; the
+  render path is allocation- and lock-free, structural ops apply at block
+  boundaries. One voice per Clap node, any number: the engine binds voices
+  to nodes (`bind_free_voices`: graph order, lowest free voice id of the
+  node's plugin) and publishes the binding; the voice host sends voices,
+  larger tables and retire requests through `VoiceMsg` and frees what comes
+  back through `VoiceBack`, so the audio thread never allocates or frees
+  for a voice.
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
   plugin scan with a cache, Surge/Dexed patch files.
+  plugin scan with a cache, Surge/Dexed patch helpers. The app is the voice
+  host (`DemoApp::sync_clap_slots`, on the UI thread = the plugins' main
+  thread): it instantiates a voice for every CLAP unit the engine has none
+  for and retires voices no unit plays. Headless `kabelsalat mcp` hosts
+  only its two startup voices.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
   MIDNAM programme names, loader thread, `LILV_LOCK`.
 - `sounds.rs` — one sound library per instrument a rig can hold. The
@@ -139,6 +150,12 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   of 4 Surge instances, idle voices not rendered); each rig chip has × with a
   "Delete rig?" confirmation. Surviving rigs keep patch, knobs, synth state,
   device binding and mix (split_rigs → edit → merge_rigs → one LoadRigs).
+- **2026-11-17** — **No voice pool** ("remove the hard limit of surge
+  instances", #2): voices are hosted on demand, one per CLAP unit, and
+  retired when the unit goes; no idle spares (a warm Surge instance loads in
+  about 40 ms, a first one in about 170 ms, measured by `many-voices-test`).
+  No cap on the count: the engine's voice table grows by a table swap. CPU is
+  the only limit, visible as `render_max_us` / `render_late` in get_status.
 - **2026-11-15** — **Mixer is its own view** (user: "volume of the rigs at the
   top doesn't make sense"): vol/pan/M/S left the strip; the Mixer stage
   (chip / F10) shows every source → its rig bus → Master out as channel strips.

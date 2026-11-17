@@ -1904,6 +1904,12 @@ struct DemoApp {
 
 impl DemoApp {
     fn new_with_sink(note_sink: Option<NoteSink>) -> Self {
+        Self::new_app(note_sink, !cfg!(test), Assistant::new())
+    }
+
+    /// `hw_scan` false = no hardware MIDI thread (tests and agent-eval never
+    /// scan the machine's devices, rule 48).
+    fn new_app(note_sink: Option<NoteSink>, hw_scan: bool, assistant: Assistant) -> Self {
         let mut app = Self {
             units: Vec::new(),
             cables: Vec::with_capacity(MAX_CABLES),
@@ -2044,7 +2050,7 @@ impl DemoApp {
             load_as_rigs: None,
             had_kb_focus: true,
             rig_sources: [(true, true); VOICE_POOL],
-            assistant: Assistant::new(),
+            assistant,
             key_input: String::new(),
             chat_input: String::new(),
             octave: 4,
@@ -2111,7 +2117,7 @@ impl DemoApp {
 
         // Hardware MIDI: a thread connects what is plugged in now and keeps
         // rescanning, so devices plugged in later are picked up too.
-        if !cfg!(test) {
+        if hw_scan {
             spawn_hw_midi(app.hw_midi.clone(), app.hw_queue.clone(), app.hw_cc_queue.clone(), app.hw_direct.clone());
         }
 
@@ -2822,14 +2828,6 @@ impl DemoApp {
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
-        self.clap_voice_ids = voice_ids;
-        self.clap_slot_map = (0..mains.len()).map(Some).collect();
-        self._surge_main = mains;
-        self.surge_controllers = controllers;
-        self.sample_rate = sample_rate;
-        self.voice_tx = Some(voice_tx);
-        self.voice_retire_rx = Some(voice_retire_rx);
         self._audio_stream = Some(stream);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         if self.count_in_enabled || self.count_in_bars != 1 {
@@ -2838,12 +2836,37 @@ impl DemoApp {
                 bars: self.count_in_bars,
             });
         }
-        self.bus = Some(bus);
+        self.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, voice_retire_rx, bus);
         self.out_level = Some(level);
-        self.surge_status = "Surge loaded — play!".into();
         self.start_input_device_scan();
         self.start_audio_out_thread();
         self
+    }
+
+    /// Bind the app to an engine and its synth voice pool: everything the
+    /// agent's tools need (command bus, voice mains for load_sound/sessions).
+    /// The real app adds the audio stream and device threads on top;
+    /// agent-eval runs on exactly this with an offline engine.
+    fn attach_engine(
+        &mut self,
+        mains: Vec<ClapVoiceMain>,
+        controllers: Vec<VoiceController>,
+        voice_ids: Vec<u64>,
+        sample_rate: f64,
+        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
+        voice_retire_rx: rtrb::Consumer<ClapVoice>,
+        bus: Arc<Mutex<CommandBus>>,
+    ) {
+        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
+        self.clap_voice_ids = voice_ids;
+        self.clap_slot_map = (0..mains.len()).map(Some).collect();
+        self._surge_main = mains;
+        self.surge_controllers = controllers;
+        self.sample_rate = sample_rate;
+        self.voice_tx = Some(voice_tx);
+        self.voice_retire_rx = Some(voice_retire_rx);
+        self.bus = Some(bus);
+        self.surge_status = "Surge loaded — play!".into();
     }
 
     /// Output selection + other apps' streams: scan every second (sooner when
@@ -3367,6 +3390,7 @@ impl DemoApp {
                     let chat: Vec<String> = list.into_iter().filter(|m| m.contains("chat") || m.contains("reason") || m.contains("flash") || m.contains("v3") || m.contains("v4")).collect();
                     if !chat.is_empty() { self.assistant.models = chat; }
                 }
+                FromWorker::Step(_) => {}
                 FromWorker::Done => self.assistant.busy = false,
                 FromWorker::Error(e) => {
                     self.assistant.busy = false;
@@ -12038,6 +12062,408 @@ pub fn run_session_test() -> anyhow::Result<()> {
 
     let _ = std::fs::remove_dir_all(&dir);
     println!("session-test: OK — capture→save→load→restore ({edges} edges, 3 knobs) + 3 templates + lv2 browser + demo restore");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// agent-eval: the real agent loop against a headless app + offline engine
+// ---------------------------------------------------------------------------
+
+/// The patch a task starts from.
+#[derive(Clone, Copy)]
+enum EvalStart {
+    /// What the app opens with: one rig, Keys → Surge A/B → Delay A/B → Master.
+    Demo,
+    /// Keys → Surge → Master.
+    OneRig,
+    /// Rig A: Keys → Surge → Delay → Master. Rig B: Keys → Surge → Master.
+    TwoRigs,
+}
+
+/// One scripted request and what the app must look like afterwards.
+struct EvalTask {
+    name: &'static str,
+    start: EvalStart,
+    prompt: &'static str,
+    /// Err says what is off. Gets the agent's final reply for questions.
+    check: fn(&mut DemoApp, &str) -> Result<(), String>,
+}
+
+fn eval_ensure(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(why()) }
+}
+
+fn eval_graph(app: &DemoApp) -> Graph {
+    app.shared_graph.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn eval_node(g: &Graph, rig: u8, what: &str, is: impl Fn(&NodeKind) -> bool) -> Result<u32, String> {
+    g.nodes.iter().find(|n| n.rig == rig && is(&n.kind)).map(|n| n.id)
+        .ok_or_else(|| format!("no {what} in rig {}", rig + 1))
+}
+
+fn eval_named(g: &Graph, name: &str) -> Result<u32, String> {
+    g.nodes.iter().find(|n| name_str(&n.name) == name).map(|n| n.id).ok_or_else(|| format!("no node named {name}"))
+}
+
+/// Does audio flow from `from` to `to` along the cables?
+fn eval_audio_path(g: &Graph, from: u32, to: u32) -> bool {
+    let mut seen = vec![from];
+    let mut i = 0;
+    while i < seen.len() {
+        let at = seen[i];
+        if at == to { return true; }
+        for e in g.edges.iter().filter(|e| e.kind == CPortKind::Audio && e.from.node == at) {
+            if !seen.contains(&e.to.node) { seen.push(e.to.node); }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn eval_midi_cable(g: &Graph, from: u32, port: u8, to: u32) -> bool {
+    g.edges.iter().any(|e| e.kind == CPortKind::Midi && e.from.node == from && e.from.port == port && e.to.node == to)
+}
+
+/// "category/name" (lower case) of the patch loaded into `rig`'s synth.
+fn eval_patch(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let multi = app.rig_count() > 1;
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| !multi || u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let name = app.patch_names.get(slot).cloned().flatten()
+        .ok_or_else(|| format!("rig {} still plays the init patch", rig + 1))?;
+    let category = app.surge_patches().iter().find(|p| p.name == name).map(|p| p.category.clone()).unwrap_or_default();
+    Ok(format!("{category}/{name}").to_lowercase())
+}
+
+/// The rig's one unit of `kind` (asking for "a delay" must not leave two).
+fn eval_one_dsp(g: &Graph, rig: u8, kind: &DspKind) -> Result<u32, String> {
+    let found: Vec<u32> = g.nodes.iter().filter(|n| n.rig == rig && n.kind == NodeKind::Dsp(kind.clone())).map(|n| n.id).collect();
+    match found[..] {
+        [one] => Ok(one),
+        _ => Err(format!("rig {} has {} {kind:?} unit(s), expected 1", rig + 1, found.len())),
+    }
+}
+
+/// One effect of `kind` that the rig's synth feeds and that reaches the master.
+fn eval_effect_in_chain(g: &Graph, rig: u8, kind: DspKind) -> Result<(), String> {
+    let fx = eval_one_dsp(g, rig, &kind)?;
+    let synth = eval_node(g, rig, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+    let master = eval_node(g, rig, "master", |k| matches!(k, NodeKind::MasterOut))?;
+    eval_ensure(eval_audio_path(g, synth, fx), || format!("the synth does not feed the {kind:?}"))?;
+    eval_ensure(eval_audio_path(g, fx, master), || format!("the {kind:?} does not reach the master"))
+}
+
+const EVAL_TASKS: &[EvalTask] = &[
+    EvalTask {
+        name: "tempo", start: EvalStart::Demo, prompt: "Set the tempo to 100 BPM.",
+        check: |app, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+    },
+    EvalTask {
+        name: "ask_tempo", start: EvalStart::Demo, prompt: "What tempo are we at?",
+        check: |app, reply| {
+            eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
+            eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
+        },
+    },
+    EvalTask {
+        name: "split_c4", start: EvalStart::Demo, prompt: "Split the keyboard at C4.",
+        check: |app, _| {
+            let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))
+        },
+    },
+    EvalTask {
+        name: "split_zones", start: EvalStart::Demo,
+        prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
+            let (a, b) = (eval_named(&g, "SURGE A")?, eval_named(&g, "SURGE B")?);
+            let split = g.node(keys).and_then(|n| n.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, a), || "LOW is not wired to Surge A".into())?;
+            eval_ensure(eval_midi_cable(&g, keys, 1, b), || "HIGH is not wired to Surge B".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 0, b), || "Surge B still plays the low half".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 1, a), || "Surge A also plays the high half".into())
+        },
+    },
+    EvalTask {
+        name: "warm_pad", start: EvalStart::OneRig, prompt: "Load a warm pad.",
+        check: |app, _| {
+            let patch = eval_patch(app, 0)?;
+            eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
+        },
+    },
+    EvalTask {
+        name: "add_reverb", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and wire it in.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 1 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 2 got a reverb too".into())
+        },
+    },
+    EvalTask {
+        name: "delay_after_synth", start: EvalStart::OneRig, prompt: "Put a delay after the synth.",
+        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
+    },
+    EvalTask {
+        name: "remove_delay", start: EvalStart::TwoRigs, prompt: "Remove the delay from rig 1.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
+            let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, synth, master), || "rig 1's synth no longer reaches its master".into())?;
+            let rig_b = g.nodes.iter().filter(|n| n.rig == 1).count();
+            eval_ensure(rig_b == 3, || format!("rig 2 changed ({rig_b} units)"))
+        },
+    },
+    EvalTask {
+        name: "metronome", start: EvalStart::OneRig, prompt: "Add a metronome and start it.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, metro, master), || "the metronome is not wired to the master".into())?;
+            eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
+        },
+    },
+    EvalTask {
+        name: "add_rig", start: EvalStart::Demo, prompt: "Add a new rig.",
+        check: |app, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
+    },
+    EvalTask {
+        name: "rig2_volume", start: EvalStart::TwoRigs, prompt: "Set rig 2 volume to 50 %.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "mute_rig1", start: EvalStart::TwoRigs, prompt: "Mute rig 1.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
+            eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
+        },
+    },
+    EvalTask {
+        name: "delete_rig2", start: EvalStart::TwoRigs, prompt: "Delete rig 2.",
+        check: |app, _| {
+            eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
+            let asked = app.pending_confirm.as_ref()
+                .is_some_and(|p| p.tool == "delete_rig" && p.args.get("rig").and_then(|r| r.as_u64()) == Some(1));
+            eval_ensure(asked, || format!("no Confirm prompt for rig 2 (pending: {:?})", app.pending_confirm.as_ref().map(|p| &p.label)))
+        },
+    },
+    EvalTask {
+        name: "bass_rig", start: EvalStart::OneRig, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        check: |app, _| {
+            eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
+            let patch = eval_patch(app, 1)?;
+            eval_ensure(patch.contains("bass"), || format!("the new rig plays {patch}, not a bass"))?;
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure(b < a, || format!("the new rig is not quieter (rig 1 {a:.2}, rig 2 {b:.2})"))
+        },
+    },
+];
+
+/// A headless app on an offline engine: no window, no audio device, no
+/// hardware scan. Frames run the app's real frame path; each frame renders
+/// one engine block so commands and publications flow as in the live app.
+struct EvalRig {
+    // Declared first so it drops first: it owns the voices' audio halves.
+    engine: GraphEngine,
+    app: DemoApp,
+    ctx: egui::Context,
+    buf: Vec<f32>,
+    started: std::time::Instant,
+}
+
+type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
+
+impl EvalRig {
+    fn new(assistant: Assistant, plugins: &EvalPlugins) -> anyhow::Result<Self> {
+        let sample_rate = 48000.0;
+        let mut voices = Vec::with_capacity(VOICE_POOL);
+        let mut mains = Vec::with_capacity(VOICE_POOL);
+        for i in 0..VOICE_POOL {
+            let (v, m) = ClapVoice::new(sample_rate)?;
+            voices.push((match i { 0 => 1, 1 => 4, _ => u32::MAX }, v));
+            mains.push(m);
+        }
+        let controllers = voices.iter().map(|(_, v)| v.controller()).collect();
+        let voice_ids = voices.iter().map(|(_, v)| v.voice_id()).collect();
+        let (bus, drain) = crate::control::command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
+        let mut app = DemoApp::new_app(None, false, assistant);
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
+        let (voice_tx, voice_rx) = rtrb::RingBuffer::new(16);
+        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(16);
+        engine.set_voice_channels(voice_rx, retire_tx);
+        engine.spawn_lv2_loader();
+        app.graph_pub = Some(graph_pub);
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        (app.plugins_clap, app.plugins_lv2) = plugins.clone();
+        app.plugins_loaded = true;
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
+    }
+
+    fn frame(&mut self) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.time = Some(self.started.elapsed().as_secs_f64());
+        let app = &mut self.app;
+        let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        self.engine.render(&mut self.buf, 2);
+    }
+
+    /// Enough frames for the engine to apply what the app sent and for the
+    /// app to adopt what the engine published.
+    fn settle(&mut self) {
+        for _ in 0..8 { self.frame(); }
+    }
+
+    fn load(&mut self, start: EvalStart) -> anyhow::Result<()> {
+        self.settle();
+        match start {
+            EvalStart::Demo => {}
+            EvalStart::OneRig => {
+                let s = crate::session::Session::new("One rig", crate::control::standard_rig_graph(true));
+                self.app.apply_session(&s)?;
+            }
+            EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+        }
+        self.settle();
+        Ok(())
+    }
+}
+
+/// What one run of one task cost and whether the app ended up right.
+struct EvalRun {
+    verdict: Result<(), String>,
+    /// Wall time from the request to the agent's last word.
+    secs: f64,
+    /// The part of `secs` spent waiting for the model (sum of its steps).
+    model_secs: f64,
+    steps: usize,
+    tools: Vec<String>,
+    routed: Vec<String>,
+    reply: String,
+}
+
+/// Longest a turn may take before the run counts as failed.
+const EVAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+fn run_eval_task(task: &EvalTask, model: &str, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
+    let mut rig = EvalRig::new(Assistant::with_model(model.to_string()), plugins)?;
+    anyhow::ensure!(rig.app.assistant.key_set, "no API key for the agent in {}", crate::assistant::config_path().display());
+    rig.load(task.start)?;
+    rig.app.submit_chat(task.prompt.to_string());
+    let sent = std::time::Instant::now();
+    while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
+        rig.frame();
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let timed_out = rig.app.assistant.busy;
+    rig.settle();
+    let turn = rig.app.assistant.turn.clone();
+    let reply = rig.app.assistant.history.iter().rev().find(|l| l.role == "assistant").map(|l| l.text.clone()).unwrap_or_default();
+    let verdict = if timed_out {
+        Err(format!("no answer within {} s", EVAL_TURN_TIMEOUT.as_secs()))
+    } else if let Some(e) = turn.errors.first() {
+        Err(format!("agent error: {e}"))
+    } else {
+        (task.check)(&mut rig.app, &reply)
+    };
+    let mut routed: Vec<String> = turn.steps.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
+    routed.sort();
+    routed.dedup();
+    Ok(EvalRun {
+        verdict,
+        secs: turn.wall.unwrap_or_else(|| sent.elapsed()).as_secs_f64(),
+        model_secs: turn.steps.iter().map(|s| s.ms as f64 / 1000.0).sum(),
+        steps: turn.steps.len(),
+        tools: turn.tools,
+        routed,
+        reply,
+    })
+}
+
+/// Nearest-rank percentile of a non-empty sample (`q` in 0..=1).
+fn eval_percentile(sorted: &[f64], q: f64) -> f64 {
+    let rank = (q * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+fn eval_median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    if n == 0 { 0.0 } else if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
+}
+
+/// `kabelsalat agent-eval [--model <id>] [--runs N] [--task <name>]`: run the
+/// real agent loop over the scripted tasks and report pass rate, model steps,
+/// tool calls, wall time and the model that answered.
+pub fn run_agent_eval() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let model = opt("--model").unwrap_or_else(crate::assistant::load_model);
+    let runs: usize = opt("--runs").map(|r| r.parse()).transpose()?.unwrap_or(1).max(1);
+    let only = opt("--task");
+    let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
+    anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
+        EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
+    // The frame path asks the compositor for its scale otherwise.
+    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
+    let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
+
+    println!("agent-eval: model {model} · {} task(s) x {runs} run(s)", tasks.len());
+    let mut results: Vec<(&EvalTask, Vec<EvalRun>)> = Vec::new();
+    for task in tasks {
+        let mut task_runs = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let run = run_eval_task(task, &model, &plugins)?;
+            let verdict = match &run.verdict { Ok(()) => "PASS".to_string(), Err(why) => format!("FAIL ({why})") };
+            println!("  {:<18} {:>6.2} s ({:.2} s model)  {} step(s)  {} tool(s) [{}]  {}  {verdict}",
+                task.name, run.secs, run.model_secs, run.steps, run.tools.len(), run.tools.join(", "), run.routed.join("+"));
+            if run.verdict.is_err() {
+                println!("    reply: {}", run.reply.replace('\n', " ").chars().take(240).collect::<String>());
+            }
+            task_runs.push(run);
+        }
+        results.push((task, task_runs));
+    }
+
+    println!("\n| task | pass | median s | p90 s | model s | steps | tools | answered by |");
+    println!("|---|---|---|---|---|---|---|---|");
+    let (mut passed, mut total, mut all_secs, mut all_model) = (0, 0, Vec::new(), 0.0);
+    for (task, task_runs) in &results {
+        let ok = task_runs.iter().filter(|r| r.verdict.is_ok()).count();
+        let mut secs: Vec<f64> = task_runs.iter().map(|r| r.secs).collect();
+        secs.sort_by(f64::total_cmp);
+        let mut routed: Vec<String> = task_runs.iter().flat_map(|r| r.routed.clone()).collect();
+        routed.sort();
+        routed.dedup();
+        println!("| {} | {ok}/{} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {} |",
+            task.name, task_runs.len(), eval_median(secs.clone()), eval_percentile(&secs, 0.9),
+            eval_median(task_runs.iter().map(|r| r.model_secs).collect()),
+            eval_median(task_runs.iter().map(|r| r.steps as f64).collect()),
+            eval_median(task_runs.iter().map(|r| r.tools.len() as f64).collect()),
+            routed.join(", "));
+        passed += ok;
+        total += task_runs.len();
+        all_secs.extend(secs);
+        all_model += task_runs.iter().map(|r| r.model_secs).sum::<f64>();
+    }
+    all_secs.sort_by(f64::total_cmp);
+    let wall: f64 = all_secs.iter().sum();
+    println!("\nagent-eval: {model} passed {passed}/{total} ({:.0} %) · wall time per request: median {:.2} s, p90 {:.2} s · total {wall:.1} s, {:.0} % of it waiting for the model",
+        100.0 * passed as f64 / total as f64, eval_median(all_secs.clone()), eval_percentile(&all_secs, 0.9), 100.0 * all_model / wall);
     Ok(())
 }
 

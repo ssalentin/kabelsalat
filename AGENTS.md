@@ -117,7 +117,7 @@ Learned so far (2026-11-15, UI polish pass):
     `assistant::tools()` + `exec_tool` + MCP; destructive ones need
     `confirm=true` after asking the user.
 24. **Live-app automation is focus-guarded:** the user may be using the
-    desktop — send `wtype` keys and take `grim` evidence only after
+    desktop — send `wtype` keys or `scripts/click.sh` clicks and take `grim` evidence only after
     checking `hyprctl activewindow` is kabelsalat (scripts must abort
     otherwise); a stray F12 went to another window once.
 25. **Routing tools update the UI mirror too:** every tool that changes
@@ -692,8 +692,9 @@ Learned so far (2026-11-15, UI polish pass):
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
   shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
   (rule 55), inject keys with `wtype -k F4` (rule 24), then
-  `scripts/shot.sh out.png <pid>` (rule 108). No live click tool is
-  installed; test clicks in egui tests (`click_at`, rule 101).
+  `scripts/shot.sh out.png <pid>` (rule 108). Click with
+  `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
+  points; needs `wlrctl`, here built into `~/.local/bin`).
 - **Hyprland window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
 

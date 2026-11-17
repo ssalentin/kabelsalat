@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::control::{DspKind, Edge, Graph, NodeId, NodeKind, PortKind};
 use crate::llm::{self, Endpoint, LlmError, Role, Route, Transport};
+use crate::vision::Image;
 
 pub fn config_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -105,10 +106,31 @@ pub struct ToolCall {
     pub args: Value,
 }
 
+/// What the user sent: their words, and an image when they attached one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserMessage {
+    pub text: String,
+    pub image: Option<Image>,
+}
+
+/// What a tool call gave back: its result line, and a picture when the tool
+/// shows something (look_at_rack).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolOutput {
+    pub text: String,
+    pub image: Option<Image>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self { text, image: None }
+    }
+}
+
 pub enum ToWorker {
-    User(String),
+    User(UserMessage),
     /// One result per call of the last `FromWorker::ToolCalls`, in call order.
-    ToolResults(Vec<String>),
+    ToolResults(Vec<ToolOutput>),
 }
 
 #[derive(Debug)]
@@ -167,17 +189,24 @@ impl TurnStats {
 
 type SharedRoute = std::sync::Arc<std::sync::Mutex<Route>>;
 
+/// Where each kind of request goes.
+#[derive(Clone)]
+struct Routes {
+    /// The acting chat model, read on every request: switching takes effect
+    /// with the next step, the conversation is kept.
+    act: SharedRoute,
+    /// The decisions model asked first about every request; None = every
+    /// request goes straight to a chat model.
+    decide: Option<Route>,
+    /// The chat model that acts while a turn carries an image.
+    perceive: Route,
+}
+
 pub struct Assistant {
     pub history: Vec<ChatLine>,
     pub busy: bool,
     pub key_set: bool,
-    /// Where the acting model's requests go, read by the worker on every
-    /// request: switching takes effect with the next step, the conversation
-    /// is kept.
-    route: SharedRoute,
-    /// The decisions model asked first about every request; None = every
-    /// request goes straight to the acting model.
-    decide: Option<Route>,
+    routes: Routes,
     /// Models offered in the picker.
     pub models: Vec<String>,
     pub turn: TurnStats,
@@ -210,8 +239,11 @@ impl Assistant {
             history: Vec::new(),
             busy: false,
             key_set: route.endpoint.key().is_some(),
-            route: std::sync::Arc::new(std::sync::Mutex::new(route)),
-            decide,
+            routes: Routes {
+                act: std::sync::Arc::new(std::sync::Mutex::new(route)),
+                decide,
+                perceive: Route::configured(Role::Perceive),
+            },
             models,
             turn: TurnStats::default(),
             tx: None,
@@ -226,7 +258,7 @@ impl Assistant {
     /// The user just stored a DeepSeek key. A route that still has no key
     /// (an OpenRouter model without an OpenRouter key) falls back to it.
     pub fn key_saved(&mut self) {
-        if let Ok(mut route) = self.route.lock() {
+        if let Ok(mut route) = self.routes.act.lock() {
             if route.endpoint.key().is_none() { *route = Route::for_model(llm::DEEPSEEK_CHAT); }
         }
         self.key_set = true;
@@ -238,20 +270,20 @@ impl Assistant {
         let (tx_out, rx_out) = channel::<FromWorker>();
         self.tx = Some(tx_in);
         self.rx = Some(rx_out);
-        let (route, decide) = (self.route.clone(), self.decide.clone());
+        let routes = self.routes.clone();
         // Its own thread: a slow model list must not delay the first request.
         let list_tx = tx_out.clone();
         std::thread::spawn(move || {
             if let Some(ids) = fetch_deepseek_models() { let _ = list_tx.send(FromWorker::Models(ids)); }
         });
         std::thread::spawn(move || match llm::HttpTransport::new() {
-            Ok(transport) => worker(llm::Client::new(transport), route, decide, Endpoint::key, rx_in, tx_out),
+            Ok(transport) => worker(llm::Client::new(transport), routes, Endpoint::key, rx_in, tx_out),
             Err(e) => { let _ = tx_out.send(FromWorker::Error(e)); }
         });
     }
 
     pub fn model(&self) -> String {
-        self.route.lock().map(|r| r.model.clone()).unwrap_or_default()
+        self.routes.act.lock().map(|r| r.model.clone()).unwrap_or_default()
     }
 
     /// Switch the acting model (persisted; applies from the next request).
@@ -260,7 +292,7 @@ impl Assistant {
         let route = Route::for_model(m);
         let spec = route.endpoint.spec();
         let missing_key = route.endpoint.key().is_none() && !cfg!(test);
-        if let Ok(mut cur) = self.route.lock() { *cur = route; }
+        if let Ok(mut cur) = self.routes.act.lock() { *cur = route; }
         let _ = save_config_field(Role::Act.model_field(), m);
         if !self.models.iter().any(|x| x == m) { self.models.push(m.to_string()); }
         if missing_key {
@@ -277,6 +309,11 @@ impl Assistant {
     /// Show `shown` in the transcript but send `sent` (e.g. with a state
     /// header) to the model.
     pub fn send_user_display(&mut self, shown: String, sent: String) {
+        self.send_user_message(shown, UserMessage { text: sent, image: None });
+    }
+
+    /// The same for a message that may carry an image.
+    pub fn send_user_message(&mut self, shown: String, sent: UserMessage) {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
@@ -286,7 +323,7 @@ impl Assistant {
     }
 
     /// Answer a batch from `poll`: one result per call, in call order.
-    pub fn send_tool_results(&mut self, results: Vec<String>) {
+    pub fn send_tool_results(&mut self, results: Vec<ToolOutput>) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::ToolResults(results));
         }
@@ -357,6 +394,9 @@ fn system_prompt() -> String {
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
+     - See: look_at_rack gives you a screenshot of the app window as the user sees it \
+     right now (layout, what is selected, how something looks). The user can also \
+     attach an image to a message; an image is visible only during its own turn.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -428,6 +468,11 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"get_status",
             "description":"Get current audio/MIDI/UI status of the app, including recent MIDI events",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"look_at_rack",
+            "description":"See the app: a screenshot of the whole kabelsalat window as the user sees it right now (rack side in view, units, cables, mixer, open panels). Use it for questions about how something looks, what is selected or where something is; get_graph is the faster source for nodes and cables.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
@@ -1329,20 +1374,36 @@ fn settled_as(d: &llm::Decisions, user: &str) -> String {
     }
 }
 
-/// `kabelsalat jev-test`: ask the configured decisions model about sample
-/// requests and print what it decides, how sure it is and how long it took.
+/// `kabelsalat jev-test [--image <file> <request>]`: ask the configured
+/// decisions model about sample requests and print what it decides, how
+/// sure it is and how long it took. With `--image`, ask about one request
+/// twice, without and with the image, to compare what the image adds.
 pub fn run_jev_test() -> anyhow::Result<()> {
     let route = Route::configured(Role::Decide);
     let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
     let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
     let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B]";
-    println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
-    for request in JEV_SAMPLES {
+    let mut ask = |request: &str, image: Option<&Image>| -> anyhow::Result<String> {
         let user = format!("{context}\n{request}");
-        let d = client.decide(&route, &key, json!(user), decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d = client.decide(&route, &key, &user, image, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let show = |q: &str| d.choice(q).map_or("refused".to_string(), |(c, p)| format!("{c} {p:.2}"));
-        println!("  {:>5} ms  action {:<18} rig {:<10} effect {:<15} sound {:<11} {:<48} {request}  [{}]",
-            d.ms, show("action"), show("rig"), show(EFFECT.key), show(SOUND.key), settled_as(&d, &user), d.model);
+        Ok(format!("  {:>5} ms  action {:<18} rig {:<10} effect {:<15} sound {:<11} {:<48} {request}  [{}]",
+            d.ms, show("action"), show("rig"), show(EFFECT.key), show(SOUND.key), settled_as(&d, &user), d.model))
+    };
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
+    if let Some(at) = args.iter().position(|a| a == "--image") {
+        let (Some(path), Some(request)) = (args.get(at + 1), args.get(at + 2)) else { anyhow::bail!("usage: jev-test --image <file> <request>") };
+        let image = Image::from_file(path, &std::fs::read(path)?).map_err(anyhow::Error::msg)?;
+        println!("image: {}, {} KB", image.describe(), image.bytes.len() / 1000);
+        for _ in 0..3 {
+            println!("text only{}", ask(request, None)?);
+            println!("with image{}", ask(request, Some(&image))?);
+        }
+        return Ok(());
+    }
+    for request in JEV_SAMPLES {
+        println!("{}", ask(request, None)?);
     }
     Ok(())
 }
@@ -1354,6 +1415,10 @@ const CONTEXT_BUDGET: usize = 60_000;
 /// at the time of the call; the model asks again when it needs fresh data.
 const OLD_RESULT_CHARS: usize = 300;
 
+/// What one image counts against the budget: its base64 text is megabytes
+/// of characters, but a model reads it as about a thousand tokens.
+const IMAGE_CHARS: usize = 4_000;
+
 /// The conversation as whole turns: a user message followed by the model's
 /// messages and their tool results. Trimming drops whole turns from the
 /// front, so a tool result can never lose the call it answers.
@@ -1363,12 +1428,16 @@ struct Conversation {
 }
 
 impl Conversation {
-    /// A new user message. Tool results of earlier turns are shortened.
-    fn start_turn(&mut self, user: String) {
+    /// A new user message. Tool results of earlier turns are shortened and
+    /// their images dropped: an image is sent only during its own turn.
+    fn start_turn(&mut self, user: &UserMessage) {
         for turn in &mut self.turns {
-            for msg in turn.iter_mut() { shorten_tool_result(msg); }
+            for msg in turn.iter_mut() {
+                shorten_tool_result(msg);
+                drop_image(msg);
+            }
         }
-        self.turns.push_back(vec![json!({ "role": "user", "content": user })]);
+        self.turns.push_back(vec![user_message(&user.text, user.image.as_ref())]);
     }
 
     /// Append a message to the current turn.
@@ -1376,8 +1445,13 @@ impl Conversation {
         if let Some(turn) = self.turns.back_mut() { turn.push(msg); }
     }
 
+    /// Does the current turn carry an image (attached, or shown by a tool)?
+    fn has_image(&self) -> bool {
+        self.turns.back().is_some_and(|turn| turn.iter().any(|m| m["content"].is_array()))
+    }
+
     fn chars(&self) -> usize {
-        self.turns.iter().flatten().map(|m| m.to_string().len()).sum()
+        self.turns.iter().flatten().map(message_chars).sum()
     }
 
     /// Bring the conversation under `budget`: drop the oldest turns first;
@@ -1390,7 +1464,7 @@ impl Conversation {
         let Some(turn) = self.turns.back_mut() else { return };
         let latest_step = turn.iter().rposition(|m| m["role"] == "assistant").unwrap_or(turn.len());
         for i in 0..latest_step {
-            if turn.iter().map(|m| m.to_string().len()).sum::<usize>() <= budget { break; }
+            if turn.iter().map(message_chars).sum::<usize>() <= budget { break; }
             shorten_tool_result(&mut turn[i]);
         }
     }
@@ -1401,6 +1475,32 @@ impl Conversation {
             .chain(self.turns.iter().flatten().cloned())
             .collect()
     }
+}
+
+/// A user message: plain text, or text and the image as content parts. The
+/// text names the image, so the note stays when the image is dropped.
+fn user_message(text: &str, image: Option<&Image>) -> Value {
+    match image {
+        None => json!({ "role": "user", "content": text }),
+        Some(image) => json!({ "role": "user", "content": [
+            { "type": "text", "text": format!("{text}\n[image: {}]", image.describe()) },
+            image.chat_part(),
+        ]}),
+    }
+}
+
+fn message_chars(msg: &Value) -> usize {
+    match msg["content"].as_array() {
+        None => msg.to_string().len(),
+        Some(parts) => parts.iter().map(|p| p["text"].as_str().map_or(IMAGE_CHARS, str::len)).sum(),
+    }
+}
+
+/// Replace a message's image by one line that says it was there.
+fn drop_image(msg: &mut Value) {
+    let Some(parts) = msg["content"].as_array() else { return };
+    let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
+    msg["content"] = json!(format!("{} — no longer attached: an image is sent only during its own turn", text.join("\n")));
 }
 
 fn shorten_tool_result(msg: &mut Value) {
@@ -1422,19 +1522,19 @@ enum TurnEnd {
     Answered,
     Failed(String),
     /// The user wrote again while tool calls were out: that message is next.
-    Interrupted(String),
+    Interrupted(UserMessage),
     /// The app is gone.
     Closed,
 }
 
 /// The agent loop: one turn per user message. A decisions model (Jev) is
-/// asked first and settles a simple request with a plan of tool calls; everything
-/// else goes to the acting chat model, whose tool calls travel to the app as
-/// ONE batch per model step and come back as one batch of results.
+/// asked first and settles a simple request with a plan of tool calls;
+/// everything else goes to a chat model (the acting model, or the seeing
+/// model while the turn carries an image), whose tool calls travel to the
+/// app as ONE batch per model step and come back as one batch of results.
 fn worker<T: Transport>(
     mut client: llm::Client<T>,
-    route: SharedRoute,
-    decide: Option<Route>,
+    routes: Routes,
     key_for: fn(Endpoint) -> Option<String>,
     rx: Receiver<ToWorker>,
     tx: Sender<FromWorker>,
@@ -1442,25 +1542,25 @@ fn worker<T: Transport>(
     let system = system_prompt();
     let tools = tools();
     let mut convo = Conversation::default();
-    let mut next_user: Option<String> = None;
+    let mut next_user: Option<UserMessage> = None;
     loop {
         let user = match next_user.take() {
-            Some(text) => text,
+            Some(message) => message,
             None => match rx.recv() {
-                Ok(ToWorker::User(text)) => text,
+                Ok(ToWorker::User(message)) => message,
                 Ok(ToWorker::ToolResults(_)) => continue, // results of a turn that already ended
                 Err(_) => break,
             },
         };
-        convo.start_turn(user.clone());
-        let end = match decide.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
+        convo.start_turn(&user);
+        let end = match routes.decide.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
             Some(end) => end,
-            None => run_turn(&mut client, &route, key_for, &system, &tools, &mut convo, &rx, &tx),
+            None => run_turn(&mut client, &routes, key_for, &system, &tools, &mut convo, &rx, &tx),
         };
         match end {
             TurnEnd::Answered => {}
             TurnEnd::Failed(why) => { let _ = tx.send(FromWorker::Error(why)); }
-            TurnEnd::Interrupted(text) => { next_user = Some(text); continue; }
+            TurnEnd::Interrupted(message) => { next_user = Some(message); continue; }
             TurnEnd::Closed => break,
         }
         let _ = tx.send(FromWorker::Done);
@@ -1469,11 +1569,11 @@ fn worker<T: Transport>(
 
 /// Send one batch of tool calls to the app and take its results (one per
 /// call, in call order). Err = the turn ends here.
-fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWorker>) -> Result<Vec<String>, TurnEnd> {
+fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWorker>) -> Result<Vec<ToolOutput>, TurnEnd> {
     let _ = tx.send(FromWorker::ToolCalls(batch));
     match rx.recv_timeout(TOOL_TIMEOUT) {
         Ok(ToWorker::ToolResults(ran)) => Ok(ran),
-        Ok(ToWorker::User(text)) => Err(TurnEnd::Interrupted(text)),
+        Ok(ToWorker::User(message)) => Err(TurnEnd::Interrupted(message)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             Err(TurnEnd::Failed(format!("the app did not run the tool calls within {} s", TOOL_TIMEOUT.as_secs())))
         }
@@ -1483,22 +1583,42 @@ fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWork
 
 const NOT_RUN: &str = "no result: the call did not run";
 
+/// Record one batch in the conversation the way a chat model's step looks:
+/// the assistant's tool calls, each call's result, then every image a tool
+/// showed (a tool message carries text only). A call without a result gets
+/// `NOT_RUN`: an unanswered call makes the next request invalid.
+fn record_batch(convo: &mut Conversation, calls: &[(Value, &str)], results: Vec<Option<ToolOutput>>) {
+    let mut shown: Vec<Value> = Vec::new();
+    for ((id, name), result) in calls.iter().zip(results) {
+        let out = result.unwrap_or_else(|| NOT_RUN.to_string().into());
+        convo.push(json!({ "role": "tool", "tool_call_id": id, "content": out.text }));
+        if let Some(image) = &out.image {
+            shown.push(user_message(&format!("[what {name} shows]"), Some(image)));
+        }
+    }
+    for message in shown { convo.push(message); }
+}
+
 /// Ask Jev about the request. When it is sure of a shortcut, run that
-/// shortcut's plan and answer; None = the acting model takes the turn (also
+/// shortcut's plan and answer; None = a chat model takes the turn (also
 /// when the decision itself fails: the fast path must never cost a
 /// request), from wherever the plan left off.
 fn decide_turn<T: Transport>(
     client: &mut llm::Client<T>,
     jev: &Route,
     key_for: fn(Endpoint) -> Option<String>,
-    user: &str,
+    user: &UserMessage,
     convo: &mut Conversation,
     rx: &Receiver<ToWorker>,
     tx: &Sender<FromWorker>,
 ) -> Option<TurnEnd> {
-    let decision = client.decide(jev, &key_for(jev.endpoint)?, json!(user), decision_questions()).ok()?;
+    // An image turn goes straight to the seeing model. Measured with
+    // `jev-test --image`: Jev reads a note in an image, but cannot return a
+    // value it states, and what it sees leaks into the rig and slot answers.
+    if user.image.is_some() { return None; }
+    let decision = client.decide(jev, &key_for(jev.endpoint)?, &user.text, None, decision_questions()).ok()?;
     let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
-    let (shortcut, facts, mut step) = settle(&decision, user)?;
+    let (shortcut, facts, mut step) = settle(&decision, &user.text)?;
     let mut done: Vec<String> = Vec::new();
     for round in 0..MAX_PLAN_BATCHES {
         let calls = match step {
@@ -1511,21 +1631,18 @@ fn decide_turn<T: Transport>(
         };
         // The conversation records the calls like a chat model's, so a
         // later chat step knows what was done.
-        let ids: Vec<String> = (0..calls.len()).map(|i| format!("jev-{round}-{i}")).collect();
-        convo.push(json!({ "role": "assistant", "content": null, "tool_calls": calls.iter().zip(&ids).map(|(c, id)| json!({
+        let ids: Vec<(Value, &str)> = calls.iter().enumerate().map(|(i, c)| (json!(format!("jev-{round}-{i}")), c.name.as_str())).collect();
+        convo.push(json!({ "role": "assistant", "content": null, "tool_calls": calls.iter().zip(&ids).map(|(c, (id, _))| json!({
             "id": id, "type": "function", "function": { "name": c.name, "arguments": c.args.to_string() },
         })).collect::<Vec<_>>() }));
-        let (ran, stopped) = match run_batch(calls, rx, tx) {
+        let (ran, stopped) = match run_batch(calls.clone(), rx, tx) {
             Ok(ran) => (ran, None),
             Err(end) => (Vec::new(), Some(end)),
         };
-        // Every call gets its tool message, even when the turn stops here.
         let mut ran = ran.into_iter();
-        for id in &ids {
-            let result = ran.next().unwrap_or_else(|| NOT_RUN.to_string());
-            convo.push(json!({ "role": "tool", "tool_call_id": id, "content": result }));
-            done.push(result);
-        }
+        let results: Vec<Option<ToolOutput>> = calls.iter().map(|_| ran.next()).collect();
+        done.extend(results.iter().map(|r| r.as_ref().map_or(NOT_RUN.to_string(), |out| out.text.clone())));
+        record_batch(convo, &ids, results);
         if stopped.is_some() { return stopped; }
         step = (shortcut.plan)(&facts, &done)?;
     }
@@ -1535,7 +1652,7 @@ fn decide_turn<T: Transport>(
 #[allow(clippy::too_many_arguments)]
 fn run_turn<T: Transport>(
     client: &mut llm::Client<T>,
-    route: &SharedRoute,
+    routes: &Routes,
     key_for: fn(Endpoint) -> Option<String>,
     system: &str,
     tools: &Value,
@@ -1545,10 +1662,16 @@ fn run_turn<T: Transport>(
 ) -> TurnEnd {
     for _ in 0..MAX_STEPS {
         convo.fit(CONTEXT_BUDGET);
-        let route = route.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT));
+        // The acting model may not see images: from the step an image
+        // enters the turn, the seeing model acts.
+        let sees = convo.has_image();
+        let route = if sees { routes.perceive.clone() } else {
+            routes.act.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT))
+        };
         let spec = route.endpoint.spec();
         let Some(key) = key_for(route.endpoint) else {
-            return TurnEnd::Failed(format!("no {} API key: add {} to {}", spec.label, spec.key_field, config_path().display()));
+            let need = if sees { format!("an image needs {} ({})", route.model, spec.label) } else { format!("no {} API key", spec.label) };
+            return TurnEnd::Failed(format!("{need}: add {} to {}", spec.key_field, config_path().display()));
         };
         let body = json!({ "messages": convo.request(system), "tools": tools, "tool_choice": "auto" });
         let done = match client.chat(&route, &key, body) {
@@ -1571,28 +1694,26 @@ fn run_turn<T: Transport>(
 
         // Each call is answered either here (it does not fit its tool) or
         // by the app (it ran).
-        let mut results: Vec<Option<String>> = Vec::with_capacity(calls.len());
+        let mut results: Vec<Option<ToolOutput>> = Vec::with_capacity(calls.len());
         let mut batch: Vec<ToolCall> = Vec::new();
+        let mut ids: Vec<(Value, &str)> = Vec::with_capacity(calls.len());
         for call in &calls {
             let name = call.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
             let raw = call.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("");
+            ids.push((call.get("id").cloned().unwrap_or(Value::Null), name));
             match parse_tool_call(tools, name, raw) {
                 Ok(args) => { batch.push(ToolCall { name: name.to_string(), args }); results.push(None); }
-                Err(why) => results.push(Some(why)),
+                Err(why) => results.push(Some(why.into())),
             }
         }
         let _ = tx.send(step(calls.len() - batch.len()));
-        // Every call gets its tool message, even when the turn stops here:
-        // an unanswered call makes the next request invalid.
         let (ran, stopped) = match if batch.is_empty() { Ok(Vec::new()) } else { run_batch(batch, rx, tx) } {
             Ok(ran) => (ran, None),
             Err(end) => (Vec::new(), Some(end)),
         };
         let mut ran = ran.into_iter();
-        for (call, rejected) in calls.iter().zip(results) {
-            let content = rejected.or_else(|| ran.next()).unwrap_or_else(|| NOT_RUN.to_string());
-            convo.push(json!({ "role": "tool", "tool_call_id": call.get("id").cloned().unwrap_or(Value::Null), "content": content }));
-        }
+        let results = results.into_iter().map(|rejected| rejected.or_else(|| ran.next())).collect();
+        record_batch(convo, &ids, results);
         if let Some(end) = stopped { return end; }
     }
     TurnEnd::Failed(format!("stopped after {MAX_STEPS} model steps without a final answer — say \"continue\" to carry on"))
@@ -1653,20 +1774,35 @@ mod tests {
         drive_with(replies, inbox, Some(Route::for_model(llm::JEV)), |_| Some("test-key".to_string()))
     }
 
+    /// The model that acts while a turn carries an image.
+    const SEEING: &str = "google/gemini-3.8-flash";
+
     fn drive_with(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>, decide: Option<Route>, key_for: fn(Endpoint) -> Option<String>) -> (Vec<FromWorker>, Vec<Value>) {
         let probe = FakeTransport::new(replies);
         let (tx_in, rx_in) = channel();
         let (tx_out, rx_out) = channel();
         for msg in inbox { tx_in.send(msg).unwrap(); }
         drop(tx_in);
-        let route = std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER)));
-        worker(llm::Client::new(probe.clone()), route, decide, key_for, rx_in, tx_out);
+        let routes = Routes {
+            act: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER))),
+            decide,
+            perceive: Route::for_model(SEEING),
+        };
+        worker(llm::Client::new(probe.clone()), routes, key_for, rx_in, tx_out);
         (rx_out.try_iter().collect(), probe.requests().into_iter().map(|(_, _, body)| body).collect())
     }
 
-    fn user(text: &str) -> ToWorker { ToWorker::User(text.to_string()) }
+    fn user(text: &str) -> ToWorker { ToWorker::User(UserMessage { text: text.to_string(), image: None }) }
 
-    fn results(r: &[&str]) -> ToWorker { ToWorker::ToolResults(r.iter().map(|s| s.to_string()).collect()) }
+    fn results(r: &[&str]) -> ToWorker { ToWorker::ToolResults(r.iter().map(|s| s.to_string().into()).collect()) }
+
+    fn image(name: &str) -> Image {
+        Image { name: name.into(), format: crate::vision::Format::Png, bytes: vec![1, 2, 3].into(), size: Some([640, 400]) }
+    }
+
+    fn user_with_image(text: &str) -> ToWorker {
+        ToWorker::User(UserMessage { text: text.to_string(), image: Some(image("note.png")) })
+    }
 
     fn messages(request: &Value) -> &Vec<Value> { request["messages"].as_array().unwrap() }
 
@@ -1785,6 +1921,10 @@ mod tests {
         }
     }
 
+    fn says(text: &str) -> UserMessage {
+        UserMessage { text: text.to_string(), image: None }
+    }
+
     fn tool_step(id: &str, result: &str) -> Vec<Value> {
         vec![
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function", "function": {"name": "get_graph", "arguments": "{}"}}]}),
@@ -1795,12 +1935,12 @@ mod tests {
     #[test]
     fn old_turns_keep_a_short_form_of_their_tool_results() {
         let mut c = Conversation::default();
-        c.start_turn("first".into());
+        c.start_turn(&says("first"));
         for m in tool_step("c1", &"g".repeat(5_000)) { c.push(m); }
         c.push(json!({"role": "assistant", "content": "done"}));
         let result = |msgs: &[Value]| msgs.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
         assert_eq!(result(&c.request("sys")).len(), 5_000, "the current turn keeps its results whole");
-        c.start_turn("second".into());
+        c.start_turn(&says("second"));
         let msgs = c.request("sys");
         assert_no_orphans(&msgs);
         let old = result(&msgs);
@@ -1812,7 +1952,7 @@ mod tests {
     fn over_budget_the_oldest_turns_go_whole_and_the_current_turn_stays() {
         let mut c = Conversation::default();
         for i in 0..6 {
-            c.start_turn(format!("request {i}"));
+            c.start_turn(&says(&format!("request {i}")));
             for m in tool_step(&format!("c{i}"), "ok") { c.push(m); }
             c.push(json!({"role": "assistant", "content": "x".repeat(900)}));
         }
@@ -1829,7 +1969,7 @@ mod tests {
     #[test]
     fn a_turn_too_big_on_its_own_shortens_its_earlier_results_not_the_latest() {
         let mut c = Conversation::default();
-        c.start_turn("build it".into());
+        c.start_turn(&says("build it"));
         for i in 0..3 {
             for m in tool_step(&format!("c{i}"), &format!("{i}").repeat(4_000)) { c.push(m); }
         }
@@ -2271,5 +2411,73 @@ mod tests {
             }
             assert!(said.is_some_and(|text| !text.is_empty()), "{}: no answer within {MAX_PLAN_BATCHES} batches", s.key);
         }
+    }
+
+    #[test]
+    fn a_turn_with_an_image_goes_to_the_seeing_model_and_skips_the_decision() {
+        let (events, requests) = drive_with_jev(vec![text(SEEING, "The note says 90.")], vec![user_with_image("What does the note say?")]);
+        assert_eq!(said(&events), vec!["The note says 90."]);
+        assert_eq!(requests.len(), 1, "no decisions request");
+        assert_eq!(requests[0]["model"], SEEING);
+        let sent = messages(&requests[0]).last().unwrap();
+        assert_eq!(sent["role"], "user");
+        assert_eq!(sent["content"], json!([
+            {"type": "text", "text": "What does the note say?\n[image: note.png (640×400 px)]"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
+        ]));
+    }
+
+    #[test]
+    fn an_image_is_sent_only_during_its_own_turn() {
+        let (_, requests) = drive(
+            vec![text(SEEING, "It says 90."), text("m", "Yes.")],
+            vec![user_with_image("What does the note say?"), user("Thanks. Still there?")],
+        );
+        assert_eq!(requests[1]["model"], llm::JEV_ROUTER, "a text turn is back on the acting model");
+        let msgs = messages(&requests[1]);
+        assert!(!requests[1].to_string().contains("image_url"), "no image in the next turn's request");
+        let old = msgs.iter().find(|m| m["role"] == "user").unwrap()["content"].as_str().expect("the old message is plain text again");
+        assert!(old.starts_with("What does the note say?\n[image: note.png (640×400 px)] — no longer attached"), "{old}");
+        assert!(msgs.iter().any(|m| m["content"] == "It says 90."), "what was seen stays as the answer");
+    }
+
+    #[test]
+    fn an_image_a_tool_shows_follows_the_tool_results_and_moves_the_turn_to_the_seeing_model() {
+        let shot = ToolOutput { text: "screenshot of the kabelsalat window: window (640×400 px)".into(), image: Some(image("window")) };
+        let (events, requests) = drive(
+            vec![calls(&[("c1", "look_at_rack", "{}"), ("c2", "get_status", "{}")]), text(SEEING, "The mixer is open.")],
+            vec![user("What is on screen?"), ToWorker::ToolResults(vec![shot, "{}".to_string().into()])],
+        );
+        assert_eq!(said(&events), vec!["The mixer is open."]);
+        assert_eq!(requests[0]["model"], llm::JEV_ROUTER, "the acting model asks to look");
+        assert_eq!(requests[1]["model"], SEEING, "the seeing model reads the screenshot");
+        let msgs = messages(&requests[1]);
+        assert_no_orphans(&msgs[1..]);
+        let roles: Vec<&str> = msgs[1..].iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "tool", "user"], "the image comes after every tool result");
+        assert_eq!(msgs[3]["content"], "screenshot of the kabelsalat window: window (640×400 px)");
+        assert_eq!(msgs[5]["content"][0]["text"], "[what look_at_rack shows]\n[image: window (640×400 px)]");
+        assert_eq!(msgs[5]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn an_image_counts_as_a_page_of_text_not_as_its_megabytes() {
+        let mut c = Conversation::default();
+        c.start_turn(&says("earlier"));
+        c.push(json!({"role": "assistant", "content": "ok"}));
+        let big = Image { bytes: vec![7; 300_000].into(), ..image("big.png") };
+        c.start_turn(&UserMessage { text: "look".into(), image: Some(big) });
+        assert!(c.request("sys").last().unwrap().to_string().len() > CONTEXT_BUDGET, "the base64 alone is past the budget");
+        c.fit(CONTEXT_BUDGET);
+        assert_eq!(c.turns.len(), 2, "the earlier turn stays");
+        assert!(c.has_image());
+        assert!(c.chars() < 2 * IMAGE_CHARS);
+    }
+
+    #[test]
+    fn an_image_without_a_key_for_the_seeing_model_is_named_and_nothing_is_sent() {
+        let (events, requests) = drive_with(vec![], vec![user_with_image("what is this?")], None, |_| None);
+        assert!(requests.is_empty());
+        assert!(matches!(&events[..], [FromWorker::Error(e), FromWorker::Done] if e.contains("an image needs google/gemini-3.8-flash") && e.contains("openrouter_api_key")), "{events:?}");
     }
 }

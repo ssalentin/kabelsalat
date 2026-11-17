@@ -623,6 +623,21 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **Delete build output you no longer need:** parallel sessions left a
+    dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
+    copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
+    held in RAM) reached 98 %, swap filled, and a build killed the session.
+    When your PR is merged or your work is abandoned, `rm -rf` your own
+    `CARGO_TARGET_DIR` and the binaries you copied. Before a long build,
+    check `df -h /tmp ~` and `free -h`. You may delete another session's
+    target dir only when no process uses it (`pgrep -fa <dir>` is empty)
+    and its branch is merged.
+119. **A column sized beside another takes what is left in the row:** the
+    Sessions list was sized `avail - left - 25`, but the row's item spacing
+    sat between the columns too, so the Delete button ran 6 pt past the
+    sheet. Size the last column from `ui.available_width()` at the point you
+    allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
+    checks the row buttons stay inside the sheet).
 
 ## Working on kabelsalat
 

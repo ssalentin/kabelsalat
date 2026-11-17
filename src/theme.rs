@@ -39,6 +39,7 @@ pub const DARK_PANEL: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // rack cha
 pub const DARK_PANEL_HI: Color32 = Color32::from_rgb(0x23, 0x21, 0x20); // plates, rails, plugs
 pub const SCRIM: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // help backdrop (α 0.62)
 pub const CREAM: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9); // primary text on dark
+pub const CREAM_META: Color32 = Color32::from_rgb(0xCC, 0xCB, 0xC6); // secondary metadata on dark (11.5:1 on PAPER, dimmer than CREAM)
 pub const CREAM_MID: Color32 = Color32::from_rgb(0xB4, 0xB4, 0xB0); // rack micro-labels (crisp on near-black)
 /// Engaged chip fill: a slightly warmed cream so ON chips read as part of the
 /// dark language, not OS-white (DARK_PANEL text on it ≈ 13:1).
@@ -61,11 +62,12 @@ pub const LIVE_TEAL: Color32 = Color32::from_rgb(0x2E, 0x9E, 0x9B); // active / 
 pub const LIVE_TEAL_DEEP: Color32 = Color32::from_rgb(0x1F, 0x7A, 0x70); // active text on paper
 /// Semantic agent highlight (consistent across rack, cables, matrix, and assistant).
 pub const AGENT_COLOR: Color32 = LIVE_TEAL;
+pub const AGENT_TEXT: Color32 = Color32::from_rgb(0x72, 0xBA, 0xB5); // legible agent teal text on dark (8.8:1 on PAPER)
 pub const AGENT_COLOR_TEXT: Color32 = DARK_PANEL;
 pub const CLIP_RED: Color32 = Color32::from_rgb(0xD9, 0x25, 0x1C); // clip graphics
 pub const CLIP_TEXT: Color32 = Color32::from_rgb(0xB9, 0x1C, 0x14); // danger text on paper
-#[allow(dead_code)] // reserved token (§3.1): danger text on dark, no call site yet
 pub const CLIP_BRIGHT: Color32 = Color32::from_rgb(0xF0, 0x55, 0x4A); // danger text on dark
+pub const DANGER_BG: Color32 = Color32::from_rgb(0x2B, 0x18, 0x17); // outlined danger button fill (4.9:1 with CLIP_BRIGHT)
 
 // Cable-salad palette (user request 2026-11-15): harmonious jacket colors for
 // the back panel, split by family so the audio≠MIDI hue semantics survive:
@@ -99,6 +101,19 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let [br, bg, bb, _] = b.to_array();
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
     Color32::from_rgb(l(ar, br), l(ag, bg), l(ab, bb))
+}
+
+#[cfg(test)]
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let lum = |c: Color32| {
+        let ch = |u: u8| {
+            let s = u as f32 / 255.0;
+            if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+    };
+    let (la, lb) = (lum(a), lum(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +489,7 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// driven by the widget visuals so hover feedback applies.
 pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     ui.scope(|ui| {
-        let (fill, txt) = if on { (CHIP_ON, DARK_PANEL) } else { (DARK_PANEL_HI, CREAM_MID) };
+        let (fill, txt) = if on { (CHIP_ON, DARK_PANEL) } else { (DARK_PANEL_HI, CREAM) };
         let base = egui::style::WidgetVisuals {
             bg_fill: fill,
             weak_bg_fill: fill,
@@ -506,6 +521,50 @@ pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
                 .min_size(egui::vec2(0.0, 26.0)),
         )
     }).inner
+}
+
+/// Destructive action button (Delete, Confirm delete): outlined uses
+/// `DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text so it never reads as
+/// the solid tomato primary CTA (`ACCENT_DEEP`).
+pub fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Response {
+    ui.scope(|ui| {
+        let (fill, stroke, txt) = if filled {
+            (CLIP_RED, CLIP_RED, ON_ACCENT)
+        } else {
+            (DANGER_BG, CLIP_RED, CLIP_BRIGHT)
+        };
+        let base = egui::style::WidgetVisuals {
+            bg_fill: fill,
+            weak_bg_fill: fill,
+            bg_stroke: Stroke::new(1.0, stroke),
+            corner_radius: 2.0.into(),
+            fg_stroke: Stroke::new(1.0, txt),
+            expansion: 0.0,
+        };
+        let hot_fill = if filled {
+            mix(CLIP_RED, INK, 0.08)
+        } else {
+            mix(DANGER_BG, PAPER_SINK, 0.25)
+        };
+        let hot = egui::style::WidgetVisuals {
+            bg_fill: hot_fill,
+            weak_bg_fill: hot_fill,
+            bg_stroke: Stroke::new(1.0, if filled { hot_fill } else { CLIP_BRIGHT }),
+            ..base
+        };
+        let v = ui.visuals_mut();
+        v.widgets.inactive = base;
+        v.widgets.hovered = hot;
+        v.widgets.active = hot;
+        v.widgets.open = base;
+        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+        ui.add(
+            egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
+                .corner_radius(2.0)
+                .min_size(egui::vec2(0.0, 26.0)),
+        )
+    })
+    .inner
 }
 
 /// Action button for adding a rig in the rig strip: same 26px chip height and

@@ -417,6 +417,12 @@ Learned so far (2026-11-15, UI polish pass):
     painting `AGENT_COLOR_TEXT` (`#1C1C1C`) on `alpha(AGENT_COLOR, t)` over a
     `#1C1C1C` plate leaves an empty dark rectangle for `t <= 0.38`
     (`bug2_untouched_units_paint_no_agent_badge_rect`).
+85. **Destructive confirms use `theme::danger_button(..., false)` (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text), never `theme::primary_button`:**
+    `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
+86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
+    duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
+87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`, and attachment thumbnails drop their `TextureHandle` on clear:**
+    align `Confirm`/`Cancel` and the attachment chip to the message text column (`78.0` px), load the ~32 px thumbnail once per `Image::bytes` Arc (`sync_chat_thumb`), and clear `chat_thumb` on removal/submit so egui frees the texture (`agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle`).
 
 ## Working on kabelsalat
 

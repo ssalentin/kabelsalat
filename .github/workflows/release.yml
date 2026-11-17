@@ -164,7 +164,13 @@ jobs:
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Create or update the GitHub release
         run: |
-          scripts/ci/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
+          {
+            scripts/ci/release-notes.sh "$VERSION"
+            printf '\n## Download\n\n'
+            printf 'Recommended: **kabelsalat-%s-<arch>.AppImage** (x86_64 or aarch64): `chmod +x` it and run it. ' "$VERSION"
+            printf 'It finds your installed CLAP/LV2 plugins and gets realtime audio priority. '
+            printf 'The Flatpak, tarball and Arch packages are attached too; see docs/PACKAGING.md for their limits.\n'
+          } > "$RUNNER_TEMP/notes.md"
           if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
           else

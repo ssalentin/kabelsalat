@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: scripts/ci/ubuntu-deps.sh
+      # A real LV2 instrument, so lv2::tests::setbfree_plays_a_note runs
+      # through lilv instead of skipping.
+      - name: Install test plugins
+        run: sudo apt-get install -y -q --no-install-recommends setbfree
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked
+      - name: Test
+        run: scripts/ci/test.sh
+
+  flatpak-sources:
+    name: flatpak cargo-sources.json is current
+    runs-on: ubuntu-24.04
+    container: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+    steps:
+      - uses: actions/checkout@v7
+      - name: Regenerate from Cargo.lock
+        run: flatpak-cargo-generator Cargo.lock -o "$RUNNER_TEMP/cargo-sources.json"
+      - name: Compare
+        run: |
+          if ! diff -q packaging/flatpak/cargo-sources.json "$RUNNER_TEMP/cargo-sources.json"; then
+            echo "::error file=packaging/flatpak/cargo-sources.json::stale; run packaging/flatpak/update-cargo-sources.sh and commit the result"
+            exit 1
+          fi

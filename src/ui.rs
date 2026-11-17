@@ -19,7 +19,7 @@
 //! arc-length LUTs, cached galleys, fixed pulse arrays — no per-frame
 //! allocation storms. Pure snapshot-style simulation; never touches audio.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -28,14 +28,15 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, FromWorker};
+use crate::assistant::{Assistant, ChatLine, ToolCall, ToolOutput, UserMessage};
+use crate::vision::Image;
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
 use crate::engine::{
-    AudioInLevels, EdgeLevels, GraphEngine, P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX,
-    P_TIME, P_VOL, P_WARM,
+    AudioInLevels, EdgeLevels, GraphEngine, VoiceBack, VoiceMsg, VoiceSlot, P_AUDIO_IN_GAIN,
+    P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM,
 };
 use crate::host::{
     list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
@@ -86,8 +87,9 @@ const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fi
 
 /// The reference CLAP instrument (docs/ARCHITECTURE.md §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
-const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
-const DEXED_ID: &str = "com.digital-suburban.dexed";
+use crate::sounds::{DEXED_ID, SURGE_ID};
+/// Ring slots between the voice host (this thread) and the audio thread.
+const VOICE_RING: usize = 64;
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
@@ -517,9 +519,19 @@ impl PortKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side { Front, Back }
 
+const KNOB_GLIDE_SECS: f32 = 0.20;
+const CABLE_DRAW_IN_SECS: f32 = 0.28;
+const UNIT_FADE_SECS: f32 = 0.24;
+const AGENT_PULSE_SECS: f32 = 0.38;
+
 struct Knob {
     label: String,
+    /// Target/logical value published immediately to the engine (rule 31).
     value: f32,
+    /// Visual needle/arc value (equals `value` on drag/load, glides on agent edits).
+    display_value: f32,
+    glide_from: f32,
+    glide_t: f32,
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
@@ -532,10 +544,54 @@ struct Knob {
     /// A Surge parameter pinned from the synth editor: the knob drives the
     /// PLUGIN parameter (0..1 mapped onto min..max), sent only on change.
     clap: Option<ClapPin>,
+    /// Where the knob comes from: the unit's own table, or a plugin parameter.
+    source: KnobSource,
     label_g: Option<Arc<theme::TrackedLabel>>,
 }
 
+/// A knob's origin. Plugin knobs carry the parameter's full name, which
+/// agents and CC bindings may use instead of the short face label.
+#[derive(Clone, PartialEq)]
+enum KnobSource {
+    /// From `engine::knob_specs`.
+    BuiltIn,
+    /// One of the instrument's main controls (`main_controls::resolve`).
+    Main(String),
+    /// Pinned by hand from the synth editor.
+    Pinned(String),
+}
+
+impl KnobSource {
+    fn plugin_name(&self) -> Option<&str> {
+        match self {
+            KnobSource::BuiltIn => None,
+            KnobSource::Main(n) | KnobSource::Pinned(n) => Some(n),
+        }
+    }
+}
+
 impl Knob {
+    fn set_immediate(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        self.display_value = v;
+        self.glide_from = v;
+        self.glide_t = 1.0;
+    }
+
+    fn glide_to(&mut self, v: f32, reduce_motion: bool) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        if reduce_motion || (self.display_value - v).abs() < 1e-4 {
+            self.display_value = v;
+            self.glide_from = v;
+            self.glide_t = 1.0;
+        } else {
+            self.glide_from = self.display_value;
+            self.glide_t = 0.0;
+        }
+    }
+
     /// Engine or plugin target this knob controls, if bindable to MIDI CC.
     fn cc_target(&self) -> Option<(u32, crate::matrix::CcTarget)> {
         if let Some(pin) = self.clap {
@@ -547,10 +603,27 @@ impl Knob {
 }
 
 #[derive(Clone, Copy)]
-struct ClapPin { id: u32, min: f64, max: f64, sent: f32 }
+struct ClapPin {
+    id: u32,
+    min: f64,
+    max: f64,
+    sent: f32,
+    /// Until this `ui_time` the plugin's value is not read back: a value on
+    /// its way to the audio thread would snap the knob to the old one.
+    hold_until: f32,
+}
 
-/// Most Surge parameters pinnable to one synth face (2 built-in + 4).
-const MAX_PINS: usize = 4;
+/// Most plugin parameters on one synth face (main controls and pins together).
+const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
+/// Width a knob label may use: one knob slot minus a gap to its neighbour.
+const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
+/// How often plugin knobs follow their plugin (values and renamed controls).
+const MAIN_POLL_SECS: f32 = 0.1;
+/// Readback pause after the UI or a CC moved a plugin knob.
+const READBACK_HOLD_SECS: f32 = 0.3;
+/// The warm shift an instrument's audio cable carries (the former TONE
+/// knob's default × 0.20, §4.10).
+const INSTRUMENT_CABLE_WARMTH: f32 = 0.07;
 
 /// A jack on the back panel: direction, port index, x fraction of the unit.
 struct Jack {
@@ -586,6 +659,9 @@ struct Unit {
     ins: [PortKind; 3],
     outs: [PortKind; 3],
     knobs: Vec<Knob>,
+    /// Which plugin the main-control knobs were built from (a CLAP voice id,
+    /// 0 for an LV2 plugin); None until that plugin's controls are known.
+    main_from: Option<u64>,
     jacks: Vec<Jack>,
     led: f32,
     /// The node owns a start/stop transport (`NodeKind::supports_transport`:
@@ -611,6 +687,11 @@ struct Unit {
 }
 
 impl Unit {
+    /// Index of the knob with this face label. Knob positions shift with
+    /// the plugin knobs in front of them, labels do not.
+    fn knob_index(&self, label: &str) -> Option<usize> {
+        self.knobs.iter().position(|k| k.label == label)
+    }
     fn jack_local(&self, unit_rect: Rect, ji: usize) -> Vec2 {
         let j = &self.jacks[ji];
         Vec2::new(unit_rect.left() + unit_rect.width() * j.xf, unit_rect.top() + unit_rect.height() * 0.54)
@@ -629,13 +710,103 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: false, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: false,
+        sent: None,
+        clap: None,
+        source: KnobSource::BuiltIn,
+        label_g: None,
+    }
 }
 
 /// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
 /// and persisted; the face renders its state as a chip instead.
 fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: true, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: true,
+        sent: None,
+        clap: None,
+        source: KnobSource::BuiltIn,
+        label_g: None,
+    }
+}
+
+/// Which plugin moves a main-control knob.
+#[derive(Clone, Copy)]
+enum MainTarget {
+    /// A CLAP parameter, sent through the voice controller.
+    Clap,
+    /// An LV2 control port, sent as the engine's `SetParam`.
+    Lv2,
+}
+
+/// A face knob for one main control at the plugin's current `value`.
+fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarget) -> Knob {
+    let norm = c.normalized(value);
+    Knob {
+        label: crate::main_controls::knob_label(&c.name),
+        value: norm,
+        display_value: norm,
+        glide_from: norm,
+        glide_t: 1.0,
+        default: c.normalized(c.default),
+        param: matches!(target, MainTarget::Lv2).then_some(c.id),
+        hidden: false,
+        sent: Some(norm),
+        clap: matches!(target, MainTarget::Clap)
+            .then_some(ClapPin { id: c.id, min: c.min, max: c.max, sent: norm, hold_until: 0.0 }),
+        source: KnobSource::Main(c.name.clone()),
+        label_g: None,
+    }
+}
+
+/// Replace a unit's main-control knobs. They lead the knob row; with the
+/// hand-pinned ones a face holds at most `MAX_PINS` plugin knobs.
+fn set_main_knobs(
+    u: &mut Unit,
+    face: &[crate::main_controls::MainControl],
+    target: MainTarget,
+    mut value: impl FnMut(&crate::main_controls::MainControl) -> f64,
+) {
+    u.knobs.retain(|k| !matches!(k.source, KnobSource::Main(_)));
+    let pinned: Vec<u32> = u.knobs.iter().filter_map(|k| k.clap.map(|pin| pin.id)).collect();
+    let fresh: Vec<Knob> = face
+        .iter()
+        .filter(|c| !pinned.contains(&c.id))
+        .take(MAX_PINS.saturating_sub(pinned.len()))
+        .map(|c| main_knob(c, value(c), target))
+        .collect();
+    u.knobs.splice(0..0, fresh);
+}
+
+/// Move a unit's CLAP knobs to the values the plugin reports (a loaded
+/// patch, an agent's edit, a stepped parameter rounding the knob's value).
+fn follow_plugin_values(u: &mut Unit, main: &mut ClapVoiceMain, now: f32, reduce_motion: bool) {
+    for k in &mut u.knobs {
+        let Some(pin) = k.clap else { continue };
+        // An unsent change is the UI's own: publish_pins sends it this frame.
+        if now < pin.hold_until || (k.value - pin.sent).abs() > 1e-4 { continue; }
+        let Some(plain) = main.param_value(pin.id) else { continue };
+        let norm = (((plain - pin.min) / (pin.max - pin.min).max(1e-9)) as f32).clamp(0.0, 1.0);
+        if (norm - k.value).abs() > 2e-3 {
+            k.glide_to(norm, reduce_motion);
+            k.clap = Some(ClapPin { sent: norm, ..pin });
+        }
+    }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -659,7 +830,8 @@ fn set_unit_split(u: &mut Unit, split: Option<u8>) {
 
 /// Value of the knob bound to `param`, or `default` if the unit has no such knob.
 fn knob_val(u: &Unit, param: u32, default: f32) -> f32 {
-    u.knobs.iter().find(|k| k.param == Some(param)).map(|k| k.value).unwrap_or(default)
+    // The unit's own knobs only: an LV2 control port shares the id space.
+    u.knobs.iter().find(|k| k.source == KnobSource::BuiltIn && k.param == Some(param)).map(|k| k.value).unwrap_or(default)
 }
 
 /// Visual breathing factor for audio leaving a unit (the engine does the real
@@ -862,11 +1034,206 @@ struct CcLearn {
     replace_existing: bool,
 }
 
+/// The knob context menu, keyed by what the knob drives — never unit/knob
+/// indices, which a rebuild can shift under an open menu (rule 10, #24).
+/// A destructive tool the assistant asked about: what to run on Confirm.
+#[derive(Clone, Debug)]
+struct PendingConfirm {
+    tool: String,
+    args: serde_json::Value,
+    /// Button text, e.g. "Delete rig 2 · Bass".
+    label: String,
+}
+
+/// Tools that change things the user cannot undo — they need confirm=true
+/// after asking (rule 23), and the in-app chat offers Confirm / Cancel.
+const CONFIRM_TOOLS: &[&str] = &["delete_rig", "install_instrument"];
+
+/// Tools whose edit the ENGINE applies: the rack only follows once the
+/// engine published it (rule 70).
+const ENGINE_EDIT_TOOLS: &[&str] = &["add_node", "connect", "disconnect", "remove_node"];
+/// How long a tool batch waits for the engine to publish one edit.
+const ENGINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Outcome state of an in-run action chip rendered under the user's message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolChipState {
+    Running,
+    Done,
+    NotApplied,
+    Failed,
+}
+
+/// One tool call chip rendered inside a chat turn run.
+#[derive(Clone, Debug)]
+struct ToolChip {
+    label: String,
+    state: ToolChipState,
+}
+
+/// Chips, collapse state, read-only step count, and final cost line associated
+/// with one user turn in `Assistant::history` (keyed by that `"user"` index).
+#[derive(Clone, Debug, Default)]
+struct TranscriptRun {
+    chips: Vec<ToolChip>,
+    read_count: usize,
+    expanded: bool,
+    cost_line: Option<String>,
+}
+
+/// Maximum tool chips shown in a finished or long run before `"+N more"`.
+const COLLAPSED_RUN_CHIPS: usize = 3;
+/// Left indent of transcript message text, chips, Confirm/Cancel, and attachments
+/// (6 px leading margin + 66 px role column + 6 px spacing).
+const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
+
+/// One model step's tool calls, run in call order. An engine edit is a
+/// barrier: the next call runs only after the engine published the edit and
+/// the rack adopted it, so every later call — and the model's next step —
+/// sees what the calls before it really did.
+struct ToolBatch {
+    todo: VecDeque<(ToolCall, Option<usize>)>,
+    results: Vec<ToolOutput>,
+    waiting: Option<(Waiting, Option<usize>)>,
+    user_idx: usize,
+}
+
+/// What a tool batch waits for before its next call runs. The wait spans
+/// frames: the UI thread never blocks on it.
+enum Waiting {
+    Engine(EngineEdit),
+    /// list_sounds / load_sound on an instrument whose library is still
+    /// being scanned: the call runs once the scan is done.
+    SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
+    /// look_at_rack: the screenshot of a coming frame. The tool's own
+    /// line is kept for the result.
+    RackShot { said: String, deadline: std::time::Instant },
+}
+
+/// Thumbnail height and row height for the chat's attached image chip.
+const ATTACH_THUMB_H: f32 = 32.0;
+const ATTACH_ROW_H: f32 = 40.0;
+
+/// Cached egui texture for the currently attached chat image (loaded once per
+/// attachment and dropped immediately when the attachment is cleared).
+struct ChatThumb {
+    bytes: Arc<[u8]>,
+    tex: Option<egui::TextureHandle>,
+    size: [usize; 2],
+}
+
+fn truncate_attachment_name(name: &str) -> String {
+    if name.chars().count() > 40 {
+        format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+    } else {
+        name.to_string()
+    }
+}
+
+fn sync_chat_thumb(ctx: &egui::Context, chat_image: &Option<Image>, chat_thumb: &mut Option<ChatThumb>) {
+    let Some(img) = chat_image.as_ref() else {
+        *chat_thumb = None;
+        return;
+    };
+    if chat_thumb.as_ref().is_some_and(|t| Arc::ptr_eq(&t.bytes, &img.bytes)) {
+        return;
+    }
+    let (tex, size) = match img.thumbnail_rgba(64) {
+        Some((sz, rgba)) => {
+            let color = egui::ColorImage::from_rgba_unmultiplied(sz, &rgba);
+            let handle = ctx.load_texture("assistant_chat_thumb", color, egui::TextureOptions::LINEAR);
+            (Some(handle), sz)
+        }
+        None => (None, [32, 32]),
+    };
+    *chat_thumb = Some(ChatThumb {
+        bytes: Arc::clone(&img.bytes),
+        tex,
+        size,
+    });
+}
+
+/// The tool that shows an agent the app window.
+const LOOK_TOOL: &str = "look_at_rack";
+/// How long look_at_rack waits for the frame's pixels.
+const RACK_SHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// look_at_rack's screenshot of the app window. The tool only asks; the
+/// frame path sends the request (it has the egui context), the windowing
+/// integration answers after it painted, and a worker thread scales and
+/// encodes the pixels. Whoever waits takes the result on a later frame.
+#[derive(Default)]
+struct RackShot {
+    wanted: bool,
+    ready: Arc<Mutex<Option<Result<Image, String>>>>,
+    /// Bridge (MCP) callers waiting for it, each with its deadline.
+    remote: Vec<(std::sync::mpsc::Sender<String>, std::time::Instant)>,
+}
+
+impl RackShot {
+    /// Ask the integration for the next frame's pixels.
+    fn request(&mut self, ctx: &egui::Context) {
+        if !std::mem::take(&mut self.wanted) { return; }
+        // A frame that came after its caller gave up is not this look's.
+        if let Ok(mut slot) = self.ready.lock() { *slot = None; }
+        let (ready, repaint) = (self.ready.clone(), ctx.clone());
+        ctx.request_screenshot(move |frame: Arc<egui::ColorImage>| {
+            std::thread::spawn(move || {
+                let image = Image::from_rgba("kabelsalat window", frame.size, frame.as_raw());
+                if let Ok(mut slot) = ready.lock() { *slot = Some(image); }
+                repaint.request_repaint();
+            });
+        });
+    }
+
+    fn take(&self) -> Option<Result<Image, String>> {
+        self.ready.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+/// look_at_rack's result once the frame arrived, or why there is none.
+fn rack_shot_output(said: &str, shot: Option<Result<Image, String>>) -> ToolOutput {
+    match shot {
+        Some(Ok(image)) => ToolOutput { text: format!("{said}: {}", image.describe()), image: Some(image) },
+        Some(Err(why)) => format!("error: the screenshot could not be encoded: {why}").into(),
+        None => format!("error: no screenshot within {} s — the window is hidden or the app runs without one", RACK_SHOT_WAIT.as_secs()).into(),
+    }
+}
+
+/// The tools that read an instrument's sound library.
+const SOUND_TOOLS: &[&str] = &["list_sounds", "load_sound"];
+/// Longest a sound tool waits for a library scan (a first Surge scan walks
+/// about 3000 files).
+const SOUND_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// An engine edit whose effect on the rack is still awaited.
+struct EngineEdit {
+    /// What the tool said when it sent the command.
+    result: String,
+    /// Node and cable ids before the edit.
+    before: (Vec<u32>, Vec<u32>),
+    /// The engine publication the rack had adopted when the tool ran. A
+    /// disconnect unplugs its cable in the rack at once, so changed ids
+    /// alone do not show that the engine has answered.
+    rev: u64,
+    deadline: std::time::Instant,
+}
+
 #[derive(Clone, Copy)]
 struct KnobMenu {
-    unit: usize,
-    idx: usize,
+    node: u32,
+    param: u32,
+    target: crate::matrix::CcTarget,
     pos: Pos2,
+}
+
+/// One bit per note source for `notes_down`: the computer keyboard, each
+/// hardware device (indices past 29 share a bit), everything else.
+fn note_source_bit(src: SourceId) -> u32 {
+    match src {
+        SourceId::Keys => 1,
+        SourceId::Hardware(d) => 1 << (1 + d.min(29)),
+        _ => 1 << 31,
+    }
 }
 
 /// MIDI note name for editor readouts (60 = C4).
@@ -931,11 +1298,18 @@ fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
 
 /// Nav item as a real button chip (§4.14, updated 2026-11-15): active/open =
 /// near-black fill + cream text; closed = recessed paper chip. No underlines.
-use crate::control::VOICE_POOL;
 
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
-    // Hover names the letter shortcut (M / N / C / B).
-    let key = match name { "Mixer" => Some("M"), "Matrix" => Some("N"), "Assistant" => Some("C"), "Keyboard" => Some("V"), "Plugins" => Some("B"), _ => None };
+    // Hover names the shortcut (M / N / C / V / B / ,).
+    let key = match name {
+        "Mixer" => Some("M"),
+        "Matrix" => Some("N"),
+        "Assistant" => Some("C"),
+        "Keyboard" => Some("V"),
+        "Plugins" => Some("B"),
+        "Settings" => Some(","),
+        _ => None,
+    };
     let r = theme::chip_button(ui, name, active);
     match key { Some(k) => r.on_hover_text(format!("{name} · key {k}")).clicked(), None => r.clicked() }
 }
@@ -1002,25 +1376,27 @@ fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
 /// Unit identity is carried by typography and position — no per-unit hues.
 fn make_unit(node: &Node) -> Unit {
     let name = name_str(&node.name).to_string();
-    let (node_kind, sub, ins, outs, knobs, jacks): (
-        UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
+    // Knobs come from the one table agents resolve names against (#19).
+    let knobs: Vec<Knob> = crate::engine::knob_specs(&node.kind)
+        .iter()
+        .map(|k| if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) })
+        .collect();
+    let (node_kind, sub, ins, outs, jacks): (
+        UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<(Dir, usize, f32, &'static str)>,
     ) = match &node.kind {
         NodeKind::Keys => (
             UnitKind::Keys, "midi source".into(),
             vec![], vec![PortKind::Midi, PortKind::Midi],
-            vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
             keys_jacks(node.split),
         ),
         NodeKind::Clap { .. } => (
             UnitKind::Clap, "synth · clap".into(),
             vec![PortKind::Midi], vec![PortKind::Audio],
-            vec![knob("TONE", 0.35, None), knob("LEVEL", 0.85, Some(P_LEVEL))],
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
-            vec![knob("VOLUME", 1.0, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             // L · R as a stereo pair, MONO apart (between them it read as a
             // center channel — vision review).
             vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
@@ -1028,51 +1404,41 @@ fn make_unit(node: &Node) -> Unit {
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
-            vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
             // IN sits under Surge's OUT (right) and MIDI IN faces Keys (left):
             // the audio cable no longer crosses the MIDI jack (vision review).
             vec![(Dir::In, 1, 0.22, "MIDI IN"), (Dir::Out, 0, 0.48, "OUT"), (Dir::In, 0, 0.74, "IN")],
         ),
         NodeKind::Dsp(kind) => {
-            // Generic DSP face: 1–2 knobs on engine params 0/1.
-            let (knobs, sub): (Vec<Knob>, String) = match kind {
-                DspKind::Reverb => (vec![knob("MIX", 0.35, Some(0)), knob("SIZE", 0.5, Some(1))], "reverb".into()),
-                DspKind::Gain => (vec![knob("GAIN", 0.9, Some(0))], "gain".into()),
-                DspKind::Filter => (vec![knob("CUTOFF", 0.45, Some(0)), knob("RESO", 0.2, Some(1))], "filter".into()),
-                DspKind::Eq3 => (vec![knob("LOW", 0.5, Some(0)), knob("HIGH", 0.5, Some(1))], "3-band eq".into()),
-                DspKind::Limiter => (vec![knob("CEIL", 0.8, Some(0)), knob("DRIVE", 0.2, Some(1))], "limiter".into()),
-                DspKind::Saturation => (vec![knob("DRIVE", 0.4, Some(0)), knob("MIX", 0.5, Some(1))], "saturation".into()),
-                DspKind::Pan => (vec![knob("PAN", 0.5, Some(0))], "panner".into()),
-                DspKind::Metronome => (vec![], "metronome · transport click".into()),
+            let sub: &str = match kind {
+                DspKind::Reverb => "reverb",
+                DspKind::Gain => "gain",
+                DspKind::Filter => "filter",
+                DspKind::Eq3 => "3-band eq",
+                DspKind::Limiter => "limiter",
+                DspKind::Saturation => "saturation",
+                DspKind::Pan => "panner",
+                DspKind::Metronome => "metronome · transport click",
                 DspKind::Delay => unreachable!(),
             };
             (
-                UnitKind::Dsp(kind.clone()), sub,
+                UnitKind::Dsp(kind.clone()), sub.into(),
                 vec![PortKind::Audio], vec![PortKind::Audio],
-                knobs,
                 vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
             )
         }
         NodeKind::Lv2 { .. } => (
             UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(),
             vec![PortKind::Audio], vec![PortKind::Audio],
-            vec![knob("GAIN", 0.9, Some(0))],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
-            // Visual only: capture gain changes via SetSystemAudio, which has
-            // no SetParam/CC path — a bindable knob here would look live but do nothing.
-            vec![knob("GAIN", 0.5, None)],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         ),
         NodeKind::AudioIn { device, channels } => (
             UnitKind::AudioIn, audio_in_sub(device.as_deref(), *channels),
             vec![], vec![PortKind::Audio],
-            // GAIN is a real bindable engine param; MON is a hidden knob whose
-            // value the face renders as a MON chip (still SetParam/CC path).
-            vec![knob("GAIN", 0.5, Some(P_AUDIO_IN_GAIN)), hidden_knob("MON", 0.0, Some(P_AUDIO_IN_MONITOR))],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         )
     };
@@ -1095,6 +1461,7 @@ fn make_unit(node: &Node) -> Unit {
         ins: ins_arr,
         outs: outs_arr,
         knobs,
+        main_from: None,
         jacks: jacks.iter().map(|&(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None }).collect(),
         led: 0.0,
         transport: node.kind.supports_transport(),
@@ -1150,6 +1517,8 @@ struct Cable {
     audio_tick: f32,
 
     age: f32,
+    /// Visual draw-in progress (0..1 from src to dst for agent-added cables).
+    draw_in: f32,
     dying: f32, // < 0 alive; else unplug-fall progress (seconds)
     detach_dst: bool,
     drift: f32,
@@ -1172,7 +1541,7 @@ impl Cable {
             n: 0, total_len: 0.0, curve: [Pos2::ZERO; 4],
             pulses: [dead; MAX_PULSES],
             level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
-            age: 0.0, dying: -1.0, detach_dst: true, drift: 0.0,
+            age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true, drift: 0.0,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
     }
@@ -1290,6 +1659,7 @@ enum StageView {
     Mixer,
     Sessions,
     Plugins,
+    Settings,
 }
 
 /// The bottom dock holds exactly one occupant at a time: no dock, the full-width
@@ -1392,9 +1762,19 @@ struct UndoSnap {
     rigs: Vec<crate::control::RigMeta>,
     mix: [crate::engine::RigMix; 8],
     active: usize,
-    patch_names: [Option<String>; VOICE_POOL],
-    /// Per-voice keyboard/hardware source switches (not in the session).
-    rig_sources: [(bool, bool); VOICE_POOL],
+    /// Per-voice source switches, device and patch name (not in the session).
+    voices: Vec<VoiceRow>,
+}
+
+/// One CLAP unit's entry of the per-voice slot tables (`rig_sources`,
+/// `rig_device`, `patch_names`) under its node id: how the tables travel
+/// across a reload that resets them (undo, rig edit).
+#[derive(Clone)]
+struct VoiceRow {
+    node: u32,
+    sources: (bool, bool),
+    device: Option<u32>,
+    patch_name: Option<String>,
 }
 
 /// Tools the running app serves to `kabelsalat mcp --attach` over the UI
@@ -1404,7 +1784,8 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
-    "list_instruments", "install_instrument",
+    "save_rig", "load_rig", "list_rig_presets",
+    "list_instruments", "install_instrument", "play_file", "stop_file", LOOK_TOOL,
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -1415,14 +1796,14 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo")
+        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo" | LOOK_TOOL)
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    name == "install_instrument"
+    matches!(name, "install_instrument" | "save_rig")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1448,12 +1829,29 @@ struct AgentAction {
     nodes: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct FadingUnit {
+    rect: Rect,
+    alpha: f32,
+    agent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FadingCable {
+    curve: [Pos2; 4],
+    color: Color32,
+    width: f32,
+    alpha: f32,
+    agent: bool,
+}
+
 /// Model-first store of recent agent edits, keyed by stable domain IDs
 /// (`NodeId`, `EdgeId`, `(SourceId, NodeId)`, rig index) so `build_rack`
 /// rebuilds never drop or shift highlights.
 #[derive(Default)]
 struct AgentActivity {
     nodes: std::collections::HashMap<u32, f32>,
+    node_pulse_at: std::collections::HashMap<u32, f32>,
     edges: std::collections::HashMap<u32, f32>,
     matrix_cells: std::collections::HashMap<(SourceId, u32), f32>,
     rigs: std::collections::HashMap<usize, f32>,
@@ -1462,6 +1860,14 @@ struct AgentActivity {
 
 impl AgentActivity {
     fn touch_node(&mut self, node: u32, now: f32) {
+        if self.nodes.get(&node).is_none_or(|&exp| exp <= now) {
+            self.node_pulse_at.insert(node, now);
+        }
+        self.nodes.insert(node, now + AGENT_TOUCH_SECS);
+    }
+
+    fn trigger_node_pulse(&mut self, node: u32, now: f32) {
+        self.node_pulse_at.insert(node, now);
         self.nodes.insert(node, now + AGENT_TOUCH_SECS);
     }
 
@@ -1479,7 +1885,7 @@ impl AgentActivity {
 
     fn record(&mut self, origin: AgentOrigin, summary: impl Into<String>, nodes: Vec<u32>, now: f32) {
         for &n in &nodes {
-            self.touch_node(n, now);
+            self.trigger_node_pulse(n, now);
         }
         self.log.push_front(AgentAction {
             origin,
@@ -1503,6 +1909,13 @@ impl AgentActivity {
         Self::strength(self.nodes.get(&node), now)
     }
 
+    fn node_pulse(&self, node: u32, now: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion { return 0.0; }
+        let Some(&start) = self.node_pulse_at.get(&node) else { return 0.0 };
+        let t = (now - start) / AGENT_PULSE_SECS;
+        if (0.0..1.0).contains(&t) { (t * std::f32::consts::PI).sin() } else { 0.0 }
+    }
+
     fn edge_alpha(&self, edge: u32, now: f32) -> f32 {
         Self::strength(self.edges.get(&edge), now)
     }
@@ -1524,6 +1937,7 @@ impl AgentActivity {
 
     fn prune(&mut self, now: f32) {
         self.nodes.retain(|_, exp| *exp > now);
+        self.node_pulse_at.retain(|id, _| self.nodes.contains_key(id));
         self.edges.retain(|_, exp| *exp > now);
         self.matrix_cells.retain(|_, exp| *exp > now);
         self.rigs.retain(|_, exp| *exp > now);
@@ -1567,6 +1981,9 @@ struct DemoApp {
     /// Per-MIDI-note LEDs for the multi-octave bottom keyboard (key_leds is
     /// per pitch class and would light every octave).
     note_leds: [f32; 128],
+    /// Notes held right now, one bit per source (`note_source_bit`): keys
+    /// stay lit until every source released them, not only for an LED blink.
+    notes_down: [u32; 128],
     meter: f32,
     /// Peak-hold for the master meter (slow release).
     meter_peak: f32,
@@ -1673,8 +2090,16 @@ struct DemoApp {
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
     rig_levels: Vec<f32>,
-    /// Active main-stage view: Rack, Matrix, Mixer, Sessions, or Plugins.
+    /// Active main-stage view: Rack, Matrix, Mixer, Sessions, Plugins, or Settings.
     stage_view: StageView,
+    /// Whether any dropdown popup was open at the start of this frame.
+    popup_open_at_start: bool,
+    settings_decide_input: String,
+    settings_act_input: String,
+    settings_perceive_input: String,
+    settings_deepseek_key: String,
+    settings_openrouter_key: String,
+    settings_msg: String,
     /// Ctrl-drag of a unit: last rack-local cursor (drives the live layout
     /// preview) and the slot rect the dragged unit would land in.
     drag_cursor: Option<Vec2>,
@@ -1682,11 +2107,11 @@ struct DemoApp {
     /// Committed mid-column centers + stack height (drop-target geometry).
     col_x: Vec<f32>,
     stack_tall_h: f32,
-    /// Installed Surge patches, scanned on first use (load_sound/list_sounds).
-    surge_patch_cache: Option<Vec<crate::host::SurgePatch>>,
-    dexed_patch_cache: Option<Vec<crate::host::DexedPatch>>,
+    /// Every instrument's sound library, scanned off this thread (rule 46).
+    sounds: crate::sounds::Libraries,
     /// Current patch per synth voice slot (None = Surge's init patch).
-    patch_names: [Option<String>; VOICE_POOL],
+    /// A slot table like `rig_sources`.
+    patch_names: Vec<Option<String>>,
     /// Sound browser search text (synth editor).
     sound_filter: String,
     /// Last frame's MIDI-matrix block width (table + legend), for centering.
@@ -1721,6 +2146,10 @@ struct DemoApp {
     /// `--demo-agent` screenshot hook: keeps the demo agent's touch fresh every
     /// frame so the rack highlight stays visible instead of fading after 2.6s.
     demo_agent_hold: bool,
+    /// Disables rack animations (`ui_reduce_motion` in config.json).
+    reduce_motion: bool,
+    fading_units: Vec<FadingUnit>,
+    fading_cables: Vec<FadingCable>,
     /// Last frame's dock panel rect (tests + keyboard hit-testing).
     dock_rect: Rect,
     /// Last frame's key area inside the dock keyboard (points).
@@ -1756,8 +2185,29 @@ struct DemoApp {
     master_meter: crate::meter::MeterSnapshot,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
+    /// A destructive assistant action waiting for the chat's Confirm /
+    /// Cancel buttons (#32).
+    pending_confirm: Option<PendingConfirm>,
+    /// The assistant's tool calls in flight (one model step).
+    tool_batch: Option<ToolBatch>,
+    /// Per-turn tool chips and finished cost line, keyed by the `"user"`
+    /// message index in `assistant.history`.
+    transcript_runs: HashMap<usize, TranscriptRun>,
+    /// Index in `assistant.history` of the `"user"` turn currently running.
+    active_run_user_idx: Option<usize>,
+    rack_shot: RackShot,
+    /// The image attached to the chat message being written.
+    chat_image: Option<Image>,
+    /// Thumbnail texture handle for `chat_image`, freed when removed.
+    chat_thumb: Option<ChatThumb>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
+    /// Save-rig-preset modal: (rig index, preset name being edited).
+    save_rig_dialog: Option<(usize, String)>,
+    /// Load-rig-preset modal: `Some(None)` = as new rig, `Some(Some(rig))` = replace `rig`.
+    load_rig_dialog: Option<Option<usize>>,
+    /// Rig preset storage dir (isolated per test under `cfg(test)`).
+    rig_presets_dir: std::path::PathBuf,
     /// Rig names of the session being applied (load path names its rigs).
     session_rig_names: Vec<String>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
@@ -1766,9 +2216,12 @@ struct DemoApp {
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
 
-    /// Per-rig input selection (keyboard, hardware) for rigs A=node1, B=node4.
-    /// The keyboard is ONE source: on-screen clicks and laptop typing.
-    rig_sources: [(bool, bool); VOICE_POOL],
+    /// Input selection (keyboard, hardware) per CLAP unit. The keyboard is
+    /// ONE source: on-screen clicks and laptop typing. A slot table: one
+    /// entry per CLAP unit in unit order (`clap_rigs`), refit by
+    /// `fit_voice_tables` whenever the units change, so it has an entry for
+    /// every CLAP unit however many there are.
+    rig_sources: Vec<(bool, bool)>,
 
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
@@ -1795,8 +2248,9 @@ struct DemoApp {
     last_midi: Option<String>,
     /// The info line is shown in the hint row (no room in the top bar).
     info_in_hint: bool,
-    /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
-    rig_device: [Option<u32>; VOICE_POOL],
+    /// Hardware device selection per CLAP unit (None = any). A slot table
+    /// like `rig_sources`.
+    rig_device: Vec<Option<u32>>,
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -1805,10 +2259,20 @@ struct DemoApp {
     surge_controllers: Vec<VoiceController>,
     clap_plugin_ids: Vec<String>,
     clap_voice_ids: Vec<u64>,
+    /// CLAP unit slot → index into the hosted voices (`_surge_main`, …):
+    /// the voice the engine bound to that unit's node.
     clap_slot_map: Vec<Option<usize>>,
+    /// Ids of hosted voices the engine was asked to hand back.
+    clap_leaving: Vec<u64>,
+    /// Capacity of the engine's voice table (grown by `VoiceMsg::Grow`).
+    engine_voice_cap: usize,
+    last_voices_rev: u64,
+    /// Graph revision adopted when this frame's load was sent: the engine's
+    /// voice binding is not adopted until it has published that load.
+    voice_hold_rev: Option<u64>,
     sample_rate: f64,
-    voice_tx: Option<rtrb::Producer<(u32, ClapVoice, Vec<f32>)>>,
-    voice_retire_rx: Option<rtrb::Consumer<ClapVoice>>,
+    voice_tx: Option<rtrb::Producer<VoiceMsg>>,
+    voice_retire_rx: Option<rtrb::Consumer<VoiceBack>>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -1832,6 +2296,8 @@ struct DemoApp {
     input_devices: std::sync::Arc<Mutex<Vec<crate::audio_in::InputDevice>>>,
     /// Outputs, our current sink and other apps' streams (scan thread).
     audio_out: std::sync::Arc<Mutex<crate::audio_out::OutputState>>,
+    /// Live levels of other apps' streams (mixer "System audio" meters).
+    stream_levels: crate::audio_out::StreamLevels,
     /// The output the user chose (None = follow PipeWire's default).
     wanted_output: std::sync::Arc<Mutex<Option<String>>>,
     /// Volume/mute changes for other apps' streams → scan thread.
@@ -1873,6 +2339,13 @@ struct DemoApp {
     editor_rig: usize,
     /// Cached parameter list for the open editor (refreshed on open/Refresh).
     editor_params: Vec<ParamDesc>,
+    /// `ui_time` of the last plugin poll for main-control knobs.
+    main_poll_at: f32,
+    /// LV2 main-control values waiting for their knobs, which appear only
+    /// once the plugin's controls are resolved: a loaded session's values
+    /// (sent to the engine) and the values carried over a rack rebuild (the
+    /// engine still holds them).
+    lv2_main_restore: Vec<(crate::session::ParamValue, bool)>,
     /// Search/filter text for the parameter list.
     editor_filter: String,
     /// Pending open/close request from a unit double-click (task-26).
@@ -1891,6 +2364,12 @@ struct DemoApp {
 
 impl DemoApp {
     fn new_with_sink(note_sink: Option<NoteSink>) -> Self {
+        Self::new_app(note_sink, !cfg!(test), Assistant::new())
+    }
+
+    /// `hw_scan` false = no hardware MIDI thread (tests and agent-eval never
+    /// scan the machine's devices, rule 48).
+    fn new_app(note_sink: Option<NoteSink>, hw_scan: bool, assistant: Assistant) -> Self {
         let mut app = Self {
             units: Vec::new(),
             cables: Vec::with_capacity(MAX_CABLES),
@@ -1918,6 +2397,7 @@ impl DemoApp {
             hover: None,
             key_leds: [0.0; 13],
             note_leds: [0.0; 128],
+            notes_down: [0; 128],
             meter: 0.0,
             meter_peak: 0.0,
             show_help: false,
@@ -1982,19 +2462,26 @@ impl DemoApp {
             active_rig: 0,
             rig_levels: Vec::new(),
             stage_view: StageView::Rack,
+            popup_open_at_start: false,
+            settings_decide_input: String::new(),
+            settings_act_input: String::new(),
+            settings_perceive_input: String::new(),
+            settings_deepseek_key: String::new(),
+            settings_openrouter_key: String::new(),
+            settings_msg: String::new(),
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
             stack_tall_h: 0.0,
-            surge_patch_cache: None,
-            dexed_patch_cache: None,
+            // Tests never scan the machine's patch folders.
+            sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
             patch_names: Default::default(),
             sound_filter: String::new(),
             matrix_block_w: 0.0,
             matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
-            assistant_input_h: 44.0,
+            assistant_input_h: 34.0,
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
@@ -2005,6 +2492,9 @@ impl DemoApp {
             dock: DockView::None,
             focus_chat_request: false,
             demo_agent_hold: false,
+            reduce_motion: crate::assistant::load_reduce_motion(),
+            fading_units: Vec::new(),
+            fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
             dock_kb_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
@@ -2025,12 +2515,22 @@ impl DemoApp {
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
+            pending_confirm: None,
+            tool_batch: None,
+            transcript_runs: HashMap::new(),
+            active_run_user_idx: None,
+            rack_shot: RackShot::default(),
+            chat_image: None,
+            chat_thumb: None,
             rename_rig_dialog: None,
+            save_rig_dialog: None,
+            load_rig_dialog: None,
+            rig_presets_dir: Self::default_rig_presets_dir(),
             session_rig_names: Vec::new(),
             load_as_rigs: None,
             had_kb_focus: true,
-            rig_sources: [(true, true); VOICE_POOL],
-            assistant: Assistant::new(),
+            rig_sources: Vec::new(),
+            assistant,
             key_input: String::new(),
             chat_input: String::new(),
             octave: 4,
@@ -2045,13 +2545,17 @@ impl DemoApp {
             hw_devices: Vec::new(),
             last_midi: None,
             info_in_hint: false,
-            rig_device: [None; VOICE_POOL],
+            rig_device: Vec::new(),
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
             clap_plugin_ids: Vec::new(),
             clap_voice_ids: Vec::new(),
             clap_slot_map: Vec::new(),
+            clap_leaving: Vec::new(),
+            engine_voice_cap: crate::engine::VOICE_TABLE_CAP,
+            last_voices_rev: 0,
+            voice_hold_rev: None,
             sample_rate: 48000.0,
             voice_tx: None,
             voice_retire_rx: None,
@@ -2066,6 +2570,7 @@ impl DemoApp {
             audio_in_tuners: std::collections::HashMap::new(),
             input_devices: std::sync::Arc::new(Mutex::new(Vec::new())),
             audio_out: std::sync::Arc::new(Mutex::new(Default::default())),
+            stream_levels: Default::default(),
             wanted_output: std::sync::Arc::new(Mutex::new(crate::assistant::load_config_str("audio_output"))),
             stream_cmds: None,
             stream_grace: Vec::new(),
@@ -2082,6 +2587,8 @@ impl DemoApp {
             editor_open: false,
             editor_rig: 0,
             editor_params: Vec::new(),
+            main_poll_at: 0.0,
+            lv2_main_restore: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
             lv2_editor_node: None,
@@ -2096,7 +2603,7 @@ impl DemoApp {
 
         // Hardware MIDI: a thread connects what is plugged in now and keeps
         // rescanning, so devices plugged in later are picked up too.
-        if !cfg!(test) {
+        if hw_scan {
             spawn_hw_midi(app.hw_midi.clone(), app.hw_queue.clone(), app.hw_cc_queue.clone(), app.hw_direct.clone());
         }
 
@@ -2115,12 +2622,14 @@ impl DemoApp {
     /// apply default knob values. This is the single path used by the demo,
     /// starter templates, and saved sessions.
     fn build_rack(&mut self, graph: &Graph, params: &[crate::session::ParamValue]) {
+        let old_clap_nodes: Vec<u32> = self.clap_rigs().into_iter().map(|(_, n)| n).collect();
         self.units.clear();
         self.cables.clear();
         self.base_graph = graph.clone();
         for node in &graph.nodes {
             self.units.push(make_unit(node));
         }
+        self.fit_voice_tables(&old_clap_nodes);
         // Classify LV2 instruments (hot-wire matrix sink columns). Rare
         // structural op: the discovery scan runs only when LV2 nodes exist.
         if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
@@ -2153,11 +2662,12 @@ impl DemoApp {
             }
         }
         self.next_id = max_id + 1;
+        self.lv2_main_restore = params.iter().map(|p| (*p, true)).collect();
         // Apply default params to the matching knobs.
         for p in params {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
                 if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(p.param)) {
-                    k.value = p.value as f32;
+                    k.set_immediate(p.value as f32);
                     k.default = p.value as f32;
                 }
             }
@@ -2173,6 +2683,7 @@ impl DemoApp {
         self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
         self.graph_sig.clear(); // force shared-graph re-mirror
+        self.prewarm_sound_libraries();
         // No load_fade reset here: build_rack also serves sync adoptions
         // (agent/MCP add_node/connect), which must appear without a flash.
         // Explicit loads call begin_load_fade().
@@ -2403,7 +2914,9 @@ impl DemoApp {
             }
             for k in &mut u.knobs {
                 if k.label_g.is_none() {
-                    k.label_g = Some(tracked(&k.label, 10.0, 0.14));
+                    // The slot is a fixed width, so the fit runs once per label.
+                    let (text, size) = fit_label(&k.label, 10.0, 8.0, KNOB_LABEL_W, |t, sz| tracked(t, sz, 0.14).size.x);
+                    k.label_g = Some(tracked(&text, size, 0.14));
                 }
             }
             for j in &mut u.jacks {
@@ -2477,6 +2990,7 @@ impl DemoApp {
                 (&["B"], "plugin browser (also F9)"),
                 (&["F11"], "MIDI matrix view"),
                 (&["F12"], "assistant"),
+                (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
             ]),
         ];
@@ -2801,20 +3315,12 @@ impl DemoApp {
         controllers: Vec<VoiceController>,
         voice_ids: Vec<u64>,
         sample_rate: f64,
-        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
-        voice_retire_rx: rtrb::Consumer<ClapVoice>,
+        voice_tx: rtrb::Producer<VoiceMsg>,
+        voice_retire_rx: rtrb::Consumer<VoiceBack>,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
-        self.clap_voice_ids = voice_ids;
-        self.clap_slot_map = (0..mains.len()).map(Some).collect();
-        self._surge_main = mains;
-        self.surge_controllers = controllers;
-        self.sample_rate = sample_rate;
-        self.voice_tx = Some(voice_tx);
-        self.voice_retire_rx = Some(voice_retire_rx);
         self._audio_stream = Some(stream);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         if self.count_in_enabled || self.count_in_bars != 1 {
@@ -2823,12 +3329,38 @@ impl DemoApp {
                 bars: self.count_in_bars,
             });
         }
-        self.bus = Some(bus);
+        self.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, voice_retire_rx, bus);
         self.out_level = Some(level);
-        self.surge_status = "Surge loaded — play!".into();
         self.start_input_device_scan();
         self.start_audio_out_thread();
         self
+    }
+
+    /// Bind the app to an engine and its startup synth voices: everything the
+    /// agent's tools need (command bus, voice mains for load_sound/sessions).
+    /// The real app adds the audio stream and device threads on top;
+    /// agent-eval runs on exactly this with an offline engine.
+    fn attach_engine(
+        &mut self,
+        mains: Vec<ClapVoiceMain>,
+        controllers: Vec<VoiceController>,
+        voice_ids: Vec<u64>,
+        sample_rate: f64,
+        voice_tx: rtrb::Producer<VoiceMsg>,
+        voice_retire_rx: rtrb::Consumer<VoiceBack>,
+        bus: Arc<Mutex<CommandBus>>,
+    ) {
+        self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
+        self.clap_voice_ids = voice_ids;
+        self._surge_main = mains;
+        self.surge_controllers = controllers;
+        self.sample_rate = sample_rate;
+        self.voice_tx = Some(voice_tx);
+        self.voice_retire_rx = Some(voice_retire_rx);
+        self.bus = Some(bus);
+        let graph = self.base_graph.clone();
+        self.sync_clap_slots(&graph, None);
+        self.surge_status = "Surge loaded — play!".into();
     }
 
     /// Output selection + other apps' streams: scan every second (sooner when
@@ -2839,6 +3371,7 @@ impl DemoApp {
         self.stream_cmds = Some(tx);
         let state = self.audio_out.clone();
         let wanted = self.wanted_output.clone();
+        let mut meters = crate::audio_out::StreamMeters::new(self.stream_levels.clone());
         std::thread::Builder::new()
             .name("kabelsalat-audio-out".into())
             .spawn(move || loop {
@@ -2851,6 +3384,7 @@ impl DemoApp {
                 crate::audio_out::apply_stream_cmds(cmds);
                 let w = wanted.lock().ok().and_then(|w| w.clone());
                 let st = crate::audio_out::scan_and_apply(w.as_deref());
+                meters.sync(&st.streams);
                 if let Ok(mut s) = state.lock() { *s = st; }
             })
             .ok();
@@ -2970,11 +3504,12 @@ impl DemoApp {
             for cmd in remote_cmds {
                 match cmd {
                     Command::SetParam { node, param, value } => {
-                        let v = value as f32;
+                        let v = (value as f32).clamp(0.0, 1.0);
+                        let rm = self.reduce_motion;
                         if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
                             for k in &mut u.knobs {
                                 if k.param == Some(param) {
-                                    k.value = v.clamp(0.0, 1.0);
+                                    k.glide_to(v, rm);
                                 }
                             }
                         }
@@ -2982,8 +3517,7 @@ impl DemoApp {
                         self.agent_activity.record(AgentOrigin::Remote, format!("Param → {uname}"), vec![node], now);
                     }
                     Command::SetRigSource { node, keyboard, hardware } => {
-                        let rig = self.rig_of_node(node);
-                        if let Some(s) = self.rig_sources.get_mut(rig) {
+                        if let Some(s) = self.voice_slot_of_node(node).and_then(|r| self.rig_sources.get_mut(r)) {
                             *s = (keyboard, hardware);
                         }
                         self.agent_activity.touch_cell(SourceId::Keys, node, now);
@@ -2991,8 +3525,7 @@ impl DemoApp {
                         self.agent_activity.record(AgentOrigin::Remote, format!("Sources → {uname}"), vec![node], now);
                     }
                     Command::SetRigDevice { node, device } => {
-                        let rig = self.rig_of_node(node);
-                        if let Some(d) = self.rig_device.get_mut(rig) {
+                        if let Some(d) = self.voice_slot_of_node(node).and_then(|r| self.rig_device.get_mut(r)) {
                             *d = device;
                         }
                         if let Some(d) = device {
@@ -3019,6 +3552,18 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            // System-audio GAIN knobs follow SetSystemAudio from any frontend
+            // (one engine-wide gain; `sent` matches so it is not echoed back).
+            if !matches!(self.drag, Drag::Knob { .. }) {
+                for u in &mut self.units {
+                    for k in &mut u.knobs {
+                        if k.param == Some(crate::engine::P_SYSTEM_GAIN) && (k.value - g.system_gain).abs() > 1e-4 {
+                            k.glide_to(g.system_gain, self.reduce_motion);
+                            k.sent = Some(g.system_gain);
+                        }
+                    }
+                }
+            }
         }
         // Master meter mirror (Bravo 1): the engine publishes a fresh snapshot
         // every block.
@@ -3055,8 +3600,23 @@ impl DemoApp {
             self.playing = now_playing;
         }
         let graph_rev_changed = g.rev != self.last_graph_rev;
+        // The engine's voice binding. While it has not published the load
+        // this app sent last, its table still describes the old graph.
+        let voices = if self.voice_hold_rev == Some(g.rev) {
+            None
+        } else {
+            self.voice_hold_rev = None;
+            (graph_rev_changed || g.voices_rev != self.last_voices_rev).then(|| {
+                self.last_voices_rev = g.voices_rev;
+                g.voices.clone()
+            })
+        };
         if !graph_rev_changed {
             drop(g);
+            if let Some(voices) = &voices {
+                let graph = self.base_graph.clone();
+                self.sync_clap_slots(&graph, Some(voices));
+            }
             if !mix_diff_rigs.is_empty() || transport_changed {
                 let pending_origin = self.take_pending_agent_origin();
                 let n_rigs = self.rig_count();
@@ -3302,16 +3862,83 @@ impl DemoApp {
             }
         }
 
+        let voices = voices.unwrap_or_default();
         if same {
-            self.sync_clap_slots(&adopted);
+            self.sync_clap_slots(&adopted, Some(&voices));
             return;
         }
+        // Preserve in-flight knob glides & cable draw-ins across the structural rebuild,
+        // and snapshot removed visible units/cables so they fade out instead of vanishing.
+        let mut knob_glides: Vec<(u32, Option<u32>, usize, f32, f32, f32)> = Vec::new();
+        for u in &self.units {
+            for (ki, k) in u.knobs.iter().enumerate() {
+                if k.glide_t < 1.0 {
+                    knob_glides.push((u.node_id, k.param, ki, k.display_value, k.glide_from, k.glide_t));
+                }
+            }
+        }
+        let mut cable_draws: Vec<(u32, f32)> = self.cables.iter()
+            .filter(|c| c.draw_in < 1.0)
+            .map(|c| (c.id, c.draw_in))
+            .collect();
+        if !self.reduce_motion {
+            for (ui, u) in self.units.iter().enumerate() {
+                if !adopted.nodes.iter().any(|n| n.id == u.node_id) && self.visible(ui) {
+                    if let Some(&r) = self.unit_rects.get(ui) {
+                        if r.width().is_finite() && r.height().is_finite() && r.is_positive() {
+                            self.fading_units.push(FadingUnit {
+                                rect: r,
+                                alpha: 1.0,
+                                agent: origin != AgentOrigin::Remote || self.agent_activity.node_alpha(u.node_id, now) > 0.01,
+                            });
+                        }
+                    }
+                }
+            }
+            for c in &self.cables {
+                if c.dying < 0.0
+                    && !adopted.edges.iter().any(|e| e.id == c.id)
+                    && self.visible(c.src)
+                    && self.visible(c.dst)
+                    && c.curve[0].x.is_finite()
+                    && c.curve[3].x.is_finite()
+                {
+                    let width = match c.kind { PortKind::Midi => 2.8, PortKind::Audio => 3.2 };
+                    self.fading_cables.push(FadingCable {
+                        curve: c.curve,
+                        color: self.cable_color(c),
+                        width,
+                        alpha: 1.0,
+                        agent: origin != AgentOrigin::Remote || self.agent_activity.edge_alpha(c.id, now) > 0.01,
+                    });
+                }
+            }
+        }
+        let carried = self.lv2_main_values();
         self.build_rack(&adopted, &[]);
-        self.sync_clap_slots(&adopted);
+        self.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
+        for (nid, param, ki, disp, from, gt) in knob_glides {
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
+                let pos = param.and_then(|p| u.knobs.iter().position(|k| k.param == Some(p))).unwrap_or(ki);
+                if let Some(k) = u.knobs.get_mut(pos) {
+                    k.display_value = disp;
+                    k.glide_from = from;
+                    k.glide_t = gt;
+                }
+            }
+        }
+        for c in &mut self.cables {
+            if let Some(&(_, d)) = cable_draws.iter().find(|&&(id, _)| id == c.id) {
+                c.draw_in = d;
+            } else if !self.reduce_motion && diff_edges.contains(&c.id) {
+                c.draw_in = 0.0;
+            }
+        }
+        cable_draws.clear();
+        self.sync_clap_slots(&adopted, Some(&voices));
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         self.adopt_rig_devices();
         // build_rack resets the view to rig 0 — keep the engine's active rig.
         let active = self.rig_snapshot.lock().map(|s| s.active).unwrap_or(0);
@@ -3322,31 +3949,339 @@ impl DemoApp {
         self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
-    fn poll_assistant(&mut self) {
-        for ev in self.assistant.poll() {
-            match ev {
-                FromWorker::Text(t) => self
-                    .assistant
-                    .history
-                    .push(ChatLine { role: "assistant".into(), text: t }),
-                FromWorker::ToolCall { id, name, args } => {
-                    let result = self.exec_tool_with_origin(&name, &args, AgentOrigin::Assistant);
-                    self.assistant.send_tool_result(id, result);
-                }
-                FromWorker::Models(list) => {
-                    // Chat-capable models only (embedding ids etc. stay out).
-                    let chat: Vec<String> = list.into_iter().filter(|m| m.contains("chat") || m.contains("reason") || m.contains("flash") || m.contains("v3") || m.contains("v4")).collect();
-                    if !chat.is_empty() { self.assistant.models = chat; }
-                }
-                FromWorker::Done => self.assistant.busy = false,
-                FromWorker::Error(e) => {
-                    self.assistant.busy = false;
-                    self.assistant
-                        .history
-                        .push(ChatLine { role: "error".into(), text: e });
+    fn classify_tool_result(result: &str) -> ToolChipState {
+        if result.contains("NOT applied") || result.contains("Confirm / Cancel") {
+            return ToolChipState::NotApplied;
+        }
+        let lower = result.trim_start().to_ascii_lowercase();
+        if lower.starts_with("error:")
+            || lower.starts_with("unknown ")
+            || lower.starts_with("failed")
+            || lower.starts_with("cannot ")
+            || lower.starts_with("invalid ")
+            || lower.starts_with("missing ")
+            || lower.starts_with("no ")
+            || lower.starts_with("not ")
+        {
+            ToolChipState::Failed
+        } else {
+            ToolChipState::Done
+        }
+    }
+
+    fn human_tool_label(&self, name: &str, args: &serde_json::Value) -> String {
+        match name {
+            "set_split" => match args.get("point").and_then(|v| v.as_u64()) {
+                Some(p) => format!("Split keys → {}", note_name(p.min(127) as u8)),
+                None => "Unsplit keys".into(),
+            },
+            "add_node" => {
+                let what = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
+                    .or_else(|| args.get("kind").and_then(|v| v.as_str()))
+                    .unwrap_or("unit");
+                let what = sentence_case(what);
+                match args.get("rig").and_then(|v| v.as_u64()) {
+                    Some(r) => format!("Add {what} → {}", self.rig_name(r as usize)),
+                    None => format!("Add {what}"),
                 }
             }
+            LOOK_TOOL => "Look at the rack".into(),
+            "get_graph" => "Read rack graph".into(),
+            "get_status" => "Check status".into(),
+            "get_rigs" => "List rigs".into(),
+            "measure_mix" => "Measure mix".into(),
+            "play_note" => {
+                let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
+                format!("Play {}", note_name(note))
+            }
+            "set_octave" => {
+                let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
+                format!("Octave → C{oct}")
+            }
+            "flip_rack" => "Flip rack".into(),
+            "set_rig_source" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
+                format!("Set {} sources", self.rig_name(rig))
+            }
+            "set_rig_mix" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Mix {}", self.rig_name(rig))
+            }
+            "set_rig_device" => match args.get("rig").and_then(|v| v.as_u64()) {
+                Some(r) => format!("Set {} MIDI input", self.rig_name(r as usize)),
+                None => "Set MIDI input".into(),
+            },
+            "get_matrix" => "Read MIDI matrix".into(),
+            "set_matrix_cell" => {
+                if args.get("on").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    "Enable MIDI route".into()
+                } else {
+                    "Mute MIDI route".into()
+                }
+            }
+            "set_matrix_rule" => "Set MIDI rule".into(),
+            "list_params" => "List parameters".into(),
+            "set_cc_map" => "Map MIDI CC".into(),
+            "clear_cc_map" => "Clear MIDI CC".into(),
+            "list_cc_maps" => "List MIDI CCs".into(),
+            "learn_cc" => "Learn MIDI CC".into(),
+            "list_sounds" => "Search patches".into(),
+            "load_sound" => format!("Load '{}'", args.get("query").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "add_rig" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => format!("Add rig · {n}"),
+                None => "Add rig".into(),
+            },
+            "delete_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Delete {}", self.rig_name(rig))
+            }
+            "rename_rig" => {
+                let new_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("rig");
+                match args.get("rig").and_then(|v| v.as_u64()) {
+                    Some(r) => format!("Rename {} → {new_name}", self.rig_name(r as usize)),
+                    None => format!("Rename rig → {new_name}"),
+                }
+            }
+            "select_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Switch to {}", self.rig_name(rig))
+            }
+            "connect" => format!(
+                "Wire {} → {}",
+                args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0),
+                args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0)
+            ),
+            "disconnect" => format!("Unplug cable {}", args.get("id").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "remove_node" => format!("Remove unit {}", args.get("node").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "load_template" => format!("Template · {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "transport_play" => "Start transport".into(),
+            "transport_stop" => "Stop transport".into(),
+            "set_bpm" => format!("Tempo → {} BPM", args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0).round() as u32),
+            "set_count_in" => "Set count-in".into(),
+            "record_start" => "Start recording".into(),
+            "record_stop" => "Stop recording".into(),
+            "record_status" => "Recording status".into(),
+            "system_audio" => "System audio level".into(),
+            "play_file" => "Play audio file".into(),
+            "stop_file" => "Stop audio file".into(),
+            "set_player" => "File player level".into(),
+            "list_plugins" => "List plugins".into(),
+            "list_instruments" => "List instruments".into(),
+            "install_instrument" => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
+            "undo" => "Undo last edit".into(),
+            "redo" => "Redo edit".into(),
+            _ => name.replace('_', " "),
         }
+    }
+
+    fn finish_chip(&mut self, user_idx: usize, chip_idx: usize, result: &str) {
+        if let Some(run) = self.transcript_runs.get_mut(&user_idx) {
+            if let Some(chip) = run.chips.get_mut(chip_idx) {
+                chip.state = Self::classify_tool_result(result);
+            }
+        }
+    }
+
+    fn finalize_active_run(&mut self) {
+        let Some(user_idx) = self.active_run_user_idx.take() else { return };
+        let base_cost = self.assistant.turn.summary().or_else(|| {
+            self.assistant
+                .turn
+                .wall
+                .map(|w| format!("0 steps · {:.1} s · {}", w.as_secs_f64(), self.assistant.model()))
+        });
+        let run = self.transcript_runs.entry(user_idx).or_default();
+        run.cost_line = base_cost.map(|c| {
+            if run.read_count > 0 {
+                format!("{c} · {} read{}", run.read_count, if run.read_count == 1 { "" } else { "s" })
+            } else {
+                c
+            }
+        });
+    }
+
+    /// Take in the worker's events and run its tool calls. The worker sends
+    /// one batch per model step and waits for all of its results.
+    fn poll_assistant(&mut self) {
+        let was_busy = self.assistant.busy;
+        if let Some(batch) = self.assistant.poll().pop() {
+            let user_idx = self.active_run_user_idx.unwrap_or_else(|| {
+                self.assistant.history.iter().rposition(|l| l.role == "user").unwrap_or(0)
+            });
+            self.active_run_user_idx = Some(user_idx);
+            let mut entries = Vec::with_capacity(batch.len());
+            for call in &batch {
+                if tool_is_read_only(&call.name) {
+                    entries.push(None);
+                } else {
+                    entries.push(Some(self.human_tool_label(&call.name, &call.args)));
+                }
+            }
+            let run = self.transcript_runs.entry(user_idx).or_default();
+            let mut todo = VecDeque::with_capacity(batch.len());
+            for (call, label) in batch.into_iter().zip(entries) {
+                let chip_idx = match label {
+                    Some(lbl) => {
+                        let idx = run.chips.len();
+                        run.chips.push(ToolChip { label: lbl, state: ToolChipState::Running });
+                        Some(idx)
+                    }
+                    None => {
+                        run.read_count += 1;
+                        None
+                    }
+                };
+                todo.push_back((call, chip_idx));
+            }
+            self.tool_batch = Some(ToolBatch {
+                todo,
+                results: Vec::new(),
+                waiting: None,
+                user_idx,
+            });
+        }
+        if let Some(mut batch) = self.tool_batch.take() {
+            if let Some((waiting, chip_idx)) = batch.waiting.take() {
+                let outcome = match &waiting {
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
+                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
+                        None if std::time::Instant::now() < *deadline => None,
+                        shot => Some(rack_shot_output(said, shot)),
+                    },
+                    Waiting::SoundScan { call, deadline } => {
+                        let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
+                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args).into())
+                    }
+                };
+                match outcome {
+                    Some(result) => {
+                        if let Some(ci) = chip_idx {
+                            self.finish_chip(batch.user_idx, ci, &result.text);
+                        }
+                        batch.results.push(result);
+                    }
+                    None => {
+                        batch.waiting = Some((waiting, chip_idx));
+                        self.tool_batch = Some(batch);
+                        return;
+                    }
+                }
+            }
+            while let Some((call, chip_idx)) = batch.todo.pop_front() {
+                if SOUND_TOOLS.contains(&call.name.as_str()) && self.sound_scan_running(&call.args) {
+                    batch.waiting = Some((Waiting::SoundScan { call, deadline: std::time::Instant::now() + SOUND_SCAN_WAIT }, chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
+                let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
+                let before = engine_edit.then(|| self.rack_ids());
+                let result = self.run_assistant_tool(&call.name, &call.args);
+                batch.waiting = match before {
+                    Some(before) => Some((
+                        Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
+                        chip_idx,
+                    )),
+                    None if call.name == LOOK_TOOL => Some((
+                        Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT },
+                        chip_idx,
+                    )),
+                    None => {
+                        if let Some(ci) = chip_idx {
+                            self.finish_chip(batch.user_idx, ci, &result);
+                        }
+                        batch.results.push(result.into());
+                        continue;
+                    }
+                };
+                self.tool_batch = Some(batch);
+                return;
+            }
+            self.assistant.send_tool_results(batch.results);
+        }
+        if was_busy && !self.assistant.busy {
+            self.finalize_active_run();
+        }
+    }
+
+    /// Node ids and living cable ids of the rack.
+    fn rack_ids(&self) -> (Vec<u32>, Vec<u32>) {
+        (
+            self.units.iter().map(|u| u.node_id).collect(),
+            self.cables.iter().filter(|c| c.dying < 0.0).map(|c| c.id).collect(),
+        )
+    }
+
+    /// What an engine edit did to the rack, appended to the tool's result:
+    /// the ids it created or removed, or that nothing changed. None = the
+    /// engine has not published it yet (and may still).
+    fn engine_edit_outcome(&self, edit: &EngineEdit) -> Option<String> {
+        let (nodes, cables) = self.rack_ids();
+        let (nodes_before, cables_before) = &edit.before;
+        let list = |what: &str, now: &[u32], then: &[u32]| {
+            let ids: Vec<String> = now.iter().filter(|id| !then.contains(id)).map(|id| id.to_string()).collect();
+            (!ids.is_empty()).then(|| format!("{what} {}", ids.join(", ")))
+        };
+        let changes: Vec<String> = [
+            list("new node id", &nodes, nodes_before),
+            list("removed node", nodes_before, &nodes),
+            list("new cable id", &cables, cables_before),
+            list("removed cable", cables_before, &cables),
+        ].into_iter().flatten().collect();
+        if !changes.is_empty() && self.last_graph_rev != edit.rev {
+            Some(format!("{} [applied: {}]", edit.result, changes.join("; ")))
+        } else if std::time::Instant::now() < edit.deadline {
+            None
+        } else {
+            Some(format!("{} — NOT applied: the engine changed nothing (check the ids with get_graph)", edit.result))
+        }
+    }
+
+    /// Run one assistant tool call. A destructive tool called without
+    /// confirm=true is refused by `exec_tool` and parked as a Confirm /
+    /// Cancel prompt in the chat (#32); the model is told to ask and wait.
+    fn run_assistant_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
+        let result = self.exec_tool_with_origin(name, args, AgentOrigin::Assistant);
+        let confirmed = args.get("confirm").and_then(|v| v.as_bool()) == Some(true);
+        if CONFIRM_TOOLS.contains(&name) && !confirmed && result.starts_with("not ") {
+            let label = match name {
+                "delete_rig" => {
+                    let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    format!("Delete rig {} · {}", rig + 1, self.rig_name(rig))
+                }
+                _ => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
+            };
+            self.pending_confirm = Some(PendingConfirm { tool: name.to_string(), args: args.clone(), label });
+            return format!("{result}. The chat now shows Confirm / Cancel buttons for this: ask the user in one short sentence and wait — their click runs or cancels it (do not call it again with confirm=true unless they answer in text).");
+        }
+        result
+    }
+
+    /// The user clicked Confirm (true) or Cancel (false) on the pending
+    /// destructive action. Confirm runs it with confirm=true; either way the
+    /// model hears what happened.
+    fn resolve_confirm(&mut self, confirm: bool) {
+        let Some(p) = self.pending_confirm.take() else { return };
+        if confirm {
+            let mut args = p.args.clone();
+            if let Some(o) = args.as_object_mut() { o.insert("confirm".into(), serde_json::Value::Bool(true)); }
+            let result = self.exec_tool_with_origin(&p.tool, &args, AgentOrigin::Assistant);
+            self.assistant.send_user_display(
+                format!("Confirm · {}", p.label),
+                format!("[The user clicked Confirm. The app ran {} with confirm=true: {result}] Report the outcome briefly; do not call it again.", p.tool),
+            );
+        } else {
+            self.assistant.send_user_display(
+                format!("Cancel · {}", p.label),
+                format!("[The user clicked Cancel: do not run {} ({}).] Acknowledge briefly.", p.tool, p.label),
+            );
+        }
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
     }
 
     fn sessions_dir() -> std::path::PathBuf {
@@ -3388,6 +4323,9 @@ impl DemoApp {
         if self.stage_view != StageView::Sessions {
             self.confirm_delete_session = None;
         }
+        if self.stage_view != StageView::Settings {
+            self.settings_msg.clear();
+        }
         if self.stage_view == StageView::Plugins && !self.plugins_loaded {
             self.refresh_plugins();
         }
@@ -3398,10 +4336,33 @@ impl DemoApp {
     fn capture_undo(&mut self) -> Option<UndoSnap> {
         let session = self.capture_session("Undo").ok()?;
         let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
-        Some(UndoSnap {
-            session, rigs, mix: self.rig_mix, active: self.active_rig,
-            patch_names: self.patch_names.clone(), rig_sources: self.rig_sources,
-        })
+        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, voices: self.voice_rows() })
+    }
+
+    fn voice_rows(&self) -> Vec<VoiceRow> {
+        self.clap_rigs().into_iter()
+            .map(|(slot, node)| VoiceRow {
+                node,
+                sources: self.rig_sources.get(slot).copied().unwrap_or((true, true)),
+                device: self.rig_device.get(slot).copied().flatten(),
+                patch_name: self.patch_names.get(slot).cloned().flatten(),
+            })
+            .collect()
+    }
+
+    /// Put rows back after a reload reset the tables (rule 20: after
+    /// `apply_session`), and tell the engine each unit's switches again.
+    fn restore_voice_rows(&mut self, rows: &[VoiceRow]) {
+        for row in rows {
+            let Some(slot) = self.voice_slot_of_node(row.node) else { continue };
+            self.rig_sources[slot] = row.sources;
+            self.rig_device[slot] = row.device;
+            self.patch_names[slot] = row.patch_name.clone();
+            self.send_rig_source(row.node);
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node: row.node, device: row.device });
+            }
+        }
     }
 
     /// Before an agent's first change in a job, snapshot the rack. A job is
@@ -3440,10 +4401,7 @@ impl DemoApp {
             s.active = active;
         }
         self.adopt_rig_devices();
-        self.patch_names = snap.patch_names;
-        // apply_session reset the source switches: restore and re-send them.
-        self.rig_sources = snap.rig_sources;
-        for (_, node) in self.clap_rigs() { self.send_rig_source(node); }
+        self.restore_voice_rows(&snap.voices);
         self.rig_mix = snap.mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
@@ -3589,80 +4547,114 @@ impl DemoApp {
         }
     }
 
-    /// Pool index in `_surge_main` / `surge_controllers` for CLAP rig slot `rig`.
+    /// Hosted-voice index in `_surge_main` / `surge_controllers` for CLAP slot `rig`.
     fn clap_pool_idx(&self, rig: usize) -> Option<usize> {
         self.clap_slot_map.get(rig).copied().flatten()
     }
 
-    /// Drain retired CLAP voices and match every `UnitKind::Clap` in `self.units`
-    /// to a `ClapVoiceMain` of matching `plugin_id`, instantiating new CLAP
-    /// plugins (e.g. Dexed) on the UI thread and delivering them to the engine.
-    fn sync_clap_slots(&mut self, graph: &Graph) {
+    /// Free the hosted voices the engine handed back (plugin main thread:
+    /// stop, deactivate, drop) and the tables it grew out of.
+    fn free_returned_voices(&mut self) {
         while let Some(rx) = self.voice_retire_rx.as_mut() {
-            let Ok(voice) = rx.pop() else { break };
-            if let Some(pos) = self.clap_voice_ids.iter().position(|&id| id == voice.voice_id()) {
+            let Ok(back) = rx.pop() else { break };
+            let VoiceBack::Voice(slot) = back else { continue };
+            let id = slot.voice_id();
+            self.clap_leaving.retain(|&l| l != id);
+            if let Some(pos) = self.clap_voice_ids.iter().position(|&v| v == id) {
                 let main = self._surge_main.remove(pos);
                 self.surge_controllers.remove(pos);
                 self.clap_plugin_ids.remove(pos);
                 self.clap_voice_ids.remove(pos);
-                main.retire(voice);
+                main.retire(slot.into_voice());
             }
         }
-        let clap_nodes: Vec<(u32, String)> = self
-            .units
-            .iter()
-            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
-            .map(|u| {
-                let pid = graph
-                    .node(u.node_id)
-                    .and_then(|n| match &n.kind {
-                        NodeKind::Clap { plugin_id } => Some(crate::control::name_str(plugin_id).to_string()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| SURGE_ID.to_string());
-                (u.node_id, pid)
+    }
+
+    /// Instantiate `plugin_id` on this (the plugins' main) thread and hand
+    /// its audio half to the engine. The engine binds it to a voiceless Clap
+    /// node of that plugin. Returns the hosted index.
+    fn host_voice(&mut self, plugin_id: &str) -> Result<usize, String> {
+        let (voice, main) = ClapVoice::new_plugin(self.sample_rate, plugin_id)
+            .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
+        let ctrl = voice.controller();
+        let id = voice.voice_id();
+        let slot = VoiceSlot::new(voice);
+        let Some(tx) = self.voice_tx.as_mut() else { return Err("no audio engine".into()) };
+        // The engine's table is full: send a larger one ahead of the voice.
+        let grow = self.clap_voice_ids.len() >= self.engine_voice_cap;
+        if tx.slots() < 1 + grow as usize {
+            main.retire(slot.into_voice());
+            return Err(format!("Voice channel busy, {plugin_id} loads in a moment"));
+        }
+        if grow {
+            let cap = self.engine_voice_cap * 2;
+            if let Some(Ok(mut g)) = self.graph_pub.as_ref().map(|p| p.lock()) {
+                g.reserve_voices(cap);
+            }
+            let _ = tx.push(VoiceMsg::Grow(Vec::with_capacity(cap)));
+            self.engine_voice_cap = cap;
+        }
+        let _ = tx.push(VoiceMsg::Add(slot));
+        self._surge_main.push(main);
+        self.surge_controllers.push(ctrl);
+        self.clap_plugin_ids.push(plugin_id.to_string());
+        self.clap_voice_ids.push(id);
+        Ok(self._surge_main.len() - 1)
+    }
+
+    /// Follow the engine's voice table: free what it handed back, map every
+    /// CLAP unit to the hosted voice that plays its node, host a voice for
+    /// each unit that has none, and ask back the voices no unit needs.
+    /// `published` is the engine's binding (`GraphPub::voices`). None = the
+    /// binding of a graph this frame loads into the engine: known before the
+    /// engine answers, because it binds by `control::bind_voices` too.
+    fn sync_clap_slots(&mut self, graph: &Graph, published: Option<&[(u64, u32)]>) {
+        self.free_returned_voices();
+        let nodes: Vec<(u32, String)> = graph.nodes.iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Clap { plugin_id } => Some((n.id, crate::control::clap_plugin_key(name_str(plugin_id)).to_string())),
+                _ => None,
             })
             .collect();
-        let mut used = vec![false; self._surge_main.len()];
-        let mut new_map = Vec::with_capacity(clap_nodes.len());
-        for (node_id, pid) in clap_nodes {
-            let found = (0..self._surge_main.len()).find(|&i| {
-                !used[i]
-                    && (self.clap_plugin_ids[i] == pid
-                        || ((pid.is_empty() || pid == "Surge XT") && self.clap_plugin_ids[i] == SURGE_ID))
-            });
-            if let Some(i) = found {
-                used[i] = true;
-                new_map.push(Some(i));
-            } else if self.voice_tx.is_some() {
-                match ClapVoice::new_plugin(self.sample_rate, &pid) {
-                    Ok((voice, main)) => {
-                        let ctrl = voice.controller();
-                        let vid = voice.voice_id();
-                        if let Some(tx) = self.voice_tx.as_mut() {
-                            if tx.push((node_id, voice, vec![0.0; 8192 * 2])).is_err() {
-                                self.plugin_msg = format!("Voice channel full for {pid}");
-                                new_map.push(None);
-                                continue;
-                            }
-                        }
-                        self._surge_main.push(main);
-                        self.surge_controllers.push(ctrl);
-                        self.clap_plugin_ids.push(pid);
-                        self.clap_voice_ids.push(vid);
-                        used.push(true);
-                        new_map.push(Some(self._surge_main.len() - 1));
-                    }
-                    Err(e) => {
-                        self.plugin_msg = format!("Load {pid} failed: {e}");
-                        new_map.push(None);
-                    }
-                }
-            } else {
-                new_map.push(None);
+        // The node every hosted voice plays.
+        let mut plays: Vec<Option<u32>> = vec![None; self.clap_voice_ids.len()];
+        for &(id, node) in published.unwrap_or(&[]) {
+            if let Some(i) = self.clap_voice_ids.iter().position(|&v| v == id) {
+                if nodes.iter().any(|(n, _)| *n == node) { plays[i] = Some(node); }
             }
         }
-        self.clap_slot_map = new_map;
+        // Voices the engine has not bound (or published) yet go by its rule.
+        let free: Vec<(u64, &str)> = (0..plays.len())
+            .filter(|&i| plays[i].is_none() && !self.clap_leaving.contains(&self.clap_voice_ids[i]))
+            .map(|i| (self.clap_voice_ids[i], self.clap_plugin_ids[i].as_str()))
+            .collect();
+        let mut open = Graph::default();
+        open.nodes = graph.nodes.iter().filter(|n| !plays.contains(&Some(n.id))).cloned().collect();
+        let mut missing: Vec<(u32, String)> = Vec::new();
+        for (node, voice) in crate::control::bind_voices(&open, &free) {
+            match voice.and_then(|id| self.clap_voice_ids.iter().position(|&v| v == id)) {
+                Some(i) => plays[i] = Some(node),
+                None => missing.extend(nodes.iter().find(|(n, _)| *n == node).cloned()),
+            }
+        }
+        if self.voice_tx.is_some() {
+            for (node, pid) in missing {
+                match self.host_voice(&pid) {
+                    Ok(_) => plays.push(Some(node)),
+                    Err(e) => self.plugin_msg = e,
+                }
+            }
+            for i in 0..plays.len() {
+                let id = self.clap_voice_ids[i];
+                if plays[i].is_some() || self.clap_leaving.contains(&id) { continue; }
+                if let Some(tx) = self.voice_tx.as_mut() {
+                    if tx.push(VoiceMsg::Retire(id)).is_ok() { self.clap_leaving.push(id); }
+                }
+            }
+        }
+        self.clap_slot_map = self.clap_rigs().into_iter()
+            .map(|(_, node)| plays.iter().position(|p| *p == Some(node)))
+            .collect();
         self.rule_param_cache = None;
     }
 
@@ -3675,7 +4667,7 @@ impl DemoApp {
         self.session_rig_names = s.rig_names.clone();
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
-        self.sync_clap_slots(&s.graph);
+        self.sync_clap_slots(&s.graph, None);
         // Restore plugin state into the remapped voices (rig order).
         let clap_nodes: Vec<u32> = self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
@@ -3692,14 +4684,14 @@ impl DemoApp {
         // Rewire the engine, then publish every knob value.
         self.ui_transport_grace = self.ui_time + 0.6;
         self.load_graph_into_engine(&s.graph);
+        self.voice_hold_rev = Some(self.last_graph_rev);
         // The editor referenced the old voice mapping; close it.
         self.editor_open = false;
         self.editor_params.clear();
         self.editor_status = "editor closed (rack reloaded)".into();
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
             for u in &mut self.units {
@@ -3803,15 +4795,16 @@ impl DemoApp {
         }
         let rigs = vec![mk_rig("Rig A", true), mk_rig("Rig B", false)];
         let merged = crate::control::merge_rigs(&rigs);
+        self.build_rack(&merged, &[]);
+        self.begin_load_fade();
+        self.sync_clap_slots(&merged, None);
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
         }
-        self.build_rack(&merged, &[]);
-        self.begin_load_fade();
+        self.voice_hold_rev = Some(self.last_graph_rev);
         self.editor_open = false;
         self.editor_params.clear();
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
     }
 
@@ -3911,7 +4904,9 @@ impl DemoApp {
                     (k, l) => k.unwrap_or(false) || l.unwrap_or(false),
                 });
                 let hardware = flag("hardware").unwrap_or(true);
-                let rig = self.rig_of_node(node);
+                let Some(rig) = self.voice_slot_of_node(node) else {
+                    return format!("set_rig_source: node {node} is not a CLAP instrument — see get_rigs");
+                };
                 self.rig_sources[rig] = (keyboard, hardware);
                 self.send_rig_source(node);
                 self.agent_activity.touch_cell(SourceId::Keys, node, now);
@@ -3977,6 +4972,19 @@ impl DemoApp {
             }
             "system_audio" => {
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                let rm = self.reduce_motion;
+                let mut touched = Vec::new();
+                for u in &mut self.units {
+                    for k in &mut u.knobs {
+                        if k.param == Some(crate::engine::P_SYSTEM_GAIN) {
+                            k.glide_to(gain, rm);
+                            touched.push(u.node_id);
+                        }
+                    }
+                }
+                if !touched.is_empty() {
+                    self.agent_activity.record(origin, format!("System audio → {gain:.2}"), touched, now);
+                }
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetSystemAudio { gain });
                 }
@@ -4043,8 +5051,9 @@ impl DemoApp {
                 let channels = args.get("channels").and_then(|v| v.as_str()).map(parse_audio_channel);
                 if let Some(gain) = args.get("gain").and_then(|v| v.as_f64()) {
                     let g = gain.clamp(0.0, 1.0);
+                    let rm = self.reduce_motion;
                     if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_GAIN)) {
-                        k.value = g as f32;
+                        k.glide_to(g as f32, rm);
                     }
                     if let Some(bus) = &self.bus {
                         let _ = bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_GAIN, value: g });
@@ -4064,6 +5073,9 @@ impl DemoApp {
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.8).clamp(0.0, 1.0) as f32;
                 if path.is_empty() {
                     return "play_file needs a path to a WAV file (16/24-bit PCM or 32-bit float)".into();
+                }
+                if !std::path::Path::new(path).is_file() {
+                    return format!("play_file: no file at '{path}'");
                 }
                 if let Some(pc) = &self.player_ctrl {
                     pc.play(path);
@@ -4094,7 +5106,9 @@ impl DemoApp {
             "set_rig_device" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 let device = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32);
-                let rig = self.rig_of_node(node);
+                let Some(rig) = self.voice_slot_of_node(node) else {
+                    return format!("set_rig_device: node {node} is not a CLAP instrument — see get_rigs");
+                };
                 self.rig_device[rig] = device;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
@@ -4366,7 +5380,15 @@ impl DemoApp {
                             .collect()
                     })
                     .unwrap_or_default();
-                serde_json::json!({"node": node, "total": total, "params": params, "knobs": knobs}).to_string()
+                let (main_controls, source) = self.main_controls_json(node);
+                serde_json::json!({
+                    "node": node,
+                    "main_controls_source": source,
+                    "main_controls": main_controls,
+                    "total": total,
+                    "params": params,
+                    "knobs": knobs,
+                }).to_string()
             }
             "learn_cc" => {
                 if args.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
@@ -4648,33 +5670,25 @@ impl DemoApp {
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
+            LOOK_TOOL => {
+                self.rack_shot.wanted = true;
+                self.agent_activity.record(origin, "Look at the rack", vec![], now);
+                "screenshot of the kabelsalat window".into()
+            }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let is_dexed = self.clap_pool_idx(self.active_rig)
-                    .and_then(|i| self.clap_plugin_ids.get(i))
-                    .map(|id| id == DEXED_ID)
-                    .unwrap_or(false);
-                if is_dexed {
-                    let hits = crate::host::search_dexed_patches(self.dexed_patches(), q, 25);
-                    if hits.is_empty() { format!("no Dexed patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
-                } else {
-                    let hits = crate::host::search_surge_patches(self.surge_patches(), q, 25);
-                    if hits.is_empty() { format!("no Surge patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
+                match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
+                    Ok((library, unit)) => crate::sounds::list_answer(&unit, &library, q),
+                    Err(e) => format!("list_sounds failed: {e}"),
                 }
             }
             "load_sound" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
-                match self.load_sound(rig, q) {
-                    Ok(p) => {
-                        let multi = self.rig_count() > 1;
-                        let nodes: Vec<u32> = self.units.iter()
-                            .filter(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
-                            .map(|u| u.node_id)
-                            .collect();
-                        self.agent_activity.touch_rig(rig, now);
-                        self.agent_activity.record(origin, format!("Sound → {p}"), nodes, now);
-                        format!("loaded '{p}' into rig {rig} '{}'", self.rig_name(rig))
+                match self.sound_target(args).and_then(|unit| self.load_sound(&unit, q).map(|sound| (sound, unit))) {
+                    Ok((sound, unit)) => {
+                        self.agent_activity.touch_rig(unit.rig, now);
+                        self.agent_activity.record(origin, format!("Sound → {}", sound.label()), vec![unit.node], now);
+                        crate::sounds::loaded_answer(&unit, &sound, &self.rig_name(unit.rig))
                     }
                     Err(e) => format!("load_sound failed: {e}"),
                 }
@@ -4697,12 +5711,10 @@ impl DemoApp {
                     None => self.edit_rigs_named(None, name),
                 }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
-                // A Surge patch query means nothing to another plugin.
                 let new_rig = self.active_rig;
-                let sound_query = if args.get("plugin_id").is_some() { None } else { args.get("sound").and_then(|v| v.as_str()) };
-                let sound = match sound_query {
-                    Some(q) => match self.load_sound(new_rig, q) {
-                        Ok(p) => format!(" Sound: {p}."),
+                let sound = match args.get("sound").and_then(|v| v.as_str()) {
+                    Some(q) => match self.sound_instrument(Some(new_rig), None).and_then(|unit| self.load_sound(&unit, q)) {
+                        Ok(sound) => format!(" Sound: {}.", sound.label()),
                         Err(e) => format!(" Sound not loaded: {e}."),
                     },
                     None => String::new(),
@@ -4758,6 +5770,41 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("View {}", self.rig_name(rig)), vec![], now);
                 format!("showing rig {rig} '{}' (view only — every rig keeps sounding)", self.rig_name(rig))
             }
+            "save_rig" => {
+                let Some(name) = args.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+                    return "save_rig needs 'name'".into();
+                };
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                let dir = self.rig_presets_dir.clone();
+                match self.save_rig_preset_to_dir(&dir, rig, name) {
+                    Ok(p) => {
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(origin, format!("Save rig → {name}"), vec![], now);
+                        format!("saved rig {rig} '{}' as preset '{name}' to {}", self.rig_name(rig), p.display())
+                    }
+                    Err(e) => format!("save_rig failed: {e}"),
+                }
+            }
+            "load_rig" => {
+                let Some(name) = args.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+                    return "load_rig needs 'name'".into();
+                };
+                let target = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+                let dir = self.rig_presets_dir.clone();
+                match self.load_rig_preset_from_dir(&dir, name, target) {
+                    Ok(slot) => {
+                        let nodes: Vec<u32> = self.units.iter().filter(|u| u.rig as usize == slot).map(|u| u.node_id).collect();
+                        self.agent_activity.touch_rig(slot, now);
+                        self.agent_activity.record(origin, format!("Load rig ← {name}"), nodes, now);
+                        format!("loaded rig preset '{name}' into rig {slot} '{}' — knobs, cables, mix and synth state restored. {}", self.rig_name(slot), self.rigs_json())
+                    }
+                    Err(e) => format!("load_rig failed: {e}"),
+                }
+            }
+            "list_rig_presets" => {
+                let presets = crate::session::list_rig_presets(&self.rig_presets_dir);
+                serde_json::json!({"presets": presets}).to_string()
+            }
             "connect" => {
                 let from_node = args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let to_node = args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -4786,10 +5833,15 @@ impl DemoApp {
                         v
                     })
                     .unwrap_or_default();
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::Disconnect(id));
-                    if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                // Unplug it in the rack too: a cable the rack still shows is
+                // re-sent to the engine every frame (publish_patch).
+                match self.live_cable(id) {
+                    Some(ci) => self.unplug_cable(ci, true),
+                    None => if let Some(bus) = &self.bus {
+                        let _ = bus.lock().unwrap().send(Command::Disconnect(id));
+                    },
                 }
+                if self.bus.is_some() && self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.record(origin, format!("Unplug cable {id}"), endpoints, now);
                 format!("disconnected cable {id}")
             }
@@ -4834,7 +5886,7 @@ impl DemoApp {
     }
 
     fn send_rig_source(&self, node: u32) {
-        let rig = self.rig_of_node(node);
+        let Some(rig) = self.voice_slot_of_node(node) else { return };
         let (keyboard, hardware) = self.rig_sources[rig];
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keyboard, hardware });
@@ -5015,7 +6067,9 @@ impl DemoApp {
                         c.value = val.clamp(c.min, hi);
                     }
                 }
+                self.mirror_lv2_editor_on_face(lv2_node);
             }
+            let moved = !ctrl_changes.is_empty();
             for (ci, val, norm) in ctrl_changes {
                 if let Some(c) = self.lv2_editor_controls.get_mut(ci) {
                     c.value = val;
@@ -5028,6 +6082,7 @@ impl DemoApp {
                     }
                 }
             }
+            if moved { self.mirror_lv2_editor_on_face(lv2_node); }
             return;
         }
         let rig = self.editor_rig;
@@ -5048,69 +6103,52 @@ impl DemoApp {
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
                 let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
-                let is_surge = plugin_id == Some(SURGE_ID);
-                let is_dexed = plugin_id == Some(DEXED_ID);
-                if is_surge {
-                    // Sound: exchange the instrument (Surge patch) of THIS synth.
+                // Sound: exchange the instrument (patch) of THIS synth.
+                let browser = match plugin_id {
+                    Some(SURGE_ID) => Some(("Init (Surge default)", "search sounds… e.g. flute, warm pad, bass", "sound_list")),
+                    Some(DEXED_ID) => Some(("Init (Dexed default)", "search DX7 sounds… e.g. piano, bass, brass", "dexed_sound_list")),
+                    _ => None,
+                };
+                if let (Some((init, hint, list_id)), Some(id)) = (browser, plugin_id) {
                     theme::section_label(ui, "Sound");
-                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Surge default)".into());
+                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| init.into());
                     ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
                     ui.add_sized([ui.available_width(), 20.0],
-                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search sounds… e.g. flute, warm pad, bass"));
+                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text(hint));
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-                    let mut chosen: Option<crate::host::SurgePatch> = None;
-                    {
-                        let patches = self.surge_patches().to_vec();
-                        egui::ScrollArea::vertical().id_salt("sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                            let mut shown = 0;
-                            for p in patches.iter().filter(|p| {
-                                let f = format!("{}/{}", p.category, p.name).to_lowercase();
-                                words.iter().all(|w| f.contains(w.as_str()))
-                            }) {
-                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
-                                shown += 1;
-                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {}", p.category, p.name)).size(12.5).color(theme::CREAM));
-                                if resp.clicked() { chosen = Some(p.clone()); }
-                            }
-                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
-                        });
-                    }
-                    if let Some(p) = chosen {
-                        match self.load_patch_into_slot(rig, &p) {
-                            Ok(n) => self.editor_status = format!("loaded {n}"),
-                            Err(e) => self.editor_status = format!("sound failed: {e}"),
+                    let library = match self.sounds.get(&crate::sounds::Instrument::Clap(id.to_string())) {
+                        crate::sounds::Lookup::Ready(library) => Some(library),
+                        _ => None,
+                    };
+                    let mut chosen: Option<crate::sounds::Sound> = None;
+                    egui::ScrollArea::vertical().id_salt(list_id).max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                        let Some(library) = &library else {
+                            ui.label(egui::RichText::new("scanning sounds…").size(12.0).color(theme::INK_2));
+                            return;
+                        };
+                        let mut shown = 0;
+                        for s in library.sounds.iter().filter(|s| {
+                            let f = s.label().to_lowercase();
+                            words.iter().all(|w| f.contains(w.as_str()))
+                        }) {
+                            if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
+                            shown += 1;
+                            // A cartridge lists its voices by their slot number.
+                            let text = match &s.load {
+                                crate::sounds::Load::DexedVoice { program, .. } => format!("{} · {:02} {}", s.category, program + 1, s.name),
+                                _ => format!("{} · {}", s.category, s.name),
+                            };
+                            let resp = ui.selectable_label(false, egui::RichText::new(text).size(12.5).color(theme::CREAM));
+                            if resp.clicked() { chosen = Some(s.clone()); }
                         }
-                    }
-                    ui.separator();
-                } else if is_dexed {
-                    theme::section_label(ui, "Sound");
-                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Dexed default)".into());
-                    ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
-                    ui.add_sized([ui.available_width(), 20.0],
-                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search DX7 sounds… e.g. piano, bass, brass"));
-                    let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-                    let mut chosen: Option<crate::host::DexedPatch> = None;
-                    {
-                        let patches = self.dexed_patches().to_vec();
-                        egui::ScrollArea::vertical().id_salt("dexed_sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                            let mut shown = 0usize;
-                            for p in patches.iter().filter(|p| {
-                                let f = format!("{}/{}", p.bank, p.name).to_lowercase();
-                                words.iter().all(|w| f.contains(w.as_str()))
-                            }) {
-                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
-                                shown += 1;
-                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {:02} {}", p.bank, p.program + 1, p.name)).size(12.5).color(theme::CREAM));
-                                if resp.clicked() { chosen = Some(p.clone()); }
-                            }
-                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
-                        });
-                    }
-                    if let Some(p) = chosen {
-                        match self.load_dexed_patch_into_slot(rig, &p) {
-                            Ok(n) => self.editor_status = format!("loaded {n}"),
-                            Err(e) => self.editor_status = format!("sound failed: {e}"),
-                        }
+                        if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
+                    });
+                    if let Some(s) = chosen {
+                        let unit = self.instrument_units().into_iter().find(|u| u.slot == Some(rig));
+                        self.editor_status = match unit.ok_or_else(|| "that synth has no voice slot".to_string()).and_then(|u| self.load_sound_into(&u, &s)) {
+                            Ok(()) => format!("loaded {}", s.label()),
+                            Err(e) => format!("sound failed: {e}"),
+                        };
                     }
                     ui.separator();
                 }
@@ -5263,7 +6301,7 @@ impl DemoApp {
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
-        if rig >= self.rig_sources.len() { return; } // beyond the voice pool
+        if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
         let node = self.units[inst].node_id;
         {
@@ -5335,11 +6373,12 @@ impl DemoApp {
                     let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
                     ui.horizontal(|ui| {
                         no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
-                        if node_at > 0.01 {
+                        if Self::agent_badge_alpha(node_at) > 0.05 {
+                            let badge_a = Self::agent_badge_alpha(node_at);
                             let (br, _) = ui.allocate_exact_size(egui::vec2(44.0, 15.0), egui::Sense::hover());
-                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, node_at));
+                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, badge_a));
                             ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "AGENT",
-                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, node_at));
+                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
                         }
                     });
                     // Single-graph mode: all nodes share rig 0 — don't label
@@ -5474,11 +6513,14 @@ impl DemoApp {
                 Vec::new()
             }
             UnitKind::Dsp(dk) => {
-                if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| &n.kind) {
+                let kind = self.base_graph.node(node_id).map(|n| &n.kind);
+                if let Some(NodeKind::Lv2 { uri }) = kind {
                     crate::lv2::control_descs_for_uri(uri.as_str())
                         .into_iter()
                         .map(|c| (c.index as u32, c.name))
                         .collect()
+                } else if matches!(kind, Some(NodeKind::SystemAudio)) {
+                    vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())]
                 } else {
                     crate::engine::dsp_param_choices(dk)
                         .iter()
@@ -5490,6 +6532,43 @@ impl DemoApp {
             UnitKind::Keys => Vec::new(),
             UnitKind::AudioIn => vec![(P_AUDIO_IN_GAIN, "Gain".into()), (P_AUDIO_IN_MONITOR, "Monitor".into())],
         }
+    }
+
+    /// `list_params`' main controls for a node: page, name, id, the current
+    /// value and its text, the face knob that shows it (if one does), and
+    /// the rule that found them. Empty when the node has none.
+    fn main_controls_json(&mut self, node: u32) -> (Vec<serde_json::Value>, Option<&'static str>) {
+        let Some(unit) = self.units.iter().position(|u| u.node_id == node) else { return (Vec::new(), None) };
+        let Some(found) = self.unit_main_controls(unit) else { return (Vec::new(), None) };
+        let is_clap = matches!(self.units[unit].node_kind, UnitKind::Clap);
+        let pool_idx = self.rig_of_unit(unit).and_then(|slot| self.clap_pool_idx(slot));
+        let rows = found.controls.iter().map(|c| {
+            let knob = self.units[unit].knobs.iter().find(|k| k.cc_target().is_some_and(|(id, _)| id == c.id));
+            let (value, text) = match pool_idx.and_then(|i| self._surge_main.get_mut(i)).filter(|_| is_clap) {
+                Some(main) => {
+                    let v = main.param_value(c.id).unwrap_or(c.default);
+                    (v, main.param_text(c.id, v))
+                }
+                // An LV2 port is not read back: the face knob holds what was sent.
+                None => {
+                    let v = knob.map_or(c.default, |k| c.plain(k.value));
+                    (v, format!("{v:.3}"))
+                }
+            };
+            serde_json::json!({
+                "page": c.page,
+                "name": c.name,
+                "id": c.id,
+                "value": value,
+                "text": text,
+                "min": c.min,
+                "max": c.max,
+                "target": if is_clap { "plugin" } else { "knob" },
+                "knob": knob.map(|k| k.label.clone()),
+            })
+        }).collect::<Vec<_>>();
+        let source = (!rows.is_empty()).then_some(found.source.as_str());
+        (rows, source)
     }
 
     fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
@@ -5505,11 +6584,23 @@ impl DemoApp {
     fn resolve_unit_knob(&self, node_id: u32, knob: &str) -> Result<(u32, crate::matrix::CcTarget), String> {
         let u = self.units.iter().find(|u| u.node_id == node_id)
             .ok_or_else(|| format!("no unit with node id {node_id}"))?;
-        let q = knob.trim().to_uppercase();
-        for k in &u.knobs {
-            if k.label.to_uppercase() == q {
-                return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
-            }
+        // Long names ("RESONANCE") resolve through the shared table's aliases.
+        let canonical = self.base_graph.node(node_id)
+            .and_then(|n| crate::engine::find_knob_spec(&n.kind, knob))
+            .map(|spec| spec.label);
+        let q = canonical.unwrap_or(knob).trim().to_uppercase();
+        // A plugin knob answers to its face label and to the control's full name.
+        let named = |k: &&Knob| k.label.to_uppercase() == q || k.source.plugin_name().is_some_and(|n| n.to_uppercase() == q);
+        // The unit's own knob wins a shared name: "LEVEL" stays the rack's LEVEL.
+        let own = |k: &&Knob| k.source == KnobSource::BuiltIn;
+        if let Some(k) = u.knobs.iter().filter(own).chain(u.knobs.iter().filter(|k| !own(k))).find(named) {
+            return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
+        }
+        // Main controls past the face (the list holds more than fit) bind too.
+        let unit = self.units.iter().position(|u| u.node_id == node_id).unwrap_or(usize::MAX);
+        if let Some(c) = self.unit_main_controls(unit).and_then(|m| m.find(knob).cloned()) {
+            let target = if matches!(u.node_kind, UnitKind::Clap) { crate::matrix::CcTarget::PluginParam } else { crate::matrix::CcTarget::Knob };
+            return Ok((c.id, target));
         }
         Err(format!("no knob '{knob}' on node {node_id}"))
     }
@@ -5567,6 +6658,7 @@ impl DemoApp {
     /// engine saw it before the binding existed, so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
         let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
+        let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
@@ -5588,6 +6680,7 @@ impl DemoApp {
                             if let Some(pin) = k.clap.as_mut() {
                                 if pin.id == m.param {
                                     k.value = norm;
+                                    pin.hold_until = hold_until;
                                     if !resend { pin.sent = norm; }
                                 }
                             }
@@ -5771,10 +6864,10 @@ impl DemoApp {
                 .find(|(id, _)| *id == self.rule_param_id)
                 .map(|(_, n)| n.as_str())
                 .unwrap_or("select param…");
-            egui::ComboBox::from_id_salt("rule_cc_param_pick")
+            theme::Dropdown::new("dd_rule_cc_param", selected_label)
                 .width((ui.available_width() - 4.0).max(160.0))
-                .selected_text(egui::RichText::new(selected_label).size(12.0).color(theme::INK))
-                .show_ui(ui, |ui| {
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
                     let mut shown = 0usize;
                     for (id, name) in choices {
                         let low = name.to_lowercase();
@@ -5782,14 +6875,16 @@ impl DemoApp {
                             continue;
                         }
                         if shown >= 80 {
-                            ui.label(egui::RichText::new("… refine filter").size(11.0).color(theme::INK_2));
+                            menu.note("… refine filter");
                             break;
                         }
                         shown += 1;
-                        ui.selectable_value(&mut self.rule_param_id, *id, egui::RichText::new(name).size(12.0).color(theme::INK));
+                        if menu.item(self.rule_param_id == *id, name) {
+                            self.rule_param_id = *id;
+                        }
                     }
                     if shown == 0 {
-                        ui.label(egui::RichText::new("no matching parameter").size(11.0).color(theme::INK_2));
+                        menu.note("no matching parameter");
                     }
                 });
         } else {
@@ -5894,7 +6989,7 @@ impl DemoApp {
             .map(|s| s.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         for (slot, node) in self.clap_rigs() {
             let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
-            if let Some(Some(d)) = devs.get(rig) {
+            if let (Some(Some(d)), true) = (devs.get(rig), slot < self.rig_sources.len()) {
                 self.rig_sources[slot] = (false, true);
                 self.rig_device[slot] = Some(*d);
             }
@@ -5909,6 +7004,12 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
+                LOOK_TOOL => {
+                    // Answered by `serve_rack_shots` once the frame arrived.
+                    self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote);
+                    self.rack_shot.remote.push((reply, std::time::Instant::now() + RACK_SHOT_WAIT));
+                    continue;
+                }
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
@@ -5920,69 +7021,114 @@ impl DemoApp {
         }
     }
 
-    /// Installed Surge patches (scanned once, cached).
-    fn surge_patches(&mut self) -> &[crate::host::SurgePatch] {
-        if self.surge_patch_cache.is_none() { self.surge_patch_cache = Some(crate::host::list_surge_patches()); }
-        self.surge_patch_cache.as_deref().unwrap_or(&[])
-    }
-
-    /// Installed Dexed DX7 `.syx` cartridge patches (scanned once, cached).
-    fn dexed_patches(&mut self) -> &[crate::host::DexedPatch] {
-        if self.dexed_patch_cache.is_none() { self.dexed_patch_cache = Some(crate::host::discover_dexed_patches()); }
-        self.dexed_patch_cache.as_deref().unwrap_or(&[])
-    }
-
-    /// Load the best-matching Surge or Dexed patch into `rig`'s (first) synth.
-    fn load_sound(&mut self, rig: usize, query: &str) -> Result<String, String> {
-        if rig >= self.rig_count() { return Err(format!("no rig {rig}")); }
+    /// The rack's instruments (CLAP synths and LV2 instruments), in unit order.
+    fn instrument_units(&self) -> Vec<crate::sounds::Unit> {
         let multi = self.rig_count() > 1;
-        let node = self.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
-            .map(|u| u.node_id).ok_or_else(|| format!("rig {rig} has no CLAP synth"))?;
-        let slot = self.clap_rigs().into_iter().find(|(_, n)| *n == node).map(|(s, _)| s)
-            .ok_or_else(|| "that synth has no voice slot".to_string())?;
-        let is_dexed = self.clap_pool_idx(slot)
-            .and_then(|i| self.clap_plugin_ids.get(i))
-            .map(|id| id == DEXED_ID)
-            .unwrap_or(false);
-        if is_dexed {
-            let words: Vec<String> = query.trim().to_lowercase().split_whitespace().map(str::to_string).collect();
-            let patch = self.dexed_patches().iter().find(|p| {
-                let hay = format!("{}/{}", p.bank, p.name).to_lowercase();
-                words.iter().all(|w| hay.contains(w.as_str()))
-            }).cloned().ok_or_else(|| format!("no Dexed patch matches '{query}'"))?;
-            return self.load_dexed_patch_into_slot(slot, &patch);
+        let mut slot = 0;
+        self.units.iter().filter_map(|u| {
+            let clap = matches!(u.node_kind, UnitKind::Clap);
+            let this_slot = clap.then(|| { slot += 1; slot - 1 });
+            if !clap && !u.lv2_inst { return None; }
+            let instrument = crate::sounds::Instrument::of(&self.base_graph.node(u.node_id)?.kind)?;
+            Some(crate::sounds::Unit { node: u.node_id, rig: if multi { u.rig as usize } else { 0 }, name: sentence_case(&u.name), instrument, slot: this_slot })
+        }).collect()
+    }
+
+    /// The instrument a sound tool means (`sounds::pick_unit`; the rig
+    /// defaults to the one in view).
+    fn sound_instrument(&self, rig: Option<usize>, node: Option<u32>) -> Result<crate::sounds::Unit, String> {
+        let rig = rig.unwrap_or(self.active_rig);
+        if node.is_none() && rig >= self.rig_count() { return Err(format!("no rig {rig}")); }
+        crate::sounds::pick_unit(&self.instrument_units(), rig, &self.rig_name(rig), node)
+    }
+
+    /// `sound_instrument` for a tool call's `rig` / `node` arguments.
+    fn sound_target(&self, args: &serde_json::Value) -> Result<crate::sounds::Unit, String> {
+        let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+        let node = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32);
+        self.sound_instrument(rig, node)
+    }
+
+    /// Is the library a sound tool call needs still being scanned? Asking
+    /// starts the scan.
+    fn sound_scan_running(&self, args: &serde_json::Value) -> bool {
+        self.sound_target(args)
+            .is_ok_and(|unit| matches!(self.sounds.get(&unit.instrument), crate::sounds::Lookup::Scanning))
+    }
+
+    /// Start scanning the libraries of the rack's instruments, so they are
+    /// there when somebody asks.
+    fn prewarm_sound_libraries(&self) {
+        for unit in self.instrument_units() {
+            let _ = self.sounds.get(&unit.instrument);
         }
-        let patch = {
-            let ps = self.surge_patches();
-            crate::host::find_surge_patch(ps, query).cloned().ok_or_else(|| format!("no Surge patch matches '{query}'"))?
+    }
+
+    /// The sound library of one instrument unit.
+    fn sound_library(&mut self, unit: &crate::sounds::Unit) -> Result<Arc<crate::sounds::Library>, String> {
+        match self.sounds.get(&unit.instrument) {
+            crate::sounds::Lookup::Ready(library) => Ok(library),
+            crate::sounds::Lookup::Scanning => Err(format!("still scanning {}'s sounds in the background: call again in a moment", unit.name)),
+            // CLAP reads parameter texts on the plugin's main thread: this one.
+            crate::sounds::Lookup::AskPlugin => {
+                let main = unit.slot.and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+                    .ok_or_else(|| format!("{} is not running (no audio engine): its presets are read from the live plugin", unit.name))?;
+                let params = main.param_list();
+                let library = crate::sounds::preset_param_library(&params, |id, value| main.param_text(id, value));
+                Ok(self.sounds.insert(unit.instrument.clone(), library))
+            }
+        }
+    }
+
+    /// Load the sound `query` means into an instrument unit.
+    fn load_sound(&mut self, unit: &crate::sounds::Unit, query: &str) -> Result<crate::sounds::Sound, String> {
+        let library = self.sound_library(unit)?;
+        let sound = crate::sounds::find_or_explain(unit, &library, query)?;
+        self.load_sound_into(unit, sound)?;
+        Ok(sound.clone())
+    }
+
+    /// Load one sound into an instrument unit (the agent tools and the
+    /// synth editor's Sound browser share this) and note it as the unit's
+    /// current sound.
+    fn load_sound_into(&mut self, unit: &crate::sounds::Unit, sound: &crate::sounds::Sound) -> Result<(), String> {
+        let pool = unit.slot.and_then(|s| self.clap_pool_idx(s));
+        let clap = pool.and_then(|i| Some((self._surge_main.get_mut(i)?, self.surge_controllers.get(i)?)));
+        let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
+        drop(bus);
+        match unit.slot {
+            Some(slot) => {
+                if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
+                if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot { self.refresh_editor_params(); }
+            }
+            None if self.lv2_editor_node == Some(unit.node) => self.lv2_preset_name = Some(sound.name.clone()),
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Answer the bridge callers that wait for look_at_rack: every one gets
+    /// the frame that arrived, or an error once its wait is over. The reply
+    /// is JSON: `{"text", "png_base64"}`.
+    fn serve_rack_shots(&mut self) {
+        if self.rack_shot.remote.is_empty() { return; }
+        let now = std::time::Instant::now();
+        let reply = |out: ToolOutput| match &out.image {
+            Some(image) => serde_json::json!({ "text": out.text, "png_base64": image.base64() }).to_string(),
+            None => out.text,
         };
-        self.load_patch_into_slot(slot, &patch)
-    }
-
-    /// Load one patch file into voice `slot` (agent load_sound and the synth
-    /// editor's Sound browser share this). Records the patch name and, if
-    /// that synth's editor is open, re-reads its parameters.
-    fn load_patch_into_slot(&mut self, slot: usize, patch: &crate::host::SurgePatch) -> Result<String, String> {
-        let data = std::fs::read(&patch.path).map_err(|e| format!("reading patch: {e}"))?;
-        let state = crate::host::fxp_to_state(&data).map_err(|e| e.to_string())?;
-        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        main.load_state(&state).map_err(|e| e.to_string())?;
-        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
-        if self.editor_open && self.editor_rig == slot { self.refresh_editor_params(); }
-        Ok(format!("{}/{}", patch.category, patch.name))
-    }
-
-    /// Load a DX7 `.syx` cartridge patch into a Dexed voice slot.
-    fn load_dexed_patch_into_slot(&mut self, slot: usize, patch: &crate::host::DexedPatch) -> Result<String, String> {
-        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        crate::host::load_dexed_patch(main, patch).map_err(|e| e.to_string())?;
-        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
-        if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot {
-            self.refresh_editor_params();
+        match self.rack_shot.take() {
+            Some(shot) => {
+                let out = reply(rack_shot_output("screenshot of the kabelsalat window", Some(shot)));
+                for (to, _) in self.rack_shot.remote.drain(..) { let _ = to.send(out.clone()); }
+            }
+            None => self.rack_shot.remote.retain(|(to, deadline)| {
+                if now < *deadline { return true; }
+                let _ = to.send(reply(rack_shot_output("", None)));
+                false
+            }),
         }
-        Ok(format!("{}/{}", patch.bank, patch.name))
     }
 
     /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
@@ -6021,20 +7167,64 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
+                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
+                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
         }
-        let msg = format!("{}\n{}", self.chat_context(), t);
+        let image = self.chat_image.take();
+        self.chat_thumb = None;
+        let shown = match &image {
+            Some(image) => format!("{t} [image: {}]", image.name).trim_start().to_string(),
+            None => t.clone(),
+        };
+        let text = format!("{}\n{}", self.chat_context(), if t.is_empty() { "(see the attached image)" } else { &t });
         self.undo_job = None; // a new request = a new undo step
-        self.assistant.send_user_display(t, msg);
+        self.pending_confirm = None; // a typed answer replaces the buttons
+        self.assistant.send_user_message(shown, UserMessage { text, image });
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
+    }
+
+    /// Attach an image to the chat message being written and show the chat.
+    /// A file that is no image is named in the transcript.
+    fn attach_chat_image(&mut self, image: Result<Image, String>) {
+        match image {
+            Ok(image) => {
+                self.chat_image = Some(image);
+                self.chat_thumb = None;
+            }
+            Err(why) => self.assistant.history.push(ChatLine { role: "error".into(), text: format!("not attached: {why}") }),
+        }
+        if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
+    }
+
+    /// Images the user handed over this frame: a file dropped on the window,
+    /// or an image pasted while the assistant is open.
+    fn take_chat_images(&mut self, ctx: &egui::Context) {
+        let (dropped, pasted) = ctx.input(|i| (
+            i.raw.dropped_files.clone(),
+            i.events.iter().find_map(|e| match e { egui::Event::PasteImage(image) => Some(image.clone()), _ => None }),
+        ));
+        for file in dropped {
+            let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
+            let too_big = std::fs::metadata(file.path()).is_ok_and(|m| m.len() > crate::vision::MAX_FILE_BYTES);
+            let image = if too_big {
+                Err(format!("{name} is larger than {} MB", crate::vision::MAX_FILE_BYTES / 1_000_000))
+            } else {
+                file.bytes().and_then(|bytes| Image::from_file(&name, &bytes))
+            };
+            self.attach_chat_image(image);
+        }
+        if let Some(image) = pasted.filter(|_| self.assistant_open()) {
+            self.attach_chat_image(Image::from_rgba("pasted image", image.size, image.as_raw()));
+        }
     }
 
     fn switch_model(&mut self, m: &str) -> String {
-        self.assistant.set_model(m);
-        let line = format!("model switched to {m} (the conversation continues)");
-        line
+        self.assistant.set_model(m)
     }
 
     /// Every rig for the agent: index, name, device, units (node ids), mix.
@@ -6053,15 +7243,6 @@ impl DemoApp {
 
     /// Most rigs the UI manages (the per-rig mixer mirror is `[RigMix; 8]`).
     const MAX_RIGS: usize = 8;
-
-    /// A fresh rig's patch: Keys→Surge→Master (stereo) while a pooled synth
-    /// voice is free (VOICE_POOL), else Keys→Master — a skeleton the user
-    /// fills from the Plugins browser.
-    fn new_rig_graph(&self) -> Graph {
-        let claps = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count();
-        let voices = if self._surge_main.is_empty() { VOICE_POOL } else { self._surge_main.len() };
-        crate::control::standard_rig_graph(claps < voices)
-    }
 
     /// Add a rig (`None`) or delete rig `Some(r)`, keeping every surviving
     /// rig's patch, knob values, synth state, device binding and mixer.
@@ -6090,6 +7271,7 @@ impl DemoApp {
             Ok(s) => s,
             Err(e) => { self.session_msg = format!("Rig edit failed: {e}"); return; }
         };
+        let voice_rows = self.voice_rows();
         let (graphs, old_bases) = crate::control::split_rigs(&s.graph);
         let devices: Vec<Option<u32>> = {
             let snap = self.rig_snapshot.lock().ok();
@@ -6112,7 +7294,7 @@ impl DemoApp {
                     .unwrap_or_else(|| format!("Rig {}", n + 1));
                 let graph = match plugin {
                     Some((id, label)) => crate::control::plugin_rig_graph(id, label),
-                    None => self.new_rig_graph(),
+                    None => crate::control::standard_rig_graph(true),
                 };
                 rigs.push((None, crate::control::Rig::new(name.clone(), graph, None)));
                 format!("Added {name}")
@@ -6151,6 +7333,12 @@ impl DemoApp {
             snap.active = active;
         }
         self.adopt_rig_devices();
+        // Switches, device and patch name follow each surviving unit to its
+        // new node id.
+        let voice_rows: Vec<VoiceRow> = voice_rows.into_iter()
+            .filter_map(|r| remap(r.node).map(|node| VoiceRow { node, ..r }))
+            .collect();
+        self.restore_voice_rows(&voice_rows);
         self.rig_mix = mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
@@ -6236,6 +7424,367 @@ impl DemoApp {
         }
     }
 
+    #[cfg(test)]
+    fn default_rig_presets_dir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("test-rig-presets").join(format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[cfg(not(test))]
+    fn default_rig_presets_dir() -> std::path::PathBuf {
+        crate::session::rig_presets_dir()
+    }
+
+    /// Snapshot ONE rig (units, cables, knobs, plugin states, matrix routes,
+    /// mix, name, device, sources, patch names) with rig-relative node ids.
+    fn capture_rig_preset(&mut self, rig: usize, preset_name: &str) -> anyhow::Result<crate::session::RigPreset> {
+        let n = self.rig_count();
+        if rig >= n {
+            anyhow::bail!("no rig {rig}: there are {n} (0..{})", n.saturating_sub(1));
+        }
+        let s = self.capture_session(preset_name)?;
+        let (graphs, bases) = crate::control::split_rigs(&s.graph);
+        let rig_graph = graphs.get(rig).cloned()
+            .ok_or_else(|| anyhow::anyhow!("rig {rig} has no graph"))?;
+        let base = bases[rig];
+        let mut rig_session = remap_session(&s, rig_graph, |old| {
+            let node = s.graph.node(old)?;
+            if node.rig as usize == rig { Some(old - base) } else { None }
+        });
+        rig_session.rig_names.clear();
+        let midi_device = self.rig_snapshot.lock().ok()
+            .and_then(|sn| sn.rigs.get(rig).and_then(|m| m.midi_device));
+        let mut clap_meta = Vec::new();
+        for (slot, nid) in self.clap_rigs() {
+            if self.units.iter().find(|u| u.node_id == nid).is_some_and(|u| u.rig as usize == rig) {
+                let (keyboard, hardware) = self.rig_sources.get(slot).copied().unwrap_or((true, true));
+                let patch_name = self.patch_names.get(slot).and_then(|p| p.clone());
+                clap_meta.push(crate::session::RigClapMeta {
+                    node: nid - base,
+                    keyboard,
+                    hardware,
+                    patch_name,
+                });
+            }
+        }
+        let mut preset = crate::session::RigPreset::new(preset_name.trim(), self.rig_name(rig), rig_session);
+        preset.mix = self.rig_mix[rig.min(7)];
+        preset.midi_device = midi_device;
+        preset.clap_meta = clap_meta;
+        preset.validate()?;
+        Ok(preset)
+    }
+
+    /// Load a single-rig preset either as a new rig (`target_rig = None`) or
+    /// replacing `Some(target_rig)`, keeping every other rig's state intact
+    /// and remapping all node-id keyed data through `remap_session`.
+    fn apply_rig_preset(
+        &mut self,
+        preset: &crate::session::RigPreset,
+        target_rig: Option<usize>,
+    ) -> anyhow::Result<usize> {
+        preset.validate()?;
+        let n = self.rig_count();
+        match target_rig {
+            None if n >= Self::MAX_RIGS => anyhow::bail!("at most {} rigs", Self::MAX_RIGS),
+            Some(t) if t >= n => anyhow::bail!("no rig {t}: there are {n}"),
+            _ => {}
+        }
+
+        let current = self.capture_session("Rigs")?;
+        let (existing_graphs, old_bases) = crate::control::split_rigs(&current.graph);
+        let existing_devices: Vec<Option<u32>> = self.rig_snapshot.lock().ok()
+            .map(|sn| (0..existing_graphs.len()).map(|i| sn.rigs.get(i).and_then(|m| m.midi_device)).collect())
+            .unwrap_or_else(|| vec![None; existing_graphs.len()]);
+        let existing_names: Vec<String> = (0..existing_graphs.len()).map(|i| self.rig_name(i)).collect();
+        let existing_mix = self.rig_mix;
+
+        let mut old_sources_by_node = std::collections::HashMap::new();
+        let mut old_patches_by_node = std::collections::HashMap::new();
+        for (slot, nid) in self.clap_rigs() {
+            old_sources_by_node.insert(nid, self.rig_sources.get(slot).copied().unwrap_or((true, true)));
+            if let Some(Some(p)) = self.patch_names.get(slot) {
+                old_patches_by_node.insert(nid, p.clone());
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum RigSlot { Existing(usize), Preset }
+        let mut slots: Vec<RigSlot> = (0..existing_graphs.len()).map(RigSlot::Existing).collect();
+        let active = match target_rig {
+            None => { slots.push(RigSlot::Preset); slots.len() - 1 }
+            Some(t) => { slots[t] = RigSlot::Preset; t }
+        };
+
+        let preset_name = if preset.rig_name.trim().is_empty() {
+            preset.name.clone()
+        } else {
+            preset.rig_name.clone()
+        };
+        let list: Vec<crate::control::Rig> = slots.iter().map(|slot| match *slot {
+            RigSlot::Existing(o) => crate::control::Rig::new(
+                existing_names[o].clone(),
+                existing_graphs[o].clone(),
+                existing_devices[o],
+            ),
+            RigSlot::Preset => crate::control::Rig::new(
+                preset_name.clone(),
+                preset.session.graph.clone(),
+                preset.midi_device,
+            ),
+        }).collect();
+
+        let new_bases = crate::control::rig_bases(&list);
+        let merged = crate::control::merge_rigs(&list);
+        let preset_slot = slots.iter().position(|s| matches!(s, RigSlot::Preset)).unwrap();
+        let mut existing_to_new: Vec<Option<usize>> = vec![None; existing_graphs.len()];
+        for (new_i, slot) in slots.iter().enumerate() {
+            if let RigSlot::Existing(o) = *slot {
+                existing_to_new[o] = Some(new_i);
+            }
+        }
+        let remap_existing = |old: u32| -> Option<u32> {
+            let o = current.graph.node(old)?.rig as usize;
+            let new_i = *existing_to_new.get(o)?.as_ref()?;
+            Some(new_bases[new_i] + (old - old_bases[o]))
+        };
+        let remap_preset = |old: u32| -> Option<u32> {
+            if preset.session.graph.node(old).is_some() {
+                Some(new_bases[preset_slot] + old)
+            } else {
+                None
+            }
+        };
+
+        let ns_existing = remap_session(&current, merged.clone(), remap_existing);
+        let ns_preset = remap_session(&preset.session, merged.clone(), remap_preset);
+        let mut combined = crate::session::Session::new("Rigs", merged);
+        combined.rig_names = list.iter().map(|r| r.name.clone()).collect();
+        for src_sess in [&ns_existing, &ns_preset] {
+            for p in src_sess.params() {
+                combined.set_param(p.node, p.param, p.value);
+            }
+            for st in src_sess.plugin_states() {
+                combined.set_plugin_state(st.node, &st.plugin_id, st.data.clone());
+            }
+        }
+        let mut rules: Vec<SavedRule> = Vec::new();
+        for src_sess in [&ns_existing, &ns_preset] {
+            if let Some(v) = src_sess.matrix() {
+                if let Ok(r) = serde_json::from_value::<Vec<SavedRule>>(v.clone()) {
+                    rules.extend(r);
+                }
+            }
+        }
+        if !rules.is_empty() {
+            combined.set_matrix(serde_json::to_value(&rules).ok());
+        }
+
+        let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        for (i, slot) in slots.iter().enumerate() {
+            mix[i] = match *slot {
+                RigSlot::Existing(o) => existing_mix[o.min(7)],
+                RigSlot::Preset => preset.mix,
+            };
+        }
+        let mut new_sources_by_node = std::collections::HashMap::new();
+        let mut new_patches_by_node = std::collections::HashMap::new();
+        for (old_nid, src) in old_sources_by_node {
+            if let Some(new_nid) = remap_existing(old_nid) {
+                new_sources_by_node.insert(new_nid, src);
+            }
+        }
+        for (old_nid, patch) in old_patches_by_node {
+            if let Some(new_nid) = remap_existing(old_nid) {
+                new_patches_by_node.insert(new_nid, patch);
+            }
+        }
+        for m in &preset.clap_meta {
+            if let Some(new_nid) = remap_preset(m.node) {
+                new_sources_by_node.insert(new_nid, (m.keyboard, m.hardware));
+                if let Some(p) = &m.patch_name {
+                    new_patches_by_node.insert(new_nid, p.clone());
+                }
+            }
+        }
+
+        self.load_as_rigs = Some((list.clone(), active));
+        self.apply_session(&combined)?;
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            snap.rigs = list.iter().map(|r| crate::control::RigMeta {
+                name: r.name.clone(),
+                midi_device: r.midi_device,
+            }).collect();
+            snap.active = active;
+        }
+        self.adopt_rig_devices();
+        // Restore per-voice source switches and patch names AFTER apply_session (rule 20/59).
+        for (slot, nid) in self.clap_rigs() {
+            if let Some(&src) = new_sources_by_node.get(&nid) {
+                if let Some(s) = self.rig_sources.get_mut(slot) {
+                    *s = src;
+                }
+                self.send_rig_source(nid);
+            }
+            if let Some(p) = new_patches_by_node.get(&nid) {
+                if let Some(pn) = self.patch_names.get_mut(slot) {
+                    *pn = Some(p.clone());
+                }
+            }
+        }
+        self.rig_mix = mix;
+        self.active_rig = usize::MAX;
+        self.set_active_rig(active);
+        for i in 0..list.len() {
+            self.ui_mix_grace[i.min(7)] = self.ui_time + 0.6;
+            self.send_rig_mix(i);
+        }
+        self.editor_status.clear();
+        Ok(active)
+    }
+
+    fn save_rig_preset_to_dir(&mut self, dir: &std::path::Path, rig: usize, name: &str) -> anyhow::Result<std::path::PathBuf> {
+        let preset = self.capture_rig_preset(rig, name)?;
+        let path = crate::session::RigPreset::package_path(dir, name)?;
+        preset.save(&path)?;
+        Ok(path)
+    }
+
+    fn load_rig_preset_from_dir(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+        target_rig: Option<usize>,
+    ) -> anyhow::Result<usize> {
+        let path = crate::session::RigPreset::package_path(dir, name)?;
+        let preset = crate::session::RigPreset::load(&path)?;
+        self.apply_rig_preset(&preset, target_rig)
+    }
+
+    /// "Save rig preset" dialog: Enter saves, Esc cancels.
+    fn save_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some((rig, mut text)) = self.save_rig_dialog.take() else { return };
+        if rig >= self.rig_count() { return; }
+        let mut decision: Option<bool> = None;
+        let rig_label = self.rig_name(rig);
+        let modal = egui::Modal::new(egui::Id::unique("save_rig_modal")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(egui::RichText::new(format!("Save rig {} · {}", rig + 1, rig_label)).size(17.0).strong().color(theme::INK));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Saves units, cables, knobs, sound, matrix routes and mix.").size(12.5).color(theme::INK_2));
+            ui.add_space(8.0);
+            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("save_rig_text").desired_width(320.0).char_limit(48));
+            if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decision = Some(true); }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Save preset").clicked() { decision = Some(true); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decision = Some(false); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(false); }
+        match decision {
+            Some(true) => {
+                let dir = self.rig_presets_dir.clone();
+                match self.save_rig_preset_to_dir(&dir, rig, &text) {
+                    Ok(_) => self.session_msg = format!("Saved rig preset '{}'", text.trim()),
+                    Err(e) => self.session_msg = format!("Save rig failed: {e}"),
+                }
+            }
+            Some(false) => {}
+            None => self.save_rig_dialog = Some((rig, text)),
+        }
+    }
+
+    /// "Load rig preset" dialog: load as a new rig or replace an existing one.
+    fn load_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut target) = self.load_rig_dialog.take() else { return };
+        let n = self.rig_count();
+        if target.is_some_and(|t| t >= n) { target = None; }
+        let dir = self.rig_presets_dir.clone();
+        let presets = crate::session::list_rig_presets(&dir);
+        let mut close = false;
+        let mut load_name: Option<String> = None;
+        let mut delete_name: Option<String> = None;
+        let modal = egui::Modal::new(egui::Id::unique("load_rig_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(egui::RichText::new("Load rig preset").size(17.0).strong().color(theme::INK));
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                if n < Self::MAX_RIGS && theme::chip_button(ui, "As new rig", target.is_none()).clicked() {
+                    target = None;
+                }
+                for r in 0..n {
+                    let lbl = format!("Replace {} · {}", r + 1, self.rig_name(r));
+                    if theme::chip_button(ui, &lbl, target == Some(r)).clicked() {
+                        target = Some(r);
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            Self::stage_hairline(ui);
+            ui.add_space(8.0);
+            let list_h = 220.0;
+            egui::ScrollArea::vertical()
+                .id_salt("rig_presets_list_scroll")
+                .min_scrolled_height(list_h)
+                .max_height(list_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if presets.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No saved rig presets yet — click Save rig to save one.")
+                                .size(13.0)
+                                .color(theme::INK_2),
+                        );
+                        return;
+                    }
+                    for (i, name) in presets.iter().enumerate() {
+                        if i > 0 { Self::stage_hairline(ui); }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if theme::danger_button(ui, "Delete", false).clicked() {
+                                    delete_name = Some(name.clone());
+                                }
+                                ui.add_space(6.0);
+                                if theme::primary_button(ui, "Load").clicked() {
+                                    load_name = Some(name.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            ui.add_space(10.0);
+            if theme::chip_button(ui, "Close", false).clicked() { close = true; }
+        });
+        if modal.should_close() { close = true; }
+        if let Some(name) = delete_name {
+            let _ = crate::session::delete_rig_preset(&dir, &name);
+        }
+        if let Some(name) = load_name {
+            match self.load_rig_preset_from_dir(&dir, &name, target) {
+                Ok(slot) => self.session_msg = format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
+                Err(e) => self.session_msg = format!("Load rig failed: {e}"),
+            }
+            return;
+        }
+        if !close {
+            self.load_rig_dialog = Some(target);
+        }
+    }
+
     /// Multi-rig overview strip: always visible above the rack.
     /// Every control (RIGS label, "+ Rig" button, separator, rig chips, delete
     /// button, source label, level bar) shares one 26px centered baseline.
@@ -6304,6 +7853,24 @@ impl DemoApp {
                                             }
                                             if chip.clicked() { switch = Some(rig); }
                                             if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
+                                            chip.context_menu(|ui| {
+                                                if ui.button("Rename…").clicked() {
+                                                    self.rename_rig_dialog = Some((rig, name.clone()));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Save rig preset…").clicked() {
+                                                    self.save_rig_dialog = Some((rig, name.clone()));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Replace from preset…").clicked() {
+                                                    self.load_rig_dialog = Some(Some(rig));
+                                                    ui.close();
+                                                }
+                                                if n > 1 && ui.button("Delete rig…").clicked() {
+                                                    self.confirm_delete_rig = Some(rig);
+                                                    ui.close();
+                                                }
+                                            });
                                             self.rig_chip_rects.push(chip.rect);
                                             if n > 1 {
                                                 let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
@@ -6329,6 +7896,22 @@ impl DemoApp {
                                             if w > 0.5 {
                                                 p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
                                             }
+                                        }
+                                        ui.add_space(4.0);
+                                        nav_separator(ui);
+                                        ui.add_space(4.0);
+                                        if theme::chip_button(ui, "Save rig", false)
+                                            .on_hover_text("save the active rig as a reusable preset")
+                                            .clicked()
+                                        {
+                                            let r = self.active_rig;
+                                            self.save_rig_dialog = Some((r, self.rig_name(r)));
+                                        }
+                                        if theme::chip_button(ui, "Load rig", false)
+                                            .on_hover_text("load a saved rig preset (new rig or replace existing)")
+                                            .clicked()
+                                        {
+                                            self.load_rig_dialog = Some(None);
                                         }
                                         if n > 1 {
                                             ui.add_space(8.0);
@@ -6372,8 +7955,11 @@ impl DemoApp {
                     // latter follows the bar's previous-frame width, so the mode
                     // flipped between frames and buttons jumped under the mouse.
                     let compact = ui.ctx().content_rect().width() < 1000.0;
+                    if compact {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                    }
                     let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
-                    ui.add_space(4.0);
+                    if !compact { ui.add_space(4.0); }
                     if compact {
                         theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                     } else if let Some(g) = self.topbar_word_g.clone() {
@@ -6389,25 +7975,29 @@ impl DemoApp {
                         let body_mid = r.top() + base - 20.0 * 0.36;
                         theme::crossed_wires(ui.painter(), Pos2::new(mark.center().x, body_mid), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                     }
-                    ui.add_space(14.0);
-                    ui.add_space(6.0);
+                    if !compact {
+                        ui.add_space(20.0);
+                    }
                     if !self.editor_open && !self.editor_status.is_empty() {
                         ui.label(egui::RichText::new(&self.editor_status).size(12.0).color(theme::ACCENT_DEEP));
-                        ui.add_space(8.0);
+                        if !compact { ui.add_space(8.0); }
                     }
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); }
                     // Two explicit groups (user): the VIEW decides what the
                     // main stage shows — exactly one, Rack included — while
                     // the BOTTOM PANEL toggles what docks under it.
-                    if !compact { theme::section_label(ui, "View"); }
-                    ui.add_space(2.0);
+                    if !compact {
+                        theme::section_label(ui, "View");
+                        ui.add_space(2.0);
+                    }
                     let views = [
                         ("Rack", StageView::Rack),
                         ("Sessions", StageView::Sessions),
                         ("Plugins", StageView::Plugins),
                         ("Matrix", StageView::Matrix),
                         ("Mixer", StageView::Mixer),
+                        ("Settings", StageView::Settings),
                     ];
                     let mut pick = None;
                     let group = ui.scope(|ui| {
@@ -6421,11 +8011,15 @@ impl DemoApp {
                     if let Some(view) = pick {
                         if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
                     }
-                    ui.add_space(12.0);
+                    if !compact { ui.add_space(12.0); } else { ui.add_space(2.0); }
                     nav_separator(ui);
-                    ui.add_space(10.0);
-                    if !compact { theme::section_label(ui, "Bottom panel"); }
-                    ui.add_space(2.0);
+                    if !compact {
+                        ui.add_space(10.0);
+                        theme::section_label(ui, "Bottom panel");
+                        ui.add_space(2.0);
+                    } else {
+                        ui.add_space(2.0);
+                    }
                     let mut dock = None;
                     let group = ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
@@ -6444,7 +8038,7 @@ impl DemoApp {
                         let last = crate::bridge::LAST_REMOTE_MS.load(Relaxed);
                         let recent = last > 0 && crate::bridge::now_ms().saturating_sub(last) < 15_000;
                         if paused || recent {
-                            ui.add_space(10.0);
+                            if !compact { ui.add_space(10.0); } else { ui.add_space(2.0); }
                             let (label, tip) = match (paused, compact) {
                                 (true, false) => ("Agent paused", "external agents (MCP) may not change this rack — click to allow"),
                                 (true, true) => ("Paused", "external agents (MCP) may not change this rack — click to allow"),
@@ -6462,9 +8056,9 @@ impl DemoApp {
                     // Master recording (GitHub #6): a REC chip (tomato only
                     // while recording) + a sync-to-transport toggle + elapsed
                     // time while active. Start/stop go through the command bus.
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
                     let snap = self.recorder.as_ref().map(|r| r.snapshot());
                     let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
@@ -6476,7 +8070,7 @@ impl DemoApp {
                         ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_DEEP))
                             .on_hover_text("recording failed to start or write");
                     }
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); }
                     let sync = self.record_sync;
                     if theme::chip_button(ui, "SYNC", sync)
                         .on_hover_text("start/stop recording with the master transport (Space)")
@@ -6544,47 +8138,6 @@ impl DemoApp {
                 )
             })
             .inner
-    }
-
-    fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Response {
-        ui.scope(|ui| {
-            let (fill, stroke, txt) = if filled {
-                (theme::CLIP_RED, theme::CLIP_RED, theme::ON_ACCENT)
-            } else {
-                (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CLIP_BRIGHT)
-            };
-            let base = egui::style::WidgetVisuals {
-                bg_fill: fill,
-                weak_bg_fill: fill,
-                bg_stroke: Stroke::new(1.0, stroke),
-                corner_radius: 2.0.into(),
-                fg_stroke: Stroke::new(1.0, txt),
-                expansion: 0.0,
-            };
-            let hot_fill = if filled {
-                theme::mix(theme::CLIP_RED, theme::INK, 0.08)
-            } else {
-                theme::mix(theme::DARK_PANEL_HI, theme::CLIP_RED, 0.14)
-            };
-            let hot = egui::style::WidgetVisuals {
-                bg_fill: hot_fill,
-                weak_bg_fill: hot_fill,
-                bg_stroke: Stroke::new(1.0, if filled { hot_fill } else { theme::CLIP_RED }),
-                ..base
-            };
-            let v = ui.visuals_mut();
-            v.widgets.inactive = base;
-            v.widgets.hovered = hot;
-            v.widgets.active = hot;
-            v.widgets.open = base;
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-            ui.add(
-                egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
-                    .corner_radius(2.0)
-                    .min_size(egui::vec2(0.0, 26.0)),
-            )
-        })
-        .inner
     }
 
     fn stage_hairline(ui: &mut egui::Ui) {
@@ -6788,11 +8341,11 @@ impl DemoApp {
                                                 *confirm_delete = None;
                                             }
                                             ui.add_space(6.0);
-                                            if Self::danger_button(ui, "Confirm delete", true).clicked() {
+                                            if theme::danger_button(ui, "Confirm delete", true).clicked() {
                                                 *delete_session = Some(name.clone());
                                             }
                                         } else {
-                                            if Self::danger_button(ui, "Delete", false)
+                                            if theme::danger_button(ui, "Delete", false)
                                                 .on_hover_text(format!("delete '{name}' from disk"))
                                                 .clicked()
                                             {
@@ -7637,6 +9190,490 @@ impl DemoApp {
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
+    fn settings_role_input_mut(&mut self, role: crate::llm::Role) -> &mut String {
+        match role {
+            crate::llm::Role::Decide => &mut self.settings_decide_input,
+            crate::llm::Role::Act => &mut self.settings_act_input,
+            crate::llm::Role::Perceive => &mut self.settings_perceive_input,
+        }
+    }
+
+    fn settings_key_input_mut(&mut self, endpoint: crate::llm::Endpoint) -> &mut String {
+        match endpoint {
+            crate::llm::Endpoint::DeepSeek => &mut self.settings_deepseek_key,
+            crate::llm::Endpoint::OpenRouter => &mut self.settings_openrouter_key,
+        }
+    }
+
+    /// Main-stage view for agent models, API keys, and app preferences.
+    fn settings_stage(&mut self, ui: &mut egui::Ui) {
+        use crate::llm::{Endpoint, Role};
+
+        enum SettingsAction {
+            ToggleDecide,
+            SetModel(Role, String),
+            SaveKey(Endpoint, String),
+            RemoveKey(Endpoint),
+            ToggleReduceMotion,
+            SetCountIn(bool, u8),
+            SetAudioOutput(Option<String>),
+        }
+
+        let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let help = self.show_help;
+
+        let keys = self.assistant.keys();
+        let decide_on = self.assistant.decide_enabled();
+        let decide_route = self.assistant.route_for(Role::Decide);
+        let act_route = self.assistant.route_for(Role::Act);
+        let perceive_route = self.assistant.route_for(Role::Perceive);
+        let (outputs, out_current) = self
+            .audio_out
+            .lock()
+            .map(|s| (s.outputs.clone(), s.current.clone()))
+            .unwrap_or_default();
+        let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
+        let reduce_motion = self.reduce_motion;
+        let count_in_enabled = self.count_in_enabled;
+        let count_in_bars = self.count_in_bars;
+        let detected_scale = ui_scale_target();
+        let mut actions: Vec<SettingsAction> = Vec::new();
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
+                    if !self.settings_msg.is_empty() {
+                        ui.add_space(16.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let col = if self.settings_msg.contains("failed") {
+                                theme::CLIP_BRIGHT
+                            } else {
+                                theme::LIVE_TEAL
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(&self.settings_msg).size(12.5).color(col)).truncate());
+                        });
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("agent models · API keys · preferences · Tab / Esc: back to the rack")
+                        .size(13.0)
+                        .color(theme::INK_2),
+                );
+                ui.add_space(12.0);
+                Self::stage_hairline(ui);
+                ui.add_space(14.0);
+
+                let avail_w = ui.available_width().max(200.0);
+                let body_h = ui.available_height().max(80.0);
+                let two_col = avail_w >= 640.0;
+
+                let draw_models = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "Agent models");
+                    ui.add_space(8.0);
+                    for (idx, role) in Role::ALL.iter().copied().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(10.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(10.0);
+                        }
+                        let route = match role {
+                            Role::Decide => &decide_route,
+                            Role::Act => &act_route,
+                            Role::Perceive => &perceive_route,
+                        };
+                        let choices = crate::assistant::role_model_choices(role, keys, &route.model);
+                        let desc = match role {
+                            Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
+                            Role::Act => "Handles conversation, questions, and multi-step rack edits.",
+                            Role::Perceive => "Reads attached screenshots and images for turns that carry one.",
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(role.label()).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(role.model_field()).size(11.0).color(theme::INK_2));
+                            if role == Role::Decide {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if theme::chip_button(ui, if decide_on { "On" } else { "Off" }, decide_on)
+                                        .on_hover_text("enable or disable Jev decisions before the chat model")
+                                        .clicked()
+                                    {
+                                        actions.push(SettingsAction::ToggleDecide);
+                                    }
+                                });
+                            }
+                        });
+                        ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
+                        ui.add_space(6.0);
+
+                        // One row when the column fits dropdown + field + Apply,
+                        // else the dropdown gets its own row; every width comes
+                        // from the column so a row never widens it.
+                        let col_w = ui.available_width();
+                        let gap = ui.spacing().item_spacing.x;
+                        let one_row = col_w >= 460.0;
+                        let dd_w = if one_row { (col_w * 0.44).clamp(150.0, 240.0) } else { col_w.min(320.0) };
+                        let mut picked: Option<String> = None;
+                        let mut apply_other = false;
+                        let mut dropdown = |ui: &mut egui::Ui| {
+                            theme::Dropdown::new(("dd_settings_model", role.model_field()), &route.model)
+                                .width(dd_w)
+                                .popup_min_width(240.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    for m in &choices {
+                                        if menu.item(*m == route.model, m) {
+                                            picked = Some(m.clone());
+                                        }
+                                    }
+                                });
+                        };
+                        let mut other_id = |ui: &mut egui::Ui| {
+                            let field_w = ui.available_width()
+                                - theme::chip_button_width(ui, "Apply")
+                                - gap
+                                - RECESSED_INPUT_CHROME;
+                            let input = app.settings_role_input_mut(role);
+                            let edit = Self::recessed_input(ui, input, field_w.max(60.0), "other model id…");
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                apply_other = true;
+                            }
+                            if theme::chip_button(ui, "Apply", false).clicked() {
+                                apply_other = true;
+                            }
+                        };
+                        if one_row {
+                            ui.horizontal(|ui| {
+                                dropdown(ui);
+                                other_id(ui);
+                            });
+                        } else {
+                            dropdown(ui);
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| other_id(ui));
+                        }
+                        if let Some(m) = picked {
+                            actions.push(SettingsAction::SetModel(role, m));
+                        }
+                        if apply_other {
+                            let input = app.settings_role_input_mut(role);
+                            let custom = input.trim().to_string();
+                            if !custom.is_empty() {
+                                input.clear();
+                                actions.push(SettingsAction::SetModel(role, custom));
+                            }
+                        }
+
+                        ui.add_space(6.0);
+                        // One galley for the whole status line: it wraps inside
+                        // the column as a unit instead of as overlapping labels.
+                        let mut status = egui::text::LayoutJob::default();
+                        let mut part = |text: &str, color: Color32| {
+                            status.append(
+                                text,
+                                0.0,
+                                egui::TextFormat { font_id: FontId::proportional(11.5), color, ..Default::default() },
+                            );
+                        };
+                        if role == Role::Decide && !decide_on {
+                            part("Effective route: Off · chat model handles requests", theme::INK_2);
+                        } else {
+                            let spec = route.endpoint.spec();
+                            part(&format!("Route: {} · {}", spec.label, route.model), theme::CREAM_META);
+                            if keys.has(route.endpoint) {
+                                part(&format!("  ·  {} key set", spec.label), theme::LIVE_TEAL);
+                            } else {
+                                part(&format!("  ·  {} key not set", spec.label), theme::ACCENT_BRIGHT);
+                            }
+                            if role == Role::Decide && spec.decisions_url.is_none() {
+                                part("  ·  endpoint has no decisions API", theme::ACCENT_BRIGHT);
+                            }
+                        }
+                        ui.add(egui::Label::new(status).wrap());
+                    }
+                };
+
+                let draw_keys = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "API keys");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Stored locally (~/.config/kabelsalat/config.json, 0600). Saving restarts the assistant worker.")
+                            .size(11.5)
+                            .color(theme::INK_2),
+                    );
+                    ui.add_space(10.0);
+                    for (idx, endpoint) in [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().copied().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(10.0);
+                        }
+                        let spec = endpoint.spec();
+                        let is_set = keys.has(endpoint);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(spec.label).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.add_space(6.0);
+                            let (status, col) = if is_set {
+                                ("set", theme::LIVE_TEAL)
+                            } else {
+                                ("not set", theme::CREAM_DIM)
+                            };
+                            ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(spec.key_field).size(11.0).color(theme::INK_2));
+                        });
+                        ui.add_space(4.0);
+
+                        let field_w = (ui.available_width()
+                            - theme::primary_button_width(ui, "Save")
+                            - theme::chip_button_width(ui, "Remove")
+                            - ui.spacing().item_spacing.x * 2.0
+                            - RECESSED_INPUT_CHROME)
+                            .clamp(60.0, 320.0);
+                        let hint = match endpoint {
+                            Endpoint::DeepSeek => "sk-…",
+                            Endpoint::OpenRouter => "sk-or-…",
+                        };
+                        let mut do_save = false;
+                        let mut do_remove = false;
+                        ui.horizontal(|ui| {
+                            let buf = app.settings_key_input_mut(endpoint);
+                            let edit = egui::Frame::new()
+                                .fill(theme::PAPER_SINK)
+                                .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                                .corner_radius(2.0)
+                                .inner_margin(egui::Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .id_salt(("settings_api_key", spec.key_field))
+                                            .password(true)
+                                            .frame(egui::Frame::NONE)
+                                            .desired_width(field_w)
+                                            .hint_text(hint),
+                                    )
+                                })
+                                .inner;
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                do_save = true;
+                            }
+                            if theme::primary_button(ui, "Save").clicked() {
+                                do_save = true;
+                            }
+                            ui.add_enabled_ui(is_set, |ui| {
+                                if theme::danger_button(ui, "Remove", false).clicked() {
+                                    do_remove = true;
+                                }
+                            });
+                        });
+                        if do_save {
+                            let buf = app.settings_key_input_mut(endpoint);
+                            let val = buf.trim().to_string();
+                            if !val.is_empty() {
+                                buf.clear();
+                                actions.push(SettingsAction::SaveKey(endpoint, val));
+                            }
+                        }
+                        if do_remove {
+                            app.settings_key_input_mut(endpoint).clear();
+                            actions.push(SettingsAction::RemoveKey(endpoint));
+                        }
+                    }
+                };
+
+                let draw_prefs = |ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "Preferences");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Reduce motion").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, if reduce_motion { "On" } else { "Off" }, reduce_motion).clicked() {
+                                actions.push(SettingsAction::ToggleReduceMotion);
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Snaps rack animations and disables pulsing indicators (ui_reduce_motion).").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
+                            theme::Dropdown::new("dd_settings_count_in_bars", bars_label)
+                                .width(92.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    for b in 1..=crate::transport::MAX_COUNT_IN_BARS {
+                                        let lbl = if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
+                                        if menu.item(count_in_bars == b, &lbl) {
+                                            actions.push(SettingsAction::SetCountIn(count_in_enabled, b));
+                                        }
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            if theme::chip_button(ui, if count_in_enabled { "On" } else { "Off" }, count_in_enabled).clicked() {
+                                actions.push(SettingsAction::SetCountIn(!count_in_enabled, count_in_bars));
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Plays metronome clicks before master playback starts.").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    let label_of = |raw: &str| {
+                        outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string())
+                    };
+                    let selected_out = match &out_wanted {
+                        Some(w) => label_of(w),
+                        None => "System default".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Audio output").font(theme::medium_font(13.5)).color(theme::INK));
+                        let out_dd_w = (ui.available_width() - 100.0).clamp(130.0, 200.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            theme::Dropdown::new("dd_settings_audio_output", &selected_out)
+                                .width(out_dd_w)
+                                .popup_min_width(240.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    if menu.item(out_wanted.is_none(), "System default") {
+                                        actions.push(SettingsAction::SetAudioOutput(None));
+                                    }
+                                    for o in &outputs {
+                                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                                            actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                    ui.label(egui::RichText::new("Sound card kabelsalat plays to (same as Mixer).").size(11.5).color(theme::INK_2));
+                    if let Some(c) = &out_current {
+                        ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::INK_2));
+                    }
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("UI scale").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{detected_scale:.2}×"))
+                                    .font(theme::medium_font(13.5))
+                                    .color(theme::INK),
+                            );
+                        });
+                    });
+                    ui.label(egui::RichText::new("Detected from display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
+                };
+
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_scroll")
+                    .min_scrolled_height(body_h)
+                    .max_height(body_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if two_col {
+                            let left_w = ((avail_w - 25.0) * 0.52).clamp(300.0, 620.0);
+                            ui.horizontal_top(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(left_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        draw_models(ui, self, &mut actions);
+                                    },
+                                );
+                                ui.add_space(12.0);
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, body_h.max(420.0)), egui::Sense::hover());
+                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                ui.add_space(12.0);
+                                let right_w = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(right_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        draw_keys(ui, self, &mut actions);
+                                        ui.add_space(16.0);
+                                        Self::stage_hairline(ui);
+                                        ui.add_space(14.0);
+                                        draw_prefs(ui, &mut actions);
+                                    },
+                                );
+                            });
+                        } else {
+                            draw_models(ui, self, &mut actions);
+                            ui.add_space(16.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(14.0);
+                            draw_keys(ui, self, &mut actions);
+                            ui.add_space(16.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(14.0);
+                            draw_prefs(ui, &mut actions);
+                        }
+                    });
+            });
+        });
+
+        for act in actions {
+            match act {
+                SettingsAction::ToggleDecide => {
+                    let next = !self.assistant.decide_enabled();
+                    self.assistant.set_decide_enabled(next);
+                    self.settings_msg = if next {
+                        "Decisions model enabled".into()
+                    } else {
+                        "Decisions model turned off".into()
+                    };
+                }
+                SettingsAction::SetModel(role, m) => {
+                    self.settings_msg = self.assistant.set_role_model(role, &m);
+                }
+                SettingsAction::SaveKey(endpoint, key) => {
+                    let label = endpoint.spec().label;
+                    match self.assistant.save_api_key(endpoint, &key) {
+                        Ok(()) => self.settings_msg = format!("{label} key saved · worker restarted"),
+                        Err(e) => self.settings_msg = format!("Save {label} key failed: {e}"),
+                    }
+                }
+                SettingsAction::RemoveKey(endpoint) => {
+                    let label = endpoint.spec().label;
+                    match self.assistant.remove_api_key(endpoint) {
+                        Ok(()) => self.settings_msg = format!("{label} key removed"),
+                        Err(e) => self.settings_msg = format!("Remove {label} key failed: {e}"),
+                    }
+                }
+                SettingsAction::ToggleReduceMotion => {
+                    self.reduce_motion = !self.reduce_motion;
+                    let _ = crate::assistant::save_reduce_motion(self.reduce_motion);
+                    self.settings_msg = if self.reduce_motion {
+                        "Reduce motion enabled".into()
+                    } else {
+                        "Reduce motion disabled".into()
+                    };
+                }
+                SettingsAction::SetCountIn(enabled, bars) => {
+                    self.set_count_in(enabled, bars);
+                }
+                SettingsAction::SetAudioOutput(out) => {
+                    self.set_audio_output(out);
+                }
+            }
+        }
+
+        if self.show_help { self.draw_help(&painter, rect); }
+    }
+
     /// One bottom dock: exactly one occupant at a time (None / Keyboard /
     /// Assistant). The occupant owns the computer keyboard.
     fn dock_panel_ui(&mut self, root: &mut egui::Ui) {
@@ -7652,72 +9689,215 @@ impl DemoApp {
         }
     }
 
+    /// Assistant dock height: shares the stage height the rack can spare
+    /// (rule 22), clamped to a floor that guarantees >= 3 transcript lines at
+    /// minimum window size while capping at 360px on tall windows.
+    fn assistant_dock_h(avail_h: f32, rack_need_h: f32) -> f32 {
+        (avail_h - rack_need_h).clamp(176.0, 360.0).round()
+    }
+
+    /// Render one chat message body as a single wrapped `LayoutJob`, keeping
+    /// bold `**...**` spans and rack entity highlights without per-segment
+    /// horizontal gaps.
+    fn chat_body_job(text: &str, entities: &[String], wrap_w: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_w.max(80.0);
+        let base_font = FontId::proportional(13.0);
+        let bold_font = theme::medium_font(13.0);
+        for (k, part) in text.split("**").enumerate() {
+            if part.is_empty() { continue; }
+            let bold = k % 2 == 1;
+            for (seg, is_entity) in highlight_segments(part, entities) {
+                let fmt = if is_entity {
+                    egui::TextFormat {
+                        font_id: bold_font.clone(),
+                        color: theme::CREAM,
+                        background: theme::DARK_PANEL_HI,
+                        ..Default::default()
+                    }
+                } else {
+                    egui::TextFormat {
+                        font_id: if bold { bold_font.clone() } else { base_font.clone() },
+                        color: theme::INK,
+                        ..Default::default()
+                    }
+                };
+                job.append(&seg, 0.0, fmt);
+            }
+        }
+        job
+    }
+
+    fn paint_busy_dots(ui: &mut egui::Ui, ui_time: f32, reduce_motion: bool) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 14.0), egui::Sense::hover());
+        let p = ui.painter();
+        for i in 0..3 {
+            let wave = if reduce_motion { 0.6 } else { (ui_time * 5.0 - i as f32 * 0.95).sin() * 0.5 + 0.5 };
+            let a = 0.25 + 0.75 * wave;
+            let x = rect.left() + 4.0 + i as f32 * 6.5;
+            p.circle_filled(Pos2::new(x, rect.center().y), 2.2 + 0.5 * wave, theme::alpha(theme::AGENT_COLOR, a));
+        }
+    }
+
+    fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32, reduce_motion: bool) {
+        let pulse = if reduce_motion { 0.8 } else { 0.45 + 0.45 * ((ui_time * 5.5).sin() * 0.5 + 0.5) };
+        let (fill, border, glyph, glyph_color, txt_color, suffix) = match chip.state {
+            ToolChipState::Running => (
+                theme::alpha(theme::AGENT_COLOR, 0.14),
+                theme::alpha(theme::AGENT_COLOR, pulse),
+                "●",
+                theme::AGENT_TEXT,
+                theme::INK,
+                "",
+            ),
+            ToolChipState::Done => (
+                theme::DARK_PANEL_HI,
+                theme::alpha(theme::AGENT_COLOR, 0.50),
+                "✓",
+                theme::AGENT_TEXT,
+                theme::CREAM,
+                "",
+            ),
+            ToolChipState::NotApplied => (
+                theme::DARK_PANEL,
+                theme::CABLE_AMBER,
+                "–",
+                theme::CABLE_AMBER,
+                theme::CREAM,
+                " · not applied",
+            ),
+            ToolChipState::Failed => (
+                theme::DANGER_BG,
+                theme::CLIP_RED,
+                "!",
+                theme::CLIP_BRIGHT,
+                theme::CLIP_BRIGHT,
+                "",
+            ),
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append(glyph, 0.0, egui::TextFormat {
+            font_id: theme::medium_font(10.5),
+            color: glyph_color,
+            ..Default::default()
+        });
+        job.append(" ", 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        job.append(&chip.label, 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        if !suffix.is_empty() {
+            job.append(suffix, 0.0, egui::TextFormat {
+                font_id: egui::FontId::proportional(10.5),
+                color: glyph_color,
+                ..Default::default()
+            });
+        }
+        // Rule 7: >= 8px horizontal and >= 4px vertical internal padding inside chip box.
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(job).selectable(false));
+            });
+    }
+
     /// Assistant dock occupant: a WIDE bottom panel — chat transcript +
     /// always-visible input on the left, live patch context & agent activity
-    /// side column on the right when wide. `resizable(false)` with a
-    /// deterministic `default_size` keeps the height stable frame to frame
-    /// (the stored-size + per-frame `size_range` loop shrank it ~3px/frame).
+    /// side column on the right when wide. Uses `exact_size` (rule 71) so the
+    /// panel follows window resizes and never sticks at a tiny first-frame size.
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
-        // The rack keeps a comfortable face height (2026-11-15, user: "racks
-        // are squished when the agent loads"): the panel only gets the height
-        // the rack can spare, within 150..=340 px — never the other way round.
-        let max_h = (root.available_height() - self.rack_need_h()).clamp(150.0, 340.0);
+        let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
+        let ui_time = self.ui_time;
+        let reduce_motion = self.reduce_motion;
+        let demo_agent_hold = self.demo_agent_hold;
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
         let mut input_rect = Rect::NOTHING;
         let mut focus_chat = self.focus_chat_request;
+        let confirm_choice: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let resp = egui::Panel::bottom("dock")
-            .default_size(max_h.min(260.0))
+            .exact_size(panel_h)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let header_w = ui.available_width();
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 26.0),
+                    egui::vec2(header_w, 24.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                         ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
-                        if self.assistant.busy {
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new("● working").size(11.5).color(theme::AGENT_COLOR));
+                        if header_w >= 560.0 {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::CREAM_META));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
                                 self.dock = DockView::None;
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             let cur = self.assistant.model();
                             let mut pick: Option<String> = None;
-                            egui::ComboBox::from_id_salt("assistant_model")
-                                .selected_text(egui::RichText::new(format!("model: {cur}")).size(12.0).color(theme::CREAM))
-                                .show_ui(ui, |ui| {
+                            theme::Dropdown::new("dd_assistant_model", format!("chat: {cur}"))
+                                .text_size(12.0)
+                                .popup_min_width(220.0)
+                                .show_ui(ui, |menu| {
                                     for m in self.assistant.models.clone() {
-                                        if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
+                                        if menu.item(m == cur, &m) {
+                                            pick = Some(m);
+                                        }
                                     }
-                                }).response.on_hover_text("chat model — switch any time, the conversation stays");
+                                })
+                                .on_hover_text(if self.assistant.decides_first() {
+                                    "chat model for what Jev does not settle (questions, multi-step wiring) — switch any time, the conversation stays"
+                                } else {
+                                    "chat model — switch any time, the conversation stays"
+                                });
                             if let Some(m) = pick { self.switch_model(&m); }
-                            if !self.assistant.history.is_empty() && !self.assistant.busy {
+                            if self.assistant.decides_first() && header_w >= 560.0 {
                                 ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Jev decides first").size(11.5).color(theme::AGENT_TEXT))
+                                    .on_hover_text("Jev answers clear requests itself in about 0.3 s; everything else goes to the chat model. No need to select it.");
+                            }
+                            if self.demo_agent_hold {
+                                ui.add_space(6.0);
+                                if theme::chip_button(ui, "Replay", false).on_hover_text("replay rack animations (Shift+F12)").clicked() {
+                                    self.replay_agent_rack_animations();
+                                }
+                            }
+                            if !self.assistant.history.is_empty() && !self.assistant.busy {
+                                ui.add_space(6.0);
                                 if theme::chip_button(ui, "Clear", false).on_hover_text("clear visible transcript").clicked() {
                                     clear_chat = true;
                                 }
                             }
-                            if ui.available_width() > 360.0 {
+                            if ui.available_width() > 240.0 {
                                 if let Some(last) = self.agent_activity.log.front() {
                                     let active = AgentActivity::strength(Some(&(last.at + AGENT_TOUCH_SECS)), self.ui_time) > 0.01;
                                     if active {
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
-                                                .size(11.5)
-                                                .color(theme::AGENT_COLOR),
+                                        ui.add_space(8.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
+                                                    .size(11.5)
+                                                    .color(theme::AGENT_COLOR),
+                                            )
+                                            .truncate(),
                                         );
                                     }
                                 }
@@ -7725,21 +9905,23 @@ impl DemoApp {
                         });
                     },
                 );
-                ui.add_space(6.0);
                 Self::stage_hairline(ui);
-                ui.add_space(6.0);
 
                 let avail_w = ui.available_width();
                 let avail_h = ui.available_height().max(40.0);
                 let two_col = avail_w >= 860.0;
-                let side_w = if two_col { (avail_w * 0.30).clamp(260.0, 360.0) } else { 0.0 };
-                let main_w = if two_col { (avail_w - side_w - 25.0).max(340.0) } else { avail_w };
+                let side_w = if two_col { (avail_w * 0.30).round().clamp(260.0, 360.0) } else { 0.0 };
+                let main_w = if two_col { (avail_w - side_w - 25.0).round().max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
+                let confirm_prompt = self.pending_confirm.as_ref().map(|p| (p.label.clone(), p.tool == "delete_rig"));
 
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
                                  chat_input: &mut String,
+                                 chat_image: &mut Option<Image>,
+                                 chat_thumb: &mut Option<ChatThumb>,
                                  assistant: &mut Assistant,
+                                 transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
                                  starter_prompt: &mut Option<String>,
                                  submit_text: &mut Option<String>,
@@ -7761,11 +9943,8 @@ impl DemoApp {
                                 if *focus_chat { key_resp.request_focus(); *focus_chat = false; }
                                 if theme::primary_button(ui, "Save key").clicked() && !key_input.trim().is_empty() {
                                     let k = key_input.trim().to_string();
-                                    match crate::assistant::save_key(&k) {
-                                        Ok(()) => {
-                                            assistant.set_key(k);
-                                            key_input.clear();
-                                        }
+                                    match assistant.save_api_key(crate::llm::Endpoint::DeepSeek, &k) {
+                                        Ok(()) => key_input.clear(),
                                         Err(e) => assistant.history.push(ChatLine {
                                             role: "error".into(),
                                             text: format!("could not save key: {e}"),
@@ -7790,8 +9969,11 @@ impl DemoApp {
                     }
 
                     let col_h = ui.available_height().max(40.0);
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 18.0).max(34.0));
-                    let hist_h = (col_h - reserve).max(16.0);
+                    // The attachment chip has a fixed row, so the history
+                    // makes room for it in the frame the image arrives.
+                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 } else { 0.0 };
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
                         .min_scrolled_height(hist_h)
@@ -7805,7 +9987,7 @@ impl DemoApp {
                                         .size(12.5)
                                         .color(theme::INK_2),
                                 );
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for prompt in [
                                         "Add a reverb to this rig",
@@ -7819,40 +10001,167 @@ impl DemoApp {
                                     }
                                 });
                             }
-                            for line in &assistant.history {
+                            let body_w = (ui.available_width() - 96.0).max(120.0);
+                            let mut current_run_idx: Option<usize> = None;
+                            for (idx, line) in assistant.history.iter().enumerate() {
+                                if line.role == "user" {
+                                    if let Some(prev_idx) = current_run_idx {
+                                        if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                                ui.label(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META));
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                    current_run_idx = Some(idx);
+                                }
                                 let (label, color, rule) = match line.role.as_str() {
-                                    "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
-                                    "assistant" => ("ASSISTANT", theme::AGENT_COLOR, theme::AGENT_COLOR),
-                                    "system" => ("SYSTEM", theme::INK_2, theme::HAIRLINE),
+                                    "user" => ("YOU", theme::CREAM, theme::HAIRLINE_DARK),
+                                    "assistant" => ("ASSISTANT", theme::AGENT_TEXT, theme::AGENT_COLOR),
+                                    "system" => ("SYSTEM", theme::CREAM_META, theme::HAIRLINE),
                                     _ => ("ERROR", theme::CLIP_BRIGHT, theme::CLIP_RED),
                                 };
-                                ui.horizontal_top(|ui| {
-                                    let (bar, _) = ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(bar, 1.0, rule);
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(label).font(theme::medium_font(10.5)).color(color));
-                                        ui.add_space(4.0);
-                                        for (k, part) in line.text.split("**").enumerate() {
-                                            if part.is_empty() { continue; }
-                                            for (seg, is_entity) in highlight_segments(part, &entities) {
-                                                let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
-                                                if k % 2 == 1 { t = t.strong(); }
-                                                if is_entity {
-                                                    t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
-                                                }
-                                                ui.label(t);
-                                            }
-                                        }
-                                    });
+                                let turn = ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add_space(6.0);
+                                    ui.add_sized(
+                                        [66.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(label).font(theme::medium_font(10.5)).color(color),
+                                        ),
+                                    );
+                                    let job = Self::chat_body_job(&line.text, &entities, body_w);
+                                    ui.label(job);
                                 });
-                                ui.add_space(5.0);
+                                let r = turn.response.rect;
+                                let bar = Rect::from_min_size(
+                                    Pos2::new(r.left(), r.top() + 2.0),
+                                    Vec2::new(2.0, (r.height() - 4.0).max(12.0)),
+                                );
+                                ui.painter().rect_filled(bar, 1.0, rule);
+                                if line.role == "user" {
+                                    if let Some(run) = transcript_runs.get_mut(&idx) {
+                                        if !run.chips.is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                                let total = run.chips.len();
+                                                let show_n = if !run.expanded && total > COLLAPSED_RUN_CHIPS {
+                                                    COLLAPSED_RUN_CHIPS
+                                                } else {
+                                                    total
+                                                };
+                                                for chip in &run.chips[..show_n] {
+                                                    Self::tool_chip_ui(ui, chip, ui_time, reduce_motion);
+                                                }
+                                                if show_n < total {
+                                                    let more = total - show_n;
+                                                    if theme::chip_button(ui, &format!("+{more} more"), false).clicked() {
+                                                        run.expanded = true;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                ui.add_space(2.0);
+                            }
+                            if !assistant.busy {
+                                if let Some(prev_idx) = current_run_idx {
+                                    if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                            ui.label(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META));
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                }
                             }
                             if assistant.busy {
-                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
+                                ui.horizontal(|ui| {
+                                    ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                    Self::paint_busy_dots(ui, ui_time, reduce_motion);
+                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_TEXT));
+                                });
+                            }
+                            if !assistant.busy || demo_agent_hold {
+                                if let Some((label, destructive)) = &confirm_prompt {
+                                    // #32: the click answers the assistant's question.
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                        let confirm_btn = if *destructive {
+                                            theme::danger_button(ui, &format!("Confirm · {label}"), false)
+                                        } else {
+                                            theme::primary_button(ui, &format!("Confirm · {label}"))
+                                        };
+                                        if confirm_btn.clicked() {
+                                            confirm_choice.set(Some(true));
+                                        }
+                                        ui.add_space(6.0);
+                                        if theme::chip_button(ui, "Cancel", false).clicked() {
+                                            confirm_choice.set(Some(false));
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
                             }
                         });
-                    ui.add_space(4.0);
+                    sync_chat_thumb(ui.ctx(), chat_image, chat_thumb);
+                    if let Some(img) = chat_image.as_ref() {
+                        let mut remove_image = false;
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), ATTACH_ROW_H),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                egui::Frame::new()
+                                    .fill(theme::DARK_PANEL_HI)
+                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                                    .corner_radius(2.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let thumb_info = chat_thumb.as_ref();
+                                            let [tw, th] = thumb_info.map_or([32, 32], |t| t.size);
+                                            let aspect = (tw as f32 / th.max(1) as f32).clamp(0.6, 2.0);
+                                            let thumb_sz = egui::vec2((ATTACH_THUMB_H * aspect).round(), ATTACH_THUMB_H);
+                                            let (rect, _) = ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
+                                            if let Some(tex) = thumb_info.and_then(|t| t.tex.as_ref()) {
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    rect,
+                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                ui.painter().rect_stroke(rect, 1.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                            } else {
+                                                ui.painter().rect_filled(rect, 2.0, theme::PAPER_SINK);
+                                                ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "IMG", theme::medium_font(9.5), theme::CREAM_META);
+                                            }
+                                            let name = truncate_attachment_name(&img.name);
+                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(theme::CREAM)).truncate());
+                                            let close = ui.add(
+                                                egui::Button::new(egui::RichText::new("×").font(theme::medium_font(13.0)).color(theme::CREAM))
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::NONE)
+                                                    .min_size(egui::vec2(22.0, 24.0)),
+                                            ).on_hover_text("remove the image");
+                                            if close.clicked() {
+                                                remove_image = true;
+                                            }
+                                        });
+                                    });
+                            },
+                        );
+                        if remove_image {
+                            *chat_image = None;
+                            *chat_thumb = None;
+                        }
+                    }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
                         let edit = egui::Frame::new()
@@ -7866,7 +10175,7 @@ impl DemoApp {
                                         .id_salt("assistant_chat_input")
                                         .frame(egui::Frame::NONE)
                                         .desired_width((ui.available_width() - 82.0).max(80.0))
-                                        .hint_text("Ask or instruct…"),
+                                        .hint_text("Ask or instruct… (drop or paste an image to show it)"),
                                 );
                                 if *focus_chat { edit_resp.request_focus(); *focus_chat = false; }
                                 edit_resp
@@ -7874,7 +10183,7 @@ impl DemoApp {
                             .inner;
                         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
-                            && !chat_input.trim().is_empty()
+                            && (!chat_input.trim().is_empty() || chat_image.is_some())
                             && !assistant.busy
                         {
                             *submit_text = Some(chat_input.trim().to_string());
@@ -7882,7 +10191,7 @@ impl DemoApp {
                         }
                     });
                     *input_rect = row.response.rect;
-                    *assistant_input_h = (4.0 + (ui.cursor().top() - row_top).max(26.0) + ui.spacing().item_spacing.y).max(34.0);
+                    *assistant_input_h = ((ui.cursor().top() - row_top).max(28.0) + ui.spacing().item_spacing.y).max(34.0);
                 };
 
                 if two_col {
@@ -7895,7 +10204,10 @@ impl DemoApp {
                                     ui,
                                     &mut self.key_input,
                                     &mut self.chat_input,
+                                    &mut self.chat_image,
+                                    &mut self.chat_thumb,
                                     &mut self.assistant,
+                                    &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
                                     &mut starter_prompt,
                                     &mut submit_text,
@@ -7923,7 +10235,13 @@ impl DemoApp {
                                 ui.add_space(8.0);
                                 Self::stage_hairline(ui);
                                 ui.add_space(6.0);
-                                theme::section_label(ui, "Agent Activity");
+                                ui.horizontal(|ui| {
+                                    theme::section_label(ui, "Agent Activity");
+                                    // What the last request cost: model steps, model time, answering model.
+                                    if let Some(cost) = self.assistant.turn.summary() {
+                                        ui.add(egui::Label::new(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META)).truncate());
+                                    }
+                                });
                                 ui.add_space(4.0);
                                 let act_h = ui.available_height().max(24.0);
                                 egui::ScrollArea::vertical()
@@ -7969,7 +10287,10 @@ impl DemoApp {
                         ui,
                         &mut self.key_input,
                         &mut self.chat_input,
+                        &mut self.chat_image,
+                        &mut self.chat_thumb,
                         &mut self.assistant,
+                        &mut self.transcript_runs,
                         &mut self.assistant_input_h,
                         &mut starter_prompt,
                         &mut submit_text,
@@ -7984,6 +10305,12 @@ impl DemoApp {
         self.focus_chat_request = focus_chat;
         if clear_chat {
             self.assistant.history.clear();
+            self.transcript_runs.clear();
+            self.active_run_user_idx = None;
+            self.pending_confirm = None;
+        }
+        if let Some(choice) = confirm_choice.get() {
+            self.resolve_confirm(choice);
         }
         if let Some(p) = starter_prompt.or(submit_text) {
             self.submit_chat(p);
@@ -8022,6 +10349,16 @@ impl DemoApp {
         12 * (wi / 7) + WHITE_SEMI[wi % 7]
     }
 
+    /// Keyboard dock height: a share of the WINDOW height (rule 64), never
+    /// below the minimum playable size, and only what the rack can spare
+    /// (rule 22). Whole pixels, so a resize does not jitter the layout.
+    fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
+        const MIN_H: f32 = 140.0; // header + keys of at least 40 px
+        const MAX_H: f32 = 300.0;
+        let spare = (avail_h - rack_need_h).max(MIN_H);
+        (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
+    }
+
     /// Which semitone (above the keyboard's lowest C) a point lands on, black first.
     fn dock_key_hit(kb_rect: Rect, pos: Pos2) -> Option<usize> {
         for oct in 0..Self::dock_octaves(kb_rect) {
@@ -8038,8 +10375,7 @@ impl DemoApp {
     /// moved to the bottom dock. Plays through the same `fire_keys` path, lights
     /// the same `key_leds`, and the Keys unit stays unchanged in the rack.
     fn keyboard_panel_ui(&mut self, root: &mut egui::Ui) {
-        let spare = (root.available_height() - self.rack_need_h()).clamp(140.0, 340.0);
-        let h = spare.min(180.0);
+        let h = Self::keyboard_dock_h(root.ctx().content_rect().height(), root.available_height(), self.rack_need_h());
         let note_leds = self.note_leds;
         let split = self.keys_unit.and_then(|k| self.shown_split(k));
         let octave = self.octave;
@@ -8047,8 +10383,10 @@ impl DemoApp {
         let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
         let mut note: Option<usize> = None;
         let mut kb_rect = Rect::NOTHING;
+        // exact_size, not default_size: egui keeps a panel's first size, so
+        // the dock never followed a window resize (#23).
         let resp = egui::Panel::bottom("dock")
-            .default_size(h)
+            .exact_size(h)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -8200,9 +10538,39 @@ impl DemoApp {
         self.clap_rigs().into_iter().find(|(_, nid)| *nid == node_id).map(|(rig, _)| rig)
     }
 
-    /// Rig index (voice slot) for a node id; 0 if not a rig.
-    fn rig_of_node(&self, node: u32) -> usize {
-        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).unwrap_or(0)
+    /// The voice slot of a CLAP node: its index into the per-voice slot
+    /// tables (`rig_sources`, `rig_device`, `patch_names`). None for any
+    /// node that is not a CLAP unit (the old "0 if unknown" sent their
+    /// edits to slot 0).
+    fn voice_slot_of_node(&self, node: u32) -> Option<usize> {
+        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r)
+    }
+
+    /// Refit the per-voice slot tables to the CLAP units after the units
+    /// changed: every entry stays with its unit (by node id), a new unit
+    /// starts at the defaults. `old_nodes` = the CLAP nodes the tables were
+    /// laid out for, in slot order.
+    fn fit_voice_tables(&mut self, old_nodes: &[u32]) {
+        let slots = self.clap_rigs();
+        let old_slot = |node: u32| old_nodes.iter().position(|&n| n == node);
+        let sources = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.rig_sources.get(i).copied()).unwrap_or((true, true)))
+            .collect();
+        let devices = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.rig_device.get(i).copied()).flatten())
+            .collect();
+        let names = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.patch_names.get(i).cloned()).flatten())
+            .collect();
+        self.rig_sources = sources;
+        self.rig_device = devices;
+        self.patch_names = names;
+    }
+
+    /// Every CLAP unit listens to the keyboard and all hardware again.
+    fn reset_rig_inputs(&mut self) {
+        self.rig_sources.fill((true, true));
+        self.rig_device.fill(None);
     }
 
     fn fire_keys(&mut self, semitone: usize, amp: f32) { self.fire_keys_with(semitone, amp, true); }
@@ -8215,9 +10583,13 @@ impl DemoApp {
         let amp = amp * (0.35 + vel * 0.65);
         // Light on note-on only: a note-off re-lighting the key restarted the
         // full decay tail AFTER release (user report: key color stays too long).
+        let bit = note_source_bit(self.current_source);
         if amp > 0.0 {
             self.key_leds[semitone % 12] = 1.0;
             self.note_leds[semitone.min(127)] = 1.0;
+            self.notes_down[semitone.min(127)] |= bit;
+        } else {
+            self.notes_down[semitone.min(127)] &= !bit;
         }
         if let Some(u) = self.units.get_mut(ki) { u.led = 1.0; }
         // A split keyboard sends each note out ONE jack (LOW below the point,
@@ -8257,13 +10629,96 @@ impl DemoApp {
         }
     }
 
-    /// Publish the patch through the control plane: living cables become
-    /// Connect commands (the engine rejects duplicates), knobs SetParam, and
-    /// the shared graph mirror is rebuilt when the cable set changed. Runs
-    /// once per frame after input, so a re-plug's Disconnect precedes it.
+    /// The main controls of a unit's instrument, if its plugin is known.
+    fn unit_main_controls(&self, unit: usize) -> Option<crate::main_controls::MainControls> {
+        let u = self.units.get(unit)?;
+        match u.node_kind {
+            UnitKind::Clap => {
+                let idx = self.clap_pool_idx(self.rig_of_unit(unit)?)?;
+                self._surge_main.get(idx).map(|m| m.main_controls().clone())
+            }
+            _ => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) => crate::lv2::main_controls_cached(uri.as_str()),
+                _ => None,
+            },
+        }
+    }
+
+    /// Current values of the LV2 main-control knobs, as session params.
+    fn lv2_main_values(&self) -> Vec<crate::session::ParamValue> {
+        self.units.iter()
+            .flat_map(|u| u.knobs.iter().filter_map(move |k| {
+                let param = k.param.filter(|_| matches!(k.source, KnobSource::Main(_)))?;
+                Some(crate::session::ParamValue { node: u.node_id, param, value: k.value as f64 })
+            }))
+            .collect()
+    }
+
+    /// Keep every instrument's main-control knobs in step with its plugin:
+    /// build them once the plugin is known, rebuild them when the plugin
+    /// renamed its controls, and follow the plugin's own values. Runs every
+    /// frame; a plugin is asked only every `MAIN_POLL_SECS`.
+    fn sync_main_knobs(&mut self) {
+        let poll = self.ui_time - self.main_poll_at >= MAIN_POLL_SECS;
+        if poll { self.main_poll_at = self.ui_time; }
+        let dragged = match self.drag { Drag::Knob { unit, .. } => Some(unit), _ => None };
+        let slots = self.clap_rigs();
+        for ui in 0..self.units.len() {
+            // A drag holds a knob index: the row must not change under it (rule 10).
+            if dragged == Some(ui) { continue; }
+            let node = self.units[ui].node_id;
+            match self.units[ui].node_kind {
+                UnitKind::Clap => {
+                    let Some(idx) = slots.iter().find(|(_, n)| *n == node).and_then(|(slot, _)| self.clap_pool_idx(*slot)) else { continue };
+                    let voice = self.clap_voice_ids.get(idx).copied();
+                    let Some(main) = self._surge_main.get_mut(idx) else { continue };
+                    let renamed = poll && main.poll_main_controls();
+                    let u = &mut self.units[ui];
+                    if renamed || u.main_from != voice {
+                        let face = main.main_controls().face().to_vec();
+                        set_main_knobs(u, &face, MainTarget::Clap, |c| main.param_value(c.id).unwrap_or(c.default));
+                        u.main_from = voice;
+                    } else if poll {
+                        follow_plugin_values(u, main, self.ui_time, self.reduce_motion);
+                    }
+                }
+                // An LV2 unit, once its plugin's controls are resolved.
+                UnitKind::Dsp(_) if self.units[ui].main_from.is_none() => {
+                    let Some(found) = self.unit_main_controls(ui) else { continue };
+                    let u = &mut self.units[ui];
+                    set_main_knobs(u, found.face(), MainTarget::Lv2, |c| c.default);
+                    for k in &mut u.knobs {
+                        let saved = self.lv2_main_restore.iter().find(|(p, _)| p.node == node && Some(p.param) == k.param);
+                        if let Some((p, send)) = saved {
+                            k.set_immediate(p.value as f32);
+                            k.sent = if *send { None } else { Some(k.value) };
+                        }
+                    }
+                    u.main_from = Some(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Show values the LV2 editor set (a preset, a slider) on the face knobs
+    /// of the same controls. The engine has them already: nothing is re-sent.
+    fn mirror_lv2_editor_on_face(&mut self, node: u32) {
+        let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) else { return };
+        for k in u.knobs.iter_mut().filter(|k| matches!(k.source, KnobSource::Main(_))) {
+            let Some(c) = k.param.and_then(|p| self.lv2_editor_controls.iter().find(|c| c.index as u32 == p)) else { continue };
+            let norm = ((c.value - c.min) / (c.max - c.min).max(1e-6)).clamp(0.0, 1.0);
+            if (norm - k.value).abs() > 1e-4 {
+                k.glide_to(norm, self.reduce_motion);
+                k.sent = Some(norm);
+            }
+        }
+    }
+
     /// Pinned Surge parameters: send changed knob values to the plugin.
     fn publish_pins(&mut self) {
         let slots = self.clap_rigs();
+        let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for u in self.units.iter_mut() {
             let Some(slot) = slots.iter().find(|(_, n)| *n == u.node_id).map(|(s, _)| *s) else { continue };
             let Some(idx) = self.clap_slot_map.get(slot).copied().flatten() else { continue };
@@ -8273,6 +10728,7 @@ impl DemoApp {
                     if (k.value - pin.sent).abs() > 1e-4 {
                         ctl.set_param(ClapId::new(pin.id), pin.min + k.value as f64 * (pin.max - pin.min));
                         pin.sent = k.value;
+                        pin.hold_until = hold_until;
                     }
                 }
             }
@@ -8287,19 +10743,28 @@ impl DemoApp {
             u.knobs.remove(i);
             return format!("unpinned {}", p.name);
         }
-        if u.knobs.iter().filter(|k| k.clap.is_some()).count() >= MAX_PINS {
-            return format!("at most {MAX_PINS} pinned knobs per synth");
+        let plugin_knobs = u.knobs.iter().filter(|k| k.clap.is_some()).count();
+        if plugin_knobs >= MAX_PINS {
+            return format!("at most {MAX_PINS} plugin knobs per synth: remove one first");
         }
         let span = (p.max - p.min).max(1e-9);
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
-        let label: String = p.name.to_uppercase().chars().take(9).collect();
-        u.knobs.push(Knob {
-            label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, hidden: false, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
+        // After the other plugin knobs, left of the unit's own.
+        u.knobs.insert(plugin_knobs, Knob {
+            label: crate::main_controls::knob_label(&p.name),
+            value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
+            default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
+            param: None, hidden: false, sent: Some(norm),
+            clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
+            source: KnobSource::Pinned(p.name.clone()), label_g: None,
         });
         format!("pinned {} to the face", p.name)
     }
 
+    /// Publish the patch through the control plane: living cables become
+    /// Connect commands (the engine rejects duplicates), knobs SetParam, and
+    /// the shared graph mirror is rebuilt when the cable set changed. Runs
+    /// once per frame after input, so a re-plug's Disconnect precedes it.
     fn publish_patch(&mut self) {
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
@@ -8803,7 +11268,39 @@ impl DemoApp {
             }
         }
 
-        for u in &mut self.units { u.led *= (-dt / UNIT_LED_TAU).exp(); }
+        let rm = self.reduce_motion;
+        for u in &mut self.units {
+            u.led *= (-dt / UNIT_LED_TAU).exp();
+            for k in &mut u.knobs {
+                if k.glide_t < 1.0 {
+                    if rm {
+                        k.glide_t = 1.0;
+                        k.display_value = k.value;
+                    } else {
+                        k.glide_t = (k.glide_t + dt / KNOB_GLIDE_SECS).min(1.0);
+                        let e = 1.0 - (1.0 - k.glide_t).powi(3);
+                        k.display_value = if k.glide_t >= 1.0 {
+                            k.value
+                        } else {
+                            k.glide_from + (k.value - k.glide_from) * e
+                        };
+                    }
+                }
+            }
+        }
+        if rm {
+            self.fading_units.clear();
+            self.fading_cables.clear();
+        } else {
+            for f in &mut self.fading_units {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_units.retain(|f| f.alpha > 0.01);
+            for f in &mut self.fading_cables {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_cables.retain(|f| f.alpha > 0.01);
+        }
         for k in &mut self.key_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         for k in &mut self.note_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
@@ -8811,6 +11308,14 @@ impl DemoApp {
         for &(_, semi) in &self.held_keys {
             self.key_leds[semi % 12] = 1.0;
             self.note_leds[semi.min(127)] = 1.0;
+        }
+        // Every held note stays lit (hardware keyboards, clicks, agents),
+        // like the laptop keys above.
+        for n in 0..128 {
+            if self.notes_down[n] != 0 {
+                self.key_leds[n % 12] = 1.0;
+                self.note_leds[n] = 1.0;
+            }
         }
         // Adopt hot-plug changes from the MIDI thread (one atomic load).
         let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
@@ -8872,8 +11377,12 @@ impl DemoApp {
         for ci in 0..self.cables.len() {
             let ea = self.endpoint(&self.cables[ci], Dir::Out);
             let eb = self.endpoint(&self.cables[ci], Dir::In);
+            let rm = self.reduce_motion;
             let c = &mut self.cables[ci];
             c.age += dt;
+            if c.draw_in < 1.0 {
+                c.draw_in = if rm { 1.0 } else { (c.draw_in + dt / CABLE_DRAW_IN_SECS).min(1.0) };
+            }
             if c.dying >= 0.0 { c.dying += dt; }
             // Endpoints without a laid-out rect (a hidden rig's units, or a
             // rack rebuilt by a key handler AFTER this frame's layout) are
@@ -9064,13 +11573,32 @@ impl DemoApp {
         self.unit_rects[unit].bottom() - FACE_PAD_B - KNOB_LABEL_H - KNOB_LABEL_GAP - KNOB_R
     }
 
-    /// Right-to-left knob slot: pairs fill from the right (idx 0,1 = the
-    /// rightmost pair, pinned knobs add pairs to the LEFT); a pair with one
-    /// knob takes the slot next to its neighbours, never leaving a gap.
+    /// Knob slot counted from the right edge: the row reads left to right
+    /// in knob order and ends at the right padding (plugin knobs come first,
+    /// so they sit left of the unit's own knobs).
     fn knob_slot(n: usize, idx: usize) -> usize {
-        let pair = idx / 2;
-        let full = pair * 2 + 1 < n;
-        pair * 2 + if full { 1 - idx % 2 } else { 0 }
+        n.saturating_sub(idx + 1)
+    }
+
+    /// How many knobs fit a unit `width` wide with the leftmost label still
+    /// right of the face's left edge.
+    fn knobs_that_fit(width: f32) -> usize {
+        let leftmost = width - FACE_X - FACE_PAD_R - KNOB_SLOT_HALF - KNOB_LABEL_W / 2.0;
+        if leftmost < 0.0 { 1 } else { (leftmost / KNOB_PITCH) as usize + 1 }
+    }
+
+    /// Show as many plugin knobs as the unit is wide; the unit's own knobs
+    /// always stay, the last plugin knobs give way first.
+    fn fit_plugin_knobs(&mut self) {
+        for (u, r) in self.units.iter_mut().zip(&self.unit_rects) {
+            if !r.width().is_finite() || !u.knobs.iter().any(|k| k.source != KnobSource::BuiltIn) { continue; }
+            let own = u.knobs.iter().filter(|k| k.source == KnobSource::BuiltIn && !k.hidden).count();
+            let mut room = Self::knobs_that_fit(r.width()).saturating_sub(own);
+            for k in u.knobs.iter_mut().filter(|k| k.source != KnobSource::BuiltIn) {
+                k.hidden = room == 0;
+                room = room.saturating_sub(1);
+            }
+        }
     }
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
@@ -9092,8 +11620,7 @@ impl DemoApp {
         let end = if n == 0 {
             r.right() - FACE_PAD_R
         } else {
-            let slots = (0..n).map(|i| Self::knob_slot(n, i)).max().unwrap_or(0);
-            r.right() - FACE_PAD_R - (slots + 1) as f32 * KNOB_PITCH - 8.0
+            r.right() - FACE_PAD_R - n as f32 * KNOB_PITCH - 8.0
         };
         (start, (end - start).max(0.0))
     }
@@ -9160,7 +11687,12 @@ impl DemoApp {
     fn handle_input(&mut self, ctx: &egui::Context, rect: Rect) {
         // The "Delete rig?" modal owns all input (Esc/Del must reach it, not
         // the rack's cable shortcuts).
-        if self.confirm_delete_rig.is_some() { return; }
+        if self.confirm_delete_rig.is_some()
+            || self.save_rig_dialog.is_some()
+            || self.load_rig_dialog.is_some()
+        {
+            return;
+        }
         let mut toggle_play = false;
         let mut tap_tempo = false;
         let mut flip = false;
@@ -9227,10 +11759,13 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.toggle_stage(StageView::Mixer);
             }
+            if i.consume_key(Modifiers::NONE, Key::Comma) {
+                self.toggle_stage(StageView::Settings);
+            }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
             }
-            if i.consume_key(Modifiers::NONE, Key::Escape) {
+            if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
@@ -9272,7 +11807,7 @@ impl DemoApp {
         }
         if reset_knobs {
             for u in &mut self.units {
-                for k in &mut u.knobs { k.value = k.default; }
+                for k in &mut u.knobs { k.set_immediate(k.default); }
             }
         }
 
@@ -9332,12 +11867,15 @@ impl DemoApp {
                         let same_learning = self.cc_learn.as_ref().is_some_and(|l| {
                             l.dest == node_id && l.param == param && l.target == tgt
                         });
+                        let menu = KnobMenu { node: node_id, param, target: tgt, pos: s };
                         if same_learning {
-                            self.cc_learn = None;
-                            self.knob_menu = None;
+                            // Learning keeps running until the menu decides:
+                            // Cancel MIDI learn, or Reset (#20 — the only way
+                            // to reset an unbound knob without the global R).
+                            self.knob_menu = Some(menu);
                         } else if self.knob_cc_binding(node_id, param, tgt).is_some() {
                             self.cc_learn = None;
-                            self.knob_menu = Some(KnobMenu { unit, idx, pos: s });
+                            self.knob_menu = Some(menu);
                         } else {
                             self.knob_menu = None;
                             self.cc_learn = Some(CcLearn {
@@ -9433,7 +11971,7 @@ impl DemoApp {
             match self.drag {
                 Drag::Knob { unit, idx, start_val, press_y } => {
                     let v = (start_val + (press_y - s.y) * 0.006).clamp(0.0, 1.0);
-                    self.units[unit].knobs[idx].value = v;
+                    self.units[unit].knobs[idx].set_immediate(v);
                 }
                 Drag::Plug { id, end } => {
                     match self.live_cable(id) {
@@ -9838,7 +12376,7 @@ impl DemoApp {
     fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
         let Some(u) = self.units.get_mut(unit) else { return };
         let Some(k) = u.knobs.get_mut(knob) else { return };
-        k.value = v.clamp(0.0, 1.0);
+        k.set_immediate(v);
         if let (Some(p), Some(bus)) = (k.param, &self.bus) {
             if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
                 k.sent = Some(k.value);
@@ -10005,7 +12543,9 @@ impl DemoApp {
                                                     let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
                                                     let shown = st.volume.min(1.0);
                                                     let mut v = Some(shown);
-                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, 0.0, fader_h);
+                                                    // What the app plays, dB-scaled (rule 62).
+                                                    let level = meter_db_pos(crate::audio_out::stream_level(&self.stream_levels, st.index));
+                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, level, fader_h);
                                                     ui.interact(fr, egui::Id::new(("app_stream_tip", st.index)), egui::Sense::hover())
                                                         .on_hover_text(format!("{} — {}", st.app, st.title));
                                                     if let Some(nv) = v {
@@ -10038,22 +12578,21 @@ impl DemoApp {
                                         Some(w) => label_of(w),
                                         None => "System default".to_string(),
                                     };
-                                    egui::ComboBox::from_id_salt("audio_output")
+                                    theme::Dropdown::new("dd_mixer_audio_output", &selected)
                                         .width(160.0)
-                                        .selected_text(egui::RichText::new(selected).size(11.5).color(theme::INK))
-                                        .show_ui(ui, |ui| {
-                                            if ui.selectable_label(out_wanted.is_none(),
-                                                egui::RichText::new("System default").color(theme::INK)).clicked() {
+                                        .popup_min_width(240.0)
+                                        .text_size(11.5)
+                                        .show_ui(ui, |menu| {
+                                            if menu.item(out_wanted.is_none(), "System default") {
                                                 out_pick = Some(None);
                                             }
                                             for o in &outputs {
-                                                if ui.selectable_label(out_wanted.as_deref() == Some(o.raw.as_str()),
-                                                    egui::RichText::new(&o.name).color(theme::INK)).clicked() {
+                                                if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
                                                     out_pick = Some(Some(o.raw.clone()));
                                                 }
                                             }
                                         })
-                                        .response.on_hover_text("the sound card kabelsalat plays to");
+                                        .on_hover_text("the sound card kabelsalat plays to");
                                     if let Some(c) = &out_current {
                                         ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
                                     }
@@ -10139,12 +12678,31 @@ impl DemoApp {
         }));
     }
 
+    /// Opacity for the `AGENT` pill badge: fades out cleanly before the dark
+    /// label text loses contrast against the `#1C1C1C` unit plate (rule 84).
+    fn agent_badge_alpha(alpha_t: f32) -> f32 {
+        ((alpha_t - 0.38) / 0.62).clamp(0.0, 1.0)
+    }
+
     /// Crisp "AGENT" pill badge inside a rack unit header (rack-local rect).
     fn draw_agent_badge(&self, painter: &egui::Painter, rect: Rect, alpha_t: f32) {
-        if alpha_t <= 0.01 { return; }
+        let badge_a = Self::agent_badge_alpha(alpha_t);
+        if badge_a <= 0.05 { return; }
         let sr = self.xf.rect(rect);
-        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, alpha_t));
-        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, alpha_t));
+        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, badge_a));
+        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
+    }
+
+    fn draw_fading_units(&self, painter: &egui::Painter) {
+        let xf = &self.xf;
+        for f in &self.fading_units {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let sr = xf.rect(f.rect);
+            painter.rect_filled(sr, 2.0, alpha(CHASSIS, a));
+            let col = if f.agent { theme::AGENT_COLOR } else { BORDER };
+            painter.rect_stroke(sr, 2.0, Stroke::new(1.4, alpha(col, a)), egui::StrokeKind::Inside);
+        }
     }
 
     fn draw_front(&self, painter: &egui::Painter) {
@@ -10155,6 +12713,7 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Single near-black family (§2.4): plates are the chassis color;
             // zones are drawn with 1px hairline rules that brighten on hover
             // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
@@ -10163,7 +12722,9 @@ impl DemoApp {
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -10215,7 +12776,7 @@ impl DemoApp {
                 self.draw_knob(painter, ui, ki);
             }
 
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = if self.split_rects(ui).is_some() {
                     Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
                 } else {
@@ -10224,6 +12785,7 @@ impl DemoApp {
                 self.draw_agent_badge(painter, badge, agent_t);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     /// Is the pointer over rack-local `rect` of `unit` (front face hover)?
@@ -10733,7 +13295,7 @@ impl DemoApp {
         let node = u.node_id;
         let v = if on { 1.0f32 } else { 0.0f32 };
         if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_MONITOR)) {
-            k.value = v;
+            k.set_immediate(v);
         }
         if let Some(bus) = &self.bus {
             if bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_MONITOR, value: v as f64 }) {
@@ -10830,7 +13392,7 @@ impl DemoApp {
 
         // Flat value arc: hairline track + solid accent arc + flat end dot
         // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, theme::ACCENT);
+        theme::value_arc(painter, |l| xf.p(l), c, r, k.display_value, theme::ACCENT);
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -10847,7 +13409,7 @@ impl DemoApp {
         // Pointer: center → 0.62r needle, 2px cream.
         let a0 = 135.0f32.to_radians();
         let sweep = 270.0f32.to_radians();
-        let ang = a0 + sweep * k.value;
+        let ang = a0 + sweep * k.display_value;
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
         painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
@@ -10894,40 +13456,36 @@ impl DemoApp {
         }
     }
 
+    /// (unit, knob) indices of the knob a menu is about, resolved this frame.
+    fn knob_menu_target(&self, menu: &KnobMenu) -> Option<(usize, usize)> {
+        let unit = self.units.iter().position(|u| u.node_id == menu.node)?;
+        let idx = self.units[unit].knobs.iter().position(|k| k.cc_target() == Some((menu.param, menu.target)))?;
+        Some((unit, idx))
+    }
+
     fn knob_menu_ui(&mut self, ctx: &egui::Context) {
         let Some(menu) = self.knob_menu else {
             self.knob_menu_rect = Rect::NOTHING;
             return;
         };
+        let close = |app: &mut Self| {
+            app.knob_menu = None;
+            app.knob_menu_rect = Rect::NOTHING;
+        };
         if self.stage_view != StageView::Rack || self.side != Side::Front {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
+            return close(self);
         }
-        let Some(u) = self.units.get(menu.unit) else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let Some(k) = u.knobs.get(menu.idx) else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let Some((param, target)) = k.cc_target() else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let node_id = u.node_id;
-        let title = format!("{} · {}", sentence_case(&u.name), k.label);
+        let Some((unit, idx)) = self.knob_menu_target(&menu) else { return close(self) };
+        let (node_id, param, target) = (menu.node, menu.param, menu.target);
+        let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node_id && l.param == param && l.target == target);
         let binding = self.knob_cc_binding(node_id, param, target);
-        let Some((src, cc)) = binding else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
+        if binding.is_none() && !learning {
+            return close(self);
+        }
+        let u = &self.units[unit];
+        let title = format!("{} · {}", sentence_case(&u.name), u.knobs[idx].label);
         let mut relearn = false;
+        let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
         let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
@@ -10949,14 +13507,25 @@ impl DemoApp {
                     .show(ui, |ui| {
                         ui.set_min_width(170.0);
                         ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
-                        ui.label(egui::RichText::new(format!("CC {cc} · {}", Self::source_str(src))).size(11.0).color(theme::MIDI_BLUE));
+                        let status = match binding {
+                            Some((src, cc)) if learning => format!("CC {cc} · {} · learning…", Self::source_str(src)),
+                            Some((src, cc)) => format!("CC {cc} · {}", Self::source_str(src)),
+                            None => "MIDI learn · move a controller".to_string(),
+                        };
+                        ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
                         ui.add_space(6.0);
-                        if theme::chip_button(ui, "MIDI learn again", false).clicked() {
+                        if learning {
+                            if theme::chip_button(ui, "Cancel MIDI learn", false).clicked() {
+                                cancel_learn = true;
+                            }
+                        } else if theme::chip_button(ui, "MIDI learn again", false).clicked() {
                             relearn = true;
                         }
-                        ui.add_space(4.0);
-                        if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
-                            clear = true;
+                        if binding.is_some() {
+                            ui.add_space(4.0);
+                            if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
+                                clear = true;
+                            }
                         }
                         ui.add_space(4.0);
                         if theme::chip_button(ui, "Reset to default", false).clicked() {
@@ -10965,9 +13534,11 @@ impl DemoApp {
                     });
             });
         self.knob_menu_rect = area.response.rect;
+        if !(relearn || cancel_learn || clear || reset_val) {
+            return;
+        }
+        close(self);
         if relearn {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
             self.cc_learn = Some(CcLearn {
                 source: SourceId::Keys,
                 dest: node_id,
@@ -10975,16 +13546,18 @@ impl DemoApp {
                 target,
                 replace_existing: true,
             });
-        } else if clear {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        }
+        // Every other choice ends a learn the right-click started, so a later
+        // controller move cannot bind the knob by surprise.
+        if learning {
+            self.cc_learn = None;
+        }
+        if clear {
             self.clear_knob_bindings(node_id, param, target);
         } else if reset_val {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            if let Some(k) = self.units.get_mut(menu.unit).and_then(|u| u.knobs.get_mut(menu.idx)) {
-                k.value = k.default;
-            }
+            let k = &mut self.units[unit].knobs[idx];
+            k.set_immediate(k.default);
         }
     }
 
@@ -10996,13 +13569,16 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -11067,7 +13643,7 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
                 self.draw_agent_badge(painter, badge, agent_t);
             }
@@ -11083,6 +13659,7 @@ impl DemoApp {
                 self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     fn cable_alpha(c: &Cable, has_sel: bool, highlighted: bool) -> f32 {
@@ -11097,13 +13674,12 @@ impl DemoApp {
         let mut col = c.color;
         if c.kind == PortKind::Audio && c.color == theme::AUDIO_CREAM {
             // Subtle flat warm shift toward the accent (§4.10), ONLY for the
-            // neutral cream jacket: TONE·0.20 + WARM·0.15. Colored jackets keep
+            // neutral cream jacket: a fixed instrument shift + WARM·0.15. Colored jackets keep
             // their hue so tomato stays scarce (selection-only) on the back.
             let mut t = 0.0;
             if let Some(su) = self.units.get(c.src) {
                 if matches!(su.node_kind, UnitKind::Clap) {
-                    let tone = su.knobs.first().map(|k| k.value).unwrap_or(0.35);
-                    t += tone * 0.20;
+                    t += INSTRUMENT_CABLE_WARMTH;
                 }
             }
             let warm = self.master_idx().map(|m| knob_val(&self.units[m], P_WARM, 0.15)).unwrap_or(0.15);
@@ -11135,8 +13711,26 @@ impl DemoApp {
 
             let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
+            let draw_t = if c.draw_in >= 1.0 {
+                1.0
+            } else {
+                let t = c.draw_in.clamp(0.0, 1.0);
+                1.0 - (1.0 - t).powi(3)
+            };
+            if draw_t <= 0.01 { continue; }
             let mut col = self.cable_color(c);
             let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
+            let cable_shape = |w: f32, col: Color32| -> Shape {
+                if draw_t >= 0.999 {
+                    bezier_shape(curve, w, col)
+                } else {
+                    Shape::CubicBezier(
+                        egui::epaint::CubicBezierShape::from_points_stroke(
+                            curve, false, Color32::TRANSPARENT, Stroke::new(w, col),
+                        ).split_range(0.0..draw_t),
+                    )
+                }
+            };
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
@@ -11145,10 +13739,18 @@ impl DemoApp {
                 col = theme::ACCENT;
                 width += 0.5;
             } else if edge_at > 0.01 {
-                painter.add(bezier_shape(curve, width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
+                painter.add(cable_shape(width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
                 col = mix(col, theme::AGENT_COLOR, edge_at * 0.85);
             }
-            painter.add(bezier_shape(curve, width, alpha(col, a)));
+            painter.add(cable_shape(width, alpha(col, a)));
+        }
+        for f in &self.fading_cables {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let curve = [xf.p(f.curve[0].to_vec2()), xf.p(f.curve[1].to_vec2()),
+                         xf.p(f.curve[2].to_vec2()), xf.p(f.curve[3].to_vec2())];
+            let col = if f.agent { mix(f.color, theme::AGENT_COLOR, 0.7) } else { f.color };
+            painter.add(bezier_shape(curve, f.width, alpha(col, a)));
         }
     }
 
@@ -11208,6 +13810,12 @@ impl DemoApp {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, false, true);
             for end in [Dir::Out, Dir::In] {
+                let plug_a = if end == Dir::In && c.draw_in < 1.0 {
+                    a * ((c.draw_in - 0.55) / 0.45).clamp(0.0, 1.0)
+                } else {
+                    a
+                };
+                if plug_a <= 0.01 { continue; }
                 let over = if end == Dir::Out { c.over_a } else { c.over_b };
                 let base = if end == Dir::Out { c.prev_a } else { c.prev_b };
                 // Fan-in: stacked plugs on one jack spread slightly.
@@ -11232,10 +13840,10 @@ impl DemoApp {
                 let pr = match c.kind { PortKind::Audio => 8.0, PortKind::Midi => 1.0 };
                 let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
                 let stroke_col = if edge_at > 0.01 { mix(BORDER, theme::AGENT_COLOR, edge_at) } else { BORDER };
-                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, a));
-                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, a)), egui::StrokeKind::Inside);
+                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, plug_a));
+                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, plug_a)), egui::StrokeKind::Inside);
                 let band = Rect::from_min_size(body.min + Vec2::new(2.0, 3.0), Vec2::new(16.0, 3.5));
-                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), a));
+                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), plug_a));
             }
         }
     }
@@ -11559,8 +14167,24 @@ fn drag_only(r: egui::Response) -> egui::Response {
 impl DemoApp {
     /// One app frame minus eframe plumbing (`ui()` delegates here) — tests
     /// drive the exact runtime path through a plain `egui::Context`.
+    fn has_active_animations(&self) -> bool {
+        if self.flipping || self.assistant.busy || self.agent_activity.has_active(self.ui_time) {
+            return true;
+        }
+        if self.reduce_motion {
+            return false;
+        }
+        self.load_fade < 1.0
+            || self.tap_flash_t > 0.0
+            || !self.fading_units.is_empty()
+            || !self.fading_cables.is_empty()
+            || self.units.iter().any(|u| u.knobs.iter().any(|k| k.glide_t < 1.0))
+            || self.cables.iter().any(|c| c.draw_in < 1.0 || c.dying >= 0.0 || c.age < 0.4)
+    }
+
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.popup_open_at_start = egui::Popup::is_any_open(&ctx);
         // Subtitles first: a changed instrument name is laid out this frame.
         self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
@@ -11589,6 +14213,9 @@ impl DemoApp {
         // Dock toggles (F12 / C / V) — handled before the panels so they work
         // even while the chat field has keyboard focus. The dock occupant owns
         // the computer keyboard, but its own close/swap shortcuts never yield.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12)) {
+            self.replay_agent_rack_animations();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
             self.toggle_dock(DockView::Assistant);
         }
@@ -11608,6 +14235,8 @@ impl DemoApp {
                 if let Err(e) = self.undo_agent(undo) { self.session_msg = e; }
             }
         }
+
+        self.take_chat_images(&ctx);
 
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
@@ -11646,6 +14275,8 @@ impl DemoApp {
         }
         self.poll_assistant();
         self.serve_ui_inbox();
+        self.serve_rack_shots();
+        self.rack_shot.request(&ctx);
         self.sync_from_engine();
         self.poll_plugin_scan();
         self.poll_install();
@@ -11709,7 +14340,9 @@ impl DemoApp {
         let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
+        self.sync_main_knobs();
         self.layout(rect);
+        self.fit_plugin_knobs();
         if !typing(&ctx) {
             self.handle_input(&ctx, rect);
         }
@@ -11725,16 +14358,18 @@ impl DemoApp {
             StageView::Mixer => self.mixer_stage(ui),
             StageView::Sessions => self.sessions_stage(ui),
             StageView::Plugins => self.plugins_stage(ui),
+            StageView::Settings => self.settings_stage(ui),
         }
         self.knob_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
+        self.save_rig_modal(&ctx);
+        self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
-        // Full frame rate while focused (the cables are the show); ~30 fps in
-        // the background — meters and cables still move, at a third of the
-        // UI thread's CPU when the user works in another window.
-        if ctx.input(|i| i.focused) || self.agent_activity.has_active(self.ui_time) {
+        // Full frame rate while focused (the cables are the show) or while an
+        // animation / agent run is active; ~30 fps when unfocused and idle.
+        if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -11786,9 +14421,13 @@ impl eframe::App for DemoApp {
 /// Exercises the real capture_session/apply_session paths (no GUI/audio needed).
 pub fn run_session_test() -> anyhow::Result<()> {
     let mut app = DemoApp::new_with_sink(None);
-    app.units[1].knobs[1].value = 0.42; // rig A level
-    app.units[3].knobs[0].value = 0.77; // master volume
-    app.units[5].knobs[1].value = 0.31; // rig B delay mix
+    let knob = |app: &DemoApp, unit: usize, label: &str| -> anyhow::Result<usize> {
+        app.units[unit].knob_index(label).ok_or_else(|| anyhow::anyhow!("unit {unit} has no {label} knob"))
+    };
+    let (level, volume, mix) = (knob(&app, 1, "LEVEL")?, knob(&app, 3, "VOLUME")?, knob(&app, 5, "MIX")?);
+    app.units[1].knobs[level].value = 0.42; // rig A level
+    app.units[3].knobs[volume].value = 0.77; // master volume
+    app.units[5].knobs[mix].value = 0.31; // rig B delay mix
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = std::path::PathBuf::from(home).join(".cache").join("ksalat-session-selftest");
@@ -11800,15 +14439,16 @@ pub fn run_session_test() -> anyhow::Result<()> {
     let edges = session.graph.edges.len();
 
     // Wipe the knobs, then restore from disk.
-    app.units[1].knobs[1].value = 0.0;
-    app.units[3].knobs[0].value = 0.0;
-    app.units[5].knobs[1].value = 0.0;
+    app.units[1].knobs[level].value = 0.0;
+    app.units[3].knobs[volume].value = 0.0;
+    app.units[5].knobs[mix].value = 0.0;
     let loaded = crate::session::Session::load(&pkg)?;
     app.apply_session(&loaded)?;
 
-    anyhow::ensure!((app.units[1].knobs[1].value - 0.42).abs() < 1e-6, "rig A level not restored");
-    anyhow::ensure!((app.units[3].knobs[0].value - 0.77).abs() < 1e-6, "master volume not restored");
-    anyhow::ensure!((app.units[5].knobs[1].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
+    let (level, volume, mix) = (knob(&app, 1, "LEVEL")?, knob(&app, 3, "VOLUME")?, knob(&app, 5, "MIX")?);
+    anyhow::ensure!((app.units[1].knobs[level].value - 0.42).abs() < 1e-6, "rig A level not restored");
+    anyhow::ensure!((app.units[3].knobs[volume].value - 0.77).abs() < 1e-6, "master volume not restored");
+    anyhow::ensure!((app.units[5].knobs[mix].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
     anyhow::ensure!(loaded.graph.edges.len() == edges, "edge count changed across round-trip");
 
     // --- Keys split (a node property): point + the HIGH cable round-trip ---
@@ -11914,6 +14554,612 @@ pub fn run_session_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// agent-eval: the real agent loop against a headless app + offline engine
+// ---------------------------------------------------------------------------
+
+/// The patch a task starts from.
+#[derive(Clone, Copy)]
+enum EvalStart {
+    /// What the app opens with: one rig, Keys → Surge A/B → Delay A/B → Master.
+    Demo,
+    /// Keys → Surge → Master.
+    OneRig,
+    /// Rig A: Keys → Surge → Delay → Master. Rig B: Keys → Surge → Master.
+    TwoRigs,
+    /// Keys → Surge → Master, plus a wired metronome that is not running.
+    OneRigMetronome,
+    /// Rig A: Keys → Surge → Master. Rig B "YANES": Keys → YANES → Master.
+    SurgeAndYanes,
+    /// Rig A: Keys → Surge → Master. Rig B "Organ": Keys → setBfree → Master.
+    SurgeAndOrgan,
+}
+
+const EVAL_YANES: &str = "org.yanes.native";
+const EVAL_ORGAN: &str = "http://gareus.org/oss/lv2/b_synth";
+/// setBfree's programmes a "jazz" registration may be: Jazz 1 all, Jimmy
+/// Smith, Jimmy Smith Plus (its MIDNAM document, programme change numbers).
+const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
+
+/// One scripted request and what the app must look like afterwards.
+struct EvalTask {
+    name: &'static str,
+    start: EvalStart,
+    /// An image the user attaches to the request (a path in the repository).
+    image: Option<&'static str>,
+    prompt: &'static str,
+    /// Err says what is off. Gets the engine (what reached a plugin) and
+    /// the agent's final reply for questions.
+    check: fn(&mut DemoApp, &GraphEngine, &str) -> Result<(), String>,
+}
+
+fn eval_ensure(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
+    if ok { Ok(()) } else { Err(why()) }
+}
+
+fn eval_graph(app: &DemoApp) -> Graph {
+    app.shared_graph.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+fn eval_node(g: &Graph, rig: u8, what: &str, is: impl Fn(&NodeKind) -> bool) -> Result<u32, String> {
+    g.nodes.iter().find(|n| n.rig == rig && is(&n.kind)).map(|n| n.id)
+        .ok_or_else(|| format!("no {what} in rig {}", rig + 1))
+}
+
+fn eval_named(g: &Graph, name: &str) -> Result<u32, String> {
+    g.nodes.iter().find(|n| name_str(&n.name) == name).map(|n| n.id).ok_or_else(|| format!("no node named {name}"))
+}
+
+/// Does audio flow from `from` to `to` along the cables?
+fn eval_audio_path(g: &Graph, from: u32, to: u32) -> bool {
+    let mut seen = vec![from];
+    let mut i = 0;
+    while i < seen.len() {
+        let at = seen[i];
+        if at == to { return true; }
+        for e in g.edges.iter().filter(|e| e.kind == CPortKind::Audio && e.from.node == at) {
+            if !seen.contains(&e.to.node) { seen.push(e.to.node); }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn eval_midi_cable(g: &Graph, from: u32, port: u8, to: u32) -> bool {
+    g.edges.iter().any(|e| e.kind == CPortKind::Midi && e.from.node == from && e.from.port == port && e.to.node == to)
+}
+
+/// "category/name" (lower case) of the patch loaded into `rig`'s synth.
+fn eval_patch(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let multi = app.rig_count() > 1;
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| !multi || u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let name = app.patch_names.get(slot).cloned().flatten()
+        .ok_or_else(|| format!("rig {} still plays the init patch", rig + 1))?;
+    let category = match app.sounds.get(&crate::sounds::Instrument::Clap(SURGE_ID.into())) {
+        crate::sounds::Lookup::Ready(library) => library.sounds.iter().find(|s| s.name == name).map(|s| s.category.clone()).unwrap_or_default(),
+        _ => String::new(),
+    };
+    Ok(format!("{category}/{name}").to_lowercase())
+}
+
+/// The rig's one unit of `kind` (asking for "a delay" must not leave two).
+fn eval_one_dsp(g: &Graph, rig: u8, kind: &DspKind) -> Result<u32, String> {
+    let found: Vec<u32> = g.nodes.iter().filter(|n| n.rig == rig && n.kind == NodeKind::Dsp(kind.clone())).map(|n| n.id).collect();
+    match found[..] {
+        [one] => Ok(one),
+        _ => Err(format!("rig {} has {} {kind:?} unit(s), expected 1", rig + 1, found.len())),
+    }
+}
+
+/// One effect of `kind` that the rig's synth feeds and that reaches the master.
+fn eval_effect_in_chain(g: &Graph, rig: u8, kind: DspKind) -> Result<(), String> {
+    let fx = eval_one_dsp(g, rig, &kind)?;
+    let synth = eval_node(g, rig, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+    let master = eval_node(g, rig, "master", |k| matches!(k, NodeKind::MasterOut))?;
+    eval_ensure(eval_audio_path(g, synth, fx), || format!("the synth does not feed the {kind:?}"))?;
+    eval_ensure(eval_audio_path(g, fx, master), || format!("the {kind:?} does not reach the master"))
+}
+
+/// The value text of the "Preset" parameter of the CLAP synth in `rig`
+/// (YANES keeps its sounds there), read from the live plugin.
+fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let main = app.clap_pool_idx(slot).and_then(|i| app._surge_main.get_mut(i))
+        .ok_or_else(|| format!("rig {}'s synth is not running", rig + 1))?;
+    let preset = main.param_list().into_iter().find(|p| p.name == "Preset")
+        .ok_or_else(|| format!("rig {}'s synth has no Preset parameter", rig + 1))?;
+    Ok(main.param_text(preset.id, preset.value))
+}
+
+const EVAL_TASKS: &[EvalTask] = &[
+    EvalTask {
+        name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
+        check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+    },
+    EvalTask {
+        name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
+        check: |app, _, reply| {
+            eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
+            eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
+        },
+    },
+    EvalTask {
+        name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
+        check: |app, _, _| {
+            let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))
+        },
+    },
+    EvalTask {
+        name: "split_zones", start: EvalStart::Demo, image: None,
+        prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
+            let (a, b) = (eval_named(&g, "SURGE A")?, eval_named(&g, "SURGE B")?);
+            let split = g.node(keys).and_then(|n| n.split);
+            eval_ensure(split == Some(60), || format!("split point is {split:?}"))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, a), || "LOW is not wired to Surge A".into())?;
+            eval_ensure(eval_midi_cable(&g, keys, 1, b), || "HIGH is not wired to Surge B".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 0, b), || "Surge B still plays the low half".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 1, a), || "Surge A also plays the high half".into())
+        },
+    },
+    EvalTask {
+        name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
+        check: |app, _, _| {
+            let patch = eval_patch(app, 0)?;
+            eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
+        },
+    },
+    EvalTask {
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        check: |app, _, _| {
+            let preset = eval_preset_param(app, 1)?;
+            eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        check: |app, engine, _| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(matches!(last, Some([0xC0, p, _]) if EVAL_JAZZ_PROGRAMS.contains(&p)),
+                || format!("the organ's last MIDI event is {last:?}, not a programme change to a jazz registration"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        check: |app, engine, reply| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(last.is_none(), || format!("the organ got {last:?}: it has no pad to load"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))?;
+            eval_ensure(!reply.trim().is_empty(), || "no reply".into())
+        },
+    },
+    EvalTask {
+        name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 1 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 2 got a reverb too".into())
+        },
+    },
+    EvalTask {
+        name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
+    },
+    EvalTask {
+        name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
+            let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, synth, master), || "rig 1's synth no longer reaches its master".into())?;
+            let rig_b = g.nodes.iter().filter(|n| n.rig == 1).count();
+            eval_ensure(rig_b == 3, || format!("rig 2 changed ({rig_b} units)"))
+        },
+    },
+    EvalTask {
+        name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, metro, master), || "the metronome is not wired to the master".into())?;
+            eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
+        },
+    },
+    EvalTask {
+        name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
+        check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
+    },
+    EvalTask {
+        name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
+        check: |app, _, _| {
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
+        check: |app, _, _| {
+            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
+            eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
+        },
+    },
+    EvalTask {
+        name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
+        check: |app, _, _| {
+            eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
+            let asked = app.pending_confirm.as_ref()
+                .is_some_and(|p| p.tool == "delete_rig" && p.args.get("rig").and_then(|r| r.as_u64()) == Some(1));
+            eval_ensure(asked, || format!("no Confirm prompt for rig 2 (pending: {:?})", app.pending_confirm.as_ref().map(|p| &p.label)))
+        },
+    },
+    EvalTask {
+        name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        check: |app, _, _| {
+            eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
+            let patch = eval_patch(app, 1)?;
+            eval_ensure(patch.contains("bass"), || format!("the new rig plays {patch}, not a bass"))?;
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure(b < a, || format!("the new rig is not quieter (rig 1 {a:.2}, rig 2 {b:.2})"))
+        },
+    },
+    EvalTask {
+        name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
+        check: |app, _, _| {
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
+        check: |app, _, _| {
+            let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
+            eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 1 got a reverb too".into())
+        },
+    },
+    EvalTask {
+        name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
+    },
+    EvalTask {
+        name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
+        check: |app, _, _| {
+            let patch = eval_patch(app, 1)?;
+            eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
+            eval_ensure(eval_patch(app, 0).is_err(), || "rig 1's sound changed too".into())
+        },
+    },
+    EvalTask {
+        name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
+            eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
+        },
+    },
+    EvalTask {
+        name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
+        check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
+    },
+    EvalTask {
+        name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
+        check: |app, _, _| {
+            eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
+            eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
+        },
+    },
+    EvalTask {
+        name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
+        prompt: "Do what the note says.",
+        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+    },
+    EvalTask {
+        name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
+        prompt: "Do what the note says.",
+        check: |app, _, _| {
+            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
+            eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
+        },
+    },
+    EvalTask {
+        name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
+        prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
+        check: |app, _, reply| {
+            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
+            eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
+        },
+    },
+    EvalTask {
+        name: "look_at_rack", start: EvalStart::Demo, image: None,
+        prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
+        check: |app, _, reply| {
+            eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
+            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
+        },
+    },
+];
+
+/// The frame the eval rig hands look_at_rack: the rig has no window, so a
+/// stored screenshot of the app (mixer view) stands in for its pixels.
+const EVAL_WINDOW_SHOT: &str = "docs/shots/mixer.png";
+
+fn eval_image(path: &str) -> anyhow::Result<Image> {
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+    let bytes = std::fs::read(&file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
+    Image::from_file(path.rsplit('/').next().unwrap_or(path), &bytes).map_err(anyhow::Error::msg)
+}
+
+
+/// A headless app on an offline engine: no window, no audio device, no
+/// hardware scan. Frames run the app's real frame path; each frame renders
+/// one engine block so commands and publications flow as in the live app.
+struct EvalRig {
+    // Declared first so it drops first: it owns the voices' audio halves.
+    engine: GraphEngine,
+    app: DemoApp,
+    ctx: egui::Context,
+    buf: Vec<f32>,
+    started: std::time::Instant,
+    /// What a screenshot request gets (`EVAL_WINDOW_SHOT`).
+    window_shot: Arc<egui::ColorImage>,
+}
+
+type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
+
+impl EvalRig {
+    fn new(assistant: Assistant, plugins: &EvalPlugins) -> anyhow::Result<Self> {
+        let sample_rate = 48000.0;
+        let (voices, mains) = startup_voices(sample_rate)?;
+        let controllers = voices.iter().map(|(_, v)| v.controller()).collect();
+        let voice_ids = voices.iter().map(|(_, v)| v.voice_id()).collect();
+        let (bus, drain) = crate::control::command_bus();
+        let mut engine = GraphEngine::new(Graph::demo_patch(), drain, sample_rate, voices);
+        let mut app = DemoApp::new_app(None, false, assistant);
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
+        engine.set_graph_pub(graph_pub.clone());
+        let (voice_tx, voice_rx) = rtrb::RingBuffer::new(VOICE_RING);
+        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(VOICE_RING);
+        engine.set_voice_channels(voice_rx, retire_tx);
+        engine.spawn_lv2_loader();
+        let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
+        engine.set_recorder(tap);
+        app.recorder = Some(recorder);
+        app.graph_pub = Some(graph_pub);
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        (app.plugins_clap, app.plugins_lv2) = plugins.clone();
+        app.plugins_loaded = true;
+        let shot = eval_image(EVAL_WINDOW_SHOT)?;
+        let (size, rgba) = crate::vision::decode_png(&shot.bytes).map_err(anyhow::Error::msg)?;
+        let window_shot = Arc::new(egui::ColorImage::from_rgba_unmultiplied(size, &rgba));
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now(), window_shot })
+    }
+
+    fn frame(&mut self) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.time = Some(self.started.elapsed().as_secs_f64());
+        let app = &mut self.app;
+        let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        for command in out.viewport_output.values().flat_map(|v| &v.commands) {
+            if let egui::ViewportCommand::Screenshot(wanted) = command {
+                wanted.clone().complete(self.window_shot.clone());
+            }
+        }
+        self.engine.render(&mut self.buf, 2);
+    }
+
+    /// Enough frames for the engine to apply what the app sent and for the
+    /// app to adopt what the engine published.
+    fn settle(&mut self) {
+        for _ in 0..8 { self.frame(); }
+    }
+
+    fn load(&mut self, start: EvalStart) -> anyhow::Result<()> {
+        self.settle();
+        match start {
+            EvalStart::Demo => {}
+            EvalStart::OneRig => {
+                let s = crate::session::Session::new("One rig", crate::control::standard_rig_graph(true));
+                self.app.apply_session(&s)?;
+            }
+            EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+            EvalStart::SurgeAndYanes => self.load_two_rigs("YANES", crate::control::plugin_rig_graph(EVAL_YANES, "YANES")),
+            EvalStart::SurgeAndOrgan => self.load_two_rigs("Organ", DemoApp::build_lv2_instrument_graph(EVAL_ORGAN, "setBfree")),
+            EvalStart::OneRigMetronome => {
+                let mut g = crate::control::standard_rig_graph(true);
+                let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut)).map_err(anyhow::Error::msg)?;
+                let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+                g.connect_with_id(4, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                self.app.apply_session(&crate::session::Session::new("One rig with a metronome", g))?;
+            }
+        }
+        self.settle();
+        Ok(())
+    }
+
+    /// Rig A: Keys → Surge → Master. Rig B, named `name`: `second`. Runs
+    /// frames until the second rig's plugin had time to load.
+    fn load_two_rigs(&mut self, name: &str, second: Graph) {
+        let rigs = vec![
+            crate::control::Rig::new("Rig A", crate::control::standard_rig_graph(true), None),
+            crate::control::Rig::new(name, second, None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        if let Some(bus) = &self.app.bus {
+            let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
+        }
+        self.app.build_rack(&merged, &[]);
+        for _ in 0..100 {
+            self.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+/// Where eval runs record: never the user's ~/Music.
+fn eval_takes_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".cache").join("ksalat-agent-eval").join("takes")
+}
+
+/// What one run of one task cost and whether the app ended up right.
+struct EvalRun {
+    verdict: Result<(), String>,
+    /// Wall time from the request to the agent's last word.
+    secs: f64,
+    /// Seconds each model step took; their sum is the part of `secs` spent
+    /// waiting for the model.
+    step_secs: Vec<f64>,
+    /// Tool calls the worker refused (unknown tool, arguments off-schema).
+    rejected: usize,
+    tools: Vec<String>,
+    routed: Vec<String>,
+    reply: String,
+}
+
+/// Longest a turn may take before the run counts as failed.
+const EVAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+
+fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
+    let mut rig = EvalRig::new(Assistant::with_model(model, jev), plugins)?;
+    let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
+    anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
+    rig.load(task.start)?;
+    rig.app.chat_image = task.image.map(eval_image).transpose()?;
+    rig.app.submit_chat(task.prompt.to_string());
+    let sent = std::time::Instant::now();
+    while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
+        rig.frame();
+        std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+    let timed_out = rig.app.assistant.busy;
+    rig.settle();
+    let turn = rig.app.assistant.turn.clone();
+    let reply = rig.app.assistant.history.iter().rev().find(|l| l.role == "assistant").map(|l| l.text.clone()).unwrap_or_default();
+    let verdict = if timed_out {
+        Err(format!("no answer within {} s", EVAL_TURN_TIMEOUT.as_secs()))
+    } else if let Some(e) = turn.errors.first() {
+        Err(format!("agent error: {e}"))
+    } else {
+        (task.check)(&mut rig.app, &rig.engine, &reply)
+    };
+    if let Some(recorder) = rig.app.recorder.take() { recorder.shutdown(); }
+    let _ = std::fs::remove_dir_all(eval_takes_dir());
+    let mut routed: Vec<String> = turn.steps.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
+    routed.sort();
+    routed.dedup();
+    Ok(EvalRun {
+        verdict,
+        secs: turn.wall.unwrap_or_else(|| sent.elapsed()).as_secs_f64(),
+        step_secs: turn.steps.iter().map(|s| s.ms as f64 / 1000.0).collect(),
+        rejected: turn.steps.iter().map(|s| s.rejected).sum(),
+        tools: turn.tools,
+        routed,
+        reply,
+    })
+}
+
+/// Nearest-rank percentile of a non-empty sample (`q` in 0..=1).
+fn eval_percentile(sorted: &[f64], q: f64) -> f64 {
+    let rank = (q * sorted.len() as f64).ceil().max(1.0) as usize;
+    sorted[rank.min(sorted.len()) - 1]
+}
+
+fn eval_median(mut xs: Vec<f64>) -> f64 {
+    xs.sort_by(f64::total_cmp);
+    let n = xs.len();
+    if n == 0 { 0.0 } else if n % 2 == 1 { xs[n / 2] } else { (xs[n / 2 - 1] + xs[n / 2]) / 2.0 }
+}
+
+/// `kabelsalat agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev]`:
+/// run the real agent loop over the scripted tasks and report pass rate,
+/// model steps, tool calls, wall time and the models that answered.
+/// `--model` picks the acting chat model; `--no-jev` takes the decisions
+/// model out of the loop.
+pub fn run_agent_eval() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let model = opt("--model").unwrap_or_else(|| crate::llm::Route::configured(crate::llm::Role::Act).model);
+    let runs: usize = opt("--runs").map(|r| r.parse()).transpose()?.unwrap_or(1).max(1);
+    let only = opt("--task");
+    let jev = !args.iter().any(|a| a == "--no-jev");
+    let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
+    anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
+        EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
+    // The frame path asks the compositor for its scale otherwise.
+    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
+    let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
+
+    let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
+    println!("agent-eval: decisions {front} · acting model {model} · {} task(s) x {runs} run(s)", tasks.len());
+    let mut results: Vec<(&EvalTask, Vec<EvalRun>)> = Vec::new();
+    for task in tasks {
+        let mut task_runs = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let run = run_eval_task(task, &model, jev, &plugins)?;
+            let verdict = match &run.verdict { Ok(()) => "PASS".to_string(), Err(why) => format!("FAIL ({why})") };
+            let steps: Vec<String> = run.step_secs.iter().map(|s| format!("{s:.1}")).collect();
+            let rejected = if run.rejected > 0 { format!("  {} call(s) refused", run.rejected) } else { String::new() };
+            println!("  {:<18} {:>6.2} s  {} step(s) [{} s]  {} tool(s) [{}]{rejected}  {}  {verdict}",
+                task.name, run.secs, steps.len(), steps.join(" "), run.tools.len(), run.tools.join(", "), run.routed.join("+"));
+            if run.verdict.is_err() {
+                println!("    reply: {}", run.reply.replace('\n', " ").chars().take(240).collect::<String>());
+            }
+            task_runs.push(run);
+        }
+        results.push((task, task_runs));
+    }
+
+    println!("\n| task | pass | median s | p90 s | model s | steps | tools | answered by |");
+    println!("|---|---|---|---|---|---|---|---|");
+    let (mut passed, mut total, mut all_secs, mut all_model) = (0, 0, Vec::new(), 0.0);
+    for (task, task_runs) in &results {
+        let ok = task_runs.iter().filter(|r| r.verdict.is_ok()).count();
+        let mut secs: Vec<f64> = task_runs.iter().map(|r| r.secs).collect();
+        secs.sort_by(f64::total_cmp);
+        let mut routed: Vec<String> = task_runs.iter().flat_map(|r| r.routed.clone()).collect();
+        routed.sort();
+        routed.dedup();
+        println!("| {} | {ok}/{} | {:.2} | {:.2} | {:.2} | {:.0} | {:.0} | {} |",
+            task.name, task_runs.len(), eval_median(secs.clone()), eval_percentile(&secs, 0.9),
+            eval_median(task_runs.iter().map(|r| r.step_secs.iter().sum()).collect()),
+            eval_median(task_runs.iter().map(|r| r.step_secs.len() as f64).collect()),
+            eval_median(task_runs.iter().map(|r| r.tools.len() as f64).collect()),
+            routed.join(", "));
+        passed += ok;
+        total += task_runs.len();
+        all_secs.extend(secs);
+        all_model += task_runs.iter().flat_map(|r| &r.step_secs).sum::<f64>();
+    }
+    all_secs.sort_by(f64::total_cmp);
+    let wall: f64 = all_secs.iter().sum();
+    println!("\nagent-eval: {model} passed {passed}/{total} ({:.0} %) · wall time per request: median {:.2} s, p90 {:.2} s · total {wall:.1} s, {:.0} % of it waiting for the model",
+        100.0 * passed as f64 / total as f64, eval_median(all_secs.clone()), eval_percentile(&all_secs, 0.9), 100.0 * all_model / wall);
+    Ok(())
+}
+
 pub fn run_demo() -> anyhow::Result<()> {
     run_inner(None, false)
 }
@@ -11979,12 +15225,26 @@ fn pin_current_thread_to_p_cores() {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
+/// One Surge voice per Clap node of the startup patch, bound to its node.
+/// Every further voice is hosted when a CLAP unit needs one
+/// (`DemoApp::sync_clap_slots`).
+fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Vec<ClapVoiceMain>)> {
+    let mut voices = Vec::new();
+    let mut mains = Vec::new();
+    for n in Graph::demo_patch().nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+        let (v, m) = ClapVoice::new(sample_rate)?;
+        voices.push((n.id, v));
+        mains.push(m);
+    }
+    Ok((voices, mains))
+}
+
 struct BuiltAudio {
     mains: Vec<ClapVoiceMain>,
     controllers: Vec<VoiceController>,
     voice_ids: Vec<u64>,
-    voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
-    voice_retire_rx: rtrb::Consumer<ClapVoice>,
+    voice_tx: rtrb::Producer<VoiceMsg>,
+    voice_retire_rx: rtrb::Consumer<VoiceBack>,
     stream: cpal::Stream,
     bus: CommandBus,
     level: Arc<std::sync::atomic::AtomicU32>,
@@ -12007,16 +15267,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let sample_rate = cfg.sample_rate() as f64;
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let ch = cfg.channels() as usize;
-    // Instrument voice pool: the demo's two stacks (nodes 1 and 4) plus
-    // spares for added rigs. Idle voices (unmapped) are not rendered.
-    let mut voices = Vec::with_capacity(VOICE_POOL);
-    let mut mains = Vec::with_capacity(VOICE_POOL);
-    for i in 0..VOICE_POOL {
-        let (v, m) = ClapVoice::new(sample_rate)?;
-        let node = match i { 0 => 1, 1 => 4, _ => u32::MAX };
-        voices.push((node, v));
-        mains.push(m);
-    }
+    let (voices, mains) = startup_voices(sample_rate)?;
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
     let voice_ids: Vec<u64> = voices.iter().map(|(_, v)| v.voice_id()).collect();
@@ -12026,13 +15277,14 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // realtime below; at normal priority even 512 frames underran.
     config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={VOICE_POOL}",
+        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={}",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
         ch,
         crate::bridge::BUFFER_FRAMES,
-        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0
+        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0,
+        voices.len()
     );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(
@@ -12070,8 +15322,8 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
-    let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
-    let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
+    let (voice_tx, voice_rx) = rtrb::RingBuffer::<VoiceMsg>::new(VOICE_RING);
+    let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<VoiceBack>::new(VOICE_RING);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
     // Audio In (issue #28): the UI opens input captures off the audio thread
     // and hands each ring consumer to the engine through this side channel.
@@ -12138,6 +15390,10 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
 /// focused Hyprland monitor's scale (what every native app on this output
 /// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
 /// Computed once — the hyprctl query never runs on the frame path again.
+/// Width a recessed text field's frame adds around its text: 8px inner
+/// margin and a 1px stroke on each side.
+const RECESSED_INPUT_CHROME: f32 = 18.0;
+
 fn ui_scale_target() -> f32 {
     static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *SCALE.get_or_init(|| {
@@ -12160,6 +15416,114 @@ fn ui_scale_target() -> f32 {
         }
         1.6
     })
+}
+
+impl DemoApp {
+    fn replay_agent_rack_animations(&mut self) {
+        let now = self.ui_time;
+        let rm = self.reduce_motion;
+        if let Some(synth_ui) = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)) {
+            let synth_node = self.units[synth_ui].node_id;
+            if let Some(k) = self.units[synth_ui].knobs.iter_mut().find(|k| !k.hidden && k.param.is_some()) {
+                let target = if k.display_value < 0.65 { 0.85 } else { 0.25 };
+                k.glide_to(target, rm);
+            }
+            self.agent_activity.trigger_node_pulse(synth_node, now);
+        }
+        if let Some(k) = self.keys_unit.and_then(|ui| self.units.get(ui)).map(|u| u.node_id) {
+            self.agent_activity.trigger_node_pulse(k, now);
+        }
+        if let Some(c) = self.cables.iter_mut().find(|c| c.dying < 0.0) {
+            c.draw_in = if rm { 1.0 } else { 0.0 };
+            self.agent_activity.touch_edge(c.id, now);
+        }
+    }
+
+    /// Stage `--demo-agent` offline for visual screenshots: finished run,
+    /// live running run with animated phase, attached image chip, Confirm /
+    /// Cancel prompt, and optional mid-flight rack animations.
+    fn stage_demo_agent(&mut self, animate_rack: bool) {
+        self.assistant.key_set = true;
+        self.dock = DockView::Assistant;
+        self.demo_agent_hold = true;
+        self.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        self.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+
+        self.assistant.history.clear();
+        self.transcript_runs.clear();
+        self.active_run_user_idx = None;
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split at C4 and level Rig A.".into(),
+        });
+        self.transcript_runs.insert(
+            0,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: self.human_tool_label("set_split", &serde_json::json!({"point": 60})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 0})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("set_bpm", &serde_json::json!({"bpm": 112})), state: ToolChipState::Done },
+                ],
+                read_count: 2,
+                expanded: false,
+                cost_line: Some("2 steps · 1.1 s · deepseek-chat · 2 reads".into()),
+            },
+        );
+        self.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split **Keys** at C4 and set **Rig A** to 0.85.".into(),
+        });
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Brighten Surge A and remove Rig B.".into(),
+        });
+        self.transcript_runs.insert(
+            2,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: self.human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
+                ],
+                read_count: 1,
+                expanded: true,
+                cost_line: None,
+            },
+        );
+        self.assistant.busy = true;
+        self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
+            step: 2,
+            model: "deepseek-chat".into(),
+            seeing: false,
+        });
+        let mut sketch = vec![28u8; 24 * 16 * 4];
+        for y in 0..16usize {
+            for x in 0..24usize {
+                let i = (y * 24 + x) * 4;
+                sketch[i + 3] = 255;
+                if (y == 4 && (3..=19).contains(&x)) || (y == 11 && (3..=12).contains(&x)) {
+                    sketch[i] = theme::CREAM.r();
+                    sketch[i + 1] = theme::CREAM.g();
+                    sketch[i + 2] = theme::CREAM.b();
+                } else if (6..=9).contains(&y) && (15..=20).contains(&x) {
+                    sketch[i] = theme::ACCENT.r();
+                    sketch[i + 1] = theme::ACCENT.g();
+                    sketch[i + 2] = theme::ACCENT.b();
+                }
+            }
+        }
+        self.chat_image = Image::from_rgba("rack-sketch.png", [24, 16], &sketch).ok();
+        self.chat_thumb = None;
+        self.pending_confirm = Some(PendingConfirm {
+            tool: "delete_rig".into(),
+            args: serde_json::json!({"rig": 1}),
+            label: "Delete rig 2 · Rig B".into(),
+        });
+        if animate_rack {
+            self.replay_agent_rack_animations();
+        }
+    }
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
@@ -12347,20 +15711,10 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     if std::env::args().any(|a| a == "--metro") {
                         app.add_metronome_to_active_rig();
                     }
-                    if std::env::args().any(|a| a == "--demo-agent") {
-                        app.assistant.key_set = true;
-                        app.dock = DockView::Assistant;
-                        app.demo_agent_hold = true;
-                        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
-                        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
-                        app.assistant.history.push(ChatLine {
-                            role: "user".into(),
-                            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
-                        });
-                        app.assistant.history.push(ChatLine {
-                            role: "assistant".into(),
-                            text: "Split **Keys** at C4 and set **Rig A** volume to 0.85.".into(),
-                        });
+                    let demo_agent = std::env::args().any(|a| a == "--demo-agent");
+                    let demo_anim = std::env::args().any(|a| a == "--demo-agent-anim");
+                    if demo_agent || demo_anim {
+                        app.stage_demo_agent(demo_anim);
                     }
                     app
                 }
@@ -13281,6 +16635,8 @@ mod rig_switch_tests {
         let (mut app, ctx) = two_rigs();
         app.assistant.key_set = true; // chat layout (history + input row)
         app.dock = DockView::Assistant;
+        // The activity header shows the last request's cost line too.
+        app.assistant.turn.steps.push(crate::assistant::StepStat { ms: 1200, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 });
         // A short window clamps the panel to its 150px minimum — the case
         // where a fixed input-row reserve overflowed the panel's top edge.
         for _ in 0..4 {
@@ -13519,15 +16875,18 @@ mod rig_switch_tests {
     fn pin_a_surge_parameter_as_a_face_knob() {
         let mut app = DemoApp::new_with_sink(None);
         let p = crate::host::ParamDesc { id: 42, name: "Filter 1 Cutoff".into(), module: "A/Filter".into(),
-            min: -60.0, max: 70.0, value: 5.0, default: 3.0, automatable: true, hidden: false, readonly: false };
+            min: -60.0, max: 70.0, value: 5.0, default: 3.0, automatable: true, stepped: false, hidden: false, readonly: false };
         let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
         let before = app.units[surge].knobs.len();
         let msg = app.toggle_pin(0, &p);
         assert!(msg.starts_with("pinned"), "{msg}");
-        let k = app.units[surge].knobs.last().unwrap();
-        assert_eq!(k.label, "FILTER 1 ");
+        let k = &app.units[surge].knobs[0];
+        assert_eq!(k.label, "1 CUTOFF", "a readable label, left of the unit's own knobs");
+        assert_eq!(app.units[surge].knobs.last().unwrap().label, "LEVEL");
         assert!((k.value - 0.5).abs() < 1e-6, "65/130 of the range: {}", k.value);
         assert_eq!(app.units[surge].knobs.len(), before + 1);
+        assert_eq!(app.resolve_unit_knob(app.units[surge].node_id, "filter 1 cutoff").ok(),
+            Some((42, crate::matrix::CcTarget::PluginParam)), "the full name resolves like the label");
         app.publish_pins(); // no controllers headless: must not panic
         assert!(app.toggle_pin(0, &p).starts_with("unpinned"));
         assert_eq!(app.units[surge].knobs.len(), before);
@@ -13575,14 +16934,151 @@ mod rig_switch_tests {
         assert_eq!(live(&app, 1), 3, "Keys→Surge MIDI + Surge→Master L/R");
         let a_cables = live(&app, 0);
         assert!(a_cables > 0);
-        // Pool of 4 voices: rig C takes the last one, rig D is a skeleton.
-        app.edit_rigs(None);
-        assert_eq!(app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count(), 4);
-        app.edit_rigs(None);
-        assert_eq!(app.rig_count(), 4);
-        assert!(app.units.iter().filter(|u| u.rig == 3).all(|u| !matches!(u.node_kind, UnitKind::Clap)), "no free voice → no voiceless synth");
+        // Every added rig gets its synth (the old four-voice pool left
+        // rig D a bare Keys + Master).
+        while app.rig_count() < DemoApp::MAX_RIGS { app.edit_rigs(None); }
+        for r in 1..DemoApp::MAX_RIGS as u8 {
+            assert_eq!(app.units.iter().filter(|u| u.rig == r && matches!(u.node_kind, UnitKind::Clap)).count(), 1, "rig {r} has a synth");
+            assert_eq!(live(&app, r), 3, "rig {r} is wired");
+        }
         assert_eq!(live(&app, 0), a_cables, "earlier rigs keep every cable");
         frame(&mut app, &ctx, vec![]);
+    }
+
+    /// One frame; returns every painted text with its screen rect.
+    fn frame_texts(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for x in v { walk(x, acc) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for cs in &out.shapes { walk(&cs.shape, &mut texts); }
+        texts
+    }
+
+    fn click_text(app: &mut DemoApp, ctx: &egui::Context, label: &str) {
+        let texts = frame_texts(app, ctx, vec![]);
+        let pos = texts.iter().find(|(t, _)| t == label)
+            .unwrap_or_else(|| panic!("'{label}' not on screen: {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()))
+            .1.center();
+        for ev in click(pos) { frame(app, ctx, ev); }
+    }
+
+    /// #32: a destructive assistant action waits for the chat's Confirm /
+    /// Cancel buttons; the click runs or cancels it and tells the model.
+    #[test]
+    fn assistant_destructive_action_waits_for_confirm_or_cancel_buttons() {
+        let (mut app, ctx) = two_rigs();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        // The model asks to delete rig 2 without confirm: refused, parked.
+        let out = app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 1}));
+        assert!(out.contains("Confirm / Cancel buttons"), "{out}");
+        assert_eq!(app.rig_count(), 2, "nothing deleted yet");
+        // Cancel: nothing happens; the model hears it.
+        click_text(&mut app, &ctx, "Cancel");
+        assert!(app.pending_confirm.is_none());
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("Cancel · Delete rig 2 · Rig B"));
+        // Ask again → Confirm deletes the rig.
+        app.assistant.busy = false;
+        app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 1}));
+        click_text(&mut app, &ctx, "Confirm · Delete rig 2 · Rig B");
+        assert_eq!(app.rig_count(), 1, "Confirm ran delete_rig with confirm=true");
+        assert!(app.pending_confirm.is_none());
+        // Buttons hide while the model is busy, and a typed answer replaces them.
+        app.assistant.busy = false;
+        app.run_assistant_tool("install_instrument", &serde_json::json!({"id": "setbfree"}));
+        app.assistant.busy = true;
+        assert!(!frame_texts(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Confirm · Install setbfree"), "hidden while busy");
+        app.assistant.busy = false;
+        assert!(frame_texts(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Confirm · Install setbfree"), "shown when idle");
+        app.assistant.busy = false;
+        app.submit_chat("no thanks".into());
+        assert!(app.pending_confirm.is_none(), "typing answers instead of clicking");
+        // Confirmed calls and other tools never park a prompt.
+        app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 5, "confirm": true}));
+        app.run_assistant_tool("list_rigs", &serde_json::json!({}));
+        assert!(app.pending_confirm.is_none());
+    }
+
+    /// Live crash: with more CLAP units than the old four-voice pool, an
+    /// undo restored sources for voice slot 4 and `rig_sources[4]` (len 4)
+    /// panicked; unknown nodes fell back to slot 0. Per-voice state now has
+    /// a slot for every CLAP unit, and it stays with its unit.
+    #[test]
+    fn any_number_of_clap_units_have_their_own_voice_state() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::demo_patch();
+        let surge = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+        let extra: Vec<u32> = (0..10).map(|i| g.add_node(surge(), name_bytes(&format!("EXTRA {i}")))).collect();
+        app.build_rack(&g, &[]);
+        let slots = app.clap_rigs();
+        assert_eq!(slots.len(), 12);
+        assert_eq!((app.rig_sources.len(), app.rig_device.len(), app.patch_names.len()), (12, 12, 12));
+        for &(slot, node) in &slots {
+            assert_eq!(app.voice_slot_of_node(node), Some(slot));
+        }
+        assert_eq!(app.voice_slot_of_node(3), None, "Master is no voice (was slot 0)");
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": 3, "keyboard": false}));
+        assert!(out.contains("not a CLAP instrument"), "{out}");
+        assert!(app.rig_sources.iter().all(|s| *s == (true, true)), "no voice slot changed");
+
+        let (last, mid) = (extra[9], extra[4]);
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": false}));
+        assert!(!out.contains("not a"), "{out}");
+        let out = app.exec_tool("set_rig_device", &serde_json::json!({"node": last, "device": 0}));
+        assert!(!out.contains("not a"), "{out}");
+        let slot_of = |app: &DemoApp, node: u32| app.voice_slot_of_node(node).unwrap();
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false);
+        assert_eq!(app.rig_device[slot_of(&app, last)], Some(0));
+        let name_slot = slot_of(&app, last);
+        app.patch_names[name_slot] = Some("Wurli".into());
+
+        // Undo of a later job restores the twelfth unit's switches.
+        app.undo_job = None;
+        app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": true}));
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, true);
+        app.exec_tool("undo", &serde_json::json!({}));
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false, "undo restored slot 11");
+
+        // A unit in the middle goes: the state after it follows its unit.
+        let mut fewer = g.clone();
+        fewer.remove_node(mid);
+        app.build_rack(&fewer, &[]);
+        assert_eq!(app.rig_sources.len(), 11);
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false);
+        assert_eq!(app.rig_device[slot_of(&app, last)], Some(0));
+        assert_eq!(app.patch_names[slot_of(&app, last)].as_deref(), Some("Wurli"));
+        assert_eq!(app.rig_sources[slot_of(&app, extra[5])], (true, true));
+        for n in extra { app.send_rig_source(n); }
+    }
+
+    /// Live report "the agent throws errors when searching for patches":
+    /// `list_sounds` used the rig in view as a voice slot, so with two synths
+    /// in rig A the second rig searched the third slot's library (Dexed for a
+    /// Surge rig) and the following load failed. Sound tools resolve the
+    /// rig's own unit, and its slot comes from the unit.
+    #[test]
+    fn sound_tools_resolve_the_rigs_own_instrument_not_slot_by_rig_number() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.edit_rigs(None); // demo rack (Surge A + Surge B) becomes rig A; rig B gets a Surge
+        let units = app.instrument_units();
+        let rig1: Vec<_> = units.iter().filter(|u| u.rig == 1).collect();
+        assert!(!rig1.is_empty(), "rig B has an instrument: {:?}", units.iter().map(|u| (u.rig, u.slot)).collect::<Vec<_>>());
+        let picked = app.sound_instrument(Some(1), None).expect("rig B's instrument");
+        assert_eq!(picked.rig, 1);
+        assert_eq!(picked.node, rig1[0].node, "the unit in rig B, whatever its slot");
+        assert_eq!(picked.slot, Some(2), "rig A holds two synths, so rig B's synth is slot 2, not 1");
     }
 
     #[test]
@@ -13627,6 +17123,27 @@ mod rig_switch_tests {
     fn descs_has_mixer(app: &DemoApp) -> bool {
         app.help_cols.iter().flat_map(|c| c.rows.iter())
             .any(|r| r.keys.iter().any(|g| g.text() == "F10") && r.desc.text().contains("mixer"))
+    }
+
+    /// #22: attached agents can start and stop backing tracks.
+    #[test]
+    fn play_file_and_stop_file_are_served_over_the_bridge() {
+        let (mut app, _ctx) = two_rigs();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus))); // the inbox is served only with an engine
+        let ask = |app: &mut DemoApp, tool: &str, args: serde_json::Value| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::bridge::UI_INBOX.lock().unwrap().push((tool.into(), args, tx));
+            app.serve_ui_inbox();
+            rx.recv().unwrap()
+        };
+        let missing = ask(&mut app, "play_file", serde_json::json!({"path": "/nonexistent/take.wav"}));
+        assert!(missing.contains("no file"), "{missing}");
+        let stopped = ask(&mut app, "stop_file", serde_json::json!({}));
+        assert_eq!(stopped, "file player stopped");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayer { gain } if *gain == 0.0)), "{cmds:?}");
     }
 
     #[test]
@@ -13677,6 +17194,98 @@ mod rig_switch_tests {
         // A later load without names does not inherit stale ones.
         fresh1.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
         assert_eq!(fresh1.rig_name(0), "Rig A");
+    }
+
+    #[test]
+    fn rig_preset_saves_from_slot_a_and_loads_into_other_slots_intact() {
+        let (mut app, ctx) = two_rigs();
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 0, "name": "Lead Stack"}));
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 1, "name": "Pad"}));
+
+        let slot0_surge = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot0_master = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        let slot0_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 0 && app.units[c.dst].rig == 0)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+        assert!(!slot0_cables.is_empty());
+
+        for u in &mut app.units {
+            if u.node_id == slot0_master {
+                if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(crate::engine::P_VOL)) {
+                    k.value = 0.42;
+                }
+            }
+        }
+        app.rig_mix[0] = crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true };
+        app.rig_mix[1] = crate::engine::RigMix { vol: 0.85, pan: 0.3, mute: false, solo: false };
+        app.rig_sources[0] = (false, true);
+        app.patch_names[0] = Some("Wurli".into());
+        app.rule_edits.insert(
+            (crate::matrix::SourceId::Keys, slot0_surge),
+            RuleEdit { transpose: -5, key_lo: 36, ..RuleEdit::default() },
+        );
+
+        let saved = app.exec_tool("save_rig", &serde_json::json!({"name": "Lead Preset", "rig": 0}));
+        assert!(saved.contains("Lead Preset"), "{saved}");
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("list_rig_presets", &serde_json::json!({}))).unwrap();
+        assert_eq!(listed["presets"], serde_json::json!(["Lead Preset"]));
+
+        let loaded_new = app.exec_tool("load_rig", &serde_json::json!({"name": "Lead Preset"}));
+        assert!(loaded_new.contains("rig 2"), "{loaded_new}");
+        assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.active_rig, 2);
+        assert_eq!(app.rig_name(2), "Lead Stack");
+        assert_eq!(app.rig_mix[2], crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true });
+        assert_eq!(app.rig_mix[1], crate::engine::RigMix { vol: 0.85, pan: 0.3, mute: false, solo: false }, "other rigs keep mix");
+
+        let slot2_surge = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot2_master = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        assert_ne!(slot2_surge, slot0_surge, "loaded into a different slot with remapped ids");
+        let slot2_vol = app.units.iter().find(|u| u.node_id == slot2_master).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_VOL)).unwrap().value;
+        assert!((slot2_vol - 0.42).abs() < 1e-5, "non-default knob preserved: {slot2_vol}");
+        let slot2_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 2 && app.units[c.dst].rig == 2)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+        assert_eq!(slot2_cables, slot0_cables);
+        let slot2_rule = app.rule_edits.get(&(crate::matrix::SourceId::Keys, slot2_surge))
+            .expect("matrix route remapped to slot 2's Clap node");
+        assert_eq!((slot2_rule.transpose, slot2_rule.key_lo), (-5, 36));
+        let slot2_voice = app.clap_rigs().into_iter().find(|(_, nid)| *nid == slot2_surge).unwrap().0;
+        assert_eq!(app.rig_sources[slot2_voice], (false, true));
+        assert_eq!(app.patch_names[slot2_voice].as_deref(), Some("Wurli"));
+
+        let replaced = app.exec_tool("load_rig", &serde_json::json!({"name": "Lead Preset", "rig": 1}));
+        assert!(replaced.contains("rig 1"), "{replaced}");
+        assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.rig_name(1), "Lead Stack");
+        assert_eq!(app.rig_mix[1], crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true });
+        let slot1_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot1_master = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        let slot1_vol = app.units.iter().find(|u| u.node_id == slot1_master).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_VOL)).unwrap().value;
+        assert!((slot1_vol - 0.42).abs() < 1e-5);
+        assert_eq!(app.rule_edits.get(&(crate::matrix::SourceId::Keys, slot1_surge)).unwrap().transpose, -5);
+
+        let tools = crate::assistant::tools();
+        let tool_names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        for name in ["save_rig", "load_rig", "list_rig_presets"] {
+            assert!(tool_names.contains(&name), "assistant::tools missing {name}");
+            assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
+        }
+        app.save_rig_dialog = Some((0, "Modal Rig".into()));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(app.save_rig_dialog.is_none(), "Esc closes save modal");
+        app.load_rig_dialog = Some(None);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(app.load_rig_dialog.is_none(), "Esc closes load modal");
+        let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
     }
 
     #[test]
@@ -14741,7 +18350,7 @@ mod split_bpm_tests {
         assert!(!app.lv2_editor_controls.is_empty(), "Vitalium controls should populate");
         assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
         frame(&mut app, &ctx, vec![]);
-        assert!(!app.dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
+        assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
     }
 
     #[test]
@@ -14917,12 +18526,12 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Rack"), "Rack is an explicit view: {texts:?}");
         let (v, d) = (app.view_group_rect, app.dock_group_rect);
         assert!(v.is_positive() && d.is_positive() && v.right() < d.left(), "two separate groups: {v:?} {d:?}");
-        // Views are exclusive: Mixer, Mixer again (stays), then Rack.
-        let mixer = v.right_center() - Vec2::new(12.0, 0.0);
-        click(&mut app, &ctx, mixer);
-        assert_eq!(app.stage_view, StageView::Mixer);
-        click(&mut app, &ctx, mixer);
-        assert_eq!(app.stage_view, StageView::Mixer, "the active view stays selected");
+        // Views are exclusive: Settings (rightmost), Settings again (stays), then Rack.
+        let settings = v.right_center() - Vec2::new(12.0, 0.0);
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.stage_view, StageView::Settings);
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.stage_view, StageView::Settings, "the active view stays selected");
         let rack = app.view_group_rect.left_center() + Vec2::new(12.0, 0.0);
         click(&mut app, &ctx, rack);
         assert_eq!(app.stage_view, StageView::Rack, "Rack button returns to the rack");
@@ -14940,9 +18549,9 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         drain.drain(|_| {}); // clear initial SetParam/Connect burst
 
-        // Surge A is unit 1, LEVEL knob is index 1 (param = Some(P_LEVEL)).
+        // Surge A is unit 1; its LEVEL knob has param = Some(P_LEVEL).
         let surge_unit = 1usize;
-        let level_idx = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
 
         // 1. Right-click enters learning state and paints "LEARN".
@@ -14950,9 +18559,17 @@ mod split_bpm_tests {
         assert!(app.cc_learn.is_some(), "right-click armed knob MIDI learn");
         assert!(texts.iter().any(|t| t == "LEARN"), "LEARN badge painted: {texts:?}");
 
-        // 2. Right-click again cancels learning.
-        let texts = rclick(&mut app, &ctx, level_pos);
-        assert!(app.cc_learn.is_none(), "second right-click cancels learn");
+        // 2. Right-click again opens the menu (learn still armed); its first
+        // button cancels learning (#20).
+        rclick(&mut app, &ctx, level_pos);
+        assert!(app.cc_learn.is_some() && app.knob_menu.is_some(), "second right-click opens the menu");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "Cancel MIDI learn"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Reset to default"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Clear MIDI map"), "nothing bound yet: {texts:?}");
+        click(&mut app, &ctx, knob_menu_buttons(&ctx)[0].center());
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none() && app.knob_menu.is_none(), "Cancel MIDI learn disarms");
         assert!(!texts.iter().any(|t| t == "LEARN"));
 
         // 3. Esc cancels learning on the rack.
@@ -15006,6 +18623,59 @@ mod split_bpm_tests {
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
     }
 
+    /// Buttons of the knob context menu, top to bottom (previous pass).
+    /// Buttons = click + focusable, no drag; the Area move widget is not focusable.
+    fn knob_menu_buttons(ctx: &egui::Context) -> Vec<Rect> {
+        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        ctx.viewport(|v| {
+            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
+                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
+                .map(|w| w.rect)
+                .collect();
+            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            btns
+        })
+    }
+
+    /// #20: an unbound knob can be reset from the menu — right-click arms
+    /// learn, right-click again opens Reset / Cancel learn.
+    #[test]
+    fn rack_knob_unbound_reset_from_the_learn_menu() {
+        let (mut app, ctx) = demo();
+        frame(&mut app, &ctx, vec![]);
+        let surge_unit = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
+        let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
+        app.units[surge_unit].knobs[level_idx].value = 0.1;
+        rclick(&mut app, &ctx, level_pos);
+        rclick(&mut app, &ctx, level_pos);
+        frame(&mut app, &ctx, vec![]);
+        let btns = knob_menu_buttons(&ctx);
+        assert_eq!(btns.len(), 2, "Cancel MIDI learn + Reset to default");
+        click(&mut app, &ctx, btns[1].center());
+        let k = &app.units[surge_unit].knobs[level_idx];
+        assert!((k.value - k.default).abs() < 1e-6, "Reset to default");
+        assert!(app.cc_learn.is_none(), "reset also ends the learn the right-click armed");
+        assert!(app.knob_menu.is_none());
+    }
+
+    /// #24: the menu names its knob by node + param, so a unit reorder under
+    /// an open menu still resolves the same knob.
+    #[test]
+    fn knob_menu_follows_its_knob_by_id_not_index() {
+        let (mut app, ctx) = demo();
+        frame(&mut app, &ctx, vec![]);
+        let surge_unit = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
+        let node = app.units[surge_unit].node_id;
+        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO };
+        assert_eq!(app.knob_menu_target(&menu), Some((surge_unit, level_idx)));
+        app.units.swap(0, surge_unit);
+        assert_eq!(app.knob_menu_target(&menu), Some((0, level_idx)), "follows the unit to its new index");
+        app.units.retain(|u| u.node_id != node);
+        assert_eq!(app.knob_menu_target(&menu), None, "a removed knob closes the menu");
+    }
+
     #[test]
     fn rack_knob_bound_menu_relearn_and_clear() {
         let (mut app, ctx) = demo();
@@ -15014,7 +18684,7 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
 
         let surge_unit = 1usize;
-        let level_idx = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
 
         // Bind CC 74 on Hardware(2).
@@ -15031,17 +18701,7 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Clear MIDI map"), "menu shows clear: {texts:?}");
 
         // Find and click "MIDI learn again" widget rect from the foreground layer.
-        // Buttons = click + focusable, no drag. Selectable labels drag; the Area
-        // move widget is click-only (not focusable).
-        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
-        let menu_buttons = || ctx.viewport(|v| {
-            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
-                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
-                .map(|w| w.rect)
-                .collect();
-            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
-            btns
-        });
+        let menu_buttons = || knob_menu_buttons(&ctx);
         let relearn_rect = menu_buttons()[0];
         click(&mut app, &ctx, relearn_rect.center());
         assert!(app.knob_menu.is_none());
@@ -15493,6 +19153,537 @@ mod ui_polish_agent_tests {
         }
     }
 
+    const WINDOW: Vec2 = Vec2 { x: 1600.0, y: 1000.0 };
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall { name: name.into(), args }
+    }
+
+    /// An app whose assistant worker is the test, on a real (voiceless)
+    /// engine: each frame renders one engine block.
+    struct Live {
+        app: DemoApp,
+        ctx: egui::Context,
+        engine: GraphEngine,
+        worker_tx: std::sync::mpsc::Sender<crate::assistant::FromWorker>,
+        worker_rx: std::sync::mpsc::Receiver<crate::assistant::ToWorker>,
+    }
+
+    impl Live {
+        fn new() -> Self {
+            let mut app = DemoApp::new_with_sink(None);
+            let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+            app.assistant = assistant;
+            let (bus, drain) = command_bus();
+            let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+            let published = Arc::new(Mutex::new(crate::engine::GraphPub { graph: app.base_graph.clone(), ..Default::default() }));
+            engine.set_graph_pub(published.clone());
+            engine.set_rig_snapshot(app.rig_snapshot.clone());
+            app.graph_pub = Some(published);
+            app.bus = Some(Arc::new(Mutex::new(bus)));
+            let mut live = Self { app, ctx: egui::Context::default(), engine, worker_tx, worker_rx };
+            for _ in 0..3 { live.frame(); }
+            live
+        }
+
+        fn frame(&mut self) {
+            run_frame(&mut self.app, &self.ctx, WINDOW, vec![]);
+            let mut buf = vec![0.0f32; 64 * 2];
+            self.engine.render(&mut buf, 2);
+        }
+
+        /// Send one model step's calls and run frames until the app answers.
+        fn run_batch(&mut self, calls: Vec<ToolCall>) -> Vec<String> {
+            self.worker_tx.send(crate::assistant::FromWorker::ToolCalls(calls)).unwrap();
+            for _ in 0..400 {
+                self.frame();
+                match self.worker_rx.try_recv() {
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results.into_iter().map(|r| r.text).collect(),
+                    Ok(_) => panic!("the app sent something other than tool results"),
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            }
+            panic!("the app never answered the batch");
+        }
+    }
+
+    /// One frame at `size`. Returns the screenshot requests the frame sent:
+    /// the windowing integration completes them after it painted.
+    fn frame_asking(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<egui::ScreenshotCallback> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        out.viewport_output.values().flat_map(|v| &v.commands)
+            .filter_map(|c| match c { egui::ViewportCommand::Screenshot(wanted) => Some(wanted.clone()), _ => None })
+            .collect()
+    }
+
+    #[test]
+    fn look_at_rack_holds_its_batch_until_the_frame_arrives_and_answers_with_the_picture() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        let ctx = egui::Context::default();
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("look_at_rack", serde_json::json!({})),
+            call("set_bpm", serde_json::json!({"bpm": 100})),
+        ])).unwrap();
+        // A frame that arrived after an earlier look gave up.
+        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("late", [4, 2], &[9; 32]));
+        let mut wanted = frame_asking(&mut app, &ctx, WINDOW);
+        assert_eq!(wanted.len(), 1, "the frame that runs the call asks for a screenshot");
+        for _ in 0..3 {
+            assert!(frame_asking(&mut app, &ctx, WINDOW).is_empty(), "one request per look");
+        }
+        assert!(worker_rx.try_recv().is_err(), "no answer before the frame arrived: frames keep running meanwhile");
+        assert_ne!(app.bpm, 100.0, "the call after it waits its turn");
+
+        wanted.remove(0).complete(Arc::new(egui::ColorImage::filled([2000, 1250], Color32::from_rgb(20, 22, 24))));
+        let results = (0..500).find_map(|_| {
+            frame_asking(&mut app, &ctx, WINDOW);
+            match worker_rx.try_recv() {
+                Ok(crate::assistant::ToWorker::ToolResults(results)) => Some(results),
+                _ => { std::thread::sleep(std::time::Duration::from_millis(4)); None }
+            }
+        }).expect("the batch is answered once the frame is encoded");
+        let shot = results[0].image.as_ref().expect("the first result carries the picture");
+        assert_eq!(shot.size, Some([1400, 875]), "scaled down for the model");
+        assert!(shot.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert_eq!(results[0].text, "screenshot of the kabelsalat window: kabelsalat window (1400×875 px)");
+        assert!(results[1].text.contains("100 BPM") && results[1].image.is_none());
+        assert_eq!(app.bpm, 100.0);
+    }
+
+    #[test]
+    fn look_at_rack_says_so_when_no_frame_arrives() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        app.tool_batch = Some(ToolBatch {
+            todo: VecDeque::new(),
+            results: Vec::new(),
+            waiting: Some((Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }, None)),
+            user_idx: 0,
+        });
+        app.poll_assistant();
+        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
+        assert!(results[0].text.starts_with("error: no screenshot within 2 s") && results[0].image.is_none(), "{:?}", results[0].text);
+    }
+
+    #[test]
+    fn a_bridge_caller_gets_the_screenshot_as_base64_png_or_an_error_past_its_wait() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.rack_shot.remote.push((tx.clone(), std::time::Instant::now() + RACK_SHOT_WAIT));
+        app.serve_rack_shots();
+        assert!(rx.try_recv().is_err(), "nothing to send yet");
+        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("kabelsalat window", [4, 2], &[9; 32]));
+        app.serve_rack_shots();
+        let reply: serde_json::Value = serde_json::from_str(&rx.try_recv().expect("answered with the frame")).unwrap();
+        assert_eq!(reply["text"], "screenshot of the kabelsalat window: kabelsalat window (4×2 px)");
+        assert!(reply["png_base64"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG file in base64");
+        assert!(app.rack_shot.remote.is_empty());
+
+        app.rack_shot.remote.push((tx, std::time::Instant::now()));
+        app.serve_rack_shots();
+        assert!(rx.try_recv().unwrap().starts_with("error: no screenshot"));
+    }
+
+    #[test]
+    fn look_at_rack_is_a_tool_of_the_assistant_the_app_and_the_bridge() {
+        let tools = crate::assistant::tools();
+        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == LOOK_TOOL));
+        assert!(UI_BRIDGE_TOOLS.contains(&LOOK_TOOL));
+        assert!(include_str!("mcp.rs").contains("ui_bridge_tool(\"look_at_rack\""));
+        let mut app = DemoApp::new_with_sink(None);
+        assert_eq!(app.exec_tool(LOOK_TOOL, &serde_json::json!({})), "screenshot of the kabelsalat window");
+        assert!(app.rack_shot.wanted && app.undo_past.is_empty(), "looking asks for a frame and changes nothing");
+    }
+
+    #[derive(Debug)]
+    struct Dropped(std::path::PathBuf, Vec<u8>);
+
+    impl egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path { &self.0 }
+        fn bytes(&self) -> Result<Vec<u8>, String> { Ok(self.1.clone()) }
+    }
+
+    fn drop_file(app: &mut DemoApp, ctx: &egui::Context, name: &str, bytes: Vec<u8>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, WINDOW));
+        raw.dropped_files = vec![Arc::new(Dropped(std::path::PathBuf::from("/nowhere").join(name), bytes))];
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+    }
+
+    #[test]
+    fn a_dropped_or_pasted_image_is_a_removable_chip_and_goes_out_with_the_next_message() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        let ctx = egui::Context::default();
+        let png = Image::from_rgba("x", [8, 4], &[200; 8 * 4 * 4]).unwrap();
+
+        // Pasting belongs to the open chat; a drop opens it.
+        let paste = || vec![egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([8, 4], Color32::RED)))];
+        run_frame(&mut app, &ctx, WINDOW, paste());
+        assert!(app.chat_image.is_none() && !app.assistant_open(), "a paste with the assistant closed is not for the chat");
+        drop_file(&mut app, &ctx, "notes.txt", b"hello".to_vec());
+        assert!(app.chat_image.is_none());
+        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("not attached: notes.txt is neither a PNG nor a JPEG"));
+        drop_file(&mut app, &ctx, "rack.png", png.bytes.to_vec());
+        assert!(app.assistant_open(), "dropping an image opens the assistant");
+        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("rack.png (8×4 px)"));
+
+        let texts = run_frame(&mut app, &ctx, WINDOW, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "rack.png"), "the chip names the image: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("px)")), "no debug pixel size in chip: {texts:?}");
+        let remove = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(_, r)| *r).expect("attachment remove button");
+        click_at(&mut app, &ctx, WINDOW, remove.center());
+        assert!(app.chat_image.is_none(), "clicking × removes the image");
+
+        run_frame(&mut app, &ctx, WINDOW, paste());
+        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("pasted image (8×4 px)"));
+        app.submit_chat("what is this?".into());
+        let Ok(crate::assistant::ToWorker::User(sent)) = worker_rx.try_recv() else { panic!("nothing was sent") };
+        assert!(sent.text.starts_with("[context:") && sent.text.ends_with("\nwhat is this?"), "{}", sent.text);
+        assert_eq!(sent.image.map(|i| i.size), Some(Some([8, 4])));
+        assert!(app.chat_image.is_none(), "the image leaves with its message");
+        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("what is this? [image: pasted image]"));
+    }
+
+    #[test]
+    fn the_attachment_chip_and_the_input_row_fit_the_panel_at_its_minimum_size() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let ctx = egui::Context::default();
+        let min_size = Vec2::new(760.0, 520.0);
+        for _ in 0..4 { run_frame(&mut app, &ctx, min_size, vec![]); }
+        let long_name = format!("{}.png", "a-very-long-screenshot-name".repeat(6));
+        app.chat_image = Some(Image::from_rgba(&long_name, [8, 4], &[200; 8 * 4 * 4]).unwrap());
+        // The first frame with the chip counts: nothing may jump out of the panel.
+        for frame in 0..3 {
+            let texts = run_frame(&mut app, &ctx, min_size, vec![]);
+            let panel = app.assistant_rect;
+            let chip = texts.iter().find(|(t, _)| t.contains("screenshot-name")).map(|(_, r)| *r).expect("chip painted");
+            assert!(panel.contains_rect(chip), "frame {frame}: chip {chip:?} outside the panel {panel:?}");
+            assert!(panel.contains_rect(app.assistant_input_rect), "frame {frame}: input row {:?} outside the panel {panel:?}", app.assistant_input_rect);
+            assert!(chip.bottom() <= app.assistant_input_rect.top() + 0.5, "frame {frame}: the chip sits above the input row");
+            let send = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("Send painted");
+            assert!(panel.contains_rect(send), "frame {frame}: Send {send:?} outside the panel");
+            assert!(app.unit_h >= 140.0, "the rack keeps its height");
+        }
+    }
+
+    /// Each disconnect of a step must reach the engine. The barrier used to
+    /// open on the rack's own unplug: the next disconnect then ran while the
+    /// engine's answer to the first was still on its way, the rack was
+    /// rebuilt from that answer with the second cable plugged in again, and
+    /// the per-frame patch publish re-connected it.
+    #[test]
+    fn every_disconnect_of_one_step_is_applied() {
+        let mut live = Live::new();
+        let results = live.run_batch((4..=5).chain(8..=9).map(|id| call("disconnect", serde_json::json!({"id": id}))).collect());
+        for (id, result) in [4, 5, 8, 9].iter().zip(&results) {
+            assert!(result.ends_with(&format!("[applied: removed cable {id}]")), "{result}");
+        }
+        for _ in 0..4 { live.frame(); }
+        let left: Vec<u32> = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().map(|e| e.id).filter(|id| [4, 5, 8, 9].contains(id)).collect();
+        assert!(left.is_empty(), "the engine still has cables {left:?}");
+    }
+
+    const TEST_ORGAN: &str = "urn:test:organ";
+    const TEST_OSC: &str = "urn:test:osc";
+
+    /// What the test instruments hold: a Surge of two patches, an organ of
+    /// one preset and two programmes, an oscillator without sounds.
+    fn test_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        use crate::sounds::{Instrument, Library, Load, Sound};
+        let sound = |category: &str, name: &str, load| Sound { category: category.into(), name: name.into(), preferred: true, load };
+        match instrument {
+            Instrument::Clap(_) => Library {
+                kind: "Surge patches".into(),
+                sounds: vec![sound("Basses", "Deep Bass", Load::SurgePatch("/nowhere/Deep Bass.fxp".into())), sound("Pads", "Warm Pad", Load::SurgePatch("/nowhere/Warm Pad.fxp".into()))],
+                params: vec![],
+            },
+            Instrument::Lv2(uri) if uri == TEST_ORGAN => Library {
+                kind: "LV2 presets and MIDI programmes".into(),
+                sounds: vec![sound("", "Full Organ", Load::Lv2Preset("urn:test:organ#full".into())), sound("", "Jazz 1 all", Load::MidiProgram(0)), sound("", "Jimmy Smith", Load::MidiProgram(103))],
+                params: vec![],
+            },
+            Instrument::Lv2(_) => Library { kind: "LV2 presets".into(), sounds: vec![], params: vec!["Frequency".into(), "Waveform".into()] },
+        }
+    }
+
+    fn instrument_rig(name: &str, instruments: &[(NodeKind, &str)]) -> crate::control::Rig {
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        for (i, (kind, unit)) in instruments.iter().enumerate() {
+            let node = g.add_node(kind.clone(), name_bytes(unit));
+            g.connect_with_id(1 + 2 * i as u32, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, CPortKind::Midi);
+            g.connect_with_id(2 + 2 * i as u32, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        }
+        crate::control::Rig::new(name, g, None)
+    }
+
+    /// Rig A: a Surge. Rig B: the test organ. Rig C: a Surge, the
+    /// organ and the oscillator together. Returns the bus's far end.
+    fn app_of_instruments() -> (DemoApp, crate::control::CommandDrain) {
+        let surge = || (NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE");
+        let lv2 = |uri: &str, name: &'static str| (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name);
+        let rigs = vec![
+            instrument_rig("Rig A", &[surge()]),
+            instrument_rig("Rig B", &[lv2(TEST_ORGAN, "ORGAN")]),
+            instrument_rig("Rig C", &[surge(), lv2(TEST_ORGAN, "ORGAN"), lv2(TEST_OSC, "OSC")]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(test_sounds);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        // The test plugins are not installed, so the scan cannot class them.
+        for u in app.units.iter_mut().filter(|u| u.name == "ORGAN" || u.name == "OSC") { u.lv2_inst = true; }
+        let (bus, drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        (app, drain)
+    }
+
+    fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
+        app.units.iter().find(|u| u.rig == rig && u.name == name).map(|u| u.node_id).expect("that unit")
+    }
+
+    #[test]
+    fn sounds_are_searched_in_the_library_of_the_rig_asked() {
+        let (mut app, _drain) = app_of_instruments();
+        let json = |out: String| serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|_| panic!("not a hit list: {out}"));
+        let in_view = json(app.exec_tool("list_sounds", &serde_json::json!({"query": "pad"})));
+        assert_eq!(in_view["instrument"], "Surge");
+        assert_eq!(in_view["library"], "Surge patches");
+        assert_eq!(in_view["sounds"], serde_json::json!(["Pads/Warm Pad"]));
+
+        let organ = json(app.exec_tool("list_sounds", &serde_json::json!({"query": "jazz drawbar", "rig": 1})));
+        assert_eq!(organ["instrument"], "Organ");
+        assert_eq!(organ["node"], node_named(&app, 1, "ORGAN"));
+        assert_eq!(organ["library"], "LV2 presets and MIDI programmes");
+        assert_eq!(organ["sounds"], serde_json::json!(["Jazz 1 all"]));
+        assert_eq!(organ["words_no_sound_has"], serde_json::json!(["drawbar"]));
+
+        let miss = app.exec_tool("list_sounds", &serde_json::json!({"query": "pad", "rig": 1}));
+        assert!(miss.starts_with("no LV2 presets and MIDI programmes of Organ match 'pad' (3 in its library"), "a Surge pad is not offered to the organ: {miss}");
+    }
+
+    #[test]
+    fn a_sound_is_loaded_into_the_rigs_instrument_along_its_own_path() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let organ = node_named(&app, 1, "ORGAN");
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "jimmy smith", "rig": 1}));
+        assert_eq!(out, format!("loaded 'Jimmy Smith' into Organ (node {organ}), rig 1 'Rig B'"));
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 103 }) if node == organ));
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "Full Organ", "rig": 1}));
+        assert!(out.starts_with("loaded 'Full Organ'"), "{out}");
+        assert!(matches!(drain.pop(), Some(Command::LoadLv2Preset { node, preset_uri }) if node == organ && preset_uri == "urn:test:organ#full"));
+        let done = app.agent_activity.log.iter().find(|a| a.summary.starts_with("Sound → Full")).expect("the load is on the activity log");
+        assert_eq!(done.summary, "Sound → Full Organ");
+
+        // No sound of another instrument, and nothing sent for a miss.
+        let miss = app.exec_tool("load_sound", &serde_json::json!({"query": "warm pad", "rig": 1}));
+        assert!(miss.starts_with("load_sound failed: no LV2 presets and MIDI programmes of Organ match 'warm pad'"), "{miss}");
+        // A Surge patch is read from its file (none here): nothing is sent.
+        let headless = app.exec_tool("load_sound", &serde_json::json!({"query": "warm pad", "rig": 0}));
+        assert_eq!(headless, "load_sound failed: reading patch: No such file or directory (os error 2)");
+        assert!(drain.pop().is_none());
+    }
+
+    #[test]
+    fn a_rig_of_different_instruments_asks_which_one() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let (surge, organ, osc) = (node_named(&app, 2, "SURGE"), node_named(&app, 2, "ORGAN"), node_named(&app, 2, "OSC"));
+        for tool in ["list_sounds", "load_sound"] {
+            let which = app.exec_tool(tool, &serde_json::json!({"query": "jazz", "rig": 2}));
+            assert_eq!(which, format!("{tool} failed: rig 2 'Rig C' has 3 different instruments: Surge (node {surge}), Organ (node {organ}), Osc (node {osc}). Say which one with node=<id>"));
+        }
+        assert!(drain.pop().is_none(), "nothing is loaded on a guess");
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "jazz", "node": organ}));
+        assert_eq!(out, format!("loaded 'Jazz 1 all' into Organ (node {organ}), rig 2 'Rig C'"));
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 0 }) if node == organ));
+
+        let nothing = app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "node": osc}));
+        assert_eq!(nothing, format!("Osc has no sounds to browse (it has no LV2 presets). It is shaped by its parameters (Frequency, Waveform): see list_params(node={osc})"));
+        let not_one = app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "node": 0}));
+        assert!(not_one.starts_with("list_sounds failed: node 0 is not an instrument (instruments: Surge (node "), "{not_one}");
+        assert_eq!(app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "rig": 9})), "list_sounds failed: no rig 9");
+    }
+
+    /// A library is scanned off the UI thread; the agent's call waits for
+    /// the scan instead of answering "try again".
+    #[test]
+    fn a_sound_tool_waits_for_the_library_scan() {
+        fn slow(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            test_sounds(instrument)
+        }
+        let mut live = Live::new();
+        live.app.sounds = crate::sounds::Libraries::background(slow);
+        let asked = std::time::Instant::now();
+        let results = live.run_batch(vec![call("list_sounds", serde_json::json!({"query": "pad"}))]);
+        assert!(asked.elapsed() >= std::time::Duration::from_millis(80), "the scan had not finished when the call arrived");
+        let hits: serde_json::Value = serde_json::from_str(&results[0]).unwrap_or_else(|_| panic!("not a hit list: {}", results[0]));
+        assert_eq!(hits["sounds"], serde_json::json!(["Pads/Warm Pad"]));
+        // Outside the agent's batch (the MCP bridge) a running scan is named.
+        live.app.sounds = crate::sounds::Libraries::background(slow);
+        let busy = live.app.exec_tool("list_sounds", &serde_json::json!({"query": "pad"}));
+        assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
+    }
+
+    /// The load_sound plan against the app's real answers, on a rig whose
+    /// instrument is not Surge.
+    #[test]
+    fn the_sound_shortcut_loads_from_the_library_of_the_rigs_instrument() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let organ = node_named(&app, 1, "ORGAN");
+        let mut ran = Vec::new();
+        let said = crate::assistant::run_shortcut("load_sound", "Give the organ rig a jazz drawbar preset.", 1, &[("sound", "organ")], |calls| {
+            ran.extend(calls.iter().map(|c| c.name.clone()));
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said.as_deref(), Some("Rig 2 now plays Jazz 1 all."));
+        assert_eq!(ran, ["list_sounds", "list_sounds", "load_sound"], "'jazz drawbar organ' misses (one preset is called organ), 'jazz drawbar' finds it");
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 0 }) if node == organ));
+        // Nothing in the organ's library is a pad: the chat model explains.
+        let said = crate::assistant::run_shortcut("load_sound", "Load a warm pad.", 1, &[("sound", "pad")], |calls| {
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said, None);
+        assert!(drain.pop().is_none());
+    }
+
+    /// The plans read what the app's tools answer: the graph as JSON, the
+    /// ids an engine edit names, a started node. Here they run against the
+    /// real tools and the real engine barrier.
+    #[test]
+    fn shortcut_plans_understand_what_the_apps_tools_answer() {
+        let mut live = Live::new();
+        let audio_into = |app: &DemoApp, node: u32| -> Vec<u32> {
+            let g = app.shared_graph.lock().unwrap();
+            let mut from: Vec<u32> = g.edges.iter().filter(|e| e.kind == CPortKind::Audio && e.to.node == node).map(|e| e.from.node).collect();
+            from.sort();
+            from.dedup();
+            from
+        };
+        let master = live.app.units[live.app.master_unit.unwrap()].node_id;
+        let fed_master = audio_into(&live.app, master);
+        assert_eq!(fed_master.len(), 4, "the demo wires two synths and two delays to the Master");
+
+        let said = crate::assistant::run_shortcut("add_effect", "Add a reverb to this rig", 0, &[("effect", "reverb")], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Reverb added to Rig 1, in front of Master."));
+        let reverb = live.app.shared_graph.lock().unwrap().nodes.iter().find(|n| n.kind == NodeKind::Dsp(DspKind::Reverb)).map(|n| n.id).expect("a reverb");
+        assert_eq!(audio_into(&live.app, master), vec![reverb], "only the reverb feeds the Master");
+        assert_eq!(audio_into(&live.app, reverb), fed_master, "everything that fed the Master feeds the reverb");
+
+        let said = crate::assistant::run_shortcut("metronome", "Add a metronome and start it.", 0, &[], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Metronome added to Rig 1 and running."));
+        for _ in 0..4 { live.frame(); }
+        let click = {
+            let published = live.app.graph_pub.as_ref().unwrap().lock().unwrap();
+            published.graph.nodes.iter().find(|n| n.kind == NodeKind::Dsp(DspKind::Metronome)).map(|n| (n.id, n.playing)).expect("a metronome")
+        };
+        assert!(click.1, "the metronome runs");
+        assert_eq!(audio_into(&live.app, master), vec![reverb, click.0], "the click goes straight to the Master");
+        let said = crate::assistant::run_shortcut("metronome", "Start the metronome.", 0, &[], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("The metronome is running."), "a second request adds no second metronome");
+
+        let said = crate::assistant::run_shortcut("remove_effect", "Remove the reverb.", 0, &[("effect", "reverb")], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Reverb removed from Rig 1."));
+        let mut back = fed_master.clone();
+        back.push(click.0);
+        assert_eq!(audio_into(&live.app, master), back, "the sources are back on the Master");
+    }
+
+    #[test]
+    fn a_tool_batch_runs_in_one_frame_and_is_answered_once() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("set_bpm", serde_json::json!({"bpm": 100})),
+            call("set_rig_mix", serde_json::json!({"rig": 0, "vol": 0.5})),
+            call("frobnicate", serde_json::json!({})),
+        ])).unwrap();
+        app.poll_assistant();
+        assert_eq!(app.bpm, 100.0);
+        assert_eq!(app.rig_mix[0].vol, 0.5);
+        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
+        assert_eq!(results.len(), 3, "one result per call, in call order");
+        let results: Vec<String> = results.into_iter().map(|r| r.text).collect();
+        assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
+        assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
+    }
+
+    #[test]
+    fn an_engine_edit_names_what_it_created_and_the_next_call_sees_it() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "dsp", "dsp": "reverb"})),
+            call("get_graph", serde_json::json!({})),
+        ]);
+        let id: u64 = results[0].split("new node id ").nth(1).and_then(|rest| rest.trim_end_matches(']').parse().ok())
+            .unwrap_or_else(|| panic!("add_node does not name the new node: {}", results[0]));
+        let graph: serde_json::Value = serde_json::from_str(&results[1]).unwrap();
+        let node = graph["nodes"].as_array().unwrap().iter().find(|n| n["id"] == id)
+            .unwrap_or_else(|| panic!("get_graph in the same batch misses node {id}"));
+        assert_eq!(node["kind"]["Dsp"], "Reverb");
+
+        // Two cables in one step: each connect sees the cable before it.
+        let master = live.app.units[live.app.master_unit.unwrap()].node_id;
+        let results = live.run_batch(vec![
+            call("connect", serde_json::json!({"from_node": 1, "to_node": id})),
+            call("connect", serde_json::json!({"from_node": id, "to_node": master, "to_port": 1})),
+        ]);
+        assert!(results.iter().all(|r| r.contains("new cable id")), "{results:?}");
+        let wired = |from: u32, to: u32| live.app.cables.iter().any(|c| live.app.units[c.src].node_id == from && live.app.units[c.dst].node_id == to);
+        assert!(wired(1, id as u32) && wired(id as u32, master), "both cables exist");
+    }
+
+    #[test]
+    fn the_disconnect_tool_removes_the_cable_for_good() {
+        let mut live = Live::new();
+        let id = live.app.cables[0].id;
+        let results = live.run_batch(vec![call("disconnect", serde_json::json!({"id": id}))]);
+        assert!(results[0].contains(&format!("removed cable {id}")), "{}", results[0]);
+        for _ in 0..4 { live.frame(); }
+        let engine_has = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().any(|e| e.id == id);
+        assert!(!engine_has, "the engine still routes cable {id}");
+        assert!(live.app.live_cable(id).is_none(), "the rack still shows cable {id}");
+    }
+
+    #[test]
+    fn an_engine_edit_that_changes_nothing_says_so() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![call("remove_node", serde_json::json!({"node": 900}))]);
+        assert!(results[0].contains("NOT applied"), "{}", results[0]);
+    }
+
+    #[test]
+    fn the_activity_panel_shows_what_the_last_request_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let step = |ms| crate::assistant::StepStat { ms, model: "anthropic/claude-opus-5.5".into(), attempts: 1, rejected: 0 };
+        app.assistant.turn.steps = vec![step(700), step(500)];
+        let mut texts = Vec::new();
+        for _ in 0..3 { texts = run_frame(&mut app, &ctx, WINDOW, vec![]); }
+        let (_, at) = texts.iter().find(|(t, _)| t == "2 steps · 1.2 s · claude-opus-5.5")
+            .unwrap_or_else(|| panic!("no cost line painted: {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()));
+        assert!(app.assistant_rect.contains_rect(*at), "cost line {at:?} outside the panel {:?}", app.assistant_rect);
+    }
+
     #[test]
     fn add_rig_button_aligns_with_rig_chips_and_adds_a_rig() {
         let mut app = DemoApp::new_with_sink(None);
@@ -15760,6 +19951,58 @@ mod ui_polish_agent_tests {
         assert_eq!(app.dock, DockView::Assistant, "typing does not swap the dock");
     }
 
+    /// #23: the keyboard dock follows the window height both ways (it kept
+    /// its first height) and never drops below a playable size.
+    #[test]
+    fn keyboard_dock_follows_the_window_height() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let dock_h = |app: &mut DemoApp, size: Vec2| {
+            for _ in 0..3 { run_frame(app, &ctx, size, vec![]); }
+            (app.dock_rect.height(), app.dock_kb_rect)
+        };
+        let (h_small, kb_small) = dock_h(&mut app, Vec2::new(1600.0, 800.0));
+        let (h_big, kb_big) = dock_h(&mut app, Vec2::new(1600.0, 1400.0));
+        let (h_back, _) = dock_h(&mut app, Vec2::new(1600.0, 800.0));
+        assert!(h_big > h_small + 20.0, "grows with the window: {h_small} → {h_big}");
+        assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
+        assert!(kb_big.height() > kb_small.height());
+        let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
+        assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
+        assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
+        assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
+    }
+
+    /// User report: the software keyboard must show a note as long as it is
+    /// pressed. A hardware note only blinked (0.09 s LED tail) while held.
+    #[test]
+    fn held_notes_stay_lit_on_the_dock_until_released() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let ev = |note: u8, velocity: f32, dev: u32| (NoteEvent { note, velocity, source: SourceId::Hardware(dev), created: std::time::Instant::now() }, true);
+        run_frame(&mut app, &ctx, size, vec![]);
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.8, 0));
+        app.hw_queue.lock().unwrap().push_back(ev(64, 0.8, 1));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(600) {
+            run_frame(&mut app, &ctx, size, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        assert_eq!(app.note_leds[60], 1.0, "held 0.6 s and still fully lit");
+        // Device 1 releasing 60 does not darken device 0's held 60.
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.0, 1));
+        app.hw_queue.lock().unwrap().push_back(ev(64, 0.0, 1));
+        for _ in 0..30 { run_frame(&mut app, &ctx, size, vec![]); std::thread::sleep(std::time::Duration::from_millis(16)); }
+        assert_eq!(app.note_leds[60], 1.0, "another device still holds 60");
+        assert!(app.note_leds[64] < 0.02, "64 released: dark after its short tail ({})", app.note_leds[64]);
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.0, 0));
+        for _ in 0..30 { run_frame(&mut app, &ctx, size, vec![]); std::thread::sleep(std::time::Duration::from_millis(16)); }
+        assert!(app.note_leds[60] < 0.02, "60 released by its last holder ({})", app.note_leds[60]);
+    }
+
     #[test]
     fn a_clicked_on_screen_key_is_released() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<NoteEvent>::new()));
@@ -15797,6 +20040,640 @@ mod ui_polish_agent_tests {
         assert!(notes.contains(&60), "white key C plays note 60: {notes:?}");
         assert!(notes.contains(&61), "black key C# plays note 61: {notes:?}");
     }
+
+    #[test]
+    fn bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split Keys at C4 and set Rig A volume to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Add a warm reverb after Surge A.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Added Reverb after Surge A and wired it to Master.".into(),
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for size in [Vec2::new(760.0, 520.0), Vec2::new(781.0, 950.0)] {
+            let mut texts = Vec::new();
+            for _ in 0..4 {
+                texts = run_frame(&mut app, &ctx, size, vec![]);
+            }
+            let header_bottom = texts.iter()
+                .find(|(t, _)| t == "Assistant")
+                .map(|(_, r)| r.bottom())
+                .expect("header painted");
+            let visible_turns: Vec<&(String, Rect)> = texts.iter()
+                .filter(|(t, r)| {
+                    (t == "YOU" || t == "ASSISTANT")
+                        && r.top() >= header_bottom
+                        && r.bottom() <= app.assistant_input_rect.top()
+                })
+                .collect();
+            assert!(
+                visible_turns.len() >= 3,
+                "size {size:?}: expected >= 3 unclipped transcript lines between header ({header_bottom}) and input ({:?}), got {}: {texts:?}",
+                app.assistant_input_rect,
+                visible_turns.len()
+            );
+        }
+    }
+
+    #[test]
+    fn bug2_untouched_units_paint_no_agent_badge_rect() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.demo_agent_hold = true;
+        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..60 {
+            app.update(0.04); // 2.4s: near end of fade on units not held by demo_agent_hold
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        fn walk_rects(shape: &egui::Shape, rects: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => for s in v { walk_rects(s, rects) },
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            walk_rects(&cs.shape, &mut rects);
+        }
+        for (ui_idx, u) in app.units.iter().enumerate() {
+            if matches!(u.node_kind, UnitKind::Clap | UnitKind::Dsp(_)) {
+                let r = app.unit_rects[ui_idx];
+                let badge_local = Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0));
+                let badge_screen = app.xf.rect(badge_local);
+                let stray: Vec<_> = rects.iter()
+                    .filter(|(rr, _)| (rr.center() - badge_screen.center()).length() < 2.0 && (rr.width() - badge_screen.width()).abs() < 2.0)
+                    .collect();
+                assert!(
+                    stray.is_empty(),
+                    "untouched/faded unit {} has stray badge rect {stray:?}",
+                    u.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn step2_live_status_shows_phase_and_route() {
+        use crate::assistant::{FromWorker, RunPhase};
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Split keys at C4".into() });
+        app.assistant.busy = true;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+
+        for (phase, expected) in [
+            (RunPhase::Deciding, "Jev · deciding"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
+            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+        ] {
+            app.assistant.phase = Some(phase);
+            let texts = run_frame(&mut app, &ctx, size, vec![]);
+            assert_eq!(
+                texts.iter().filter(|(t, _)| t == expected).count(),
+                1,
+                "expected exactly one phase '{expected}' in UI, got {texts:?}"
+            );
+            assert!(
+                texts.iter().all(|(t, _)| !t.contains("thinking…")),
+                "static thinking… text must be gone: {texts:?}"
+            );
+        }
+        let _ = FromWorker::Done;
+    }
+
+    #[test]
+    fn step2_action_chips_have_rule7_padding_states_collapse_and_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let user_idx = app.assistant.history.len();
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Wire up a reverb on rig 2".into() });
+        app.assistant.history.push(ChatLine { role: "assistant".into(), text: "Added Reverb on rig 2.".into() });
+        let chips = vec![
+            ToolChip {
+                label: app.human_tool_label("set_split", &serde_json::json!({"point": 60})),
+                state: ToolChipState::Done,
+            },
+            ToolChip {
+                label: app.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})),
+                state: DemoApp::classify_tool_result("added — NOT applied: engine changed nothing"),
+            },
+            ToolChip {
+                label: app.human_tool_label("set_bpm", &serde_json::json!({"bpm": 120})),
+                state: ToolChipState::Running,
+            },
+            ToolChip {
+                label: app.human_tool_label("remove_node", &serde_json::json!({"node": 99})),
+                state: ToolChipState::Failed,
+            },
+        ];
+        app.transcript_runs.insert(
+            user_idx,
+            TranscriptRun {
+                chips,
+                read_count: 0,
+                expanded: false,
+                cost_line: Some("2 steps · 1.4 s · deepseek-chat".into()),
+            },
+        );
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push(r.rect),
+                egui::Shape::Vec(v) => for s in v { collect(s, texts, rects) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            collect(&cs.shape, &mut texts, &mut rects);
+        }
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing split chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Add Reverb → Rig B") && t.contains("not applied")), "missing not-applied chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Tempo → 120 BPM")), "missing running chip: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "4th chip collapsed initially");
+        let more_rect = texts.iter().find(|(t, _)| t == "+1 more").map(|(_, r)| *r).expect("+1 more collapse chip");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.4 s · deepseek-chat"), "missing cost line: {texts:?}");
+
+        // Rule 7 padding on visible chips: enclosing filled rect extends >= 7.5px H and >= 3.5px V around text.
+        for label in ["Split keys → C4", "Tempo → 120 BPM", "+1 more"] {
+            let tr = texts.iter().find(|(t, _)| t.contains(label)).map(|(_, r)| *r).unwrap();
+            let boxed = rects.iter().any(|br| {
+                br.contains_rect(tr)
+                    && (tr.left() - br.left()) >= 7.5
+                    && (br.right() - tr.right()) >= 7.5
+                    && (tr.top() - br.top()) >= 3.5
+                    && (br.bottom() - tr.bottom()) >= 3.5
+            });
+            assert!(boxed, "chip '{label}' ({tr:?}) violates rule 7 padding against {rects:?}");
+        }
+
+        // Click "+1 more" -> expands to show Failed 4th chip.
+        click_at(&mut app, &ctx, size, more_rect.center());
+        let expanded_texts = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(expanded_texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "expanded 4th chip missing: {expanded_texts:?}");
+        assert_eq!(DemoApp::classify_tool_result("unknown tool: foo"), ToolChipState::Failed);
+        assert_eq!(DemoApp::classify_tool_result("octave set to C4"), ToolChipState::Done);
+    }
+
+    #[test]
+    fn step3_knob_glides_visually_while_logical_value_updates_immediately() {
+        let (tx, mut drain) = crate::control::command_bus();
+        let mut app = DemoApp::new_with_sink(None);
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.reduce_motion = false;
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = app.units[synth_ui].node_id;
+        let (ki, param, start) = {
+            let (ki, k) = app.units[synth_ui].knobs.iter().enumerate().find(|(_, k)| k.param.is_some()).unwrap();
+            (ki, k.param.unwrap(), k.value)
+        };
+        let target = if start < 0.5 { 0.88 } else { 0.14 };
+
+        // Direct agent/remote param edit updates logical value (sound first) and glides display_value.
+        app.units[synth_ui].knobs[ki].glide_to(target, app.reduce_motion);
+        app.publish_patch();
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node: n, param: p, value } if *n == node && *p == param && (*value as f32 - target).abs() < 1e-5)),
+            "sound command must publish target immediately (rule 31): {cmds:?}"
+        );
+        let k = &app.units[synth_ui].knobs[ki];
+        assert!((k.value - target).abs() < 1e-6);
+        assert!((k.display_value - start).abs() < 1e-6);
+        assert!(k.glide_t == 0.0);
+
+        app.update(0.10); // halfway through 200ms glide
+        let mid = app.units[synth_ui].knobs[ki].display_value;
+        assert!(
+            (mid - start).abs() > 0.05 && (mid - target).abs() > 0.01,
+            "display_value must ease between {start} and {target}: {mid}"
+        );
+
+        app.update(0.15); // past 200ms -> exact convergence
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - target).abs() < 1e-6, "converged exactly: {}", k.display_value);
+
+        // reduce_motion disables glide and snaps immediately.
+        app.reduce_motion = true;
+        app.units[synth_ui].knobs[ki].glide_to(start, app.reduce_motion);
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - start).abs() < 1e-6);
+    }
+
+    #[test]
+    fn step3_cable_draw_in_unit_pulse_and_removed_unit_fade_respect_reduce_motion() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let node = app.units[0].node_id;
+
+        // 1. Cable draw-in starts at 0, advances smoothly, converges to 1.0.
+        app.cables[0].draw_in = 0.0;
+        app.update(0.14);
+        assert!(app.cables[0].draw_in > 0.3 && app.cables[0].draw_in < 0.7, "draw_in mid: {}", app.cables[0].draw_in);
+        app.update(0.20);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+
+        // 2. Unit pulse triggers once, fades after AGENT_PULSE_SECS, does not re-trigger on touch_node hold.
+        let t0 = app.ui_time;
+        app.agent_activity.trigger_node_pulse(node, t0);
+        app.update(0.19);
+        let p_mid = app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion);
+        assert!(p_mid > 0.5, "pulse active near midpoint: {p_mid}");
+        app.agent_activity.touch_node(node, app.ui_time); // hold while active must not reset pulse
+        app.update(0.25);
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+
+        // 3. Fading units & cables decay and clear cleanly; reduce_motion snaps them clear.
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.fading_cables.push(FadingCable { curve: [Pos2::ZERO; 4], color: theme::AUDIO_CREAM, width: 3.0, alpha: 1.0, agent: true });
+        app.update(0.12);
+        assert_eq!(app.fading_units.len(), 1);
+        assert!(app.fading_units[0].alpha < 0.6 && app.fading_units[0].alpha > 0.3);
+        app.update(0.20);
+        assert!(app.fading_units.is_empty());
+        assert!(app.fading_cables.is_empty());
+
+        app.reduce_motion = true;
+        app.cables[0].draw_in = 0.0;
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.update(0.01);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+        assert!(app.fading_units.is_empty());
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+    }
+
+    #[test]
+    fn step4_animations_request_repaint_while_active_and_stop_on_converge() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 800.0);
+
+        // Settle initial cable age / load_fade and egui's first-frame UI scale / layout passes.
+        for _ in 0..30 {
+            app.update(0.05);
+        }
+        let mut t = 1.0f64;
+        let mut run_unfocused = |app: &mut DemoApp| -> std::time::Duration {
+            t += 0.1;
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.focused = false;
+            raw.time = Some(t);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+        };
+        for _ in 0..8 {
+            let _ = run_unfocused(&mut app);
+        }
+
+        // Idle + unfocused -> 30 fps throttled (>= 33ms delay), no immediate repaint.
+        assert!(!app.has_active_animations());
+        let idle_delay = run_unfocused(&mut app);
+        assert!(
+            idle_delay >= std::time::Duration::from_millis(30),
+            "idle delay: {idle_delay:?}, focused={}, causes={:?}",
+            ctx.input(|i| i.focused),
+            ctx.repaint_causes()
+        );
+
+        // Trigger a knob glide -> immediate repaint requested even while unfocused.
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let start = app.units[synth_ui].knobs[0].value;
+        app.units[synth_ui].knobs[0].glide_to(if start < 0.5 { 0.85 } else { 0.15 }, false);
+        assert!(app.has_active_animations());
+        let active_delay = run_unfocused(&mut app);
+        assert_eq!(active_delay, std::time::Duration::ZERO, "active animation must request immediate repaint");
+
+        // Advance past glide duration -> converges and drops back to throttled repaint
+        // once the prior active frame's 1-pass egui outstanding repaint drains.
+        for _ in 0..10 {
+            app.update(0.05);
+        }
+        assert!(!app.has_active_animations());
+        let _ = run_unfocused(&mut app);
+        let settled_delay = run_unfocused(&mut app);
+        assert!(settled_delay >= std::time::Duration::from_millis(30), "settled delay: {settled_delay:?}");
+    }
+
+    #[test]
+    fn step5_staged_demo_agent_shows_full_ui_and_replays_rack_animations() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        app.stage_demo_agent(false);
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        let mut texts = Vec::new();
+        for _ in 0..5 {
+            texts = run_frame(&mut app, &ctx, size, vec![]);
+        }
+
+        // Finished run: user message, action chips, assistant message, cost line.
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing finished chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Mix Rig A")), "chip must use rig display name: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "+1 more"), "missing collapsed chip button: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat · 2 reads"), "missing cost line: {texts:?}");
+        // Running run: animated status label + running chip (no static "thinking…", no duplicate live status, no read-only chips).
+        assert_eq!(texts.iter().filter(|(t, _)| t == "DeepSeek · step 2").count(), 1, "live phase label must appear once: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
+        // Attached image chip + Confirm / Cancel prompt + Replay chip.
+        assert!(texts.iter().any(|(t, _)| t == "rack-sketch.png"), "missing attached image chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "debug size text must be gone: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Replay"), "missing replay chip: {texts:?}");
+
+        // Replay rack animations via Shift+F12.
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.events.push(egui::Event::Key {
+            key: Key::F12,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        });
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        let synth = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let synth_node = synth.node_id;
+        let gliding = synth.knobs.iter().any(|k| !k.hidden && k.param.is_some() && k.glide_t < 1.0 && (k.value - k.display_value).abs() > 0.05);
+        assert!(gliding, "Shift+F12 must trigger knob glide on Surge");
+        assert!(app.cables.iter().any(|c| c.draw_in < 1.0), "Shift+F12 must trigger cable draw-in");
+        app.update(0.15);
+        assert!(app.agent_activity.node_pulse(synth_node, app.ui_time, false) > 0.0, "Shift+F12 must pulse touched synth unit");
+    }
+
+    fn collect_painted(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<(Rect, Color32, Stroke)>) {
+        match shape {
+            egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+            egui::Shape::Rect(r) => rects.push((r.rect, r.fill, r.stroke)),
+            egui::Shape::Vec(v) => for s in v { collect_painted(s, texts, rects) },
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn agent_panel_defect1_danger_confirm_differs_from_send() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_demo_agent(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
+
+        let confirm_r = texts.iter().find(|(t, _)| t == "Confirm · Delete rig 2 · Rig B").map(|(_, r)| *r).expect("confirm text");
+        let send_r = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("send text");
+        let enclosing_fill = |tr: Rect| {
+            rects.iter()
+                .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(tr))
+                .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+                .map(|(_, fill, stroke)| (*fill, *stroke))
+        };
+        let (confirm_fill, confirm_stroke) = enclosing_fill(confirm_r).expect("confirm button rect");
+        let (send_fill, _) = enclosing_fill(send_r).expect("send button rect");
+        assert_eq!(send_fill, theme::ACCENT_DEEP, "Send CTA keeps ACCENT_DEEP fill");
+        assert_eq!(confirm_fill, theme::DANGER_BG, "destructive Confirm uses DANGER_BG fill");
+        assert_eq!(confirm_stroke.color, theme::CLIP_RED, "destructive Confirm uses CLIP_RED border");
+        assert_ne!(confirm_fill, send_fill, "danger button fill must differ from Send fill");
+    }
+
+    #[test]
+    fn agent_panel_defect3_chips_use_rig_display_names() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        assert_eq!(app.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.8})), "Mix Rig A");
+        assert_eq!(app.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})), "Add Reverb → Rig B");
+        assert_eq!(app.human_tool_label("delete_rig", &serde_json::json!({"rig": 1})), "Delete Rig B");
+        assert_eq!(app.human_tool_label("select_rig", &serde_json::json!({"rig": 1})), "Switch to Rig B");
+
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 0, "name": "Lead"}));
+        assert_eq!(app.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.5})), "Mix Lead");
+        let node = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Keys)).unwrap().node_id;
+        assert_eq!(app.human_tool_label("set_rig_source", &serde_json::json!({"node": node})), "Set Lead sources");
+    }
+
+    #[test]
+    fn agent_panel_defect4_read_only_tools_omitted_from_chip_row() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.submit_chat("check graph and lower rig 1".into());
+        let _ = worker_rx.try_recv(); // drain ToWorker::User
+        app.assistant.busy = true;
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("get_graph", serde_json::json!({})),
+            call("get_rigs", serde_json::json!({})),
+            call("list_sounds", serde_json::json!({"query": "pad"})),
+            call("set_rig_mix", serde_json::json!({"rig": 0, "vol": 0.6})),
+        ])).unwrap();
+        app.poll_assistant();
+        let _ = worker_rx.try_recv(); // drain ToWorker::ToolResults
+
+        let user_idx = app.active_run_user_idx.unwrap();
+        let run = &app.transcript_runs[&user_idx];
+        assert_eq!(run.read_count, 3, "read-only tools counted for metadata");
+        assert_eq!(run.chips.len(), 1, "only mutating tool creates a chip: {:?}", run.chips);
+        assert_eq!(run.chips[0].label, "Mix Rig A");
+        assert_eq!(run.chips[0].state, ToolChipState::Done);
+
+        app.assistant.busy = false;
+        app.assistant.turn.wall = Some(std::time::Duration::from_millis(400));
+        app.finalize_active_run();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let texts = run_frame(&mut app, &ctx, Vec2::new(781.0, 950.0), vec![]);
+        assert!(texts.iter().any(|(t, _)| t.contains("Mix Rig A")), "mutating chip painted: {texts:?}");
+        for hidden in ["Read rack graph", "List rigs", "Search patches"] {
+            assert!(texts.iter().all(|(t, _)| !t.contains(hidden)), "read-only chip '{hidden}' leaked: {texts:?}");
+        }
+        assert!(texts.iter().any(|(t, _)| t.contains("3 reads")), "read count in cost line: {texts:?}");
+    }
+
+    #[test]
+    fn agent_panel_defect5_contrast_ratios_and_hierarchy() {
+        let body = theme::contrast_ratio(theme::INK, theme::PAPER);
+        let you_lbl = theme::contrast_ratio(theme::CREAM, theme::PAPER);
+        let asst_lbl = theme::contrast_ratio(theme::AGENT_TEXT, theme::PAPER);
+        let sys_lbl = theme::contrast_ratio(theme::CREAM_META, theme::PAPER);
+        let err_lbl = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::PAPER);
+        let meta = theme::contrast_ratio(theme::CREAM_META, theme::PAPER);
+        let chip_done = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let chip_not_applied = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL);
+        let chip_failed = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
+        let cancel_btn = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let attach_name = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let attach_x = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let danger_confirm = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
+
+        for (name, r) in [
+            ("YOU", you_lbl),
+            ("ASSISTANT", asst_lbl),
+            ("SYSTEM", sys_lbl),
+            ("ERROR", err_lbl),
+            ("metadata", meta),
+            ("chip Done", chip_done),
+            ("chip NotApplied", chip_not_applied),
+            ("chip Failed", chip_failed),
+            ("Cancel", cancel_btn),
+            ("attachment name", attach_name),
+            ("attachment ×", attach_x),
+            ("danger Confirm", danger_confirm),
+        ] {
+            assert!(r >= 4.5, "{name} contrast {r:.2}:1 < 4.5:1");
+        }
+        assert!(meta < body, "metadata ({meta:.2}:1) stays dimmer than message body ({body:.2}:1)");
+    }
+
+    #[test]
+    fn agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_demo_agent(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 950.0);
+
+        let run_capture = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            let mut texts = Vec::new();
+            let mut rects = Vec::new();
+            for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
+            let set_ids: Vec<egui::TextureId> = out.textures_delta.set.iter().map(|(id, _)| *id).collect();
+            let free_ids = out.textures_delta.free.clone();
+            out.textures_delta.clear();
+            (texts, rects, set_ids, free_ids)
+        };
+
+        // Frame 1: thumbnail texture created once.
+        let (_, _, set1, _) = run_capture(&mut app, vec![]);
+        let tex_id = app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()).expect("thumbnail texture loaded");
+        assert!(set1.contains(&tex_id), "frame 1 uploads thumbnail texture {tex_id:?}");
+
+        // Settle layout and verify Frame N does NOT re-upload thumbnail texture.
+        let _ = run_capture(&mut app, vec![]);
+        let (texts, rects, set3, _) = run_capture(&mut app, vec![]);
+        assert!(!set3.contains(&tex_id), "thumbnail texture must not be recreated on subsequent frames");
+        assert_eq!(app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()), Some(tex_id));
+
+        // Alignment: Confirm/Cancel and attachment chip share the transcript text column left edge.
+        let msg_left = texts.iter().find(|(t, _)| t.contains("Brighten Surge A")).map(|(_, r)| r.left()).expect("msg text");
+        let chip_text_r = texts.iter().find(|(t, _)| t.contains("Split keys → C4")).map(|(_, r)| *r).expect("chip text");
+        let chip_box = rects.iter()
+            .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(chip_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("chip box").0;
+        let confirm_text_r = texts.iter().find(|(t, _)| t == "Confirm · Delete rig 2 · Rig B").map(|(_, r)| *r).expect("confirm");
+        let confirm_box = rects.iter()
+            .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(confirm_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("confirm button box").0;
+        let attach_text_r = texts.iter().find(|(t, _)| t == "rack-sketch.png").map(|(_, r)| *r).expect("attach name");
+        let attach_box = rects.iter()
+            .filter(|(r, fill, _)| *fill == theme::DARK_PANEL_HI && r.contains_rect(attach_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("attach chip box").0;
+        assert!(
+            (confirm_box.left() - chip_box.left()).abs() <= 0.5 && (confirm_box.left() - msg_left).abs() <= 2.0,
+            "Confirm left ({}) != transcript column (chip {}, msg {msg_left})",
+            confirm_box.left(),
+            chip_box.left()
+        );
+        assert!(
+            (attach_box.left() - chip_box.left()).abs() <= 0.5 && (attach_box.left() - msg_left).abs() <= 2.0,
+            "Attachment chip left ({}) != transcript column (chip {}, msg {msg_left})",
+            attach_box.left(),
+            chip_box.left()
+        );
+        assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "no debug pixel dimensions: {texts:?}");
+
+        // Remove via × -> texture handle dropped and freed in textures_delta.free.
+        let x_pos = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).unwrap().1.center();
+        let mut freed = Vec::new();
+        for pressed in [true, false] {
+            let ev = vec![
+                egui::Event::PointerMoved(x_pos),
+                egui::Event::PointerButton {
+                    pos: x_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ];
+            freed.extend(run_capture(&mut app, ev).3);
+        }
+        freed.extend(run_capture(&mut app, vec![]).3);
+        assert!(app.chat_image.is_none() && app.chat_thumb.is_none(), "attachment and thumb cleared");
+        assert!(freed.contains(&tex_id), "removed attachment must free thumbnail texture {tex_id:?}, freed: {freed:?}");
+    }
 }
 
 /// Face-grid audit: every element on every unit face (title, LED, knobs and
@@ -15806,7 +20683,7 @@ mod ui_polish_agent_tests {
 mod face_layout_tests {
     use super::*;
 
-    fn frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) {
+    pub(super) fn frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
         eframe::App::raw_input_hook(app, ctx, &mut raw);
@@ -15924,6 +20801,38 @@ mod face_layout_tests {
     }
 
     #[test]
+    fn instrument_faces_with_main_knobs_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        check(app, "clap main knobs");
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        check(app, "clap main knobs, two rigs");
+
+        let (app, _) = super::main_control_tests::lv2_synth_rack(&[]);
+        check(app, "lv2 instrument main knobs");
+    }
+
+    /// The audit above only sees what `items` lists: prove the main knobs
+    /// are in it, and that a wide unit shows all four.
+    #[test]
+    fn main_knobs_are_part_of_the_audited_face() {
+        let mut app = DemoApp::new_with_sink(None);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(2560.0, 1440.0)); }
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let names: Vec<String> = items(&app, surge).into_iter().map(|(n, _)| n).filter(|n| n.starts_with("knob")).collect();
+        assert_eq!(names, ["knob CUTOFF", "knob RESO", "knob OSC 1 VOL", "knob BAL", "knob LEVEL"]);
+        for k in &app.units[surge].knobs {
+            let w = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
+            assert!(w > 0.0 && w <= KNOB_LABEL_W, "{} is {w}px wide, a slot leaves {KNOB_LABEL_W}", k.label);
+        }
+    }
+
+    #[test]
     fn audio_in_face_is_padded_and_clear() {
         // A minimal rack: Keys + AudioIn (In 1, wired to Master) + Master. The
         // Keys/Master stay wide side anchors so the AudioIn unit is the lone
@@ -15956,6 +20865,253 @@ mod face_layout_tests {
             .collect();
         assert!(bottom_row.len() >= 3, "keys, a bottom stack and master share the bottom: {bottom_row:?}");
         assert!(bottom_row.iter().all(|y| (y - bottom_row[0]).abs() < 0.5), "one knob line: {bottom_row:?}");
+    }
+}
+
+#[cfg(test)]
+mod main_control_tests {
+    use super::*;
+    use super::face_layout_tests::frame_at;
+    use crate::control::command_bus;
+    use crate::main_controls::{MainControl, MainControls, MainSource};
+
+    fn control(id: u32, name: &str, page: &str) -> MainControl {
+        MainControl { id, name: name.into(), page: page.into(), min: 0.0, max: 2.0, default: 1.0 }
+    }
+
+    /// Six controls, like a plugin whose list is longer than a face.
+    pub(super) fn synth_controls() -> MainControls {
+        MainControls {
+            source: MainSource::RemoteControls,
+            controls: vec![
+                control(101, "M1: Cutoff", "Macros"),
+                control(102, "M2: Resonance", "Macros"),
+                control(103, "A Osc 1 Volume", "Scene A Mixer"),
+                control(104, "A Filter Balance", "Scene A Filters"),
+                control(105, "A Feedback", "Scene A Filters"),
+                control(106, "A Waveshaper Drive", "Scene A Filters"),
+            ],
+        }
+    }
+
+    pub(super) fn give_clap_units_main_knobs(app: &mut DemoApp) {
+        let found = synth_controls();
+        for u in app.units.iter_mut().filter(|u| matches!(u.node_kind, UnitKind::Clap)) {
+            set_main_knobs(u, found.face(), MainTarget::Clap, |c| c.default);
+        }
+    }
+
+    const LV2_SYNTH: &str = "urn:kabelsalat:test-synth";
+
+    /// Keys → an LV2 plugin → Master, with the plugin's controls already
+    /// resolved (the app resolves them on a worker thread).
+    pub(super) fn lv2_synth_rack(params: &[crate::session::ParamValue]) -> (DemoApp, usize) {
+        crate::lv2::set_main_controls_for_test(LV2_SYNTH, MainControls { source: MainSource::Fallback, ..synth_controls() });
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(LV2_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&g, params);
+        let unit = app.units.iter().position(|u| u.node_id == synth).unwrap();
+        (app, unit)
+    }
+
+    fn labels(app: &DemoApp, unit: usize) -> Vec<&str> {
+        app.units[unit].knobs.iter().map(|k| k.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_clap_face_shows_its_main_controls_left_of_level() {
+        let mut app = DemoApp::new_with_sink(None);
+        give_clap_units_main_knobs(&mut app);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        assert_eq!(labels(&app, surge), ["CUTOFF", "RESO", "OSC 1 VOL", "BAL", "LEVEL"]);
+        let k = &app.units[surge].knobs[0];
+        assert_eq!(k.cc_target(), Some((101, crate::matrix::CcTarget::PluginParam)), "bound to the plugin parameter");
+        assert!((k.value - 0.5).abs() < 1e-6, "the plugin's value 1.0 in 0..2");
+
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(2560.0, 1440.0));
+        let xs: Vec<f32> = (0..5).map(|i| app.knob_center(surge, i).x).collect();
+        assert!(xs.windows(2).all(|w| w[1] - w[0] == KNOB_PITCH), "one row, left to right: {xs:?}");
+    }
+
+    #[test]
+    fn a_narrow_unit_keeps_level_and_drops_the_last_main_knobs() {
+        assert_eq!(DemoApp::knobs_that_fit(200.0), 2);
+        assert_eq!(DemoApp::knobs_that_fit(268.0), 3);
+        assert_eq!(DemoApp::knobs_that_fit(420.0), 6);
+        let mut app = DemoApp::new_with_sink(None);
+        give_clap_units_main_knobs(&mut app);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        let shown: Vec<&str> = app.units[surge].knobs.iter().filter(|k| !k.hidden).map(|k| k.label.as_str()).collect();
+        assert_eq!(shown, ["CUTOFF", "LEVEL"]);
+        assert!(app.resolve_unit_knob(app.units[surge].node_id, "RESO").is_ok(), "a knob without room still binds");
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        assert!(app.units[surge].knobs.iter().all(|k| !k.hidden), "and comes back with the room");
+    }
+
+    #[test]
+    fn main_knobs_make_room_for_a_hand_pinned_one_and_never_repeat_it() {
+        let mut app = DemoApp::new_with_sink(None);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let pinned = crate::host::ParamDesc { id: 102, name: "M2: Resonance".into(), module: String::new(),
+            min: 0.0, max: 2.0, value: 2.0, default: 1.0, automatable: true, hidden: false, readonly: false, stepped: false };
+        assert!(app.toggle_pin(0, &pinned).starts_with("pinned"));
+        give_clap_units_main_knobs(&mut app);
+        assert_eq!(labels(&app, surge), ["CUTOFF", "OSC 1 VOL", "BAL", "RESO", "LEVEL"], "four plugin knobs, the pin kept once");
+        // A patch that renames its controls replaces the main knobs only.
+        let renamed = [control(201, "M1: Wobble", "Macros"), control(202, "Level", "Macros")];
+        set_main_knobs(&mut app.units[surge], &renamed, MainTarget::Clap, |c| c.default);
+        assert_eq!(labels(&app, surge), ["WOBBLE", "LEVEL", "RESO", "LEVEL"]);
+        assert_eq!(app.resolve_unit_knob(app.units[surge].node_id, "level"), Ok((P_LEVEL, crate::matrix::CcTarget::Knob)),
+            "the rack's own LEVEL keeps its name when a plugin control shares it");
+    }
+
+    #[test]
+    fn an_lv2_instrument_face_shows_main_controls_that_drive_its_ports() {
+        let (mut app, unit) = lv2_synth_rack(&[]);
+        let node = app.units[unit].node_id;
+        let ctx = egui::Context::default();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert_eq!(labels(&app, unit), ["CUTOFF", "RESO", "OSC 1 VOL", "BAL"], "no knob that drives nothing");
+        assert_eq!(app.units[unit].knobs[1].cc_target(), Some((102, crate::matrix::CcTarget::Knob)));
+        let mut sent = Vec::new();
+        drain.drain(|c| if let Command::SetParam { node: n, param, value } = c { if n == node { sent.push((param, value)); } });
+        assert!(sent.is_empty(), "a fresh knob shows the port's default: nothing to send, {sent:?}");
+
+        app.units[unit].knobs[1].set_immediate(0.25);
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        drain.drain(|c| if let Command::SetParam { node: n, param, value } = c { if n == node { sent.push((param, value)); } });
+        assert_eq!(sent, [(102, 0.25)], "turning the knob sets the plugin's control port");
+    }
+
+    #[test]
+    fn a_loaded_session_restores_lv2_main_knobs_and_a_rebuild_keeps_them() {
+        let saved = [crate::session::ParamValue { node: 1, param: 103, value: 0.8 }];
+        let (mut app, unit) = lv2_synth_rack(&saved);
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let k = &app.units[unit].knobs[2];
+        assert!((k.value - 0.8).abs() < 1e-6 && k.sent.is_none(), "restored and due to be sent");
+
+        app.units[unit].knobs[0].set_immediate(0.1);
+        let carried = app.lv2_main_values();
+        assert!(carried.contains(&crate::session::ParamValue { node: 1, param: 101, value: 0.1f32 as f64 }));
+        let graph = app.base_graph.clone();
+        app.build_rack(&graph, &[]);
+        app.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let k = &app.units[unit].knobs[0];
+        assert!((k.value - 0.1).abs() < 1e-6, "the value survives the rebuild");
+        assert_eq!(k.sent, Some(k.value), "the engine still holds it: nothing is re-sent");
+    }
+
+    #[test]
+    fn list_params_puts_main_controls_first_and_their_names_bind() {
+        let (mut app, unit) = lv2_synth_rack(&[]);
+        let node = app.units[unit].node_id;
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        app.units[unit].knobs[0].set_immediate(0.75);
+        let out: serde_json::Value = serde_json::from_str(&app.exec_tool("list_params", &serde_json::json!({"node": node}))).unwrap();
+        assert_eq!(out["main_controls_source"], "fallback");
+        let main = out["main_controls"].as_array().unwrap();
+        assert_eq!(main.len(), 6, "the whole list, not only the face: {out}");
+        assert_eq!(main[0]["name"], "M1: Cutoff");
+        assert_eq!(main[0]["page"], "Macros");
+        assert_eq!(main[0]["id"], 101);
+        assert_eq!(main[0]["knob"], "CUTOFF");
+        assert_eq!(main[0]["value"], 1.5, "0.75 of 0..2");
+        assert_eq!(main[0]["text"], "1.500");
+        assert_eq!(main[5]["knob"], serde_json::Value::Null, "listed, not on the face");
+
+        // The face label, the full name, and a control past the face all bind.
+        for (knob, id) in [("CUTOFF", 101), ("m1: cutoff", 101), ("A Waveshaper Drive", 106)] {
+            assert_eq!(app.resolve_unit_knob(node, knob), Ok((id, crate::matrix::CcTarget::Knob)), "{knob}");
+        }
+        let bound = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 21, "knob": "A Waveshaper Drive"}));
+        assert!(app.rule_edits.values().any(|e| e.cc_map.iter().any(|m| m.cc == 21 && m.param == 106)), "{bound}");
+        assert!(app.resolve_unit_knob(node, "GAIN").is_err(), "the old port-0 GAIN knob is gone");
+    }
+
+    /// The whole path on real Surge XT voices and the app's own frames:
+    /// knobs appear, a turned knob reaches the plugin, a loaded patch renames
+    /// them, and the agent reads the same list.
+    #[test]
+    fn real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin() {
+        let Ok(mut rig) = EvalRig::new(Assistant::new(), &(Vec::new(), Vec::new())) else { return };
+        rig.settle();
+        let surge = rig.app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = rig.app.units[surge].node_id;
+        assert_eq!(labels(&rig.app, surge), ["OSC 1 VOL", "OSC 2 VOL", "OSC 3 VOL", "NOISE VOL", "LEVEL"],
+            "the init patch names no macro: Surge's next page, the scene mixer");
+        let pin = rig.app.units[surge].knobs[0].clap.expect("a plugin knob");
+        assert!((rig.app.units[surge].knobs[0].value - 1.0).abs() < 1e-3, "read from the plugin: osc 1 is at full volume");
+
+        rig.app.units[surge].knobs[0].set_immediate(0.25);
+        rig.settle();
+        let read = rig.app._surge_main[0].param_value(pin.id).unwrap();
+        assert!((read - 0.25).abs() < 1e-3, "the knob moved Surge's parameter: {read}");
+
+        let out: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("list_params", &serde_json::json!({"node": node}))).unwrap();
+        assert_eq!(out["main_controls_source"], "remote controls");
+        assert_eq!(out["main_controls"][0]["name"], "A Osc 1 Volume");
+        assert_eq!(out["main_controls"][0]["page"], "Scene A Mixer");
+        assert_eq!(out["main_controls"][0]["knob"], "OSC 1 VOL");
+        assert!((out["main_controls"][0]["value"].as_f64().unwrap() - 0.25).abs() < 1e-3, "{out}");
+        assert_eq!(out["main_controls"].as_array().unwrap().len(), 8);
+
+        let patches = crate::host::list_surge_patches();
+        let Some(patch) = patches.iter().find(|p| p.name.eq_ignore_ascii_case("bell pad")) else { return };
+        let state = crate::host::fxp_to_state(&std::fs::read(&patch.path).unwrap()).unwrap();
+        rig.app._surge_main[0].load_state(&state).unwrap();
+        for _ in 0..600 {
+            rig.frame();
+            if rig.app.units[surge].knobs[0].label == "CUTOFF" { break; }
+        }
+        assert_eq!(labels(&rig.app, surge), ["CUTOFF", "SKEW H", "SHAPE", "SPEED", "LEVEL"], "the patch's named macros");
+        assert_eq!(rig.app.resolve_unit_knob(node, "M5: Vibrato Rate").map(|(_, t)| t), Ok(crate::matrix::CcTarget::PluginParam),
+            "a macro past the face binds by name");
+    }
+
+    #[test]
+    fn a_clap_knob_follows_the_value_the_plugin_reports() {
+        let Ok((mut voice, mut main)) = ClapVoice::new(48000.0) else { return };
+        let mut app = DemoApp::new_with_sink(None);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let face = main.main_controls().face().to_vec();
+        assert!(!face.is_empty(), "Surge XT has remote-control pages");
+        set_main_knobs(&mut app.units[surge], &face, MainTarget::Clap, |c| main.param_value(c.id).unwrap_or(c.default));
+        let c = &face[0];
+        let start = app.units[surge].knobs[0].value;
+        let target = if start < 0.5 { 0.9 } else { 0.1 };
+
+        // Something other than this knob moves the parameter (an agent, a patch).
+        voice.controller().set_param(ClapId::new(c.id), c.plain(target));
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..8 { voice.render(&mut buf, crate::transport::Transport::default()); }
+        follow_plugin_values(&mut app.units[surge], &mut main, 10.0, true);
+        let k = &app.units[surge].knobs[0];
+        assert!((k.value - target).abs() < 0.02, "{} followed {start} -> {target}: {}", c.name, k.value);
+        assert_eq!(k.clap.map(|p| p.sent), Some(k.value), "read back, so not sent again");
+
+        // A value the UI just sent is not overwritten by a stale readback.
+        let sent_at = 20.0;
+        let k = &mut app.units[surge].knobs[0];
+        k.set_immediate(start);
+        k.clap = k.clap.map(|p| ClapPin { sent: start, hold_until: sent_at + READBACK_HOLD_SECS, ..p });
+        follow_plugin_values(&mut app.units[surge], &mut main, sent_at + 0.1, true);
+        assert!((app.units[surge].knobs[0].value - start).abs() < 1e-6, "held while the change travels");
+        main.retire(voice);
     }
 }
 
@@ -15999,5 +21155,483 @@ Client 130 : \"kabelsalat-hw\" [User Legacy]\n  Port   0 : \"kabelsalat-hw   \" 
         assert_eq!(match_midi_device(&devices, "Launchkey:Launchkey MIDI 32:0"), Ok(None));
         // Something never seen → new.
         assert_eq!(match_midi_device(&devices, "Other:Other 40:0"), Ok(None));
+    }
+}
+
+#[cfg(test)]
+mod settings_and_dropdown_tests {
+    use super::*;
+
+    fn collect_shapes(
+        shape: &egui::Shape,
+        texts: &mut Vec<(String, Rect)>,
+        rects: &mut Vec<(Rect, Color32)>,
+    ) {
+        match shape {
+            egui::Shape::Text(t) => texts.push((
+                t.galley.text().to_owned(),
+                t.galley.rect.translate(t.pos.to_vec2()),
+            )),
+            egui::Shape::Rect(r) => rects.push((r.rect, r.fill)),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_shapes(s, texts, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_frame(
+        app: &mut DemoApp,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        // Past egui's area fade-in, which paints a new popup alpha-scaled.
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            collect_shapes(&cs.shape, &mut texts, &mut rects);
+        }
+        let (fg_areas, middle) = ctx.memory(|m| {
+            let fg: Vec<Rect> = m
+                .areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Foreground)
+                .filter_map(|l| m.area_rect(l.id))
+                .collect();
+            let mid: Vec<egui::LayerId> = m
+                .areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Middle)
+                .collect();
+            (fg, mid)
+        });
+        let fg_rects: Vec<(Rect, Color32)> = rects
+            .into_iter()
+            .filter(|(r, _)| fg_areas.iter().any(|fa| fa.expand(2.0).contains_rect(*r)))
+            .collect();
+        (texts, fg_rects, middle)
+    }
+
+    fn key(k: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+        let ptr = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame(app, ctx, size, vec![ptr(true)]);
+        run_frame(app, ctx, size, vec![ptr(false)]);
+    }
+
+    fn warm(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        let mut res = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..3 {
+            res = run_frame(app, ctx, size, vec![]);
+        }
+        res
+    }
+
+    fn open_dropdown(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        click_at(app, ctx, size, pos);
+        run_frame(app, ctx, size, vec![])
+    }
+
+    /// Every text galley of the Settings sheet stays inside the sheet,
+    /// keeps its words on one line, and overlaps no other galley.
+    fn assert_settings_text_layout(app: &DemoApp, texts: &[(String, Rect)], size: Vec2) {
+        let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+        let sheet: Vec<&(String, Rect)> = texts
+            .iter()
+            .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0)
+            .collect();
+        assert!(sheet.iter().any(|(t, _)| t == "Settings"), "{size:?}: Settings title painted");
+        for (t, r) in &sheet {
+            assert!(
+                r.left() >= inner.left() - 1.0 && r.right() <= inner.right() + 1.0,
+                "{size:?}: {t:?} at {r:?} leaves the sheet {inner:?}",
+            );
+            if ["Apply", "Save", "Remove", "On", "Off"].contains(&t.as_str()) {
+                assert!(r.height() < 20.0, "{size:?}: button text {t:?} wrapped: {r:?}");
+            }
+        }
+        for (i, (a, ra)) in sheet.iter().enumerate() {
+            for (b, rb) in &sheet[i + 1..] {
+                let o = ra.intersect(*rb);
+                assert!(
+                    !(o.width() > 0.5 && o.height() > 0.5),
+                    "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_combobox_remains_and_all_three_dropdowns_use_themed_popup() {
+        let src = include_str!("ui.rs");
+        let combo = concat!("egui::", "ComboBox");
+        assert!(!src.contains(combo), "all ComboBoxes replaced with theme::Dropdown");
+        for old_id in ["\"rule_cc_param_pick\"", "\"assistant_model\"", "\"audio_output\""] {
+            let pattern = format!("from_id_salt({old_id})");
+            assert!(!src.contains(&pattern), "old ComboBox id {old_id} still present");
+        }
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let trigger = texts.iter().find(|(t, _)| t == "chat: deepseek-chat").expect("assistant model trigger").1.center();
+        let (texts, fg_rects, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL), "assistant dropdown uses DARK_PANEL: {fg_rects:?}");
+        assert!(!fg_rects.iter().any(|(_, f)| *f == Color32::BLACK), "no default black popup fill");
+        let reasoner = texts.iter().find(|(t, _)| t == "deepseek-reasoner").unwrap().1.center();
+        click_at(&mut app, &ctx, size, reasoner);
+        assert_eq!(app.assistant.model(), "deepseek-reasoner");
+        assert!(!egui::Popup::is_any_open(&ctx));
+
+        app.dock = DockView::None;
+        app.stage_view = StageView::Mixer;
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let out_pos = texts.iter().find(|(t, _)| t == "System default").expect("mixer audio output dropdown").1.center();
+        let (_, fg_rects, _) = open_dropdown(&mut app, &ctx, size, out_pos);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL));
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx), "Esc closes mixer dropdown");
+        assert_eq!(app.stage_view, StageView::Mixer, "first Esc does not exit Mixer while dropdown was open");
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack, "second Esc leaves Mixer");
+
+        app.stage_view = StageView::Matrix;
+        let master = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master)).unwrap();
+        app.rule_editor = Some((master, MatrixRow::Keys));
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let choices = app.node_param_choices(app.units[master].node_id);
+        let selected_name = choices.iter().find(|(id, _)| *id == app.rule_param_id).map(|(_, n)| n.as_str()).unwrap_or("select param…");
+        let trig = texts.iter().rev().find(|(t, _)| t == selected_name).expect("matrix param dropdown").1.center();
+        let (_, fg_rects, _) = open_dropdown(&mut app, &ctx, size, trig);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL), "matrix param dropdown uses DARK_PANEL");
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx), "Esc closes matrix dropdown");
+        assert!(app.rule_editor.is_some(), "Esc closed only the dropdown, not the rule editor");
+    }
+
+    #[test]
+    fn settings_opens_via_nav_and_shortcut_and_esc_returns() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let nav_pos = texts.iter().find(|(t, r)| t == "Settings" && r.top() < 50.0).expect("Settings nav chip").1.center();
+        click_at(&mut app, &ctx, size, nav_pos);
+        assert_eq!(app.stage_view, StageView::Settings);
+        let (texts, _, middle) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(middle.is_empty(), "Settings renders in main stage, not a floating window: {middle:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Settings"));
+
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack);
+
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Settings);
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Rack);
+
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Settings);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let hint_pos = texts.iter().find(|(t, _)| t == "other model id…").expect("other model id input").1.center();
+        click_at(&mut app, &ctx, size, hint_pos);
+        let mut ev = key(Key::Comma);
+        ev.push(egui::Event::Text(",".into()));
+        run_frame(&mut app, &ctx, size, ev);
+        assert_eq!(app.stage_view, StageView::Settings, "typing comma keeps Settings open");
+        assert_eq!(app.settings_decide_input, ",");
+    }
+
+    #[test]
+    fn settings_api_keys_never_render_key_text_and_update_status() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let fake_ds = "sk-fake-deepseek-secret-9942";
+        let fake_or = "sk-or-fake-openrouter-secret-7731";
+        app.settings_deepseek_key = fake_ds.into();
+        app.settings_openrouter_key = fake_or.into();
+
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            for (t, _) in &texts {
+                assert!(!t.contains("9942") && !t.contains("deepseek-secret"), "painted text leaked key: {t}");
+                assert!(!t.contains("7731") && !t.contains("openrouter-secret"), "painted text leaked key: {t}");
+            }
+            if size.y >= 800.0 {
+                assert!(texts.iter().any(|(t, _)| t == "not set"));
+            }
+        }
+
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let mut save_btns: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Save").map(|(_, r)| *r).collect();
+        save_btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert_eq!(save_btns.len(), 2, "Save buttons for DeepSeek and OpenRouter");
+        click_at(&mut app, &ctx, size, save_btns[0].center());
+        click_at(&mut app, &ctx, size, save_btns[1].center());
+
+        assert!(app.assistant.keys().deepseek && app.assistant.keys().openrouter);
+        assert!(app.settings_deepseek_key.is_empty() && app.settings_openrouter_key.is_empty());
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        for (t, _) in &texts {
+            assert!(!t.contains("9942") && !t.contains("7731"), "key leaked after save: {t}");
+        }
+        assert!(texts.iter().any(|(t, _)| t == "set"));
+    }
+
+    #[test]
+    fn settings_models_and_prefs_reach_assistant_and_fit_narrow_windows() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            assert_settings_text_layout(&app, &texts, size);
+            assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
+            if size.y >= 800.0 {
+                assert!(texts.iter().any(|(t, _)| t == "Chat model"));
+                assert!(texts.iter().any(|(t, _)| t == "Vision model"));
+                assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
+            }
+            for (t, _) in &texts {
+                let low = t.to_lowercase();
+                assert!(!low.contains("faster") && !low.contains("speed") && !low.contains("0.2 s") && !low.contains("0.3 s"),
+                    "rule 78 violation in Settings text: {t}");
+            }
+        }
+
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::DEEPSEEK_CHAT).expect("Act model dropdown").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, act_dd);
+        let opus = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("OpenRouter choice in Act dropdown").1.center();
+        click_at(&mut app, &ctx, size, opus);
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, crate::llm::CLAUDE_OPUS);
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let vision_dd = texts.iter().find(|(t, _)| t == crate::llm::PERCEIVE_MODEL).expect("Perceive dropdown").1.center();
+        let _ = open_dropdown(&mut app, &ctx, size, vision_dd);
+        assert!(egui::Popup::is_any_open(&ctx));
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx));
+        assert_eq!(app.stage_view, StageView::Settings, "first Esc closes dropdown, keeps Settings open");
+
+        app.settings_perceive_input = "openai/gpt-5.4".into();
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
+        applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert_eq!(applies.len(), 3);
+        click_at(&mut app, &ctx, size, applies[2].center());
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Perceive).model, "openai/gpt-5.4");
+
+        assert!(app.assistant.decide_enabled());
+        assert!(!app.reduce_motion);
+        assert!(!app.count_in_enabled);
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let decide_y = texts.iter().find(|(t, _)| t == "Decisions (Jev)").unwrap().1.center().y;
+        let decide_toggle = texts.iter()
+            .find(|(t, r)| t == "On" && (r.center().y - decide_y).abs() < 16.0)
+            .expect("Decisions On/Off toggle").1.center();
+        click_at(&mut app, &ctx, size, decide_toggle);
+        assert!(!app.assistant.decide_enabled());
+        assert!(!app.assistant.decides_first());
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let rm_y = texts.iter().find(|(t, _)| t == "Reduce motion").unwrap().1.center().y;
+        let rm_toggle = texts.iter()
+            .find(|(t, r)| t == "Off" && (r.center().y - rm_y).abs() < 16.0)
+            .expect("Reduce motion toggle").1.center();
+        click_at(&mut app, &ctx, size, rm_toggle);
+        assert!(app.reduce_motion);
+
+        let ci_y = texts.iter().find(|(t, _)| t == "Count-in").unwrap().1.center().y;
+        let ci_toggle = texts.iter()
+            .find(|(t, r)| t == "Off" && (r.center().y - ci_y).abs() < 16.0)
+            .expect("Count-in toggle").1.center();
+        click_at(&mut app, &ctx, size, ci_toggle);
+        assert!(app.count_in_enabled);
+    }
+}
+
+/// The app hosting real Surge XT voices on an offline engine (`EvalRig`).
+/// Skipped when Surge XT is not installed.
+#[cfg(test)]
+mod voice_host_tests {
+    use super::*;
+
+    fn rig() -> Option<EvalRig> {
+        let (assistant, _tx, _rx) = Assistant::with_test_worker();
+        match EvalRig::new(assistant, &(Vec::new(), Vec::new())) {
+            Ok(mut rig) => {
+                rig.settle();
+                Some(rig)
+            }
+            Err(e) => {
+                eprintln!("voice_host_tests skipped: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Every CLAP unit is played by a hosted voice, the engine says the
+    /// same, and nothing is hosted that no unit plays.
+    fn assert_voiced(rig: &mut EvalRig, units: usize, when: &str) {
+        rig.settle();
+        let app = &rig.app;
+        let published = app.graph_pub.as_ref().unwrap().lock().unwrap().voices.clone();
+        let slots = app.clap_rigs();
+        assert_eq!(slots.len(), units, "{when}: CLAP units");
+        for &(slot, node) in &slots {
+            let idx = app.clap_pool_idx(slot).unwrap_or_else(|| panic!("{when}: node {node} has no voice"));
+            let id = app.clap_voice_ids[idx];
+            assert!(published.contains(&(id, node)), "{when}: the engine plays node {node} with another voice than {id}: {published:?}");
+        }
+        assert_eq!(app._surge_main.len(), units, "{when}: hosted voices");
+        assert_eq!(published.len(), units, "{when}: voices in the engine");
+        assert!(app.clap_leaving.is_empty(), "{when}: voices still on their way out");
+    }
+
+    /// Surge's volume, the audible mark each voice gets.
+    fn volume_param(app: &mut DemoApp) -> ParamDesc {
+        app._surge_main[0].param_list().into_iter()
+            .find(|p| p.automatable && !p.hidden && !p.readonly && p.max > p.min && p.name.to_lowercase().contains("volume"))
+            .expect("Surge XT volume parameter")
+    }
+
+    fn mark(rig: &mut EvalRig, p: &ParamDesc, values: &[f64]) {
+        for (slot, _) in rig.app.clap_rigs() {
+            let idx = rig.app.clap_pool_idx(slot).unwrap();
+            rig.app.surge_controllers[idx].set_param(ClapId::new(p.id), values[slot]);
+        }
+        rig.settle();
+    }
+
+    /// The mark of every CLAP unit, in unit order.
+    fn marks(rig: &mut EvalRig, p: &ParamDesc) -> Vec<f64> {
+        rig.settle();
+        let slots = rig.app.clap_rigs();
+        slots.into_iter()
+            .map(|(slot, _)| {
+                let idx = rig.app.clap_pool_idx(slot).unwrap();
+                rig.app._surge_main[idx].param_value(p.id).unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_marks(got: &[f64], want: &[f64], when: &str) {
+        assert_eq!(got.len(), want.len(), "{when}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-3, "{when}: unit {i} plays state {g}, its own is {w} (all: {got:?})");
+        }
+    }
+
+    #[test]
+    fn eight_clap_units_across_rigs_keep_their_voices_and_state() {
+        let Some(mut rig) = rig() else { return };
+        assert_voiced(&mut rig, 2, "the demo patch");
+        // A full voice table, so hosting more sends larger tables ahead.
+        rig.app.engine_voice_cap = rig.engine.shrink_voice_table();
+        assert_eq!(rig.app.engine_voice_cap, 2);
+        // Six more rigs: eight Surge units in seven rigs (the old pool had 4).
+        for _ in 0..6 {
+            rig.app.exec_tool("add_rig", &serde_json::json!({}));
+            rig.settle();
+        }
+        assert_eq!(rig.app.rig_count(), 7);
+        assert_voiced(&mut rig, 8, "after six added rigs");
+        assert!(rig.engine.voice_table_cap() >= 8, "the engine took the larger tables: {}", rig.engine.voice_table_cap());
+        assert_eq!(rig.app.engine_voice_cap, 8);
+
+        let p = volume_param(&mut rig.app);
+        let own: Vec<f64> = (0..8).map(|i| p.min + (p.max - p.min) * (0.15 + 0.1 * i as f64)).collect();
+        mark(&mut rig, &p, &own);
+        assert_marks(&marks(&mut rig, &p), &own, "marked");
+        let last = rig.app.clap_rigs()[7].1;
+        rig.app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": false}));
+
+        // Delete rig 3 (its Surge is unit 3): the others keep their state,
+        // its voice is freed.
+        rig.app.undo_job = None;
+        let out = rig.app.exec_tool("delete_rig", &serde_json::json!({"rig": 2, "confirm": true}));
+        assert_voiced(&mut rig, 7, &format!("after delete_rig ({out})"));
+        let mut without: Vec<f64> = own.clone();
+        without.remove(3);
+        assert_marks(&marks(&mut rig, &p), &without, "after deleting rig 3");
+        assert_eq!(rig.app.rig_sources[6], (false, true), "the last unit keeps its keyboard switch through the rig delete");
+
+        // Undo brings the rig back with the state its synth had.
+        let out = rig.app.exec_tool("undo", &serde_json::json!({}));
+        assert_voiced(&mut rig, 8, &format!("after undo ({out})"));
+        assert_marks(&marks(&mut rig, &p), &own, "after undo");
+        assert_eq!(rig.app.rig_sources[7], (false, true));
+
+        // Session round trip through a smaller rack.
+        let session = rig.app.capture_session("eight").unwrap();
+        rig.app.load_demo_patch();
+        assert_voiced(&mut rig, 2, "the demo patch again");
+        rig.app.apply_session(&session).unwrap();
+        assert_voiced(&mut rig, 8, "the session loaded back");
+        assert_marks(&marks(&mut rig, &p), &own, "after the session round trip");
+    }
+
+    /// The engine frees and binds voices on its own (remote AddNode /
+    /// RemoveNode): the app follows what the engine published, never its
+    /// own guess. Removing the first Surge left the app editing the freed
+    /// voice while the engine played the other one.
+    #[test]
+    fn the_app_follows_the_engines_binding_after_remote_edits() {
+        let Some(mut rig) = rig() else { return };
+        let p = volume_param(&mut rig.app);
+        let own = [p.min + (p.max - p.min) * 0.3, p.min + (p.max - p.min) * 0.8];
+        mark(&mut rig, &p, &own);
+        let (first, second) = (rig.app.clap_rigs()[0].1, rig.app.clap_rigs()[1].1);
+        let send = |rig: &mut EvalRig, cmd: Command| {
+            assert!(rig.app.bus.as_ref().unwrap().lock().unwrap().send(cmd));
+            rig.settle();
+        };
+        send(&mut rig, Command::RemoveNode(first));
+        assert_voiced(&mut rig, 1, "after a remote RemoveNode");
+        assert_eq!(rig.app.clap_rigs()[0].1, second);
+        assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
+
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
+        assert_voiced(&mut rig, 2, "after a remote AddNode");
+        assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
 }

@@ -43,7 +43,7 @@ Learned so far (2026-11-15, UI polish pass):
    "%[pixel:p{0,0}]" info:`); opaque white corners show as a white square on
    dark taskbars.
 3. **Cable colors:** keep audio jackets warm/neutral and MIDI jackets cool
-   (per-family palettes) — never mix the family hues; the TONE/WARM warming
+   (per-family palettes) — never mix the family hues; the WARM warming
    shift applies only to the neutral cream jacket, so tomato stays
    selection-only. Audio palette = cream/amber/rose/sand (a sage green
    slipped in and broke the warm family — check new hues against it).
@@ -94,9 +94,11 @@ Learned so far (2026-11-15, UI polish pass):
     claimed (hidden-rig) units when it opens instrument columns — another
     rig's synth left an empty gap column and shoved stacks against Master.
 19. **A new rig is playable or says why:** "+ Rig"/add_rig builds
-    `standard_rig_graph` (Keys→Surge→Master, wired) from the voice pool
-    (`VOICE_POOL`); idle pool voices skip `render`. Never ship a bare
-    Keys+Master just because the startup voices are used up.
+    `standard_rig_graph` (Keys→Surge→Master, wired) and the app hosts a
+    voice for its synth on demand (`sync_clap_slots`; there is no voice
+    pool and no cap). A plugin that cannot load says so (`plugin_msg`).
+    Never ship a bare Keys+Master, and never keep spare voices: a voice no
+    unit plays is retired.
 20. **`build_rack` resets view + mixer (active_rig = 0, rig_mix = unity):**
     restore remapped mix / the active rig AFTER `apply_session`/`build_rack`,
     never before — and the engine-sync rebuild restores the snapshot's
@@ -174,11 +176,12 @@ Learned so far (2026-11-15, UI polish pass):
     (clamped by `rtkit` to 200 ms) rather than `BUFFER_FRAMES` (~5.3 ms) to
     `promote_current_thread_to_real_time`; Surge XT applies `load_state` inside
     `process()`, which exceeds 5.3 ms and triggers `SIGXCPU` on `SCHED_RR`.
-39. **Share one patch-search helper with alias fallback:** `ui.rs` and `mcp.rs`
-    both call `host::search_surge_patches`; `find_surge_patch` and
-    `search_surge_patches` try literal matches first, then instrument aliases
-    (`wurlitzer` → `wurli`, `rhodes` → `suitcase`/`ep`, etc.) so common
-    queries don't miss and leave Surge on the init saw patch.
+39. **Share one sound-search helper with alias fallback:** every library
+    (Surge, Dexed, LV2, plugin presets) is searched by `sounds::search` and
+    `sounds::find`, from `ui.rs`, `mcp.rs` and the self-tests; they try
+    literal matches first, then instrument aliases (`wurlitzer` → `wurli`,
+    `rhodes` → `suitcase`/`ep`, etc.) so common queries don't miss and leave
+    Surge on the init saw patch.
 40. **`AddNode` for `Clap` must wire matrix + bind idle voices:** adding a
     CLAP node (`Command::AddNode`) left it disconnected in `Matrix` and
     unbound in `voices`, and `sync_from_engine` skipped `sync_clap_slots` when
@@ -317,6 +320,251 @@ Learned so far (2026-11-15, UI polish pass):
     instrument tools called `ui_bridge_tool("install_instrument")` but the
     app's serve list did not include them, so attached agents got "not
     served". `ui_bridge_tools_cover_mcp` reads mcp.rs and fails on any gap.
+67. **Knob names live in one table:** `engine::knob_specs` defines every
+    rack knob (label, default, param, aliases); `make_unit`, the UI resolver
+    and headless MCP all read it. Headless MCP used `dsp_param_choices` names,
+    so `knob="RESO"` failed and `CEILING` bound the DRIVE knob. Add knobs
+    there, never as a literal in a face or a resolver. A plugin's own
+    controls are the second table: its `MainControls` list, resolved by
+    `MainControls::find` in the app and in headless MCP alike (rule 90).
+68. **A knob on the face drives something, or is not bindable:** the
+    system-audio GAIN knob was visual only (no SetParam path). A knob with
+    `param: Some(..)` must reach the engine via `apply_engine_param`, and
+    any engine state it shows is published back (here `GraphPub::system_gain`).
+69. **LV2 event inputs append and clear; outputs announce capacity:** each
+    note became the WHOLE atom sequence and it was never cleared, so a
+    note-off and a note-on in one block (legato) lost the note-off and
+    setBfree droned; chords played only their last note. `queue_midi`
+    appends, `process` re-inits the input after `run()`, and every atom
+    OUTPUT gets an 8-byte-aligned Chunk header of full capacity before
+    `run()` (#38). `lv2-instrument-engine-test` plays chord + legato.
+70. **Agents read the engine's graph, and structural edits wait for it:**
+    attached MCP validated ids against the UI's lagging copy, so
+    add_node → connect said "node does not exist" and auto cable ids
+    collided (#37). The bridge answers get_graph from `GraphPub`, and a
+    structural `cmd` returns once the engine published it (≤ 250 ms).
+71. **Panels that follow the window use `exact_size`:** egui keeps a
+    panel's first `default_size`, so the keyboard dock never resized
+    (#23). Derive the size from `ctx.content_rect()` each frame.
+72. **LV2 instruments are what they declare:** `lv2:InstrumentPlugin` in
+    the plugin's `rdf:type` decides; any other lv2core class means effect.
+    The port guess (MIDI in + audio out) called 198 of 208 effects
+    instruments; it is only the fallback for class-less plugins (#26).
+73. **Every effect hears every source wired into it, in signal order:**
+    built-in effects summed only CLAP voices and audio inputs, and LV2 ran
+    after them, so setBfree → Drive and any effect → effect chain were
+    silent at the master while the input cable still glowed. Render step
+    2b runs DSP and LV2 effects in one dependency order (`next_effect`)
+    and sums via `sum_audio_into`; add any new node type as a source there.
+    `lv2-instrument-engine-test` plays setBfree through a Saturation unit.
+74. **Check a plugin test mask against rendered audio, not XML flags alone:**
+    Surge's `Gate Chord` clears `trigmask` bit 12 (no envelope retrigger),
+    yet step 12 opens the filter (`s12 = 0.833`) over step 11's envelope +
+    delay (~8% of onset energy), so treating bit 12 as silent shrank the
+    rotation margin until free-running unison phases flipped steps (#18).
+    Verify step/gate masks against actual rendered energy before shipping.
+75. **Agent tool calls wait for the engine:** `add_node`, `connect`,
+    `disconnect` and `remove_node` are applied by the engine, so in
+    `poll_assistant` each is a barrier: the next call of the batch and the
+    result wait until the rack adopted the publication, and the result names
+    the ids it created or removed, or says `NOT applied`. A `get_graph` right
+    after `add_node` read the stale mirror and the model added the unit twice.
+    Add any new engine-applied tool to `ENGINE_EDIT_TOOLS`.
+76. **A tool that removes a cable unplugs it in the rack too:**
+    `publish_patch` re-sends every living rack cable each frame, so the
+    assistant's `disconnect` (a bus command only) was undone in the same
+    engine block while it reported success. Use `unplug_cable`
+    (`the_disconnect_tool_removes_the_cable_for_good`).
+77. **Model tool calls are checked against the tool table, never defaulted:**
+    the worker's `parse_tool_call` answers an unknown tool or off-schema
+    arguments with an `error:` result the model can correct; `exec_tool`
+    silently used defaults. A tool's `required` list must match the flow the
+    prompt describes: `delete_rig` required `confirm` although the Confirm
+    flow starts without it (`the_tool_table_fits_the_argument_checker`).
+78. **Know what a model id is before it becomes a default:**
+    `typesafe/jev-router` is a router to chat models (answers came from Kimi
+    and Haiku at 1.2–9.6 s per step); Jev itself (`~typesafe/jev-latest`) is
+    a DECISIONS model on `/api/alpha/decisions` (typed questions in,
+    probabilities out, about 0.2 s) and rejects chat completions. Read the
+    provider's model entry (`architecture.output_modalities`), then run
+    `kabelsalat jev-test` and `kabelsalat agent-eval` before changing a
+    route's default. Never claim an agent speedup that agent-eval did not
+    measure.
+79. **Build output never goes to tmpfs, also not as a copy:** a 690 MB debug
+    binary copied into a scratch directory under `/tmp` filled the volume
+    and every command lost its output. Keep binaries and eval output under
+    `~/.cache/ksalat-*` and strip copies.
+80. **An engine barrier opens on the engine's answer, never on the rack's
+    own move:** `disconnect` unplugs its cable in the rack at once, so the
+    changed cable ids released the barrier before the engine had published.
+    The next `disconnect` of the step then ran while that publication was on
+    its way, `sync_from_engine` rebuilt the rack from it with the second
+    cable plugged in, and `publish_patch` re-connected it: every second
+    disconnect of a step reported `NOT applied`. `EngineEdit` keeps the
+    adopted `last_graph_rev` and reports "applied" only once it moved
+    (`every_disconnect_of_one_step_is_applied`).
+81. **Tell a model the base of an index it passes:** users say "rig 1",
+    tools take the 0-based `rig`. The chat model put a reverb into rig B
+    for "rig 1" in 2 of 22 runs; with the mapping stated in the system
+    prompt, 0 of 24 (`agent-eval --task reverb_and_tempo --runs 24`).
+82. **A turn with an image skips the decisions model:** measured with
+    `kabelsalat jev-test --image <file> <request>`. Jev reads a written note
+    (action `tempo` at p = 1.00) but its typed answers cannot return the
+    value the note states, and what it sees leaks into the other answers (a
+    mixer screenshot made it name rig 1 at p = 0.95 and a keys sound at
+    0.88 for a request that names neither). The seeing model
+    (`agent_perceive_model`) acts for that turn; re-measure before sending
+    images to Jev.
+83. **Assistant dock uses `exact_size`, a 176 px floor, and a clipped single-row header:**
+    `default_size` froze the panel at its first-frame height and `150` px left
+    one transcript line clipped by the header (`bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950`).
+84. **Fade `AGENT` badges out before their dark text vanishes:**
+    painting `AGENT_COLOR_TEXT` (`#1C1C1C`) on `alpha(AGENT_COLOR, t)` over a
+    `#1C1C1C` plate leaves an empty dark rectangle for `t <= 0.38`
+    (`bug2_untouched_units_paint_no_agent_badge_rect`).
+85. **Destructive confirms use `theme::danger_button(..., false)` (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text), never `theme::primary_button`:**
+    `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
+86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
+    duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
+87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`, and attachment thumbnails drop their `TextureHandle` on clear:**
+    align `Confirm`/`Cancel` and the attachment chip to the message text column (`78.0` px), load the ~32 px thumbnail once per `Image::bytes` Arc (`sync_chat_thumb`), and clear `chat_thumb` on removal/submit so egui frees the texture (`agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle`).
+88. **A key shows lit for as long as it is held, from every source:** only
+    laptop keys counted as held, so a note held on the FM-1 (or any hardware
+    keyboard) blinked for one 0.09 s LED tail and the key went dark while it
+    still sounded. `notes_down` keeps one bit per source per note, set on
+    note-on and cleared on note-off in `fire_keys_with`
+    (`held_notes_stay_lit_on_the_dock_until_released`).
+89. **A plugin knob is one of the plugin's own controls, under the plugin's
+    name:** every LV2 unit had a `GAIN` knob on control port 0, whatever that
+    port was (Vitalium: `lv2_freewheel`; setBfree has no control port, so the
+    knob moved nothing), and a CLAP unit had a visual-only `TONE`. Plugin
+    knobs come from `main_controls::resolve` (remote-controls pages, then
+    `param:` designations, then the first usable continuous parameters,
+    macros first); a port with any other designation (`lv2:freeWheeling`,
+    `lv2:enabled`) is the host's and is never offered to the player. Check
+    with `kabelsalat main-controls-test`.
+90. **Re-read a plugin's controls after a state load, without waiting to be
+    told:** Surge XT names its macros per patch ("M1: Cutoff") and announces
+    no `params.rescan`, so the list read at instantiation kept "M1: -" after
+    a patch load. `ClapVoiceMain::load_state` arms the next
+    `poll_main_controls` calls, and the face rebuilds its main knobs when the
+    list changed (`real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin`).
+91. **A control the plugin left unnamed is not a main control:** only 274 of
+    3008 installed Surge patches name a macro; the others report "M1: -",
+    which moves nothing. `resolve` skips a slot whose name has no letter or
+    digit after its tag and continues with the next remote-controls page.
+92. **Find a knob by label or id, never by position:** plugin knobs sit in
+    front of a unit's own knobs, and how many there are follows the plugin
+    and the unit's width. `units[1].knobs[1]` stopped being LEVEL; use
+    `Unit::knob_index("LEVEL")` or `cc_target()`, and never rebuild a unit's
+    knob row while one of its knobs is dragged (rule 10).
+
+93. **A sound tool works in the library of the rig's own instrument:**
+    `list_sounds` / `load_sound` searched Surge patches for every rig, so a
+    YANES or setBfree rig got Surge results and a load went into the wrong
+    plugin. The instrument is the key (`sounds::Instrument`, from the node's
+    kind), `Instrument::source` is the one table of where its sounds come
+    from, and every answer names the instrument and library. A new
+    instrument kind gets a `Source` there, never a branch in a tool. Check
+    with `kabelsalat sound-library-test` (every installed catalog instrument
+    lists, searches, loads one sound through the engine and sounds
+    different) and `agent-eval --task yanes_bass` / `organ_jazz`.
+94. **Find out where a plugin keeps its sounds before writing a browser:**
+    YANES has no preset files and no CLAP preset-discovery factory; its 146
+    presets are the values of a stepped "Preset" parameter. setBfree has no
+    LV2 presets; its 110 registrations are MIDI programmes it names in a
+    MIDNAM document (`lv2::midi_programs`). Instantiate the plugin, list its
+    parameters with their value texts and its extension data, and read its
+    source, before assuming a file format.
+95. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
+    label before any preference. Factory patches were preferred first, so
+    the listed "Third/Pads/Warm Pad" loaded the factory "Pads/Warm Pad"
+    (`a_listed_label_loads_exactly_that_sound`).
+96. **A search word no sound of the library holds is left out, never
+    fuzzy-ranked:** every setBfree programme is an organ and none is called
+    one, so "jazz organ" found nothing. `sounds::search` drops such words
+    (and reports them as `words_no_sound_has`) only when the full query
+    finds nothing; words the library does hold are never dropped, so a
+    "wobbly growling bass" still falls back to the kind as before.
+97. **A library scan never runs on the UI thread, and an agent call waits
+    for it:** `sounds::Libraries` scans on its own thread (the first
+    `list_sounds` walked about 3000 patch files on the UI thread) and
+    `build_rack` starts the scans of the rack's instruments. In
+    `poll_assistant` a sound tool whose library is still scanning is held
+    (`Waiting::SoundScan`) instead of answering "try again", which would
+    cost a model step. A preset parameter is read from the live plugin on
+    the UI thread, which is the CLAP main thread
+    (`a_sound_tool_waits_for_the_library_scan`).
+98. **A request that names one sound is not "a kind of sound":** widening
+    the Jev `load_sound` criterion (so "a jazz drawbar preset" settles
+    there) also pulled in "Load the patch Pads/Dreamscape", whose plan would
+    fall back to any pad. The plan hands a request with a `Category/Name`
+    label to the chat model. Compare `jev-test` outcomes for every sample
+    before and after changing a criterion.
+
+99. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
+    that hands over after running tools puts its calls into the
+    conversation; DeepSeek's thinking models (`deepseek-flash`) answer 400
+    ("reasoning_content … must be passed back") to an assistant tool call
+    whose id they did not issue, unless it has that field (empty is
+    enough; measured against the API, and OpenRouter's Gemini accepts it).
+    Every hand-over from a plan failed this way, for Surge too. `agent-eval
+    --task organ_no_pad` runs that path.
+100. **Rows in a fixed-width column take their widths from the column:**
+    size a flexible field as the remaining width minus the measured buttons
+    (`theme::chip_button_width` / `primary_button_width`), never a fixed
+    width in `horizontal_wrapped`. In Settings at 781 px, the model row
+    asked for 150 + 240 px plus Apply in a 328 px column. Apply wrapped
+    letter by letter, the column grew, and the right column, including
+    the UI-scale value, was pushed past the window. A status line of
+    several colors is one `LayoutJob` label: wrapped labels' galleys start
+    at the row's left edge (`leading_space`) and overlap.
+    `assert_settings_text_layout` checks containment and no overlap at
+    781x950, 760x520 and 1280x900.
+101. **egui tests that read popup paint advance `RawInput::time`:** an
+    Area fades in, so a popup's first frames paint its fill alpha-scaled
+    (`DARK_PANEL` read as `#0707073C` and looked like a wrong fill). Set
+    `raw.time` past `animation_time` each frame. Click as a user does
+    (move, press, release on separate frames, `click_at`): egui ignores a
+    click that lands on the frame right after its popup closed.
+102. **Per-voice state is a slot table with one entry per CLAP unit:**
+    `rig_sources` / `rig_device` / `patch_names` are refit to the CLAP
+    units by `fit_voice_tables` (in `build_rack`), any number of them.
+    Resolve a node with `voice_slot_of_node` (None only for non-CLAP
+    nodes), never index by a rig index or assume a size: fixed
+    `[_; VOICE_POOL]` arrays panicked on an undo with 5+ CLAP units, and
+    unknown nodes silently mapped to slot 0
+    (`any_number_of_clap_units_have_their_own_voice_state`).
+103. **The engine binds voices, the app follows:** which hosted voice plays
+    which Clap node is the engine's decision (`bind_free_voices`),
+    published as `GraphPub::voices`; `sync_clap_slots` maps units from it.
+    The app matched plugin ids in its own order, so after a remote
+    RemoveNode it edited the freed voice while the engine played the other
+    one. Where the app must know the binding before the engine answers (a
+    load it sends, to restore plugin state), it uses the engine's rule
+    `control::bind_voices`, never a guess of its own
+    (`the_app_follows_the_engines_binding_after_remote_edits`).
+104. **Engine state of a node starts over when a voice is bound to it:**
+    level, keyboard/hardware switches and device live in the `VoiceSlot`
+    but belong to the node; `VoiceSlot::bind` resets them. A voice kept
+    "keyboard off" across a template load while the UI showed it on.
+105. **MIDI routes belong to the Clap node, not to its voice:**
+    `GraphEngine::new` wired routes per startup voice, so a node whose
+    voice is hosted later never got a note (found by `many-voices-test`).
+    LoadGraph, AddNode and the constructor all route per Clap node.
+106. **Per-voice UI state travels by node id through every reload:** a rig
+    add/delete renumbers nodes and `apply_session` resets the switches, so
+    `edit_rigs` carries `VoiceRow`s through its id remap and the undo
+    snapshot holds them (device included). Adding a rig silently turned
+    every switched-off keyboard back on (rule 59 class).
+107. **The audio thread neither allocates nor frees for a voice:** the host
+    builds each `VoiceSlot` (with its render buffer), sends
+    `VoiceMsg::Grow` with a larger table ahead of the `Add` that would not
+    fit (and reserves the published list, `GraphPub::reserve_voices`), and
+    frees whatever comes back through `VoiceBack`. The old path
+    dropped a replaced voice's buffer in `render` and went silent past 32
+    voices. Voice messages are drained before every structural command,
+    so what the host sent before a load is in place when the load binds.
 
 ## Working on kabelsalat
 
@@ -324,14 +572,16 @@ Learned so far (2026-11-15, UI polish pass):
   and ideas = [GitHub issues](https://github.com/ssalentin/kabelsalat/issues)
   with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
   `testing`) and milestones per release; how and why it is built =
-  `docs/ARCHITECTURE.md`; released changes = `CHANGELOG.md` (add yours under
+  `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
+  released changes = `CHANGELOG.md` (add yours under
   **Unreleased**); rules = this file. Read open issues with
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
-- **Releases:** SemVer tags `vX.Y.Z` on `main`; move the CHANGELOG
-  **Unreleased** block under the new version, bump `Cargo.toml`, tag, then
-  `gh release create vX.Y.Z --notes-file <that block>`.
+- **Releases:** SemVer tags `vX.Y.Z` on `main`. Pushing the tag builds every
+  package (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and
+  publishes the GitHub release from that version's CHANGELOG block; the steps
+  before the tag are in `docs/PACKAGING.md` ("Cut a release").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
   `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
@@ -339,11 +589,24 @@ Learned so far (2026-11-15, UI polish pass):
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
   real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
-  `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
+  `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
-  (`./target/debug/kabelsalat <name>`).
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
+  `sound-library-test` (`./target/debug/kabelsalat <name>`).
+- **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
+  [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
+  (headless app, offline engine, real Surge voices, plus YANES and setBfree
+  for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
+  model APIs and costs a few cents; three requests carry an image, and
+  `look_at_rack` gets `docs/shots/mixer.png` in place of a window) and
+  `kabelsalat jev-test` shows Jev's decisions (`--image <file> <request>`
+  asks about one request without and with an image). A new shortcut row
+  needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
+  with
+  `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
+  `llm::fake::FakeTransport` (rule 37).
 - **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
   the running app); one-shot: `kabelsalat send '<json>'`.
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`

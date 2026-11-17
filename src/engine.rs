@@ -97,14 +97,86 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
         DspKind::Gain => &[(0, "Gain")],
         DspKind::Filter => &[(0, "Cutoff"), (1, "Resonance")],
         DspKind::Eq3 => &[(0, "Low"), (1, "High")],
-        DspKind::Limiter => &[(0, "Threshold"), (1, "Ceiling")],
+        DspKind::Limiter => &[(0, "Ceiling"), (1, "Drive")],
         DspKind::Saturation => &[(0, "Drive"), (1, "Mix")],
         DspKind::Pan => &[(0, "Pan")],
         DspKind::Metronome => &[],
     }
 }
 
-struct VoiceSlot {
+/// System-audio capture gain (0..=1, the same value `SetSystemAudio` sets),
+/// as a SetParam on a SystemAudio node so its GAIN knob and CC bindings work.
+pub const P_SYSTEM_GAIN: ParamId = 66;
+
+/// One rack-unit knob: the label on the face (canonical for agents too),
+/// its default, the engine param it drives (None = local-only), and the long
+/// names agents may use instead of the label.
+pub struct KnobSpec {
+    pub label: &'static str,
+    pub default: f32,
+    pub param: Option<ParamId>,
+    /// Not drawn as a knob (the face renders it as a chip); still bindable.
+    pub hidden: bool,
+    pub aliases: &'static [&'static str],
+}
+
+const fn ks(label: &'static str, default: f32, param: Option<ParamId>, aliases: &'static [&'static str]) -> KnobSpec {
+    KnobSpec { label, default, param, hidden: false, aliases }
+}
+
+/// A `'static` knob table: `const` items are promoted, `const fn` calls are not.
+macro_rules! knobs {
+    ($($k:expr),* $(,)?) => {{
+        const K: &[KnobSpec] = &[$($k),*];
+        K
+    }};
+}
+
+/// The knobs a rack unit shows for a node kind — the ONE table both the UI
+/// (`make_unit`, `resolve_unit_knob`) and headless MCP resolve knob names
+/// against, so `knob="RESO"` means the same knob everywhere.
+pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
+    match kind {
+        NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
+        // The plugin's main controls join LEVEL on the face (`main_controls`).
+        NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
+        NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
+        NodeKind::Dsp(dk) => match dk {
+            DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
+            DspKind::Reverb => knobs!(ks("MIX", 0.35, Some(0), &[]), ks("SIZE", 0.5, Some(1), &[])),
+            DspKind::Gain => knobs!(ks("GAIN", 0.9, Some(0), &[])),
+            DspKind::Filter => knobs!(ks("CUTOFF", 0.45, Some(0), &[]), ks("RESO", 0.2, Some(1), &["RESONANCE"])),
+            DspKind::Eq3 => knobs!(ks("LOW", 0.5, Some(0), &[]), ks("HIGH", 0.5, Some(1), &[])),
+            DspKind::Limiter => knobs!(ks("CEIL", 0.8, Some(0), &["CEILING"]), ks("DRIVE", 0.2, Some(1), &[])),
+            DspKind::Saturation => knobs!(ks("DRIVE", 0.4, Some(0), &[]), ks("MIX", 0.5, Some(1), &[])),
+            DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
+            DspKind::Metronome => &[],
+        },
+        // An LV2 unit's knobs are its plugin's main controls (`main_controls`):
+        // param 0 is whatever port the plugin lists first, never a "gain".
+        NodeKind::Lv2 { .. } => &[],
+        // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
+        NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
+        NodeKind::AudioIn { .. } => knobs!(
+            ks("GAIN", 0.5, Some(P_AUDIO_IN_GAIN), &[]),
+            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, aliases: &["MONITOR"] },
+        ),
+    }
+}
+
+/// Resolve a knob name (label or alias, any case) on a node kind.
+pub fn find_knob_spec(kind: &NodeKind, name: &str) -> Option<&'static KnobSpec> {
+    let q = name.trim();
+    knob_specs(kind)
+        .iter()
+        .find(|k| k.label.eq_ignore_ascii_case(q) || k.aliases.iter().any(|a| a.eq_ignore_ascii_case(q)))
+}
+
+/// A hosted CLAP voice inside the engine: the audio half of the plugin plus
+/// the per-instrument state of the Clap node it plays. Built off the audio
+/// thread (it owns its render buffer) and handed over with [`VoiceMsg::Add`].
+pub struct VoiceSlot {
+    /// The Clap node this voice plays; `NodeId::MAX` = free.
     node: NodeId,
     voice: ClapVoice,
     level: f32,
@@ -117,6 +189,62 @@ struct VoiceSlot {
     // device (per-device routing, AUM's "different keyboard per rig").
     rig_device: Option<u32>,
 }
+
+impl VoiceSlot {
+    pub fn new(voice: ClapVoice) -> Self {
+        Self {
+            node: NodeId::MAX,
+            voice,
+            level: 0.85,
+            scratch: vec![0.0; 8192 * 2],
+            src_keys: true,
+            src_hw: true,
+            rig_device: None,
+        }
+    }
+
+    pub fn voice_id(&self) -> u64 {
+        self.voice.voice_id()
+    }
+
+    /// The audio half, for `ClapVoiceMain::retire` on the plugin's main thread.
+    pub fn into_voice(self) -> ClapVoice {
+        self.voice
+    }
+
+    /// Play `node` (or go free with `NodeId::MAX`). Level and input switches
+    /// belong to the node, so they start over: a voice that kept
+    /// "keyboard off" from its last node was deaf on the next one.
+    fn bind(&mut self, node: NodeId) {
+        self.node = node;
+        self.level = 0.85;
+        self.src_keys = true;
+        self.src_hw = true;
+        self.rig_device = None;
+    }
+}
+
+/// Voice host → audio thread (`set_voice_channels`). Drained at block
+/// boundaries and before every structural command, so what the host sent
+/// before a load is in place when the load binds voices.
+pub enum VoiceMsg {
+    Add(VoiceSlot),
+    /// An empty table with more capacity than the engine's: the host sends
+    /// it before the `Add` that would not fit, so the audio thread never
+    /// allocates to hold another voice.
+    Grow(Vec<VoiceSlot>),
+    /// Hand the voice with this id back, whatever it plays.
+    Retire(u64),
+}
+
+/// Audio thread → voice host: everything the host has to free.
+pub enum VoiceBack {
+    Voice(VoiceSlot),
+    Table(Vec<VoiceSlot>),
+}
+
+/// Voices the engine holds before the host has to send a larger table.
+pub const VOICE_TABLE_CAP: usize = 32;
 
 /// Does this rig accept notes from the given source? (The MIDI cable gate is
 /// checked separately by the caller.)
@@ -429,7 +557,8 @@ fn block_peak(buf: &[f32]) -> f32 {
 }
 
 /// Per-rig mixer state (AUM overview strip). Unity by default.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RigMix {
     pub vol: f32,
     pub pan: f32,
@@ -488,7 +617,14 @@ pub struct GraphPub {
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
+    /// System-audio capture gain, published with the mix (same `mix_rev`).
+    pub system_gain: f32,
     pub mix_rev: u64,
+    /// Every hosted voice and the Clap node it plays (`NodeId::MAX` = free),
+    /// bumped by `voices_rev`. The engine binds voices; frontends that hold
+    /// the plugins' main halves read which one serves which node here.
+    pub voices: Vec<(u64, NodeId)>,
+    pub voices_rev: u64,
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
@@ -496,6 +632,20 @@ pub struct GraphPub {
     /// `meter_rev` every render block via a non-blocking `try_lock` (rule 33).
     pub meter: MeterSnapshot,
     pub meter_rev: u64,
+}
+
+fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
+    g.voices.clear();
+    g.voices.extend(voices.iter().map(|v| (v.voice.voice_id(), v.node)));
+    g.voices_rev = g.voices_rev.wrapping_add(1);
+}
+
+impl GraphPub {
+    /// Make room for `n` published voices. Called off the audio thread by
+    /// whoever raises the engine's voice capacity.
+    pub fn reserve_voices(&mut self, n: usize) {
+        self.voices.reserve(n.saturating_sub(self.voices.len()));
+    }
 }
 
 pub struct GraphEngine {
@@ -506,6 +656,8 @@ pub struct GraphEngine {
     dsp: Vec<DspSlot>,
     lv2: Vec<Lv2Slot>,
     lv2_in: Vec<f32>,
+    /// Per-block scratch: which effects already ran (render step 2b).
+    fx_done: Vec<bool>,
     master_vol: f32,
     master_warm: f32,
     /// Master bus limiter (zero latency) in front of the warmth stage: many
@@ -568,8 +720,14 @@ pub struct GraphEngine {
     audio_in_levels: Arc<AudioInLevels>,
     /// UI → audio: delivers a freshly-opened input ring's consumer to the slot.
     audio_in_rx: Option<rtrb::Consumer<(NodeId, rtrb::Consumer<f32>)>>,
-    // Runtime CLAP voice delivery + retirement side channels (UI <-> audio).
-    voice_rx: Option<rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>>,
+    // Runtime CLAP voice delivery + retirement side channels (host <-> audio).
+    voice_rx: Option<rtrb::Consumer<VoiceMsg>>,
+    voice_back_tx: Option<rtrb::Producer<VoiceBack>>,
+    /// Returns waiting while the host's ring is full (preallocated: dropping
+    /// a voice or a table here would free memory on the audio thread).
+    voice_backlog: Vec<VoiceBack>,
+    /// The voice table changed since its last publication (`GraphPub::voices`).
+    voices_dirty: bool,
     /// LV2 loader thread link (`spawn_lv2_loader`); None loads inline
     /// (tests, offline self-tests).
     lv2_req: Option<rtrb::Producer<Lv2Request>>,
@@ -580,7 +738,6 @@ pub struct GraphEngine {
     /// Slots waiting to be retired while the loader's queue is full
     /// (preallocated: freeing one here would stall the audio thread).
     lv2_retire_backlog: Vec<Lv2Slot>,
-    voice_retire_tx: Option<rtrb::Producer<ClapVoice>>,
     // Master recording tap (the final output). None = recording unavailable
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
@@ -603,20 +760,12 @@ impl GraphEngine {
         sample_rate: f64,
         voices_in: Vec<(NodeId, ClapVoice)>,
     ) -> Self {
-        let mut voices: Vec<VoiceSlot> = Vec::with_capacity(32);
-        voices.extend(
-            voices_in
-                .into_iter()
-                .map(|(node, voice)| VoiceSlot {
-                    node,
-                    voice,
-                    level: 0.85,
-                    scratch: vec![0.0; 8192 * 2],
-                    src_keys: true,
-                    src_hw: true,
-                    rig_device: None,
-                }),
-        );
+        let mut voices: Vec<VoiceSlot> = Vec::with_capacity(VOICE_TABLE_CAP.max(voices_in.len()));
+        voices.extend(voices_in.into_iter().map(|(node, voice)| {
+            let mut slot = VoiceSlot::new(voice);
+            slot.node = node;
+            slot
+        }));
         let dsp = graph
             .nodes
             .iter()
@@ -630,12 +779,14 @@ impl GraphEngine {
         // Default routing: every source class feeds every rig (full range).
         let mut matrix = Matrix::new();
         matrix.reserve(64);
-        for v in voices.iter().filter(|v| v.node != NodeId::MAX) {
-            matrix.connect(SourceId::Keys, v.node);
+        // Routes belong to the Clap node, not to the voice that plays it: a
+        // voice hosted after startup finds its node already routed.
+        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+            matrix.connect(SourceId::Keys, n.id);
             // Cover hardware device ids 0..MAX so any connected device routes;
             // the per-rig `rig_device` filter then selects which one is heard.
             for dev in 0..MAX_HW_DEVICES {
-                matrix.connect(SourceId::Hardware(dev), v.node);
+                matrix.connect(SourceId::Hardware(dev), n.id);
             }
         }
         for slot in &lv2 {
@@ -646,6 +797,7 @@ impl GraphEngine {
                 }
             }
         }
+        let route_cap = matrix.rules.len().max(64);
         Self {
             graph,
             drain,
@@ -654,6 +806,7 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
+            fx_done: Vec::with_capacity(256),
             master_vol: 1.0,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
@@ -667,7 +820,7 @@ impl GraphEngine {
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
             matrix,
-            route_out: Vec::with_capacity(64),
+            route_out: Vec::with_capacity(route_cap),
             #[cfg(test)]
             note_log: Vec::new(),
             #[cfg(test)]
@@ -690,11 +843,13 @@ impl GraphEngine {
             audio_in_levels: Arc::new(AudioInLevels::new()),
             audio_in_rx: None,
             voice_rx: None,
+            voice_back_tx: None,
+            voice_backlog: Vec::with_capacity(64),
+            voices_dirty: true,
             lv2_req: None,
             lv2_resp: None,
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
-            voice_retire_tx: None,
             recorder: None,
             record_sync: false,
             record_sync_pending: false,
@@ -814,13 +969,135 @@ impl GraphEngine {
     }
 
     /// Attach runtime CLAP voice delivery + retirement ring buffers.
-    pub fn set_voice_channels(
-        &mut self,
-        rx: rtrb::Consumer<(NodeId, ClapVoice, Vec<f32>)>,
-        retire_tx: rtrb::Producer<ClapVoice>,
-    ) {
+    pub fn set_voice_channels(&mut self, rx: rtrb::Consumer<VoiceMsg>, back_tx: rtrb::Producer<VoiceBack>) {
         self.voice_rx = Some(rx);
-        self.voice_retire_tx = Some(retire_tx);
+        self.voice_back_tx = Some(back_tx);
+    }
+
+    /// Test hook: drop the table's spare capacity, so a test reaches the
+    /// `VoiceMsg::Grow` path with a handful of voices. Returns the capacity.
+    #[cfg(test)]
+    pub(crate) fn shrink_voice_table(&mut self) -> usize {
+        self.voices.shrink_to_fit();
+        self.voices.capacity()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn voice_table_cap(&self) -> usize {
+        self.voices.capacity()
+    }
+
+    /// Give every voiceless Clap node, in graph order, the free voice of its
+    /// plugin with the lowest id (`control::bind_voices` is the same rule for
+    /// a host that has to know the outcome before the engine answers).
+    /// Allocation-free.
+    fn bind_free_voices(&mut self) {
+        for n in &self.graph.nodes {
+            let NodeKind::Clap { plugin_id } = &n.kind else { continue };
+            if self.voices.iter().any(|v| v.node == n.id) {
+                continue;
+            }
+            let key = crate::control::clap_plugin_key(name_str(plugin_id));
+            let free = self
+                .voices
+                .iter_mut()
+                .filter(|v| v.node == NodeId::MAX && v.voice.plugin_id() == key)
+                .min_by_key(|v| v.voice.voice_id());
+            if let Some(v) = free {
+                v.bind(n.id);
+            }
+        }
+        self.voices_dirty = true;
+    }
+
+    /// One note can reach every instrument: keep the routing scratch large
+    /// enough for all rules, so note routing never allocates (structural
+    /// ops only).
+    fn fit_route_out(&mut self) {
+        let need = self.matrix.rules.len();
+        if self.route_out.capacity() < need {
+            self.route_out.reserve(need - self.route_out.len());
+        }
+    }
+
+    fn send_back(&mut self, item: VoiceBack) {
+        let item = match self.voice_back_tx.as_mut() {
+            Some(tx) => match tx.push(item) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(item)) => item,
+            },
+            None => item,
+        };
+        if self.voice_backlog.len() < self.voice_backlog.capacity() {
+            self.voice_backlog.push(item);
+        } else {
+            // Nobody takes returns and the backlog is full: a leak is the
+            // only way left that does not free on the audio thread.
+            std::mem::forget(item);
+        }
+    }
+
+    /// Apply what the voice host sent: new voices, a larger table, voices
+    /// to hand back. Allocation-free (the host allocates, the host frees).
+    fn drain_voice_msgs(&mut self) {
+        while let Some(item) = self.voice_backlog.pop() {
+            let Some(tx) = self.voice_back_tx.as_mut() else {
+                self.voice_backlog.push(item);
+                break;
+            };
+            if let Err(rtrb::PushError::Full(item)) = tx.push(item) {
+                self.voice_backlog.push(item);
+                break;
+            }
+        }
+        let mut changed = false;
+        loop {
+            let Some(rx) = self.voice_rx.as_mut() else { break };
+            let Ok(msg) = rx.pop() else { break };
+            match msg {
+                VoiceMsg::Add(slot) => {
+                    if self.voices.len() < self.voices.capacity() {
+                        self.voices.push(slot);
+                        changed = true;
+                    } else {
+                        self.send_back(VoiceBack::Voice(slot));
+                    }
+                }
+                VoiceMsg::Grow(mut table) => {
+                    if table.capacity() > self.voices.capacity() {
+                        table.extend(self.voices.drain(..));
+                        std::mem::swap(&mut self.voices, &mut table);
+                    }
+                    self.send_back(VoiceBack::Table(table));
+                }
+                VoiceMsg::Retire(id) => {
+                    if let Some(i) = self.voices.iter().position(|v| v.voice.voice_id() == id) {
+                        let slot = self.voices.swap_remove(i);
+                        self.send_back(VoiceBack::Voice(slot));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.bind_free_voices();
+        }
+    }
+
+    /// Publish the voice table when it changed outside a graph publication:
+    /// a non-blocking lock, retried next block (rule 33).
+    fn publish_voices(&mut self) {
+        if !self.voices_dirty {
+            return;
+        }
+        let Some(p) = &self.graph_pub else {
+            self.voices_dirty = false;
+            return;
+        };
+        if let Ok(mut g) = p.try_lock() {
+            write_voices(&mut g, &self.voices);
+            self.voices_dirty = false;
+        }
     }
 
     /// Attach a system-audio capture source (started off the audio thread).
@@ -935,6 +1212,11 @@ impl GraphEngine {
     /// Attach the shared graph publication (main-thread setup, before the
     /// engine moves to the audio thread).
     pub fn set_graph_pub(&mut self, p: Arc<Mutex<GraphPub>>) {
+        // Room for the voice list now, so publishing it never allocates on
+        // the audio thread (the host reserves again when it sends `Grow`).
+        if let Ok(mut g) = p.lock() {
+            g.reserve_voices(self.voices.capacity());
+        }
         self.graph_pub = Some(p);
     }
 
@@ -948,9 +1230,12 @@ impl GraphEngine {
                 g.graph = self.graph.clone();
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
+                g.system_gain = self.system_gain;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
                 g.transport = tp;
                 g.transport_rev = g.transport_rev.wrapping_add(1);
+                write_voices(&mut g, &self.voices);
+                self.voices_dirty = false;
             }
         }
     }
@@ -1012,9 +1297,47 @@ impl GraphEngine {
         }
     }
 
+    /// The next effect to run: the first not-yet-run one whose wired effect
+    /// inputs have all run; in a feedback loop, the first not-yet-run one.
+    /// Allocation-free (linear scans over a handful of nodes).
+    fn next_effect(&self, n_dsp: usize, n_fx: usize) -> Option<usize> {
+        let node = |f: usize| if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
+        let mut first = None;
+        for f in 0..n_fx {
+            if self.fx_done[f] { continue; }
+            first.get_or_insert(f);
+            let waits = (0..n_fx).any(|g| {
+                g != f && !self.fx_done[g] && self.graph.has_route(node(g), node(f), PortKind::Audio)
+            });
+            if !waits { return Some(f); }
+        }
+        first
+    }
+
+    /// Sum every audio source wired into `dest` into `out` (stereo
+    /// interleaved). Allocation-free.
+    fn sum_audio_into(&self, dest: NodeId, out: &mut [f32]) {
+        out.fill(0.0);
+        let mut add = |src: NodeId, buf: &[f32]| {
+            if src != dest && self.graph.has_route(src, dest, PortKind::Audio) {
+                for (o, x) in out.iter_mut().zip(buf) { *o += *x; }
+            }
+        };
+        for v in &self.voices { if v.node != NodeId::MAX { add(v.node, &v.scratch); } }
+        for a in &self.audio_in { add(a.node, &a.buf); }
+        for d in &self.dsp { add(d.node, &d.buf); }
+        for l in &self.lv2 { add(l.node, &l.buf); }
+    }
+
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
+    }
+
+    /// Current plain value of an LV2 node's nth control input (verification).
+    pub fn lv2_control_value(&self, node: NodeId, nth: usize) -> Option<f32> {
+        let slot = self.lv2.iter().find(|s| s.node == node)?;
+        slot.plugin.control_descs().get(nth).map(|c| c.value)
     }
 
     fn has_midi_cable(&self, dest: NodeId) -> bool {
@@ -1043,6 +1366,16 @@ impl GraphEngine {
         }
     }
 
+    /// One setter for the system-audio gain (SetSystemAudio and the GAIN knob
+    /// alike); the mixer publication carries it back to the UI (rule 33).
+    fn set_system_gain(&mut self, gain: f32) {
+        let g = gain.clamp(0.0, 1.0);
+        if g != self.system_gain {
+            self.system_gain = g;
+            self.mix_dirty = true;
+        }
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
@@ -1057,6 +1390,11 @@ impl GraphEngine {
                 return true;
             }
             false
+        } else if param == P_SYSTEM_GAIN
+            && self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::SystemAudio))
+        {
+            self.set_system_gain(v);
+            true
         } else if self.audio_in.iter().any(|s| s.node == node) {
             let Some(s) = self.audio_in.iter_mut().find(|s| s.node == node) else {
                 return false;
@@ -1114,6 +1452,9 @@ impl GraphEngine {
     }
 
     fn apply(&mut self, cmd: Command) {
+        if matches!(cmd, Command::AddNode { .. } | Command::LoadGraph { .. } | Command::LoadRigs { .. }) {
+            self.drain_voice_msgs();
+        }
         match cmd {
             Command::AddNode { kind, name, rig } => {
                 let id = self.graph.add_node(kind.clone(), name);
@@ -1130,19 +1471,13 @@ impl GraphEngine {
                     NodeKind::AudioIn { device, channels } => {
                         self.audio_in.push(AudioInSlot::new(id, *channels, device.clone()));
                     }
-                    NodeKind::Clap { plugin_id } => {
+                    NodeKind::Clap { .. } => {
                         self.matrix.connect(SourceId::Keys, id);
                         for dev in 0..MAX_HW_DEVICES {
                             self.matrix.connect(SourceId::Hardware(dev), id);
                         }
-                        let pid = name_str(plugin_id);
-                        if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX && v.voice.plugin_id() == pid) {
-                            v.node = id;
-                        } else if pid.is_empty() || pid == "Surge XT" {
-                            if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX) {
-                                v.node = id;
-                            }
-                        }
+                        self.fit_route_out();
+                        self.bind_free_voices();
                     }
                     _ => {}
                 }
@@ -1160,7 +1495,7 @@ impl GraphEngine {
                 }
                 for s in &mut self.voices {
                     if s.node == id {
-                        s.node = u32::MAX;
+                        s.bind(NodeId::MAX);
                     }
                 }
                 self.publish_graph();
@@ -1205,6 +1540,14 @@ impl GraphEngine {
                     }
                 }
             }
+            Command::ProgramChange { node, program } => {
+                let program = program.min(127);
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                    s.plugin.program_change(program);
+                } else if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                    s.voice.program_change_rt(program);
+                }
+            }
             Command::LoadGraph { graph } => {
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
@@ -1232,31 +1575,19 @@ impl GraphEngine {
                     self.retire_lv2(slot);
                 }
                 self.lv2_gen = self.lv2_gen.wrapping_add(1);
-                // Remap existing CLAP voices onto the new Clap nodes by matching
-                // plugin_id (falling back to any idle Surge voice for legacy
-                // "Surge XT" / empty ids); unmatched voices go idle (u32::MAX).
-                let clap_nodes: Vec<(NodeId, String)> = self
+                // The hosted voices move over to the new graph's Clap nodes;
+                // voices it has no node for stay free.
+                for v in &mut self.voices {
+                    v.bind(NodeId::MAX);
+                }
+                self.bind_free_voices();
+                let clap_ids: Vec<NodeId> = self
                     .graph
                     .nodes
                     .iter()
-                    .filter_map(|n| match &n.kind {
-                        NodeKind::Clap { plugin_id } => Some((n.id, name_str(plugin_id).to_string())),
-                        _ => None,
-                    })
+                    .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
+                    .map(|n| n.id)
                     .collect();
-                for v in &mut self.voices {
-                    v.node = u32::MAX;
-                }
-                for (id, pid) in &clap_nodes {
-                    if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX && v.voice.plugin_id() == pid) {
-                        v.node = *id;
-                    } else if pid.is_empty() || pid == "Surge XT" {
-                        if let Some(v) = self.voices.iter_mut().find(|v| v.node == u32::MAX) {
-                            v.node = *id;
-                        }
-                    }
-                }
-                let clap_ids: Vec<NodeId> = clap_nodes.iter().map(|(id, _)| *id).collect();
                 self.matrix = Matrix::new();
                 self.matrix.reserve(64);
                 for &id in &clap_ids {
@@ -1265,6 +1596,7 @@ impl GraphEngine {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
                 }
+                self.fit_route_out();
                 self.rig_meta.clear();
                 for i in 0..self.graph.nodes.len() {
                     if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
@@ -1558,9 +1890,7 @@ impl GraphEngine {
                     self.publish_graph();
                 }
             }
-            Command::SetSystemAudio { gain } => {
-                self.system_gain = gain.clamp(0.0, 1.0);
-            }
+            Command::SetSystemAudio { gain } => self.set_system_gain(gain),
             Command::SetAudioIn { node, device, channels } => {
                 // Structural: rewrite the node's device/channels, rebuild its
                 // slot, and publish so frontends adopt the selection.
@@ -1771,38 +2101,8 @@ impl GraphEngine {
             self.record_sync_pending = false;
             self.record_start();
         }
-        // Attach any runtime-loaded CLAP voices delivered from the UI thread.
-        while let Some(rx) = self.voice_rx.as_mut() {
-            let Ok((node, voice, scratch)) = rx.pop() else { break };
-            if let Some(slot) = self.voices.iter_mut().find(|s| s.node == node) {
-                let old = std::mem::replace(&mut slot.voice, voice);
-                if let Some(tx) = self.voice_retire_tx.as_mut() {
-                    let _ = tx.push(old);
-                }
-            } else if self.voices.len() < self.voices.capacity() {
-                self.voices.push(VoiceSlot {
-                    node,
-                    voice,
-                    level: 0.85,
-                    scratch,
-                    src_keys: true,
-                    src_hw: true,
-                    rig_device: None,
-                });
-            } else if let Some(slot) = self.voices.iter_mut().find(|s| s.node == u32::MAX) {
-                slot.node = node;
-                slot.level = 0.85;
-                slot.src_keys = true;
-                slot.src_hw = true;
-                slot.rig_device = None;
-                let old = std::mem::replace(&mut slot.voice, voice);
-                if let Some(tx) = self.voice_retire_tx.as_mut() {
-                    let _ = tx.push(old);
-                }
-            } else if let Some(tx) = self.voice_retire_tx.as_mut() {
-                let _ = tx.push(voice);
-            }
-        }
+        self.drain_voice_msgs();
+        self.publish_voices();
         // Attach freshly-opened input captures (UI opened a device for a node):
         // a (node, ring consumer) pair, swapped in place of any stale consumer.
         while let Some(rx) = self.audio_in_rx.as_mut() {
@@ -1817,6 +2117,7 @@ impl GraphEngine {
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
+                    g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
                 },
@@ -1836,7 +2137,7 @@ impl GraphEngine {
 
         // 1. Every instrument renders and applies its level.
         for s in &mut self.voices {
-            // Idle pool voice (no Clap node mapped): skip the plugin entirely.
+            // A free voice (no Clap node bound): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
             s.voice.render(&mut s.scratch[..n2], self.transport);
             for x in s.scratch[..n2].iter_mut() {
@@ -1847,31 +2148,6 @@ impl GraphEngine {
         // 1a. Audio In nodes: pull the input ring into each node's stereo
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
-
-        // 2. Each DSP node sums the instruments wired into it, then processes.
-        for d in &mut self.dsp {
-            if d.kind == DspKind::Metronome {
-                continue; // generated below from transport state, no inputs
-            }
-            for x in d.buf[..n2].iter_mut() {
-                *x = 0.0;
-            }
-            for v in &self.voices {
-                if self.graph.has_route(v.node, d.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        d.buf[i] += v.scratch[i];
-                    }
-                }
-            }
-            for a in &self.audio_in {
-                if self.graph.has_route(a.node, d.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        d.buf[i] += a.buf[i];
-                    }
-                }
-            }
-            d.proc.process(&mut d.buf[..n2], frames);
-        }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
@@ -1936,27 +2212,32 @@ impl GraphEngine {
             }
         }
 
-        // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
-        for slot in &mut self.lv2 {
-            for x in self.lv2_in[..n2].iter_mut() {
-                *x = 0.0;
+        // 2b. Effects — built-in DSP and LV2 alike — in signal-flow order,
+        // each summing EVERY audio source wired into it: instruments (CLAP and
+        // LV2), audio inputs, metronomes and other effects. Built-in effects
+        // used to hear only CLAP voices and audio inputs, and LV2 ran after
+        // them, so setBfree → Drive and Delay → Reverb were silent. A feedback
+        // loop reads the previous block's output of the effect not yet run.
+        let mut bus = std::mem::take(&mut self.lv2_in);
+        let n_dsp = self.dsp.len();
+        let n_fx = n_dsp + self.lv2.len();
+        self.fx_done.clear();
+        self.fx_done.extend((0..n_dsp).map(|i| self.dsp[i].kind == DspKind::Metronome));
+        self.fx_done.extend(std::iter::repeat(false).take(self.lv2.len()));
+        while let Some(f) = self.next_effect(n_dsp, n_fx) {
+            self.fx_done[f] = true;
+            let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
+            self.sum_audio_into(node, &mut bus[..n2]);
+            if f < n_dsp {
+                let d = &mut self.dsp[f];
+                d.buf[..n2].copy_from_slice(&bus[..n2]);
+                d.proc.process(&mut d.buf[..n2], frames);
+            } else {
+                let slot = &mut self.lv2[f - n_dsp];
+                slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
             }
-            for v in &self.voices {
-                if self.graph.has_route(v.node, slot.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        self.lv2_in[i] += v.scratch[i];
-                    }
-                }
-            }
-            for a in &self.audio_in {
-                if self.graph.has_route(a.node, slot.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        self.lv2_in[i] += a.buf[i];
-                    }
-                }
-            }
-            slot.plugin.process(&self.lv2_in[..n2], &mut slot.buf[..n2], frames);
         }
+        self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
         // Pull system-audio capture once per block (RT-safe ring pop).
@@ -2407,6 +2688,35 @@ mod tests {
         assert_eq!(e.graph().node(1).unwrap().split, None);
     }
 
+    /// A voice carried "keyboard off" from the node it played before a
+    /// load onto the node it plays after it, while every frontend showed
+    /// the default again. Real Surge XT; skipped when it is not installed.
+    #[test]
+    fn a_load_gives_every_clap_node_the_default_inputs_again() {
+        let Ok((voice, _main)) = crate::host::ClapVoice::new(48000.0) else { return };
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::demo_patch(), drain, 48000.0, vec![(1, voice)]);
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut peak_of_a_note = |engine: &mut super::GraphEngine, bus: &mut crate::control::CommandBus| {
+            bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+            let mut peak = 0.0f32;
+            for _ in 0..40 {
+                engine.render(&mut buf, 2);
+                peak = peak.max(super::block_peak(&buf));
+            }
+            bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+            for _ in 0..200 {
+                engine.render(&mut buf, 2);
+            }
+            peak
+        };
+        bus.send(Command::SetRigSource { node: 1, keyboard: false, hardware: true });
+        assert!(peak_of_a_note(&mut engine, &mut bus) < 1e-4, "keyboard off: the synth ignores the keys");
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let peak = peak_of_a_note(&mut engine, &mut bus);
+        assert!(peak > 1e-3, "after a load the synth hears the keyboard again (peak {peak})");
+    }
+
     #[test]
     fn rig_source_filter_is_a_keyboard_hardware_pair() {
         use super::source_allowed;
@@ -2519,11 +2829,11 @@ mod tests {
         // Routing honors the edit: note 48 (in zone) transposes to 36.
         let mut out = Vec::new();
         engine.matrix.route_into(SourceId::Keys, MidiMsg::note_on(2, 48, 100), &mut out);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].1.note(), 36);
+        let to_1 = |out: &[(u32, MidiMsg)]| out.iter().filter(|(d, _)| *d == 1).map(|(_, m)| m.note()).collect::<Vec<u8>>();
+        assert_eq!(to_1(&out), [36]);
         // Note 60 is outside the zone → filtered.
         engine.matrix.route_into(SourceId::Keys, MidiMsg::note_on(2, 60, 100), &mut out);
-        assert!(out.is_empty());
+        assert!(to_1(&out).is_empty());
         // Unknown pair (device 9 → node 2) creates a rule.
         let before = engine.matrix.rules.len();
         bus.send(Command::MatrixRule {
@@ -2557,6 +2867,58 @@ mod tests {
         assert_eq!(p.rev, 1, "rule edit must bump the publication rev");
         let r = p.rules.iter().find(|r| r.source == SourceId::Keys && r.dest == 1).unwrap();
         assert_eq!(r.transpose, 7);
+    }
+
+    /// #21: the system-audio GAIN knob is a real SetParam (and so CC-bindable),
+    /// and the gain goes back to frontends like SetSystemAudio's does.
+    #[test]
+    fn system_audio_gain_knob_sets_and_publishes_the_capture_gain() {
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::demo_patch();
+        let sys = g.add_node(NodeKind::SystemAudio, name_bytes("SYSTEM AUDIO"));
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::SetParam { node: sys, param: super::P_SYSTEM_GAIN, value: 0.6 });
+        engine.render(&mut buf, 2);
+        assert!((engine.system_gain - 0.6).abs() < 1e-6);
+        assert!((pub_.lock().unwrap().system_gain - 0.6).abs() < 1e-6, "published for the knob mirror");
+        // The param id means nothing on another node kind.
+        bus.send(Command::SetParam { node: 1, param: super::P_SYSTEM_GAIN, value: 0.1 });
+        engine.render(&mut buf, 2);
+        assert!((engine.system_gain - 0.6).abs() < 1e-6);
+        // SetSystemAudio (tool path) publishes too.
+        bus.send(Command::SetSystemAudio { gain: 0.25 });
+        engine.render(&mut buf, 2);
+        assert!((pub_.lock().unwrap().system_gain - 0.25).abs() < 1e-6);
+        // A CC bound to the knob (CcTarget::Knob) reaches the same setter.
+        assert!(engine.apply_engine_param(sys, super::P_SYSTEM_GAIN, 1.0));
+        assert!((engine.system_gain - 1.0).abs() < 1e-6);
+    }
+
+    /// #19: one knob table — rack labels canonical, long names as aliases.
+    #[test]
+    fn knob_specs_resolve_rack_labels_and_aliases() {
+        use super::find_knob_spec;
+        use crate::control::DspKind;
+        let filter = NodeKind::Dsp(DspKind::Filter);
+        assert_eq!(find_knob_spec(&filter, "reso").and_then(|k| k.param), Some(1));
+        assert_eq!(find_knob_spec(&filter, "RESONANCE").map(|k| k.label), Some("RESO"));
+        let lim = NodeKind::Dsp(DspKind::Limiter);
+        // CEILING is the CEIL knob (param 0), never DRIVE (param 1).
+        assert_eq!(find_knob_spec(&lim, "CEILING").and_then(|k| k.param), Some(0));
+        assert_eq!(find_knob_spec(&lim, "DRIVE").and_then(|k| k.param), Some(1));
+        assert!(find_knob_spec(&lim, "THRESHOLD").is_none());
+        // Engine param names agree with the knob a param drives.
+        for dk in [DspKind::Delay, DspKind::Reverb, DspKind::Gain, DspKind::Filter, DspKind::Eq3,
+                   DspKind::Limiter, DspKind::Saturation, DspKind::Pan] {
+            let kind = NodeKind::Dsp(dk.clone());
+            for &(id, name) in super::dsp_param_choices(&dk) {
+                let spec = find_knob_spec(&kind, name).unwrap_or_else(|| panic!("{dk:?} '{name}' has no knob"));
+                assert_eq!(spec.param, Some(id), "{dk:?} '{name}'");
+            }
+        }
     }
 
     /// Two metronomes: M1 wired to the master (audible), M2 unwired. Returns
@@ -2594,6 +2956,35 @@ mod tests {
             peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
         }
         peak
+    }
+
+    /// Effects hear every wired source, in signal-flow order whatever the
+    /// node order: Metronome → Gain A → Gain B → Master, with Gain B added
+    /// first. Built-in effects heard only CLAP voices and audio inputs, so
+    /// any chain of two effects (or LV2 → effect, like setBfree → Drive)
+    /// was silent at the master.
+    #[test]
+    fn effect_chains_reach_the_master_in_signal_order() {
+        use crate::control::DspKind;
+        let mut g = crate::control::Graph::default();
+        let gain_b = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN B"));
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+        let gain_a = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN A"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: gain_a, port: 0 }, PortKind::Audio);
+        g.connect_with_id(2, PortRef { node: gain_a, port: 0 }, PortRef { node: gain_b, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: gain_b, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        for n in [gain_a, gain_b] {
+            bus.send(Command::SetParam { node: n, param: 0, value: 0.9 });
+        }
+        bus.send(Command::SetNodePlaying { node: metro, playing: true });
+        let peak = peak_1s(&mut engine);
+        assert!(peak > 0.01, "the click passes two effects to the master: peak {peak}");
+        // A feedback loop (B → A) must not hang the render.
+        bus.send(Command::Connect { id: 4, from: PortRef { node: gain_b, port: 0 }, to: PortRef { node: gain_a, port: 0 }, kind: PortKind::Audio });
+        assert!(peak_1s(&mut engine).is_finite());
     }
 
     #[test]
@@ -3538,6 +3929,47 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     println!("lv2-instrument-engine-test: {uri}: master peak silent={before:.4} held={held:.4} 4-5 s after release={after:.4}");
     anyhow::ensure!(held > 1e-3, "LV2 instrument {uri} is silent at the master while a key is held");
     anyhow::ensure!(after < held * 0.01, "LV2 instrument {uri} keeps sounding after note-off");
+    // A chord pressed and released within one block each: every note-off
+    // must reach the plugin (one event per block left a note hanging).
+    for n in [60u8, 64, 67] {
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+    }
+    let chord = peak_over(&mut engine, 47);
+    for n in [60u8, 64, 67] {
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+    }
+    peak_over(&mut engine, 375);
+    let chord_after = peak_over(&mut engine, 94);
+    println!("lv2-instrument-engine-test: chord held={chord:.4} 4-5 s after one-block release={chord_after:.4}");
+    anyhow::ensure!(chord > 1e-3, "LV2 instrument {uri} is silent for a chord");
+    anyhow::ensure!(chord_after < chord * 0.01, "LV2 instrument {uri} leaves a chord note hanging after note-off");
+    // Legato: release 60 and press 62 in the same block, then release 62.
+    // With one event per block the note-off for 60 was lost (a hanging
+    // organ note, reported live with setBfree).
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    peak_over(&mut engine, 20);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    let legato = peak_over(&mut engine, 20);
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    peak_over(&mut engine, 375);
+    let legato_after = peak_over(&mut engine, 94);
+    println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
+    anyhow::ensure!(legato_after < legato * 0.01, "LV2 instrument {uri} leaves a legato note hanging (note-off and note-on in one block)");
+    // Through a built-in effect, like a live organ rig (setBfree → Drive →
+    // Master): the effect must hear the LV2 instrument.
+    let drive = master + 1;
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0 });
+    bus.send(Command::Disconnect(2));
+    bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
+    peak_over(&mut engine, 5);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let through = peak_over(&mut engine, 47);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak_over(&mut engine, 100);
+    println!("lv2-instrument-engine-test: through a Saturation unit: master peak held={through:.4}");
+    anyhow::ensure!(through > 1e-3, "LV2 instrument {uri} → built-in effect → Master is silent");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
     Ok(())
 }
@@ -3592,6 +4024,200 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
     }
     anyhow::ensure!(worst[1] < std::time::Duration::from_millis(5), "render blocked {:?} with the loader", worst[1]);
     println!("lv2-async-test: OK — the loader keeps every render block under one buffer while {uri} loads");
+    Ok(())
+}
+
+/// What a held note sounds like, coarsely: loudness, pitch-ish zero-crossing
+/// rate and brightness (high-frequency share).
+#[derive(Clone, Copy)]
+struct Timbre {
+    rms: f32,
+    zero_cross_hz: f32,
+    brightness: f32,
+}
+
+impl Timbre {
+    /// How far apart two timbres are: the sum of their relative differences.
+    fn distance(self, other: Timbre) -> f32 {
+        let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(b.abs()).max(1e-6);
+        rel(self.rms, other.rms) + rel(self.zero_cross_hz, other.zero_cross_hz) + rel(self.brightness, other.brightness)
+    }
+}
+
+/// Hold `note` for half a second at the engine's master and describe it,
+/// then release it and let the tail ring out.
+fn timbre_of_note(engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8, sr: f64) -> Timbre {
+    use crate::control::Command;
+    use crate::matrix::SourceId;
+    let mut buf = vec![0.0f32; 512 * 2];
+    bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    let (mut zc, mut sq, mut dsq, mut n, mut prev) = (0usize, 0.0f64, 0.0f64, 0usize, 0.0f32);
+    for _ in 0..(sr as usize / 2 / 512) {
+        engine.render(&mut buf, 2);
+        for f in buf.chunks(2) {
+            let x = f[0];
+            if (x > 0.0) != (prev > 0.0) { zc += 1; }
+            sq += (x * x) as f64;
+            dsq += ((x - prev) * (x - prev)) as f64;
+            prev = x;
+            n += 1;
+        }
+    }
+    bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    for _ in 0..(sr as usize * 2 / 512) { engine.render(&mut buf, 2); }
+    let rms = (sq / n as f64).sqrt() as f32;
+    Timbre { rms, zero_cross_hz: zc as f32 / n as f32 * sr as f32 / 2.0, brightness: (dsq / n as f64).sqrt() as f32 / rms.max(1e-9) }
+}
+
+/// One instrument of `sound-library-test`: its library, a search, and one
+/// sound loaded through the engine. Ok(line) describes what was proven.
+fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> anyhow::Result<String> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::sounds::{Instrument, Libraries, Load, Lookup, Target};
+    let sr = 48000.0;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let kind = match instrument {
+        Instrument::Clap(id) => NodeKind::Clap { plugin_id: name_bytes(id) },
+        Instrument::Lv2(uri) => NodeKind::Lv2 { uri: Lv2Uri::new(uri) },
+    };
+    let node = g.add_node(kind, name_bytes("INSTRUMENT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let (mut engine, mut clap) = match instrument {
+        Instrument::Clap(id) => {
+            let (voice, main) = crate::host::ClapVoice::new_plugin(sr, id)?;
+            let controller = voice.controller();
+            (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((main, controller)))
+        }
+        Instrument::Lv2(uri) => {
+            // The app's path: the loader thread instantiates the plugin.
+            let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+            engine.spawn_lv2_loader();
+            bus.send(Command::LoadGraph { graph: g });
+            let start = std::time::Instant::now();
+            while !engine.lv2.iter().any(|s| s.node == node) {
+                anyhow::ensure!(start.elapsed() < std::time::Duration::from_secs(10), "{uri} never attached");
+                engine.render(&mut buf, 2);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            (engine, None)
+        }
+    };
+
+    let library = match Libraries::blocking(crate::sounds::scan).get(instrument) {
+        Lookup::Ready(library) => library,
+        Lookup::AskPlugin => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("a preset parameter needs the live plugin"))?;
+            let params = main.param_list();
+            std::sync::Arc::new(crate::sounds::preset_param_library(&params, |id, value| main.param_text(id, value)))
+        }
+        Lookup::Scanning => anyhow::bail!("a blocking library never reports a scan in progress"),
+    };
+    anyhow::ensure!(!library.sounds.is_empty(), "no {} found (its parameters: {})", library.kind, library.params.iter().take(6).cloned().collect::<Vec<_>>().join(", "));
+    let hits = crate::sounds::search(&library.sounds, query, 5).labels;
+    let label = hits.first().ok_or_else(|| anyhow::anyhow!("no {} matches '{query}' ({} in the library)", library.kind, library.sounds.len()))?;
+    let sound = crate::sounds::find(&library.sounds, label).ok_or_else(|| anyhow::anyhow!("'{label}' was listed but is not found"))?;
+    anyhow::ensure!(sound.label() == *label, "'{label}' was listed, but find picks '{}'", sound.label());
+
+    for _ in 0..20 { engine.render(&mut buf, 2); }
+    let before = timbre_of_note(&mut engine, &mut bus, 60, sr);
+    let state_before = clap.as_mut().and_then(|(main, _)| main.save_state().ok());
+    crate::sounds::load(sound, Target { node, clap: clap.as_mut().map(|(main, controller)| (main, &*controller)), bus: Some(&mut bus) })
+        .map_err(|e| anyhow::anyhow!("loading '{label}': {e}"))?;
+    // A plugin applies state and parameters on the audio thread; an LV2
+    // preset comes back from the loader thread.
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let readback = match &sound.load {
+        Load::ParamValue { param, value } => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+            let now = main.param_value(*param);
+            anyhow::ensure!(now == Some(*value), "parameter {param} reads {now:?} after loading '{label}', expected {value}");
+            format!("parameter {param} = {value} ('{}')", main.param_text(*param, *value))
+        }
+        Load::MidiProgram(program) => {
+            let last = engine.lv2_last_note(node);
+            anyhow::ensure!(last == Some([0xC0, *program, 0]), "the plugin's last MIDI event is {last:?}, expected programme change {program}");
+            format!("programme change {program} reached the plugin")
+        }
+        Load::SurgePatch(_) | Load::DexedVoice { .. } => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+            let state = main.save_state()?;
+            anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
+            "plugin state changed".to_string()
+        }
+        Load::Lv2Preset(uri) => {
+            let preset = crate::lv2::discover_presets(instrument.id())
+                .into_iter().find(|p| p.uri == *uri).ok_or_else(|| anyhow::anyhow!("preset {uri} vanished"))?;
+            let slot = engine.lv2.iter().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+            let controls = slot.plugin.control_descs();
+            let (set, total) = preset.values.iter().fold((0, 0), |(set, total), (symbol, value)| {
+                match controls.iter().find(|c| c.symbol == *symbol) {
+                    Some(c) => (set + ((c.value - value).abs() < 1e-5) as usize, total + 1),
+                    None => (set, total),
+                }
+            });
+            anyhow::ensure!(total > 0 && set == total, "{set} of {total} preset controls hold the preset's value");
+            format!("{set}/{total} controls hold the preset's values")
+        }
+    };
+    let after = timbre_of_note(&mut engine, &mut bus, 60, sr);
+    anyhow::ensure!(after.rms > 1e-4, "'{label}' is silent (rms {:.5})", after.rms);
+    let distance = before.distance(after);
+    anyhow::ensure!(distance > 0.1, "'{label}' sounds like the sound before it (distance {distance:.3})");
+    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2})",
+        library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
+}
+
+/// `sound-library-test`: every catalog instrument installed on this machine
+/// lists its sound library, answers a search and loads one sound through
+/// the real engine, proven by a readback and by the note sounding different.
+pub fn sound_library_test() -> anyhow::Result<()> {
+    use crate::sounds::Instrument;
+    // A search the instrument's library should answer.
+    let query = |id: &str| match id {
+        "setbfree" => "jazz",
+        "dexed" => "brass",
+        "vitalium" => "pad",
+        _ => "bass",
+    };
+    let clap = crate::host::list_clap_plugins();
+    let lv2 = crate::lv2::discover();
+    let (mut tested, mut failed) = (0, Vec::new());
+    for entry in crate::catalog::CATALOG {
+        let instrument = match entry.clap_id {
+            Some(id) => clap.iter().any(|p| p.id == id).then(|| Instrument::Clap(id.to_string())),
+            None => entry.lv2_uris.iter().find(|u| lv2.iter().any(|p| p.uri == **u)).map(|u| Instrument::Lv2(u.to_string())),
+        };
+        let Some(instrument) = instrument else {
+            println!("  {:<9} not installed, skipped", entry.name);
+            continue;
+        };
+        tested += 1;
+        if let Instrument::Clap(id) = &instrument {
+            let providers = crate::host::clap_preset_providers(id)?;
+            println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
+                if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
+        }
+        match sound_library_check(&instrument, query(entry.id)) {
+            Ok(line) => println!("  {:<9} {line}", entry.name),
+            Err(e) => {
+                println!("  {:<9} FAILED: {e:#}", entry.name);
+                failed.push(entry.name);
+            }
+        }
+    }
+    anyhow::ensure!(tested > 0, "no catalog instrument is installed");
+    anyhow::ensure!(failed.is_empty(), "sound-library-test: {} of {tested} instrument(s) failed: {}", failed.len(), failed.join(", "));
+    println!("sound-library-test: OK — {tested} instrument(s): library listed, searched, one sound loaded through the engine and heard");
     Ok(())
 }
 
@@ -3857,6 +4483,148 @@ pub fn multi_rig_load_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `kabelsalat many-voices-test`: a rack with more CLAP instruments than the
+/// old four-voice pool. Eight Surge XT units (plus Dexed and YANES when
+/// installed) start without a voice; this thread hosts one per unit the way
+/// the app does (`VoiceMsg::Add`, a `Grow` on the way), every unit must
+/// sound, and retiring them hands every voice back to be freed here.
+pub fn many_voices_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef, SURGE_PLUGIN_ID};
+    use crate::host::{ClapVoice, ClapVoiceMain};
+    use crate::matrix::SourceId;
+    use std::time::Instant;
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+
+    let installed = crate::host::list_clap_plugins();
+    let mut plugins: Vec<(String, String)> = (1..=8).map(|i| (format!("Surge XT {i}"), SURGE_PLUGIN_ID.to_string())).collect();
+    for name in ["Dexed", "YANES"] {
+        match installed.iter().find(|p| p.name == name && p.features.iter().any(|f| f == "instrument")) {
+            Some(p) => plugins.push((name.to_string(), p.id.clone())),
+            None => println!("  {name}: not installed, skipped"),
+        }
+    }
+
+    let mut g = Graph::default();
+    g.reserve(64, 256);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    // (node, its cable into the master's left input)
+    let mut units: Vec<(NodeId, u32)> = Vec::new();
+    let mut edge = 1u32;
+    for (name, id) in &plugins {
+        let node = g.add_node(NodeKind::Clap { plugin_id: name_bytes(id) }, name_bytes(&name.to_uppercase()));
+        g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi);
+        g.connect_with_id(edge + 1, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        g.connect_with_id(edge + 2, PortRef { node, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+        units.push((node, edge + 1));
+        edge += 3;
+    }
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g.clone(), drain, SR, vec![]);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: g, ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
+    let levels = engine.edge_levels_handle();
+    let (mut tx, rx) = rtrb::RingBuffer::<VoiceMsg>::new(64);
+    let (back_tx, mut back) = rtrb::RingBuffer::<VoiceBack>::new(64);
+    engine.set_voice_channels(rx, back_tx);
+    let mut buf = vec![0.0f32; BLOCK * 2];
+    let bound = |p: &Arc<Mutex<GraphPub>>, id: u64| -> Option<NodeId> {
+        p.lock().ok()?.voices.iter().find(|(v, _)| *v == id).map(|(_, n)| *n).filter(|n| *n != NodeId::MAX)
+    };
+
+    let mut mains: Vec<(u64, ClapVoiceMain)> = Vec::new();
+    let table_cap = engine.voices.capacity();
+    for (i, (name, id)) in plugins.iter().enumerate() {
+        let t = Instant::now();
+        let (voice, main) = ClapVoice::new_plugin(SR, id)?;
+        let load_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let vid = voice.voice_id();
+        // A larger table on the way, while four voices already play.
+        if i == 4 {
+            graph_pub.lock().map_err(|_| anyhow::anyhow!("graph publication poisoned"))?.reserve_voices(table_cap * 2);
+            tx.push(VoiceMsg::Grow(Vec::with_capacity(table_cap * 2))).map_err(|_| anyhow::anyhow!("voice ring full"))?;
+        }
+        tx.push(VoiceMsg::Add(VoiceSlot::new(voice))).map_err(|_| anyhow::anyhow!("voice ring full"))?;
+        engine.render(&mut buf, 2);
+        let node = bound(&graph_pub, vid);
+        anyhow::ensure!(node == Some(units[i].0), "{name}: voice {vid} bound to {node:?}, expected node {}", units[i].0);
+        println!("  {name:<10} voice {vid:>2} -> node {:>2}   instantiate {load_ms:6.1} ms", units[i].0);
+        mains.push((vid, main));
+    }
+    anyhow::ensure!(engine.voices.capacity() == table_cap * 2, "the larger voice table was not adopted");
+    anyhow::ensure!(
+        matches!(back.pop(), Ok(VoiceBack::Table(t)) if t.capacity() == table_cap),
+        "the old voice table did not come back to be freed"
+    );
+
+    // Every unit holds a chord at once: per-voice peak at its master cable
+    // and the cost of a block with all of them sounding.
+    for note in [48u8, 55, 60, 64] {
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    }
+    let blocks = (SR as usize * 3) / BLOCK;
+    let mut peaks = vec![0.0f32; units.len()];
+    let mut times_us: Vec<f64> = Vec::with_capacity(blocks);
+    let mut master_peak = 0.0f32;
+    for _ in 0..blocks {
+        let t = Instant::now();
+        engine.render(&mut buf, 2);
+        times_us.push(t.elapsed().as_secs_f64() * 1e6);
+        for (i, (_, cable)) in units.iter().enumerate() {
+            peaks[i] = peaks[i].max(levels.load(*cable));
+        }
+        master_peak = master_peak.max(block_peak(&buf));
+    }
+    for note in [48u8, 55, 60, 64] {
+        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    }
+    engine.render(&mut buf, 2);
+    for (i, (name, _)) in plugins.iter().enumerate() {
+        println!("  {name:<10} peak {:.4}", peaks[i]);
+        anyhow::ensure!(peaks[i] > 1e-3, "{name} (node {}) is silent: peak {}", units[i].0, peaks[i]);
+    }
+    let errors: u64 = engine.voices.iter().map(|v| v.voice.process_errors()).sum();
+    anyhow::ensure!(errors == 0, "{errors} failed CLAP process calls");
+    anyhow::ensure!(master_peak <= 1.0, "master clipped: {master_peak}");
+    times_us.sort_by(|a, b| a.total_cmp(b));
+    let budget_us = BLOCK as f64 / SR * 1e6;
+    let (median, p99, max) = (times_us[blocks / 2], times_us[blocks * 99 / 100], times_us[blocks - 1]);
+    println!(
+        "  render per {BLOCK}-frame block, {} voices on a 4-note chord, {blocks} blocks: median {median:.0} us, p99 {p99:.0} us, render_max_us {max:.0} (budget {budget_us:.0} us, {:.0}% at the median)",
+        units.len(),
+        median / budget_us * 100.0
+    );
+
+    // Retire: every voice comes back and is stopped and deactivated here.
+    for (vid, _) in &mains {
+        tx.push(VoiceMsg::Retire(*vid)).map_err(|_| anyhow::anyhow!("voice ring full"))?;
+    }
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.voices.is_empty(), "{} voices left in the engine", engine.voices.len());
+    anyhow::ensure!(graph_pub.lock().map(|p| p.voices.is_empty()).unwrap_or(false), "voices still published");
+    let mut freed = 0;
+    while let Ok(item) = back.pop() {
+        let VoiceBack::Voice(slot) = item else { continue };
+        let pos = mains.iter().position(|(vid, _)| *vid == slot.voice_id())
+            .ok_or_else(|| anyhow::anyhow!("an unknown voice came back"))?;
+        mains.remove(pos).1.retire(slot.into_voice());
+        freed += 1;
+    }
+    anyhow::ensure!(mains.is_empty(), "{} voices never came back", mains.len());
+    for _ in 0..8 {
+        engine.render(&mut buf, 2);
+    }
+    anyhow::ensure!(block_peak(&buf) < 1e-4, "sound after every voice was retired");
+    println!(
+        "many-voices-test: OK — {} CLAP voices hosted on demand, all audible, table grown {table_cap} -> {}, {freed} retired and freed",
+        units.len(),
+        table_cap * 2
+    );
+    Ok(())
+}
+
 /// Real-plugin CC-mapping self-test: maps CC 74 on Hardware(0) to Surge XT's
 /// Filter 1 Cutoff, sends CC 0 and CC 127, and verifies both parameter readback
 /// and rendered audio difference.
@@ -3967,6 +4735,149 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         cutoff.module, cutoff.name, cutoff.id, val_low, val_high,
         gain_p.module, gain_p.name, gain_p.id, g_low, g_high, rms_low, rms_high
     );
+    Ok(())
+}
+
+/// `kabelsalat main-controls-test`: for every installed instrument, print its
+/// main controls and the rule that found them, then move the first one
+/// through the engine and read the plugin's own value back.
+pub fn main_controls_test() -> anyhow::Result<()> {
+    let clap = crate::host::list_clap_plugins();
+    let lv2 = crate::lv2::discover();
+    let mut tested = 0;
+    let mut failed: Vec<String> = Vec::new();
+    let mut run = |name: &str, result: Option<anyhow::Result<()>>| match result {
+        None => println!("{name}: not installed, skipped"),
+        Some(Ok(())) => tested += 1,
+        Some(Err(e)) => failed.push(format!("{name}: {e:#}")),
+    };
+    for name in ["Surge XT", "Dexed", "YANES"] {
+        let id = clap.iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.id.clone());
+        run(name, id.map(|id| clap_main_controls_check(name, &id)));
+    }
+    for (name, uri) in [("setBfree", "http://gareus.org/oss/lv2/b_synth"), ("Vitalium", "urn:distrho:vitalium")] {
+        let installed = lv2.iter().any(|p| p.uri == uri);
+        run(name, installed.then(|| lv2_main_controls_check(name, uri)));
+    }
+    anyhow::ensure!(failed.is_empty(), "main-controls-test FAILED:\n{}", failed.join("\n"));
+    anyhow::ensure!(tested > 0, "main-controls-test: no instrument installed");
+    println!("main-controls-test: OK ({tested} instruments)");
+    Ok(())
+}
+
+fn print_main_controls(name: &str, found: &crate::main_controls::MainControls, mut text: impl FnMut(&crate::main_controls::MainControl) -> String) {
+    if found.controls.is_empty() {
+        println!("main-controls-test: {name}: no main controls (the plugin declares no usable parameter)");
+        return;
+    }
+    println!("main-controls-test: {name}: {} main controls, source: {}", found.controls.len(), found.source.as_str());
+    for (i, c) in found.controls.iter().enumerate() {
+        let face = if i < crate::main_controls::FACE_MAIN_CONTROLS { "face" } else { "list" };
+        println!(
+            "  {}. [{face}] {:<28} page {:<24} id {:<10} = {} (range {}..{})",
+            i + 1, c.name, format!("\"{}\"", c.page), c.id, text(c), c.min, c.max
+        );
+    }
+}
+
+/// Keys → instrument → Master, the smallest rig an instrument plays in.
+fn instrument_graph(kind: crate::control::NodeKind) -> (Graph, NodeId) {
+    use crate::control::{name_bytes, NodeKind, PortKind, PortRef};
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let inst = g.add_node(kind, name_bytes("INSTRUMENT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    (g, inst)
+}
+
+fn clap_main_controls_check(name: &str, plugin_id: &str) -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, NodeKind};
+    let sr = 48000.0;
+    let (voice, mut main) = ClapVoice::new_plugin(sr, plugin_id)?;
+    let found = main.main_controls().clone();
+    print_main_controls(name, &found, |c| {
+        let v = main.param_value(c.id).unwrap_or(c.default);
+        main.param_text(c.id, v)
+    });
+    let Some(c) = found.controls.first() else { return Ok(()) };
+    let knob = voice.controller();
+    let (g, inst) = instrument_graph(NodeKind::Clap { plugin_id: name_bytes(plugin_id) });
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(inst, voice)]);
+    let mut buf = vec![0.0f32; 256 * 2];
+    let mut settle = |engine: &mut GraphEngine| for _ in 0..8 { engine.render(&mut buf, 2) };
+    settle(&mut engine);
+    let start = main.param_value(c.id).unwrap_or(f64::NAN);
+    // What a face knob sends: the voice controller, applied in the next block.
+    knob.set_param(clack_host::prelude::ClapId::new(c.id), c.plain(0.25));
+    settle(&mut engine);
+    let by_knob = main.param_value(c.id).unwrap_or(f64::NAN);
+    // What a MIDI-learned knob does: a hardware CC through the matrix.
+    bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: inst, cc: 20, param: Some(c.id), target: CcTarget::PluginParam });
+    bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 20, value: 127 });
+    settle(&mut engine);
+    let by_cc = main.param_value(c.id).unwrap_or(f64::NAN);
+    println!(
+        "main-controls-test: {name}: moved '{}' (id {}): start {start:.4} -> knob at 25% {by_knob:.4} ({}) -> CC 127 {by_cc:.4} ({})",
+        c.name, c.id, main.param_text(c.id, by_knob), main.param_text(c.id, by_cc)
+    );
+    let span = c.max - c.min;
+    anyhow::ensure!((by_knob - c.plain(0.25)).abs() < span * 0.02, "knob did not move '{}': wanted {}, plugin reads {by_knob}", c.name, c.plain(0.25));
+    anyhow::ensure!((by_cc - c.max).abs() < span * 0.02, "CC did not move '{}': wanted {}, plugin reads {by_cc}", c.name, c.max);
+    if name == "Surge XT" {
+        surge_macro_names_follow_the_patch(&mut main, &mut engine)?;
+    }
+    Ok(())
+}
+
+/// Surge names its macros per patch and announces nothing: the polls after
+/// a state load must pick the new names up once the audio thread applied it.
+fn surge_macro_names_follow_the_patch(main: &mut crate::host::ClapVoiceMain, engine: &mut GraphEngine) -> anyhow::Result<()> {
+    let patches = crate::host::list_surge_patches();
+    let Some(patch) = patches.iter().find(|p| p.name.eq_ignore_ascii_case("bell pad")) else {
+        println!("main-controls-test: Surge XT: factory patch 'Bell Pad' not installed, patch-reload check skipped");
+        return Ok(());
+    };
+    let names = |main: &crate::host::ClapVoiceMain| -> Vec<String> { main.main_controls().face().iter().map(|c| c.name.clone()).collect() };
+    let before = names(main);
+    main.load_state(&crate::host::fxp_to_state(&std::fs::read(&patch.path)?)?)?;
+    let mut buf = vec![0.0f32; 256 * 2];
+    let mut changed = false;
+    for _ in 0..10 {
+        for _ in 0..8 { engine.render(&mut buf, 2); }
+        changed |= main.poll_main_controls();
+    }
+    let after = names(main);
+    println!("main-controls-test: Surge XT: patch '{}/{}' loaded: face controls {before:?} -> {after:?}", patch.category, patch.name);
+    anyhow::ensure!(changed && after.iter().any(|n| n.starts_with("M1: ")), "Surge XT main controls did not follow the patch's named macros");
+    anyhow::ensure!(!main.poll_main_controls(), "a settled list must not report a change");
+    Ok(())
+}
+
+fn lv2_main_controls_check(name: &str, uri: &str) -> anyhow::Result<()> {
+    use crate::control::{command_bus, Command, Lv2Uri, NodeKind};
+    let sr = 48000.0;
+    let found = crate::lv2::main_controls_for_uri(uri);
+    print_main_controls(name, &found, |c| format!("{:.4} (default)", c.default));
+    let Some(c) = found.controls.first() else { return Ok(()) };
+    let (g, inst) = instrument_graph(NodeKind::Lv2 { uri: Lv2Uri::new(uri) });
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    bus.send(Command::LoadGraph { graph: g });
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut settle = |engine: &mut GraphEngine| for _ in 0..8 { engine.render(&mut buf, 2) };
+    settle(&mut engine);
+    let start = engine.lv2_control_value(inst, c.id as usize).ok_or_else(|| anyhow::anyhow!("{uri} did not load in the engine"))?;
+    let norm = if c.normalized(start as f64) < 0.5 { 0.9 } else { 0.1 };
+    // What a face knob sends, and what a CC bound to it applies.
+    bus.send(Command::SetParam { node: inst, param: c.id, value: norm as f64 });
+    settle(&mut engine);
+    let moved = engine.lv2_control_value(inst, c.id as usize).unwrap_or(f32::NAN);
+    println!("main-controls-test: {name}: moved '{}' (control {}): start {start:.4} -> knob at {:.0}% {moved:.4}", c.name, c.id, norm * 100.0);
+    anyhow::ensure!((moved as f64 - c.plain(norm)).abs() < (c.max - c.min) * 1e-3, "SetParam did not move '{}': wanted {}, plugin port reads {moved}", c.name, c.plain(norm));
     Ok(())
 }
 

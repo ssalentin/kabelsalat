@@ -43,6 +43,7 @@ use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
     ParamInfoFlags, ParamRescanFlags, PluginParams,
 };
+use clack_extensions::remote_controls::{PluginRemoteControls, RemoteControlsPageBuffer};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
@@ -52,6 +53,7 @@ use clack_host::host::{HostError, HostExtensions};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
+use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::transport::{Transport, BEATS_PER_BAR};
 
 use x11rb::connection::Connection;
@@ -81,6 +83,7 @@ struct HostShared {
     gui: OnceLock<Option<PluginGui>>,
     latency: OnceLock<Option<PluginLatency>>,
     audio_ports: OnceLock<Option<PluginAudioPorts>>,
+    remote_controls: OnceLock<Option<PluginRemoteControls>>,
     // Plugin -> host requests (lock-free flags).
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
@@ -102,6 +105,7 @@ impl<'a> SharedHandler<'a> for HostShared {
         let _ = self.gui.set(instance.get_extension());
         let _ = self.latency.set(instance.get_extension());
         let _ = self.audio_ports.set(instance.get_extension());
+        let _ = self.remote_controls.set(instance.get_extension());
     }
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
@@ -207,6 +211,7 @@ struct Exts {
     gui: Option<PluginGui>,
     latency: Option<PluginLatency>,
     audio_ports: Option<PluginAudioPorts>,
+    remote_controls: Option<PluginRemoteControls>,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,14 +346,16 @@ impl ClapVoice {
             gui: h.gui.get().copied().flatten(),
             latency: h.latency.get().copied().flatten(),
             audio_ports: h.audio_ports.get().copied().flatten(),
+            remote_controls: h.remote_controls.get().copied().flatten(),
         });
         println!(
-            "extensions: params={} state={} gui={} latency={} audio-ports={}",
+            "extensions: params={} state={} gui={} latency={} audio-ports={} remote-controls={}",
             exts.params.is_some(),
             exts.state.is_some(),
             exts.gui.is_some(),
             exts.latency.is_some(),
-            exts.audio_ports.is_some()
+            exts.audio_ports.is_some(),
+            exts.remote_controls.is_some()
         );
 
         let (in_count, in_ch, out_chs, main_out) =
@@ -413,11 +420,14 @@ impl ClapVoice {
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
         };
-        let main = ClapVoiceMain {
+        let mut main = ClapVoiceMain {
             instance: plugin,
             exts,
+            main_controls: MainControls::default(),
+            main_controls_rechecks: 0,
             _entry: entry,
         };
+        main.refresh_main_controls();
         Ok((voice, main))
     }
 
@@ -473,6 +483,11 @@ impl ClapVoice {
     /// Queue a raw MIDI 1.0 CC event on the audio thread without locking or allocating.
     pub fn send_cc_rt(&mut self, channel: u8, cc: u8, value: u8) {
         self.push_rt(VoiceCmd::Midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]));
+    }
+
+    /// Queue a MIDI programme change on the audio thread without locking or allocating.
+    pub fn program_change_rt(&mut self, program: u8) {
+        self.push_rt(VoiceCmd::Midi([0xC0, program & 0x7F, 0]));
     }
 
     /// Install a sample-accurate sequence of (frame offset, command), consumed
@@ -673,12 +688,22 @@ mod transport_event_tests {
     }
 }
 
+/// Main-control polls that look again after a state load (about a second
+/// at the UI's poll rate): the state lands on the audio thread a few blocks
+/// later.
+const MAIN_CONTROLS_RECHECKS: u8 = 10;
+
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
 /// `!Send`), state save/restore, GUI access and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
 pub struct ClapVoiceMain {
     instance: PluginInstance<TestHost>,
     exts: Exts,
+    /// Resolved when the instance is created, and again only when the plugin
+    /// reports changed parameter info. Never per frame: it walks every param.
+    main_controls: MainControls,
+    /// Polls left that re-read the main controls after a state load.
+    main_controls_rechecks: u8,
     _entry: PluginEntry,
 }
 
@@ -712,6 +737,7 @@ impl ClapVoiceMain {
     pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
+        self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
         Ok(())
     }
 
@@ -752,11 +778,82 @@ impl ClapVoiceMain {
                 value,
                 default: info.default_value,
                 automatable: info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE),
+                stepped: info.flags.contains(ParamInfoFlags::IS_STEPPED),
                 hidden: info.flags.contains(ParamInfoFlags::IS_HIDDEN),
                 readonly: info.flags.contains(ParamInfoFlags::IS_READONLY),
             });
         }
         out
+    }
+
+    /// The instrument's main controls (see `main_controls::resolve`).
+    pub fn main_controls(&self) -> &MainControls {
+        &self.main_controls
+    }
+
+    /// Re-read the main controls when they may have changed: the plugin
+    /// announced new parameter info, or a state was loaded (a patch renames
+    /// its macros; Surge applies the state on the audio thread a few blocks
+    /// later and announces nothing, so the next few polls look again). True
+    /// when the list changed. Call it a few times per second, not per frame.
+    pub fn poll_main_controls(&mut self) -> bool {
+        let announced = self.instance.access_handler(|h| h.params_rescan.replace(false));
+        if !announced && self.main_controls_rechecks == 0 {
+            return false;
+        }
+        self.main_controls_rechecks = self.main_controls_rechecks.saturating_sub(1);
+        let before = std::mem::take(&mut self.main_controls);
+        self.refresh_main_controls();
+        before != self.main_controls
+    }
+
+    fn refresh_main_controls(&mut self) {
+        let pages = self.remote_pages();
+        let params = self.param_candidates();
+        self.main_controls = main_controls::resolve(&pages, &params);
+    }
+
+    fn remote_pages(&mut self) -> Vec<RemotePage> {
+        let Some(rc) = self.exts.remote_controls else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let mut buf = RemoteControlsPageBuffer::new();
+        (0..rc.count(&handle))
+            .filter_map(|i| {
+                let page = rc.get(&handle, i, &mut buf)?;
+                Some(RemotePage {
+                    name: String::from_utf8_lossy(page.page_name).into_owned(),
+                    slots: page.param_ids.map(|id| id.map(|id| id.get())),
+                })
+            })
+            .collect()
+    }
+
+    fn param_candidates(&mut self) -> Vec<Candidate> {
+        let Some(params) = self.exts.params else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let mut info_buf = ParamInfoBuffer::new();
+        (0..params.count(&handle))
+            .filter_map(|i| {
+                let info = params.get_info(&handle, i, &mut info_buf)?;
+                Some(Candidate {
+                    id: info.id.get(),
+                    name: String::from_utf8_lossy(info.name).into_owned(),
+                    group: String::from_utf8_lossy(info.module).into_owned(),
+                    min: info.min_value,
+                    max: info.max_value,
+                    default: info.default_value,
+                    usable: info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE)
+                        && !info.flags.contains(ParamInfoFlags::IS_HIDDEN)
+                        && !info.flags.contains(ParamInfoFlags::IS_READONLY),
+                    stepped: info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                    designated: false,
+                })
+            })
+            .collect()
     }
 
     /// Current plain value of a single parameter (main thread only).
@@ -788,6 +885,8 @@ pub struct ParamDesc {
     pub value: f64,
     pub default: f64,
     pub automatable: bool,
+    /// Whole-number values only (a switch, a list, a preset selector).
+    pub stepped: bool,
     pub hidden: bool,
     pub readonly: bool,
 }
@@ -1027,9 +1126,38 @@ fn load_bundle(path: &std::path::Path, id: &str) -> Result<(PluginEntry, CString
 }
 
 fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
-    let (path, id) = bundle_with(|p| p.id == target_id)
-        .ok_or_else(|| anyhow!("CLAP plugin '{target_id}' not found in CLAP search paths"))?;
-    load_bundle(&path, &id)
+    // Resolved once per process and plugin: a rack hosts one voice per CLAP
+    // unit, so the same id is asked for again with every added unit. Only a
+    // hit is remembered, so a later install is still found.
+    static FOUND: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+    let known = FOUND.lock().ok().and_then(|f| f.iter().find(|(id, _)| id == target_id).map(|(_, p)| p.clone()));
+    let path = match known {
+        Some(path) => path,
+        None => {
+            let (path, id) = bundle_with(|p| p.id == target_id)
+                .ok_or_else(|| anyhow!("CLAP plugin '{target_id}' not found in CLAP search paths"))?;
+            if let Ok(mut f) = FOUND.lock() {
+                f.push((id, path.clone()));
+            }
+            path
+        }
+    };
+    load_bundle(&path, target_id)
+}
+
+/// Names of the CLAP preset-discovery providers the bundle of `plugin_id`
+/// offers (`clap.preset-discovery-factory`); empty when it has no such
+/// factory. Loads the bundle: `sound-library-test` reports it per plugin.
+pub fn clap_preset_providers(plugin_id: &str) -> Result<Vec<String>> {
+    use clack_extensions::preset_discovery::factory::PresetDiscoveryFactory;
+    let (path, _) = bundle_with(|p| p.id == plugin_id)
+        .ok_or_else(|| anyhow!("CLAP plugin '{plugin_id}' not found in CLAP search paths"))?;
+    // SAFETY: as in `load_bundle`: the scan found the plugin in this bundle.
+    let entry = unsafe { PluginEntry::load(&path) }.with_context(|| format!("failed to load CLAP bundle {}", path.display()))?;
+    let Some(factory) = entry.get_factory::<PresetDiscoveryFactory>() else { return Ok(Vec::new()) };
+    Ok(factory.provider_descriptors()
+        .map(|d| d.name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+        .collect())
 }
 
 fn discover_surge() -> Result<(PluginEntry, CString)> {
@@ -1096,85 +1224,6 @@ pub fn list_surge_patches() -> Vec<SurgePatch> {
     out
 }
 
-fn word_alternatives(w: &str) -> &'static [&'static str] {
-    match w {
-        "wurlitzer" | "wurli" => &["wurlitzer", "wurli"],
-        "rhodes" => &["rhodes", "suitcase", "ep"],
-        "ep" => &["ep", "electric piano", "suitcase", "wurli", "rhodes"],
-        "electric" => &["electric", "ep", "suitcase", "wurli", "rhodes"],
-        "piano" => &["piano", "ep", "suitcase", "wurli", "keys"],
-        "harpsichord" | "harpsi" => &["harpsichord", "harpsi"],
-        "saxophone" | "sax" => &["saxophone", "sax"],
-        "synthesizer" | "synth" => &["synthesizer", "synth"],
-        "vibraphone" | "vibes" => &["vibraphone", "vibes"],
-        "glockenspiel" | "glock" => &["glockenspiel", "glock"],
-        "clavinet" | "clav" => &["clavinet", "clav"],
-        "percussion" | "perc" => &["percussion", "perc"],
-        "reverb" | "verb" => &["reverb", "verb"],
-        "atmospheric" | "atmosphere" | "atmos" => &["atmospheric", "atmosphere", "atmos", "ambient", "pad"],
-        "spooky" | "creepy" | "eerie" => &["spooky", "creepy", "eerie", "dark", "haunt"],
-        _ => &[],
-    }
-}
-
-fn word_matches_alias(haystack: &str, w: &str) -> bool {
-    haystack.contains(w) || word_alternatives(w).iter().any(|alt| haystack.contains(alt))
-}
-
-/// Search `patches` by words in `"Category/Name"`, preferring literal matches
-/// first and falling back to common instrument aliases (`wurlitzer` -> `wurli`,
-/// `rhodes` -> `suitcase`/`ep`, etc.).
-pub fn search_surge_patches(patches: &[SurgePatch], query: &str, limit: usize) -> Vec<String> {
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut out = Vec::new();
-    for alias in [false, true] {
-        for p in patches {
-            if out.len() >= limit { return out; }
-            let f = format!("{}/{}", p.category, p.name).to_lowercase();
-            let ok = if alias {
-                words.iter().all(|w| word_matches_alias(&f, w))
-            } else {
-                words.iter().all(|w| f.contains(w))
-            };
-            if ok {
-                let label = format!("{}/{}", p.category, p.name);
-                if !out.contains(&label) {
-                    out.push(label);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Best patch for a free-text query ("flute", "warm pad", "Winds/Flute 2"):
-/// exact name > name contains every word > category+name contains every
-/// word > alias-expanded match; factory before 3rd-party on ties (list order).
-pub fn find_surge_patch<'a>(patches: &'a [SurgePatch], query: &str) -> Option<&'a SurgePatch> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() { return None; }
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let full = |p: &SurgePatch| format!("{}/{}", p.category, p.name).to_lowercase();
-    let is_factory = |p: &SurgePatch| p.path.to_string_lossy().contains("patches_factory");
-    let tiers: [&dyn Fn(&SurgePatch) -> bool; 7] = [
-        &|p| p.name.to_lowercase() == q || full(p) == q,
-        &|p| p.name.to_lowercase().starts_with(&q),
-        &|p| words.iter().all(|w| p.name.to_lowercase().contains(w)),
-        &|p| words.iter().all(|w| full(p).contains(w)),
-        &|p| words.iter().all(|w| word_matches_alias(&p.name.to_lowercase(), w)),
-        &|p| words.iter().all(|w| word_matches_alias(&full(p), w)),
-        &|p| words.iter().any(|w| w.len() > 2 && word_matches_alias(&full(p), w)),
-    ];
-    // The curated factory library wins at every tier; 3rd-party is the fallback.
-    for factory_only in [true, false] {
-        for t in tiers.iter() {
-            if let Some(p) = patches.iter().find(|p| (!factory_only || is_factory(p)) && t(p)) { return Some(p); }
-        }
-    }
-    None
-}
-
 /// The patch name inside a Surge state blob (`<meta name="…" …>` in the
 /// sub3 XML). Surge's init patch is named "Init Saw" / "Init" etc.
 pub fn patch_name_from_state(state: &[u8]) -> Option<String> {
@@ -1202,9 +1251,10 @@ pub fn fxp_to_state(bytes: &[u8]) -> Result<Vec<u8>> {
 /// (a) the state took (the saved state names the patch) and (b) the sound
 /// changed (same note, different spectrum than the init patch).
 pub fn run_preset_test() -> Result<()> {
-    let patches = list_surge_patches();
-    anyhow::ensure!(!patches.is_empty(), "no Surge patches installed");
-    let flute = find_surge_patch(&patches, "flute").ok_or_else(|| anyhow!("no flute patch found"))?;
+    let library = crate::sounds::scan(&crate::sounds::Instrument::Clap(crate::sounds::SURGE_ID.into()));
+    anyhow::ensure!(!library.sounds.is_empty(), "no Surge patches installed");
+    let flute = crate::sounds::find(&library.sounds, "flute").ok_or_else(|| anyhow!("no flute patch found"))?;
+    let crate::sounds::Load::SurgePatch(path) = &flute.load else { anyhow::bail!("a Surge sound is a patch file") };
     let sr = 48_000.0;
     let (mut voice, mut main) = ClapVoice::new(sr)?;
     let ctl = voice.controller();
@@ -1228,7 +1278,7 @@ pub fn run_preset_test() -> Result<()> {
     };
     let (zc_a, rms_a) = measure(&mut voice);
     let init_state = main.save_state()?;
-    let data = std::fs::read(&flute.path)?;
+    let data = std::fs::read(path)?;
     main.load_state(&fxp_to_state(&data)?)?;
     let mut buf = vec![0.0f32; 512 * 2];
     for _ in 0..20 { voice.render(&mut buf, Transport::default()); } // Surge applies state on the audio thread
@@ -1236,7 +1286,7 @@ pub fn run_preset_test() -> Result<()> {
     // The plugin now reports a different patch than the init one.
     let named = saved != init_state;
     let (zc_b, rms_b) = measure(&mut voice);
-    println!("patches: {} · picked '{}/{}' · plugin state changed: {named}", patches.len(), flute.category, flute.name);
+    println!("patches: {} · picked '{}' · plugin state changed: {named}", library.sounds.len(), flute.label());
     println!("init: ~{zc_a:.0} Hz zero-cross, rms {rms_a:.4} · flute: ~{zc_b:.0} Hz, rms {rms_b:.4}");
     anyhow::ensure!(named, "plugin state unchanged after loading the patch");
     anyhow::ensure!(rms_b > 1e-4, "flute patch is silent");
@@ -1317,34 +1367,6 @@ pub fn discover_dexed_patches() -> Vec<DexedPatch> {
     out
 }
 
-/// Search Dexed patches by words in `"{bank}/{name}"`, preferring literal
-/// matches first and falling back to common instrument aliases.
-pub fn search_dexed_patches(patches: &[DexedPatch], query: &str, limit: usize) -> Vec<String> {
-    let q = query.trim().to_lowercase();
-    let words: Vec<&str> = q.split_whitespace().collect();
-    let mut out = Vec::new();
-    for alias in [false, true] {
-        for p in patches {
-            if out.len() >= limit {
-                return out;
-            }
-            let f = format!("{}/{}", p.bank, p.name).to_lowercase();
-            let ok = if alias {
-                words.iter().all(|w| word_matches_alias(&f, w))
-            } else {
-                words.iter().all(|w| f.contains(w))
-            };
-            if ok {
-                let label = format!("{}/{:02} {}", p.bank, p.program + 1, p.name);
-                if !out.contains(&label) {
-                    out.push(label);
-                }
-            }
-        }
-    }
-    out
-}
-
 const JUCE_B64_ALPHABET: &[u8; 64] =
     b".ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+";
 
@@ -1416,16 +1438,16 @@ fn replace_xml_attr(xml: &str, attr: &str, value: &str) -> Option<String> {
     Some(out)
 }
 
-/// Load a DX7 cartridge patch into a Dexed CLAP instance.
-pub fn load_dexed_patch(main: &mut ClapVoiceMain, patch: &DexedPatch) -> Result<()> {
-    let syx = std::fs::read(&patch.syx_path)?;
+/// Load voice `program` (0..32) of a DX7 cartridge into a Dexed CLAP instance.
+pub fn load_dexed_voice(main: &mut ClapVoiceMain, syx_path: &std::path::Path, program: usize) -> Result<()> {
+    let syx = std::fs::read(syx_path)?;
     anyhow::ensure!(
         syx.len() == 4104 && syx.starts_with(&[0xF0, 0x43, 0x00, 0x09, 0x20, 0x00]),
         "invalid DX7 .syx bank: {}",
-        patch.syx_path.display()
+        syx_path.display()
     );
-    anyhow::ensure!(patch.program < 32, "program index {} out of range", patch.program);
-    let voice_start = 6 + patch.program * 128;
+    anyhow::ensure!(program < 32, "program index {program} out of range");
+    let voice_start = 6 + program * 128;
     let unpacked = unpack_dx7_voice(&syx[voice_start..voice_start + 128]);
     let sysex_b64 = juce_b64_encode(&syx);
     let prog_b64 = juce_b64_encode(&unpacked);
@@ -1439,7 +1461,7 @@ pub fn load_dexed_patch(main: &mut ClapVoiceMain, patch: &DexedPatch) -> Result<
     let mut xml = std::str::from_utf8(&state[xml_start..])
         .map_err(|e| anyhow!("Dexed state not UTF-8: {e}"))?
         .to_string();
-    xml = replace_xml_attr(&xml, "currentProgram", &patch.program.to_string())
+    xml = replace_xml_attr(&xml, "currentProgram", &program.to_string())
         .ok_or_else(|| anyhow!("Dexed state missing currentProgram"))?;
     xml = replace_xml_attr(&xml, "base64:sysex", &sysex_b64)
         .ok_or_else(|| anyhow!("Dexed state missing base64:sysex"))?;
@@ -2907,28 +2929,6 @@ fn clamp_size(size: GuiSize, rect: EditorRect) -> GuiSize {
 mod patch_search_tests {
     use super::*;
 
-    fn patch(cat: &str, name: &str, factory: bool) -> SurgePatch {
-        let root = if factory { "/usr/share/surge-xt/patches_factory" } else { "/usr/share/surge-xt/patches_3rdparty" };
-        SurgePatch {
-            name: name.into(),
-            category: cat.into(),
-            path: std::path::PathBuf::from(format!("{root}/{cat}/{name}.fxp")),
-        }
-    }
-
-    #[test]
-    fn wurlitzer_alias_finds_wurli_and_factory_wins_on_exact() {
-        let patches = vec![
-            patch("Cybersoda/Keys", "Wurli", false),
-            patch("3rd/Winds", "Jazz Flute", false),
-            patch("Keys", "EP 1", true),
-            patch("Winds", "Flute 1", true),
-        ];
-        assert_eq!(find_surge_patch(&patches, "wurlitzer").map(|p| p.name.as_str()), Some("Wurli"));
-        assert!(search_surge_patches(&patches, "wurlitzer", 10).contains(&"Cybersoda/Keys/Wurli".to_string()));
-        assert_eq!(find_surge_patch(&patches, "flute").map(|p| p.name.as_str()), Some("Flute 1"));
-    }
-
     #[test]
     fn non_surge_clap_discovers_and_renders_when_installed() {
         let plugins = list_clap_plugins();
@@ -2967,7 +2967,7 @@ mod patch_search_tests {
         let (mut voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
             .expect("Dexed CLAP should instantiate");
         let before = main.save_state().expect("save before");
-        load_dexed_patch(&mut main, target).expect("load_dexed_patch");
+        load_dexed_voice(&mut main, &target.syx_path, target.program).expect("load_dexed_voice");
         let mut buf = vec![0.0f32; 256 * 2];
         for _ in 0..4 {
             voice.render(&mut buf, Transport::default());

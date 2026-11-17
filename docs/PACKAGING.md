@@ -1,0 +1,154 @@
+# Packaging and releases
+
+How kabelsalat is tested on GitHub, which packages a release ships and how to
+cut one. Workflows live in `.github/workflows/`, and every packaging step is a
+script that also runs on a developer machine (in docker).
+
+## CI on every push and pull request
+
+`.github/workflows/ci.yml` runs on x86_64 (`ubuntu-24.04`) and aarch64
+(`ubuntu-24.04-arm`):
+
+- `cargo build --locked`, then `scripts/ci/test.sh`: `cargo test --bin
+  kabelsalat`, green only when cargo exits 0 and prints `test result: ok`
+  (AGENTS.md rule 50).
+- The runners have no sound card, display, MIDI device or plugin, and the
+  suite needs none (rule 37). Ubuntu's `setbfree` package is installed so
+  `lv2::tests::setbfree_plays_a_note` plays a real LV2 instrument through
+  lilv. The tests that need Surge XT, Dexed or Vitalium return early when the
+  plugin is missing, so on CI they pass without testing anything:
+  `engine::tests::surge_cc_moves_real_param`,
+  `host::tests::non_surge_clap_discovers_and_renders_when_installed`,
+  `host::tests::dexed_load_patch_changes_state_and_renders`,
+  `lv2::tests::discover_presets_vitalium`,
+  `lv2::tests::vitalium_survives_repeated_load_and_free`,
+  `lv2::tests::vitalium_apply_preset_and_render_audio`,
+  `lv2::tests::reused_vitalium_starts_fresh_and_still_plays`,
+  `ui::tests::vitalium_and_dexed_editor_support`. Run them, and the CLI
+  self-tests listed in AGENTS.md, on a machine with those plugins.
+- `cargo fmt --check` is not run: the tree is not rustfmt-formatted.
+- A second job regenerates `packaging/flatpak/cargo-sources.json` from
+  `Cargo.lock` and fails when the committed file differs.
+
+## Release packages
+
+`.github/workflows/release.yml` runs on a pushed `v*` tag, and by hand from the
+Actions tab (`workflow_dispatch`, version `<crate version>-dev.<sha>`, no
+release). Each package is built natively for x86_64 and aarch64:
+
+| Package | Built by | Built on | Notes |
+| --- | --- | --- | --- |
+| `kabelsalat-<v>-linux-<arch>.tar.gz` | `packaging/tarball.sh` | Ubuntu 22.04 (glibc 2.35) | Binary, desktop file, icon, `INSTALL.md` with the runtime libraries to install. |
+| `kabelsalat-<v>-<arch>.AppImage` | `packaging/appimage.sh` ([linuxdeploy](https://github.com/linuxdeploy/linuxdeploy) `1-alpha-20251107-1`, checksum-pinned) | Ubuntu 22.04 | Bundles lilv, serd, sord, sratom; uses the host's glibc, ALSA (so `pipewire-alsa` works) and display stack. |
+| `kabelsalat-<v>-<arch>.flatpak` | `packaging/flatpak/build.sh` | `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` | Single-file bundle, see below. |
+| `kabelsalat-git-<v>.r<n>.g<sha>-1-<arch>.pkg.tar.*` | `packaging/arch-makepkg.sh` | `archlinux:base-devel`, `menci/archlinuxarm:base-devel` | `packaging/PKGBUILD` built from the tagged commit. |
+
+**Recommended download: the AppImage.** It runs unsandboxed, so it finds the
+user's CLAP/LV2 plugins, its audio thread gets realtime priority through rtkit
+(AGENTS.md rule 29) and `kabelsalat mcp --attach` reaches it. The Flatpak is a
+secondary format: in its sandbox rtkit cannot promote the audio thread (no
+realtime until the app uses the Realtime portal), plugins needing a newer glibc
+than the runtime do not load, and host-side agents cannot attach. README and
+every release's notes point to the AppImage.
+
+Each job smoke-tests its package with `kabelsalat --version`. The release job
+adds `SHA256SUMS`, then creates the GitHub release with the tag's CHANGELOG
+block as notes (`scripts/ci/release-notes.sh`), or uploads to it when the
+release already exists.
+
+## Flatpak
+
+App id `io.github.ssalentin.kabelsalat`, runtime `org.freedesktop.Platform`
+26.08, Rust from `org.freedesktop.Sdk.Extension.rust-stable`. The manifest
+`packaging/flatpak/io.github.ssalentin.kabelsalat.yml` builds lv2, zix, serd,
+sord, sratom and lilv (the runtime has none of them), then kabelsalat offline
+from `cargo-sources.json`.
+
+Install and run a bundle:
+
+```sh
+flatpak install --user kabelsalat-<v>-<arch>.flatpak
+flatpak run io.github.ssalentin.kabelsalat
+```
+
+Sandbox permissions, and what they are for:
+
+- X11 and Wayland, `dri`: the window. The app prefers X11 (XWayland renders
+  it 1:1) and uses Wayland when no X server is reachable.
+- `pulseaudio` socket and `xdg-run/pipewire-0`: the runtime's `pactl`, `parec`,
+  `paplay` and `pw-record` (system-audio capture, audio inputs, app streams)
+  run inside the sandbox and talk to the host's sound server. No
+  `flatpak-spawn --host` is needed.
+- `--device=all`: `/dev/snd` for ALSA output and the ALSA sequencer (MIDI and
+  hot-plug). Flatpak has no narrower device class for sound.
+- `network`: the assistant's model APIs.
+- `xdg-config/kabelsalat`, `~/kabelsalat-sessions`,
+  `~/kabelsalat-rig-presets`, `xdg-music/kabelsalat`: the same config,
+  sessions, presets and recordings as a native install. `~/.cache/kabelsalat`
+  (scan cache) is private to the sandbox.
+- Plugins: `~/.clap` and `~/.lv2` read-write (source installs land there),
+  the host's `/usr` read-only through `host-os` (`CLAP_PATH` and `LV2_PATH`
+  point at `/run/host/usr/{lib,lib64,local/lib}/{clap,lv2}`), and Flathub's
+  `org.freedesktop.LinuxAudio.Plugins.*` extensions at
+  `/app/extensions/Plugins`.
+
+Known limits:
+
+- Plugins from the host's `/usr/lib` are built against the host's libraries
+  but load against the runtime's. A plugin that needs a newer glibc or
+  libstdc++ than the 26.08 runtime fails to load. Plugins in `~/.clap`,
+  `~/.lv2` and the LinuxAudio extensions are the reliable path.
+- No realtime render thread: `audio_thread_priority` asks rtkit to promote
+  the sandbox's thread id, which rtkit cannot resolve on the host, so the
+  manifest does not grant `org.freedesktop.RealtimeKit1`. Realtime in the
+  sandbox needs the `org.freedesktop.portal.Realtime` portal.
+- `kabelsalat mcp --attach` from the host cannot reach the sandboxed app's
+  socket; run it inside the sandbox with
+  `flatpak run --command=kabelsalat io.github.ssalentin.kabelsalat mcp --attach`.
+- The instrument catalog's "is it installed" probe looks at `/usr/lib/clap`
+  and `/usr/lib/lv2`, which are empty in the sandbox.
+
+### When Cargo.lock changes
+
+Regenerate the vendored crate list and commit it with the lock file:
+
+```sh
+packaging/flatpak/update-cargo-sources.sh
+```
+
+It runs `flatpak-cargo-generator` from the builder image (through docker when
+the tool is not installed). CI fails while the committed file is stale.
+
+## Build a package locally
+
+Each script runs on the host it targets, as in CI. With docker:
+
+```sh
+# Flatpak (privileged: flatpak-builder needs bubblewrap)
+docker run --rm --privileged -v "$PWD:/src" -w /src \
+  ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08 \
+  packaging/flatpak/build.sh 0.1.0 dist .flatpak-builder
+# Arch package (x86_64: archlinux:base-devel)
+docker run --rm -v "$PWD:/src" -w /src menci/archlinuxarm:base-devel \
+  bash -c 'pacman --disable-sandbox -Sy --noconfirm git && packaging/arch-makepkg.sh dist'
+```
+
+The tarball and AppImage scripts take a built binary:
+`packaging/tarball.sh target/release/kabelsalat 0.1.0 dist` and
+`packaging/appimage.sh target/release/kabelsalat 0.1.0 dist`. Keep build
+output out of `/tmp` (AGENTS.md rule 79).
+
+## Cut a release
+
+1. Move the CHANGELOG **Unreleased** block under `## [X.Y.Z] — <date>` and
+   add the compare links at the bottom.
+2. Bump `version` in `Cargo.toml` (and `Cargo.lock`, by building once).
+3. Add `<release version="X.Y.Z" date="...">` at the top of `<releases>` in
+   `packaging/flatpak/io.github.ssalentin.kabelsalat.metainfo.xml`.
+4. If `Cargo.lock` changed beyond the version, run
+   `packaging/flatpak/update-cargo-sources.sh`.
+5. Commit on `main`, tag `vX.Y.Z`, push the tag.
+
+The release workflow checks that the tag matches `Cargo.toml`, that the
+CHANGELOG has notes for it and that the metainfo lists it, then builds every
+package and publishes the release.

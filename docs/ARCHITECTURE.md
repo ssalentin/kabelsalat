@@ -6,8 +6,9 @@ This document explains how kabelsalat is built and why. It is not a task list:
 planned work, bugs and ideas are tracked as
 [GitHub issues](https://github.com/ssalentin/kabelsalat/issues) grouped into
 [milestones](https://github.com/ssalentin/kabelsalat/milestones), released
-changes are in [CHANGELOG.md](../CHANGELOG.md), and the working rules for
-contributors and agents are in [AGENTS.md](../AGENTS.md).
+changes are in [CHANGELOG.md](../CHANGELOG.md), CI and release packaging in
+[PACKAGING.md](PACKAGING.md), and the working rules for contributors and
+agents are in [AGENTS.md](../AGENTS.md).
 
 ## Module map (src/)
 
@@ -16,13 +17,38 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   `RigSnapshot`, `merge_rigs`/`split_rigs`, the lock-free `command_bus()` (rtrb).
 - `engine.rs` — `GraphEngine`: voices → DSP → LV2 → per-rig mix → master
   limiter → master saturation. Sums every MasterOut (one per rig). Publishes
-  `GraphPub` (graph, rules, mix) and edge levels to the UI; the render path is
-  allocation- and lock-free, structural ops apply at block boundaries.
+  `GraphPub` (graph, rules, mix, voice binding) and edge levels to the UI; the
+  render path is allocation- and lock-free, structural ops apply at block
+  boundaries. One voice per Clap node, any number: the engine binds voices
+  to nodes (`bind_free_voices`: graph order, lowest free voice id of the
+  node's plugin) and publishes the binding; the voice host sends voices,
+  larger tables and retire requests through `VoiceMsg` and frees what comes
+  back through `VoiceBack`, so the audio thread never allocates or frees
+  for a voice.
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
-  plugin scan with a cache, Surge/Dexed patch helpers.
+  plugin scan with a cache, Surge/Dexed patch files.
+  plugin scan with a cache, Surge/Dexed patch helpers. The app is the voice
+  host (`DemoApp::sync_clap_slots`, on the UI thread = the plugins' main
+  thread): it instantiates a voice for every CLAP unit the engine has none
+  for and retires voices no unit plays. Headless `kabelsalat mcp` hosts
+  only its two startup voices.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
-  loader thread, `LILV_LOCK`.
+  MIDNAM programme names, loader thread, `LILV_LOCK`.
+- `sounds.rs` — one sound library per instrument a rig can hold. The
+  instrument (`Instrument`: a CLAP id or an LV2 URI) is the key and
+  `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
+  voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
+  MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
+  parameter (YANES). Each `Sound` carries its `Load` (plugin state, parameter
+  value, LV2 preset, programme change), and `load` sends each along its own
+  path. `Libraries` scans on a thread of its own and keeps the results;
+  `search` / `find` are the one search for every library, and the
+  `list_sounds` / `load_sound` tools of the app, MCP and the Jev plan all
+  answer from here.
+- `main_controls.rs` — the few parameters a plugin's designer marked as most
+  important: one `MainControls` list per plugin, the rule that finds it
+  (`resolve`), knob labels, and name lookup for agents and CC bindings.
 - `dsp.rs` — built-in processors (gain, pan, EQ, filter, limiter, saturation,
   delay, reverb, metronome).
 - `matrix.rs` — MIDI routing: sources × destinations, per-cell rules (channel,
@@ -41,7 +67,12 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
 - `bridge.rs` — unix socket `$XDG_RUNTIME_DIR/kabelsalat.sock` between the
   running app and `kabelsalat mcp --attach` / `kabelsalat send`.
 - `mcp.rs` / `assistant.rs` — MCP server (headless or attached) and the
-  built-in DeepSeek assistant; both expose the same tools (AGENTS.md rule 6).
+  built-in assistant; both expose the same tools (AGENTS.md rule 6). The
+  assistant's worker asks a decisions model first (`SHORTCUTS`: one row per
+  request it settles, each a plan of tool calls) and hands the rest to a chat
+  model. `llm.rs` is the one client and the route per role (decide, act,
+  perceive); `vision.rs` sizes and encodes the images a model gets (attached
+  by the user, or the app window through `look_at_rack`).
 - `session.rs` — sessions (multi-rig), templates.
 
 ## 0. Decision log
@@ -120,6 +151,12 @@ contributors and agents are in [AGENTS.md](../AGENTS.md).
   of 4 Surge instances, idle voices not rendered); each rig chip has × with a
   "Delete rig?" confirmation. Surviving rigs keep patch, knobs, synth state,
   device binding and mix (split_rigs → edit → merge_rigs → one LoadRigs).
+- **2026-11-17** — **No voice pool** ("remove the hard limit of surge
+  instances", #2): voices are hosted on demand, one per CLAP unit, and
+  retired when the unit goes; no idle spares (a warm Surge instance loads in
+  about 40 ms, a first one in about 170 ms, measured by `many-voices-test`).
+  No cap on the count: the engine's voice table grows by a table swap. CPU is
+  the only limit, visible as `render_max_us` / `render_late` in get_status.
 - **2026-11-15** — **Mixer is its own view** (user: "volume of the rigs at the
   top doesn't make sense"): vol/pan/M/S left the strip; the Mixer stage
   (chip / F10) shows every source → its rig bus → Master out as channel strips.
@@ -207,6 +244,13 @@ The graph is presented as a **rack of labeled hardware-style units** (Reason):
   synth + reverb); friendly empty states with big, obvious "add" affordances.
 - **Smart controls:** per-instrument macro knobs — many plugin parameters mapped to
   a few expressive controls. Made for live playing; MIDI-learn binds them.
+  The knobs are the plugin's own main controls (`main_controls::resolve`):
+  CLAP remote-controls pages first, then LV2 `param:` designations, then the
+  first usable continuous parameters with macros in front. A CLAP list is
+  read on the plugin's main thread when the instance is created and again
+  after a state load; an LV2 list is read per URI on a worker thread. The
+  face polls CLAP values back at 10 Hz. An LV2 port is not read back, so its
+  knob mirrors what the app sent (the engine does not publish port values).
 - **Big, friendly controls:** touch-sized targets, rounded cards, playful visual
   feedback — instruments and cables react visibly when played.
 - **Templates:** one-click starting points ("Lead + Reverb", "Drums + Bass",

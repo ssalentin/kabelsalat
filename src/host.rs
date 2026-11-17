@@ -317,6 +317,12 @@ impl ClapVoice {
         Self::instantiate_entry(entry, cid, sample_rate)
     }
 
+    /// [`Self::new_plugin`] from one bundle file, not the search paths.
+    pub fn new_from_bundle(sample_rate: f64, bundle: &std::path::Path, plugin_id: &str) -> Result<(ClapVoice, ClapVoiceMain)> {
+        let (entry, cid) = load_bundle(bundle, plugin_id)?;
+        Self::instantiate_entry(entry, cid, sample_rate)
+    }
+
     fn instantiate_entry(
         entry: PluginEntry,
         plugin_id: CString,

@@ -880,13 +880,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_instruments",
-            "description":"List the built-in instrument catalog (setBfree, Surge XT, Dexed, Vitalium, YANES): each entry's id, format (CLAP/LV2), description, GitHub repo, install route (distro package or build-from-source), whether it is currently installed, and whether an install is running. Use install_instrument to install one.",
+            "description":"List the built-in instrument catalog: each entry's id, name, format (CLAP/LV2), description, about text, licence, homepage, source code URL, install route (distro package, build from source, or prebuilt GitHub release), whether it is currently installed, and whether an install is running. Use install_instrument to install one.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"install_instrument",
-            "description":"Install a catalog instrument (from list_instruments) onto this system: a distro package (via sudo pacman) or a build from GitHub source into ~/.clap / ~/.lv2. DESTRUCTIVE (it changes the user's system): requires confirm=true after asking the user. Runs in the background with a live log in the Plugins view and rescans plugins when done.",
-            "parameters":{"type":"object","properties":{"id":{"type":"string","description":"Catalog instrument id from list_instruments (e.g. 'setbfree', 'surge-xt', 'dexed', 'vitalium', 'yanes')"},"confirm":{"type":"boolean","description":"Must be true after asking the user"}},"required":["id"]}
+            "description":"Install a catalog instrument (from list_instruments) onto this system: a distro package (via sudo pacman), a build from GitHub source, or a checksum-verified prebuilt GitHub release, into ~/.clap / ~/.lv2. DESTRUCTIVE (it changes the user's system): requires confirm=true after asking the user. Runs in the background with a live log in the Plugins view and rescans plugins when done.",
+            "parameters":{"type":"object","properties":{"id":{"type":"string","description":"Catalog instrument id from list_instruments (e.g. 'setbfree', 'surge-xt', 'odin2')"},"confirm":{"type":"boolean","description":"Must be true after asking the user"}},"required":["id"]}
         }},
         {"type":"function","function":{
             "name":"transport_play",

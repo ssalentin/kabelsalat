@@ -644,6 +644,20 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **A plugin editor is judged by its window, not by `gui.show`'s answer:**
+    Odin 2 returns false from `show` yet attaches and paints its editor;
+    treating that as failure refused a working GUI. `editor-test` checks the
+    plugin put a child window into ours, and that it closes and reopens.
+119. **Plugin editor windows are dialogs:** Hyprland tiled a plain X11
+    toplevel (781x950, the plugin squeezed to fit); `PluginWindow` sets
+    `_NET_WM_WINDOW_TYPE_DIALOG`, so it floats at the plugin's own size. Its
+    class is `kabelsalat-plugin`; `scripts/shot.sh <out> <pid> <title>`
+    captures one.
+120. **Plugin timers run only while that plugin's editor is open:** JUCE's
+    timers drive one message loop per process; running every Surge's timers
+    each frame deadlocked the unit suite, whose tests host Surge on parallel
+    threads (`voice_host_tests` hung 3 of 4 runs, 12 of 12 passed after).
+    `ClapVoiceMain::pump` returns at once without an editor.
 
 ## Working on kabelsalat
 
@@ -714,7 +728,9 @@ Learned so far (2026-11-15, UI polish pass):
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).
-- **No X11 child windows** — plugin editors are native egui.
+- **Plugin GUIs only in their own windows:** the main window is native
+  Wayland and never embeds X11. A plugin's own editor opens in a separate
+  `PluginWindow` (XWayland) on request; check with `kabelsalat editor-test`.
 - **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside
   `ctx.fonts_mut`/`ui.fonts_mut` — layout under the lock, paint after release.
 - RT discipline: the audio render path is allocation-free; UI animation reads

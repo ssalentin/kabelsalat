@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
+  Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
+  editor pane, in a window of its own, and closes from the same button or the
+  window's close button. kabelsalat now runs the plugin's timers and file
+  descriptor callbacks, which these editors paint from.
+  `kabelsalat editor-test` opens, checks and closes every installed editor.
 - **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
   installs from its prebuilt release on x86_64 and builds from source on
   aarch64; its 260 factory patches are fetched too, so the assistant can list,

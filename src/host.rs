@@ -23,7 +23,7 @@
 //!   blocks (CLAP [audio-thread])
 //! - cpal callback: drains a lock-free `rtrb` ring into the device buffer
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +34,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window as ClapWindow};
+use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
+use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
 use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
 use clack_extensions::params::{
@@ -46,11 +49,12 @@ use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
 };
 use clack_host::events::{EventFlags, EventHeader, Match};
-use clack_host::host::HostExtensions;
+use clack_host::host::{HostError, HostExtensions};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
 use crate::main_controls::{self, Candidate, MainControls, RemotePage};
+use crate::plugin_window::PluginWindow;
 use crate::transport::{Transport, BEATS_PER_BAR};
 
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
@@ -72,11 +76,18 @@ struct HostShared {
     latency: OnceLock<Option<PluginLatency>>,
     audio_ports: OnceLock<Option<PluginAudioPorts>>,
     remote_controls: OnceLock<Option<PluginRemoteControls>>,
+    gui: OnceLock<Option<PluginGui>>,
+    timer: OnceLock<Option<PluginTimer>>,
+    posix_fd: OnceLock<Option<PluginPosixFd>>,
     // Plugin -> host requests (lock-free flags).
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
     process_requested: AtomicBool,
     flush_requested: AtomicBool,
+    // Editor requests. clack dispatches every HostGuiImpl callback to the
+    // shared handler (they may come from any thread).
+    gui_resize: Mutex<Option<GuiSize>>,
+    gui_closed: AtomicBool,
 }
 
 impl<'a> SharedHandler<'a> for HostShared {
@@ -86,6 +97,9 @@ impl<'a> SharedHandler<'a> for HostShared {
         let _ = self.latency.set(instance.get_extension());
         let _ = self.audio_ports.set(instance.get_extension());
         let _ = self.remote_controls.set(instance.get_extension());
+        let _ = self.gui.set(instance.get_extension());
+        let _ = self.timer.set(instance.get_extension());
+        let _ = self.posix_fd.set(instance.get_extension());
     }
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
@@ -111,10 +125,41 @@ impl HostParamsImplShared for HostShared {
     }
 }
 
+impl HostGuiImpl for HostShared {
+    fn resize_hints_changed(&self) {}
+    fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
+        *self.gui_resize.lock().unwrap() = Some(new_size);
+        Ok(())
+    }
+    fn request_show(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn request_hide(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+    fn closed(&self, _was_destroyed: bool) {
+        self.gui_closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A timer the plugin registered (`timer-support`); the UI frame fires it.
+struct PluginTimerSlot {
+    id: u32,
+    period: Duration,
+    due: Instant,
+}
+
+/// Host shortest timer period: the UI frame drives timers, so faster ones
+/// could not be honoured anyway.
+const MIN_TIMER_PERIOD: Duration = Duration::from_millis(15);
+
 struct HostMainThread {
     state_dirty: Cell<bool>,
     latency_changed: Cell<bool>,
     params_rescan: Cell<bool>,
+    timers: RefCell<Vec<PluginTimerSlot>>,
+    next_timer_id: Cell<u32>,
+    fds: RefCell<Vec<(i32, FdFlags)>>,
 }
 
 impl HostMainThread {
@@ -123,7 +168,55 @@ impl HostMainThread {
             state_dirty: Cell::new(false),
             latency_changed: Cell::new(false),
             params_rescan: Cell::new(false),
+            timers: RefCell::new(Vec::new()),
+            next_timer_id: Cell::new(1),
+            fds: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Ids of timers that are due, rescheduled for their next tick.
+    fn take_due_timers(&self, now: Instant) -> Vec<u32> {
+        let mut due = Vec::new();
+        for t in self.timers.borrow_mut().iter_mut() {
+            if now >= t.due {
+                due.push(t.id);
+                t.due = now + t.period;
+            }
+        }
+        due
+    }
+}
+
+impl HostTimerImpl for HostMainThread {
+    fn register_timer(&self, period_ms: u32) -> Result<TimerId, HostError> {
+        let id = self.next_timer_id.get();
+        self.next_timer_id.set(id.wrapping_add(1).max(1));
+        let period = Duration::from_millis(period_ms as u64).max(MIN_TIMER_PERIOD);
+        self.timers.borrow_mut().push(PluginTimerSlot { id, period, due: Instant::now() + period });
+        Ok(TimerId(id))
+    }
+    fn unregister_timer(&self, timer_id: TimerId) -> Result<(), HostError> {
+        self.timers.borrow_mut().retain(|t| t.id != timer_id.0);
+        Ok(())
+    }
+}
+
+impl HostPosixFdImpl for HostMainThread {
+    fn register_fd(&self, fd: i32, flags: FdFlags) -> Result<(), HostError> {
+        let mut fds = self.fds.borrow_mut();
+        fds.retain(|(f, _)| *f != fd);
+        fds.push((fd, flags));
+        Ok(())
+    }
+    fn modify_fd(&self, fd: i32, flags: FdFlags) -> Result<(), HostError> {
+        if let Some(e) = self.fds.borrow_mut().iter_mut().find(|(f, _)| *f == fd) {
+            e.1 = flags;
+        }
+        Ok(())
+    }
+    fn unregister_fd(&self, fd: i32) -> Result<(), HostError> {
+        self.fds.borrow_mut().retain(|(f, _)| *f != fd);
+        Ok(())
     }
 }
 
@@ -160,7 +253,10 @@ impl HostHandlers for TestHost {
             .register::<HostLog>()
             .register::<HostParams>()
             .register::<HostState>()
-            .register::<HostLatency>();
+            .register::<HostLatency>()
+            .register::<HostGui>()
+            .register::<HostTimer>()
+            .register::<HostPosixFd>();
     }
 }
 
@@ -171,6 +267,9 @@ struct Exts {
     latency: Option<PluginLatency>,
     audio_ports: Option<PluginAudioPorts>,
     remote_controls: Option<PluginRemoteControls>,
+    gui: Option<PluginGui>,
+    timer: Option<PluginTimer>,
+    posix_fd: Option<PluginPosixFd>,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +410,9 @@ impl ClapVoice {
             latency: h.latency.get().copied().flatten(),
             audio_ports: h.audio_ports.get().copied().flatten(),
             remote_controls: h.remote_controls.get().copied().flatten(),
+            gui: h.gui.get().copied().flatten(),
+            timer: h.timer.get().copied().flatten(),
+            posix_fd: h.posix_fd.get().copied().flatten(),
         });
         println!(
             "extensions: params={} state={} latency={} audio-ports={} remote-controls={}",
@@ -388,6 +490,7 @@ impl ClapVoice {
             exts,
             main_controls: MainControls::default(),
             main_controls_rechecks: 0,
+            editor: None,
             _entry: entry,
         };
         main.refresh_main_controls();
@@ -651,6 +754,121 @@ mod transport_event_tests {
     }
 }
 
+fn x11_embedded() -> GuiConfiguration<'static> {
+    GuiConfiguration { api_type: GuiApiType::X11, is_floating: false }
+}
+
+/// The registered descriptors that are ready now (never blocks).
+fn ready_fds(fds: &[(i32, FdFlags)]) -> Vec<(i32, FdFlags)> {
+    let mut polls: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&(fd, flags)| {
+            let mut events = 0;
+            if flags.contains(FdFlags::READ) {
+                events |= libc::POLLIN;
+            }
+            if flags.contains(FdFlags::WRITE) {
+                events |= libc::POLLOUT;
+            }
+            libc::pollfd { fd, events, revents: 0 }
+        })
+        .collect();
+    if polls.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: `polls` is a valid, exclusively borrowed array of its length.
+    if unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0) } <= 0 {
+        return Vec::new();
+    }
+    polls
+        .iter()
+        .filter(|p| p.revents != 0)
+        .map(|p| {
+            let mut flags = FdFlags::empty();
+            if p.revents & libc::POLLIN != 0 {
+                flags |= FdFlags::READ;
+            }
+            if p.revents & libc::POLLOUT != 0 {
+                flags |= FdFlags::WRITE;
+            }
+            if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                flags |= FdFlags::ERROR;
+            }
+            (p.fd, flags)
+        })
+        .collect()
+}
+
+/// `kabelsalat editor-test [plugin-id...]`: open every installed CLAP
+/// plugin's own editor (or the named ones), run its main-thread callbacks for
+/// a while, and check that the editor attached to the host window. Hold each
+/// open longer with `KABELSALAT_EDITOR_HOLD=<seconds>` (for screenshots).
+pub fn run_editor_test(ids: &[String]) -> Result<()> {
+    let ids: Vec<String> = if ids.is_empty() {
+        let mut all: Vec<String> = list_clap_plugins().into_iter().map(|p| p.id).collect();
+        all.sort();
+        all.dedup();
+        all
+    } else {
+        ids.to_vec()
+    };
+    let hold = std::env::var("KABELSALAT_EDITOR_HOLD").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0);
+    let mut failed = Vec::new();
+    for id in &ids {
+        let (voice, mut main) = match ClapVoice::new_plugin(48_000.0, id) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("editor-test {id}: SKIP (does not load: {e:#})");
+                continue;
+            }
+        };
+        if !main.has_editor() {
+            println!("editor-test {id}: no X11 editor");
+            main.retire(voice);
+            continue;
+        }
+        let result = main.open_editor(&format!("{id} · kabelsalat editor-test")).and_then(|()| {
+            let until = Instant::now() + Duration::from_secs_f64(hold);
+            while Instant::now() < until && main.editor_open() {
+                main.pump();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            match main.editor_children() {
+                Some(n) if n > 0 => Ok(n),
+                Some(_) => Err(anyhow!("the plugin attached no window to the editor window")),
+                None => Err(anyhow!("the editor closed by itself")),
+            }
+        });
+        main.close_editor();
+        let reopened = result.is_ok() && main.open_editor("reopen").is_ok() && {
+            for _ in 0..10 {
+                main.pump();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            main.editor_children().is_some_and(|n| n > 0)
+        };
+        main.close_editor();
+        match (result, reopened) {
+            (Ok(n), true) => println!("editor-test {id}: PASS ({n} child window, closes and reopens)"),
+            (Ok(_), false) => {
+                println!("editor-test {id}: FAIL (did not reopen after close)");
+                failed.push(id.clone());
+            }
+            (Err(e), _) => {
+                println!("editor-test {id}: FAIL ({e:#})");
+                failed.push(id.clone());
+            }
+        }
+        main.retire(voice);
+    }
+    if failed.is_empty() {
+        println!("=== editor-test PASS ===");
+        Ok(())
+    } else {
+        bail!("editor-test FAIL: {}", failed.join(", "))
+    }
+}
+
 /// Main-control polls that look again after a state load (about a second
 /// at the UI's poll rate): the state lands on the audio thread a few blocks
 /// later.
@@ -667,10 +885,134 @@ pub struct ClapVoiceMain {
     main_controls: MainControls,
     /// Polls left that re-read the main controls after a state load.
     main_controls_rechecks: u8,
+    /// The plugin's own editor, while it is open.
+    editor: Option<ClapEditor>,
     _entry: PluginEntry,
 }
 
+/// An open plugin editor: the plugin's GUI embedded in a host toplevel.
+/// The window must outlive the GUI, so `close_editor` destroys the GUI first.
+struct ClapEditor {
+    gui: PluginGui,
+    window: PluginWindow,
+    resizable: bool,
+}
+
+impl Drop for ClapVoiceMain {
+    fn drop(&mut self) {
+        self.close_editor();
+    }
+}
+
 impl ClapVoiceMain {
+    /// Whether the plugin has its own editor kabelsalat can open.
+    pub fn has_editor(&mut self) -> bool {
+        let Some(gui) = self.exts.gui else { return false };
+        gui.is_api_supported(&self.instance.plugin_handle(), x11_embedded())
+    }
+
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Open the plugin's own editor in a window titled `title`. A second call
+    /// while it is open does nothing.
+    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+        if self.editor.is_some() {
+            return Ok(());
+        }
+        let gui = self.exts.gui.ok_or_else(|| anyhow!("this plugin has no editor of its own"))?;
+        let cfg = x11_embedded();
+        if !gui.is_api_supported(&self.instance.plugin_handle(), cfg) {
+            bail!("this plugin's editor does not run on X11");
+        }
+        self.instance.access_shared_handler(|h| {
+            h.gui_closed.store(false, Ordering::SeqCst);
+            h.gui_resize.lock().unwrap().take();
+        });
+        gui.create(&self.instance.plugin_handle(), cfg).map_err(|e| anyhow!("the plugin could not create its editor: {e:?}"))?;
+        let handle = self.instance.plugin_handle();
+        let size = gui.get_size(&handle).unwrap_or(GuiSize { width: 800, height: 600 });
+        let resizable = gui.can_resize(&handle);
+        let window = match PluginWindow::open(title, size.width, size.height, resizable) {
+            Ok(w) => w,
+            Err(e) => {
+                gui.destroy(&handle);
+                return Err(e);
+            }
+        };
+        // SAFETY: the window lives in `self.editor` and `close_editor`
+        // destroys the GUI before dropping it.
+        let parented = unsafe { gui.set_parent(&handle, ClapWindow::from_x11_handle(window.id() as _)) };
+        if let Err(e) = parented {
+            gui.destroy(&handle);
+            bail!("the plugin could not attach its editor: {e:?}");
+        }
+        // Odin 2 answers false here yet shows its editor; whether it attached
+        // is what `editor-test` checks, not this answer.
+        let _ = gui.show(&handle);
+        self.editor = Some(ClapEditor { gui, window, resizable });
+        Ok(())
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(ed) = self.editor.take() {
+            let handle = self.instance.plugin_handle();
+            let _ = ed.gui.hide(&handle);
+            ed.gui.destroy(&handle);
+            drop(ed.window);
+        }
+    }
+
+    /// While the editor is open, run the plugin's main-thread callbacks: due
+    /// timers, ready file descriptors, the window's events and resize
+    /// requests. Call it every UI frame; JUCE editors (Surge) paint only from
+    /// these. Without an editor nothing runs: JUCE's timers drive its one
+    /// process-wide message loop, and firing them from several threads (one
+    /// per test) deadlocked the unit suite.
+    pub fn pump(&mut self) {
+        if self.editor.is_none() {
+            return;
+        }
+        let due = self.instance.access_handler(|h| h.take_due_timers(Instant::now()));
+        if let Some(timer) = self.exts.timer {
+            for id in due {
+                timer.on_timer(&mut self.instance.plugin_handle(), TimerId(id));
+            }
+        }
+        if let Some(posix_fd) = self.exts.posix_fd {
+            let fds = self.instance.access_handler(|h| h.fds.borrow().clone());
+            for (fd, flags) in ready_fds(&fds) {
+                posix_fd.on_fd(&mut self.instance.plugin_handle(), fd, flags);
+            }
+        }
+        self.pump_editor();
+    }
+
+    /// Windows the plugin attached inside its editor window, while it is open.
+    pub fn editor_children(&self) -> Option<usize> {
+        self.editor.as_ref().and_then(|ed| ed.window.child_count().ok())
+    }
+
+    fn pump_editor(&mut self) {
+        let plugin_closed = self.instance.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst));
+        let requested = self.instance.access_shared_handler(|h| h.gui_resize.lock().unwrap().take());
+        let Some(ed) = self.editor.as_mut() else { return };
+        let events = ed.window.poll();
+        if plugin_closed || events.close_requested {
+            self.close_editor();
+            return;
+        }
+        let handle = self.instance.plugin_handle();
+        if let Some(size) = requested {
+            let _ = ed.window.resize(size.width, size.height, ed.resizable);
+            let _ = ed.gui.set_size(&handle, size);
+        } else if let Some((w, h)) = events.resized.filter(|_| ed.resizable) {
+            let size = ed.gui.adjust_size(&handle, GuiSize { width: w, height: h }).unwrap_or(GuiSize { width: w, height: h });
+            let _ = ed.gui.set_size(&handle, size);
+        }
+    }
+
     /// Direct access for params inspection (main thread only).
     pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
         &mut self.instance

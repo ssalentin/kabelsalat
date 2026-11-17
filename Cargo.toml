@@ -21,6 +21,7 @@ audio_thread_priority = { version = "0.35.1", features = ["with_dbus"] }
 eframe = "0.37.0"
 egui = "0.37.0"
 libc = "0.2"
+x11rb = "0.14.0"
 midir = "0.11.1"
 # Agent image input: encode app screenshots / pasted images for vision models.
 png = "0.18.1"

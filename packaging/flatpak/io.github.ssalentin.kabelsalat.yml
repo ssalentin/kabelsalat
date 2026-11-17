@@ -10,6 +10,8 @@ rename-icon: kabelsalat
 
 finish-args:
   - --socket=wayland
+  # Plugin GUIs are X11: each opens in its own XWayland window.
+  - --socket=x11
   - --share=ipc
   - --device=dri
   # Audio: cpal opens ALSA (pipewire-alsa / pulse plugin); pactl, parec, paplay

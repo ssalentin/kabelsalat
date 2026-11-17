@@ -14,6 +14,24 @@ releases may still change behaviour and session files.
   existing rig, independent of whole sessions. Available from the Rigs strip
   ("Save rig" / "Load rig" and rig-chip context menu) and as agent/MCP tools
   `save_rig`, `load_rig`, and `list_rig_presets`.
+- **Jev decides first:** the in-app agent asks TypeSafe's Jev decisions model
+  (`~typesafe/jev-latest`, OpenRouter's decisions API) about every request.
+  A single clear action (tempo, a rig's volume / mute / solo, keyboard split,
+  add / delete / show a rig, transport, undo / redo, flip) runs from that one
+  decision, measured at 0.2–0.5 s instead of 2–2.5 s through a chat model.
+  Everything else goes to the chat model as before. Needs
+  `openrouter_api_key` in `config.json`; `agent_decide_model: "off"` turns it
+  off.
+- **Model routes per role** in `config.json`: `agent_decide_model`,
+  `agent_act_model` (also set by `/model` in the chat) and
+  `agent_perceive_model`. Ids with a vendor prefix (`vendor/model`) go to
+  OpenRouter, bare ids to DeepSeek.
+- **`kabelsalat agent-eval`** runs the real agent loop over 14 scripted
+  requests on a headless app with an offline engine and reports pass rate,
+  model steps, tool calls, wall time and the models that answered.
+  **`kabelsalat jev-test`** shows what Jev decides for sample requests.
+- **Agent Activity shows the cost of the last request:** model steps, model
+  time and the model that answered.
 - **Confirm / Cancel buttons in the chat** (#32): when the assistant asks
   before a destructive action (delete a rig, install an instrument), the chat
   shows the two buttons; the click runs or cancels it.
@@ -70,6 +88,9 @@ releases may still change behaviour and session files.
 - After recording, the top bar names the saved take with **Play** and **Folder**.
 
 ### Changed
+- **`agent_act_model` replaces `assistant_model`** in `config.json`; the old
+  field is no longer read. A request stops after 24 model steps with a
+  message instead of running on.
 - **I** toggles the info line at the top right (was D, which is also a note
   key); it now starts with the last incoming MIDI event — device, note and
   velocity, or CC number and value.
@@ -79,6 +100,22 @@ releases may still change behaviour and session files.
   clears `trigmask` bit 12 (tied envelope), but step 12 still opens the filter
   over the previous step and delay (~8% of onset energy). Scoring on the true
   silent steps (`9, 10, 15`) removes the ~5–8% false-rotation rate across runs.
+- **The agent's `disconnect` works:** the cable came back in the same audio
+  block because the rack re-sent it every frame; the tool reported success.
+- **No more doubled units from the agent:** a `get_graph` right after
+  `add_node` showed the patch from before the edit, so the model added the
+  unit again. Tool calls that the engine applies now finish before the next
+  call runs, and their results name the node and cable ids they created or
+  removed (or say that nothing changed).
+- **The agent survives a flaky network:** timeouts, connection errors, 429
+  and 5xx are retried up to three times (honoring `Retry-After`) instead of
+  ending the turn.
+- **Wrong tool calls are corrected, not guessed:** an unknown tool or
+  arguments that do not fit the tool get an error the model can act on; they
+  used to run with default values.
+- **Long chats stay fast:** the conversation sent to the model is capped
+  (about 15k tokens); old tool results are shortened and the oldest turns
+  dropped whole.
 - **Effect chains are audible:** an LV2 instrument into a built-in effect
   (setBfree → Drive) and any effect into another effect (Delay → Reverb) were
   silent at the master. Effects now run in signal-flow order and hear every

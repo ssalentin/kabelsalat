@@ -406,7 +406,7 @@ impl PreviewApp {
                         let k = self.key_input.trim().to_string();
                         match assistant::save_key(&k) {
                             Ok(()) => {
-                                self.assistant.set_key(k);
+                                self.assistant.key_saved();
                                 self.key_input.clear();
                             }
                             Err(e) => self.assistant.history.push(assistant::ChatLine {
@@ -662,25 +662,9 @@ impl eframe::App for PreviewApp {
             }
         }
         // Assistant events (tool calls execute here, on the UI thread).
-        for ev in self.assistant.poll() {
-            match ev {
-                assistant::FromWorker::Models(_) => {}
-                assistant::FromWorker::Text(t) => self
-                    .assistant
-                    .history
-                    .push(assistant::ChatLine { role: "assistant".into(), text: t }),
-                assistant::FromWorker::ToolCall { id, name, args } => {
-                    let result = self.exec_tool(&name, &args);
-                    self.assistant.send_tool_result(id, result);
-                }
-                assistant::FromWorker::Done => self.assistant.busy = false,
-                assistant::FromWorker::Error(e) => {
-                    self.assistant.busy = false;
-                    self.assistant
-                        .history
-                        .push(assistant::ChatLine { role: "error".into(), text: e });
-                }
-            }
+        for batch in self.assistant.poll() {
+            let results = batch.iter().map(|call| self.exec_tool(&call.name, &call.args)).collect();
+            self.assistant.send_tool_results(results);
         }
         self.assistant_panel(root);
         egui::CentralPanel::default()

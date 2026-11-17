@@ -1520,9 +1520,12 @@ impl GraphEngine {
             self.drain_voice_msgs();
         }
         match cmd {
-            Command::AddNode { kind, name, rig } => {
+            Command::AddNode { kind, name, rig, wire } => {
                 let id = self.graph.add_node(kind.clone(), name);
                 self.graph.set_rig(id, rig);
+                if wire {
+                    self.graph.wire_instrument(id);
+                }
                 let sr = self.sample_rate;
                 match &kind {
                     NodeKind::Dsp(dk) => {
@@ -3564,6 +3567,7 @@ mod tests {
             kind: NodeKind::Dsp(crate::control::DspKind::Gain),
             name: crate::control::name_bytes("G"),
             rig: 0,
+            wire: false,
         });
         engine.render(&mut buf, 2);
         assert_eq!(rev(), 1);
@@ -4269,7 +4273,7 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     // Through a built-in effect, like a live organ rig (setBfree → Drive →
     // Master): the effect must hear the LV2 instrument.
     let drive = master + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0, wire: false });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
@@ -4304,7 +4308,7 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
             engine.spawn_lv2_loader();
         }
         let inst = keys.max(master) + 1;
-        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0 });
+        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0, wire: false });
         bus.send(Command::Connect { id: 1, from: PortRef { node: keys, port: 0 }, to: PortRef { node: inst, port: 0 }, kind: PortKind::Midi });
         bus.send(Command::Connect { id: 2, from: PortRef { node: inst, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
         let mut buf = vec![0.0f32; 256 * 2];
@@ -4550,7 +4554,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
 
     // Insert a dynamically added gain node: surge -> gain -> master.
     let gain = keys.max(surge).max(master) + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false });
     bus.send(Command::SetParam { node: gain, param: 0, value: 1.0 });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });

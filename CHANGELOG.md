@@ -43,6 +43,12 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **An instrument the assistant adds plays at once:** `add_node` wires a
+  CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
+  rig's synth: the rig's Keys into it and it into the rig's Master. A
+  setBfree added to a rig was left with only its MIDI cable and stayed
+  silent. The assistant also no longer believes LV2 instruments are
+  "coming soon".
 - **A stuck source could silence everything:** an instrument outputting a
   constant (DC) filled the master meter while every rig went quiet, and sent
   the offset to the speakers. The master now blocks DC.

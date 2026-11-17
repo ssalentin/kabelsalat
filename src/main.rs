@@ -33,6 +33,8 @@ mod transport;
 mod ui;
 mod vision;
 
+const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test";
+
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
     match mode.as_str() {
@@ -95,8 +97,16 @@ fn main() -> anyhow::Result<()> {
         "meter-test" => engine::meter_test(),
         "record-test" => record::run_test(),
         "audio-in-test" => audio_in::run_test(),
+        "--version" | "-V" => {
+            println!("kabelsalat {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        "--help" | "-h" | "help" => {
+            println!("usage: kabelsalat [mode]\nmodes: {MODES}");
+            Ok(())
+        }
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, main-controls-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, sound-library-test, many-voices-test");
+            eprintln!("unknown mode: {other}\nmodes: {MODES}");
             std::process::exit(1);
         }
     }

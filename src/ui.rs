@@ -269,6 +269,26 @@ fn midi_port_key(name: &str) -> &str {
     }
 }
 
+/// A hardware MIDI port as people read it: the device, and the port when
+/// the device has several ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 2 24:1" →
+/// "ESI MIDIMATE eX" + "Port 2"). ALSA repeats the client name in the port
+/// name and appends "client:port" numbers that change on a re-plug.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MidiPortName { device: String, port: String }
+
+fn midi_port_name(raw: &str) -> MidiPortName {
+    let key = midi_port_key(raw);
+    let Some((client, port)) = key.split_once(':') else {
+        return MidiPortName { device: key.trim().to_string(), port: String::new() };
+    };
+    let port = port.strip_prefix(client).unwrap_or(port).trim();
+    let port = match port.strip_prefix("MIDI ") {
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => format!("Port {n}"),
+        _ => port.to_string(),
+    };
+    MidiPortName { device: client.trim().to_string(), port }
+}
+
 /// Which known device index a port belongs to (#16). `Err(())` = already
 /// connected (live under this exact name), `Ok(None)` = a new device.
 /// A re-plug can get another ALSA client number: an OFFLINE device with the
@@ -859,6 +879,11 @@ fn unit_time_mul(u: &Unit) -> f32 {
 /// and laptop typing are ONE source); `HwAll` = any hardware device (omni).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MatrixRow { Keys, HwAll, HwDev(u32) }
+
+/// A matrix source row as drawn: `port` is set only when its device has
+/// several ports, and `continues` marks a further port of the device above.
+#[derive(Clone, Debug)]
+struct MatrixSource { row: MatrixRow, name: String, port: Option<String>, live: bool, continues: bool, led: f32 }
 
 impl MatrixRow {
     /// The concrete source a row edits (HwAll is an aggregate — no single rule).
@@ -2244,6 +2269,8 @@ struct DemoApp {
     hw_status: String,
     /// Connected hardware MIDI device names, indexed by device id.
     hw_devices: Vec<String>,
+    /// Which of `hw_devices` is plugged in right now (missing = live).
+    hw_live: Vec<bool>,
     /// Last hardware MIDI event for the info line ("eX MIDI 1 · C4 v100").
     last_midi: Option<String>,
     /// The info line is shown in the hint row (no room in the top bar).
@@ -2543,6 +2570,7 @@ impl DemoApp {
             hw_midi_rev: u64::MAX,
             hw_status: String::new(),
             hw_devices: Vec::new(),
+            hw_live: Vec::new(),
             last_midi: None,
             info_in_hint: false,
             rig_device: Vec::new(),
@@ -2824,7 +2852,7 @@ impl DemoApp {
         match dev {
             None => "ALL SOURCES".into(),
             Some(d) => match self.hw_devices.get(d as usize) {
-                Some(name) => format!("HW: {}", name.to_uppercase()),
+                Some(_) => format!("HW: {}", self.hw_device_label(d).to_uppercase()),
                 None => format!("HW: DEV {d}"),
             },
         }
@@ -6325,19 +6353,135 @@ impl DemoApp {
         }
     }
 
-    /// Matrix source rows with their header label and activity LED: ONE
-    /// Keyboard row (on-screen clicks + laptop typing), hardware omni, then
-    /// one row per detected device.
-    fn matrix_rows(&self) -> Vec<(MatrixRow, String, f32)> {
-        let mut rows: Vec<(MatrixRow, String, f32)> = vec![
-            (MatrixRow::Keys, "Keyboard".into(), self.keyboard_led()),
-            (MatrixRow::HwAll, "All Hardware".into(), self.hw_leds.iter().cloned().fold(0.0f32, f32::max)),
+    /// A hardware device's display name, with its port when the device has
+    /// several ("U6MIDI Pro · Port 2"). One name for the matrix and rig strip.
+    fn hw_device_label(&self, d: u32) -> String {
+        let Some(raw) = self.hw_devices.get(d as usize) else { return format!("Device {d}") };
+        let n = midi_port_name(raw);
+        match self.hw_port_shown(&n) {
+            Some(port) => format!("{} · {port}", n.device),
+            None => n.device,
+        }
+    }
+
+    fn hw_port_shown(&self, n: &MidiPortName) -> Option<String> {
+        let ports = self.hw_devices.iter().filter(|r| midi_port_name(r).device == n.device).count();
+        (ports > 1 && !n.port.is_empty()).then(|| n.port.clone())
+    }
+
+    /// Matrix source rows: ONE Keyboard row (on-screen clicks + laptop
+    /// typing), hardware omni, then one row per detected device port.
+    fn matrix_rows(&self) -> Vec<MatrixSource> {
+        let mut rows = vec![
+            MatrixSource { row: MatrixRow::Keys, name: "Keyboard".into(), port: None, live: true, continues: false, led: self.keyboard_led() },
+            MatrixSource { row: MatrixRow::HwAll, name: "All hardware".into(), port: None, live: true, continues: false,
+                led: self.hw_leds.iter().cloned().fold(0.0f32, f32::max) },
         ];
-        for (d, name) in self.hw_devices.iter().enumerate() {
-            rows.push((MatrixRow::HwDev(d as u32), format!("Hardware: {name}"),
-                self.hw_leds.get(d).copied().unwrap_or(0.0)));
+        let mut prev_device: Option<String> = None;
+        for (d, raw) in self.hw_devices.iter().enumerate() {
+            let n = midi_port_name(raw);
+            let continues = prev_device.as_deref() == Some(n.device.as_str());
+            prev_device = Some(n.device.clone());
+            rows.push(MatrixSource {
+                row: MatrixRow::HwDev(d as u32),
+                port: self.hw_port_shown(&n),
+                name: n.device,
+                live: self.hw_live.get(d).copied().unwrap_or(true),
+                continues,
+                led: self.hw_leds.get(d).copied().unwrap_or(0.0),
+            });
         }
         rows
+    }
+
+    /// A matrix row header: activity LED, a kind badge (KEYS, ANY HW, HW),
+    /// the source's name, its port chip and an UNPLUGGED chip. Further ports
+    /// of one device hang off the first by an elbow instead of a badge.
+    fn matrix_source_head(ui: &mut egui::Ui, src: &MatrixSource) {
+        const H: f32 = 32.0;
+        const BADGE_W: f32 = 74.0;
+        const GAP: f32 = 10.0;
+        let hw = !matches!(src.row, MatrixRow::Keys);
+        let (badge_text, sub) = match src.row {
+            MatrixRow::Keys => ("KEYS", Some("screen + computer keys")),
+            MatrixRow::HwAll => ("ANY HW", Some("every device")),
+            MatrixRow::HwDev(_) => ("HW", None),
+        };
+        let ink = if src.live { theme::INK } else { theme::INK_2 };
+        let p = ui.painter();
+        let name = (!src.continues).then(|| p.layout_no_wrap(src.name.clone(), theme::medium_font(14.0), ink));
+        let sub = sub.map(|t| p.layout_no_wrap(t.into(), egui::FontId::proportional(12.0), theme::INK_2));
+        let chip_font = theme::medium_font(10.5);
+        let port = src.port.clone().map(|t| p.layout_no_wrap(t, chip_font.clone(), theme::CREAM_META));
+        let offline = (!src.live).then(|| p.layout_no_wrap("UNPLUGGED".into(), chip_font.clone(), theme::INK_2));
+        let badge = p.layout_no_wrap(badge_text.into(), chip_font.clone(), if hw { theme::MIDI_BLUE } else { theme::CREAM_META });
+        let chip_w = |g: &std::sync::Arc<egui::Galley>| g.size().x + 16.0;
+        let mut w = 6.0 + GAP + BADGE_W + GAP;
+        if let Some(g) = &name { w += g.size().x + GAP; }
+        if let Some(g) = &sub { w += g.size().x + GAP; }
+        if let Some(g) = &port { w += chip_w(g) + GAP; }
+        if let Some(g) = &offline { w += chip_w(g); }
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
+        let p = ui.painter();
+        let cy = rect.center().y;
+        let mut x = rect.left();
+        let led = if src.live { 0.25 + 0.75 * src.led.clamp(0.0, 1.0) } else { 0.12 };
+        p.circle_filled(egui::pos2(x + 3.0, cy), 3.0, theme::alpha(theme::LIVE_TEAL, led));
+        x += 6.0 + GAP;
+        let accent = if hw { theme::MIDI_BLUE } else { theme::CREAM_META };
+        if src.continues {
+            // Elbow from the device's first port down into this one.
+            let ex = x + 14.0;
+            let stroke = Stroke::new(1.0, theme::alpha(theme::MIDI_BLUE, 0.55));
+            p.line_segment([egui::pos2(ex, rect.top() - 10.0), egui::pos2(ex, cy)], stroke);
+            p.line_segment([egui::pos2(ex, cy), egui::pos2(x + BADGE_W, cy)], stroke);
+        } else {
+            let b = egui::Rect::from_min_size(egui::pos2(x, cy - 11.0), egui::vec2(BADGE_W, 22.0));
+            let fill = if hw { theme::alpha(theme::MIDI_BLUE, if src.live { 0.14 } else { 0.06 }) } else { theme::DARK_PANEL_HI };
+            p.rect_filled(b, 3.0, fill);
+            p.rect_stroke(b, 3.0, Stroke::new(1.0, if hw { theme::alpha(theme::MIDI_BLUE, 0.5) } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+            let gc = egui::pos2(b.left() + 15.0, cy);
+            match src.row {
+                MatrixRow::Keys => {
+                    // Keyboard glyph: a key bed with three black keys.
+                    let kb = egui::Rect::from_center_size(gc, egui::vec2(13.0, 9.0));
+                    p.rect_stroke(kb, 1.5, Stroke::new(1.2, accent), egui::StrokeKind::Inside);
+                    for i in 1..4 {
+                        let kx = kb.left() + i as f32 * kb.width() / 4.0;
+                        p.line_segment([egui::pos2(kx, kb.top()), egui::pos2(kx, kb.top() + 5.0)], Stroke::new(1.6, accent));
+                    }
+                }
+                _ => {
+                    // 5-pin DIN socket: pins on the upper arc, key notch below.
+                    p.circle_stroke(gc, 6.5, Stroke::new(1.2, accent));
+                    for deg in [180.0f32, 225.0, 270.0, 315.0, 0.0] {
+                        let r = deg.to_radians();
+                        p.circle_filled(gc + egui::vec2(r.cos(), r.sin()) * 3.6 + egui::vec2(0.0, 0.8), 1.0, accent);
+                    }
+                    p.line_segment([gc + egui::vec2(0.0, 4.0), gc + egui::vec2(0.0, 6.5)], Stroke::new(1.6, accent));
+                }
+            }
+            p.galley(egui::pos2(b.left() + 27.0, cy - badge.size().y / 2.0), badge, accent);
+        }
+        x += BADGE_W + GAP;
+        if let Some(g) = name {
+            let gw = g.size().x;
+            p.galley(egui::pos2(x, cy - g.size().y / 2.0), g, ink);
+            x += gw + GAP;
+        }
+        if let Some(g) = sub {
+            let gw = g.size().x;
+            p.galley(egui::pos2(x, cy - g.size().y / 2.0 + 1.0), g, theme::INK_2);
+            x += gw + GAP;
+        }
+        let chip = |g: std::sync::Arc<egui::Galley>, x: f32, col: Color32| -> f32 {
+            let r = egui::Rect::from_min_size(egui::pos2(x, cy - 10.0), egui::vec2(chip_w(&g), 20.0));
+            p.rect_stroke(r, 10.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            p.galley(egui::pos2(r.left() + 8.0, cy - g.size().y / 2.0), g, col);
+            r.width()
+        };
+        if let Some(g) = port { x += chip(g, x, theme::CREAM_META) + GAP; }
+        if let Some(g) = offline { chip(g, x, theme::INK_2); }
     }
 
     /// The hot-wire MIDI matrix grid: sources × instrument rigs, live.
@@ -6390,15 +6534,20 @@ impl DemoApp {
                 });
             }
             ui.end_row();
-            for (row, label, led) in &rows {
-                // Row header with activity dot.
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                    ui.painter().circle_filled(r.center(), 3.0,
-                        theme::alpha(theme::LIVE_TEAL, 0.25 + 0.75 * led.clamp(0.0, 1.0)));
-                    ui.add_space(4.0);
-                    no_wrap(ui, egui::RichText::new(label).size(14.0).color(theme::INK));
-                });
+            for src in &rows {
+                let row = &src.row;
+                if src.row == MatrixRow::HwAll {
+                    ui.horizontal(|ui| {
+                        theme::section_label(ui, "Hardware MIDI");
+                        let live = (0..self.hw_devices.len()).filter(|d| self.hw_live.get(*d).copied().unwrap_or(true)).count();
+                        ui.label(egui::RichText::new(match self.hw_devices.len() {
+                            0 => "none plugged in".to_string(),
+                            n => format!("{live} of {n} ports live"),
+                        }).size(11.0).color(theme::INK_2));
+                    });
+                    ui.end_row();
+                }
+                Self::matrix_source_head(ui, src);
                 for &s in &sinks {
                     let u = &self.units[s];
                     let is_clap = matches!(u.node_kind, UnitKind::Clap);
@@ -11323,6 +11472,7 @@ impl DemoApp {
             self.hw_midi_rev = rev;
             if let Ok(d) = self.hw_midi.devices.lock() {
                 self.hw_devices = d.iter().map(|(n, _)| n.clone()).collect();
+                self.hw_live = d.iter().map(|(_, l)| *l).collect();
                 let live: Vec<&str> = d.iter().filter(|(_, l)| *l).map(|(n, _)| n.as_str()).collect();
                 self.hw_status = if live.is_empty() {
                     "no hardware MIDI — laptop keys live".into()
@@ -16084,11 +16234,34 @@ mod matrix_ui_tests {
     fn matrix_has_one_keyboard_row() {
         let app = demo_app();
         let rows = app.matrix_rows();
-        let kb: Vec<_> = rows.iter().filter(|(r, _, _)| *r == MatrixRow::Keys).collect();
+        let kb: Vec<_> = rows.iter().filter(|r| r.row == MatrixRow::Keys).collect();
         assert_eq!(kb.len(), 1);
-        assert_eq!(kb[0].1, "Keyboard");
+        assert_eq!(kb[0].name, "Keyboard");
         assert_eq!(rows.len(), 2 + app.hw_devices.len(), "Keyboard + HW all + one per device");
-        assert!(rows.iter().all(|(_, l, _)| !l.to_lowercase().contains("laptop")));
+        assert!(rows.iter().all(|r| !r.name.to_lowercase().contains("laptop")));
+    }
+
+    #[test]
+    fn hardware_rows_name_the_device_and_only_a_needed_port() {
+        // Real names from `aconnect -l` / midir on this machine (rule 63).
+        let mut app = demo_app();
+        app.hw_devices = vec![
+            "ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 24:0".into(),
+            "ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 2 24:1".into(),
+            "M2:M2 MIDI 1 32:0".into(),
+            "Midi Through:Midi Through Port-0 14:0".into(),
+        ];
+        app.hw_live = vec![true, true, false, true];
+        let hw: Vec<_> = app.matrix_rows().into_iter().filter(|r| matches!(r.row, MatrixRow::HwDev(_))).collect();
+        let seen: Vec<_> = hw.iter().map(|r| (r.name.as_str(), r.port.as_deref(), r.continues, r.live)).collect();
+        assert_eq!(seen, vec![
+            ("ESI MIDIMATE eX", Some("Port 1"), false, true),
+            ("ESI MIDIMATE eX", Some("Port 2"), true, true),
+            ("M2", None, false, false),
+            ("Midi Through", None, false, true),
+        ]);
+        assert_eq!(app.hw_device_label(1), "ESI MIDIMATE eX · Port 2");
+        assert_eq!(app.hw_device_label(2), "M2");
     }
 
     /// Every text galley painted in a frame, with its screen rect.
@@ -16129,7 +16302,8 @@ mod matrix_ui_tests {
         let texts = panel_frame(&mut app, &ctx, vec![]);
         let count = |t: &str| texts.iter().filter(|(s, _)| s == t).count();
         // User 2026-11-15: no RIG INPUTS chips in the top bar — the brand sits there.
-        assert_eq!(count("K") + count("H"), 0, "no K/H chips: {texts:?}");
+        let bar_chips = texts.iter().filter(|(s, r)| (s == "K" || s == "H") && r.top() < 60.0).count();
+        assert_eq!(bar_chips, 0, "no K/H chips in the top bar: {texts:?}");
         assert!(texts.iter().any(|(s, _)| s == "k"), "wordmark painted (tracked per-char): {texts:?}");
         assert!(texts.iter().all(|(s, _)| !s.contains("Laptop") && !s.contains("laptop")));
         // The matrix keeps ONE Keyboard row (its rig-A cell is the old K chip);
@@ -16814,7 +16988,11 @@ mod rig_switch_tests {
             .map(|w| w.rect).collect());
         assert!(!cells.is_empty(), "matrix cells found");
         let sheet_mid = app.stage_rect.center().x;
-        let block_left = cells.iter().map(|r| r.left()).fold(f32::MAX, f32::min) - 120.0 - 20.0; // label col + spacing
+        let heads: Vec<Rect> = ctx.viewport(|v| v.prev_pass.widgets.get_layer(egui::LayerId::background())
+            .filter(|w| !w.sense.senses_click() && (w.rect.height() - 32.0).abs() < 1.0 && w.rect.right() < cells[0].left())
+            .map(|w| w.rect).collect());
+        assert!(!heads.is_empty(), "source row headers found");
+        let block_left = heads.iter().map(|r| r.left()).fold(f32::MAX, f32::min);
         let block_mid = block_left + block_w / 2.0;
         assert!((block_mid - sheet_mid).abs() < 60.0, "block centered: mid {block_mid} vs sheet {sheet_mid}");
     }

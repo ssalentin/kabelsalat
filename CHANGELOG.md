@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Changed
+- **MIDI matrix sources read like devices:** hardware rows show the device name
+  ("ESI MIDIMATE eX") instead of ALSA's "client:port 24:0" string, with a port
+  chip only when a device has several ports and further ports joined to the
+  first by a tree line. Each source carries a kind badge (KEYS, ANY HW, HW with
+  a DIN socket in MIDI blue), hardware sits under a "Hardware MIDI · n of m
+  ports live" header, and unplugged devices dim with an UNPLUGGED chip. The rig
+  strip uses the same device names.
 - **Themed dropdowns (`theme::Dropdown`):** replaced all three `egui::ComboBox`
   selectors (MIDI matrix CC parameter picker, assistant header chat-model
   picker, mixer audio output) with a Hurricane-styled dropdown matching the

@@ -8,11 +8,39 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Fixed
+- **The agent browses every instrument's own sounds.** `list_sounds` and
+  `load_sound` searched Surge patches whatever a rig held, so a YANES,
+  setBfree or Vitalium rig was offered Surge patches that mean nothing to it
+  (and a load wrote a Surge patch into the wrong plugin or failed with "no
+  CLAP synth"). Both tools now take `rig` (and `node`), find that rig's
+  instrument and work in its library: Surge patches, Dexed DX7 cartridge
+  voices, an LV2 instrument's presets and MIDI programmes (setBfree's 110
+  organ registrations, Vitalium's presets), or a plugin's own preset list
+  (YANES' 146 presets on its "Preset" parameter). The answer names the
+  instrument and the library; an instrument without sounds says which
+  parameters shape it; a rig with different instruments asks for the node.
+  The same holds for MCP (attached and headless) and for the Jev sound
+  shortcut. Check with `kabelsalat sound-library-test`.
+- **A listed sound loads exactly that sound:** `load_sound` with a label from
+  `list_sounds` could load another patch that shared a word with it, because
+  factory patches were preferred before the exact label was tried.
+- **A shortcut that hands over to the chat model no longer fails with a
+  DeepSeek 400:** when a Jev plan ran tools and then left the request to the
+  chat model (no sound matched, a rig needed a node named), DeepSeek's
+  thinking models rejected the conversation ("reasoning_content … must be
+  passed back") and the user got an error instead of an answer.
+- **Sound libraries are scanned off the UI thread** (rule 46): the first
+  `list_sounds` walked about 3000 patch files on it. An agent call that
+  arrives during a scan waits for it.
 - **Held notes stay lit** on the software keyboard and the Keys unit for as
   long as they are pressed, from a hardware keyboard too (they only blinked).
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.
 
 ### Added
+- **`ProgramChange` engine command:** a MIDI programme change to one
+  instrument node (how setBfree changes its registration), and
+  `kabelsalat sound-library-test`, which lists, searches and loads one sound
+  per installed catalog instrument through the real engine.
 - **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in

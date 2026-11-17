@@ -215,6 +215,11 @@ The cables are not lines — they are patch cables, and they behave like it:
   gravity, ends pinned to the jacks, stepped at a fixed 120 Hz; dragging a node or
   grabbing a cable makes it swing and settle, an unplugged end falls free.
   Plugging/unplugging animates. The graph feels alive, never static.
+- **Organ face (`organ.rs`):** setBfree has no LV2 control ports, only MIDI
+  CCs. Its controls are ordinary knob parameters (`organ::P_BASE + n`, in
+  `engine::knob_specs`), which the engine turns into the plugin's CCs; the nine
+  drawbars are hidden knobs painted as faders. Values sent while the instance
+  loads are parked and replayed (`organ_pending`).
 - **Theme:** cable colors follow the Omarchy accent palette; audio vs MIDI visually
   distinct; selected cables highlight their full path.
 - **RT-safe by construction:** animation is driven purely by lock-free snapshots

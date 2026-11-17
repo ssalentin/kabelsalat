@@ -1707,6 +1707,8 @@ enum Drag {
     Split { unit: usize, start: u8, press: Pos2, cur: u8 },
     /// Dragging a metronome face's BPM readout (the one global tempo).
     Bpm { start: f32, press: Pos2 },
+    /// Pulling one of an organ face's drawbars (`bar` 0 = 16').
+    Drawbar { unit: usize, bar: usize },
 }
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
@@ -7118,6 +7120,9 @@ impl DemoApp {
         let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
         crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
         drop(bus);
+        if let crate::sounds::Load::MidiProgram(p) = sound.load {
+            self.adopt_program_drawbars(unit.node, p);
+        }
         match unit.slot {
             Some(slot) => {
                 if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
@@ -11021,6 +11026,62 @@ impl DemoApp {
         Some((chip, readout))
     }
 
+    /// Is this unit setBfree (an organ face: drawbars + CC knobs)?
+    fn is_organ_unit(&self, unit: usize) -> bool {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .is_some_and(|n| crate::organ::is_organ(&n.kind))
+    }
+
+    /// An organ face's nine drawbar slots (rack-local), left to right from
+    /// 16': each a footage label above a track the bar is pulled down in.
+    /// Between the header and the knob row; None when there is not room for
+    /// a usable fader (never squeeze, rule 22).
+    fn drawbar_rects(&self, unit: usize) -> Option<[Rect; crate::organ::DRAWBARS]> {
+        if !self.is_organ_unit(unit) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let top = r.top() + 82.0;
+        let bottom = self.knob_row_y(unit) - KNOB_R - 16.0;
+        let (left, right) = (r.left() + FACE_X, r.right() - FACE_PAD_R);
+        let gap = 6.0;
+        let w = ((right - left - 8.0 * gap) / 9.0).min(26.0);
+        if w < 14.0 || bottom - top < 64.0 { return None; }
+        Some(std::array::from_fn(|i| Rect::from_min_max(
+            Pos2::new(left + i as f32 * (w + gap), top), Pos2::new(left + i as f32 * (w + gap) + w, bottom))))
+    }
+
+    /// The part of a drawbar slot the bar travels in (below its label).
+    fn drawbar_track(slot: Rect) -> Rect {
+        Rect::from_min_max(slot.min + Vec2::new(0.0, 16.0), slot.max)
+    }
+
+    /// Pull drawbar `bar` of an organ unit to the position under rack-local `y`.
+    fn set_drawbar_at(&mut self, unit: usize, bar: usize, y: f32) {
+        let Some(slots) = self.drawbar_rects(unit) else { return };
+        let t = Self::drawbar_track(slots[bar]);
+        let pos = (((y - t.top()) / t.height()) * 8.0).round().clamp(0.0, 8.0) as u8;
+        let param = crate::organ::drawbar_param(bar);
+        if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(param)) {
+            k.set_immediate(crate::organ::drawbar_value(pos));
+        }
+    }
+
+    /// After a programme loads into an organ, show the registration it set
+    /// (setBfree reports nothing back; its programme file says what it is).
+    /// The organ has these values already: nothing is re-sent.
+    fn adopt_program_drawbars(&mut self, node: u32, program: u8) {
+        let Some(bars) = crate::organ::program_drawbars(program) else { return };
+        let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) else { return };
+        for (i, pos) in bars.iter().enumerate() {
+            let param = crate::organ::drawbar_param(i);
+            if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(param)) {
+                k.set_immediate(crate::organ::drawbar_value(*pos));
+                k.sent = Some(k.value);
+            }
+        }
+    }
+
     /// Octave steppers of a split Keys face, `[LOW, HIGH]` (rack-local): a
     /// row under the SPLIT control, right-aligned with it; HIGH stacks above
     /// LOW when one row does not fit. None while unsplit, or when the face
@@ -11252,6 +11313,7 @@ impl DemoApp {
         let split = self.units.get(unit).map_or(false, |u| u.split.is_some())
             && self.split_rects(unit).map_or(false, |(_, r)| r.contains(lp));
         split || self.bpm_rects(unit).map_or(false, |b| b.value.contains(lp))
+            || self.drawbar_rects(unit).is_some_and(|b| b.iter().any(|r| r.contains(lp)))
     }
 
     /// Set the metronome tempo, clamped to the engine's 20..=300 range, and
@@ -11990,6 +12052,10 @@ impl DemoApp {
                         if self.bpm_rects(ui).map_or(false, |b| b.value.contains(lp)) {
                             self.drag = Drag::Bpm { start: self.bpm, press: s };
                         }
+                        if let Some(bar) = self.drawbar_rects(ui).and_then(|b| b.iter().position(|r| r.contains(lp))) {
+                            self.drag = Drag::Drawbar { unit: ui, bar };
+                            self.set_drawbar_at(ui, bar, lp.y);
+                        }
                     }
                     _ => {}
                 }
@@ -12050,6 +12116,7 @@ impl DemoApp {
                         self.set_keys_split(unit, Some(p));
                     }
                 }
+                Drag::Drawbar { unit, bar } => self.set_drawbar_at(unit, bar, l.y),
                 Drag::Bpm { start, press } => {
                     // Up/right = faster: one BPM per 3px, whole BPMs only.
                     let d = ((press.y - s.y) + (s.x - press.x)) / 3.0;
@@ -12252,7 +12319,7 @@ impl DemoApp {
             CursorIcon::Grabbing
         } else if ctrl && matches!(self.hover, Some(Hit::Unit(_))) {
             CursorIcon::Grab
-        } else if on_field || matches!(self.drag, Drag::Split { .. } | Drag::Bpm { .. }) {
+        } else if on_field || matches!(self.drag, Drag::Split { .. } | Drag::Bpm { .. } | Drag::Drawbar { .. }) {
             CursorIcon::ResizeVertical
         } else {
             match self.hover {
@@ -12810,6 +12877,7 @@ impl DemoApp {
                 UnitKind::Clap => self.draw_surge_display(painter, ui),
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
+                UnitKind::Dsp(_) if self.is_organ_unit(ui) => self.draw_organ_face(painter, ui),
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, ui),
                 UnitKind::AudioIn => self.draw_audio_in_face(painter, ui),
@@ -12902,6 +12970,43 @@ impl DemoApp {
             None => {
                 self.paint_face_field(painter, readout, false);
                 self.face_text(painter, readout.center(), "OFF", FontId::proportional(11.0), SUBTEXT);
+            }
+        }
+    }
+
+    /// Organ face: nine drawbars, pulled down out of their tracks like a
+    /// tonewheel organ's (brown sub-octaves, cream foundation and octaves,
+    /// dark mutations), with the position on each bar's cap.
+    fn draw_organ_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some(slots) = self.drawbar_rects(unit) else { return };
+        let u = &self.units[unit];
+        let xf = &self.xf;
+        for (i, slot) in slots.iter().enumerate() {
+            let param = crate::organ::drawbar_param(i);
+            let pos = u.knobs.iter().find(|k| k.param == Some(param))
+                .map_or(0, |k| crate::organ::drawbar_position(k.display_value));
+            let dragging = matches!(self.drag, Drag::Drawbar { unit: du, bar } if du == unit && bar == i);
+            let hov = dragging || self.face_hovered(painter, unit, *slot);
+            self.face_text(painter, Pos2::new(slot.center().x, slot.top() + 6.0), crate::organ::FOOTAGES[i],
+                FontId::proportional(10.0), if hov { TEXT } else { SUBTEXT });
+            let track = Self::drawbar_track(*slot);
+            painter.rect_filled(xf.rect(track), 2.0, CHASSIS);
+            painter.rect_stroke(xf.rect(track), 2.0, Stroke::new(1.0, if hov { theme::CREAM_DIM } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+            let (cap, ink) = match i {
+                0 | 1 => (theme::DRAWBAR_BROWN, theme::CREAM),
+                // Mutations: black caps on an organ; mid-grey here so they
+                // read on the dark track (DARK_PANEL_HI vanished into it).
+                4 | 6 | 7 => (theme::MUTED, theme::CREAM),
+                _ => (theme::CREAM, theme::DARK_PANEL),
+            };
+            // The bar shows from the track top down to its position; at 0 a
+            // stub stays visible so a pushed-in bar can still be grabbed.
+            let len = (track.height() - 4.0) * pos as f32 / 8.0;
+            let bar = Rect::from_min_size(track.min + Vec2::new(2.0, 2.0), Vec2::new(track.width() - 4.0, len.max(3.0)));
+            let fill = if pos == 0 { alpha(cap, 0.35) } else { cap };
+            painter.rect_filled(xf.rect(bar), 1.5, fill);
+            if pos > 0 && bar.height() >= 16.0 {
+                self.face_text(painter, Pos2::new(bar.center().x, bar.bottom() - 8.0), &pos.to_string(), theme::medium_font(11.0), ink);
             }
         }
     }
@@ -19631,6 +19736,60 @@ mod ui_polish_agent_tests {
         app.units.iter().find(|u| u.rig == rig && u.name == name).map(|u| u.node_id).expect("that unit")
     }
 
+    /// setBfree's face: drawbars and four CC knobs, all ordinary knob
+    /// parameters (organ.rs). Pulling a drawbar sends its parameter; a
+    /// loaded programme shows its registration without sending it back.
+    #[test]
+    fn the_organ_face_pulls_drawbars_and_shows_a_programmes_registration() {
+        let rigs = vec![
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        let organ = node_named(&app, 1, "ORGAN");
+        let ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let labels: Vec<&str> = app.units[ui].knobs.iter().filter(|k| !k.hidden).map(|k| k.label.as_str()).collect();
+        assert_eq!(labels, ["LESLIE", "PERC", "DRIVE", "REVERB"]);
+        assert_eq!(app.units[ui].knobs.iter().filter(|k| k.hidden).count(), crate::organ::DRAWBARS);
+        app.set_active_rig(1);
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        while drain.pop().is_some() {}
+        // Pull the 4' bar (index 3) all the way out: drag to the track bottom.
+        let slots = app.drawbar_rects(ui).expect("drawbars on the organ face");
+        let t = DemoApp::drawbar_track(slots[3]);
+        app.drag = Drag::Drawbar { unit: ui, bar: 3 };
+        app.set_drawbar_at(ui, 3, t.bottom());
+        app.publish_patch();
+        let mut sent = Vec::new();
+        while let Some(c) = drain.pop() { sent.push(c); }
+        assert!(sent.iter().any(|c| matches!(c, Command::SetParam { node, param, value }
+            if *node == organ && *param == crate::organ::drawbar_param(3) && (*value - 1.0).abs() < 1e-6)), "{sent:?}");
+        // Halfway up the track = position 4.
+        app.set_drawbar_at(ui, 3, t.top() + t.height() / 2.0);
+        let k = app.units[ui].knobs.iter().find(|k| k.param == Some(crate::organ::drawbar_param(3))).unwrap();
+        assert_eq!(crate::organ::drawbar_position(k.value), 4);
+        app.drag = Drag::None;
+        app.publish_patch();
+        while drain.pop().is_some() {}
+        // A programme load shows its drawbars and sends none of them.
+        app.adopt_program_drawbars(organ, 1); // display 2, "Fredriks tfn 1" = 75 8757 200 (when installed)
+        if let Some(bars) = crate::organ::program_drawbars(1) {
+            let shown: Vec<u8> = (0..9).map(|i| crate::organ::drawbar_position(
+                app.units[ui].knobs.iter().find(|k| k.param == Some(crate::organ::drawbar_param(i))).unwrap().value)).collect();
+            assert_eq!(shown, bars.to_vec());
+            app.publish_patch();
+            let mut resent = Vec::new();
+            while let Some(c) = drain.pop() {
+                if let Command::SetParam { param, .. } = c { if crate::organ::index(param).is_some() { resent.push(param); } }
+            }
+            assert!(resent.is_empty(), "the organ has the programme's values already: {resent:?}");
+        }
+    }
+
     #[test]
     fn sounds_are_searched_in_the_library_of_the_rig_asked() {
         let (mut app, _drain) = app_of_instruments();
@@ -20907,6 +21066,9 @@ mod face_layout_tests {
             v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
+        if let Some(b) = app.drawbar_rects(ui) {
+            v.push(("drawbars".into(), b[0].union(b[crate::organ::DRAWBARS - 1])));
+        }
         if let Some(z) = app.zone_rects(ui) {
             v.push(("zone low".into(), z[0].all()));
             v.push(("zone high".into(), z[1].all()));
@@ -20976,6 +21138,19 @@ mod face_layout_tests {
         let k = app.keys_unit.unwrap();
         app.set_keys_split(k, Some(60));
         check(app, "split keys, two rigs");
+    }
+
+    #[test]
+    fn organ_faces_with_drawbars_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        check(app, "organ");
     }
 
     #[test]

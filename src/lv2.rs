@@ -1334,6 +1334,11 @@ impl Lv2Plugin {
         self.queue_midi([0x80, note, 0]);
     }
 
+    /// Queue a MIDI control change (channel 1) for the next run().
+    pub fn control_change(&mut self, cc: u8, value: u8) {
+        self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
+    }
+
     /// Queue a MIDI programme change for the next run() (allocation-free).
     pub fn program_change(&mut self, program: u8) {
         let program = program.min(127);

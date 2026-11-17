@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
+  states, matrix routes, mix, name) as a named `.ksalat-rig` preset in
+  `~/kabelsalat-rig-presets` and load it later as a new rig or replacing an
+  existing rig, independent of whole sessions. Available from the Rigs strip
+  ("Save rig" / "Load rig" and rig-chip context menu) and as agent/MCP tools
+  `save_rig`, `load_rig`, and `list_rig_presets`.
 - **Confirm / Cancel buttons in the chat** (#32): when the assistant asks
   before a destructive action (delete a rig, install an instrument), the chat
   shows the two buttons; the click runs or cancels it.

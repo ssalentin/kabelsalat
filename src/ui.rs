@@ -1412,6 +1412,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
+    "save_rig", "load_rig", "list_rig_presets",
     "list_instruments", "install_instrument", "play_file", "stop_file",
 ];
 
@@ -1430,7 +1431,7 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    name == "install_instrument"
+    matches!(name, "install_instrument" | "save_rig")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1769,6 +1770,12 @@ struct DemoApp {
     pending_confirm: Option<PendingConfirm>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
+    /// Save-rig-preset modal: (rig index, preset name being edited).
+    save_rig_dialog: Option<(usize, String)>,
+    /// Load-rig-preset modal: `Some(None)` = as new rig, `Some(Some(rig))` = replace `rig`.
+    load_rig_dialog: Option<Option<usize>>,
+    /// Rig preset storage dir (isolated per test under `cfg(test)`).
+    rig_presets_dir: std::path::PathBuf,
     /// Rig names of the session being applied (load path names its rigs).
     session_rig_names: Vec<String>,
     /// Set by edit_rigs: the next engine load is LoadRigs, not LoadGraph.
@@ -2040,6 +2047,9 @@ impl DemoApp {
             confirm_delete_rig: None,
             pending_confirm: None,
             rename_rig_dialog: None,
+            save_rig_dialog: None,
+            load_rig_dialog: None,
+            rig_presets_dir: Self::default_rig_presets_dir(),
             session_rig_names: Vec::new(),
             load_as_rigs: None,
             had_kb_focus: true,
@@ -4831,6 +4841,41 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("View {}", self.rig_name(rig)), vec![], now);
                 format!("showing rig {rig} '{}' (view only — every rig keeps sounding)", self.rig_name(rig))
             }
+            "save_rig" => {
+                let Some(name) = args.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+                    return "save_rig needs 'name'".into();
+                };
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                let dir = self.rig_presets_dir.clone();
+                match self.save_rig_preset_to_dir(&dir, rig, name) {
+                    Ok(p) => {
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(origin, format!("Save rig → {name}"), vec![], now);
+                        format!("saved rig {rig} '{}' as preset '{name}' to {}", self.rig_name(rig), p.display())
+                    }
+                    Err(e) => format!("save_rig failed: {e}"),
+                }
+            }
+            "load_rig" => {
+                let Some(name) = args.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+                    return "load_rig needs 'name'".into();
+                };
+                let target = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+                let dir = self.rig_presets_dir.clone();
+                match self.load_rig_preset_from_dir(&dir, name, target) {
+                    Ok(slot) => {
+                        let nodes: Vec<u32> = self.units.iter().filter(|u| u.rig as usize == slot).map(|u| u.node_id).collect();
+                        self.agent_activity.touch_rig(slot, now);
+                        self.agent_activity.record(origin, format!("Load rig ← {name}"), nodes, now);
+                        format!("loaded rig preset '{name}' into rig {slot} '{}' — knobs, cables, mix and synth state restored. {}", self.rig_name(slot), self.rigs_json())
+                    }
+                    Err(e) => format!("load_rig failed: {e}"),
+                }
+            }
+            "list_rig_presets" => {
+                let presets = crate::session::list_rig_presets(&self.rig_presets_dir);
+                serde_json::json!({"presets": presets}).to_string()
+            }
             "connect" => {
                 let from_node = args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let to_node = args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -6317,6 +6362,367 @@ impl DemoApp {
         }
     }
 
+    #[cfg(test)]
+    fn default_rig_presets_dir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("test-rig-presets").join(format!(
+            "{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    #[cfg(not(test))]
+    fn default_rig_presets_dir() -> std::path::PathBuf {
+        crate::session::rig_presets_dir()
+    }
+
+    /// Snapshot ONE rig (units, cables, knobs, plugin states, matrix routes,
+    /// mix, name, device, sources, patch names) with rig-relative node ids.
+    fn capture_rig_preset(&mut self, rig: usize, preset_name: &str) -> anyhow::Result<crate::session::RigPreset> {
+        let n = self.rig_count();
+        if rig >= n {
+            anyhow::bail!("no rig {rig}: there are {n} (0..{})", n.saturating_sub(1));
+        }
+        let s = self.capture_session(preset_name)?;
+        let (graphs, bases) = crate::control::split_rigs(&s.graph);
+        let rig_graph = graphs.get(rig).cloned()
+            .ok_or_else(|| anyhow::anyhow!("rig {rig} has no graph"))?;
+        let base = bases[rig];
+        let mut rig_session = remap_session(&s, rig_graph, |old| {
+            let node = s.graph.node(old)?;
+            if node.rig as usize == rig { Some(old - base) } else { None }
+        });
+        rig_session.rig_names.clear();
+        let midi_device = self.rig_snapshot.lock().ok()
+            .and_then(|sn| sn.rigs.get(rig).and_then(|m| m.midi_device));
+        let mut clap_meta = Vec::new();
+        for (slot, nid) in self.clap_rigs() {
+            if self.units.iter().find(|u| u.node_id == nid).is_some_and(|u| u.rig as usize == rig) {
+                let (keyboard, hardware) = self.rig_sources.get(slot).copied().unwrap_or((true, true));
+                let patch_name = self.patch_names.get(slot).and_then(|p| p.clone());
+                clap_meta.push(crate::session::RigClapMeta {
+                    node: nid - base,
+                    keyboard,
+                    hardware,
+                    patch_name,
+                });
+            }
+        }
+        let mut preset = crate::session::RigPreset::new(preset_name.trim(), self.rig_name(rig), rig_session);
+        preset.mix = self.rig_mix[rig.min(7)];
+        preset.midi_device = midi_device;
+        preset.clap_meta = clap_meta;
+        preset.validate()?;
+        Ok(preset)
+    }
+
+    /// Load a single-rig preset either as a new rig (`target_rig = None`) or
+    /// replacing `Some(target_rig)`, keeping every other rig's state intact
+    /// and remapping all node-id keyed data through `remap_session`.
+    fn apply_rig_preset(
+        &mut self,
+        preset: &crate::session::RigPreset,
+        target_rig: Option<usize>,
+    ) -> anyhow::Result<usize> {
+        preset.validate()?;
+        let n = self.rig_count();
+        match target_rig {
+            None if n >= Self::MAX_RIGS => anyhow::bail!("at most {} rigs", Self::MAX_RIGS),
+            Some(t) if t >= n => anyhow::bail!("no rig {t}: there are {n}"),
+            _ => {}
+        }
+
+        let current = self.capture_session("Rigs")?;
+        let (existing_graphs, old_bases) = crate::control::split_rigs(&current.graph);
+        let existing_devices: Vec<Option<u32>> = self.rig_snapshot.lock().ok()
+            .map(|sn| (0..existing_graphs.len()).map(|i| sn.rigs.get(i).and_then(|m| m.midi_device)).collect())
+            .unwrap_or_else(|| vec![None; existing_graphs.len()]);
+        let existing_names: Vec<String> = (0..existing_graphs.len()).map(|i| self.rig_name(i)).collect();
+        let existing_mix = self.rig_mix;
+
+        let mut old_sources_by_node = std::collections::HashMap::new();
+        let mut old_patches_by_node = std::collections::HashMap::new();
+        for (slot, nid) in self.clap_rigs() {
+            old_sources_by_node.insert(nid, self.rig_sources.get(slot).copied().unwrap_or((true, true)));
+            if let Some(Some(p)) = self.patch_names.get(slot) {
+                old_patches_by_node.insert(nid, p.clone());
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum RigSlot { Existing(usize), Preset }
+        let mut slots: Vec<RigSlot> = (0..existing_graphs.len()).map(RigSlot::Existing).collect();
+        let active = match target_rig {
+            None => { slots.push(RigSlot::Preset); slots.len() - 1 }
+            Some(t) => { slots[t] = RigSlot::Preset; t }
+        };
+
+        let preset_name = if preset.rig_name.trim().is_empty() {
+            preset.name.clone()
+        } else {
+            preset.rig_name.clone()
+        };
+        let list: Vec<crate::control::Rig> = slots.iter().map(|slot| match *slot {
+            RigSlot::Existing(o) => crate::control::Rig::new(
+                existing_names[o].clone(),
+                existing_graphs[o].clone(),
+                existing_devices[o],
+            ),
+            RigSlot::Preset => crate::control::Rig::new(
+                preset_name.clone(),
+                preset.session.graph.clone(),
+                preset.midi_device,
+            ),
+        }).collect();
+
+        let new_bases = crate::control::rig_bases(&list);
+        let merged = crate::control::merge_rigs(&list);
+        let preset_slot = slots.iter().position(|s| matches!(s, RigSlot::Preset)).unwrap();
+        let mut existing_to_new: Vec<Option<usize>> = vec![None; existing_graphs.len()];
+        for (new_i, slot) in slots.iter().enumerate() {
+            if let RigSlot::Existing(o) = *slot {
+                existing_to_new[o] = Some(new_i);
+            }
+        }
+        let remap_existing = |old: u32| -> Option<u32> {
+            let o = current.graph.node(old)?.rig as usize;
+            let new_i = *existing_to_new.get(o)?.as_ref()?;
+            Some(new_bases[new_i] + (old - old_bases[o]))
+        };
+        let remap_preset = |old: u32| -> Option<u32> {
+            if preset.session.graph.node(old).is_some() {
+                Some(new_bases[preset_slot] + old)
+            } else {
+                None
+            }
+        };
+
+        let ns_existing = remap_session(&current, merged.clone(), remap_existing);
+        let ns_preset = remap_session(&preset.session, merged.clone(), remap_preset);
+        let mut combined = crate::session::Session::new("Rigs", merged);
+        combined.rig_names = list.iter().map(|r| r.name.clone()).collect();
+        for src_sess in [&ns_existing, &ns_preset] {
+            for p in src_sess.params() {
+                combined.set_param(p.node, p.param, p.value);
+            }
+            for st in src_sess.plugin_states() {
+                combined.set_plugin_state(st.node, &st.plugin_id, st.data.clone());
+            }
+        }
+        let mut rules: Vec<SavedRule> = Vec::new();
+        for src_sess in [&ns_existing, &ns_preset] {
+            if let Some(v) = src_sess.matrix() {
+                if let Ok(r) = serde_json::from_value::<Vec<SavedRule>>(v.clone()) {
+                    rules.extend(r);
+                }
+            }
+        }
+        if !rules.is_empty() {
+            combined.set_matrix(serde_json::to_value(&rules).ok());
+        }
+
+        let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        for (i, slot) in slots.iter().enumerate() {
+            mix[i] = match *slot {
+                RigSlot::Existing(o) => existing_mix[o.min(7)],
+                RigSlot::Preset => preset.mix,
+            };
+        }
+        let mut new_sources_by_node = std::collections::HashMap::new();
+        let mut new_patches_by_node = std::collections::HashMap::new();
+        for (old_nid, src) in old_sources_by_node {
+            if let Some(new_nid) = remap_existing(old_nid) {
+                new_sources_by_node.insert(new_nid, src);
+            }
+        }
+        for (old_nid, patch) in old_patches_by_node {
+            if let Some(new_nid) = remap_existing(old_nid) {
+                new_patches_by_node.insert(new_nid, patch);
+            }
+        }
+        for m in &preset.clap_meta {
+            if let Some(new_nid) = remap_preset(m.node) {
+                new_sources_by_node.insert(new_nid, (m.keyboard, m.hardware));
+                if let Some(p) = &m.patch_name {
+                    new_patches_by_node.insert(new_nid, p.clone());
+                }
+            }
+        }
+
+        self.load_as_rigs = Some((list.clone(), active));
+        self.apply_session(&combined)?;
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            snap.rigs = list.iter().map(|r| crate::control::RigMeta {
+                name: r.name.clone(),
+                midi_device: r.midi_device,
+            }).collect();
+            snap.active = active;
+        }
+        self.adopt_rig_devices();
+        // Restore per-voice source switches and patch names AFTER apply_session (rule 20/59).
+        for (slot, nid) in self.clap_rigs() {
+            if let Some(&src) = new_sources_by_node.get(&nid) {
+                if let Some(s) = self.rig_sources.get_mut(slot) {
+                    *s = src;
+                }
+                self.send_rig_source(nid);
+            }
+            if let Some(p) = new_patches_by_node.get(&nid) {
+                if let Some(pn) = self.patch_names.get_mut(slot) {
+                    *pn = Some(p.clone());
+                }
+            }
+        }
+        self.rig_mix = mix;
+        self.active_rig = usize::MAX;
+        self.set_active_rig(active);
+        for i in 0..list.len() {
+            self.ui_mix_grace[i.min(7)] = self.ui_time + 0.6;
+            self.send_rig_mix(i);
+        }
+        self.editor_status.clear();
+        Ok(active)
+    }
+
+    fn save_rig_preset_to_dir(&mut self, dir: &std::path::Path, rig: usize, name: &str) -> anyhow::Result<std::path::PathBuf> {
+        let preset = self.capture_rig_preset(rig, name)?;
+        let path = crate::session::RigPreset::package_path(dir, name)?;
+        preset.save(&path)?;
+        Ok(path)
+    }
+
+    fn load_rig_preset_from_dir(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+        target_rig: Option<usize>,
+    ) -> anyhow::Result<usize> {
+        let path = crate::session::RigPreset::package_path(dir, name)?;
+        let preset = crate::session::RigPreset::load(&path)?;
+        self.apply_rig_preset(&preset, target_rig)
+    }
+
+    /// "Save rig preset" dialog: Enter saves, Esc cancels.
+    fn save_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some((rig, mut text)) = self.save_rig_dialog.take() else { return };
+        if rig >= self.rig_count() { return; }
+        let mut decision: Option<bool> = None;
+        let rig_label = self.rig_name(rig);
+        let modal = egui::Modal::new(egui::Id::unique("save_rig_modal")).show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(egui::RichText::new(format!("Save rig {} · {}", rig + 1, rig_label)).size(17.0).strong().color(theme::INK));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Saves units, cables, knobs, sound, matrix routes and mix.").size(12.5).color(theme::INK_2));
+            ui.add_space(8.0);
+            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("save_rig_text").desired_width(320.0).char_limit(48));
+            if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) { decision = Some(true); }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Save preset").clicked() { decision = Some(true); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decision = Some(false); }
+            });
+        });
+        if modal.should_close() && decision.is_none() { decision = Some(false); }
+        match decision {
+            Some(true) => {
+                let dir = self.rig_presets_dir.clone();
+                match self.save_rig_preset_to_dir(&dir, rig, &text) {
+                    Ok(_) => self.session_msg = format!("Saved rig preset '{}'", text.trim()),
+                    Err(e) => self.session_msg = format!("Save rig failed: {e}"),
+                }
+            }
+            Some(false) => {}
+            None => self.save_rig_dialog = Some((rig, text)),
+        }
+    }
+
+    /// "Load rig preset" dialog: load as a new rig or replace an existing one.
+    fn load_rig_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut target) = self.load_rig_dialog.take() else { return };
+        let n = self.rig_count();
+        if target.is_some_and(|t| t >= n) { target = None; }
+        let dir = self.rig_presets_dir.clone();
+        let presets = crate::session::list_rig_presets(&dir);
+        let mut close = false;
+        let mut load_name: Option<String> = None;
+        let mut delete_name: Option<String> = None;
+        let modal = egui::Modal::new(egui::Id::unique("load_rig_modal")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.label(egui::RichText::new("Load rig preset").size(17.0).strong().color(theme::INK));
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                if n < Self::MAX_RIGS && theme::chip_button(ui, "As new rig", target.is_none()).clicked() {
+                    target = None;
+                }
+                for r in 0..n {
+                    let lbl = format!("Replace {} · {}", r + 1, self.rig_name(r));
+                    if theme::chip_button(ui, &lbl, target == Some(r)).clicked() {
+                        target = Some(r);
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            Self::stage_hairline(ui);
+            ui.add_space(8.0);
+            let list_h = 220.0;
+            egui::ScrollArea::vertical()
+                .id_salt("rig_presets_list_scroll")
+                .min_scrolled_height(list_h)
+                .max_height(list_h)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if presets.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No saved rig presets yet — click Save rig to save one.")
+                                .size(13.0)
+                                .color(theme::INK_2),
+                        );
+                        return;
+                    }
+                    for (i, name) in presets.iter().enumerate() {
+                        if i > 0 { Self::stage_hairline(ui); }
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if Self::danger_button(ui, "Delete", false).clicked() {
+                                    delete_name = Some(name.clone());
+                                }
+                                ui.add_space(6.0);
+                                if theme::primary_button(ui, "Load").clicked() {
+                                    load_name = Some(name.clone());
+                                }
+                            });
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            ui.add_space(10.0);
+            if theme::chip_button(ui, "Close", false).clicked() { close = true; }
+        });
+        if modal.should_close() { close = true; }
+        if let Some(name) = delete_name {
+            let _ = crate::session::delete_rig_preset(&dir, &name);
+        }
+        if let Some(name) = load_name {
+            match self.load_rig_preset_from_dir(&dir, &name, target) {
+                Ok(slot) => self.session_msg = format!("Loaded rig '{name}' into {}", self.rig_name(slot)),
+                Err(e) => self.session_msg = format!("Load rig failed: {e}"),
+            }
+            return;
+        }
+        if !close {
+            self.load_rig_dialog = Some(target);
+        }
+    }
+
     /// Multi-rig overview strip: always visible above the rack.
     /// Every control (RIGS label, "+ Rig" button, separator, rig chips, delete
     /// button, source label, level bar) shares one 26px centered baseline.
@@ -6385,6 +6791,24 @@ impl DemoApp {
                                             }
                                             if chip.clicked() { switch = Some(rig); }
                                             if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
+                                            chip.context_menu(|ui| {
+                                                if ui.button("Rename…").clicked() {
+                                                    self.rename_rig_dialog = Some((rig, name.clone()));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Save rig preset…").clicked() {
+                                                    self.save_rig_dialog = Some((rig, name.clone()));
+                                                    ui.close();
+                                                }
+                                                if ui.button("Replace from preset…").clicked() {
+                                                    self.load_rig_dialog = Some(Some(rig));
+                                                    ui.close();
+                                                }
+                                                if n > 1 && ui.button("Delete rig…").clicked() {
+                                                    self.confirm_delete_rig = Some(rig);
+                                                    ui.close();
+                                                }
+                                            });
                                             self.rig_chip_rects.push(chip.rect);
                                             if n > 1 {
                                                 let (dr, dresp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
@@ -6410,6 +6834,22 @@ impl DemoApp {
                                             if w > 0.5 {
                                                 p.rect_filled(Rect::from_min_size(r.min, egui::vec2(w, 3.0)), 1.0, theme::LIVE_TEAL);
                                             }
+                                        }
+                                        ui.add_space(4.0);
+                                        nav_separator(ui);
+                                        ui.add_space(4.0);
+                                        if theme::chip_button(ui, "Save rig", false)
+                                            .on_hover_text("save the active rig as a reusable preset")
+                                            .clicked()
+                                        {
+                                            let r = self.active_rig;
+                                            self.save_rig_dialog = Some((r, self.rig_name(r)));
+                                        }
+                                        if theme::chip_button(ui, "Load rig", false)
+                                            .on_hover_text("load a saved rig preset (new rig or replace existing)")
+                                            .clicked()
+                                        {
+                                            self.load_rig_dialog = Some(None);
                                         }
                                         if n > 1 {
                                             ui.add_space(8.0);
@@ -9271,7 +9711,12 @@ impl DemoApp {
     fn handle_input(&mut self, ctx: &egui::Context, rect: Rect) {
         // The "Delete rig?" modal owns all input (Esc/Del must reach it, not
         // the rack's cable shortcuts).
-        if self.confirm_delete_rig.is_some() { return; }
+        if self.confirm_delete_rig.is_some()
+            || self.save_rig_dialog.is_some()
+            || self.load_rig_dialog.is_some()
+        {
+            return;
+        }
         let mut toggle_play = false;
         let mut tap_tempo = false;
         let mut flip = false;
@@ -11856,6 +12301,8 @@ impl DemoApp {
         self.knob_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
+        self.save_rig_modal(&ctx);
+        self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
         // Full frame rate while focused (the cables are the show); ~30 fps in
@@ -13891,6 +14338,98 @@ mod rig_switch_tests {
         // A later load without names does not inherit stale ones.
         fresh1.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
         assert_eq!(fresh1.rig_name(0), "Rig A");
+    }
+
+    #[test]
+    fn rig_preset_saves_from_slot_a_and_loads_into_other_slots_intact() {
+        let (mut app, ctx) = two_rigs();
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 0, "name": "Lead Stack"}));
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 1, "name": "Pad"}));
+
+        let slot0_surge = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot0_master = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        let slot0_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 0 && app.units[c.dst].rig == 0)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+        assert!(!slot0_cables.is_empty());
+
+        for u in &mut app.units {
+            if u.node_id == slot0_master {
+                if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(crate::engine::P_VOL)) {
+                    k.value = 0.42;
+                }
+            }
+        }
+        app.rig_mix[0] = crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true };
+        app.rig_mix[1] = crate::engine::RigMix { vol: 0.85, pan: 0.3, mute: false, solo: false };
+        app.rig_sources[0] = (false, true);
+        app.patch_names[0] = Some("Wurli".into());
+        app.rule_edits.insert(
+            (crate::matrix::SourceId::Keys, slot0_surge),
+            RuleEdit { transpose: -5, key_lo: 36, ..RuleEdit::default() },
+        );
+
+        let saved = app.exec_tool("save_rig", &serde_json::json!({"name": "Lead Preset", "rig": 0}));
+        assert!(saved.contains("Lead Preset"), "{saved}");
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("list_rig_presets", &serde_json::json!({}))).unwrap();
+        assert_eq!(listed["presets"], serde_json::json!(["Lead Preset"]));
+
+        let loaded_new = app.exec_tool("load_rig", &serde_json::json!({"name": "Lead Preset"}));
+        assert!(loaded_new.contains("rig 2"), "{loaded_new}");
+        assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.active_rig, 2);
+        assert_eq!(app.rig_name(2), "Lead Stack");
+        assert_eq!(app.rig_mix[2], crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true });
+        assert_eq!(app.rig_mix[1], crate::engine::RigMix { vol: 0.85, pan: 0.3, mute: false, solo: false }, "other rigs keep mix");
+
+        let slot2_surge = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot2_master = app.units.iter().find(|u| u.rig == 2 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        assert_ne!(slot2_surge, slot0_surge, "loaded into a different slot with remapped ids");
+        let slot2_vol = app.units.iter().find(|u| u.node_id == slot2_master).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_VOL)).unwrap().value;
+        assert!((slot2_vol - 0.42).abs() < 1e-5, "non-default knob preserved: {slot2_vol}");
+        let slot2_cables: Vec<(u8, u8)> = app.cables.iter()
+            .filter(|c| app.units[c.src].rig == 2 && app.units[c.dst].rig == 2)
+            .map(|c| (c.src_port as u8, c.dst_port as u8))
+            .collect();
+        assert_eq!(slot2_cables, slot0_cables);
+        let slot2_rule = app.rule_edits.get(&(crate::matrix::SourceId::Keys, slot2_surge))
+            .expect("matrix route remapped to slot 2's Clap node");
+        assert_eq!((slot2_rule.transpose, slot2_rule.key_lo), (-5, 36));
+        let slot2_voice = app.clap_rigs().into_iter().find(|(_, nid)| *nid == slot2_surge).unwrap().0;
+        assert_eq!(app.rig_sources[slot2_voice], (false, true));
+        assert_eq!(app.patch_names[slot2_voice].as_deref(), Some("Wurli"));
+
+        let replaced = app.exec_tool("load_rig", &serde_json::json!({"name": "Lead Preset", "rig": 1}));
+        assert!(replaced.contains("rig 1"), "{replaced}");
+        assert_eq!(app.rig_count(), 3);
+        assert_eq!(app.rig_name(1), "Lead Stack");
+        assert_eq!(app.rig_mix[1], crate::engine::RigMix { vol: 0.55, pan: -0.4, mute: false, solo: true });
+        let slot1_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let slot1_master = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Master)).unwrap().node_id;
+        let slot1_vol = app.units.iter().find(|u| u.node_id == slot1_master).unwrap()
+            .knobs.iter().find(|k| k.param == Some(crate::engine::P_VOL)).unwrap().value;
+        assert!((slot1_vol - 0.42).abs() < 1e-5);
+        assert_eq!(app.rule_edits.get(&(crate::matrix::SourceId::Keys, slot1_surge)).unwrap().transpose, -5);
+
+        let tools = crate::assistant::tools();
+        let tool_names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        for name in ["save_rig", "load_rig", "list_rig_presets"] {
+            assert!(tool_names.contains(&name), "assistant::tools missing {name}");
+            assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
+        }
+        app.save_rig_dialog = Some((0, "Modal Rig".into()));
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(app.save_rig_dialog.is_none(), "Esc closes save modal");
+        app.load_rig_dialog = Some(None);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, key(Key::Escape));
+        assert!(app.load_rig_dialog.is_none(), "Esc closes load modal");
+        let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
     }
 
     #[test]

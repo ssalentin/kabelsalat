@@ -266,8 +266,9 @@ fn system_prompt() -> String {
      - Rigs (you operate on ALL of them, not only the one in view): get_rigs lists every \
      rig; add_rig creates a new playable rig (Keys -> Surge -> Master); delete_rig removes \
      one; select_rig changes the view; add_node \
-     takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo. Wire only nodes of the \
-     same rig. Every rig sounds at once.\n\
+     takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
+     save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     Wire only nodes of the same rig. Every rig sounds at once.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
      the chat then shows Confirm / Cancel buttons. Ask the user in one short sentence and \
      wait — their click runs or cancels it.\n\
@@ -566,6 +567,21 @@ pub(crate) fn tools() -> Value {
             "name":"select_rig",
             "description":"Show a rig in the big rack view (view only — every rig keeps sounding).",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"}},"required":["rig"]}
+        }},
+        {"type":"function","function":{
+            "name":"save_rig",
+            "description":"Save one rig (units, cables, knobs, plugin states, matrix routes, mix, name) as a named rig preset in ~/kabelsalat-rig-presets, independent of whole sessions. rig: 0-based rig index (default: the rig in view).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Preset name (no slashes)"},"rig":{"type":"integer","description":"Rig index from get_rigs (default: active rig)"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"load_rig",
+            "description":"Load a saved rig preset by name, restoring units, cables, knobs, plugin state, matrix routes, mix and rig name. Omit rig to add it as a new rig, or pass rig=<index> to replace an existing rig.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Saved rig preset name (see list_rig_presets)"},"rig":{"type":"integer","description":"Optional target rig index to replace; omit to load as a new rig"}},"required":["name"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_rig_presets",
+            "description":"List saved single-rig preset names in ~/kabelsalat-rig-presets.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"connect",

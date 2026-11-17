@@ -69,6 +69,10 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- **`transport-test` step detector flake** (#18): Surge's "Gate Chord" patch
+  clears `trigmask` bit 12 (tied envelope), but step 12 still opens the filter
+  over the previous step and delay (~8% of onset energy). Scoring on the true
+  silent steps (`9, 10, 15`) removes the ~5–8% false-rotation rate across runs.
 - **Effect chains are audible:** an LV2 instrument into a built-in effect
   (setBfree → Drive) and any effect into another effect (Delay → Reverb) were
   silent at the master. Effects now run in signal-flow order and hear every

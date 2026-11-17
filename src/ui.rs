@@ -12600,6 +12600,8 @@ enum EvalStart {
     OneRig,
     /// Rig A: Keys → Surge → Delay → Master. Rig B: Keys → Surge → Master.
     TwoRigs,
+    /// Keys → Surge → Master, plus a wired metronome that is not running.
+    OneRigMetronome,
 }
 
 /// One scripted request and what the app must look like afterwards.
@@ -12789,6 +12791,59 @@ const EVAL_TASKS: &[EvalTask] = &[
             eval_ensure(b < a, || format!("the new rig is not quieter (rig 1 {a:.2}, rig 2 {b:.2})"))
         },
     },
+    EvalTask {
+        name: "rig2_quieter", start: EvalStart::TwoRigs, prompt: "Make rig 2 a bit quieter.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
+            eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "rig1_pan_left", start: EvalStart::TwoRigs, prompt: "Pan rig 1 to the left.",
+        check: |app, _| {
+            let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
+            eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
+        },
+    },
+    EvalTask {
+        name: "rig2_reverb", start: EvalStart::TwoRigs, prompt: "Insert a reverb into rig 2.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
+            eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 1 got a reverb too".into())
+        },
+    },
+    EvalTask {
+        name: "reverb_this_rig", start: EvalStart::OneRig, prompt: "Add a reverb to this rig",
+        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
+    },
+    EvalTask {
+        name: "rig2_bass", start: EvalStart::TwoRigs, prompt: "Load a bass sound into rig 2.",
+        check: |app, _| {
+            let patch = eval_patch(app, 1)?;
+            eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
+            eval_ensure(eval_patch(app, 0).is_err(), || "rig 1's sound changed too".into())
+        },
+    },
+    EvalTask {
+        name: "start_metronome", start: EvalStart::OneRigMetronome, prompt: "Start the metronome.",
+        check: |app, _| {
+            let g = eval_graph(app);
+            let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
+            eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
+        },
+    },
+    EvalTask {
+        name: "record", start: EvalStart::OneRig, prompt: "Start recording.",
+        check: |app, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
+    },
+    EvalTask {
+        name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
+        check: |app, _| {
+            eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
+            eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
+        },
+    },
 ];
 
 /// A headless app on an offline engine: no window, no audio device, no
@@ -12827,6 +12882,9 @@ impl EvalRig {
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(16);
         engine.set_voice_channels(voice_rx, retire_tx);
         engine.spawn_lv2_loader();
+        let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
+        engine.set_recorder(tap);
+        app.recorder = Some(recorder);
         app.graph_pub = Some(graph_pub);
         app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
         (app.plugins_clap, app.plugins_lv2) = plugins.clone();
@@ -12859,10 +12917,23 @@ impl EvalRig {
                 self.app.apply_session(&s)?;
             }
             EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+            EvalStart::OneRigMetronome => {
+                let mut g = crate::control::standard_rig_graph(true);
+                let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut)).map_err(anyhow::Error::msg)?;
+                let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+                g.connect_with_id(4, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                self.app.apply_session(&crate::session::Session::new("One rig with a metronome", g))?;
+            }
         }
         self.settle();
         Ok(())
     }
+}
+
+/// Where eval runs record: never the user's ~/Music.
+fn eval_takes_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".cache").join("ksalat-agent-eval").join("takes")
 }
 
 /// What one run of one task cost and whether the app ended up right.
@@ -12905,6 +12976,8 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     } else {
         (task.check)(&mut rig.app, &reply)
     };
+    if let Some(recorder) = rig.app.recorder.take() { recorder.shutdown(); }
+    let _ = std::fs::remove_dir_all(eval_takes_dir());
     let mut routed: Vec<String> = turn.steps.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
     routed.sort();
     routed.dedup();

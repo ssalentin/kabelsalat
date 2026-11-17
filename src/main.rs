@@ -18,6 +18,7 @@ mod mcp;
 mod midi;
 mod player;
 mod preview;
+mod rope;
 mod session;
 mod theme;
 mod ui;

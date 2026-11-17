@@ -1027,9 +1027,23 @@ fn load_bundle(path: &std::path::Path, id: &str) -> Result<(PluginEntry, CString
 }
 
 fn discover_plugin(target_id: &str) -> Result<(PluginEntry, CString)> {
-    let (path, id) = bundle_with(|p| p.id == target_id)
-        .ok_or_else(|| anyhow!("CLAP plugin '{target_id}' not found in CLAP search paths"))?;
-    load_bundle(&path, &id)
+    // Resolved once per process and plugin: a rack hosts one voice per CLAP
+    // unit, so the same id is asked for again with every added unit. Only a
+    // hit is remembered, so a later install is still found.
+    static FOUND: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+    let known = FOUND.lock().ok().and_then(|f| f.iter().find(|(id, _)| id == target_id).map(|(_, p)| p.clone()));
+    let path = match known {
+        Some(path) => path,
+        None => {
+            let (path, id) = bundle_with(|p| p.id == target_id)
+                .ok_or_else(|| anyhow!("CLAP plugin '{target_id}' not found in CLAP search paths"))?;
+            if let Ok(mut f) = FOUND.lock() {
+                f.push((id, path.clone()));
+            }
+            path
+        }
+    };
+    load_bundle(&path, target_id)
 }
 
 fn discover_surge() -> Result<(PluginEntry, CString)> {

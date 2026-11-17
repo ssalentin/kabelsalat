@@ -659,6 +659,18 @@ Learned so far (2026-11-15, UI polish pass):
 
 ## Ground rules
 
+- **One branch per session (user, 2026-11-17):** the user runs several
+  sessions in parallel. Before your first edit, put your work on its own
+  branch in its own worktree:
+  `git worktree add ../kabelsalat-<topic> -b <topic> main`, then work only
+  there. Never edit on `main`. A branch alone is not enough: sessions that
+  share one checkout share its working tree, so a `git switch` in one moves
+  every other session's files too. Check `git branch --show-current` and
+  `pwd` before editing. When the work is finished, commit it and push the
+  branch (`git push -u origin <topic>`, gated per rule 50), then open a
+  pull request against `main` (`gh pr create`) that references its issue
+  and shows the evidence. Never leave finished work only on the local
+  machine or only on a branch. Remove the worktree once its PR is merged.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

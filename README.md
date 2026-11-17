@@ -83,6 +83,19 @@ Press **?** in the app for every shortcut.
 
 ## Install
 
+**AppImage (recommended)** — download `kabelsalat-<version>-<arch>.AppImage`
+(x86_64 or aarch64) from the
+[latest release](https://github.com/ssalentin/kabelsalat/releases/latest), then:
+
+```sh
+chmod +x kabelsalat-*.AppImage
+./kabelsalat-*.AppImage
+```
+
+It runs unsandboxed, so it finds the CLAP/LV2 plugins installed on your system
+and gets realtime audio priority like a native install. Install the plugins
+from your distribution (`surge-xt` for the default synth).
+
 **Arch / Omarchy** (builds the package with a launcher entry and icon):
 
 ```sh
@@ -93,6 +106,10 @@ makepkg -si
 
 Recommended: `surge-xt-clap` (the default synth). Optional: `dexed-clap`,
 `lv2-plugins`.
+
+**Flatpak / tarball** — also attached to every release. The Flatpak runs in a
+sandbox: no realtime audio priority yet and `kabelsalat mcp --attach` from the
+host cannot reach it; see [docs/PACKAGING.md](docs/PACKAGING.md).
 
 **From source** — needs Rust (rustup), `alsa-lib`, `lilv`, and PipeWire or ALSA:
 

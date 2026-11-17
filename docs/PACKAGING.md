@@ -43,6 +43,14 @@ release). Each package is built natively for x86_64 and aarch64:
 | `kabelsalat-<v>-<arch>.flatpak` | `packaging/flatpak/build.sh` | `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` | Single-file bundle, see below. |
 | `kabelsalat-git-<v>.r<n>.g<sha>-1-<arch>.pkg.tar.*` | `packaging/arch-makepkg.sh` | `archlinux:base-devel`, `menci/archlinuxarm:base-devel` | `packaging/PKGBUILD` built from the tagged commit. |
 
+**Recommended download: the AppImage.** It runs unsandboxed, so it finds the
+user's CLAP/LV2 plugins, its audio thread gets realtime priority through rtkit
+(AGENTS.md rule 29) and `kabelsalat mcp --attach` reaches it. The Flatpak is a
+secondary format: in its sandbox rtkit cannot promote the audio thread (no
+realtime until the app uses the Realtime portal), plugins needing a newer glibc
+than the runtime do not load, and host-side agents cannot attach. README and
+every release's notes point to the AppImage.
+
 Each job smoke-tests its package with `kabelsalat --version`. The release job
 adds `SHA256SUMS`, then creates the GitHub release with the tag's CHANGELOG
 block as notes (`scripts/ci/release-notes.sh`), or uploads to it when the

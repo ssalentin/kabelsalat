@@ -451,6 +451,28 @@ pub fn tracked_label(ui: &mut egui::Ui, text: &str, size: f32, tracking_em: f32,
 }
 
 /// Section label for egui chrome: uppercase, 10px, tracked +0.14em, INK_2.
+/// Horizontal text padding of `primary_button`.
+pub const PRIMARY_PAD_X: f32 = 12.0;
+/// Horizontal text padding of `chip_button` and `danger_button` (12.5px text).
+pub const CHIP_PAD_X: f32 = 10.0;
+
+/// Width `primary_button` takes for `text`.
+pub fn primary_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    button_text_width(ui, egui::RichText::new(text)) + PRIMARY_PAD_X * 2.0
+}
+
+/// Width `chip_button` or `danger_button` takes for `text`.
+pub fn chip_button_width(ui: &egui::Ui, text: &str) -> f32 {
+    button_text_width(ui, egui::RichText::new(text).size(12.5)) + CHIP_PAD_X * 2.0
+}
+
+fn button_text_width(ui: &egui::Ui, text: egui::RichText) -> f32 {
+    egui::WidgetText::from(text)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button)
+        .size()
+        .x
+}
+
 pub fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Response {
     tracked_label(ui, &text.to_uppercase(), 10.0, 0.14, INK_2)
 }
@@ -477,7 +499,7 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
         v.widgets.hovered = hot;
         v.widgets.active = hot;
         v.widgets.open = base;
-        ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
+        ui.spacing_mut().button_padding = egui::vec2(PRIMARY_PAD_X, 5.0);
         ui.add(egui::Button::new(egui::RichText::new(text).color(ON_ACCENT)).corner_radius(2.0).min_size(egui::vec2(0.0, 26.0)))
     }).inner
 }
@@ -512,7 +534,7 @@ pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
         v.widgets.active = hot;
         v.widgets.open = base;
         // Breathing room: boxed text never touches the chip edge (rule 7).
-        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+        ui.spacing_mut().button_padding = egui::vec2(CHIP_PAD_X, 5.0);
         // Explicit text color: visuals.override_text_color would otherwise
         // force cream on the cream ON-fill (invisible label).
         ui.add(
@@ -557,7 +579,7 @@ pub fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Respo
         v.widgets.hovered = hot;
         v.widgets.active = hot;
         v.widgets.open = base;
-        ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+        ui.spacing_mut().button_padding = egui::vec2(CHIP_PAD_X, 5.0);
         ui.add(
             egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
                 .corner_radius(2.0)
@@ -757,6 +779,208 @@ pub fn medium_font(size: f32) -> FontId {
     }
 }
 
+/// Popup frame for [`Dropdown`], matching the knob context menu
+/// (`DARK_PANEL`, 1px `HAIRLINE`, 4px corner radius, soft drop shadow).
+pub fn dropdown_popup_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(DARK_PANEL)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(4.0)
+        .inner_margin(egui::Margin::same(6))
+        .shadow(egui::Shadow {
+            offset: [0, 6],
+            blur: 16,
+            spread: 0,
+            color: Color32::from_black_alpha(130),
+        })
+}
+
+/// Contents builder passed to [`Dropdown::show_ui`].
+pub struct DropdownMenu<'a> {
+    ui: &'a mut egui::Ui,
+    text_size: f32,
+}
+
+impl DropdownMenu<'_> {
+    /// One selectable row. Selected rows show a `LIVE_TEAL` dot and raised
+    /// `DARK_PANEL_HI` plate (tomato stays reserved for rack selection/CTAs).
+    pub fn item(&mut self, selected: bool, label: &str) -> bool {
+        let pad_x = 8.0;
+        let pad_y = 4.0;
+        let mark_w = 14.0;
+        let row_w = self.ui.available_width().max(120.0);
+        let max_text_w = (row_w - pad_x * 2.0 - mark_w).max(20.0);
+        let font = if selected {
+            medium_font(self.text_size)
+        } else {
+            FontId::proportional(self.text_size)
+        };
+        let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), font, CREAM);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_text_w);
+        let galley = self.ui.fonts_mut(|f| f.layout_job(job));
+        let elided = galley.elided;
+        let row_h = (galley.size().y + pad_y * 2.0).max(24.0);
+        let (rect, mut resp) = self.ui.allocate_exact_size(Vec2::new(row_w, row_h), egui::Sense::click());
+        if self.ui.is_rect_visible(rect) {
+            let hovered = resp.hovered();
+            let fill = if hovered {
+                mix(DARK_PANEL_HI, CREAM, 0.08)
+            } else if selected {
+                DARK_PANEL_HI
+            } else {
+                Color32::TRANSPARENT
+            };
+            let painter = self.ui.painter();
+            if fill != Color32::TRANSPARENT {
+                painter.rect_filled(rect, 2.0, fill);
+            }
+            if selected && !hovered {
+                painter.rect_stroke(rect, 2.0, Stroke::new(1.0, HAIRLINE), egui::StrokeKind::Inside);
+            }
+            if selected {
+                painter.circle_filled(Pos2::new(rect.left() + pad_x + 4.0, rect.center().y), 3.0, LIVE_TEAL);
+            }
+            let text_pos = Pos2::new(rect.left() + pad_x + mark_w, rect.center().y - galley.size().y * 0.5);
+            painter.galley(text_pos, galley, CREAM);
+        }
+        if elided {
+            resp = resp.on_hover_text(label);
+        }
+        resp.clicked()
+    }
+
+    /// Muted informational row (e.g. filter hint or empty state).
+    pub fn note(&mut self, text: &str) {
+        self.ui.add(
+            egui::Label::new(egui::RichText::new(text).size(11.5).color(INK_2)).selectable(false),
+        );
+    }
+}
+
+/// Hurricane-themed dropdown replacing `egui::ComboBox`: chip-styled trigger
+/// with chevron, `DARK_PANEL` popup matching the knob menu, scrollable list,
+/// Esc-to-close, and truncation with full-text hover tooltips.
+pub struct Dropdown {
+    id_salt: egui::IdSalt,
+    selected_text: String,
+    width: Option<f32>,
+    popup_min_width: Option<f32>,
+    max_popup_height: f32,
+    text_size: f32,
+}
+
+impl Dropdown {
+    pub fn new(id_salt: impl egui::AsIdSalt, selected_text: impl Into<String>) -> Self {
+        Self {
+            id_salt: egui::IdSalt::new(id_salt),
+            selected_text: selected_text.into(),
+            width: None,
+            popup_min_width: None,
+            max_popup_height: 240.0,
+            text_size: 12.5,
+        }
+    }
+
+    pub fn width(mut self, width: f32) -> Self {
+        self.width = Some(width);
+        self
+    }
+
+    pub fn popup_min_width(mut self, width: f32) -> Self {
+        self.popup_min_width = Some(width);
+        self
+    }
+
+    pub fn text_size(mut self, size: f32) -> Self {
+        self.text_size = size;
+        self
+    }
+
+    pub fn show_ui(self, ui: &mut egui::Ui, add_contents: impl FnOnce(&mut DropdownMenu<'_>)) -> egui::Response {
+        let pad_x = 10.0;
+        let pad_y = 5.0;
+        let gap = 6.0;
+        let chevron_w = 10.0;
+        let button_id = ui.make_persistent_id(self.id_salt);
+        let popup_id = button_id.with("popup");
+        let is_open = egui::Popup::is_id_open(ui.ctx(), popup_id);
+
+        let font = FontId::proportional(self.text_size);
+        let natural = ui.fonts_mut(|f| {
+            let g = f.layout_no_wrap(self.selected_text.clone(), font.clone(), CREAM);
+            g.size()
+        });
+        let avail_w = ui.available_width().max(80.0);
+        let btn_w = match self.width {
+            Some(w) => w.clamp(60.0, avail_w.max(60.0)),
+            None => (natural.x + pad_x * 2.0 + gap + chevron_w).clamp(80.0, avail_w),
+        };
+        let btn_h = (natural.y + pad_y * 2.0).max(26.0);
+        let (_, rect) = ui.allocate_space(Vec2::new(btn_w, btn_h));
+        let mut resp = ui.interact(rect, button_id, egui::Sense::click());
+
+        let max_text_w = (rect.width() - pad_x * 2.0 - gap - chevron_w).max(12.0);
+        let mut job = egui::text::LayoutJob::simple_singleline(self.selected_text.clone(), font, CREAM);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(max_text_w);
+        let galley = ui.fonts_mut(|f| f.layout_job(job));
+        let elided = galley.elided;
+
+        if ui.is_rect_visible(rect) {
+            let hovered = resp.hovered();
+            let (fill, stroke_col, chev_col) = if is_open {
+                (mix(DARK_PANEL_HI, CREAM, 0.10), HAIRLINE_DARK, CREAM)
+            } else if hovered {
+                (mix(DARK_PANEL_HI, CREAM, 0.07), MUTED, CREAM)
+            } else {
+                (DARK_PANEL_HI, HAIRLINE, CREAM_MID)
+            };
+            let painter = ui.painter();
+            painter.rect_filled(rect, 2.0, fill);
+            painter.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke_col), egui::StrokeKind::Inside);
+            let text_pos = Pos2::new(rect.left() + pad_x, rect.center().y - galley.size().y * 0.5);
+            painter.galley(text_pos, galley, CREAM);
+
+            let cx = rect.right() - pad_x - chevron_w * 0.5;
+            let cy = rect.center().y;
+            let dy = if is_open { 1.8 } else { -1.8 };
+            let pts = [
+                Pos2::new(cx - 3.5, cy + dy),
+                Pos2::new(cx, cy - dy),
+                Pos2::new(cx + 3.5, cy + dy),
+            ];
+            let s = Stroke::new(1.4, chev_col);
+            painter.line_segment([pts[0], pts[1]], s);
+            painter.line_segment([pts[1], pts[2]], s);
+        }
+
+        if elided {
+            resp = resp.on_hover_text(&self.selected_text);
+        }
+
+        let popup_w = self.popup_min_width.unwrap_or(0.0).max(rect.width()).clamp(140.0, 380.0);
+        egui::Popup::menu(&resp)
+            .id(popup_id)
+            .width(popup_w)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .frame(dropdown_popup_frame())
+            .show(|ui| {
+                let inner_w = (popup_w - 12.0).max(120.0);
+                ui.set_min_width(inner_w);
+                ui.set_max_width(368.0);
+                egui::ScrollArea::vertical()
+                    .max_height(self.max_popup_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let mut menu = DropdownMenu { ui, text_size: self.text_size };
+                        add_contents(&mut menu);
+                    });
+            });
+
+        resp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,5 +1033,92 @@ mod tests {
             assert!((g.h * ext - size * 0.5).abs() < 1e-3);
             assert_eq!(g.over[0], Pos2::new(-g.h, -g.h));
         }
+    }
+
+    #[test]
+    fn dropdown_opens_uses_palette_fill_selects_and_closes_on_escape() {
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Rect(r) => rects.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => for s in v { collect(s, texts, rects); },
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        ctx.set_visuals(visuals());
+        let items = ["Alpha", "Beta", "Gamma", "Very-long-label-that-should-truncate-cleanly-on-narrow-buttons"];
+        let mut selected = 0usize;
+
+        let step = |selected: &mut usize, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0)));
+            // Past egui's area fade-in, which paints a new popup alpha-scaled.
+            raw.time = Some(ctx.input(|i| i.time) + 0.25);
+            raw.events = events;
+            let mut btn_rect = Rect::NOTHING;
+            let mut out = ctx.run_ui(raw, |ui| {
+                egui::Panel::top("dd_test_bar").show(ui, |ui| {
+                    let resp = Dropdown::new("test_dd", items[*selected])
+                        .width(160.0)
+                        .show_ui(ui, |menu| {
+                            for (i, label) in items.iter().enumerate() {
+                                if menu.item(*selected == i, label) {
+                                    *selected = i;
+                                }
+                            }
+                        });
+                    btn_rect = resp.rect;
+                });
+            });
+            out.textures_delta.clear();
+            let mut texts = Vec::new();
+            let mut rects = Vec::new();
+            for cs in &out.shapes {
+                collect(&cs.shape, &mut texts, &mut rects);
+            }
+            let fg_open = ctx.memory(|m| {
+                m.areas().visible_layer_ids().into_iter().any(|l| l.order == egui::Order::Foreground)
+            });
+            (texts, rects, fg_open, btn_rect)
+        };
+
+        let (texts, rects, fg_open, btn_rect) = step(&mut selected, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Alpha"));
+        assert!(!fg_open);
+        assert!(!rects.iter().any(|(_, fill)| *fill == DARK_PANEL));
+
+        let pos = btn_rect.center();
+        let click_ev = |p: Pos2| vec![
+            egui::Event::PointerMoved(p),
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
+            egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE },
+        ];
+        let _ = step(&mut selected, click_ev(pos));
+        let (texts, rects, fg_open, _) = step(&mut selected, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx) && fg_open);
+        assert!(rects.iter().any(|(_, fill)| *fill == DARK_PANEL), "popup uses DARK_PANEL fill: {rects:?}");
+        assert!(!rects.iter().any(|(_, fill)| *fill == Color32::BLACK));
+        assert!(texts.iter().any(|(t, _)| t == "Gamma"));
+
+        let _ = step(&mut selected, vec![
+            egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE },
+            egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE },
+        ]);
+        assert!(!egui::Popup::is_any_open(&ctx));
+        assert_eq!(selected, 0);
+
+        step(&mut selected, vec![egui::Event::PointerMoved(pos)]);
+        step(&mut selected, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+        step(&mut selected, vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        let (texts, _, _, _) = step(&mut selected, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx), "trigger reopens the dropdown after Esc");
+        let gamma_pos = texts.iter().find(|(t, _)| t == "Gamma").unwrap().1.center();
+        step(&mut selected, vec![egui::Event::PointerMoved(gamma_pos)]);
+        step(&mut selected, vec![egui::Event::PointerButton { pos: gamma_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }]);
+        step(&mut selected, vec![egui::Event::PointerButton { pos: gamma_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: egui::Modifiers::NONE }]);
+        assert_eq!(selected, 2);
+        assert!(!egui::Popup::is_any_open(&ctx));
     }
 }

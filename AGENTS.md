@@ -515,6 +515,23 @@ Learned so far (2026-11-15, UI polish pass):
     enough; measured against the API, and OpenRouter's Gemini accepts it).
     Every hand-over from a plan failed this way, for Surge too. `agent-eval
     --task organ_no_pad` runs that path.
+101. **Rows in a fixed-width column take their widths from the column:**
+    size a flexible field as the remaining width minus the measured buttons
+    (`theme::chip_button_width` / `primary_button_width`), never a fixed
+    width in `horizontal_wrapped`. In Settings at 781 px, the model row
+    asked for 150 + 240 px plus Apply in a 328 px column. Apply wrapped
+    letter by letter, the column grew, and the right column, including
+    the UI-scale value, was pushed past the window. A status line of
+    several colors is one `LayoutJob` label: wrapped labels' galleys start
+    at the row's left edge (`leading_space`) and overlap.
+    `assert_settings_text_layout` checks containment and no overlap at
+    781x950, 760x520 and 1280x900.
+102. **egui tests that read popup paint advance `RawInput::time`:** an
+    Area fades in, so a popup's first frames paint its fill alpha-scaled
+    (`DARK_PANEL` read as `#0707073C` and looked like a wrong fill). Set
+    `raw.time` past `animation_time` each frame. Click as a user does
+    (move, press, release on separate frames, `click_at`): egui ignores a
+    click that lands on the frame right after its popup closed.
 
 ## Working on kabelsalat
 

@@ -67,12 +67,22 @@ pub enum Role {
 }
 
 impl Role {
+    pub const ALL: [Role; 3] = [Role::Decide, Role::Act, Role::Perceive];
+
     /// The config.json field that overrides this role's model.
     pub fn model_field(self) -> &'static str {
         match self {
             Role::Decide => "agent_decide_model",
             Role::Act => "agent_act_model",
             Role::Perceive => "agent_perceive_model",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Role::Decide => "Decisions (Jev)",
+            Role::Act => "Chat model",
+            Role::Perceive => "Vision model",
         }
     }
 }
@@ -90,7 +100,9 @@ pub const JEV: &str = "~typesafe/jev-latest";
 /// have only an OpenRouter key.
 pub const JEV_ROUTER: &str = "typesafe/jev-router";
 pub const DEEPSEEK_CHAT: &str = "deepseek-chat";
-const PERCEIVE_MODEL: &str = "google/gemini-3.8-flash";
+pub const PERCEIVE_MODEL: &str = "google/gemini-3.8-flash";
+pub const CLAUDE_OPUS: &str = "anthropic/claude-opus-5.5";
+pub const GEMINI_FLASH_25: &str = "google/gemini-2.5-flash";
 
 impl Route {
     /// The endpoint follows the id's shape: OpenRouter ids are
@@ -125,10 +137,26 @@ impl Route {
 }
 
 /// Which endpoints config.json has a key for.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Keys {
     pub openrouter: bool,
     pub deepseek: bool,
+}
+
+impl Keys {
+    pub fn has(self, endpoint: Endpoint) -> bool {
+        match endpoint {
+            Endpoint::OpenRouter => self.openrouter,
+            Endpoint::DeepSeek => self.deepseek,
+        }
+    }
+
+    pub fn set(&mut self, endpoint: Endpoint, present: bool) {
+        match endpoint {
+            Endpoint::OpenRouter => self.openrouter = present,
+            Endpoint::DeepSeek => self.deepseek = present,
+        }
+    }
 }
 
 /// Why a request failed, by what the caller can do about it.

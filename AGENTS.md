@@ -611,6 +611,29 @@ Learned so far (2026-11-15, UI polish pass):
     `organ_pending` (fixed size, no allocation) holds them and `attach_lv2`
     replays them; `LoadGraph` clears it. Check with `kabelsalat organ-test`,
     which sends the registration before the instance exists.
+114. **A small window shows the whole app, not a corner of it:** the rack
+    had fixed 200/220 px column floors and 60 px margins, so below ~950 px
+    it panned and cut Keys and Master off; stage sheets kept 30 px margins
+    and a 200 px minimum that painted into the docks; the mixer's dB marks
+    stacked on a short meter. Column floors come from the faces
+    (`face_min_w`: own knobs, title clear of the LED, Master's meter), a
+    small stage switches to `RackChrome::TIGHT`, a short but wide stage
+    lays the stacks out in one row (`rack_flat`), and sheets clip to
+    themselves. `every_view_fits_small_windows` fails on any text overlap,
+    text outside the window or sideways rack overflow in every view at six
+    window sizes × three docks; `face_layout_tests` audits faces at the same
+    sizes. See the result without the desktop:
+    `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
+    (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
+115. **UI scale follows the monitor the window is on:** `ui_scale_target`
+    read the FOCUSED monitor once at launch, so a window on the 1.0x
+    external screen ran at the laptop's 1.6x (a 1368 px window laid out as
+    855 px). `hypr_window_scale` finds this pid's window in `hyprctl
+    clients` and is re-read every 2 s on its own thread (rule 48).
+116. **Tracked text advances by a width that is never zero:**
+    `layout_tracked` used `glyph_width`, which answered 0 in a busy test
+    run and stacked "kabelsalat" on one spot; the laid-out glyph's width
+    is the fallback.
 
 ## Working on kabelsalat
 

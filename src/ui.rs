@@ -68,6 +68,10 @@ const SUBTEXT: Color32 = theme::CREAM_MID;
 /// Knob radius on unit faces (labels and display captions share its baseline).
 const KNOB_R: f32 = 17.0;
 const METER_SEGS: usize = 14;
+/// Top of Master's meter in a face too short for its caption (under the subtitle).
+const METER_TOP_SHORT: f32 = 60.0;
+/// Width of a Master meter segment.
+const METER_SEG_W: f32 = 22.0;
 /// Face grid (rack-local px), shared by every unit face: content starts on
 /// the title's left edge, keeps FACE_PAD_R from the right border and
 /// FACE_PAD_B under the lowest label. The knob row sits on the bottom of
@@ -1738,6 +1742,35 @@ enum Drag {
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
 /// axis). All rack drawing goes through this.
+/// The rack's margins and spacing (points). A small window drops to `TIGHT`
+/// before any face goes below its floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RackChrome {
+    /// Stage edge to the rack, each side.
+    margin: f32,
+    /// Stage top to the rack's view.
+    top: f32,
+    /// Room for the hint line under the rack.
+    hint: f32,
+    /// Rack edge to the units.
+    pad: f32,
+    /// Width of the side rails.
+    rail: f32,
+    /// Between units.
+    gap: f32,
+    /// Corner radius of the rack panel.
+    radius: f32,
+}
+
+impl RackChrome {
+    const ROOMY: Self = Self { margin: 30.0, top: 40.0, hint: 36.0, pad: 20.0, rail: 14.0, gap: 12.0, radius: 36.0 };
+    const TIGHT: Self = Self { margin: 8.0, top: 8.0, hint: 30.0, pad: 10.0, rail: 8.0, gap: 8.0, radius: 22.0 };
+}
+
+/// Readable floors of a rack unit (points).
+const MIN_UNIT_H: f32 = 136.0;
+const FACE_MIN_W: f32 = 150.0;
+
 #[derive(Clone, Copy)]
 struct Xform {
     center: Pos2, // screen
@@ -2059,6 +2092,10 @@ struct DemoApp {
     /// stage view, the current pan offset, and the rack's clip (Some only
     /// while overflowing).
     rack_overflow: Vec2,
+    /// Margins and spacing the last `layout` used (roomy, or tight in a small window).
+    rack_chrome: RackChrome,
+    /// The stacks are laid out in one row (a short, wide window).
+    rack_flat: bool,
     rack_pan: Vec2,
     rack_clip: Option<Rect>,
     /// Unsimulated time carried to the next frame (fixed rope step).
@@ -2130,6 +2167,8 @@ struct DemoApp {
     drop_ghost: Option<Rect>,
     /// Committed mid-column centers + stack height (drop-target geometry).
     col_x: Vec<f32>,
+    /// Each stack's committed (left x, width) in rack-local points.
+    col_span: Vec<(f32, f32)>,
     stack_tall_h: f32,
     /// Every instrument's sound library, scanned off this thread (rule 46).
     sounds: crate::sounds::Libraries,
@@ -2455,6 +2494,8 @@ impl DemoApp {
             stats_line: String::new(),
             rack_w: 640.0,
             rack_overflow: Vec2::ZERO,
+            rack_chrome: RackChrome::ROOMY,
+            rack_flat: false,
             rack_pan: Vec2::ZERO,
             rack_clip: None,
             rack_h: 560.0,
@@ -2499,6 +2540,7 @@ impl DemoApp {
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
+            col_span: Vec::new(),
             stack_tall_h: 0.0,
             // Tests never scan the machine's patch folders.
             sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
@@ -2879,9 +2921,15 @@ impl DemoApp {
             .min_by(|a, b| (drop.x - a.1).abs().total_cmp(&(drop.x - b.1).abs()))
             .map(|(j, _)| j)?;
         let others = self.stack_cols.get(tj)?.iter().filter(|&&u| u != unit).count();
-        let pad = 20.0;
-        let slot = self.stack_tall_h / (others + 1) as f32;
-        let tr = (((drop.y - pad) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
+        // A stack reads top to bottom, or left to right in a flat rack.
+        let (start, along, span) = if self.rack_flat {
+            let (x0, w) = self.col_span[tj];
+            (x0, drop.x, w)
+        } else {
+            (self.rack_chrome.pad, drop.y, self.stack_tall_h)
+        };
+        let slot = span / (others + 1) as f32;
+        let tr = (((along - start) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
         Some((tj, tr))
     }
 
@@ -3039,62 +3087,84 @@ impl DemoApp {
         self.toolbar_top = rect.top();
         // Adaptive rack: KEYS (left, full height) | one column per instrument
         // stack (instrument + its FX chain) | MASTER (right, full height).
-        let rows = self.layout_rows.max(1);
-        let n_mid = self.stack_cols.len();
-        // Readable floors: below them the rack grows past the stage and pans
-        // (wheel / trackpad) instead of squishing faces.
-        const MIN_UNIT_H: f32 = 140.0;
-        const MIN_MID_W: f32 = 200.0;
-        const MIN_SIDE_W: f32 = 220.0;
+        // A window too short for the stacks but wide enough lays each chain
+        // out in one row instead (instrument, then its FX, left to right).
+        let stacked_rows = self.layout_rows.max(1);
+        let floor = |u: usize| self.face_min_w(u);
+        let keys_floor = self.keys_unit.map_or(FACE_MIN_W, floor);
+        let master_floor = self.master_unit.map_or(FACE_MIN_W, floor);
+        let mid_floor = self.stack_cols.iter().flatten().map(|&u| floor(u)).fold(FACE_MIN_W, f32::max);
+        let n_stacks = self.stack_cols.len();
+        let n_flat: usize = self.stack_cols.iter().map(|c| c.len()).sum();
         // Caps sized for the 1.6x design scale (1600x1000 points): the rack
         // uses the stage instead of floating small in it.
-        let fit_w = (rect.width() - 60.0).clamp(560.0, 1480.0);
-        // No masthead any more (user 2026-11-15: Play button removed, brand in
-        // the top bar) — the stage overhead is just margins + the hint line.
-        self.unit_h = ((rect.height() - 150.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
-        let gap = 12.0;
-        let pad = 20.0;
-        let rail = 14.0;
-        self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
-        let n_cols = n_mid + 2; // keys + stacks + master
+        let usable = |c: &RackChrome, n_mid: usize| (rect.width() - 2.0 * c.margin).min(1480.0)
+            - 2.0 * (c.pad + c.rail) - (n_mid as f32 + 1.0) * c.gap;
+        let unit_room = |c: &RackChrome, rows: usize| {
+            let rf = rows as f32;
+            (rect.height() - c.top - c.hint - 2.0 * c.pad - (rf - 1.0) * c.gap) / rf
+        };
+        let floor_w = |n_mid: usize| keys_floor + master_floor + n_mid as f32 * mid_floor;
+        let fits = |c: &RackChrome, n_mid: usize, rows: usize| usable(c, n_mid) >= floor_w(n_mid) && unit_room(c, rows) >= MIN_UNIT_H;
+        let (ch, flat) = if fits(&RackChrome::ROOMY, n_stacks, stacked_rows) {
+            (RackChrome::ROOMY, false)
+        } else if stacked_rows > 1 && unit_room(&RackChrome::TIGHT, stacked_rows) < MIN_UNIT_H
+            && fits(&RackChrome::TIGHT, n_flat, 1) {
+            (RackChrome::TIGHT, true)
+        } else {
+            (RackChrome::TIGHT, false)
+        };
+        self.rack_chrome = ch;
+        self.rack_flat = flat;
+        let (rows, n_mid) = if flat { (1, n_flat) } else { (stacked_rows, n_stacks) };
+        let rf = rows as f32;
+        let n_cols = n_mid + 2; // keys + middle columns + master
+        self.unit_h = unit_room(&ch, rows).clamp(MIN_UNIT_H, 250.0);
+        let (gap, pad, rail) = (ch.gap, ch.pad, ch.rail);
+        self.rack_h = pad * 2.0 + rf * self.unit_h + (rf - 1.0) * gap;
         let gaps = (n_cols as f32 - 1.0) * gap;
-        let usable_fit = fit_w - 2.0 * (pad + rail) - gaps;
+        let usable_fit = usable(&ch, n_mid);
         let side_frac = if n_mid == 0 { 0.5 } else if n_mid <= 2 { 0.26 } else { 0.20 };
         let mid_frac = if n_mid == 0 { 0.0 } else { (1.0 - 2.0 * side_frac) / n_mid as f32 };
-        let (mut side_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
-        if n_mid > 0 && mid_w < MIN_MID_W {
-            mid_w = MIN_MID_W;
-            side_w = side_w.max(MIN_SIDE_W);
-        }
+        let (mut keys_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
         // A lone stack must not stretch across half the stage (a one-synth
         // rig read as a mostly empty face): cap the column, the rack centers.
         const MAX_MID_W: f32 = 420.0;
         if n_mid > 0 && mid_w > MAX_MID_W {
             mid_w = MAX_MID_W;
-            side_w = side_w.min(MAX_MID_W * 1.1);
+            keys_w = keys_w.min(MAX_MID_W * 1.1);
         }
-        self.rack_w = 2.0 * (pad + rail) + 2.0 * side_w + n_mid as f32 * mid_w + gaps;
-        let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
-        widths.push(side_w); // keys
-        for _ in 0..n_mid { widths.push(mid_w); }
-        widths.push(side_w); // master
-        let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
-        let mut x = pad + rail;
-        for w in &widths { xs.push(x); x += w + gap; }
-        let tall_h = rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
+        let mut master_w = keys_w;
+        if keys_w < keys_floor.max(master_floor) || (n_mid > 0 && mid_w < mid_floor) {
+            // Floors first (Keys and Master each their own), the rest of the
+            // stage shared as before.
+            let extra = (usable_fit - floor_w(n_mid)).max(0.0);
+            keys_w = keys_floor + extra * side_frac;
+            master_w = master_floor + extra * side_frac;
+            mid_w = mid_floor + extra * mid_frac;
+        }
+        self.rack_w = 2.0 * (pad + rail) + keys_w + master_w + n_mid as f32 * mid_w + gaps;
+        let mid_x = |j: usize| pad + rail + keys_w + gap + j as f32 * (mid_w + gap);
+        let tall_h = rf * self.unit_h + (rf - 1.0) * gap;
         let mk = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
         if self.unit_rects.len() != self.units.len() {
             self.unit_rects = vec![Rect::NOTHING; self.units.len()];
         }
         if let Some(k) = self.keys_unit {
-            self.unit_rects[k] = mk(xs[0], pad, widths[0], tall_h);
+            self.unit_rects[k] = mk(pad + rail, pad, keys_w, tall_h);
         }
         if let Some(m) = self.master_unit {
-            self.unit_rects[m] = mk(xs[n_cols - 1], pad, widths[n_cols - 1], tall_h);
+            self.unit_rects[m] = mk(mid_x(n_mid), pad, master_w, tall_h);
         }
-        // Column centers of the COMMITTED layout: the drop target is judged
+        // Stack spans of the COMMITTED layout: the drop target is judged
         // from these, so the live preview below cannot feed back into it.
-        self.col_x = (0..n_mid).map(|j| xs[j + 1] + widths[j + 1] / 2.0).collect();
+        let mut first = 0;
+        self.col_span = self.stack_cols.iter().map(|c| {
+            let (x0, n) = if flat { (mid_x(first), c.len().max(1)) } else { (mid_x(first), 1) };
+            first += if flat { c.len() } else { 1 };
+            (x0, n as f32 * mid_w + (n as f32 - 1.0) * gap)
+        }).collect();
+        self.col_x = self.col_span.iter().map(|(x, w)| x + w / 2.0).collect();
         self.stack_tall_h = tall_h;
         // While Ctrl-dragging a unit, lay the others out AS IF it were
         // released here (user: show the layout before release); the ghost
@@ -3105,28 +3175,33 @@ impl DemoApp {
         };
         let cols = preview.as_ref().map(|(_, c)| c.clone()).unwrap_or_else(|| self.stack_cols.clone());
         self.drop_ghost = None;
-        for j in 0..n_mid.min(cols.len()) {
-            let cx = xs[j + 1];
-            let cw = widths[j + 1];
-            // A shorter stack stretches its units to the full column height
-            // (one rack size for every rig, no empty rows).
-            let len = cols[j].len().max(1);
-            let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
-            for r in 0..cols[j].len() {
-                let u = cols[j][r];
-                let y = pad + r as f32 * (uh + gap);
-                let rr = mk(cx, y, cw, uh);
-                if preview.as_ref().map_or(false, |(d, _)| *d == u) {
-                    self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
-                } else {
-                    self.unit_rects[u] = rr;
+        let mut place = |u: usize, rr: Rect| {
+            if preview.as_ref().map_or(false, |(d, _)| *d == u) {
+                self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
+            } else {
+                self.unit_rects[u] = rr;
+            }
+        };
+        if flat {
+            for (i, &u) in cols.iter().flatten().enumerate().take(n_mid) {
+                place(u, mk(mid_x(i), pad, mid_w, tall_h));
+            }
+        } else {
+            for j in 0..n_mid.min(cols.len()) {
+                // A shorter stack stretches its units to the full column height
+                // (one rack size for every rig, no empty rows).
+                let len = cols[j].len().max(1);
+                let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
+                for r in 0..cols[j].len() {
+                    place(cols[j][r], mk(mid_x(j), pad + r as f32 * (uh + gap), mid_w, uh));
                 }
             }
         }
-        // Stage view for the rack: below the masthead, above the hint line.
+        // Stage view for the rack: above the hint line.
+        let side_m = ch.margin.min(16.0);
         let view = Rect::from_min_max(
-            Pos2::new(rect.left() + 16.0, rect.top() + 40.0),
-            Pos2::new(rect.right() - 16.0, rect.bottom() - 36.0),
+            Pos2::new(rect.left() + side_m, rect.top() + ch.top),
+            Pos2::new(rect.right() - side_m, rect.bottom() - ch.hint),
         );
         let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
         if ov != self.rack_overflow {
@@ -3138,11 +3213,12 @@ impl DemoApp {
             self.rack_pan.x.clamp(-ov.x / 2.0, ov.x / 2.0),
             self.rack_pan.y.clamp(-ov.y / 2.0, ov.y / 2.0),
         );
-        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0).then_some(view.expand(8.0));
+        // The clip keeps 8 px of air around the view, except into the hint line.
+        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0)
+            .then_some(Rect::from_min_max(view.min - Vec2::splat(8.0), Pos2::new(view.max.x + 8.0, view.max.y)));
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
-            if ov.y > 0.0 { view.center().y - self.rack_h / 2.0 + self.rack_pan.y }
-            else { rect.center().y - self.rack_h / 2.0 - 8.0 },
+            view.center().y - self.rack_h / 2.0 + self.rack_pan.y,
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -4493,13 +4569,18 @@ impl DemoApp {
     }
 
     fn stage_sheet_rects(&self, rect: Rect, min_h: f32) -> (Rect, Rect) {
-        let top = self.toolbar_top + 20.0;
-        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min((rect.width() - 16.0).max(200.0));
+        // A small stage gives its margins to the sheet's content; the sheet
+        // never reaches past the stage (its users clip to it, so a short
+        // stage scrolls instead of painting into a dock).
+        let tight = rect.width() < 1000.0 || rect.height() < 560.0;
+        let (margin, inner) = if tight { (8.0, Vec2::new(18.0, 14.0)) } else { (20.0, Vec2::new(32.0, 26.0)) };
+        let top = self.toolbar_top + margin;
+        let w = (rect.width() - 3.0 * margin).clamp(560.0, 1240.0).min((rect.width() - 2.0 * margin).max(200.0));
         let sheet = Rect::from_min_max(
             Pos2::new(rect.center().x - w / 2.0, top),
-            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + min_h)),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - margin).max(top + min_h).min(rect.bottom())),
         );
-        (sheet, sheet.shrink2(Vec2::new(32.0, 26.0)))
+        (sheet, sheet.shrink2(inner))
     }
 
     /// Snapshot the current patch + knobs + plugin state into a Session.
@@ -8089,10 +8170,17 @@ impl DemoApp {
                                             self.load_rig_dialog = Some(None);
                                         }
                                         if n > 1 {
-                                            ui.add_space(8.0);
+                                            // The hint is the first thing to go: shown only where it fits whole.
                                             let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
-                                            ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
-                                                .size(11.0).color(theme::INK_2));
+                                            let room = scroll_w - (ui.min_rect().width() + 8.0);
+                                            for hint in [format!("{keys} or arrow keys switch the view · all rigs keep sounding"), format!("{keys} or ←→ switch the view")] {
+                                                let g = ui.painter().layout_no_wrap(hint.clone(), FontId::proportional(11.0), theme::INK_2);
+                                                if g.size().x <= room {
+                                                    ui.add_space(8.0);
+                                                    ui.label(egui::RichText::new(hint).size(11.0).color(theme::INK_2));
+                                                    break;
+                                                }
+                                            }
                                         }
                                     },
                                 );
@@ -8359,6 +8447,7 @@ impl DemoApp {
         let names = Self::list_saved_sessions(dir);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
@@ -8961,6 +9050,7 @@ impl DemoApp {
         let help = self.show_help;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
@@ -9420,6 +9510,7 @@ impl DemoApp {
         let mut actions: Vec<SettingsAction> = Vec::new();
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
@@ -10426,11 +10517,10 @@ impl DemoApp {
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                         if self.agent_activity.log.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("No agent edits yet — assistant & MCP/CLI changes appear here and highlight in the rack.")
-                                                    .size(11.5)
-                                                    .color(theme::INK_2),
-                                            );
+                                            // One line: a short dock leaves this list a single row.
+                                            ui.add(egui::Label::new(egui::RichText::new("No agent edits yet")
+                                                .size(11.5).color(theme::INK_2)).truncate())
+                                                .on_hover_text("assistant & MCP/CLI changes appear here and highlight in the rack");
                                             return;
                                         }
                                         for entry in &self.agent_activity.log {
@@ -10528,7 +10618,7 @@ impl DemoApp {
     /// below the minimum playable size, and only what the rack can spare
     /// (rule 22). Whole pixels, so a resize does not jitter the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 140.0; // header + keys of at least 40 px
+        const MIN_H: f32 = 112.0; // header + keys of at least 60 px
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -11842,6 +11932,23 @@ impl DemoApp {
         }
     }
 
+    /// Narrowest face that still shows the unit's own knobs, header and LED
+    /// (plugin knobs give way first, `fit_plugin_knobs`).
+    fn face_min_w(&self, unit: usize) -> f32 {
+        let Some(u) = self.units.get(unit) else { return FACE_MIN_W };
+        let own = u.knobs.iter().filter(|k| k.source == KnobSource::BuiltIn && !k.hidden).count();
+        // Left of the knob row: Master's meter segments (a display just hides;
+        // the meter's caption sits above the knob row and may run over it).
+        let meter = if matches!(u.node_kind, UnitKind::Master) { METER_SEG_W + 8.0 } else { 0.0 };
+        let knobs = if own == 0 { 0.0 } else {
+            FACE_X + meter + KNOB_LABEL_W / 2.0 + KNOB_SLOT_HALF + (own - 1) as f32 * KNOB_PITCH + FACE_PAD_R
+        };
+        // The title clears the LED (top right); the subtitle row runs under it.
+        let title = FACE_X + u.name_g.as_ref().map_or(0.0, |g| g.size().x) + 30.0;
+        let sub = FACE_X + u.sub_g.as_ref().map_or(0.0, |g| g.size.x) + 10.5;
+        knobs.max(title).max(sub).max(FACE_MIN_W).ceil()
+    }
+
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
         let Some(u) = self.units.get(unit) else {
@@ -12503,7 +12610,7 @@ impl DemoApp {
         let mut rp = painter.clone();
         if let Some(clip) = self.rack_clip { rp.set_clip_rect(clip.intersect(rect)); }
         rp.set_opacity(self.load_fade);
-        rp.rect_filled(rack, 36.0, CHASSIS);
+        rp.rect_filled(rack, self.rack_chrome.radius, CHASSIS);
 
         if self.xf.sy > 0.04 {
             self.draw_rails(&rp);
@@ -12521,10 +12628,10 @@ impl DemoApp {
     /// Hairline pan indicators when the rack overflows the stage: a thumb
     /// showing the visible part on the bottom / right edge of the view.
     fn draw_pan_bars(&self, painter: &egui::Painter) {
-        let Some(view) = self.rack_clip.map(|c| c.shrink(8.0)) else { return };
+        let Some(view) = self.rack_clip.map(|c| Rect::from_min_max(c.min + Vec2::splat(8.0), Pos2::new(c.max.x - 8.0, c.max.y))) else { return };
         let ov = self.rack_overflow;
         if ov.x > 0.0 {
-            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 6.0), Pos2::new(view.right() - 40.0, view.bottom() + 9.0));
+            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 2.0), Pos2::new(view.right() - 40.0, view.bottom() + 5.0));
             let frac = view.width() / self.rack_w;
             let t = 0.5 - self.rack_pan.x / ov.x.max(1.0); // pan +ov/2 = left end
             let w = track.width() * frac;
@@ -12557,6 +12664,7 @@ impl DemoApp {
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
         let help = self.show_help;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
@@ -12667,6 +12775,7 @@ impl DemoApp {
             .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
@@ -12675,12 +12784,14 @@ impl DemoApp {
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(14.0);
-                let h = ui.available_height();
                 // Strip height: name + sub + fader + value + bus controls.
-                let fader_h = (h - 210.0).clamp(90.0, 480.0);
+                // A short sheet keeps a usable fader and scrolls the rest.
+                let view_h = ui.available_height().max(1.0);
+                let fader_h = (view_h - 210.0).clamp(64.0, 480.0);
+                let h = view_h.max(fader_h + 210.0);
                 ui.horizontal_top(|ui| {
                     let scroll_w = ui.available_width().max(200.0);
-                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, view_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         // Center the strips in the sheet while they fit (a left-
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
@@ -12688,7 +12799,7 @@ impl DemoApp {
                         let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
                         let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
-                        egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad);
                                 for rig in 0..n {
@@ -12857,17 +12968,23 @@ impl DemoApp {
                                         ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
                                     }
                                     ui.add_space(4.0);
-                                    let rigs = if n == 1 { "1 rig · peak meter".to_string() } else { format!("sum of {n} rigs · peak meter") };
-                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
+                                    let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
+                                        .on_hover_text("peak meter of everything kabelsalat plays");
                                     ui.add_space(8.0);
                                     // Meter + dB scale: a labeled peak meter, not a missing fader.
                                     let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
                                     let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
                                     paint_meter(ui.painter(), mr, meter_db_pos(self.meter), meter_db_pos(self.meter_peak));
-                                    for db in [0.0f32, -6.0, -12.0, -24.0, -48.0] {
+                                    // The ends first; a mark too close to one already drawn is left out
+                                    // (a short meter put "0 dB", "−6" and "−12" on top of each other).
+                                    let mut drawn: Vec<f32> = Vec::new();
+                                    for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
                                         // Labels only (a tick hairline beside "0" read as "-0"),
                                         // with a real minus sign.
                                         let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
+                                        if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
+                                        drawn.push(y);
                                         let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
                                         ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
                                             label, FontId::monospace(9.5), theme::CREAM_DIM);
@@ -12902,8 +13019,10 @@ impl DemoApp {
 
     fn draw_rails(&self, painter: &egui::Painter) {
         let xf = &self.xf;
-        for side_x in [8.0, self.rack_w - 22.0] {
-            let rail = Rect::from_min_size(Pos2::new(side_x, 8.0), Vec2::new(14.0, self.rack_h - 16.0));
+        let RackChrome { pad, rail: w, .. } = self.rack_chrome;
+        let inset = pad * 0.4;
+        for side_x in [inset, self.rack_w - inset - w] {
+            let rail = Rect::from_min_size(Pos2::new(side_x, inset), Vec2::new(w, self.rack_h - 2.0 * inset));
             painter.rect_filled(xf.rect(rail), 4.0, RAIL);
         }
         // No screws — the editorial language has no hardware chrome (§4.2).
@@ -13389,8 +13508,16 @@ impl DemoApp {
         let r = self.unit_rects[unit];
         let x = r.left() + FACE_X;
         let bottom = self.knob_row_y(unit) + KNOB_R;
-        let pitch = ((bottom - (r.top() + 84.0)) / METER_SEGS as f32).clamp(4.0, 17.0);
+        let pitch = (bottom - (r.top() + 84.0)) / METER_SEGS as f32;
+        // A short face drops the OUTPUT caption and starts the meter under the header.
+        let pitch = if pitch >= 4.0 { pitch.min(17.0) } else { ((bottom - (r.top() + METER_TOP_SHORT)) / METER_SEGS as f32).max(2.0) };
         (x, bottom, pitch)
+    }
+
+    /// Whether Master's meter has room for its OUTPUT caption.
+    fn meter_caption_shown(&self, unit: usize) -> bool {
+        let (_, bottom, pitch) = self.meter_geom(unit);
+        bottom - METER_SEGS as f32 * pitch - 18.0 >= self.unit_rects[unit].top() + METER_TOP_SHORT
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
@@ -13402,7 +13529,7 @@ impl DemoApp {
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
-                Vec2::new(22.0, pitch * 0.72),
+                Vec2::new(METER_SEG_W, pitch * 0.72),
             );
             let col = theme::meter_color(i as f32 / (n - 1) as f32);
             let fill = if i < lit { col } else { theme::METER_TRACK };
@@ -13422,7 +13549,9 @@ impl DemoApp {
         // the meter, not floating on the knob-label row (vision review).
         let top = bottom - n as f32 * pitch;
         // Left-aligned with the meter column and the title (face grid).
-        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        if self.meter_caption_shown(unit) {
+            self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        }
     }
 
     // -- Audio In face (issue #28) -------------------------------------------
@@ -13461,7 +13590,8 @@ impl DemoApp {
     fn audio_in_chips_y(&self, unit: usize) -> Option<f32> {
         let r = *self.unit_rects.get(unit)?;
         let y = (r.top() + 60.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
-        if y + FACE_CTL_H + 8.0 > self.knob_row_y(unit) {
+        // Clear of the input meter, which starts 20 px above the knob row.
+        if y + FACE_CTL_H + 4.0 > self.knob_row_y(unit) - 20.0 {
             return None;
         }
         Some(y)
@@ -15709,27 +15839,45 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
 const RECESSED_INPUT_CHROME: f32 = 18.0;
 
 fn ui_scale_target() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let valid = |s: f32| (1.0..=3.0).contains(&s);
-        if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
-            return s;
-        }
-        if cfg!(test) { return 1.6; }
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let out = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
-            if let Ok(out) = out {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    let mons = v.as_array().cloned().unwrap_or_default();
-                    let pick = mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first());
-                    if let Some(s) = pick.and_then(|m| m["scale"].as_f64()).map(|s| s as f32).filter(|s| valid(*s)) {
-                        return s;
-                    }
-                }
-            }
-        }
-        1.6
-    })
+    use std::sync::atomic::AtomicU32;
+    static SCALE: AtomicU32 = AtomicU32::new(0);
+    static WATCH: std::sync::Once = std::sync::Once::new();
+    let valid = |s: f32| (1.0..=3.0).contains(&s);
+    if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
+        return s;
+    }
+    if cfg!(test) { return 1.6; }
+    if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_none() { return 1.6; }
+    WATCH.call_once(|| {
+        if let Some(s) = hypr_window_scale().filter(|s| valid(*s)) { SCALE.store(s.to_bits(), Ordering::Relaxed); }
+        // The window can move to another monitor: follow the one it is on
+        // (a window on the 1.0x external screen kept the laptop's 1.6x).
+        let _ = std::thread::Builder::new().name("ui-scale".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if let Some(s) = hypr_window_scale().filter(|s| valid(*s)) { SCALE.store(s.to_bits(), Ordering::Relaxed); }
+        });
+    });
+    match SCALE.load(Ordering::Relaxed) { 0 => 1.6, bits => f32::from_bits(bits) }
+}
+
+/// Scale of the Hyprland monitor that shows this process's window, or of
+/// the focused monitor while the window is not mapped yet.
+fn hypr_window_scale() -> Option<f32> {
+    let json = |what: &str| -> Option<serde_json::Value> {
+        let out = std::process::Command::new("hyprctl").args(["-j", what]).output().ok()?;
+        serde_json::from_slice(&out.stdout).ok()
+    };
+    let mons = json("monitors")?;
+    let mons = mons.as_array()?;
+    let pid = std::process::id() as u64;
+    let on = json("clients").and_then(|c| c.as_array()?.iter()
+        .find(|c| c["pid"].as_u64() == Some(pid))
+        .and_then(|c| c["monitor"].as_i64()));
+    let mon = match on {
+        Some(id) => mons.iter().find(|m| m["id"].as_i64() == Some(id)),
+        None => mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first()),
+    }?;
+    mon["scale"].as_f64().map(|s| s as f32)
 }
 
 impl DemoApp {
@@ -16746,19 +16894,19 @@ mod rig_switch_tests {
             "the stage ends where the assistant begins: stage {:?} panel {:?}", app.stage_rect, app.assistant_rect);
     }
 
-    /// One rig with 6 instrument stacks of 4 units (Surge → 3 FX) — the
-    /// kind of patch an agent builds; it must not squish.
+    /// One rig with 8 instrument stacks of 7 units (Surge → 6 FX): more than
+    /// a 1600x1000 window holds even at the face floors; it must not squish.
     fn big_patch_app() -> (DemoApp, egui::Context) {
         let mut g = Graph::default();
         g.reserve(64, 64);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut eid = 1;
-        for _ in 0..6 {
+        for _ in 0..8 {
             let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
             g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi); eid += 1;
             let mut prev = synth;
-            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
+            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb, DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
                 let fx = g.add_node(NodeKind::Dsp(k), name_bytes("FX"));
                 g.connect_with_id(eid, PortRef { node: prev, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio); eid += 1;
                 prev = fx;
@@ -16775,11 +16923,12 @@ mod rig_switch_tests {
     #[test]
     fn big_patch_keeps_readable_units_and_pans() {
         let (mut app, ctx) = big_patch_app();
-        assert_eq!(app.stack_cols.len(), 6);
-        assert_eq!(app.layout_rows, 4);
-        assert!(app.unit_h >= 140.0, "unit height floor, not squished: {}", app.unit_h);
+        assert_eq!(app.stack_cols.len(), 8);
+        assert_eq!(app.layout_rows, 7);
+        assert!(app.unit_h >= MIN_UNIT_H, "unit height floor, not squished: {}", app.unit_h);
         let mid_w = app.unit_rects[app.stack_cols[0][0]].width();
-        assert!(mid_w >= 200.0, "column width floor: {mid_w}");
+        let floor = app.stack_cols.iter().flatten().map(|&u| app.face_min_w(u)).fold(0.0, f32::max);
+        assert!(mid_w >= floor, "column width floor: {mid_w} < {floor}");
         let ov = app.rack_overflow;
         assert!(ov.x > 0.0 && ov.y > 0.0, "the rack overflows the stage instead: {ov:?}");
         assert!(app.rack_clip.is_some());
@@ -20482,7 +20631,7 @@ mod ui_polish_agent_tests {
         assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
         assert!(kb_big.height() > kb_small.height());
         let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
-        assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
+        assert!(h_tiny >= 111.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
     }
@@ -21211,7 +21360,8 @@ mod face_layout_tests {
         let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
         let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
         let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
-        v.push(("header".to_string(), title.union(sub)));
+        v.push(("title".to_string(), title));
+        v.push(("subtitle".to_string(), sub));
         v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
         for (ki, k) in u.knobs.iter().enumerate() {
             if k.hidden { continue; }
@@ -21239,9 +21389,11 @@ mod face_layout_tests {
         }
         if matches!(u.node_kind, UnitKind::Master) {
             let (x, bottom, pitch) = app.meter_geom(ui);
-            let top = bottom - METER_SEGS as f32 * pitch - 18.0;
-            let w = sz(&app.caption_output_g).x.max(22.0);
-            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
+            let top = bottom - METER_SEGS as f32 * pitch;
+            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + METER_SEG_W, bottom))));
+            if app.meter_caption_shown(ui) {
+                v.push(("meter caption".into(), Rect::from_min_size(Pos2::new(x, top - 18.0), sz(&app.caption_output_g))));
+            }
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
         if let Some(b) = app.drawbar_rects(ui) {
@@ -21292,10 +21444,15 @@ mod face_layout_tests {
     fn check(mut app: DemoApp, what: &str) {
         let ctx = egui::Context::default();
         let mut all = Vec::new();
-        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
-            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
-            for v in audit(&app) { all.push(format!("[{what} {}x{}] {v}", size.x, size.y)); }
+        let small = super::window_size_layout_tests::SIZES.map(|(w, h)| Vec2::new(w, h));
+        for dock in [DockView::None, DockView::Keyboard, DockView::Assistant] {
+            app.dock = dock;
+            for size in [Vec2::new(2560.0, 1440.0)].into_iter().chain(small) {
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                for v in audit(&app) { all.push(format!("[{what} {}x{} {dock:?}] {v}", size.x, size.y)); }
+            }
         }
+        app.dock = DockView::None;
         assert!(all.is_empty(), "face layout violations:\n{}", all.join("\n"));
     }
 
@@ -22180,5 +22337,291 @@ mod voice_host_tests {
         send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
+    }
+}
+
+#[cfg(test)]
+mod window_size_layout_tests {
+    use super::*;
+
+    /// Window sizes in points, as the compositor tiles a 1.6x laptop panel
+    /// (halves, quarters) plus the default and the minimum window.
+    pub(super) const SIZES: [(f32, f32); 6] =
+        [(1600.0, 1000.0), (1280.0, 800.0), (781.0, 950.0), (1576.0, 468.0), (781.0, 468.0), (760.0, 520.0)];
+
+    struct Text { s: String, rect: Rect, clip: Rect }
+
+    fn walk(shape: &Shape, clip: Rect, out: &mut Vec<Text>) {
+        match shape {
+            Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => out.push(Text {
+                s: t.galley.text().replace('\n', "⏎"),
+                rect: ink_rect(&t.galley).translate(t.pos.to_vec2()),
+                clip,
+            }),
+            Shape::Vec(v) => for s in v { walk(s, clip, out) },
+            _ => {}
+        }
+    }
+
+    /// The glyphs' extent: a galley's own rect also spans `leading_space`
+    /// and the empty part of a wrapped row.
+    fn ink_rect(g: &egui::Galley) -> Rect {
+        let mut r = Rect::NOTHING;
+        for row in &g.rows {
+            let ink: Vec<_> = row.glyphs.iter().filter(|gl| !gl.chr.is_whitespace()).collect();
+            let (Some(a), Some(b)) = (ink.first(), ink.last()) else { continue };
+            r = r.union(Rect::from_min_max(
+                row.pos + Vec2::new(a.pos.x, 0.0),
+                row.pos + Vec2::new(b.pos.x + b.advance_width, row.height()),
+            ));
+        }
+        if r.is_positive() { r } else { g.rect }
+    }
+
+    fn texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<Text> {
+        let mut out = Vec::new();
+        for i in 0..4 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64); // popups and panels past their fade-in (rule 101)
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut frame = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            frame.textures_delta.clear(); // rule 11
+            out.clear();
+            for cs in &frame.shapes { walk(&cs.shape, cs.clip_rect, &mut out); }
+        }
+        out
+    }
+
+    /// Text that leaves the window, is cut by its clip, or overlaps other
+    /// text. Text a scroll area clips at its edge is scrolled, not broken,
+    /// so a clip cut only counts outside `scrolled` regions.
+    fn audit(texts: &[Text], size: Vec2) -> Vec<String> {
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        let mut bad = Vec::new();
+        let vis: Vec<(&Text, Rect)> = texts.iter()
+            .map(|t| (t, t.rect.intersect(t.clip).intersect(screen)))
+            .filter(|(_, v)| v.width() > 0.5 && v.height() > 0.5)
+            .collect();
+        for (t, v) in &vis {
+            if !screen.expand(0.5).contains_rect(t.rect) {
+                bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
+            } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
+                bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
+            }
+        }
+        for i in 0..vis.len() {
+            for j in i + 1..vis.len() {
+                let o = vis[i].1.intersect(vis[j].1);
+                if o.width() > 1.0 && o.height() > 1.0 {
+                    bad.push(format!("{:?} {:?} overlaps {:?} {:?}", vis[i].0.s, vis[i].1, vis[j].0.s, vis[j].1));
+                }
+            }
+        }
+        bad
+    }
+
+    fn report(setup: &dyn Fn(&mut DemoApp)) -> Vec<String> {
+        let mut all = Vec::new();
+        for (w, h) in SIZES {
+            for (dock, dname) in [(DockView::None, "no dock"), (DockView::Keyboard, "keyboard"), (DockView::Assistant, "assistant")] {
+                let mut app = DemoApp::new_with_sink(None);
+                setup(&mut app);
+                app.dock = dock;
+                let ctx = egui::Context::default();
+                let size = Vec2::new(w, h);
+                let t = texts(&mut app, &ctx, size);
+                for v in audit(&t, size) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
+                    let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
+                    all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    #[ignore = "report: cargo test --bin kabelsalat window_size_report -- --ignored --nocapture"]
+    fn window_size_report() {
+        let mut n = 0;
+        for (name, setup) in VIEWS {
+            let r = report(setup);
+            n += r.len();
+            for l in r { println!("{name}: {l}"); }
+        }
+        println!("TOTAL {n}");
+    }
+
+    /// In every view, window size and dock: no text on other text, none
+    /// outside the window, and a rack as wide as the window (rule 114).
+    /// Scroll areas cutting text at their edge, and a rack that pans
+    /// vertically under a dock in the smallest windows, are allowed.
+    #[test]
+    fn every_view_fits_small_windows() {
+        let mut bad = Vec::new();
+        for (name, setup) in VIEWS {
+            for l in report(setup) {
+                if l.contains(" overlaps ") || l.contains("leaves the window") || l.contains("overflows sideways") {
+                    bad.push(format!("{name}: {l}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+            ("rack", &|_| {}),
+            ("rack back", &|a| a.side = Side::Back),
+            ("two rigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| a.stage_view = StageView::Mixer),
+            ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+        ];
+}
+
+/// Offline screenshots of the real frame: egui's tessellated triangles
+/// rasterized on the CPU (no window, no compositor, no GPU). Run with
+/// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`.
+#[cfg(test)]
+mod offline_shots {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Textures(HashMap<egui::TextureId, (usize, usize, Vec<Color32>)>);
+
+    impl Textures {
+        fn apply(&mut self, delta: &egui::TexturesDelta) {
+            for (id, d) in delta.set.iter().flat_map(|(id, ds)| ds.iter().map(move |d| (id, d))) {
+                let egui::ImageData::Color(img) = &d.image;
+                let [w, h] = img.size;
+                match d.pos {
+                    None => { self.0.insert(*id, (w, h, img.pixels.clone())); }
+                    Some([x0, y0]) => if let Some((tw, _, px)) = self.0.get_mut(id) {
+                        for y in 0..h { for x in 0..w { px[(y0 + y) * *tw + x0 + x] = img.pixels[y * w + x]; } }
+                    },
+                }
+            }
+            for id in &delta.free { self.0.remove(id); }
+        }
+
+        fn sample(&self, id: egui::TextureId, uv: Pos2) -> [f32; 4] {
+            let Some((w, h, px)) = self.0.get(&id) else { return [1.0; 4] };
+            let (fx, fy) = (uv.x * *w as f32 - 0.5, uv.y * *h as f32 - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let at = |x: f32, y: f32| {
+                let c = px[(y.clamp(0.0, *h as f32 - 1.0) as usize) * *w + x.clamp(0.0, *w as f32 - 1.0) as usize];
+                [c.r() as f32, c.g() as f32, c.b() as f32, c.a() as f32]
+            };
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+            std::array::from_fn(|i| {
+                let top = a[i] + (b[i] - a[i]) * tx;
+                let bot = c[i] + (d[i] - c[i]) * tx;
+                (top + (bot - top) * ty) / 255.0
+            })
+        }
+    }
+
+    fn rasterize(prims: &[egui::ClippedPrimitive], tex: &Textures, w: usize, h: usize, ppp: f32) -> Vec<[f32; 3]> {
+        let mut img = vec![[0.0f32; 3]; w * h];
+        for p in prims {
+            let egui::epaint::Primitive::Mesh(mesh) = &p.primitive else { continue };
+            let c = p.clip_rect;
+            let (cx0, cy0) = ((c.min.x * ppp).round().max(0.0) as i64, (c.min.y * ppp).round().max(0.0) as i64);
+            let (cx1, cy1) = ((c.max.x * ppp).round().min(w as f32) as i64, (c.max.y * ppp).round().min(h as f32) as i64);
+            for t in mesh.indices.chunks_exact(3) {
+                let v = [&mesh.vertices[t[0] as usize], &mesh.vertices[t[1] as usize], &mesh.vertices[t[2] as usize]];
+                let pt: [Vec2; 3] = std::array::from_fn(|i| v[i].pos.to_vec2() * ppp);
+                let area = (pt[1] - pt[0]).x * (pt[2] - pt[0]).y - (pt[1] - pt[0]).y * (pt[2] - pt[0]).x;
+                if area.abs() < 1e-6 { continue; }
+                let lo = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MAX, f32::min);
+                let hi = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MIN, f32::max);
+                let (x0, x1) = ((lo(|p| p.x).floor() as i64).max(cx0), (hi(|p| p.x).ceil() as i64).min(cx1));
+                let (y0, y1) = ((lo(|p| p.y).floor() as i64).max(cy0), (hi(|p| p.y).ceil() as i64).min(cy1));
+                let col: [[f32; 4]; 3] = std::array::from_fn(|i| {
+                    let c = v[i].color;
+                    [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0]
+                });
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let s = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                        let e = |a: Vec2, b: Vec2| (b - a).x * (s - a).y - (b - a).y * (s - a).x;
+                        let (w0, w1, w2) = (e(pt[1], pt[2]) / area, e(pt[2], pt[0]) / area, e(pt[0], pt[1]) / area);
+                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 { continue; }
+                        let uv = Pos2::new(
+                            w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x,
+                            w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y,
+                        );
+                        let t = tex.sample(mesh.texture_id, uv);
+                        let src: [f32; 4] = std::array::from_fn(|i| (w0 * col[0][i] + w1 * col[1][i] + w2 * col[2][i]) * t[i]);
+                        let d = &mut img[y as usize * w + x as usize];
+                        for i in 0..3 { d[i] = src[i] + d[i] * (1.0 - src[3]); }
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    /// Run frames of `app` at `size` points and write the last one as a PNG.
+    pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
+        let ctx = egui::Context::default();
+        let mut tex = Textures::default();
+        let mut last = None;
+        for i in 0..5 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            tex.apply(&out.textures_delta);
+            out.textures_delta.clear(); // rule 11
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        let ppp = out.pixels_per_point;
+        let prims = ctx.tessellate(out.shapes, ppp);
+        let (w, h) = ((size.x * ppp).round() as usize, (size.y * ppp).round() as usize);
+        let img = rasterize(&prims, &tex, w, h, ppp);
+        let bytes: Vec<u8> = img.iter().flat_map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)).collect();
+        let file = std::fs::File::create(path).expect("create png");
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&bytes).unwrap();
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored"]
+    fn window_size_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 7] = [
+            ("rack", &|_| {}),
+            ("back", &|a| a.side = Side::Back),
+            ("tworigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+        ];
+        let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
+        for (w, h) in super::window_size_layout_tests::SIZES {
+            for (name, setup) in &views {
+                for (dock, dn) in [(DockView::None, ""), (DockView::Keyboard, "-kbd"), (DockView::Assistant, "-chat")] {
+                    let file = format!("{w}x{h}-{name}{dn}.png");
+                    if only.as_ref().is_some_and(|o| !file.contains(o.as_str())) { continue; }
+                    let mut app = DemoApp::new_with_sink(None);
+                    setup(&mut app);
+                    app.dock = dock;
+                    shot(&mut app, Vec2::new(w, h), &dir.join(file));
+                }
+            }
+        }
     }
 }

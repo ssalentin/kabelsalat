@@ -94,9 +94,11 @@ Learned so far (2026-11-15, UI polish pass):
     claimed (hidden-rig) units when it opens instrument columns — another
     rig's synth left an empty gap column and shoved stacks against Master.
 19. **A new rig is playable or says why:** "+ Rig"/add_rig builds
-    `standard_rig_graph` (Keys→Surge→Master, wired) from the voice pool
-    (`VOICE_POOL`); idle pool voices skip `render`. Never ship a bare
-    Keys+Master just because the startup voices are used up.
+    `standard_rig_graph` (Keys→Surge→Master, wired) and the app hosts a
+    voice for its synth on demand (`sync_clap_slots`; there is no voice
+    pool and no cap). A plugin that cannot load says so (`plugin_msg`).
+    Never ship a bare Keys+Master, and never keep spare voices: a voice no
+    unit plays is retired.
 20. **`build_rack` resets view + mixer (active_rig = 0, rig_mix = unity):**
     restore remapped mix / the active rig AFTER `apply_session`/`build_rack`,
     never before — and the engine-sync rebuild restores the snapshot's
@@ -429,13 +431,44 @@ Learned so far (2026-11-15, UI polish pass):
     still sounded. `notes_down` keeps one bit per source per note, set on
     note-on and cleared on note-off in `fire_keys_with`
     (`held_notes_stay_lit_on_the_dock_until_released`).
-89. **Per-voice state is indexed by voice slot, and only a voice has one:**
-    `clap_rigs()` numbers every CLAP unit, but `rig_sources` / `rig_device`
-    / `patch_names` hold `VOICE_POOL` entries. With 5+ CLAP units an undo
-    restored sources for slot 4 and the app panicked (live crash); unknown
-    nodes silently mapped to slot 0. Resolve with `voice_slot_of_node`
-    (None past the pool or for non-CLAP nodes), never index by a rig index
-    (`clap_units_past_the_voice_pool_never_index_voice_state`).
+89. **Per-voice state is a slot table with one entry per CLAP unit:**
+    `rig_sources` / `rig_device` / `patch_names` are refit to the CLAP
+    units by `fit_voice_tables` (in `build_rack`), any number of them.
+    Resolve a node with `voice_slot_of_node` (None only for non-CLAP
+    nodes), never index by a rig index or assume a size: fixed
+    `[_; VOICE_POOL]` arrays panicked on an undo with 5+ CLAP units, and
+    unknown nodes silently mapped to slot 0
+    (`any_number_of_clap_units_have_their_own_voice_state`).
+90. **The engine binds voices, the app follows:** which hosted voice plays
+    which Clap node is the engine's decision (`bind_free_voices`),
+    published as `GraphPub::voices`; `sync_clap_slots` maps units from it.
+    The app matched plugin ids in its own order, so after a remote
+    RemoveNode it edited the freed voice while the engine played the other
+    one. Where the app must know the binding before the engine answers (a
+    load it sends, to restore plugin state), it uses the engine's rule
+    `control::bind_voices`, never a guess of its own
+    (`the_app_follows_the_engines_binding_after_remote_edits`).
+91. **Engine state of a node starts over when a voice is bound to it:**
+    level, keyboard/hardware switches and device live in the `VoiceSlot`
+    but belong to the node; `VoiceSlot::bind` resets them. A voice kept
+    "keyboard off" across a template load while the UI showed it on.
+92. **MIDI routes belong to the Clap node, not to its voice:**
+    `GraphEngine::new` wired routes per startup voice, so a node whose
+    voice is hosted later never got a note (found by `many-voices-test`).
+    LoadGraph, AddNode and the constructor all route per Clap node.
+93. **Per-voice UI state travels by node id through every reload:** a rig
+    add/delete renumbers nodes and `apply_session` resets the switches, so
+    `edit_rigs` carries `VoiceRow`s through its id remap and the undo
+    snapshot holds them (device included). Adding a rig silently turned
+    every switched-off keyboard back on (rule 59 class).
+94. **The audio thread neither allocates nor frees for a voice:** the host
+    builds each `VoiceSlot` (with its render buffer), sends
+    `VoiceMsg::Grow` with a larger table ahead of the `Add` that would not
+    fit (and reserves the published list, `GraphPub::reserve_voices`), and
+    frees whatever comes back through `VoiceBack`. The old path
+    dropped a replaced voice's buffer in `render` and went silent past 32
+    voices. Voice messages are drained before every structural command,
+    so what the host sent before a load is in place when the load binds.
 
 ## Working on kabelsalat
 
@@ -458,7 +491,7 @@ Learned so far (2026-11-15, UI polish pass):
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
   real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
-  `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
+  `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`

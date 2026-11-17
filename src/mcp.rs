@@ -19,7 +19,8 @@
 //! - Audio: a cpal output stream renders `GraphEngine::render` in its
 //!   callback (same pattern as the app, minus egui). Two Surge XT voices
 //!   serve nodes 1 and 4; their `ClapVoiceMain` halves stay on the main
-//!   thread. If audio init fails, a dummy render loop keeps draining the
+//!   thread. Headless mode hosts no further voices (the app hosts one per
+//!   CLAP unit): tools name Clap nodes without one (`note_silent_claps`). If audio init fails, a dummy render loop keeps draining the
 //!   bus so every tool still works headless.
 //! - Transport: MCP over stdio via rmcp. stdout is reserved for JSON-RPC:
 //!   fd 1 is rerouted to stderr for the whole process (the CLAP host logs
@@ -559,6 +560,30 @@ fn rig_meta(st: &State) -> Result<Vec<crate::control::RigMeta>, String> {
     Ok(st.rigs.lock().map(|s| s.rigs.clone()).unwrap_or_default())
 }
 
+/// Headless mode hosts only its startup voices (the plugins' main thread
+/// serves MCP); the running app hosts one per CLAP unit. Adds the Clap nodes
+/// of the current patch that no voice plays to a tool result, so a surplus
+/// synth is reported, not just silent.
+fn note_silent_claps(st: &State, result: &mut Value) {
+    if !matches!(st.backend, Backend::Local(_)) {
+        return;
+    }
+    let Some(hosted) = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.voices.clone())) else { return };
+    let voices: Vec<(u64, &str)> = hosted.iter().map(|(id, _)| (*id, control::SURGE_PLUGIN_ID)).collect();
+    let silent: Vec<NodeId> = control::bind_voices(&st.graph, &voices)
+        .into_iter()
+        .filter(|(_, voice)| voice.is_none())
+        .map(|(node, _)| node)
+        .collect();
+    if !silent.is_empty() {
+        result["silent_clap_nodes"] = json!(silent);
+        result["note"] = json!(format!(
+            "headless mcp hosts {} Surge XT voice(s): these Clap nodes have none and stay silent. The running app (kabelsalat mcp --attach) hosts a voice for every CLAP unit.",
+            hosted.len()
+        ));
+    }
+}
+
 fn send_cmd(st: &mut State, cmd: Command) -> Result<(), String> {
     match &mut st.backend {
         Backend::Local(bus) => {
@@ -864,8 +889,7 @@ impl McpServer {
                 let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| {
                     (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)).unwrap_or_else(|| "Rig".into())
                 });
-                let claps = st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })).count();
-                rigs.push(Rig::new(name, control::standard_rig_graph(claps < control::VOICE_POOL), None));
+                rigs.push(Rig::new(name, control::standard_rig_graph(true), None));
                 rigs.len() - 1
             }
         };
@@ -878,7 +902,9 @@ impl McpServer {
         if matches!(st.backend, Backend::Local(_)) {
             if let Ok(mut s) = st.rigs.lock() { s.rigs = metas.clone(); s.active = active; }
         }
-        ok_json(json!({"rigs": metas, "active": active}))
+        let mut result = json!({"rigs": metas, "active": active});
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
     }
 }
 
@@ -984,7 +1010,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. Clap voices are main-thread-only, so new clap nodes sound via load_graph's voice remap, not add_node.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -1017,7 +1043,9 @@ impl McpServer {
         }
         let id = st.graph.add_node(kind, name);
         st.graph.set_rig(id, rig);
-        ok_json(json!({"id": id, "name": name_str(&name)}))
+        let mut result = json!({"id": id, "name": name_str(&name)});
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
     }
 
     /// Remove a node and its cables.
@@ -1641,7 +1669,7 @@ impl McpServer {
     }
 
     /// Load several independent rigs at once.
-    #[tool(name = "load_rigs", description = "Load multiple independent rigs (Command::LoadRigs): each rig is a full rack graph with its own MasterOut, bound to a hardware MIDI device (midi_device null = the keyboard + all devices). Graphs use the patch shape: nodes [{id, kind, name?}] and edges [{id, from:{node,port}, to:{node,port}, kind:'midi'|'audio'}]; kinds are 'Keys', 'MasterOut', 'SystemAudio', {Clap:{plugin_id}}, {Dsp:'delay'|'reverb'|...}, {Lv2:{uri}}; names/plugin ids may be plain strings. The 2 CLAP voices are remapped to Clap nodes in node-id order across all rigs (surplus Clap nodes are silent — use LV2 instruments for more). Returns {loaded, active, nodes, edges}. Query the result with get_rigs.")]
+    #[tool(name = "load_rigs", description = "Load multiple independent rigs (Command::LoadRigs): each rig is a full rack graph with its own MasterOut, bound to a hardware MIDI device (midi_device null = the keyboard + all devices). Graphs use the patch shape: nodes [{id, kind, name?}] and edges [{id, from:{node,port}, to:{node,port}, kind:'midi'|'audio'}]; kinds are 'Keys', 'MasterOut', 'SystemAudio', {Clap:{plugin_id}}, {Dsp:'delay'|'reverb'|...}, {Lv2:{uri}}; names/plugin ids may be plain strings. In the running app (mcp --attach) every Clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices, bound to the first Surge nodes in node-id order, and names the rest in silent_clap_nodes. Returns {loaded, active, nodes, edges}. Query the result with get_rigs.")]
     fn load_rigs(&self, Parameters(args): Parameters<LoadRigsArgs>) -> Result<CallToolResult, McpError> {
         let active = args.active.unwrap_or(0);
         let mut rigs = Vec::with_capacity(args.rigs.len());
@@ -1685,6 +1713,8 @@ impl McpServer {
                 s.active = active;
             }
         }
+        let mut summary = summary;
+        note_silent_claps(&st, &mut summary);
         ok_json(summary)
     }
 
@@ -1705,7 +1735,7 @@ impl McpServer {
         tool_err("redo needs the running app (kabelsalat mcp --attach)")
     }
 
-    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id> -> Master for any installed CLAP instrument from list_plugins; needs the running app), wired and playable (a bare Keys + Master when every synth voice is taken). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
+    #[tool(name = "add_rig", description = "Add a new rig (an independent rack with its own Master): Keys -> Surge -> Master (or Keys -> <plugin_id> -> Master for any installed CLAP instrument from list_plugins; needs the running app), wired and playable (headless mcp hosts two Surge XT voices: a rig past them is returned in silent_clap_nodes). Existing rigs keep their graphs and device bindings (knob/synth state is kept by the in-app agent path only). A single-graph patch becomes rig 0. Returns {rigs, active} like get_rigs.")]
     fn add_rig(&self, Parameters(args): Parameters<AddRigArgs>) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if remote {

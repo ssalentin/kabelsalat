@@ -439,12 +439,44 @@ pub fn merge_rigs(rigs: &[Rig]) -> Graph {
     merged
 }
 
-/// Hosted Surge voices the live app creates at startup (main-thread CLAP
-/// instances). The demo uses two; the rest serve added rigs.
-pub const VOICE_POOL: usize = 4;
+/// Surge XT's CLAP id: the synth of the standard rig and of legacy graphs.
+pub const SURGE_PLUGIN_ID: &str = "org.surge-synth-team.surge-xt";
+
+/// The plugin a Clap node's voice has to be: its `plugin_id`, with the
+/// legacy spellings (empty, "Surge XT") meaning Surge.
+pub fn clap_plugin_key(plugin_id: &str) -> &str {
+    if plugin_id.is_empty() || plugin_id == "Surge XT" { SURGE_PLUGIN_ID } else { plugin_id }
+}
+
+/// Which hosted voice plays which Clap node: every node, in graph order,
+/// takes the free voice of its plugin with the lowest id. `voices` lists
+/// `(voice id, plugin id)`; the result pairs each Clap node with its voice
+/// (None: no free voice of that plugin). The engine binds by this rule
+/// (`GraphEngine::bind_free_voices`); a voice host uses it to know the
+/// binding of a load it is about to send.
+pub fn bind_voices(graph: &Graph, voices: &[(u64, &str)]) -> Vec<(NodeId, Option<u64>)> {
+    let mut taken = vec![false; voices.len()];
+    graph
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            NodeKind::Clap { plugin_id } => Some((n.id, clap_plugin_key(name_str(plugin_id)))),
+            _ => None,
+        })
+        .map(|(node, key)| {
+            let free = (0..voices.len())
+                .filter(|&i| !taken[i] && voices[i].1 == key)
+                .min_by_key(|&i| voices[i].0);
+            if let Some(i) = free {
+                taken[i] = true;
+            }
+            (node, free.map(|i| voices[i].0))
+        })
+        .collect()
+}
 
 /// The standard new rig ("+ Rig", agent/MCP add_rig): Keys → Surge → Master
-/// (MIDI + stereo L/R), or a bare Keys + Master when no synth voice is free.
+/// (MIDI + stereo L/R); `with_synth = false` leaves the bare Keys + Master.
 pub fn standard_rig_graph(with_synth: bool) -> Graph {
     let mut g = Graph::default();
     g.reserve(16, 16);
@@ -452,7 +484,7 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     if with_synth {
         let synth = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: name_bytes(SURGE_PLUGIN_ID) },
             name_bytes("SURGE"),
         );
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
@@ -743,6 +775,25 @@ impl CommandDrain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voices_bind_in_graph_order_lowest_free_id_of_the_nodes_plugin() {
+        let mut g = Graph::default();
+        let clap = |id: &str| NodeKind::Clap { plugin_id: name_bytes(id) };
+        let a = g.add_node(clap(SURGE_PLUGIN_ID), name_bytes("A"));
+        g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let dexed = g.add_node(clap("dexed"), name_bytes("D"));
+        let legacy = g.add_node(clap("Surge XT"), name_bytes("B"));
+        let unnamed = g.add_node(clap(""), name_bytes("C"));
+        // Listed out of order: the rule goes by voice id, not by position.
+        let voices = [(7, SURGE_PLUGIN_ID), (9, "dexed"), (3, SURGE_PLUGIN_ID), (4, "yanes")];
+        assert_eq!(
+            bind_voices(&g, &voices),
+            [(a, Some(3)), (dexed, Some(9)), (legacy, Some(7)), (unnamed, None)],
+            "legacy and empty ids mean Surge; the third Surge node finds no voice, yanes fits no node"
+        );
+        assert!(bind_voices(&g, &[]).iter().all(|(_, v)| v.is_none()));
+    }
 
     #[test]
     fn demo_patch_is_wired() {

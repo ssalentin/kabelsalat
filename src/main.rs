@@ -82,6 +82,7 @@ fn main() -> anyhow::Result<()> {
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
         "lv2-async-test" => engine::lv2_async_test(),
         "add-node-test" => engine::add_node_test(),
+        "many-voices-test" => engine::many_voices_test(),
         "mono-master-test" => engine::mono_master_test(),
         "multi-rig-test" => engine::multi_rig_test(),
         "rig-mix-test" => engine::rig_mix_test(),
@@ -91,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         "record-test" => record::run_test(),
         "audio-in-test" => audio_in::run_test(),
         other => {
-            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test");
+            eprintln!("unknown mode: {other}\nmodes: app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, many-voices-test");
             std::process::exit(1);
         }
     }

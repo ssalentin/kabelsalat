@@ -20,7 +20,7 @@ dist=$2 tag=$3 repo=$4
 base="https://github.com/$repo/releases/download/$tag"
 link() { printf -- '- [%s](%s/%s)\n' "$1" "$base" "$1"; }
 shopt -s nullglob
-appimages=("$dist"/kabelsalat-*-x86_64.AppImage "$dist"/kabelsalat-*-aarch64.AppImage)
+appimages=("$dist"/kabelsalat-x86_64.AppImage "$dist"/kabelsalat-aarch64.AppImage)
 if [ ${#appimages[@]} -eq 0 ]; then
   echo "no AppImage in $dist" >&2
   exit 1
@@ -28,7 +28,8 @@ fi
 
 printf '\n## Download\n\n'
 printf '**Recommended: the AppImage.** Download the one for your machine, `chmod +x` it and run it. '
-printf 'It finds your installed CLAP/LV2 plugins and gets realtime audio priority.\n\n'
+printf 'It finds your installed CLAP/LV2 plugins and gets realtime audio priority. '
+printf 'AppImageUpdate or Gear Lever update it in place.\n\n'
 for f in "${appimages[@]}"; do
   name=$(basename "$f")
   arch=${name%.AppImage}; arch=${arch##*-}
@@ -37,7 +38,7 @@ done
 printf '\nOther packages (limits in [docs/PACKAGING.md](https://github.com/%s/blob/main/docs/PACKAGING.md)):\n\n' "$repo"
 for f in "$dist"/*; do
   name=$(basename "$f")
-  case $name in *.AppImage | SHA256SUMS) continue ;; esac
+  case $name in *.AppImage | *.zsync | SHA256SUMS) continue ;; esac
   link "$name"
 done
 [ -e "$dist/SHA256SUMS" ] && printf '\nChecksums: [SHA256SUMS](%s/SHA256SUMS)\n' "$base"

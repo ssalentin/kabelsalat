@@ -11,7 +11,9 @@ releases may still change behaviour and session files.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).
-  The README links the newest AppImage for each architecture directly.
+  The README links the newest AppImage for each architecture directly; the
+  AppImages are named `kabelsalat-<arch>.AppImage`, and AppImageUpdate or
+  Gear Lever update them in place.
 - **Organ face for setBfree:** nine drawbars to pull (16′ … 1′) and LESLIE
   (stop/slow/fast), PERC, DRIVE and REVERB knobs. setBfree only listens to MIDI
   controllers, so the face sends its CCs; values are saved with the session,

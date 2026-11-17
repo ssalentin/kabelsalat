@@ -122,7 +122,10 @@ jobs:
           }
           tar -xzf "dist/kabelsalat-$VERSION-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
           smoke "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat"
-          smoke "dist/kabelsalat-$VERSION-${{ matrix.arch }}.AppImage" --appimage-extract-and-run
+          smoke "dist/kabelsalat-${{ matrix.arch }}.AppImage" --appimage-extract-and-run
+          "dist/kabelsalat-${{ matrix.arch }}.AppImage" --appimage-updateinformation \
+            | grep -qx "gh-releases-zsync|${GITHUB_REPOSITORY/\//|}|latest|kabelsalat-${{ matrix.arch }}.AppImage.zsync"
+          test -s "dist/kabelsalat-${{ matrix.arch }}.AppImage.zsync"
       - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
@@ -221,13 +224,6 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # Unversioned copies: README links releases/latest/download/<name>,
-      # which needs a file name that stays the same across releases.
-      - name: Stable AppImage names
-        run: |
-          for arch in x86_64 aarch64; do
-            cp "dist/kabelsalat-$VERSION-$arch.AppImage" "dist/kabelsalat-$arch.AppImage"
-          done
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Create or update the GitHub release

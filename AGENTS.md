@@ -174,11 +174,12 @@ Learned so far (2026-11-15, UI polish pass):
     (clamped by `rtkit` to 200 ms) rather than `BUFFER_FRAMES` (~5.3 ms) to
     `promote_current_thread_to_real_time`; Surge XT applies `load_state` inside
     `process()`, which exceeds 5.3 ms and triggers `SIGXCPU` on `SCHED_RR`.
-39. **Share one patch-search helper with alias fallback:** `ui.rs` and `mcp.rs`
-    both call `host::search_surge_patches`; `find_surge_patch` and
-    `search_surge_patches` try literal matches first, then instrument aliases
-    (`wurlitzer` → `wurli`, `rhodes` → `suitcase`/`ep`, etc.) so common
-    queries don't miss and leave Surge on the init saw patch.
+39. **Share one sound-search helper with alias fallback:** every library
+    (Surge, Dexed, LV2, plugin presets) is searched by `sounds::search` and
+    `sounds::find`, from `ui.rs`, `mcp.rs` and the self-tests; they try
+    literal matches first, then instrument aliases (`wurlitzer` → `wurli`,
+    `rhodes` → `suitcase`/`ep`, etc.) so common queries don't miss and leave
+    Surge on the init saw patch.
 40. **`AddNode` for `Clap` must wire matrix + bind idle voices:** adding a
     CLAP node (`Command::AddNode`) left it disconnected in `Matrix` and
     unbound in `voices`, and `sync_from_engine` skipped `sync_clap_slots` when
@@ -437,6 +438,58 @@ Learned so far (2026-11-15, UI polish pass):
     (None past the pool or for non-CLAP nodes), never index by a rig index
     (`clap_units_past_the_voice_pool_never_index_voice_state`).
 
+90. **A sound tool works in the library of the rig's own instrument:**
+    `list_sounds` / `load_sound` searched Surge patches for every rig, so a
+    YANES or setBfree rig got Surge results and a load went into the wrong
+    plugin. The instrument is the key (`sounds::Instrument`, from the node's
+    kind), `Instrument::source` is the one table of where its sounds come
+    from, and every answer names the instrument and library. A new
+    instrument kind gets a `Source` there, never a branch in a tool. Check
+    with `kabelsalat sound-library-test` (every installed catalog instrument
+    lists, searches, loads one sound through the engine and sounds
+    different) and `agent-eval --task yanes_bass` / `organ_jazz`.
+91. **Find out where a plugin keeps its sounds before writing a browser:**
+    YANES has no preset files and no CLAP preset-discovery factory; its 146
+    presets are the values of a stepped "Preset" parameter. setBfree has no
+    LV2 presets; its 110 registrations are MIDI programmes it names in a
+    MIDNAM document (`lv2::midi_programs`). Instantiate the plugin, list its
+    parameters with their value texts and its extension data, and read its
+    source, before assuming a file format.
+92. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
+    label before any preference. Factory patches were preferred first, so
+    the listed "Third/Pads/Warm Pad" loaded the factory "Pads/Warm Pad"
+    (`a_listed_label_loads_exactly_that_sound`).
+93. **A search word no sound of the library holds is left out, never
+    fuzzy-ranked:** every setBfree programme is an organ and none is called
+    one, so "jazz organ" found nothing. `sounds::search` drops such words
+    (and reports them as `words_no_sound_has`) only when the full query
+    finds nothing; words the library does hold are never dropped, so a
+    "wobbly growling bass" still falls back to the kind as before.
+94. **A library scan never runs on the UI thread, and an agent call waits
+    for it:** `sounds::Libraries` scans on its own thread (the first
+    `list_sounds` walked about 3000 patch files on the UI thread) and
+    `build_rack` starts the scans of the rack's instruments. In
+    `poll_assistant` a sound tool whose library is still scanning is held
+    (`Waiting::SoundScan`) instead of answering "try again", which would
+    cost a model step. A preset parameter is read from the live plugin on
+    the UI thread, which is the CLAP main thread
+    (`a_sound_tool_waits_for_the_library_scan`).
+95. **A request that names one sound is not "a kind of sound":** widening
+    the Jev `load_sound` criterion (so "a jazz drawbar preset" settles
+    there) also pulled in "Load the patch Pads/Dreamscape", whose plan would
+    fall back to any pad. The plan hands a request with a `Category/Name`
+    label to the chat model. Compare `jev-test` outcomes for every sample
+    before and after changing a criterion.
+
+96. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
+    that hands over after running tools puts its calls into the
+    conversation; DeepSeek's thinking models (`deepseek-flash`) answer 400
+    ("reasoning_content … must be passed back") to an assistant tool call
+    whose id they did not issue, unless it has that field (empty is
+    enough; measured against the API, and OpenRouter's Gemini accepts it).
+    Every hand-over from a plan failed this way, for Surge too. `agent-eval
+    --task organ_no_pad` runs that path.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs
@@ -461,11 +514,12 @@ Learned so far (2026-11-15, UI polish pass):
   `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
-  (`./target/debug/kabelsalat <name>`).
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
+  `sound-library-test` (`./target/debug/kabelsalat <name>`).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
-  (headless app, offline engine, real Surge voices; it calls the configured
+  [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
+  (headless app, offline engine, real Surge voices, plus YANES and setBfree
+  for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
   model APIs and costs a few cents; three requests carry an image, and
   `look_at_rack` gets `docs/shots/mixer.png` in place of a window) and
   `kabelsalat jev-test` shows Jev's decisions (`--image <file> <request>`

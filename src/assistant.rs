@@ -525,10 +525,16 @@ fn system_prompt() -> String {
      preamble, no recap. Name rigs and units EXACTLY as the app shows them \
      (e.g. Rig A, Surge B, Delay, Reverb, Master) so the UI can highlight them; \
      do not use markdown headings.\n\
-     SOUNDS: a new rig or synth starts on Surge's init patch — when the user asks \
-     for an instrument or character (flute, warm pad, 808 bass…), call \
-     load_sound(rig, query) (or add_rig with sound=…); list_sounds(query) browses \
-     the ~3000 installed Surge patches by category/name.\n\
+     SOUNDS: every instrument has its OWN sound library, and load_sound / list_sounds \
+     work in the library of the rig's instrument: Surge has ~3000 patches (a new Surge \
+     plays its init patch), Dexed its DX7 cartridge voices, setBfree its organ \
+     registrations (MIDI programmes), Vitalium its LV2 presets, YANES its chip presets. \
+     When the user asks for an instrument or character (flute, warm pad, 808 bass, jazz \
+     organ…), call load_sound(query, rig) (or add_rig with sound=…); list_sounds(query, \
+     rig) browses that library and names the instrument and library it searched. A sound \
+     of one instrument cannot be loaded into another: if a library has nothing that fits, \
+     say so and offer what it has. A rig with several different instruments needs \
+     node=<the instrument's node id>.\n\
      Be concise and practical. When something is broken, diagnose step by step starting \
      with get_status. Notes: loading a template or adding a plugin rebuilds the current \
      patch; only Surge XT is loadable as a CLAP instrument so far (other CLAP and LV2 \
@@ -771,13 +777,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_sounds",
-            "description":"Search the installed Surge patches (factory + 3rd-party, ~3000) by words in category/name, e.g. 'flute', 'pad warm', 'bass'. Returns up to 25 'Category/Name' entries.",
-            "parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+            "description":"Search the sound library of ONE instrument by words in its sounds' names, e.g. 'flute', 'pad warm', 'bass', 'jazz'. Each instrument has its own library: Surge patches (~3000, 'Category/Name'), Dexed DX7 cartridge voices, an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: index of the rig whose instrument is searched (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns up to 25 sounds with the instrument, the library and its size, or says what the instrument offers instead when it has no sounds to browse.",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"},"node":{"type":"integer"}},"required":["query"]}
         }},
         {"type":"function","function":{
             "name":"load_sound",
-            "description":"Load a Surge patch into a rig's synth so it really sounds like that instrument (a rig's Surge otherwise plays the init patch). query: words or 'Category/Name' from list_sounds; rig: index from get_rigs (default: the rig in view). Returns the patch that was loaded.",
-            "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"}},"required":["query"]}
+            "description":"Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index from get_rigs (default: the rig in view); node: the instrument's node id, needed when a rig holds several different instruments. Returns the sound that was loaded and the unit it went into.",
+            "parameters":{"type":"object","properties":{"query":{"type":"string"},"rig":{"type":"integer"},"node":{"type":"integer"}},"required":["query"]}
         }},
         {"type":"function","function":{
             "name":"undo",
@@ -796,8 +802,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_rig",
-            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional patch query loaded into the new rig's Surge (e.g. 'flute'). Returns get_rigs.",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional Surge patch query, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
+            "description":"Create a new rig (an independent rack: Keys -> Surge -> its own Master, wired and playable; a bare Keys -> Master when all 4 synth voices are taken). Existing rigs keep their patches, knobs and sounds. The view switches to the new rig. sound: optional sound query loaded into the new rig's instrument from its own library (e.g. 'flute' for Surge, 'bass' for YANES). Returns get_rigs.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Optional rig name (default Rig A/B/C… or the plugin's name)"},"sound":{"type":"string","description":"Optional sound query for the new rig's instrument, e.g. 'flute'"},"plugin_id":{"type":"string","description":"Optional CLAP plugin id from list_plugins (e.g. 'org.yanes.native'): the rig is Keys -> that plugin -> Master instead of Surge"}}}
         }},
         {"type":"function","function":{
             "name":"rename_rig",
@@ -1023,8 +1029,14 @@ impl Facts<'_> {
         let mut kept = Vec::new();
         let mut i = 0;
         while i < words.len() {
-            // "rig 2", "rig B": the word after "rig" names it.
-            if words[i] == "rig" { i += 2; continue; }
+            if words[i] == "rig" {
+                // "the organ rig": the word before names it. "rig 2",
+                // "rig B": the word after does.
+                if i > 0 && kept.last() == Some(&words[i - 1]) { kept.pop(); }
+                let named_after = words.get(i + 1).is_some_and(|w| w.len() == 1 || w.chars().all(|c| c.is_ascii_digit()));
+                i += if named_after { 2 } else { 1 };
+                continue;
+            }
             if !FILLER.contains(&words[i].as_str()) { kept.push(words[i].clone()); }
             i += 1;
         }
@@ -1294,9 +1306,14 @@ fn metronome(f: &Facts, done: &[String]) -> Option<Step> {
     }
 }
 
-/// Load a sound of the kind Jev picked. The patch search is asked for the
-/// user's own words first ("warm pad"), then for the kind alone.
+/// Load a sound of the kind Jev picked from the library of the rig's own
+/// instrument. That library is asked for the user's words with the kind
+/// ("jazz drawbar organ"), then for the words, then for the kind alone; an
+/// instrument without sounds, or one that needs a node named, is the chat
+/// model's to explain.
 fn load_sound(f: &Facts, done: &[String]) -> Option<Step> {
+    // "Pads/Dreamscape" names one sound, not a kind: no other pad will do.
+    if f.request.contains('/') { return None; }
     let kind = f.pick(&SOUND)?;
     let rig = f.rig_or_view()?;
     let described = f.sound_words().join(" ");
@@ -1309,9 +1326,10 @@ fn load_sound(f: &Facts, done: &[String]) -> Option<Step> {
     let query = queries.get(misses)?;
     match done.last().map(String::as_str) {
         Some(hits) if hits.starts_with('{') => run("load_sound", json!({ "query": query, "rig": rig })),
-        Some(loaded) if loaded.starts_with("loaded '") => Some(Step::Say(format!("Rig {} now plays {}.", rig + 1, loaded.split('\'').nth(1)?))),
+        // A sound's name may hold an apostrophe ("8' solo").
+        Some(loaded) if loaded.starts_with("loaded '") => Some(Step::Say(format!("Rig {} now plays {}.", rig + 1, loaded.strip_prefix("loaded '")?.rsplit_once("' into ")?.0))),
         Some(other) if !other.starts_with("no ") => None,
-        _ => run("list_sounds", json!({ "query": query })),
+        _ => run("list_sounds", json!({ "query": query, "rig": rig })),
     }
 }
 
@@ -1340,7 +1358,7 @@ const SHORTCUTS: &[Shortcut] = &[
         plan: add_effect },
     Shortcut { key: "remove_effect", means: "Remove ONE effect unit (e.g. the delay) from a rig, and nothing more.",
         plan: remove_effect },
-    Shortcut { key: "load_sound", means: "Load a kind of sound (e.g. a warm pad, a bass, a piano) into an existing rig's synth, and nothing more (no new rig, no level).",
+    Shortcut { key: "load_sound", means: "Load a kind of sound or preset (e.g. a warm pad, a bass, a piano, a jazz organ registration) into an existing rig's instrument, and nothing more (no new rig, no level).",
         plan: load_sound },
     Shortcut { key: "add_rig", means: "Add a new, plain rig (no sound, name or level asked for).",
         // The tool appends the rig list as JSON for a model to read.
@@ -1450,6 +1468,7 @@ const JEV_SAMPLES: &[&str] = &[
     "Set the tempo to 100 BPM.", "What tempo are we at?", "Split the keyboard at C4.",
     "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.", "Load a warm pad.",
     "Load a bass sound into rig 2.", "give me a rhodes", "load a flute", "Load the patch Pads/Dreamscape.",
+    "Load a bass sound on the YANES rig.", "Give the organ rig a jazz drawbar preset.",
     "Add a reverb to rig 1 and wire it in.", "Add a reverb to this rig", "Insert a reverb into rig 2.",
     "Put a delay after the synth.", "Put a filter between the synth and the delay.", "Add a reverb with a long tail to rig 1.",
     "Add a chorus to rig 1.", "Add a reverb to rig 1 and set the tempo to 120 BPM.", "Remove the delay from rig 1.",
@@ -1477,7 +1496,7 @@ pub fn run_jev_test() -> anyhow::Result<()> {
     let route = Route::configured(Role::Decide);
     let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
     let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
-    let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B]";
+    let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B, 3 · YANES, 4 · Organ]";
     let mut ask = |request: &str, image: Option<&Image>| -> anyhow::Result<String> {
         let user = format!("{context}\n{request}");
         let d = client.decide(&route, &key, &user, image, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1727,9 +1746,11 @@ fn decide_turn<T: Transport>(
             Step::Run(calls) => calls,
         };
         // The conversation records the calls like a chat model's, so a
-        // later chat step knows what was done.
+        // later chat step knows what was done. DeepSeek's thinking models
+        // answer 400 to a tool call they did not issue themselves unless
+        // it carries `reasoning_content` (empty will do).
         let ids: Vec<(Value, &str)> = calls.iter().enumerate().map(|(i, c)| (json!(format!("jev-{round}-{i}")), c.name.as_str())).collect();
-        convo.push(json!({ "role": "assistant", "content": null, "tool_calls": calls.iter().zip(&ids).map(|(c, (id, _))| json!({
+        convo.push(json!({ "role": "assistant", "content": null, "reasoning_content": "", "tool_calls": calls.iter().zip(&ids).map(|(c, (id, _))| json!({
             "id": id, "type": "function", "function": { "name": c.name, "arguments": c.args.to_string() },
         })).collect::<Vec<_>>() }));
         let (ran, stopped) = match run_batch(calls.clone(), rx, tx) {
@@ -2474,23 +2495,69 @@ mod tests {
     fn a_sound_is_searched_by_the_users_words_then_by_its_kind() {
         let (events, requests) = drive_with_jev(
             vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "pad")])],
-            vec![asked("Load a warm pad."), results(&[r#"{"patches":["Pads/Warm Pad"]}"#]), results(&["loaded 'Pads/Warm Pad' into rig 0 'Rig A'"])],
+            vec![asked("Load a warm pad."), results(&[r#"{"instrument":"Surge","node":1,"rig":0,"library":"Surge patches","total":3008,"sounds":["Pads/Warm Pad"]}"#]),
+                results(&["loaded 'Pads/Warm Pad' into Surge (node 1), rig 0 'Rig A'"])],
         );
         assert_eq!(requests.len(), 1);
-        assert_eq!(ran(&events), vec![call("list_sounds", json!({"query": "warm pad"})), call("load_sound", json!({"query": "warm pad", "rig": 0}))]);
+        assert_eq!(ran(&events), vec![call("list_sounds", json!({"query": "warm pad", "rig": 0})), call("load_sound", json!({"query": "warm pad", "rig": 0}))]);
         assert_eq!(said(&events), vec!["Rig 1 now plays Pads/Warm Pad."]);
 
-        let miss = "no Surge patch matches";
+        let miss = "no Surge patches of Surge match 'wobbly growling bass' (3008 in its library, e.g. Basses/Attacky): search with other words";
         let (events, _) = drive_with_jev(
             vec![decision_with("load_sound", 0.99, ("rig_2", 0.99), &[("sound", "bass")])],
-            vec![asked("Give rig 2 a wobbly growling bass."), results(&[miss]), results(&[r#"{"patches":["Basses/Attacky"]}"#]),
-                results(&["loaded 'Basses/Attacky' into rig 1 'Rig B'"])],
+            vec![asked("Give rig 2 a wobbly growling bass."), results(&[miss]), results(&[r#"{"instrument":"Surge","node":4,"rig":1,"library":"Surge patches","total":3008,"sounds":["Basses/Attacky"]}"#]),
+                results(&["loaded 'Basses/Attacky' into Surge (node 4), rig 1 'Rig B'"])],
         );
         let ran = ran(&events);
         let queries: Vec<&str> = ran.iter().map(|c| c.args["query"].as_str().unwrap()).collect();
         assert_eq!(queries, vec!["wobbly growling bass", "bass", "bass"], "the words, then the kind alone, which is loaded");
-        assert_eq!(ran.last().unwrap().args["rig"], 1);
+        assert!(ran.iter().all(|c| c.args["rig"] == 1), "the search and the load both name the rig: its instrument's library is searched");
         assert_eq!(said(&events), vec!["Rig 2 now plays Basses/Attacky."]);
+    }
+
+    #[test]
+    fn a_sound_is_searched_in_the_library_of_the_rigs_own_instrument() {
+        // Every setBfree programme is an organ and none says so: the kind
+        // is one more search word, which the app's search leaves out.
+        let (events, _) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("rig_2", 0.99), &[("sound", "organ")])],
+            vec![asked("Give the organ rig a jazz drawbar preset."),
+                results(&[r#"{"instrument":"Setbfree","node":4,"rig":1,"library":"MIDI programmes","total":110,"sounds":["Jazz 1 all"]}"#]),
+                results(&["loaded 'Jazz 1 all' into Setbfree (node 4), rig 1 'Organ'"])],
+        );
+        assert_eq!(ran(&events), vec![
+            call("list_sounds", json!({"query": "jazz drawbar organ", "rig": 1})),
+            call("load_sound", json!({"query": "jazz drawbar organ", "rig": 1})),
+        ]);
+        assert_eq!(said(&events), vec!["Rig 2 now plays Jazz 1 all."]);
+
+        // A request that names one sound by its label is not a kind of sound.
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "pad")]), text("m", "from the chat model")],
+            vec![asked("Load the patch Pads/Dreamscape.")],
+        );
+        assert!(ran(&events).is_empty() && requests.len() == 2, "the chat model looks for that one patch");
+
+        // A name with an apostrophe is said whole.
+        let (events, _) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "organ")])],
+            vec![asked("Load a solo organ."), results(&[r#"{"instrument":"Setbfree","node":1,"rig":0,"library":"MIDI programmes","total":110,"sounds":["8' solo"]}"#]),
+                results(&["loaded '8' solo' into Setbfree (node 1), rig 0 'Rig A'"])],
+        );
+        assert_eq!(said(&events), vec!["Rig 1 now plays 8' solo."]);
+
+        // An instrument without sounds to browse is the chat model's to explain.
+        let nothing = "Lsp osc has no sounds to browse (it has no LV2 presets). It is shaped by its parameters (Frequency, Waveform): see list_params(node=1)";
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "bass")]), text("m", "from the chat model")],
+            vec![asked("Load a bass."), results(&[nothing])],
+        );
+        assert_eq!(ran(&events).len(), 1, "one search, no load");
+        assert_eq!(requests.len(), 2, "the chat model takes over and sees the search's answer");
+        let handed_over = requests[1]["messages"].as_array().unwrap();
+        let planned = handed_over.iter().find(|m| m["tool_calls"][0]["id"] == "jev-0-0").expect("the plan's call is in the conversation");
+        assert_eq!(planned["reasoning_content"], "", "DeepSeek's thinking models reject a foreign tool call without it");
+        assert_eq!(handed_over.last().unwrap()["content"], nothing);
     }
 
     #[test]
@@ -2508,6 +2575,9 @@ mod tests {
         assert_eq!(facts("split the keyboard somewhere").note(), None);
         assert_eq!(facts("Load a warm pad into rig 2, please.").sound_words(), vec!["warm", "pad"]);
         assert_eq!(facts("give me a Rhodes on rig B").sound_words(), vec!["rhodes"]);
+        assert_eq!(facts("Give the organ rig a jazz drawbar preset.").sound_words(), vec!["jazz", "drawbar"], "the word before 'rig' names the rig");
+        assert_eq!(facts("Load a bass sound on the YANES rig.").sound_words(), vec!["bass"]);
+        assert_eq!(facts("give this rig jazz chords").sound_words(), vec!["jazz", "chords"], "only a number or a letter after 'rig' names it");
         // The [context] line holds numbers too; only the request counts.
         let d = llm::Decisions { answers: [("action".to_string(), llm::Answer::Choice { choice: "tempo".into(), p: 1.0 })].into(), model: String::new(), ms: 0, attempts: 1 };
         assert!(settle(&d, "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 100)]\nset the tempo").is_none());
@@ -2519,8 +2589,8 @@ mod tests {
             "get_rigs" => RIGS.to_string(),
             "get_graph" => graph.to_string(),
             "add_node" => "added [applied: new node id 40]".to_string(),
-            "list_sounds" => r#"{"patches":["Pads/Warm Pad"]}"#.to_string(),
-            "load_sound" => "loaded 'Pads/Warm Pad' into rig 1 'Rig B'".to_string(),
+            "list_sounds" => r#"{"instrument":"Surge","node":4,"rig":1,"library":"Surge patches","total":3008,"sounds":["Pads/Warm Pad"]}"#.to_string(),
+            "load_sound" => "loaded 'Pads/Warm Pad' into Surge (node 4), rig 1 'Rig B'".to_string(),
             "set_node_playing" => "node 40 playing".to_string(),
             "set_rig_mix" => "rig 1: vol 0.50 pan 0.00 mute false solo false".to_string(),
             _ => "done [applied: new cable id 41]".to_string(),

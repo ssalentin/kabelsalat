@@ -87,8 +87,7 @@ const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fi
 
 /// The reference CLAP instrument (docs/ARCHITECTURE.md §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
-const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
-const DEXED_ID: &str = "com.digital-suburban.dexed";
+use crate::sounds::{DEXED_ID, SURGE_ID};
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
@@ -986,6 +985,9 @@ struct ToolBatch {
 /// frames: the UI thread never blocks on it.
 enum Waiting {
     Engine(EngineEdit),
+    /// list_sounds / load_sound on an instrument whose library is still
+    /// being scanned: the call runs once the scan is done.
+    SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
     /// look_at_rack: the screenshot of a coming frame. The tool's own
     /// line is kept for the result.
     RackShot { said: String, deadline: std::time::Instant },
@@ -1081,6 +1083,11 @@ fn rack_shot_output(said: &str, shot: Option<Result<Image, String>>) -> ToolOutp
     }
 }
 
+/// The tools that read an instrument's sound library.
+const SOUND_TOOLS: &[&str] = &["list_sounds", "load_sound"];
+/// Longest a sound tool waits for a library scan (a first Surge scan walks
+/// about 3000 files).
+const SOUND_SCAN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// An engine edit whose effect on the rack is still awaited.
 struct EngineEdit {
     /// What the tool said when it sent the command.
@@ -1956,9 +1963,8 @@ struct DemoApp {
     /// Committed mid-column centers + stack height (drop-target geometry).
     col_x: Vec<f32>,
     stack_tall_h: f32,
-    /// Installed Surge patches, scanned on first use (load_sound/list_sounds).
-    surge_patch_cache: Option<Vec<crate::host::SurgePatch>>,
-    dexed_patch_cache: Option<Vec<crate::host::DexedPatch>>,
+    /// Every instrument's sound library, scanned off this thread (rule 46).
+    sounds: crate::sounds::Libraries,
     /// Current patch per synth voice slot (None = Surge's init patch).
     patch_names: [Option<String>; VOICE_POOL],
     /// Sound browser search text (synth editor).
@@ -2294,8 +2300,8 @@ impl DemoApp {
             drop_ghost: None,
             col_x: Vec::new(),
             stack_tall_h: 0.0,
-            surge_patch_cache: None,
-            dexed_patch_cache: None,
+            // Tests never scan the machine's patch folders.
+            sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
             patch_names: Default::default(),
             sound_filter: String::new(),
             matrix_block_w: 0.0,
@@ -2495,6 +2501,7 @@ impl DemoApp {
         self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
         self.graph_sig.clear(); // force shared-graph re-mirror
+        self.prewarm_sound_libraries();
         // No load_fade reset here: build_rack also serves sync adoptions
         // (agent/MCP add_node/connect), which must appear without a flash.
         // Explicit loads call begin_load_fade().
@@ -3942,6 +3949,10 @@ impl DemoApp {
                         None if std::time::Instant::now() < *deadline => None,
                         shot => Some(rack_shot_output(said, shot)),
                     },
+                    Waiting::SoundScan { call, deadline } => {
+                        let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
+                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args).into())
+                    }
                 };
                 match outcome {
                     Some(result) => {
@@ -3958,6 +3969,11 @@ impl DemoApp {
                 }
             }
             while let Some((call, chip_idx)) = batch.todo.pop_front() {
+                if SOUND_TOOLS.contains(&call.name.as_str()) && self.sound_scan_running(&call.args) {
+                    batch.waiting = Some((Waiting::SoundScan { call, deadline: std::time::Instant::now() + SOUND_SCAN_WAIT }, chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
                 let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
                 let before = engine_edit.then(|| self.rack_ids());
                 let result = self.run_assistant_tool(&call.name, &call.args);
@@ -5392,31 +5408,18 @@ impl DemoApp {
             }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let is_dexed = self.clap_pool_idx(self.active_rig)
-                    .and_then(|i| self.clap_plugin_ids.get(i))
-                    .map(|id| id == DEXED_ID)
-                    .unwrap_or(false);
-                if is_dexed {
-                    let hits = crate::host::search_dexed_patches(self.dexed_patches(), q, 25);
-                    if hits.is_empty() { format!("no Dexed patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
-                } else {
-                    let hits = crate::host::search_surge_patches(self.surge_patches(), q, 25);
-                    if hits.is_empty() { format!("no Surge patch matches '{q}'") } else { serde_json::json!({"patches": hits}).to_string() }
+                match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
+                    Ok((library, unit)) => crate::sounds::list_answer(&unit, &library, q),
+                    Err(e) => format!("list_sounds failed: {e}"),
                 }
             }
             "load_sound" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
-                match self.load_sound(rig, q) {
-                    Ok(p) => {
-                        let multi = self.rig_count() > 1;
-                        let nodes: Vec<u32> = self.units.iter()
-                            .filter(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
-                            .map(|u| u.node_id)
-                            .collect();
-                        self.agent_activity.touch_rig(rig, now);
-                        self.agent_activity.record(origin, format!("Sound → {p}"), nodes, now);
-                        format!("loaded '{p}' into rig {rig} '{}'", self.rig_name(rig))
+                match self.sound_target(args).and_then(|unit| self.load_sound(&unit, q).map(|sound| (sound, unit))) {
+                    Ok((sound, unit)) => {
+                        self.agent_activity.touch_rig(unit.rig, now);
+                        self.agent_activity.record(origin, format!("Sound → {}", sound.label()), vec![unit.node], now);
+                        crate::sounds::loaded_answer(&unit, &sound, &self.rig_name(unit.rig))
                     }
                     Err(e) => format!("load_sound failed: {e}"),
                 }
@@ -5439,12 +5442,10 @@ impl DemoApp {
                     None => self.edit_rigs_named(None, name),
                 }
                 if self.rig_count() == n { return format!("add_rig failed: {}", self.session_msg); }
-                // A Surge patch query means nothing to another plugin.
                 let new_rig = self.active_rig;
-                let sound_query = if args.get("plugin_id").is_some() { None } else { args.get("sound").and_then(|v| v.as_str()) };
-                let sound = match sound_query {
-                    Some(q) => match self.load_sound(new_rig, q) {
-                        Ok(p) => format!(" Sound: {p}."),
+                let sound = match args.get("sound").and_then(|v| v.as_str()) {
+                    Some(q) => match self.sound_instrument(Some(new_rig), None).and_then(|unit| self.load_sound(&unit, q)) {
+                        Ok(sound) => format!(" Sound: {}.", sound.label()),
                         Err(e) => format!(" Sound not loaded: {e}."),
                     },
                     None => String::new(),
@@ -5831,69 +5832,52 @@ impl DemoApp {
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
                 let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
-                let is_surge = plugin_id == Some(SURGE_ID);
-                let is_dexed = plugin_id == Some(DEXED_ID);
-                if is_surge {
-                    // Sound: exchange the instrument (Surge patch) of THIS synth.
+                // Sound: exchange the instrument (patch) of THIS synth.
+                let browser = match plugin_id {
+                    Some(SURGE_ID) => Some(("Init (Surge default)", "search sounds… e.g. flute, warm pad, bass", "sound_list")),
+                    Some(DEXED_ID) => Some(("Init (Dexed default)", "search DX7 sounds… e.g. piano, bass, brass", "dexed_sound_list")),
+                    _ => None,
+                };
+                if let (Some((init, hint, list_id)), Some(id)) = (browser, plugin_id) {
                     theme::section_label(ui, "Sound");
-                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Surge default)".into());
+                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| init.into());
                     ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
                     ui.add_sized([ui.available_width(), 20.0],
-                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search sounds… e.g. flute, warm pad, bass"));
+                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text(hint));
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-                    let mut chosen: Option<crate::host::SurgePatch> = None;
-                    {
-                        let patches = self.surge_patches().to_vec();
-                        egui::ScrollArea::vertical().id_salt("sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                            let mut shown = 0;
-                            for p in patches.iter().filter(|p| {
-                                let f = format!("{}/{}", p.category, p.name).to_lowercase();
-                                words.iter().all(|w| f.contains(w.as_str()))
-                            }) {
-                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
-                                shown += 1;
-                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {}", p.category, p.name)).size(12.5).color(theme::CREAM));
-                                if resp.clicked() { chosen = Some(p.clone()); }
-                            }
-                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
-                        });
-                    }
-                    if let Some(p) = chosen {
-                        match self.load_patch_into_slot(rig, &p) {
-                            Ok(n) => self.editor_status = format!("loaded {n}"),
-                            Err(e) => self.editor_status = format!("sound failed: {e}"),
+                    let library = match self.sounds.get(&crate::sounds::Instrument::Clap(id.to_string())) {
+                        crate::sounds::Lookup::Ready(library) => Some(library),
+                        _ => None,
+                    };
+                    let mut chosen: Option<crate::sounds::Sound> = None;
+                    egui::ScrollArea::vertical().id_salt(list_id).max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+                        let Some(library) = &library else {
+                            ui.label(egui::RichText::new("scanning sounds…").size(12.0).color(theme::INK_2));
+                            return;
+                        };
+                        let mut shown = 0;
+                        for s in library.sounds.iter().filter(|s| {
+                            let f = s.label().to_lowercase();
+                            words.iter().all(|w| f.contains(w.as_str()))
+                        }) {
+                            if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
+                            shown += 1;
+                            // A cartridge lists its voices by their slot number.
+                            let text = match &s.load {
+                                crate::sounds::Load::DexedVoice { program, .. } => format!("{} · {:02} {}", s.category, program + 1, s.name),
+                                _ => format!("{} · {}", s.category, s.name),
+                            };
+                            let resp = ui.selectable_label(false, egui::RichText::new(text).size(12.5).color(theme::CREAM));
+                            if resp.clicked() { chosen = Some(s.clone()); }
                         }
-                    }
-                    ui.separator();
-                } else if is_dexed {
-                    theme::section_label(ui, "Sound");
-                    let current = self.patch_names.get(rig).cloned().flatten().unwrap_or_else(|| "Init (Dexed default)".into());
-                    ui.label(egui::RichText::new(current).font(theme::medium_font(15.0)).color(theme::INK));
-                    ui.add_sized([ui.available_width(), 20.0],
-                        egui::TextEdit::singleline(&mut self.sound_filter).hint_text("search DX7 sounds… e.g. piano, bass, brass"));
-                    let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-                    let mut chosen: Option<crate::host::DexedPatch> = None;
-                    {
-                        let patches = self.dexed_patches().to_vec();
-                        egui::ScrollArea::vertical().id_salt("dexed_sound_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
-                            let mut shown = 0usize;
-                            for p in patches.iter().filter(|p| {
-                                let f = format!("{}/{}", p.bank, p.name).to_lowercase();
-                                words.iter().all(|w| f.contains(w.as_str()))
-                            }) {
-                                if shown >= 150 { ui.label(egui::RichText::new("… refine the search").size(11.0).color(theme::INK_2)); break; }
-                                shown += 1;
-                                let resp = ui.selectable_label(false, egui::RichText::new(format!("{} · {:02} {}", p.bank, p.program + 1, p.name)).size(12.5).color(theme::CREAM));
-                                if resp.clicked() { chosen = Some(p.clone()); }
-                            }
-                            if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
-                        });
-                    }
-                    if let Some(p) = chosen {
-                        match self.load_dexed_patch_into_slot(rig, &p) {
-                            Ok(n) => self.editor_status = format!("loaded {n}"),
-                            Err(e) => self.editor_status = format!("sound failed: {e}"),
-                        }
+                        if shown == 0 { ui.label(egui::RichText::new("no matching sound").size(12.0).color(theme::INK_2)); }
+                    });
+                    if let Some(s) = chosen {
+                        let unit = self.instrument_units().into_iter().find(|u| u.slot == Some(rig));
+                        self.editor_status = match unit.ok_or_else(|| "that synth has no voice slot".to_string()).and_then(|u| self.load_sound_into(&u, &s)) {
+                            Ok(()) => format!("loaded {}", s.label()),
+                            Err(e) => format!("sound failed: {e}"),
+                        };
                     }
                     ui.separator();
                 }
@@ -6717,57 +6701,91 @@ impl DemoApp {
         }
     }
 
-    /// Installed Surge patches (scanned once, cached).
-    fn surge_patches(&mut self) -> &[crate::host::SurgePatch] {
-        if self.surge_patch_cache.is_none() { self.surge_patch_cache = Some(crate::host::list_surge_patches()); }
-        self.surge_patch_cache.as_deref().unwrap_or(&[])
-    }
-
-    /// Installed Dexed DX7 `.syx` cartridge patches (scanned once, cached).
-    fn dexed_patches(&mut self) -> &[crate::host::DexedPatch] {
-        if self.dexed_patch_cache.is_none() { self.dexed_patch_cache = Some(crate::host::discover_dexed_patches()); }
-        self.dexed_patch_cache.as_deref().unwrap_or(&[])
-    }
-
-    /// Load the best-matching Surge or Dexed patch into `rig`'s (first) synth.
-    fn load_sound(&mut self, rig: usize, query: &str) -> Result<String, String> {
-        if rig >= self.rig_count() { return Err(format!("no rig {rig}")); }
+    /// The rack's instruments (CLAP synths and LV2 instruments), in unit order.
+    fn instrument_units(&self) -> Vec<crate::sounds::Unit> {
         let multi = self.rig_count() > 1;
-        let node = self.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap) && (!multi || u.rig as usize == rig))
-            .map(|u| u.node_id).ok_or_else(|| format!("rig {rig} has no CLAP synth"))?;
-        let slot = self.clap_rigs().into_iter().find(|(_, n)| *n == node).map(|(s, _)| s)
-            .ok_or_else(|| "that synth has no voice slot".to_string())?;
-        let is_dexed = self.clap_pool_idx(slot)
-            .and_then(|i| self.clap_plugin_ids.get(i))
-            .map(|id| id == DEXED_ID)
-            .unwrap_or(false);
-        if is_dexed {
-            let words: Vec<String> = query.trim().to_lowercase().split_whitespace().map(str::to_string).collect();
-            let patch = self.dexed_patches().iter().find(|p| {
-                let hay = format!("{}/{}", p.bank, p.name).to_lowercase();
-                words.iter().all(|w| hay.contains(w.as_str()))
-            }).cloned().ok_or_else(|| format!("no Dexed patch matches '{query}'"))?;
-            return self.load_dexed_patch_into_slot(slot, &patch);
-        }
-        let patch = {
-            let ps = self.surge_patches();
-            crate::host::find_surge_patch(ps, query).cloned().ok_or_else(|| format!("no Surge patch matches '{query}'"))?
-        };
-        self.load_patch_into_slot(slot, &patch)
+        let mut slot = 0;
+        self.units.iter().filter_map(|u| {
+            let clap = matches!(u.node_kind, UnitKind::Clap);
+            let this_slot = clap.then(|| { slot += 1; slot - 1 });
+            if !clap && !u.lv2_inst { return None; }
+            let instrument = crate::sounds::Instrument::of(&self.base_graph.node(u.node_id)?.kind)?;
+            Some(crate::sounds::Unit { node: u.node_id, rig: if multi { u.rig as usize } else { 0 }, name: sentence_case(&u.name), instrument, slot: this_slot })
+        }).collect()
     }
 
-    /// Load one patch file into voice `slot` (agent load_sound and the synth
-    /// editor's Sound browser share this). Records the patch name and, if
-    /// that synth's editor is open, re-reads its parameters.
-    fn load_patch_into_slot(&mut self, slot: usize, patch: &crate::host::SurgePatch) -> Result<String, String> {
-        let data = std::fs::read(&patch.path).map_err(|e| format!("reading patch: {e}"))?;
-        let state = crate::host::fxp_to_state(&data).map_err(|e| e.to_string())?;
-        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        main.load_state(&state).map_err(|e| e.to_string())?;
-        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
-        if self.editor_open && self.editor_rig == slot { self.refresh_editor_params(); }
-        Ok(format!("{}/{}", patch.category, patch.name))
+    /// The instrument a sound tool means (`sounds::pick_unit`; the rig
+    /// defaults to the one in view).
+    fn sound_instrument(&self, rig: Option<usize>, node: Option<u32>) -> Result<crate::sounds::Unit, String> {
+        let rig = rig.unwrap_or(self.active_rig);
+        if node.is_none() && rig >= self.rig_count() { return Err(format!("no rig {rig}")); }
+        crate::sounds::pick_unit(&self.instrument_units(), rig, &self.rig_name(rig), node)
+    }
+
+    /// `sound_instrument` for a tool call's `rig` / `node` arguments.
+    fn sound_target(&self, args: &serde_json::Value) -> Result<crate::sounds::Unit, String> {
+        let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+        let node = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32);
+        self.sound_instrument(rig, node)
+    }
+
+    /// Is the library a sound tool call needs still being scanned? Asking
+    /// starts the scan.
+    fn sound_scan_running(&self, args: &serde_json::Value) -> bool {
+        self.sound_target(args)
+            .is_ok_and(|unit| matches!(self.sounds.get(&unit.instrument), crate::sounds::Lookup::Scanning))
+    }
+
+    /// Start scanning the libraries of the rack's instruments, so they are
+    /// there when somebody asks.
+    fn prewarm_sound_libraries(&self) {
+        for unit in self.instrument_units() {
+            let _ = self.sounds.get(&unit.instrument);
+        }
+    }
+
+    /// The sound library of one instrument unit.
+    fn sound_library(&mut self, unit: &crate::sounds::Unit) -> Result<Arc<crate::sounds::Library>, String> {
+        match self.sounds.get(&unit.instrument) {
+            crate::sounds::Lookup::Ready(library) => Ok(library),
+            crate::sounds::Lookup::Scanning => Err(format!("still scanning {}'s sounds in the background: call again in a moment", unit.name)),
+            // CLAP reads parameter texts on the plugin's main thread: this one.
+            crate::sounds::Lookup::AskPlugin => {
+                let main = unit.slot.and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+                    .ok_or_else(|| format!("{} is not running (no audio engine): its presets are read from the live plugin", unit.name))?;
+                let params = main.param_list();
+                let library = crate::sounds::preset_param_library(&params, |id, value| main.param_text(id, value));
+                Ok(self.sounds.insert(unit.instrument.clone(), library))
+            }
+        }
+    }
+
+    /// Load the sound `query` means into an instrument unit.
+    fn load_sound(&mut self, unit: &crate::sounds::Unit, query: &str) -> Result<crate::sounds::Sound, String> {
+        let library = self.sound_library(unit)?;
+        let sound = crate::sounds::find_or_explain(unit, &library, query)?;
+        self.load_sound_into(unit, sound)?;
+        Ok(sound.clone())
+    }
+
+    /// Load one sound into an instrument unit (the agent tools and the
+    /// synth editor's Sound browser share this) and note it as the unit's
+    /// current sound.
+    fn load_sound_into(&mut self, unit: &crate::sounds::Unit, sound: &crate::sounds::Sound) -> Result<(), String> {
+        let pool = unit.slot.and_then(|s| self.clap_pool_idx(s));
+        let clap = pool.and_then(|i| Some((self._surge_main.get_mut(i)?, self.surge_controllers.get(i)?)));
+        let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+        crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
+        drop(bus);
+        match unit.slot {
+            Some(slot) => {
+                if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
+                if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot { self.refresh_editor_params(); }
+            }
+            None if self.lv2_editor_node == Some(unit.node) => self.lv2_preset_name = Some(sound.name.clone()),
+            None => {}
+        }
+        Ok(())
     }
 
     /// Answer the bridge callers that wait for look_at_rack: every one gets
@@ -6791,18 +6809,6 @@ impl DemoApp {
                 false
             }),
         }
-    }
-
-    /// Load a DX7 `.syx` cartridge patch into a Dexed voice slot.
-    fn load_dexed_patch_into_slot(&mut self, slot: usize, patch: &crate::host::DexedPatch) -> Result<String, String> {
-        let idx = self.clap_pool_idx(slot).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        let main = self._surge_main.get_mut(idx).ok_or_else(|| "no audio engine (headless)".to_string())?;
-        crate::host::load_dexed_patch(main, patch).map_err(|e| e.to_string())?;
-        if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(patch.name.clone()); }
-        if self.editor_open && self.lv2_editor_node.is_none() && self.editor_rig == slot {
-            self.refresh_editor_params();
-        }
-        Ok(format!("{}/{}", patch.bank, patch.name))
     }
 
     /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
@@ -13602,7 +13608,17 @@ enum EvalStart {
     TwoRigs,
     /// Keys → Surge → Master, plus a wired metronome that is not running.
     OneRigMetronome,
+    /// Rig A: Keys → Surge → Master. Rig B "YANES": Keys → YANES → Master.
+    SurgeAndYanes,
+    /// Rig A: Keys → Surge → Master. Rig B "Organ": Keys → setBfree → Master.
+    SurgeAndOrgan,
 }
+
+const EVAL_YANES: &str = "org.yanes.native";
+const EVAL_ORGAN: &str = "http://gareus.org/oss/lv2/b_synth";
+/// setBfree's programmes a "jazz" registration may be: Jazz 1 all, Jimmy
+/// Smith, Jimmy Smith Plus (its MIDNAM document, programme change numbers).
+const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
 
 /// One scripted request and what the app must look like afterwards.
 struct EvalTask {
@@ -13611,8 +13627,9 @@ struct EvalTask {
     /// An image the user attaches to the request (a path in the repository).
     image: Option<&'static str>,
     prompt: &'static str,
-    /// Err says what is off. Gets the agent's final reply for questions.
-    check: fn(&mut DemoApp, &str) -> Result<(), String>,
+    /// Err says what is off. Gets the engine (what reached a plugin) and
+    /// the agent's final reply for questions.
+    check: fn(&mut DemoApp, &GraphEngine, &str) -> Result<(), String>,
 }
 
 fn eval_ensure(ok: bool, why: impl FnOnce() -> String) -> Result<(), String> {
@@ -13659,7 +13676,10 @@ fn eval_patch(app: &mut DemoApp, rig: usize) -> Result<String, String> {
         .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
     let name = app.patch_names.get(slot).cloned().flatten()
         .ok_or_else(|| format!("rig {} still plays the init patch", rig + 1))?;
-    let category = app.surge_patches().iter().find(|p| p.name == name).map(|p| p.category.clone()).unwrap_or_default();
+    let category = match app.sounds.get(&crate::sounds::Instrument::Clap(SURGE_ID.into())) {
+        crate::sounds::Lookup::Ready(library) => library.sounds.iter().find(|s| s.name == name).map(|s| s.category.clone()).unwrap_or_default(),
+        _ => String::new(),
+    };
     Ok(format!("{category}/{name}").to_lowercase())
 }
 
@@ -13681,21 +13701,34 @@ fn eval_effect_in_chain(g: &Graph, rig: u8, kind: DspKind) -> Result<(), String>
     eval_ensure(eval_audio_path(g, fx, master), || format!("the {kind:?} does not reach the master"))
 }
 
+/// The value text of the "Preset" parameter of the CLAP synth in `rig`
+/// (YANES keeps its sounds there), read from the live plugin.
+fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
+    let slot = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap))
+        .position(|u| u.rig as usize == rig)
+        .ok_or_else(|| format!("rig {} has no synth", rig + 1))?;
+    let main = app.clap_pool_idx(slot).and_then(|i| app._surge_main.get_mut(i))
+        .ok_or_else(|| format!("rig {}'s synth is not running", rig + 1))?;
+    let preset = main.param_list().into_iter().find(|p| p.name == "Preset")
+        .ok_or_else(|| format!("rig {}'s synth has no Preset parameter", rig + 1))?;
+    Ok(main.param_text(preset.id, preset.value))
+}
+
 const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
-        check: |app, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+        check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
         name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
             eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
         },
     },
     EvalTask {
         name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
-        check: |app, _| {
+        check: |app, _, _| {
             let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
             eval_ensure(split == Some(60), || format!("split point is {split:?}"))
         },
@@ -13703,7 +13736,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "split_zones", start: EvalStart::Demo, image: None,
         prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let keys = eval_node(&g, 0, "Keys", |k| matches!(k, NodeKind::Keys))?;
             let (a, b) = (eval_named(&g, "SURGE A")?, eval_named(&g, "SURGE B")?);
@@ -13717,14 +13750,42 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
-        check: |app, _| {
+        check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
         },
     },
     EvalTask {
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        check: |app, _, _| {
+            let preset = eval_preset_param(app, 1)?;
+            eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        check: |app, engine, _| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(matches!(last, Some([0xC0, p, _]) if EVAL_JAZZ_PROGRAMS.contains(&p)),
+                || format!("the organ's last MIDI event is {last:?}, not a programme change to a jazz registration"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))
+        },
+    },
+    EvalTask {
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        check: |app, engine, reply| {
+            let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
+            let last = engine.lv2_last_note(organ);
+            eval_ensure(last.is_none(), || format!("the organ got {last:?}: it has no pad to load"))?;
+            eval_ensure(app.patch_names[0].is_none(), || format!("rig 1's Surge got '{}'", app.patch_names[0].clone().unwrap_or_default()))?;
+            eval_ensure(!reply.trim().is_empty(), || "no reply".into())
+        },
+    },
+    EvalTask {
         name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 1 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 2 got a reverb too".into())
@@ -13732,11 +13793,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
-        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
     },
     EvalTask {
         name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
             let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
@@ -13748,7 +13809,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
             let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
@@ -13758,25 +13819,25 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
-        check: |app, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
+        check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
     },
     EvalTask {
         name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
         name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
     },
     EvalTask {
         name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
             let asked = app.pending_confirm.as_ref()
                 .is_some_and(|p| p.tool == "delete_rig" && p.args.get("rig").and_then(|r| r.as_u64()) == Some(1));
@@ -13785,7 +13846,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("the new rig plays {patch}, not a bass"))?;
@@ -13795,21 +13856,21 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
         name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
             eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
         },
     },
     EvalTask {
         name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Reverb)), || "rig 1 got a reverb too".into())
@@ -13817,11 +13878,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
-        check: |app, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
+        check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
     },
     EvalTask {
         name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
-        check: |app, _| {
+        check: |app, _, _| {
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
             eval_ensure(eval_patch(app, 0).is_err(), || "rig 1's sound changed too".into())
@@ -13829,7 +13890,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
-        check: |app, _| {
+        check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
             eval_ensure(g.node(metro).is_some_and(|n| n.playing), || "the metronome is not running".into())
@@ -13837,11 +13898,11 @@ const EVAL_TASKS: &[EvalTask] = &[
     },
     EvalTask {
         name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
-        check: |app, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
+        check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
         name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
-        check: |app, _| {
+        check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
@@ -13849,12 +13910,12 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
         prompt: "Do what the note says.",
-        check: |app, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
+        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
         name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
         prompt: "Do what the note says.",
-        check: |app, _| {
+        check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
@@ -13862,7 +13923,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
         prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
             eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
         },
@@ -13870,7 +13931,7 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "look_at_rack", start: EvalStart::Demo, image: None,
         prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
-        check: |app, reply| {
+        check: |app, _, reply| {
             eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
             eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
         },
@@ -13969,6 +14030,8 @@ impl EvalRig {
                 self.app.apply_session(&s)?;
             }
             EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
+            EvalStart::SurgeAndYanes => self.load_two_rigs("YANES", crate::control::plugin_rig_graph(EVAL_YANES, "YANES")),
+            EvalStart::SurgeAndOrgan => self.load_two_rigs("Organ", DemoApp::build_lv2_instrument_graph(EVAL_ORGAN, "setBfree")),
             EvalStart::OneRigMetronome => {
                 let mut g = crate::control::standard_rig_graph(true);
                 let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut)).map_err(anyhow::Error::msg)?;
@@ -13979,6 +14042,24 @@ impl EvalRig {
         }
         self.settle();
         Ok(())
+    }
+
+    /// Rig A: Keys → Surge → Master. Rig B, named `name`: `second`. Runs
+    /// frames until the second rig's plugin had time to load.
+    fn load_two_rigs(&mut self, name: &str, second: Graph) {
+        let rigs = vec![
+            crate::control::Rig::new("Rig A", crate::control::standard_rig_graph(true), None),
+            crate::control::Rig::new(name, second, None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        if let Some(bus) = &self.app.bus {
+            let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
+        }
+        self.app.build_rack(&merged, &[]);
+        for _ in 0..100 {
+            self.frame();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
 
@@ -14027,7 +14108,7 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     } else if let Some(e) = turn.errors.first() {
         Err(format!("agent error: {e}"))
     } else {
-        (task.check)(&mut rig.app, &reply)
+        (task.check)(&mut rig.app, &rig.engine, &reply)
     };
     if let Some(recorder) = rig.app.recorder.take() { recorder.shutdown(); }
     let _ = std::fs::remove_dir_all(eval_takes_dir());
@@ -15829,7 +15910,7 @@ mod rig_switch_tests {
     fn pin_a_surge_parameter_as_a_face_knob() {
         let mut app = DemoApp::new_with_sink(None);
         let p = crate::host::ParamDesc { id: 42, name: "Filter 1 Cutoff".into(), module: "A/Filter".into(),
-            min: -60.0, max: 70.0, value: 5.0, default: 3.0, automatable: true, hidden: false, readonly: false };
+            min: -60.0, max: 70.0, value: 5.0, default: 3.0, automatable: true, stepped: false, hidden: false, readonly: false };
         let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
         let before = app.units[surge].knobs.len();
         let msg = app.toggle_pin(0, &p);
@@ -15986,6 +16067,24 @@ mod rig_switch_tests {
         assert_eq!(app.rig_sources, before, "no voice slot changed");
         app.send_rig_source(past);
         for n in extra { app.send_rig_source(n); }
+    }
+
+    /// Live report "the agent throws errors when searching for patches":
+    /// `list_sounds` used the rig in view as a voice slot, so with two synths
+    /// in rig A the second rig searched the third slot's library (Dexed for a
+    /// Surge rig) and the following load failed. Sound tools resolve the
+    /// rig's own unit, and its slot comes from the unit.
+    #[test]
+    fn sound_tools_resolve_the_rigs_own_instrument_not_slot_by_rig_number() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.edit_rigs(None); // demo rack (Surge A + Surge B) becomes rig A; rig B gets a Surge
+        let units = app.instrument_units();
+        let rig1: Vec<_> = units.iter().filter(|u| u.rig == 1).collect();
+        assert!(!rig1.is_empty(), "rig B has an instrument: {:?}", units.iter().map(|u| (u.rig, u.slot)).collect::<Vec<_>>());
+        let picked = app.sound_instrument(Some(1), None).expect("rig B's instrument");
+        assert_eq!(picked.rig, 1);
+        assert_eq!(picked.node, rig1[0].node, "the unit in rig B, whatever its slot");
+        assert_eq!(picked.slot, Some(2), "rig A holds two synths, so rig B's synth is slot 2, not 1");
     }
 
     #[test]
@@ -17257,7 +17356,7 @@ mod split_bpm_tests {
         assert!(!app.lv2_editor_controls.is_empty(), "Vitalium controls should populate");
         assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
         frame(&mut app, &ctx, vec![]);
-        assert!(!app.dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
+        assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
     }
 
     #[test]
@@ -18298,6 +18397,174 @@ mod ui_polish_agent_tests {
         for _ in 0..4 { live.frame(); }
         let left: Vec<u32> = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().map(|e| e.id).filter(|id| [4, 5, 8, 9].contains(id)).collect();
         assert!(left.is_empty(), "the engine still has cables {left:?}");
+    }
+
+    const TEST_ORGAN: &str = "urn:test:organ";
+    const TEST_OSC: &str = "urn:test:osc";
+
+    /// What the test instruments hold: a Surge of two patches, an organ of
+    /// one preset and two programmes, an oscillator without sounds.
+    fn test_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        use crate::sounds::{Instrument, Library, Load, Sound};
+        let sound = |category: &str, name: &str, load| Sound { category: category.into(), name: name.into(), preferred: true, load };
+        match instrument {
+            Instrument::Clap(_) => Library {
+                kind: "Surge patches".into(),
+                sounds: vec![sound("Basses", "Deep Bass", Load::SurgePatch("/nowhere/Deep Bass.fxp".into())), sound("Pads", "Warm Pad", Load::SurgePatch("/nowhere/Warm Pad.fxp".into()))],
+                params: vec![],
+            },
+            Instrument::Lv2(uri) if uri == TEST_ORGAN => Library {
+                kind: "LV2 presets and MIDI programmes".into(),
+                sounds: vec![sound("", "Full Organ", Load::Lv2Preset("urn:test:organ#full".into())), sound("", "Jazz 1 all", Load::MidiProgram(0)), sound("", "Jimmy Smith", Load::MidiProgram(103))],
+                params: vec![],
+            },
+            Instrument::Lv2(_) => Library { kind: "LV2 presets".into(), sounds: vec![], params: vec!["Frequency".into(), "Waveform".into()] },
+        }
+    }
+
+    fn instrument_rig(name: &str, instruments: &[(NodeKind, &str)]) -> crate::control::Rig {
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        for (i, (kind, unit)) in instruments.iter().enumerate() {
+            let node = g.add_node(kind.clone(), name_bytes(unit));
+            g.connect_with_id(1 + 2 * i as u32, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, CPortKind::Midi);
+            g.connect_with_id(2 + 2 * i as u32, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        }
+        crate::control::Rig::new(name, g, None)
+    }
+
+    /// Rig A: a Surge. Rig B: the test organ. Rig C: a Surge, the
+    /// organ and the oscillator together. Returns the bus's far end.
+    fn app_of_instruments() -> (DemoApp, crate::control::CommandDrain) {
+        let surge = || (NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE");
+        let lv2 = |uri: &str, name: &'static str| (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name);
+        let rigs = vec![
+            instrument_rig("Rig A", &[surge()]),
+            instrument_rig("Rig B", &[lv2(TEST_ORGAN, "ORGAN")]),
+            instrument_rig("Rig C", &[surge(), lv2(TEST_ORGAN, "ORGAN"), lv2(TEST_OSC, "OSC")]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(test_sounds);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        // The test plugins are not installed, so the scan cannot class them.
+        for u in app.units.iter_mut().filter(|u| u.name == "ORGAN" || u.name == "OSC") { u.lv2_inst = true; }
+        let (bus, drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        (app, drain)
+    }
+
+    fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
+        app.units.iter().find(|u| u.rig == rig && u.name == name).map(|u| u.node_id).expect("that unit")
+    }
+
+    #[test]
+    fn sounds_are_searched_in_the_library_of_the_rig_asked() {
+        let (mut app, _drain) = app_of_instruments();
+        let json = |out: String| serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|_| panic!("not a hit list: {out}"));
+        let in_view = json(app.exec_tool("list_sounds", &serde_json::json!({"query": "pad"})));
+        assert_eq!(in_view["instrument"], "Surge");
+        assert_eq!(in_view["library"], "Surge patches");
+        assert_eq!(in_view["sounds"], serde_json::json!(["Pads/Warm Pad"]));
+
+        let organ = json(app.exec_tool("list_sounds", &serde_json::json!({"query": "jazz drawbar", "rig": 1})));
+        assert_eq!(organ["instrument"], "Organ");
+        assert_eq!(organ["node"], node_named(&app, 1, "ORGAN"));
+        assert_eq!(organ["library"], "LV2 presets and MIDI programmes");
+        assert_eq!(organ["sounds"], serde_json::json!(["Jazz 1 all"]));
+        assert_eq!(organ["words_no_sound_has"], serde_json::json!(["drawbar"]));
+
+        let miss = app.exec_tool("list_sounds", &serde_json::json!({"query": "pad", "rig": 1}));
+        assert!(miss.starts_with("no LV2 presets and MIDI programmes of Organ match 'pad' (3 in its library"), "a Surge pad is not offered to the organ: {miss}");
+    }
+
+    #[test]
+    fn a_sound_is_loaded_into_the_rigs_instrument_along_its_own_path() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let organ = node_named(&app, 1, "ORGAN");
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "jimmy smith", "rig": 1}));
+        assert_eq!(out, format!("loaded 'Jimmy Smith' into Organ (node {organ}), rig 1 'Rig B'"));
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 103 }) if node == organ));
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "Full Organ", "rig": 1}));
+        assert!(out.starts_with("loaded 'Full Organ'"), "{out}");
+        assert!(matches!(drain.pop(), Some(Command::LoadLv2Preset { node, preset_uri }) if node == organ && preset_uri == "urn:test:organ#full"));
+        let done = app.agent_activity.log.iter().find(|a| a.summary.starts_with("Sound → Full")).expect("the load is on the activity log");
+        assert_eq!(done.summary, "Sound → Full Organ");
+
+        // No sound of another instrument, and nothing sent for a miss.
+        let miss = app.exec_tool("load_sound", &serde_json::json!({"query": "warm pad", "rig": 1}));
+        assert!(miss.starts_with("load_sound failed: no LV2 presets and MIDI programmes of Organ match 'warm pad'"), "{miss}");
+        // A Surge patch is read from its file (none here): nothing is sent.
+        let headless = app.exec_tool("load_sound", &serde_json::json!({"query": "warm pad", "rig": 0}));
+        assert_eq!(headless, "load_sound failed: reading patch: No such file or directory (os error 2)");
+        assert!(drain.pop().is_none());
+    }
+
+    #[test]
+    fn a_rig_of_different_instruments_asks_which_one() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let (surge, organ, osc) = (node_named(&app, 2, "SURGE"), node_named(&app, 2, "ORGAN"), node_named(&app, 2, "OSC"));
+        for tool in ["list_sounds", "load_sound"] {
+            let which = app.exec_tool(tool, &serde_json::json!({"query": "jazz", "rig": 2}));
+            assert_eq!(which, format!("{tool} failed: rig 2 'Rig C' has 3 different instruments: Surge (node {surge}), Organ (node {organ}), Osc (node {osc}). Say which one with node=<id>"));
+        }
+        assert!(drain.pop().is_none(), "nothing is loaded on a guess");
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "jazz", "node": organ}));
+        assert_eq!(out, format!("loaded 'Jazz 1 all' into Organ (node {organ}), rig 2 'Rig C'"));
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 0 }) if node == organ));
+
+        let nothing = app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "node": osc}));
+        assert_eq!(nothing, format!("Osc has no sounds to browse (it has no LV2 presets). It is shaped by its parameters (Frequency, Waveform): see list_params(node={osc})"));
+        let not_one = app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "node": 0}));
+        assert!(not_one.starts_with("list_sounds failed: node 0 is not an instrument (instruments: Surge (node "), "{not_one}");
+        assert_eq!(app.exec_tool("list_sounds", &serde_json::json!({"query": "bass", "rig": 9})), "list_sounds failed: no rig 9");
+    }
+
+    /// A library is scanned off the UI thread; the agent's call waits for
+    /// the scan instead of answering "try again".
+    #[test]
+    fn a_sound_tool_waits_for_the_library_scan() {
+        fn slow(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            test_sounds(instrument)
+        }
+        let mut live = Live::new();
+        live.app.sounds = crate::sounds::Libraries::background(slow);
+        let asked = std::time::Instant::now();
+        let results = live.run_batch(vec![call("list_sounds", serde_json::json!({"query": "pad"}))]);
+        assert!(asked.elapsed() >= std::time::Duration::from_millis(80), "the scan had not finished when the call arrived");
+        let hits: serde_json::Value = serde_json::from_str(&results[0]).unwrap_or_else(|_| panic!("not a hit list: {}", results[0]));
+        assert_eq!(hits["sounds"], serde_json::json!(["Pads/Warm Pad"]));
+        // Outside the agent's batch (the MCP bridge) a running scan is named.
+        live.app.sounds = crate::sounds::Libraries::background(slow);
+        let busy = live.app.exec_tool("list_sounds", &serde_json::json!({"query": "pad"}));
+        assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
+    }
+
+    /// The load_sound plan against the app's real answers, on a rig whose
+    /// instrument is not Surge.
+    #[test]
+    fn the_sound_shortcut_loads_from_the_library_of_the_rigs_instrument() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let organ = node_named(&app, 1, "ORGAN");
+        let mut ran = Vec::new();
+        let said = crate::assistant::run_shortcut("load_sound", "Give the organ rig a jazz drawbar preset.", 1, &[("sound", "organ")], |calls| {
+            ran.extend(calls.iter().map(|c| c.name.clone()));
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said.as_deref(), Some("Rig 2 now plays Jazz 1 all."));
+        assert_eq!(ran, ["list_sounds", "list_sounds", "load_sound"], "'jazz drawbar organ' misses (one preset is called organ), 'jazz drawbar' finds it");
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 0 }) if node == organ));
+        // Nothing in the organ's library is a pad: the chat model explains.
+        let said = crate::assistant::run_shortcut("load_sound", "Load a warm pad.", 1, &[("sound", "pad")], |calls| {
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said, None);
+        assert!(drain.pop().is_none());
     }
 
     /// The plans read what the app's tools answer: the graph as JSON, the

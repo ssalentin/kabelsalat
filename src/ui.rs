@@ -3324,8 +3324,7 @@ impl DemoApp {
                         self.agent_activity.record(AgentOrigin::Remote, format!("Param → {uname}"), vec![node], now);
                     }
                     Command::SetRigSource { node, keyboard, hardware } => {
-                        let rig = self.rig_of_node(node);
-                        if let Some(s) = self.rig_sources.get_mut(rig) {
+                        if let Some(s) = self.voice_slot_of_node(node).and_then(|r| self.rig_sources.get_mut(r)) {
                             *s = (keyboard, hardware);
                         }
                         self.agent_activity.touch_cell(SourceId::Keys, node, now);
@@ -3333,8 +3332,7 @@ impl DemoApp {
                         self.agent_activity.record(AgentOrigin::Remote, format!("Sources → {uname}"), vec![node], now);
                     }
                     Command::SetRigDevice { node, device } => {
-                        let rig = self.rig_of_node(node);
-                        if let Some(d) = self.rig_device.get_mut(rig) {
+                        if let Some(d) = self.voice_slot_of_node(node).and_then(|r| self.rig_device.get_mut(r)) {
                             *d = device;
                         }
                         if let Some(d) = device {
@@ -3796,7 +3794,7 @@ impl DemoApp {
             "flip_rack" => "Flip rack".into(),
             "set_rig_source" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-                let rig = self.rig_of_node(node);
+                let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
                 format!("Set {} sources", self.rig_name(rig))
             }
             "set_rig_mix" => {
@@ -4629,7 +4627,9 @@ impl DemoApp {
                     (k, l) => k.unwrap_or(false) || l.unwrap_or(false),
                 });
                 let hardware = flag("hardware").unwrap_or(true);
-                let rig = self.rig_of_node(node);
+                let Some(rig) = self.voice_slot_of_node(node) else {
+                    return format!("set_rig_source: node {node} is not a voiced instrument (CLAP synth within the {VOICE_POOL}-voice pool) — see get_rigs");
+                };
                 self.rig_sources[rig] = (keyboard, hardware);
                 self.send_rig_source(node);
                 self.agent_activity.touch_cell(SourceId::Keys, node, now);
@@ -4829,7 +4829,9 @@ impl DemoApp {
             "set_rig_device" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 let device = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32);
-                let rig = self.rig_of_node(node);
+                let Some(rig) = self.voice_slot_of_node(node) else {
+                    return format!("set_rig_device: node {node} is not a voiced instrument (CLAP synth within the {VOICE_POOL}-voice pool) — see get_rigs");
+                };
                 self.rig_device[rig] = device;
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
@@ -5614,7 +5616,8 @@ impl DemoApp {
     }
 
     fn send_rig_source(&self, node: u32) {
-        let rig = self.rig_of_node(node);
+        // A CLAP unit past the voice pool has no voice and no source state.
+        let Some(rig) = self.voice_slot_of_node(node) else { return };
         let (keyboard, hardware) = self.rig_sources[rig];
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::SetRigSource { node, keyboard, hardware });
@@ -6682,7 +6685,7 @@ impl DemoApp {
             .map(|s| s.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         for (slot, node) in self.clap_rigs() {
             let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
-            if let Some(Some(d)) = devs.get(rig) {
+            if let (Some(Some(d)), true) = (devs.get(rig), slot < VOICE_POOL) {
                 self.rig_sources[slot] = (false, true);
                 self.rig_device[slot] = Some(*d);
             }
@@ -9715,9 +9718,12 @@ impl DemoApp {
         self.clap_rigs().into_iter().find(|(_, nid)| *nid == node_id).map(|(rig, _)| rig)
     }
 
-    /// Rig index (voice slot) for a node id; 0 if not a rig.
-    fn rig_of_node(&self, node: u32) -> usize {
-        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).unwrap_or(0)
+    /// The voice slot of a CLAP node: its index into the per-voice state
+    /// (`rig_sources`, `rig_device`, `patch_names`). None for any other node
+    /// and for CLAP units past the voice pool (they have no voice): the old
+    /// "0 if unknown" sent their edits to slot 0 or indexed past the arrays.
+    fn voice_slot_of_node(&self, node: u32) -> Option<usize> {
+        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).filter(|&r| r < VOICE_POOL)
     }
 
     fn fire_keys(&mut self, semitone: usize, amp: f32) { self.fire_keys_with(semitone, amp, true); }
@@ -15953,6 +15959,33 @@ mod rig_switch_tests {
         app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 5, "confirm": true}));
         app.run_assistant_tool("list_rigs", &serde_json::json!({}));
         assert!(app.pending_confirm.is_none());
+    }
+
+    /// Live crash: with more CLAP units than voices (two Surges in rig A plus
+    /// three single-synth rigs), an undo restored sources for voice slot 4 and
+    /// `rig_sources[4]` (len 4) panicked; unknown nodes fell back to slot 0.
+    #[test]
+    fn clap_units_past_the_voice_pool_never_index_voice_state() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::demo_patch();
+        let surge = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+        let extra: Vec<u32> = (0..3).map(|i| g.add_node(surge(), name_bytes(&format!("EXTRA {i}")))).collect();
+        app.build_rack(&g, &[]);
+        let slots = app.clap_rigs();
+        assert!(slots.len() > VOICE_POOL, "{} CLAP units for {VOICE_POOL} voices", slots.len());
+        let past = slots[VOICE_POOL].1;
+        assert_eq!(app.voice_slot_of_node(past), None);
+        assert_eq!(app.voice_slot_of_node(3), None, "Master is no voice (was slot 0)");
+        let before = app.rig_sources;
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": past, "keyboard": false}));
+        assert!(out.contains("not a voiced instrument"), "{out}");
+        let out = app.exec_tool("set_rig_device", &serde_json::json!({"node": past, "device": 0}));
+        assert!(out.contains("not a voiced instrument"), "{out}");
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": 3, "keyboard": false}));
+        assert!(out.contains("not a voiced instrument"), "{out}");
+        assert_eq!(app.rig_sources, before, "no voice slot changed");
+        app.send_rig_source(past);
+        for n in extra { app.send_rig_source(n); }
     }
 
     #[test]

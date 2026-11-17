@@ -429,6 +429,13 @@ Learned so far (2026-11-15, UI polish pass):
     still sounded. `notes_down` keeps one bit per source per note, set on
     note-on and cleared on note-off in `fire_keys_with`
     (`held_notes_stay_lit_on_the_dock_until_released`).
+89. **Per-voice state is indexed by voice slot, and only a voice has one:**
+    `clap_rigs()` numbers every CLAP unit, but `rig_sources` / `rig_device`
+    / `patch_names` hold `VOICE_POOL` entries. With 5+ CLAP units an undo
+    restored sources for slot 4 and the app panicked (live crash); unknown
+    nodes silently mapped to slot 0. Resolve with `voice_slot_of_node`
+    (None past the pool or for non-CLAP nodes), never index by a rig index
+    (`clap_units_past_the_voice_pool_never_index_voice_state`).
 
 ## Working on kabelsalat
 

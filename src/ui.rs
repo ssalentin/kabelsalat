@@ -8936,6 +8936,7 @@ impl DemoApp {
         let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
         let ui_time = self.ui_time;
         let reduce_motion = self.reduce_motion;
+        let demo_agent_hold = self.demo_agent_hold;
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
@@ -8991,6 +8992,12 @@ impl DemoApp {
                                     }
                                 }).response.on_hover_text("chat model — switch any time, the conversation stays");
                             if let Some(m) = pick { self.switch_model(&m); }
+                            if self.demo_agent_hold {
+                                ui.add_space(6.0);
+                                if theme::chip_button(ui, "Replay", false).on_hover_text("replay rack animations (Shift+F12)").clicked() {
+                                    self.replay_agent_rack_animations();
+                                }
+                            }
                             if !self.assistant.history.is_empty() && !self.assistant.busy {
                                 ui.add_space(6.0);
                                 if theme::chip_button(ui, "Clear", false).on_hover_text("clear visible transcript").clicked() {
@@ -9198,19 +9205,22 @@ impl DemoApp {
                                     Self::paint_busy_dots(ui, ui_time, reduce_motion);
                                     ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_COLOR));
                                 });
-                            } else if let Some(label) = &confirm_label {
-                                // #32: the click answers the assistant's question.
-                                ui.horizontal(|ui| {
-                                    ui.add_space(6.0);
-                                    if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
-                                        confirm_choice.set(Some(true));
-                                    }
-                                    ui.add_space(6.0);
-                                    if theme::chip_button(ui, "Cancel", false).clicked() {
-                                        confirm_choice.set(Some(false));
-                                    }
-                                });
-                                ui.add_space(4.0);
+                            }
+                            if !assistant.busy || demo_agent_hold {
+                                if let Some(label) = &confirm_label {
+                                    // #32: the click answers the assistant's question.
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(6.0);
+                                        if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
+                                            confirm_choice.set(Some(true));
+                                        }
+                                        ui.add_space(6.0);
+                                        if theme::chip_button(ui, "Cancel", false).clicked() {
+                                            confirm_choice.set(Some(false));
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
                             }
                         });
                     if let Some(label) = chat_image.as_ref().map(attachment_label) {
@@ -13119,6 +13129,9 @@ impl DemoApp {
         // Dock toggles (F12 / C / V) — handled before the panels so they work
         // even while the chat field has keyboard focus. The dock occupant owns
         // the computer keyboard, but its own close/swap shortcuts never yield.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12)) {
+            self.replay_agent_rack_animations();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
             self.toggle_dock(DockView::Assistant);
         }
@@ -14234,6 +14247,96 @@ fn ui_scale_target() -> f32 {
     })
 }
 
+impl DemoApp {
+    fn replay_agent_rack_animations(&mut self) {
+        let now = self.ui_time;
+        let rm = self.reduce_motion;
+        if let Some(synth_ui) = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)) {
+            let synth_node = self.units[synth_ui].node_id;
+            if let Some(k) = self.units[synth_ui].knobs.iter_mut().find(|k| !k.hidden && k.param.is_some()) {
+                let target = if k.display_value < 0.65 { 0.85 } else { 0.25 };
+                k.glide_to(target, rm);
+            }
+            self.agent_activity.trigger_node_pulse(synth_node, now);
+        }
+        if let Some(k) = self.keys_unit.and_then(|ui| self.units.get(ui)).map(|u| u.node_id) {
+            self.agent_activity.trigger_node_pulse(k, now);
+        }
+        if let Some(c) = self.cables.iter_mut().find(|c| c.dying < 0.0) {
+            c.draw_in = if rm { 1.0 } else { 0.0 };
+            self.agent_activity.touch_edge(c.id, now);
+        }
+    }
+
+    /// Stage `--demo-agent` offline for visual screenshots: finished run,
+    /// live running run with animated phase, attached image chip, Confirm /
+    /// Cancel prompt, and optional mid-flight rack animations.
+    fn stage_demo_agent(&mut self, animate_rack: bool) {
+        self.assistant.key_set = true;
+        self.dock = DockView::Assistant;
+        self.demo_agent_hold = true;
+        self.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        self.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+
+        self.assistant.history.clear();
+        self.transcript_runs.clear();
+        self.active_run_user_idx = None;
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split at C4 and level Rig A.".into(),
+        });
+        self.transcript_runs.insert(
+            0,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: Self::human_tool_label("set_split", &serde_json::json!({"point": 60})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label(LOOK_TOOL, &serde_json::json!({})), state: ToolChipState::Done },
+                ],
+                expanded: false,
+                cost_line: Some("2 steps · 1.1 s · deepseek-chat".into()),
+            },
+        );
+        self.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split **Keys** at C4 and set **Rig A** to 0.85.".into(),
+        });
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Brighten Surge A and remove Rig B.".into(),
+        });
+        self.transcript_runs.insert(
+            2,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
+                ],
+                expanded: true,
+                cost_line: None,
+            },
+        );
+        self.assistant.busy = true;
+        self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
+            step: 2,
+            model: "deepseek-chat".into(),
+            seeing: false,
+        });
+        self.chat_image = Image::from_rgba("rack-sketch.png", [4, 4], &[40u8; 4 * 4 * 4]).ok();
+        self.pending_confirm = Some(PendingConfirm {
+            tool: "delete_rig".into(),
+            args: serde_json::json!({"rig": 1}),
+            label: "Delete rig 2 · Rig B".into(),
+        });
+        if animate_rack {
+            self.replay_agent_rack_animations();
+        }
+    }
+}
+
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
     // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
     // must reparent into our window; (2) winit has no fractional-scale support,
@@ -14419,20 +14522,10 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     if std::env::args().any(|a| a == "--metro") {
                         app.add_metronome_to_active_rig();
                     }
-                    if std::env::args().any(|a| a == "--demo-agent") {
-                        app.assistant.key_set = true;
-                        app.dock = DockView::Assistant;
-                        app.demo_agent_hold = true;
-                        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
-                        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
-                        app.assistant.history.push(ChatLine {
-                            role: "user".into(),
-                            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
-                        });
-                        app.assistant.history.push(ChatLine {
-                            role: "assistant".into(),
-                            text: "Split **Keys** at C4 and set **Rig A** volume to 0.85.".into(),
-                        });
+                    let demo_agent = std::env::args().any(|a| a == "--demo-agent");
+                    let demo_anim = std::env::args().any(|a| a == "--demo-agent-anim");
+                    if demo_agent || demo_anim {
+                        app.stage_demo_agent(demo_anim);
                     }
                     app
                 }
@@ -18843,6 +18936,57 @@ mod ui_polish_agent_tests {
         let _ = run_unfocused(&mut app);
         let settled_delay = run_unfocused(&mut app);
         assert!(settled_delay >= std::time::Duration::from_millis(30), "settled delay: {settled_delay:?}");
+    }
+
+    #[test]
+    fn step5_staged_demo_agent_shows_full_ui_and_replays_rack_animations() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        app.stage_demo_agent(false);
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        let mut texts = Vec::new();
+        for _ in 0..5 {
+            texts = run_frame(&mut app, &ctx, size, vec![]);
+        }
+
+        // Finished run: user message, action chips, assistant message, cost line.
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing finished chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "+1 more"), "missing collapsed chip button: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat"), "missing cost line: {texts:?}");
+        // Running run: animated status label + running chip (no static "thinking…").
+        assert!(texts.iter().any(|(t, _)| t == "DeepSeek · step 2"), "missing live phase label: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
+        // Attached image chip + Confirm / Cancel prompt + Replay chip.
+        assert!(texts.iter().any(|(t, _)| t.contains("rack-sketch.png")), "missing attached image chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Replay"), "missing replay chip: {texts:?}");
+
+        // Replay rack animations via Shift+F12.
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.events.push(egui::Event::Key {
+            key: Key::F12,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        });
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        let synth = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let synth_node = synth.node_id;
+        let gliding = synth.knobs.iter().any(|k| !k.hidden && k.param.is_some() && k.glide_t < 1.0 && (k.value - k.display_value).abs() > 0.05);
+        assert!(gliding, "Shift+F12 must trigger knob glide on Surge");
+        assert!(app.cables.iter().any(|c| c.draw_in < 1.0), "Shift+F12 must trigger cable draw-in");
+        app.update(0.15);
+        assert!(app.agent_activity.node_pulse(synth_node, app.ui_time, false) > 0.0, "Shift+F12 must pulse touched synth unit");
     }
 }
 

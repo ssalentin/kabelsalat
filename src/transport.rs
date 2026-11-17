@@ -228,9 +228,9 @@ fn onset_grid_hz(onsets: &[f64], sample_rate: f64) -> f64 {
 }
 
 /// Which of the 16 sequencer steps was playing when the onsets start, at
-/// `step_hz` steps per second: the rotation of the patch's trigger mask that
+/// `step_hz` steps per second: the rotation of the patch's sounding mask that
 /// best covers the onset energy per step (silent steps have none). Returns
-/// (step, share of onset energy on triggering steps for that rotation).
+/// (step, share of onset energy on sounding steps for that rotation).
 fn sequencer_step_at_start(onsets: &[f64], sample_rate: f64, step_hz: f64) -> (usize, f64) {
     let mut per_step = [0.0f64; 16];
     for (i, o) in onsets.iter().enumerate() {
@@ -240,17 +240,20 @@ fn sequencer_step_at_start(onsets: &[f64], sample_rate: f64, step_hz: f64) -> (u
     let total: f64 = per_step.iter().sum::<f64>().max(f64::MIN_POSITIVE);
     (0..16)
         .map(|start| {
-            let on_triggers: f64 = (0..16)
-                .filter(|slot| GATE_CHORD_TRIGGERS >> ((slot + start) % 16) & 1 == 1)
+            let on_sounding: f64 = (0..16)
+                .filter(|slot| GATE_CHORD_SOUNDING >> ((slot + start) % 16) & 1 == 1)
                 .map(|slot| per_step[slot])
                 .sum();
-            (start, on_triggers / total)
+            (start, on_sounding / total)
         })
         .fold((0, 0.0), |best, r| if r.1 > best.1 { r } else { best })
 }
-/// "Gate Chord"'s `trigmask`: bit k set = step k retriggers the envelopes.
-/// Steps 9, 10, 12 and 15 are silent, so every rotation is distinct.
-const GATE_CHORD_TRIGGERS: u32 = 27135;
+/// Steps where "Gate Chord" produces onset energy: every step except 9, 10, 15.
+/// `trigmask` (27135) also clears bit 12 (no envelope retrigger), but step 12
+/// opens the filter (`s12 = 0.833333`) over step 11's envelope + 1/4-note
+/// delay (`fx5`), so step 12 is loud; marking it silent let free-running
+/// unison phase variance tip false rotations ahead of the true step.
+const GATE_CHORD_SOUNDING: u32 = 0xffff & !((1 << 9) | (1 << 10) | (1 << 15));
 
 /// `transport-test`: real Surge XT, hosted by the real engine, must follow the
 /// engine's tempo, song position and play state. The factory patch
@@ -349,7 +352,7 @@ pub fn run_test() -> anyhow::Result<()> {
         let host_step = (at.beats * 4.0).round() as usize % 16;
         let want = if stop_first { (host_step + PAUSE_STEPS) % 16 } else { host_step };
         println!(
-            "transport-test: note at engine beat {:.2} ({}) → Surge's sequencer on step {step:>2}, expected {want:>2} ({:.0}% of onset energy on its trigger steps)",
+            "transport-test: note at engine beat {:.2} ({}) → Surge's sequencer on step {step:>2}, expected {want:>2} ({:.0}% of onset energy on its sounding steps)",
             at.beats,
             if at.playing { "playing" } else { "stopped" },
             share * 100.0
@@ -386,7 +389,7 @@ pub fn run_test() -> anyhow::Result<()> {
     );
     let (step0, share0) = sequencer_step_at_start(&hold_note(&mut engine, &mut bus, 4.0), SR, STEP_HZ);
     println!(
-        "transport-test: after 4-beat count-in at engine beat {:.2} (playing) → Surge's sequencer on step {step0:>2} ({:.0}% on trigger steps)",
+        "transport-test: after 4-beat count-in at engine beat {:.2} (playing) → Surge's sequencer on step {step0:>2} ({:.0}% on sounding steps)",
         after_count_in.beats,
         share0 * 100.0
     );
@@ -401,7 +404,7 @@ pub fn run_test() -> anyhow::Result<()> {
     );
     let (step2, share2) = sequencer_step_at_start(&hold_note(&mut engine, &mut bus, 4.0), SR, STEP_HZ);
     println!(
-        "transport-test: count-in + 0.50 song beats (playing) → Surge's sequencer on step {step2:>2} ({:.0}% on trigger steps)",
+        "transport-test: count-in + 0.50 song beats (playing) → Surge's sequencer on step {step2:>2} ({:.0}% on sounding steps)",
         share2 * 100.0
     );
     anyhow::ensure!(step2 == 2, "expected Surge on step 2 after count-in + 0.5 beat, got {step2}");
@@ -558,5 +561,26 @@ mod tests {
         let c4 = MasterClock::CountingIn { remaining_beats: 0.2, total_beats: 4.0 };
         assert_eq!(c4.count_in_beat(), 4);
         assert_eq!(MasterClock::Playing.count_in_beat(), 0);
+    }
+
+    #[test]
+    fn gate_chord_sounding_mask_separates_every_rotation() {
+        // Observed step-energy profile of Gate Chord (step 12 is loud; 9, 10, 15 are silent).
+        let profile = [
+            0.05, 0.04, 0.10, 0.04, 0.11, 0.04, 0.05, 0.11,
+            0.04, 0.007, 0.013, 0.13, 0.08, 0.04, 0.08, 0.018,
+        ];
+        let step_hz = 8.0;
+        let hops = (16.0 * SR / (step_hz * ONSET_HOP as f64)).ceil() as usize;
+        for start in 0..16 {
+            let mut onsets = vec![0.0; hops];
+            for slot in 0..16 {
+                let idx = ((slot as f64 + 0.5) * SR / (step_hz * ONSET_HOP as f64)) as usize;
+                onsets[idx] = profile[(slot + start) % 16];
+            }
+            let (got, share) = sequencer_step_at_start(&onsets, SR, step_hz);
+            assert_eq!(got, start, "rotation {start} misidentified as {got}");
+            assert!(share > 0.94, "expected >94% on sounding steps, got {share}");
+        }
     }
 }

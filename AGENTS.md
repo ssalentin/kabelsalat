@@ -352,6 +352,12 @@ Learned so far (2026-11-15, UI polish pass):
     2b runs DSP and LV2 effects in one dependency order (`next_effect`)
     and sums via `sum_audio_into`; add any new node type as a source there.
     `lv2-instrument-engine-test` plays setBfree through a Saturation unit.
+74. **Check a plugin test mask against rendered audio, not XML flags alone:**
+    Surge's `Gate Chord` clears `trigmask` bit 12 (no envelope retrigger),
+    yet step 12 opens the filter (`s12 = 0.833`) over step 11's envelope +
+    delay (~8% of onset energy), so treating bit 12 as silent shrank the
+    rotation margin until free-running unison phases flipped steps (#18).
+    Verify step/gate masks against actual rendered energy before shipping.
 
 ## Working on kabelsalat
 

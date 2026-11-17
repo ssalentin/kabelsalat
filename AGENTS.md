@@ -317,6 +317,15 @@ Learned so far (2026-11-15, UI polish pass):
     instrument tools called `ui_bridge_tool("install_instrument")` but the
     app's serve list did not include them, so attached agents got "not
     served". `ui_bridge_tools_cover_mcp` reads mcp.rs and fails on any gap.
+67. **Knob names live in one table:** `engine::knob_specs` defines every
+    rack knob (label, default, param, aliases); `make_unit`, the UI resolver
+    and headless MCP all read it. Headless MCP used `dsp_param_choices` names,
+    so `knob="RESO"` failed and `CEILING` bound the DRIVE knob. Add knobs
+    there, never as a literal in a face or a resolver.
+68. **A knob on the face drives something, or is not bindable:** the
+    system-audio GAIN knob was visual only (no SetParam path). A knob with
+    `param: Some(..)` must reach the engine via `apply_engine_param`, and
+    any engine state it shows is published back (here `GraphPub::system_gain`).
 
 ## Working on kabelsalat
 

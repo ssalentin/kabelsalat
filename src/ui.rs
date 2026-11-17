@@ -862,10 +862,13 @@ struct CcLearn {
     replace_existing: bool,
 }
 
+/// The knob context menu, keyed by what the knob drives — never unit/knob
+/// indices, which a rebuild can shift under an open menu (rule 10, #24).
 #[derive(Clone, Copy)]
 struct KnobMenu {
-    unit: usize,
-    idx: usize,
+    node: u32,
+    param: u32,
+    target: crate::matrix::CcTarget,
     pos: Pos2,
 }
 
@@ -1002,25 +1005,27 @@ fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
 /// Unit identity is carried by typography and position — no per-unit hues.
 fn make_unit(node: &Node) -> Unit {
     let name = name_str(&node.name).to_string();
-    let (node_kind, sub, ins, outs, knobs, jacks): (
-        UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<Knob>, Vec<(Dir, usize, f32, &'static str)>,
+    // Knobs come from the one table agents resolve names against (#19).
+    let knobs: Vec<Knob> = crate::engine::knob_specs(&node.kind)
+        .iter()
+        .map(|k| if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) })
+        .collect();
+    let (node_kind, sub, ins, outs, jacks): (
+        UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<(Dir, usize, f32, &'static str)>,
     ) = match &node.kind {
         NodeKind::Keys => (
             UnitKind::Keys, "midi source".into(),
             vec![], vec![PortKind::Midi, PortKind::Midi],
-            vec![knob("RATE", 0.5, None), knob("VEL", 0.8, None)],
             keys_jacks(node.split),
         ),
         NodeKind::Clap { .. } => (
             UnitKind::Clap, "synth · clap".into(),
             vec![PortKind::Midi], vec![PortKind::Audio],
-            vec![knob("TONE", 0.35, None), knob("LEVEL", 0.85, Some(P_LEVEL))],
             vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
             vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
-            vec![knob("VOLUME", 1.0, Some(P_VOL)), knob("WARM", 0.15, Some(P_WARM))],
             // L · R as a stereo pair, MONO apart (between them it read as a
             // center channel — vision review).
             vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
@@ -1028,51 +1033,41 @@ fn make_unit(node: &Node) -> Unit {
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
             vec![PortKind::Audio, PortKind::Midi], vec![PortKind::Audio],
-            vec![knob("TIME", 0.4, Some(P_TIME)), knob("MIX", 0.5, Some(P_MIX))],
             // IN sits under Surge's OUT (right) and MIDI IN faces Keys (left):
             // the audio cable no longer crosses the MIDI jack (vision review).
             vec![(Dir::In, 1, 0.22, "MIDI IN"), (Dir::Out, 0, 0.48, "OUT"), (Dir::In, 0, 0.74, "IN")],
         ),
         NodeKind::Dsp(kind) => {
-            // Generic DSP face: 1–2 knobs on engine params 0/1.
-            let (knobs, sub): (Vec<Knob>, String) = match kind {
-                DspKind::Reverb => (vec![knob("MIX", 0.35, Some(0)), knob("SIZE", 0.5, Some(1))], "reverb".into()),
-                DspKind::Gain => (vec![knob("GAIN", 0.9, Some(0))], "gain".into()),
-                DspKind::Filter => (vec![knob("CUTOFF", 0.45, Some(0)), knob("RESO", 0.2, Some(1))], "filter".into()),
-                DspKind::Eq3 => (vec![knob("LOW", 0.5, Some(0)), knob("HIGH", 0.5, Some(1))], "3-band eq".into()),
-                DspKind::Limiter => (vec![knob("CEIL", 0.8, Some(0)), knob("DRIVE", 0.2, Some(1))], "limiter".into()),
-                DspKind::Saturation => (vec![knob("DRIVE", 0.4, Some(0)), knob("MIX", 0.5, Some(1))], "saturation".into()),
-                DspKind::Pan => (vec![knob("PAN", 0.5, Some(0))], "panner".into()),
-                DspKind::Metronome => (vec![], "metronome · transport click".into()),
+            let sub: &str = match kind {
+                DspKind::Reverb => "reverb",
+                DspKind::Gain => "gain",
+                DspKind::Filter => "filter",
+                DspKind::Eq3 => "3-band eq",
+                DspKind::Limiter => "limiter",
+                DspKind::Saturation => "saturation",
+                DspKind::Pan => "panner",
+                DspKind::Metronome => "metronome · transport click",
                 DspKind::Delay => unreachable!(),
             };
             (
-                UnitKind::Dsp(kind.clone()), sub,
+                UnitKind::Dsp(kind.clone()), sub.into(),
                 vec![PortKind::Audio], vec![PortKind::Audio],
-                knobs,
                 vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
             )
         }
         NodeKind::Lv2 { .. } => (
             UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(),
             vec![PortKind::Audio], vec![PortKind::Audio],
-            vec![knob("GAIN", 0.9, Some(0))],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
-            // Visual only: capture gain changes via SetSystemAudio, which has
-            // no SetParam/CC path — a bindable knob here would look live but do nothing.
-            vec![knob("GAIN", 0.5, None)],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         ),
         NodeKind::AudioIn { device, channels } => (
             UnitKind::AudioIn, audio_in_sub(device.as_deref(), *channels),
             vec![], vec![PortKind::Audio],
-            // GAIN is a real bindable engine param; MON is a hidden knob whose
-            // value the face renders as a MON chip (still SetParam/CC path).
-            vec![knob("GAIN", 0.5, Some(P_AUDIO_IN_GAIN)), hidden_knob("MON", 0.0, Some(P_AUDIO_IN_MONITOR))],
             vec![(Dir::Out, 0, 0.62, "OUT")],
         )
     };
@@ -1404,7 +1399,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
-    "list_instruments", "install_instrument",
+    "list_instruments", "install_instrument", "play_file", "stop_file",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3019,6 +3014,18 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            // System-audio GAIN knobs follow SetSystemAudio from any frontend
+            // (one engine-wide gain; `sent` matches so it is not echoed back).
+            if !matches!(self.drag, Drag::Knob { .. }) {
+                for u in &mut self.units {
+                    for k in &mut u.knobs {
+                        if k.param == Some(crate::engine::P_SYSTEM_GAIN) && (k.value - g.system_gain).abs() > 1e-4 {
+                            k.value = g.system_gain;
+                            k.sent = Some(g.system_gain);
+                        }
+                    }
+                }
+            }
         }
         // Master meter mirror (Bravo 1): the engine publishes a fresh snapshot
         // every block.
@@ -4064,6 +4071,9 @@ impl DemoApp {
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.8).clamp(0.0, 1.0) as f32;
                 if path.is_empty() {
                     return "play_file needs a path to a WAV file (16/24-bit PCM or 32-bit float)".into();
+                }
+                if !std::path::Path::new(path).is_file() {
+                    return format!("play_file: no file at '{path}'");
                 }
                 if let Some(pc) = &self.player_ctrl {
                     pc.play(path);
@@ -5474,11 +5484,14 @@ impl DemoApp {
                 Vec::new()
             }
             UnitKind::Dsp(dk) => {
-                if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node_id).map(|n| &n.kind) {
+                let kind = self.base_graph.node(node_id).map(|n| &n.kind);
+                if let Some(NodeKind::Lv2 { uri }) = kind {
                     crate::lv2::control_descs_for_uri(uri.as_str())
                         .into_iter()
                         .map(|c| (c.index as u32, c.name))
                         .collect()
+                } else if matches!(kind, Some(NodeKind::SystemAudio)) {
+                    vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())]
                 } else {
                     crate::engine::dsp_param_choices(dk)
                         .iter()
@@ -5505,7 +5518,11 @@ impl DemoApp {
     fn resolve_unit_knob(&self, node_id: u32, knob: &str) -> Result<(u32, crate::matrix::CcTarget), String> {
         let u = self.units.iter().find(|u| u.node_id == node_id)
             .ok_or_else(|| format!("no unit with node id {node_id}"))?;
-        let q = knob.trim().to_uppercase();
+        // Long names ("RESONANCE") resolve through the shared table's aliases.
+        let canonical = self.base_graph.node(node_id)
+            .and_then(|n| crate::engine::find_knob_spec(&n.kind, knob))
+            .map(|spec| spec.label);
+        let q = canonical.unwrap_or(knob).trim().to_uppercase();
         for k in &u.knobs {
             if k.label.to_uppercase() == q {
                 return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
@@ -9332,12 +9349,15 @@ impl DemoApp {
                         let same_learning = self.cc_learn.as_ref().is_some_and(|l| {
                             l.dest == node_id && l.param == param && l.target == tgt
                         });
+                        let menu = KnobMenu { node: node_id, param, target: tgt, pos: s };
                         if same_learning {
-                            self.cc_learn = None;
-                            self.knob_menu = None;
+                            // Learning keeps running until the menu decides:
+                            // Cancel MIDI learn, or Reset (#20 — the only way
+                            // to reset an unbound knob without the global R).
+                            self.knob_menu = Some(menu);
                         } else if self.knob_cc_binding(node_id, param, tgt).is_some() {
                             self.cc_learn = None;
-                            self.knob_menu = Some(KnobMenu { unit, idx, pos: s });
+                            self.knob_menu = Some(menu);
                         } else {
                             self.knob_menu = None;
                             self.cc_learn = Some(CcLearn {
@@ -10894,40 +10914,36 @@ impl DemoApp {
         }
     }
 
+    /// (unit, knob) indices of the knob a menu is about, resolved this frame.
+    fn knob_menu_target(&self, menu: &KnobMenu) -> Option<(usize, usize)> {
+        let unit = self.units.iter().position(|u| u.node_id == menu.node)?;
+        let idx = self.units[unit].knobs.iter().position(|k| k.cc_target() == Some((menu.param, menu.target)))?;
+        Some((unit, idx))
+    }
+
     fn knob_menu_ui(&mut self, ctx: &egui::Context) {
         let Some(menu) = self.knob_menu else {
             self.knob_menu_rect = Rect::NOTHING;
             return;
         };
+        let close = |app: &mut Self| {
+            app.knob_menu = None;
+            app.knob_menu_rect = Rect::NOTHING;
+        };
         if self.stage_view != StageView::Rack || self.side != Side::Front {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
+            return close(self);
         }
-        let Some(u) = self.units.get(menu.unit) else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let Some(k) = u.knobs.get(menu.idx) else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let Some((param, target)) = k.cc_target() else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
-        let node_id = u.node_id;
-        let title = format!("{} · {}", sentence_case(&u.name), k.label);
+        let Some((unit, idx)) = self.knob_menu_target(&menu) else { return close(self) };
+        let (node_id, param, target) = (menu.node, menu.param, menu.target);
+        let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node_id && l.param == param && l.target == target);
         let binding = self.knob_cc_binding(node_id, param, target);
-        let Some((src, cc)) = binding else {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            return;
-        };
+        if binding.is_none() && !learning {
+            return close(self);
+        }
+        let u = &self.units[unit];
+        let title = format!("{} · {}", sentence_case(&u.name), u.knobs[idx].label);
         let mut relearn = false;
+        let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
         let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
@@ -10949,14 +10965,25 @@ impl DemoApp {
                     .show(ui, |ui| {
                         ui.set_min_width(170.0);
                         ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
-                        ui.label(egui::RichText::new(format!("CC {cc} · {}", Self::source_str(src))).size(11.0).color(theme::MIDI_BLUE));
+                        let status = match binding {
+                            Some((src, cc)) if learning => format!("CC {cc} · {} · learning…", Self::source_str(src)),
+                            Some((src, cc)) => format!("CC {cc} · {}", Self::source_str(src)),
+                            None => "MIDI learn · move a controller".to_string(),
+                        };
+                        ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
                         ui.add_space(6.0);
-                        if theme::chip_button(ui, "MIDI learn again", false).clicked() {
+                        if learning {
+                            if theme::chip_button(ui, "Cancel MIDI learn", false).clicked() {
+                                cancel_learn = true;
+                            }
+                        } else if theme::chip_button(ui, "MIDI learn again", false).clicked() {
                             relearn = true;
                         }
-                        ui.add_space(4.0);
-                        if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
-                            clear = true;
+                        if binding.is_some() {
+                            ui.add_space(4.0);
+                            if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
+                                clear = true;
+                            }
                         }
                         ui.add_space(4.0);
                         if theme::chip_button(ui, "Reset to default", false).clicked() {
@@ -10965,9 +10992,11 @@ impl DemoApp {
                     });
             });
         self.knob_menu_rect = area.response.rect;
+        if !(relearn || cancel_learn || clear || reset_val) {
+            return;
+        }
+        close(self);
         if relearn {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
             self.cc_learn = Some(CcLearn {
                 source: SourceId::Keys,
                 dest: node_id,
@@ -10975,16 +11004,18 @@ impl DemoApp {
                 target,
                 replace_existing: true,
             });
-        } else if clear {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
+            return;
+        }
+        // Every other choice ends a learn the right-click started, so a later
+        // controller move cannot bind the knob by surprise.
+        if learning {
+            self.cc_learn = None;
+        }
+        if clear {
             self.clear_knob_bindings(node_id, param, target);
         } else if reset_val {
-            self.knob_menu = None;
-            self.knob_menu_rect = Rect::NOTHING;
-            if let Some(k) = self.units.get_mut(menu.unit).and_then(|u| u.knobs.get_mut(menu.idx)) {
-                k.value = k.default;
-            }
+            let k = &mut self.units[unit].knobs[idx];
+            k.value = k.default;
         }
     }
 
@@ -13629,6 +13660,27 @@ mod rig_switch_tests {
             .any(|r| r.keys.iter().any(|g| g.text() == "F10") && r.desc.text().contains("mixer"))
     }
 
+    /// #22: attached agents can start and stop backing tracks.
+    #[test]
+    fn play_file_and_stop_file_are_served_over_the_bridge() {
+        let (mut app, _ctx) = two_rigs();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus))); // the inbox is served only with an engine
+        let ask = |app: &mut DemoApp, tool: &str, args: serde_json::Value| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            crate::bridge::UI_INBOX.lock().unwrap().push((tool.into(), args, tx));
+            app.serve_ui_inbox();
+            rx.recv().unwrap()
+        };
+        let missing = ask(&mut app, "play_file", serde_json::json!({"path": "/nonexistent/take.wav"}));
+        assert!(missing.contains("no file"), "{missing}");
+        let stopped = ask(&mut app, "stop_file", serde_json::json!({}));
+        assert_eq!(stopped, "file player stopped");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayer { gain } if *gain == 0.0)), "{cmds:?}");
+    }
+
     #[test]
     fn ui_bridge_tools_cover_mcp() {
         // Rule 6 for the attached path: an MCP tool forwarded to the app that
@@ -14950,9 +15002,17 @@ mod split_bpm_tests {
         assert!(app.cc_learn.is_some(), "right-click armed knob MIDI learn");
         assert!(texts.iter().any(|t| t == "LEARN"), "LEARN badge painted: {texts:?}");
 
-        // 2. Right-click again cancels learning.
-        let texts = rclick(&mut app, &ctx, level_pos);
-        assert!(app.cc_learn.is_none(), "second right-click cancels learn");
+        // 2. Right-click again opens the menu (learn still armed); its first
+        // button cancels learning (#20).
+        rclick(&mut app, &ctx, level_pos);
+        assert!(app.cc_learn.is_some() && app.knob_menu.is_some(), "second right-click opens the menu");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "Cancel MIDI learn"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "Reset to default"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "Clear MIDI map"), "nothing bound yet: {texts:?}");
+        click(&mut app, &ctx, knob_menu_buttons(&ctx)[0].center());
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none() && app.knob_menu.is_none(), "Cancel MIDI learn disarms");
         assert!(!texts.iter().any(|t| t == "LEARN"));
 
         // 3. Esc cancels learning on the rack.
@@ -15006,6 +15066,57 @@ mod split_bpm_tests {
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
     }
 
+    /// Buttons of the knob context menu, top to bottom (previous pass).
+    /// Buttons = click + focusable, no drag; the Area move widget is not focusable.
+    fn knob_menu_buttons(ctx: &egui::Context) -> Vec<Rect> {
+        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        ctx.viewport(|v| {
+            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
+                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
+                .map(|w| w.rect)
+                .collect();
+            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            btns
+        })
+    }
+
+    /// #20: an unbound knob can be reset from the menu — right-click arms
+    /// learn, right-click again opens Reset / Cancel learn.
+    #[test]
+    fn rack_knob_unbound_reset_from_the_learn_menu() {
+        let (mut app, ctx) = demo();
+        frame(&mut app, &ctx, vec![]);
+        let (surge_unit, level_idx) = (1usize, 1usize);
+        let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
+        app.units[surge_unit].knobs[level_idx].value = 0.1;
+        rclick(&mut app, &ctx, level_pos);
+        rclick(&mut app, &ctx, level_pos);
+        frame(&mut app, &ctx, vec![]);
+        let btns = knob_menu_buttons(&ctx);
+        assert_eq!(btns.len(), 2, "Cancel MIDI learn + Reset to default");
+        click(&mut app, &ctx, btns[1].center());
+        let k = &app.units[surge_unit].knobs[level_idx];
+        assert!((k.value - k.default).abs() < 1e-6, "Reset to default");
+        assert!(app.cc_learn.is_none(), "reset also ends the learn the right-click armed");
+        assert!(app.knob_menu.is_none());
+    }
+
+    /// #24: the menu names its knob by node + param, so a unit reorder under
+    /// an open menu still resolves the same knob.
+    #[test]
+    fn knob_menu_follows_its_knob_by_id_not_index() {
+        let (mut app, ctx) = demo();
+        frame(&mut app, &ctx, vec![]);
+        let (surge_unit, level_idx) = (1usize, 1usize);
+        let node = app.units[surge_unit].node_id;
+        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO };
+        assert_eq!(app.knob_menu_target(&menu), Some((surge_unit, level_idx)));
+        app.units.swap(0, surge_unit);
+        assert_eq!(app.knob_menu_target(&menu), Some((0, level_idx)), "follows the unit to its new index");
+        app.units.retain(|u| u.node_id != node);
+        assert_eq!(app.knob_menu_target(&menu), None, "a removed knob closes the menu");
+    }
+
     #[test]
     fn rack_knob_bound_menu_relearn_and_clear() {
         let (mut app, ctx) = demo();
@@ -15031,17 +15142,7 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Clear MIDI map"), "menu shows clear: {texts:?}");
 
         // Find and click "MIDI learn again" widget rect from the foreground layer.
-        // Buttons = click + focusable, no drag. Selectable labels drag; the Area
-        // move widget is click-only (not focusable).
-        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
-        let menu_buttons = || ctx.viewport(|v| {
-            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
-                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
-                .map(|w| w.rect)
-                .collect();
-            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
-            btns
-        });
+        let menu_buttons = || knob_menu_buttons(&ctx);
         let relearn_rect = menu_buttons()[0];
         click(&mut app, &ctx, relearn_rect.center());
         assert!(app.knob_menu.is_none());

@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **MCP `play_file` / `stop_file`** (#22): attached agents
+  (`kabelsalat mcp --attach`) can start and stop backing tracks through the UI
+  bridge; headless `stop_file` mutes the player.
+- **Reset an unbound knob from its menu** (#20): right-click arms MIDI learn,
+  a second right-click opens the menu (Cancel MIDI learn / Reset to default)
+  instead of only cancelling.
 - **setBfree plays** (#36): the LV2 host now provides the Worker extension
   (`work:schedule`); each plugin with a `worker#interface` gets a non-RT worker
   thread fed through two lock-free rings (requests and responses), with
@@ -58,6 +64,16 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- **System audio GAIN knob works** (#21): it sets the capture gain through
+  SetParam (so it is MIDI-bindable), starts muted, and follows
+  `system_audio`/`set_system_audio` changes from any agent.
+- **Headless MCP knob names match the rack** (#19): one knob table for the
+  rack, the in-app agent and headless MCP (`RESO`, `CEIL`; long names like
+  `RESONANCE` as aliases); headless `list_params` lists the knobs. Headless
+  `CEILING` no longer binds the DRIVE knob, and the limiter's params are named
+  Ceiling/Drive.
+- The knob context menu keys its knob by node + param, not unit/knob indices
+  (#24).
 - The top bar no longer runs past the window edge in narrow windows (compact
   mode, window-width based); the info line is truncated or moves to the hint row.
 - The master output was 2–4 dB too quiet at full volume: level lost in the

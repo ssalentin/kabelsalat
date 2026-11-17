@@ -313,6 +313,15 @@ struct SetPlayerArgs {
     gain: f32,
 }
 
+/// Arguments for `play_file`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct PlayFileArgs {
+    /// Absolute path to a WAV file (16/24-bit PCM or 32-bit float).
+    path: String,
+    /// Mix level 0..1 (default 0.8).
+    gain: Option<f32>,
+}
+
 /// Arguments for `set_bpm`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetBpmArgs {
@@ -1210,7 +1219,7 @@ impl McpServer {
     }
 
     /// Set the file-player mix gain.
-    #[tool(name = "set_player", description = "Set the backing-track file player's mix gain (Command::SetPlayer), 0..1, 0 mutes. Loading a file is done in the GUI app (play_file assistant tool) since paths can't cross the fixed-size command bus.")]
+    #[tool(name = "set_player", description = "Set the backing-track file player's mix gain (Command::SetPlayer), 0..1, 0 mutes. Start a file with play_file (needs the running app).")]
     fn set_player(&self, Parameters(args): Parameters<SetPlayerArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         let gain = args.gain.clamp(0.0, 1.0);
@@ -1218,6 +1227,31 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"gain": gain}))
+    }
+
+    /// Start a backing track in the running app (the path crosses the UI
+    /// bridge; the fixed-size command bus cannot carry it).
+    #[tool(name = "play_file", description = "Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). Needs the running app (kabelsalat mcp --attach).")]
+    fn play_file(&self, Parameters(args): Parameters<PlayFileArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !remote {
+            return tool_err("play_file needs the running app (kabelsalat mcp --attach) — headless mode has no file player");
+        }
+        Self::ui_bridge_tool("play_file", json!({"path": args.path, "gain": args.gain.unwrap_or(0.8)}))
+    }
+
+    /// Stop the backing track.
+    #[tool(name = "stop_file", description = "Stop the backing-track file player (and mute its mix).")]
+    fn stop_file(&self) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("stop_file", json!({}));
+        }
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain: 0.0 }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"stopped": true}))
     }
 
     /// Select which hardware device feeds a rig.
@@ -1305,20 +1339,12 @@ impl McpServer {
         }
     }
 
+    /// Same table as the rack faces (`engine::knob_specs`): labels like
+    /// "RESO"/"CEIL" are canonical, long names ("RESONANCE") are aliases.
     fn resolve_headless_knob(kind: &NodeKind, knob: &str) -> Result<u32, String> {
-        let q = knob.trim().to_uppercase();
-        match kind {
-            NodeKind::Clap { .. } if q == "LEVEL" => Ok(crate::engine::P_LEVEL),
-            NodeKind::MasterOut if q == "VOLUME" || q == "VOL" => Ok(crate::engine::P_VOL),
-            NodeKind::MasterOut if q == "WARM" || q == "WARMTH" => Ok(crate::engine::P_WARM),
-            NodeKind::Dsp(dk) => crate::engine::dsp_param_choices(dk)
-                .iter()
-                .find(|&&(_, name)| name.to_uppercase() == q)
-                .map(|&(id, _)| id)
-                .ok_or_else(|| format!("no knob '{knob}' on DSP node")),
-            NodeKind::Lv2 { .. } if q == "GAIN" => Ok(0),
-            _ => Err(format!("no knob '{knob}' on this node")),
-        }
+        let spec = crate::engine::find_knob_spec(kind, knob)
+            .ok_or_else(|| format!("no knob '{knob}' on this node"))?;
+        spec.param.ok_or_else(|| format!("knob '{}' is local-only", spec.label))
     }
 
     /// Bind or unbind one CC on a matrix rule.
@@ -1535,7 +1561,8 @@ impl McpServer {
             NodeKind::Clap { .. } => {
                 return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
             }
-            NodeKind::Keys | NodeKind::SystemAudio => Vec::new(),
+            NodeKind::SystemAudio => vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())],
+            NodeKind::Keys => Vec::new(),
         };
         let q = args.query.unwrap_or_default().to_lowercase();
         let words: Vec<&str> = q.split_whitespace().collect();
@@ -1549,7 +1576,11 @@ impl McpServer {
             .take(50)
             .map(|(id, name)| json!({"id": id, "name": name}))
             .collect();
-        ok_json(json!({"node": args.node, "total": total, "params": params}))
+        let knobs: Vec<Value> = crate::engine::knob_specs(&n.kind)
+            .iter()
+            .filter_map(|k| k.param.map(|p| json!({"label": k.label, "param": p, "target": "knob"})))
+            .collect();
+        ok_json(json!({"node": args.node, "total": total, "params": params, "knobs": knobs}))
     }
 
     /// Arm MIDI-learn in the running GUI app.
@@ -2317,6 +2348,45 @@ mod tests {
         // never a local pacman/git subprocess on the server thread.
         assert!(is_err(server.install_instrument(Parameters(args(json!({"id": "setbfree", "confirm": true}))))),
             "headless install (no running app) is refused even with confirm");
+    }
+
+    /// #19: headless knob names are the rack labels (long names as aliases),
+    /// and headless list_params lists the knobs like the attached app does.
+    #[test]
+    fn headless_knob_names_match_the_rack_labels() {
+        let lim = NodeKind::Dsp(crate::control::DspKind::Limiter);
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "CEIL"), Ok(0));
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "ceiling"), Ok(0), "CEILING never binds DRIVE");
+        assert_eq!(McpServer::resolve_headless_knob(&lim, "DRIVE"), Ok(1));
+        let filter = NodeKind::Dsp(crate::control::DspKind::Filter);
+        assert_eq!(McpServer::resolve_headless_knob(&filter, "RESO"), Ok(1));
+        assert_eq!(McpServer::resolve_headless_knob(&filter, "Resonance"), Ok(1));
+        assert!(McpServer::resolve_headless_knob(&NodeKind::Keys, "RATE").is_err(), "local-only knob");
+        assert_eq!(McpServer::resolve_headless_knob(&NodeKind::SystemAudio, "GAIN"), Ok(crate::engine::P_SYSTEM_GAIN));
+
+        let (server, _engine) = local_server();
+        // Demo node 2 = DELAY A: knobs TIME + MIX.
+        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
+        let labels: Vec<&str> = out["knobs"].as_array().unwrap().iter().map(|k| k["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["TIME", "MIX"], "{out}");
+        assert_eq!(out["knobs"][0]["target"], json!("knob"));
+        // set_cc_map with a rack label works headless.
+        let set: SetCcMapArgs = serde_json::from_value(json!({"node": 2, "source": "hw:0", "cc": 20, "knob": "mix"})).unwrap();
+        let res = tool_json(&server.set_cc_map(Parameters(set)));
+        assert_eq!(res["param"], json!(crate::engine::P_MIX), "{res}");
+        assert_eq!(res["target"], json!("knob"));
+    }
+
+    /// #22: play_file needs the app (the path cannot cross the command bus);
+    /// stop_file still mutes the player headless.
+    #[test]
+    fn play_file_needs_the_app_and_stop_file_mutes_headless() {
+        let (server, mut engine) = local_server();
+        let res = serde_json::to_value(server.play_file(Parameters(PlayFileArgs { path: "/x.wav".into(), gain: None })).unwrap()).unwrap();
+        assert_eq!(res["isError"], json!(true), "{res}");
+        assert_eq!(tool_json(&server.stop_file()), json!({"stopped": true}));
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
     }
 
     #[test]

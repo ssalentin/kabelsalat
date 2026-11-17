@@ -122,7 +122,7 @@ docker run --rm --privileged -v "$PWD:/src" -w /src \
   packaging/flatpak/build.sh 0.1.0 dist .flatpak-builder
 # Arch package (x86_64: archlinux:base-devel)
 docker run --rm -v "$PWD:/src" -w /src menci/archlinuxarm:base-devel \
-  bash -c 'pacman -Sy --noconfirm git && packaging/arch-makepkg.sh dist'
+  bash -c 'pacman --disable-sandbox -Sy --noconfirm git && packaging/arch-makepkg.sh dist'
 ```
 
 The tarball and AppImage scripts take a built binary:

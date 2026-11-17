@@ -14,7 +14,7 @@ mkdir -p "$work" "$out"
 cp "$root/packaging/PKGBUILD" "$work/"
 
 source "$work/PKGBUILD"
-pacman -Syu --noconfirm --needed base-devel git "${depends[@]}" "${makedepends[@]}"
+pacman --disable-sandbox -Syu --noconfirm --needed base-devel git "${depends[@]}" "${makedepends[@]}"
 
 git config --global --add safe.directory '*'
 git clone --quiet --mirror "$root" "$work/$_pkgname"

@@ -4759,7 +4759,9 @@ impl DemoApp {
             _ => None,
         }).collect();
         for (node, state) in restored {
-            if let Err(e) = self.restore_lv2_state(node, state) {
+            if let Err(e) = self.restore_lv2_state(node, state.clone()) {
+                // Kept anyway: the next save or rig edit restores it.
+                self.lv2_states.insert(node, state);
                 self.session_msg = format!("plugin state of node {node} not restored: {e}");
             }
         }

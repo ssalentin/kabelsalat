@@ -45,19 +45,31 @@ pub fn patches(data: &Path) -> Vec<Sound> {
 
 /// Is this a patch Vitalium can load? A patch it cannot parse makes it open
 /// a modal alert box, which waits for a message loop no host here runs: the
-/// thread that restored it hangs for good. So every part `jsonToState` reads
-/// must be there.
+/// thread that restored it hangs for good. So every part `jsonToState`
+/// reads must be there with the type it reads it as (`LoadSave::load*` in
+/// Vitalium's load_save.cpp).
 pub fn check_patch(data: &[u8]) -> Result<(), String> {
+    use serde_json::Value;
     let text = std::str::from_utf8(data).map_err(|_| "not a Vital patch (not text)".to_string())?;
-    let json: serde_json::Value = serde_json::from_str(text.trim_end_matches('\0')).map_err(|e| format!("not a Vital patch: {e}"))?;
-    json.get("synth_version").and_then(|v| v.as_str()).ok_or("not a Vital patch (no synth_version)")?;
-    let settings = json.get("settings").and_then(|v| v.as_object()).ok_or("not a Vital patch (no settings)")?;
-    for part in ["modulations", "sample", "wavetables", "lfos"] {
-        if !settings.contains_key(part) {
-            return Err(format!("incomplete Vital patch (no {part})"));
+    let json: Value = serde_json::from_str(text.trim_end_matches('\0')).map_err(|e| format!("not a Vital patch: {e}"))?;
+    json.get("synth_version").and_then(Value::as_str).ok_or("not a Vital patch (no synth_version)")?;
+    for text_field in ["preset_name", "author", "comments"] {
+        if json.get(text_field).is_some_and(|v| !v.is_string()) {
+            return Err(format!("broken Vital patch ({text_field} is not text)"));
         }
     }
-    Ok(())
+    let settings = json.get("settings").and_then(Value::as_object).ok_or("not a Vital patch (no settings)")?;
+    let part = |name: &str, ok: fn(&Value) -> bool| match settings.get(name) {
+        None => Err(format!("incomplete Vital patch (no {name})")),
+        Some(v) if !ok(v) => Err(format!("broken Vital patch ({name})")),
+        Some(_) => Ok(()),
+    };
+    part("sample", Value::is_object)?;
+    part("wavetables", Value::is_array)?;
+    part("lfos", Value::is_array)?;
+    part("modulations", |v| v.as_array().is_some_and(|mods| mods.iter().all(|m| {
+        m.get("source").is_some_and(Value::is_string) && m.get("destination").is_some_and(Value::is_string)
+    })))
 }
 
 /// Put a `.vitalbank` (a zip of `<bank>/Presets/…` and friends) or a single
@@ -177,6 +189,10 @@ mod tests {
         assert_eq!(check_patch(&patch(full)), Ok(()));
         let partial = serde_json::json!({"osc_1_transpose": 12.0});
         assert!(check_patch(&patch(partial)).unwrap_err().contains("incomplete"));
+        let bad_mod = serde_json::json!({"modulations": [{"source": "lfo_1"}], "sample": {}, "wavetables": [], "lfos": []});
+        assert_eq!(check_patch(&patch(bad_mod)), Err("broken Vital patch (modulations)".into()));
+        let not_list = serde_json::json!({"modulations": [], "sample": {}, "wavetables": "x", "lfos": []});
+        assert_eq!(check_patch(&patch(not_list)), Err("broken Vital patch (wavetables)".into()));
         assert!(check_patch(b"{\"settings\": {}}").is_err());
         assert!(check_patch(b"\x00\x01binary").is_err());
     }

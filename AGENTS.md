@@ -423,6 +423,12 @@ Learned so far (2026-11-15, UI polish pass):
     duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
 87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`, and attachment thumbnails drop their `TextureHandle` on clear:**
     align `Confirm`/`Cancel` and the attachment chip to the message text column (`78.0` px), load the ~32 px thumbnail once per `Image::bytes` Arc (`sync_chat_thumb`), and clear `chat_thumb` on removal/submit so egui frees the texture (`agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle`).
+88. **A key shows lit for as long as it is held, from every source:** only
+    laptop keys counted as held, so a note held on the FM-1 (or any hardware
+    keyboard) blinked for one 0.09 s LED tail and the key went dark while it
+    still sounded. `notes_down` keeps one bit per source per note, set on
+    note-on and cleared on note-off in `fire_keys_with`
+    (`held_notes_stay_lit_on_the_dock_until_released`).
 
 ## Working on kabelsalat
 

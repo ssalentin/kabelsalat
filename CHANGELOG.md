@@ -20,6 +20,9 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **Matrix routes and MIDI-learn bindings were lost after agent edits:** an
+  agent change to the rack dropped them from the app, and the next rig add or
+  delete removed them from the engine too. They now survive both.
 - **MIDI-learned knobs did not move on screen:** a hardware CC bound to a
   knob changed the sound, but the knob stood still. It now follows the
   controller.

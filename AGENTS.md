@@ -590,6 +590,13 @@ Learned so far (2026-11-15, UI polish pass):
     `MasterLimiter::process` matches the output RMS to the default-WARM chain
     (200 ms window); check any drive/saturation change with
     `warm_keeps_the_loudness_of_the_default_warm`, not only with peaks.
+111. **An adoption is not a load:** `build_rack` clears `rule_edits` (loads
+    start fresh), but `sync_from_engine` also rebuilds through it after any
+    agent/MCP edit, right after mirroring the engine's rules. The UI lost every
+    CC binding and route edit; learned knobs stopped following, and the next
+    rig add/delete captured an empty matrix and loaded it into the engine.
+    The sync rebuild keeps the rules it mirrored
+    (`cc_bindings_survive_an_agent_edit_and_a_rig_add`).
 
 ## Working on kabelsalat
 

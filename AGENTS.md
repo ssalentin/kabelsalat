@@ -572,14 +572,16 @@ Learned so far (2026-11-15, UI polish pass):
   and ideas = [GitHub issues](https://github.com/ssalentin/kabelsalat/issues)
   with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
   `testing`) and milestones per release; how and why it is built =
-  `docs/ARCHITECTURE.md`; released changes = `CHANGELOG.md` (add yours under
+  `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
+  released changes = `CHANGELOG.md` (add yours under
   **Unreleased**); rules = this file. Read open issues with
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
-- **Releases:** SemVer tags `vX.Y.Z` on `main`; move the CHANGELOG
-  **Unreleased** block under the new version, bump `Cargo.toml`, tag, then
-  `gh release create vX.Y.Z --notes-file <that block>`.
+- **Releases:** SemVer tags `vX.Y.Z` on `main`. Pushing the tag builds every
+  package (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and
+  publishes the GitHub release from that version's CHANGELOG block; the steps
+  before the tag are in `docs/PACKAGING.md` ("Cut a release").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
   `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task

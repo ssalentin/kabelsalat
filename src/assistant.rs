@@ -675,7 +675,10 @@ fn system_prompt() -> String {
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
      LOW below the point, port 1 = HIGH at/above; wire each to a rig with connect \
-     from_port 0/1 — there is no automatic rig split), flip_rack.\n\
+     from_port 0/1 — there is no automatic rig split; low_octave/high_octave shift a zone by \
+     octaves. The keys below a split are low already and many bass sounds are pitched down: \
+     when you put a bass on the LOW zone, set low_octave 1 unless the user asked for a deep \
+     bass, and tell the user; if they say it is too deep or too high, step it), flip_rack.\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
@@ -782,8 +785,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_split",
-            "description":"Split a Keys node's keyboard at a MIDI note (a property of the Keys node). Played notes below the point leave on its port 0 (LOW), notes at/above on port 1 (HIGH). point null/omitted = unsplit (one MIDI OUT; HIGH cables are removed). Routing is plain wiring: after splitting, connect from_port 1 of the Keys node to the rig that should play the high zone (existing cables stay on LOW). Example: {point: 60} splits at C4.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit = unsplit"}}}
+            "description":"Split a Keys node's keyboard at a MIDI note (a property of the Keys node) and set each zone's octave. Played notes below the point leave on its port 0 (LOW), notes at/above on port 1 (HIGH). Routing is plain wiring: after splitting, connect from_port 1 of the Keys node to the rig that should play the high zone (existing cables stay on LOW). low_octave/high_octave shift what a zone plays by whole octaves (-3..3); the keys that pick the zone stay the same. A call with only octaves keeps the current split; a call with neither point nor octaves unsplits (one MIDI OUT; HIGH cables are removed, octaves reset). Examples: {point: 60} splits at C4; {low_octave: 1} raises the low zone an octave.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit with no octaves = unsplit"},"low_octave":{"type":"integer","description":"octave shift of the LOW zone, -3..3"},"high_octave":{"type":"integer","description":"octave shift of the HIGH zone, -3..3"}}}
         }},
         {"type":"function","function":{
             "name":"save_session",

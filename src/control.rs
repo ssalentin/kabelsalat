@@ -170,6 +170,13 @@ pub struct Node {
     /// `NodeKind::Keys` (always None otherwise); older sessions load unsplit.
     #[serde(default)]
     pub split: Option<u8>,
+    /// Octave shift of each split zone, `[LOW, HIGH]` (port 0 / port 1),
+    /// in octaves within `-ZONE_OCTAVE_MAX..=ZONE_OCTAVE_MAX`. Applied to the
+    /// notes a zone sends only while split; unsplitting resets it. A bass
+    /// below the split usually plays an octave up: the keys there are low and
+    /// many bass sounds are pitched down already. Older sessions load at 0.
+    #[serde(default)]
+    pub zone_octave: [i8; 2],
 }
 
 /// Which Keys output port a PLAYED note leaves on: unsplit → 0; split at
@@ -183,6 +190,8 @@ pub fn split_port(split: Option<u8>, note: u8) -> u8 {
 
 /// The C4 split point the face chip toggles to (MIDI 60).
 pub const DEFAULT_SPLIT: u8 = 60;
+/// Largest octave shift of a split zone, either way.
+pub const ZONE_OCTAVE_MAX: i8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PortKind {
@@ -223,7 +232,7 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None });
+        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None, zone_octave: [0; 2] });
         id
     }
 
@@ -266,11 +275,36 @@ impl Graph {
         let mut changed = n.split != point;
         n.split = point;
         if point.is_none() {
+            changed |= n.zone_octave != [0; 2];
+            n.zone_octave = [0; 2];
             let before = self.edges.len();
             self.edges.retain(|e| !(e.from.node == id && e.from.port >= 1));
             changed |= self.edges.len() != before;
         }
         Some(changed)
+    }
+
+    /// Shift one zone (0 = LOW, 1 = HIGH) of a split Keys node by `octave`
+    /// (clamped to ±`ZONE_OCTAVE_MAX`). Returns `Some(changed)` for a split
+    /// Keys node, `None` otherwise (unknown, not Keys, unsplit, bad zone).
+    pub fn set_zone_octave(&mut self, id: NodeId, zone: u8, octave: i8) -> Option<bool> {
+        let n = self.nodes.iter_mut().find(|n| n.id == id)?;
+        if !matches!(n.kind, NodeKind::Keys) || n.split.is_none() || zone > 1 {
+            return None;
+        }
+        let o = octave.clamp(-ZONE_OCTAVE_MAX, ZONE_OCTAVE_MAX);
+        let changed = n.zone_octave[zone as usize] != o;
+        n.zone_octave[zone as usize] = o;
+        Some(changed)
+    }
+
+    /// Semitones a played note moves on its way out of a Keys node: its
+    /// zone's octave while split, else 0.
+    pub fn zone_shift(n: &Node, played: u8) -> i16 {
+        match n.split {
+            Some(_) => n.zone_octave[split_port(n.split, played) as usize] as i16 * 12,
+            None => 0,
+        }
     }
 
     /// Master transport: set the playing flag on EVERY transport-capable
@@ -639,6 +673,10 @@ pub enum Command {
     /// plain graph wiring — wire LOW/HIGH to rigs like any ports. The engine
     /// releases held notes on every instrument the node feeds.
     SetNodeSplit { node: NodeId, point: Option<u8> },
+    /// Octave shift of one zone of a split Keys node (`zone` 0 = LOW, 1 =
+    /// HIGH; `octave` clamped to ±`ZONE_OCTAVE_MAX`). The engine releases
+    /// held notes on every instrument the node feeds first (rule 41).
+    SetZoneOctave { node: NodeId, zone: u8, octave: i8 },
     /// Live edit of ONE matrix rule (source → dest): channel filter, transpose,
     /// key/velocity ranges, enabled. Fixed-size; CC maps use `MatrixCcMap`.
     /// The engine applies it in place and releases held notes on the destination
@@ -751,7 +789,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
-            | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
+            | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::ProgramChange { .. })
     }
 }

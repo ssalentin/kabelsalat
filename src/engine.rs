@@ -1423,16 +1423,23 @@ impl GraphEngine {
     /// their note-on because the zone is a pure function of the note.
     /// Allocation-free linear scans, like the rest of the render path.
     fn keys_gate(&self, dest: NodeId, played: u8) -> bool {
-        self.graph.nodes.iter().any(|n| {
-            matches!(n.kind, NodeKind::Keys) && {
-                let port = split_port(n.split, played);
-                self.graph.edges.iter().any(|e| {
-                    e.kind == PortKind::Midi
-                        && e.from.node == n.id
-                        && e.from.port == port
-                        && e.to.node == dest
-                })
-            }
+        self.keys_route(dest, played).is_some()
+    }
+
+    /// The Keys zone a played note reaches `dest` through: `Some(semitones)`
+    /// of that zone's octave shift, `None` if no Keys cable carries the note
+    /// there. Note-on and note-off take the same answer, so a release always
+    /// meets the pitch its note-on started (rule 41). Allocation-free.
+    fn keys_route(&self, dest: NodeId, played: u8) -> Option<i16> {
+        self.graph.nodes.iter().find_map(|n| {
+            if !matches!(n.kind, NodeKind::Keys) { return None; }
+            let port = split_port(n.split, played);
+            self.graph.edges.iter().any(|e| {
+                e.kind == PortKind::Midi
+                    && e.from.node == n.id
+                    && e.from.port == port
+                    && e.to.node == dest
+            }).then(|| crate::control::Graph::zone_shift(n, played))
         })
     }
 
@@ -1675,19 +1682,18 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    if !self.keys_gate(dest, note) {
-                        continue;
-                    }
+                    let Some(shift) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = shifted(m.note(), shift) else { continue };
                     #[cfg(test)]
-                    self.note_log.push((dest, m.note(), true));
+                    self.note_log.push((dest, out, true));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
-                            s.voice.note_on(m.note() as u16, velocity as f64);
+                            s.voice.note_on(out as u16, velocity as f64);
                         }
                     }
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                         if s.plugin.is_instrument() {
-                            s.plugin.note_on(m.note(), (velocity.clamp(0.0, 1.0) * 127.0) as u8);
+                            s.plugin.note_on(out, (velocity.clamp(0.0, 1.0) * 127.0) as u8);
                         }
                     }
                 }
@@ -1697,19 +1703,18 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    if !self.keys_gate(dest, note) {
-                        continue;
-                    }
+                    let Some(shift) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = shifted(m.note(), shift) else { continue };
                     #[cfg(test)]
-                    self.note_log.push((dest, m.note(), false));
+                    self.note_log.push((dest, out, false));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
-                            s.voice.note_off(m.note() as u16);
+                            s.voice.note_off(out as u16);
                         }
                     }
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
                         if s.plugin.is_instrument() {
-                            s.plugin.note_off(m.note());
+                            s.plugin.note_off(out);
                         }
                     }
                 }
@@ -1766,6 +1771,25 @@ impl GraphEngine {
                     }
                     // Unsplitting also drops the node's HIGH-port cables.
                     self.graph.set_split(node, point);
+                    self.publish_graph();
+                }
+            }
+            Command::SetZoneOctave { node, zone, octave } => {
+                // Same safety as a split move: a held note must be released
+                // at the pitch it started, so release first (rule 41).
+                let o = octave.clamp(-crate::control::ZONE_OCTAVE_MAX, crate::control::ZONE_OCTAVE_MAX);
+                let is_change = zone <= 1 && self.graph.node(node).is_some_and(|n| {
+                    matches!(n.kind, NodeKind::Keys) && n.split.is_some() && n.zone_octave[zone as usize] != o
+                });
+                if is_change {
+                    for i in 0..self.graph.edges.len() {
+                        let e = &self.graph.edges[i];
+                        if e.kind == PortKind::Midi && e.from.node == node {
+                            let dest = e.to.node;
+                            self.release_all(dest);
+                        }
+                    }
+                    self.graph.set_zone_octave(node, zone, octave);
                     self.publish_graph();
                 }
             }
@@ -2537,6 +2561,13 @@ impl MasterLimiter {
     }
 }
 
+/// A routed note moved by a zone's octave shift; `None` when it leaves the
+/// MIDI range (that key is silent in this zone, on and off alike).
+#[inline]
+fn shifted(note: u8, semis: i16) -> Option<u8> {
+    u8::try_from(note as i16 + semis).ok().filter(|n| *n <= 127)
+}
+
 /// Generate one metronome's click into `buf` (stereo-interleaved): a
 /// decaying 1 kHz burst on each beat while ITS transport plays. Driven by
 /// SetNodePlaying / master TransportPlay·Stop / SetBpm; allocation-free.
@@ -2803,6 +2834,32 @@ mod tests {
         // Non-Keys nodes ignore the command.
         assert!(play(&mut e, &mut bus, Command::SetNodeSplit { node: 1, point: Some(60) }).is_empty());
         assert_eq!(e.graph().node(1).unwrap().split, None);
+    }
+
+    #[test]
+    fn each_split_zone_plays_in_its_own_octave() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(Some(60), true);
+        // LOW one octave up (the bass case), HIGH one down.
+        let log = play(&mut e, &mut bus, Command::SetZoneOctave { node: 0, zone: 0, octave: 1 });
+        assert_eq!(log, vec![(1, 255, false), (4, 255, false)], "a zone move releases held notes first");
+        play(&mut e, &mut bus, Command::SetZoneOctave { node: 0, zone: 1, octave: -1 });
+        assert_eq!(e.graph().node(0).unwrap().zone_octave, [1, -1]);
+        // The zone is chosen by the KEY played; the octave moves what sounds.
+        assert_eq!(play(&mut e, &mut bus, on(40)), vec![(1, 52, true)], "E2 on LOW sounds E3");
+        assert_eq!(play(&mut e, &mut bus, on(72)), vec![(4, 60, true)], "C5 on HIGH sounds C4");
+        assert_eq!(play(&mut e, &mut bus, off(40)), vec![(1, 52, false)], "the note-off meets its note-on");
+        // Clamped to ±3 octaves; a note pushed past the MIDI range is silent.
+        play(&mut e, &mut bus, Command::SetZoneOctave { node: 0, zone: 1, octave: 9 });
+        assert_eq!(e.graph().node(0).unwrap().zone_octave[1], crate::control::ZONE_OCTAVE_MAX);
+        assert!(play(&mut e, &mut bus, on(100)).is_empty(), "100 + 36 is past 127");
+        // Unsplit: the shift goes with the zones; one range again.
+        play(&mut e, &mut bus, Command::SetNodeSplit { node: 0, point: None });
+        assert_eq!(e.graph().node(0).unwrap().zone_octave, [0, 0]);
+        assert_eq!(play(&mut e, &mut bus, on(40)), vec![(1, 40, true)]);
+        // An unsplit Keys node takes no zone octave.
+        assert!(play(&mut e, &mut bus, Command::SetZoneOctave { node: 0, zone: 0, octave: 1 }).is_empty());
+        assert_eq!(e.graph().node(0).unwrap().zone_octave, [0, 0]);
     }
 
     /// A voice carried "keyboard off" from the node it played before a

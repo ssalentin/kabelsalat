@@ -286,8 +286,13 @@ struct SetSplitArgs {
     /// Keys node in the patch.
     node: Option<NodeId>,
     /// MIDI note 0..=127 to split at: notes below leave on the Keys node's
-    /// port 0 (LOW), notes at/above on port 1 (HIGH). Omit (null) = unsplit.
+    /// port 0 (LOW), notes at/above on port 1 (HIGH). Omit (null) with no
+    /// octaves = unsplit; omit with octaves = keep the current split.
     point: Option<u8>,
+    /// Octave shift of the LOW zone, -3..=3 (what it plays, not which keys).
+    low_octave: Option<i8>,
+    /// Octave shift of the HIGH zone, -3..=3.
+    high_octave: Option<i8>,
 }
 
 /// Arguments for `set_system_audio`.
@@ -1177,7 +1182,7 @@ impl McpServer {
     }
 
     /// Split one Keys node into LOW/HIGH outputs.
-    #[tool(name = "set_split", description = "Split a Keys node's keyboard (Command::SetNodeSplit) — a property of the Keys node, not a global setting. point is a MIDI note 0..=127: played notes below it leave on the Keys node's port 0 (LOW), notes at/above on port 1 (HIGH). point null/omitted = unsplit (one MIDI OUT, port 0; HIGH-port cables are removed). node defaults to the first Keys node. Routing is plain wiring: connect LOW (from_port 0) and HIGH (from_port 1) to rigs with connect. Held notes are released. Example: {point: 60} splits at C4; then connect {from_node: 0, from_port: 1, to_node: 4, kind: midi}.")]
+    #[tool(name = "set_split", description = "Split a Keys node's keyboard (Command::SetNodeSplit) — a property of the Keys node, not a global setting. point is a MIDI note 0..=127: played notes below it leave on the Keys node's port 0 (LOW), notes at/above on port 1 (HIGH). point null/omitted with no octaves = unsplit (one MIDI OUT, port 0; HIGH-port cables are removed, octaves reset). low_octave/high_octave (-3..=3) shift what a zone plays by whole octaves (Command::SetZoneOctave); octaves alone keep the current split (or split at C4). node defaults to the first Keys node. Routing is plain wiring: connect LOW (from_port 0) and HIGH (from_port 1) to rigs with connect. Held notes are released. Examples: {point: 60} splits at C4; then connect {from_node: 0, from_port: 1, to_node: 4, kind: midi}; {low_octave: 1} lifts a bass on the low zone an octave.")]
     fn set_split(&self, Parameters(args): Parameters<SetSplitArgs>) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Some(p) = args.point {
@@ -1201,11 +1206,28 @@ impl McpServer {
                 None => return tool_err("the patch has no Keys node"),
             },
         };
-        if let Err(e) = send_cmd(&mut st, Command::SetNodeSplit { node, point: args.point }) {
+        let octaves = [args.low_octave, args.high_octave];
+        let point = match args.point {
+            Some(p) => Some(p),
+            None if octaves.iter().any(Option::is_some) => {
+                Some(st.graph.node(node).and_then(|n| n.split).unwrap_or(crate::control::DEFAULT_SPLIT))
+            }
+            None => None,
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetNodeSplit { node, point }) {
             return tool_err(e);
         }
-        st.graph.set_split(node, args.point);
-        ok_json(json!({"node": node, "point": args.point, "split": args.point.is_some()}))
+        st.graph.set_split(node, point);
+        for (zone, o) in octaves.into_iter().enumerate() {
+            let Some(o) = o else { continue };
+            let o = o.clamp(-crate::control::ZONE_OCTAVE_MAX, crate::control::ZONE_OCTAVE_MAX);
+            if let Err(e) = send_cmd(&mut st, Command::SetZoneOctave { node, zone: zone as u8, octave: o }) {
+                return tool_err(e);
+            }
+            st.graph.set_zone_octave(node, zone as u8, o);
+        }
+        let oct = st.graph.node(node).map_or([0; 2], |n| n.zone_octave);
+        ok_json(json!({"node": node, "point": point, "split": point.is_some(), "low_octave": oct[0], "high_octave": oct[1]}))
     }
 
     /// Mix system audio into the master.
@@ -2883,14 +2905,14 @@ mod tests {
     fn set_split_tool_targets_the_keys_node() {
         let (server, mut engine) = local_server();
         let mut buf = vec![0.0f32; 64 * 2];
-        let r = tool_json(&server.set_split(Parameters(SetSplitArgs { node: None, point: Some(60) })));
+        let r = tool_json(&server.set_split(Parameters(SetSplitArgs { node: None, point: Some(60), low_octave: None, high_octave: None })));
         assert_eq!(r["node"], json!(0), "defaults to the first Keys node");
         assert_eq!(r["split"], json!(true));
         engine.render(&mut buf, 2);
         assert_eq!(engine.graph().node(0).unwrap().split, Some(60), "engine received SetNodeSplit");
         let keys = |v: &Value| v["nodes"].as_array().unwrap().iter().find(|n| n["id"] == json!(0)).cloned().unwrap();
         assert_eq!(keys(&tool_json(&server.get_graph()))["split"], json!(60), "get_graph exposes split");
-        tool_json(&server.set_split(Parameters(SetSplitArgs { node: Some(0), point: None })));
+        tool_json(&server.set_split(Parameters(SetSplitArgs { node: Some(0), point: None, low_octave: None, high_octave: None })));
         engine.render(&mut buf, 2);
         assert_eq!(engine.graph().node(0).unwrap().split, None);
         assert_eq!(keys(&tool_json(&server.get_graph()))["split"], Value::Null);
@@ -2899,9 +2921,9 @@ mod tests {
             let v = serde_json::to_value(res.unwrap()).unwrap();
             v.get("isError").and_then(Value::as_bool) == Some(true)
         };
-        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(1), point: Some(60) }))));
-        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(999), point: Some(60) }))));
-        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: None, point: Some(200) }))));
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(1), point: Some(60), low_octave: None, high_octave: None }))));
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: Some(999), point: Some(60), low_octave: None, high_octave: None }))));
+        assert!(is_err(server.set_split(Parameters(SetSplitArgs { node: None, point: Some(200), low_octave: None, high_octave: None }))));
     }
 
     #[test]

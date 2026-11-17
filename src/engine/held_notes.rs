@@ -46,6 +46,8 @@ enum Step {
 enum Edit {
     /// SetNodeSplit on the Keys node.
     Split(Option<u8>),
+    /// SetZoneOctave on the Keys node (acts only while split).
+    ZoneOctave { zone: u8, octave: i8 },
     /// MatrixRule Keys → dest (full key/velocity range).
     Rule { dest: u32, transpose: i8, enabled: bool },
     /// Disconnect a MIDI cable by edge id (1 = Keys→A, 6 = Keys→B).
@@ -58,10 +60,11 @@ enum Edit {
     LoadStart,
 }
 
-const EDITS: [Edit; 14] = [
+const EDITS: [Edit; 15] = [
     Edit::Split(None),
     Edit::Split(Some(60)),
     Edit::Split(Some(48)),
+    Edit::ZoneOctave { zone: 0, octave: 1 },
     Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
     Edit::Rule { dest: SURGE_A, transpose: 12, enabled: true },
     Edit::Rule { dest: SURGE_A, transpose: 0, enabled: false },
@@ -79,7 +82,7 @@ const EDITS: [Edit; 14] = [
 impl Edit {
     fn kind(self) -> Kind {
         match self {
-            Edit::Split(_) => Kind::Split,
+            Edit::Split(_) | Edit::ZoneOctave { .. } => Kind::Split,
             Edit::Rule { .. } => Kind::Matrix,
             Edit::Unplug(_) | Edit::Plug { .. } => Kind::Cable,
             Edit::Remove(_) => Kind::Node,
@@ -90,6 +93,7 @@ impl Edit {
     fn command(self) -> Command {
         match self {
             Edit::Split(point) => Command::SetNodeSplit { node: KEYS, point },
+            Edit::ZoneOctave { zone, octave } => Command::SetZoneOctave { node: KEYS, zone, octave },
             Edit::Rule { dest, transpose, enabled } => Command::MatrixRule {
                 source: SourceId::Keys,
                 dest,
@@ -233,6 +237,7 @@ fn describe(step: Step) -> String {
         Step::On(k) => format!("NoteOn {k}"),
         Step::Off(k) => format!("NoteOff {k}"),
         Step::Edit(Edit::Split(p)) => format!("SetNodeSplit {p:?}"),
+        Step::Edit(Edit::ZoneOctave { zone, octave }) => format!("SetZoneOctave zone {zone} {octave:+}"),
         Step::Edit(Edit::Rule { dest, transpose, enabled }) => {
             let name = if dest == SURGE_A { "Surge A" } else { "Surge B" };
             format!("MatrixRule Keys→{name} transpose {transpose:+} enabled {enabled}")

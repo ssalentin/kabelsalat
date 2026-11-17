@@ -578,6 +578,18 @@ Learned so far (2026-11-15, UI polish pass):
     seeing kabelsalat and nothing else (also no device, account or file
     names that are not the app's). Evidence screenshots for replies stay in
     the scratchpad, never in the repo; never `git add -A` an image.
+109. **A knob the hardware moves moves on screen too:** the face draws
+    `display_value`, which only advances during a glide; `apply_cc_to_knobs`
+    set `value` alone, so every CC-learned knob (Master WARM, Surge LEVEL, …)
+    changed the sound while it stood still. Move it with `Knob::set_immediate`
+    and assert `display_value` in tests, never `value` alone
+    (`a_learned_cc_moves_the_drawn_master_warm_knob`).
+110. **A colour stage keeps its loudness:** WARM's make-up pinned only the
+    full-scale peak, but below the limiter ceiling `tanh` is almost linear, so
+    WARM 0→100 % raised quiet playing by 7.7 dB and read as a volume knob.
+    `MasterLimiter::process` matches the output RMS to the default-WARM chain
+    (200 ms window); check any drive/saturation change with
+    `warm_keeps_the_loudness_of_the_default_warm`, not only with peaks.
 
 ## Working on kabelsalat
 

@@ -20,6 +20,12 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **MIDI-learned knobs did not move on screen:** a hardware CC bound to a
+  knob changed the sound, but the knob stood still. It now follows the
+  controller.
+- **Master WARM acted like a volume knob:** turning it up made quiet playing
+  up to 7.7 dB louder. WARM now changes only the colour (saturation); the
+  loudness stays that of the default setting.
 - **Plugin knobs that drove the wrong thing or nothing:** every LV2 unit had
   a `GAIN` knob wired to the plugin's first control port, whatever that port
   was (Vitalium: its freewheel switch; setBfree: nothing), and a CLAP synth

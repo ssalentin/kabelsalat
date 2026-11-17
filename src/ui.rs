@@ -6640,16 +6640,17 @@ impl DemoApp {
                     let is_clap = matches!(u.node_kind, UnitKind::Clap);
                     for k in &mut u.knobs {
                         let by_param = matches!(m.target, crate::matrix::CcTarget::Knob) || !is_clap;
+                        // A hardware knob is followed at once: the face draws
+                        // display_value, so setting only `value` left the
+                        // on-screen knob where it was.
                         if by_param && k.param == Some(m.param) {
-                            k.value = norm;
+                            k.set_immediate(norm);
                             if !resend { k.sent = Some(norm); }
                         } else if matches!(m.target, crate::matrix::CcTarget::PluginParam) {
-                            if let Some(pin) = k.clap.as_mut() {
-                                if pin.id == m.param {
-                                    k.value = norm;
-                                    pin.hold_until = hold_until;
-                                    if !resend { pin.sent = norm; }
-                                }
+                            if let Some(pin) = k.clap.as_mut().filter(|p| p.id == m.param) {
+                                pin.hold_until = hold_until;
+                                if !resend { pin.sent = norm; }
+                                k.set_immediate(norm);
                             }
                         }
                     }
@@ -18507,6 +18508,8 @@ mod split_bpm_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(2), 0, 74, 127));
         frame(&mut app, &ctx, vec![]);
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+        assert!((app.units[surge_unit].knobs[level_idx].display_value - 1.0).abs() < 1e-6,
+            "the drawn knob follows the hardware knob too");
         assert_ne!(before_val, 1.0);
         let mut feedback_cmds = Vec::new();
         drain.drain(|c| feedback_cmds.push(c));
@@ -18517,6 +18520,33 @@ mod split_bpm_tests {
         app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(0), 0, 74, 0));
         frame(&mut app, &ctx, vec![]);
         assert!((app.units[surge_unit].knobs[level_idx].value - 1.0).abs() < 1e-6);
+    }
+
+    /// A CC learned to Master WARM moves the knob the face draws: only
+    /// `value` followed, `display_value` stayed put, so the knob looked dead
+    /// while the sound changed.
+    #[test]
+    fn a_learned_cc_moves_the_drawn_master_warm_knob() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+        drain.drain(|_| {});
+        let m = app.master_idx().unwrap();
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let pos = app.xf.p(app.knob_center(m, wi));
+        rclick(&mut app, &ctx, pos);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 30));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "CC 11 completed the learn");
+        for v in [100u8, 10, 127] {
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, v));
+            frame(&mut app, &ctx, vec![]);
+            let k = &app.units[m].knobs[wi];
+            let want = v as f32 / 127.0;
+            assert!((k.value - want).abs() < 1e-6 && (k.display_value - want).abs() < 1e-6,
+                "CC 11 = {v}: value {} drawn {}", k.value, k.display_value);
+        }
     }
 
     /// Buttons of the knob context menu, top to bottom (previous pass).

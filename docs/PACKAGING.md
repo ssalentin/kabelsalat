@@ -41,7 +41,7 @@ release). Each package is built natively for x86_64 and aarch64:
 | `kabelsalat-<v>-linux-<arch>.tar.gz` | `packaging/tarball.sh` | Ubuntu 22.04 (glibc 2.35) | Binary, desktop file, icon, `INSTALL.md` with the runtime libraries to install. |
 | `kabelsalat-<v>-<arch>.AppImage` | `packaging/appimage.sh` ([linuxdeploy](https://github.com/linuxdeploy/linuxdeploy) `1-alpha-20251107-1`, checksum-pinned) | Ubuntu 22.04 | Bundles lilv, serd, sord, sratom; uses the host's glibc, ALSA (so `pipewire-alsa` works) and display stack. |
 | `kabelsalat-<v>-<arch>.flatpak` | `packaging/flatpak/build.sh` | `ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08` | Single-file bundle, see below. |
-| `kabelsalat-git-<v>.r<n>.g<sha>-1-<arch>.pkg.tar.zst` | `packaging/arch-makepkg.sh` | `archlinux:base-devel`, `menci/archlinuxarm:base-devel` | `packaging/PKGBUILD` built from the tagged commit. |
+| `kabelsalat-git-<v>.r<n>.g<sha>-1-<arch>.pkg.tar.*` | `packaging/arch-makepkg.sh` | `archlinux:base-devel`, `menci/archlinuxarm:base-devel` | `packaging/PKGBUILD` built from the tagged commit. |
 
 Each job smoke-tests its package with `kabelsalat --version`. The release job
 adds `SHA256SUMS`, then creates the GitHub release with the tag's CHANGELOG

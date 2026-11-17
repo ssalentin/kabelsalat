@@ -8,16 +8,16 @@
 //!
 //! Cable model
 //! -----------
-//! Each cable is a cubic Bézier whose two control points are damped-spring
-//! particles anchored to a distance-aware rest shape (downward sag + lateral
-//! bulge for vertical runs). Grabbing a cable injects forces into the
-//! particles; dragging a plug moves an endpoint — the cable whips and settles.
+//! Each cable is a Verlet rope (`rope.rs`, ported from the salen7in site):
+//! point masses under gravity with distance constraints, plugged ends pinned
+//! to their jacks, a free end left to fall. Grabbing a cable drags its nearest
+//! point; dragging a plug moves an endpoint — the cable whips and settles.
 //! MIDI cables carry pulses fired by a simulated 96 BPM band; audio cables
 //! breathe with envelopes triggered when pulses arrive.
 //!
-//! Performance: `epaint::CubicBezierShape` (4 points, zero heap), fixed-size
-//! arc-length LUTs, cached galleys, fixed pulse arrays — no per-frame
-//! allocation storms. Pure snapshot-style simulation; never touches audio.
+//! Performance: fixed-size rope and sample arrays, fixed-size arc-length
+//! LUTs, cached galleys, fixed pulse arrays — no per-frame allocation
+//! storms. Pure snapshot-style simulation; never touches audio.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -44,6 +44,7 @@ use crate::host::{
 use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::SourceId;
+use crate::rope::{self, Rope};
 use crate::session::Template;
 use crate::theme;
 
@@ -91,7 +92,7 @@ use crate::sounds::{DEXED_ID, SURGE_ID};
 /// Ring slots between the voice host (this thread) and the audio thread.
 const VOICE_RING: usize = 64;
 
-const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
+const MAX_SAMPLES: usize = rope::MAX_SAMPLES;
 const MAX_PULSES: usize = 12;
 /// Audio cables flow while their smoothed level exceeds this (docs/ARCHITECTURE.md §2).
 const AUDIO_PULSE_MIN: f32 = 0.05;
@@ -144,10 +145,6 @@ fn edge_display_level(peak: f32) -> f32 {
 }
 const MAX_CABLES: usize = 64;
 const FLIP_SECS: f32 = 0.35;
-// Damped spring: omega ≈ 11.4 rad/s (~1.8 Hz), zeta ≈ 0.3 → a few visible
-// swings before settling. Semi-implicit Euler at ≤ 1/240 s substeps.
-const SPRING_K: f32 = 130.0;
-const SPRING_D: f32 = 6.8;
 
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 const BLACK_SEMI: [usize; 5] = [1, 3, 6, 8, 10];
@@ -159,28 +156,6 @@ const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black k
 
 // alpha/mix live in the theme module (single source for the Signal palette).
 use crate::theme::{alpha, mix};
-
-#[inline]
-fn clamp_len(v: Vec2, max: f32) -> Vec2 {
-    let len = v.length();
-    if len > max && len > 0.0 { v * (max / len) } else { v }
-}
-
-#[inline]
-fn cubic(p: &[Pos2; 4], t: f32) -> Pos2 {
-    let u = 1.0 - t;
-    let (w0, w1, w2, w3) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
-    Pos2::new(
-        w0 * p[0].x + w1 * p[1].x + w2 * p[2].x + w3 * p[3].x,
-        w0 * p[0].y + w1 * p[1].y + w2 * p[2].y + w3 * p[3].y,
-    )
-}
-
-fn bezier_shape(p: [Pos2; 4], width: f32, color: Color32) -> Shape {
-    Shape::CubicBezier(egui::epaint::CubicBezierShape::from_points_stroke(
-        p, false, Color32::TRANSPARENT, Stroke::new(width, color),
-    ))
-}
 
 fn dist_sq_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let ab = b - a;
@@ -1491,23 +1466,18 @@ struct Cable {
     color: Color32,
     pattern: u8, // 0 = melody, 1 = tap (MIDI only)
 
-    // Spring particles: control-point offsets relative to each endpoint.
-    c1: Vec2, v1: Vec2,
-    c2: Vec2, v2: Vec2,
-    prev_a: Vec2, prev_b: Vec2,
+    /// Laid out on the first update, once the unit rects (and so the jack
+    /// positions) exist.
+    rope: Option<Rope>,
     // Endpoint overrides while a plug is being dragged.
     over_a: Option<Vec2>,
     over_b: Option<Vec2>,
-
-    bulge_side: f32,
-    bulge_var: f32,
 
     // Local-space samples + cumulative arc length, rebuilt each frame.
     pts: [Pos2; MAX_SAMPLES],
     lut: [f32; MAX_SAMPLES],
     n: usize,
     total_len: f32,
-    curve: [Pos2; 4],
 
     pulses: [Pulse; MAX_PULSES],
     level: f32,
@@ -1521,7 +1491,6 @@ struct Cable {
     draw_in: f32,
     dying: f32, // < 0 alive; else unplug-fall progress (seconds)
     detach_dst: bool,
-    drift: f32,
 
     next_event: f64,
     pat_idx: usize,
@@ -1533,15 +1502,13 @@ impl Cable {
         let dead = Pulse { active: false, t: 0.0, speed: 0.0, amp: 0.0 };
         Self {
             id, src, src_port, dst, dst_port, kind, color, pattern,
-            c1: Vec2::ZERO, v1: Vec2::ZERO, c2: Vec2::ZERO, v2: Vec2::ZERO,
-            prev_a: Vec2::ZERO, prev_b: Vec2::ZERO,
+            rope: None,
             over_a: None, over_b: None,
-            bulge_side: 1.0, bulge_var: 1.0,
             pts: [Pos2::ZERO; MAX_SAMPLES], lut: [0.0; MAX_SAMPLES],
-            n: 0, total_len: 0.0, curve: [Pos2::ZERO; 4],
+            n: 0, total_len: 0.0,
             pulses: [dead; MAX_PULSES],
             level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
-            age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true, drift: 0.0,
+            age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
     }
@@ -1552,22 +1519,32 @@ impl Cable {
         self.pulses[slot] = Pulse { active: true, t, speed, amp };
     }
 
-    fn arc_to_param(&self, frac: f32) -> f32 {
+    /// Sample segment and fraction within it at arc-length fraction `frac`.
+    fn arc_seg(&self, frac: f32) -> (usize, f32) {
         let s = frac.clamp(0.0, 1.0) * self.total_len;
         let n = self.n;
-        if n < 2 { return 0.0; }
-        for i in 0..n - 1 {
-            if s <= self.lut[i + 1] || i == n - 2 {
-                let span = self.lut[i + 1] - self.lut[i];
-                let f = if span > 1e-6 { (s - self.lut[i]) / span } else { 0.0 };
-                return (i as f32 + f.clamp(0.0, 1.0)) / (n - 1) as f32;
-            }
-        }
-        1.0
+        if n < 2 { return (0, 0.0); }
+        let i = self.lut[1..n - 1].partition_point(|&l| l < s);
+        let span = self.lut[i + 1] - self.lut[i];
+        let f = if span > 1e-6 { (s - self.lut[i]) / span } else { 0.0 };
+        (i, f.clamp(0.0, 1.0))
     }
 
     fn point_at_arc(&self, frac: f32) -> Pos2 {
-        cubic(&self.curve, self.arc_to_param(frac))
+        if self.n < 2 { return self.pts[0]; }
+        let (i, f) = self.arc_seg(frac);
+        self.pts[i] + (self.pts[i + 1] - self.pts[i]) * f
+    }
+
+    /// The stretch of cable between arc-length fractions `f0..f1`.
+    fn arc_slice(&self, f0: f32, f1: f32) -> Vec<Pos2> {
+        let (i0, _) = self.arc_seg(f0);
+        let (i1, _) = self.arc_seg(f1);
+        let mut out = Vec::with_capacity(i1 - i0 + 2);
+        out.push(self.point_at_arc(f0));
+        out.extend_from_slice(&self.pts[i0 + 1..=i1]);
+        out.push(self.point_at_arc(f1));
+        out
     }
 }
 
@@ -1577,8 +1554,7 @@ struct Pending {
     dir: Dir,
     kind: PortKind,
     cursor: Vec2, // rack-local
-    c1: Vec2, v1: Vec2, c2: Vec2, v2: Vec2,
-    prev_b: Vec2,
+    rope: Rope,
 }
 
 /// Outcome of dropping a held plug on a jack (`replug_cable`).
@@ -1838,7 +1814,9 @@ struct FadingUnit {
 
 #[derive(Clone, Copy)]
 struct FadingCable {
-    curve: [Pos2; 4],
+    /// Rack-local polyline of the cable when it was removed.
+    pts: [Pos2; MAX_SAMPLES],
+    n: usize,
     color: Color32,
     width: f32,
     alpha: f32,
@@ -2039,6 +2017,8 @@ struct DemoApp {
     rack_overflow: Vec2,
     rack_pan: Vec2,
     rack_clip: Option<Rect>,
+    /// Unsimulated time carried to the next frame (fixed rope step).
+    rope_acc: f32,
     unit_h: f32,
     unit_rects: Vec<Rect>, // rack-local, indexed by unit
     /// Rack structure derived from the loaded graph (stable while patching).
@@ -2432,6 +2412,7 @@ impl DemoApp {
             rack_pan: Vec2::ZERO,
             rack_clip: None,
             rack_h: 560.0,
+            rope_acc: 0.0,
             unit_h: 120.0,
             unit_rects: Vec::new(),
             keys_unit: None,
@@ -3228,22 +3209,6 @@ impl DemoApp {
         };
         let mut c = Cable::new(id, src, src_port, dst, dst_port, kind, color, 0, id * 7919 + 13);
         c.next_event = self.time + 0.2 + rng01(&mut c.rng) as f64 * 0.4;
-        // Bulge away from the rack centerline; vary per cable for organic look.
-        let a = self.endpoint(&c, Dir::Out);
-        let b = self.endpoint(&c, Dir::In);
-        let mid_x = (a.x + b.x) * 0.5;
-        c.bulge_side = if (mid_x - self.rack_w / 2.0).abs() < 26.0 {
-            if id % 2 == 0 { 1.0 } else { -1.0 }
-        } else if mid_x < self.rack_w / 2.0 { -1.0 } else { 1.0 };
-        c.bulge_var = 0.85 + 0.3 * rng01(&mut c.rng);
-        let dist = (b - a).length();
-        let sag = (18.0 + dist * 0.20).min(170.0);
-        c.c1 = Vec2::new(0.0, sag - 90.0);
-        c.c2 = Vec2::new(0.0, sag - 90.0);
-        c.v1 = Vec2::new(0.0, 260.0);
-        c.v2 = Vec2::new(0.0, 260.0);
-        c.prev_a = a;
-        c.prev_b = b;
         self.units[src].led = 1.0;
         self.units[dst].led = 1.0;
         self.cables.push(c);
@@ -3260,9 +3225,10 @@ impl DemoApp {
             c.detach_dst = detach_dst;
             c.over_a = None;
             c.over_b = None;
-            c.drift = if rng01(&mut c.rng) > 0.5 { 34.0 } else { -34.0 };
-            c.v1 += Vec2::new(0.0, -120.0);
-            c.v2 += Vec2::new(0.0, -120.0);
+            let drift = if rng01(&mut c.rng) > 0.5 { 120.0 } else { -120.0 };
+            if let Some(r) = &mut c.rope {
+                r.kick_all(Vec2::new(drift, -160.0), |t| if detach_dst { t } else { 1.0 - t });
+            }
         }
     }
 
@@ -3900,12 +3866,13 @@ impl DemoApp {
                     && !adopted.edges.iter().any(|e| e.id == c.id)
                     && self.visible(c.src)
                     && self.visible(c.dst)
-                    && c.curve[0].x.is_finite()
-                    && c.curve[3].x.is_finite()
+                    && c.n >= 2
+                    && c.pts[..c.n].iter().all(|p| p.x.is_finite() && p.y.is_finite())
                 {
                     let width = match c.kind { PortKind::Midi => 2.8, PortKind::Audio => 3.2 };
                     self.fading_cables.push(FadingCable {
-                        curve: c.curve,
+                        pts: c.pts,
+                        n: c.n,
                         color: self.cable_color(c),
                         width,
                         alpha: 1.0,
@@ -10860,11 +10827,10 @@ impl DemoApp {
         let j = &self.units[unit].jacks[jack];
         let (dir, kind) = (j.dir, self.units[unit].kind(j.dir, j.port));
         let origin = self.jack_pos(unit, jack);
+        let side = p_side(unit, self);
         self.pending = Some(Pending {
             unit, jack, dir, kind, cursor,
-            c1: Vec2::new(16.0, 40.0), v1: Vec2::ZERO,
-            c2: Vec2::new(-16.0, 40.0), v2: Vec2::ZERO,
-            prev_b: if dir == Dir::Out { cursor } else { origin },
+            rope: if dir == Dir::Out { Rope::new(origin, cursor, side) } else { Rope::new(cursor, origin, side) },
         });
     }
 
@@ -11199,12 +11165,6 @@ impl DemoApp {
 
     // -- simulation -----------------------------------------------------------
 
-    fn step_spring(c: &mut Vec2, v: &mut Vec2, target: Vec2, h: f32) {
-        *v += ((target - *c) * SPRING_K - *v * SPRING_D) * h;
-        *c += *v * h;
-        *c = clamp_len(*c, 460.0);
-    }
-
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
         // Audio In tuner: drain each open capture's tuner ring and run YIN.
@@ -11257,8 +11217,10 @@ impl DemoApp {
                     // Rack lands: cables get a little thump and settle.
                     for c in &mut self.cables {
                         let jx = (rng01(&mut c.rng) - 0.5) * 130.0;
-                        c.v1 += Vec2::new(jx, 60.0 + rng01(&mut c.rng) * 60.0);
-                        c.v2 += Vec2::new(-jx, 60.0 + rng01(&mut c.rng) * 60.0);
+                        let jy = 60.0 + rng01(&mut c.rng) * 60.0;
+                        if let Some(r) = &mut c.rope {
+                            r.kick_all(Vec2::new(jx, jy), |t| (t * std::f32::consts::PI).sin());
+                        }
                     }
                 }
             }
@@ -11372,6 +11334,11 @@ impl DemoApp {
         let pt = if matches!(self.hover, Some(Hit::Play)) { 1.0 } else { 0.0 };
         self.play_hover_t += (pt - self.play_hover_t) * ease;
 
+        self.rope_acc = (self.rope_acc + dt).min(8.0 * rope::STEP);
+        let rope_steps = (self.rope_acc / rope::STEP) as usize;
+        self.rope_acc -= rope_steps as f32 * rope::STEP;
+        let bounds = rope::Bounds { min_x: 4.0, max_x: self.rack_w - 4.0, floor: self.rack_h - 6.0 };
+
         let mut n_arrivals = 0usize;
         let edge_levels = self.edge_levels.clone();
         for ci in 0..self.cables.len() {
@@ -11390,56 +11357,24 @@ impl DemoApp {
             // never recovers — every cable of a keyboard-loaded rig was
             // invisible on the back. Skip until laid out; heal any NaN.
             if !(ea.x.is_finite() && ea.y.is_finite() && eb.x.is_finite() && eb.y.is_finite()) { continue; }
-            if !(c.c1.x.is_finite() && c.c1.y.is_finite() && c.c2.x.is_finite() && c.c2.y.is_finite()
-                && c.v1.x.is_finite() && c.v1.y.is_finite() && c.v2.x.is_finite() && c.v2.y.is_finite()) {
-                c.c1 = Vec2::ZERO; c.c2 = Vec2::ZERO; c.v1 = Vec2::ZERO; c.v2 = Vec2::ZERO;
-            }
-            if !(c.prev_a.x.is_finite() && c.prev_a.y.is_finite() && c.prev_b.x.is_finite() && c.prev_b.y.is_finite()) {
-                c.prev_a = ea; c.prev_b = eb;
-            }
+            if c.rope.as_ref().is_some_and(|r| !r.is_finite()) { c.rope = None; }
 
-            let mut a = c.over_a.unwrap_or(ea);
-            let mut b = c.over_b.unwrap_or(eb);
-            if c.dying >= 0.0 {
-                let p = (c.dying / 0.55).clamp(0.0, 1.0);
-                let fall = Vec2::new(c.drift * p, 430.0 * p * p);
-                if c.detach_dst { b += fall; } else { a += fall; }
-            }
-
-            // Inertial feed: endpoint motion whips the cable. On the first
-            // frame prev_* is still the constructor placeholder (unit rects
-            // were Rect::NOTHING → NaN), so skip the feed and seed bulge side.
-            let first = !c.prev_a.is_finite();
-            let feed_a = if first { Vec2::ZERO } else { clamp_len((c.prev_a - a) / dt.max(1e-4), 2400.0) * 0.28 };
-            let feed_b = if first { Vec2::ZERO } else { clamp_len((c.prev_b - b) / dt.max(1e-4), 2400.0) * 0.28 };
-            c.v1 += feed_a;
-            c.v2 += feed_b;
-            if first {
-                let mid_x = (a.x + b.x) * 0.5;
-                c.bulge_side = if (mid_x - self.rack_w / 2.0).abs() < 26.0 {
+            // Pinned ends: the jack, or the cursor while a plug is dragged.
+            // An unplugged cable lets its detached end fall.
+            let a = (c.dying < 0.0 || c.detach_dst).then(|| c.over_a.unwrap_or(ea));
+            let b = (c.dying < 0.0 || !c.detach_dst).then(|| c.over_b.unwrap_or(eb));
+            // Unit rects are Rect::NOTHING until the first layout, so the jacks
+            // can still be NaN here.
+            if c.rope.is_none() {
+                let mid_x = (ea.x + eb.x) * 0.5;
+                let side = if (mid_x - self.rack_w / 2.0).abs() < 26.0 {
                     if c.id % 2 == 0 { 1.0 } else { -1.0 }
                 } else if mid_x < self.rack_w / 2.0 { -1.0 } else { 1.0 };
+                c.rope = Some(Rope::new(ea, eb, side));
             }
-            c.prev_a = a;
-            c.prev_b = b;
-
-            // Rest shape: gravity sag + lateral bulge for vertical runs.
-            let d = b - a;
-            let dist = d.length().max(1e-3);
-            let dir = d / dist;
-            let vert = dir.y.abs();
             let breathe = if c.kind == PortKind::Audio { 1.0 + 0.04 * c.level } else { 1.0 };
-            let sag = (18.0 + dist * 0.20).min(170.0) * breathe;
-            let bulge = dist * (0.06 + 0.30 * vert) * c.bulge_var * c.bulge_side;
-            let stub = (dist * 0.12).clamp(10.0, 50.0);
-            let t1 = Vec2::new(bulge + dir.x * stub, sag + dir.y * stub * 0.3);
-            let t2 = Vec2::new(bulge - dir.x * stub, sag - dir.y * stub * 0.3);
-
-            let steps = ((dt / (1.0 / 240.0)).ceil() as usize).clamp(1, 12);
-            let h = dt / steps as f32;
-            for _ in 0..steps {
-                Self::step_spring(&mut c.c1, &mut c.v1, t1, h);
-                Self::step_spring(&mut c.c2, &mut c.v2, t2, h);
+            if let Some(rope) = &mut c.rope {
+                for _ in 0..rope_steps { rope.step(a, b, breathe, bounds); }
             }
 
             // No simulated band: pulses are fired ONLY by real key presses
@@ -11518,49 +11453,23 @@ impl DemoApp {
         if self.pending.is_some() {
             let (pu, pj) = { let p = self.pending.as_ref().unwrap(); (p.unit, p.jack) };
             let origin = self.jack_pos(pu, pj);
-            let side = p_side(pu, self);
             let p = self.pending.as_mut().unwrap();
             let (a, b) = if p.dir == Dir::Out { (origin, p.cursor) } else { (p.cursor, origin) };
-            let d = b - a;
-            let dist = d.length().max(1e-3);
-            let dir = d / dist;
-            let sag = (18.0 + dist * 0.20).min(170.0);
-            let bulge = dist * (0.06 + 0.30 * dir.y.abs()) * side;
-            let stub = (dist * 0.12).clamp(10.0, 50.0);
-            let feed = clamp_len((p.prev_b - b) / dt.max(1e-4), 2400.0) * 0.28;
-            p.v2 += feed;
-            p.prev_b = b;
-            let steps = ((dt / (1.0 / 240.0)).ceil() as usize).clamp(1, 12);
-            let h = dt / steps as f32;
-            for _ in 0..steps {
-                Self::step_spring(&mut p.c1, &mut p.v1, Vec2::new(bulge + dir.x * stub, sag), h);
-                Self::step_spring(&mut p.c2, &mut p.v2, Vec2::new(bulge - dir.x * stub, sag), h);
-            }
-            let _ = a;
+            for _ in 0..rope_steps { p.rope.step(Some(a), Some(b), 1.0, bounds); }
         }
     }
 
-    /// Rebuild local-space samples + arc-length LUT (LOD by on-screen size).
+    /// Rebuild local-space samples + arc-length LUT from each rope.
     fn tessellate(&mut self) {
         for c in &mut self.cables {
-            let a = c.prev_a;
-            let b = c.prev_b;
-            let p = [a.to_pos2(), (a + c.c1).to_pos2(), (b + c.c2).to_pos2(), b.to_pos2()];
-            c.curve = p;
-            let rough = (p[3] - p[0]).length() + (p[1] - p[0]).length() + (p[2] - p[3]).length();
-            let screen_len = rough * self.xf.sy.max(0.4);
-            let n = ((screen_len / 11.0) as usize).clamp(10, MAX_SAMPLES - 1) + 1;
+            let Some(r) = &c.rope else { continue };
+            let n = r.sample(&mut c.pts);
             c.n = n;
             let mut acc = 0.0;
-            let mut prev = p[0];
-            c.pts[0] = p[0];
             c.lut[0] = 0.0;
             for i in 1..n {
-                let q = cubic(&p, i as f32 / (n - 1) as f32);
-                acc += (q - prev).length();
-                c.pts[i] = q;
+                acc += (c.pts[i] - c.pts[i - 1]).length();
                 c.lut[i] = acc;
-                prev = q;
             }
             c.total_len = acc.max(1e-3);
         }
@@ -11984,23 +11893,20 @@ impl DemoApp {
                 }
                 Drag::Cable { id, u } => {
                     if let Some(ci) = self.live_cable(id) {
-                        let c = &mut self.cables[ci];
-                        let pt = c.point_at_arc(u).to_vec2();
-                        let delta = clamp_len(l - pt, 240.0);
-                        // Soft grab: forces into both spring particles.
-                        c.v1 += delta * 160.0 * (1.0 - u) * dt_of(ctx);
-                        c.v2 += delta * 160.0 * u * dt_of(ctx);
-                        c.c1 += delta * 3.0 * (1.0 - u) * dt_of(ctx);
-                        c.c2 += delta * 3.0 * u * dt_of(ctx);
+                        // Not laid out yet (no rope): nothing to pull this frame.
+                        let ends = self.cables[ci].rope.as_mut().map(|r| {
+                            r.pull(u, l, 0.5);
+                            (r.start(), r.end())
+                        });
                         // Tug near an end → unplug.
-                        let a = c.prev_a;
-                        let b = c.prev_b;
-                        if u < 0.16 && (l - a).length() > 48.0 {
-                            self.unplug_cable(ci, false);
-                            self.drag = Drag::None;
-                        } else if u > 0.84 && (l - b).length() > 48.0 {
-                            self.unplug_cable(ci, true);
-                            self.drag = Drag::None;
+                        if let Some((a, b)) = ends {
+                            if u < 0.16 && (l - a).length() > 48.0 {
+                                self.unplug_cable(ci, false);
+                                self.drag = Drag::None;
+                            } else if u > 0.84 && (l - b).length() > 48.0 {
+                                self.unplug_cable(ci, true);
+                                self.drag = Drag::None;
+                            }
                         }
                     } else {
                         self.drag = Drag::None;
@@ -13709,8 +13615,7 @@ impl DemoApp {
             };
             if hovered || grabbed { width += 0.8; }
 
-            let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
-                         xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
+            if c.n < 2 { continue; }
             let draw_t = if c.draw_in >= 1.0 {
                 1.0
             } else {
@@ -13718,19 +13623,14 @@ impl DemoApp {
                 1.0 - (1.0 - t).powi(3)
             };
             if draw_t <= 0.01 { continue; }
+            let pts: Vec<Pos2> = if draw_t >= 0.999 {
+                c.pts[..c.n].iter().map(|p| xf.p(p.to_vec2())).collect()
+            } else {
+                c.arc_slice(0.0, draw_t).into_iter().map(|p| xf.p(p.to_vec2())).collect()
+            };
             let mut col = self.cable_color(c);
             let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
-            let cable_shape = |w: f32, col: Color32| -> Shape {
-                if draw_t >= 0.999 {
-                    bezier_shape(curve, w, col)
-                } else {
-                    Shape::CubicBezier(
-                        egui::epaint::CubicBezierShape::from_points_stroke(
-                            curve, false, Color32::TRANSPARENT, Stroke::new(w, col),
-                        ).split_range(0.0..draw_t),
-                    )
-                }
-            };
+            let cable_shape = |w: f32, col: Color32| Shape::line(pts.clone(), Stroke::new(w, col));
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
@@ -13747,10 +13647,9 @@ impl DemoApp {
         for f in &self.fading_cables {
             let a = f.alpha.clamp(0.0, 1.0);
             if a <= 0.01 { continue; }
-            let curve = [xf.p(f.curve[0].to_vec2()), xf.p(f.curve[1].to_vec2()),
-                         xf.p(f.curve[2].to_vec2()), xf.p(f.curve[3].to_vec2())];
+            let pts: Vec<Pos2> = f.pts[..f.n].iter().map(|p| xf.p(p.to_vec2())).collect();
             let col = if f.agent { mix(f.color, theme::AGENT_COLOR, 0.7) } else { f.color };
-            painter.add(bezier_shape(curve, f.width, alpha(col, a)));
+            painter.add(Shape::line(pts, Stroke::new(f.width, alpha(col, a))));
         }
     }
 
@@ -13817,7 +13716,8 @@ impl DemoApp {
                 };
                 if plug_a <= 0.01 { continue; }
                 let over = if end == Dir::Out { c.over_a } else { c.over_b };
-                let base = if end == Dir::Out { c.prev_a } else { c.prev_b };
+                let Some(r) = &c.rope else { continue };
+                let base = if end == Dir::Out { r.start() } else { r.end() };
                 // Fan-in: stacked plugs on one jack spread slightly.
                 let p = if let Some(q) = over { q } else {
                     let (u, port) = if end == Dir::Out { (c.src, c.src_port) } else { (c.dst, c.dst_port) };
@@ -13873,12 +13773,12 @@ impl DemoApp {
     fn draw_pending(&self, painter: &egui::Painter) {
         let Some(p) = &self.pending else { return };
         let xf = &self.xf;
-        let origin = self.jack_pos(p.unit, p.jack);
-        let (a, b) = if p.dir == Dir::Out { (origin, p.cursor) } else { (p.cursor, origin) };
-        let curve = [xf.p(a), xf.p(a + p.c1), xf.p(b + p.c2), xf.p(b)];
+        let mut samples = [Pos2::ZERO; MAX_SAMPLES];
+        let n = p.rope.sample(&mut samples);
+        let pts: Vec<Pos2> = samples[..n].iter().map(|q| xf.p(q.to_vec2())).collect();
         let col = p.kind.color();
         // Single flat stroke (§4.12) — no under-stroke.
-        painter.add(bezier_shape(curve, 2.8, alpha(col, 0.85)));
+        painter.add(Shape::line(pts, Stroke::new(2.8, alpha(col, 0.85))));
         let cursor = xf.p(p.cursor);
         painter.circle_filled(cursor, 6.5, alpha(col, 0.95));
         painter.circle_stroke(cursor, 9.5, Stroke::new(1.6, alpha(col, 0.5)));
@@ -14008,10 +13908,6 @@ impl DemoApp {
         painter.hline(card.left() + PAD..=card.right() - PAD, fy - 12.0, rule);
         theme::paint_tracked(painter, Pos2::new(card.left() + PAD, fy), foot, SUBTEXT);
     }
-}
-
-fn dt_of(ctx: &egui::Context) -> f32 {
-    ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0)
 }
 
 fn p_side(unit: usize, app: &DemoApp) -> f32 {
@@ -16714,13 +16610,13 @@ mod rig_switch_tests {
         frame(&mut app, &ctx, key(Key::F4));
         assert_eq!(app.rig_count(), 2, "F4 loaded the two-rig demo");
         app.side = Side::Back;
-        let finite = |c: &Cable| c.curve.iter().all(|p| p.x.is_finite() && p.y.is_finite());
+        let finite = |c: &Cable| c.n >= 2 && c.pts[..c.n].iter().all(|p| p.x.is_finite() && p.y.is_finite());
         for rig in [0usize, 1, 0] {
             app.set_active_rig(rig);
             for _ in 0..6 { frame(&mut app, &ctx, vec![]); }
             let vis: Vec<&Cable> = app.cables.iter().filter(|c| app.visible(c.src) && app.visible(c.dst)).collect();
             assert!(!vis.is_empty(), "rig {rig} has cables");
-            for c in vis { assert!(finite(c), "rig {rig} cable {} curve {:?}", c.id, c.curve); }
+            for c in vis { assert!(finite(c), "rig {rig} cable {} rope {:?}", c.id, &c.pts[..c.n]); }
         }
     }
 
@@ -20328,7 +20224,7 @@ mod ui_polish_agent_tests {
 
         // 3. Fading units & cables decay and clear cleanly; reduce_motion snaps them clear.
         app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
-        app.fading_cables.push(FadingCable { curve: [Pos2::ZERO; 4], color: theme::AUDIO_CREAM, width: 3.0, alpha: 1.0, agent: true });
+        app.fading_cables.push(FadingCable { pts: [Pos2::ZERO; MAX_SAMPLES], n: 0, color: theme::AUDIO_CREAM, width: 3.0, alpha: 1.0, agent: true });
         app.update(0.12);
         assert_eq!(app.fading_units.len(), 1);
         assert!(app.fading_units[0].alpha < 0.6 && app.fading_units[0].alpha > 0.3);

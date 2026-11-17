@@ -8,6 +8,10 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Changed
+- **Rope cables:** patch cables are now Verlet ropes (gravity, slack, plugged
+  ends pinned, a free end falls) instead of spring-driven Bézier curves.
+  Grabbing a cable pulls its nearest point; the ghost wire while patching is a
+  rope too. Stepped at a fixed 120 Hz, so the feel is frame-rate independent.
 - **Themed dropdowns (`theme::Dropdown`):** replaced all three `egui::ComboBox`
   selectors (MIDI matrix CC parameter picker, assistant header chat-model
   picker, mixer audio output) with a Hurricane-styled dropdown matching the

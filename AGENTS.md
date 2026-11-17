@@ -627,9 +627,10 @@ Learned so far (2026-11-15, UI polish pass):
   share one checkout share its working tree, so a `git switch` in one moves
   every other session's files too. Check `git branch --show-current` and
   `pwd` before editing. When the work is finished, commit it and push the
-  branch (`git push -u origin <topic>`, gated per rule 50); never leave
-  finished work only on the local machine. Remove the worktree once its
-  branch is merged.
+  branch (`git push -u origin <topic>`, gated per rule 50), then open a
+  pull request against `main` (`gh pr create`) that references its issue
+  and shows the evidence. Never leave finished work only on the local
+  machine or only on a branch. Remove the worktree once its PR is merged.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

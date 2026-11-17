@@ -899,6 +899,10 @@ struct EngineEdit {
     result: String,
     /// Node and cable ids before the edit.
     before: (Vec<u32>, Vec<u32>),
+    /// The engine publication the rack had adopted when the tool ran. A
+    /// disconnect unplugs its cable in the rack at once, so changed ids
+    /// alone do not show that the engine has answered.
+    rev: u64,
     deadline: std::time::Instant,
 }
 
@@ -3437,7 +3441,7 @@ impl DemoApp {
                 batch.results.push(result);
                 continue;
             };
-            batch.waiting = Some(EngineEdit { result, before, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT });
+            batch.waiting = Some(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT });
             self.tool_batch = Some(batch);
             return;
         }
@@ -3468,7 +3472,7 @@ impl DemoApp {
             list("new cable id", &cables, cables_before),
             list("removed cable", cables_before, &cables),
         ].into_iter().flatten().collect();
-        if !changes.is_empty() {
+        if !changes.is_empty() && self.last_graph_rev != edit.rev {
             Some(format!("{} [applied: {}]", edit.result, changes.join("; ")))
         } else if std::time::Instant::now() < edit.deadline {
             None
@@ -16932,6 +16936,65 @@ mod ui_polish_agent_tests {
             }
             panic!("the app never answered the batch");
         }
+    }
+
+    /// Each disconnect of a step must reach the engine. The barrier used to
+    /// open on the rack's own unplug: the next disconnect then ran while the
+    /// engine's answer to the first was still on its way, the rack was
+    /// rebuilt from that answer with the second cable plugged in again, and
+    /// the per-frame patch publish re-connected it.
+    #[test]
+    fn every_disconnect_of_one_step_is_applied() {
+        let mut live = Live::new();
+        let results = live.run_batch((4..=5).chain(8..=9).map(|id| call("disconnect", serde_json::json!({"id": id}))).collect());
+        for (id, result) in [4, 5, 8, 9].iter().zip(&results) {
+            assert!(result.ends_with(&format!("[applied: removed cable {id}]")), "{result}");
+        }
+        for _ in 0..4 { live.frame(); }
+        let left: Vec<u32> = live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.edges.iter().map(|e| e.id).filter(|id| [4, 5, 8, 9].contains(id)).collect();
+        assert!(left.is_empty(), "the engine still has cables {left:?}");
+    }
+
+    /// The plans read what the app's tools answer: the graph as JSON, the
+    /// ids an engine edit names, a started node. Here they run against the
+    /// real tools and the real engine barrier.
+    #[test]
+    fn shortcut_plans_understand_what_the_apps_tools_answer() {
+        let mut live = Live::new();
+        let audio_into = |app: &DemoApp, node: u32| -> Vec<u32> {
+            let g = app.shared_graph.lock().unwrap();
+            let mut from: Vec<u32> = g.edges.iter().filter(|e| e.kind == CPortKind::Audio && e.to.node == node).map(|e| e.from.node).collect();
+            from.sort();
+            from.dedup();
+            from
+        };
+        let master = live.app.units[live.app.master_unit.unwrap()].node_id;
+        let fed_master = audio_into(&live.app, master);
+        assert_eq!(fed_master.len(), 4, "the demo wires two synths and two delays to the Master");
+
+        let said = crate::assistant::run_shortcut("add_effect", "Add a reverb to this rig", 0, &[("effect", "reverb")], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Reverb added to Rig 1, in front of Master."));
+        let reverb = live.app.shared_graph.lock().unwrap().nodes.iter().find(|n| n.kind == NodeKind::Dsp(DspKind::Reverb)).map(|n| n.id).expect("a reverb");
+        assert_eq!(audio_into(&live.app, master), vec![reverb], "only the reverb feeds the Master");
+        assert_eq!(audio_into(&live.app, reverb), fed_master, "everything that fed the Master feeds the reverb");
+
+        let said = crate::assistant::run_shortcut("metronome", "Add a metronome and start it.", 0, &[], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Metronome added to Rig 1 and running."));
+        for _ in 0..4 { live.frame(); }
+        let click = {
+            let published = live.app.graph_pub.as_ref().unwrap().lock().unwrap();
+            published.graph.nodes.iter().find(|n| n.kind == NodeKind::Dsp(DspKind::Metronome)).map(|n| (n.id, n.playing)).expect("a metronome")
+        };
+        assert!(click.1, "the metronome runs");
+        assert_eq!(audio_into(&live.app, master), vec![reverb, click.0], "the click goes straight to the Master");
+        let said = crate::assistant::run_shortcut("metronome", "Start the metronome.", 0, &[], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("The metronome is running."), "a second request adds no second metronome");
+
+        let said = crate::assistant::run_shortcut("remove_effect", "Remove the reverb.", 0, &[("effect", "reverb")], |calls| live.run_batch(calls));
+        assert_eq!(said.as_deref(), Some("Reverb removed from Rig 1."));
+        let mut back = fed_master.clone();
+        back.push(click.0);
+        assert_eq!(audio_into(&live.app, master), back, "the sources are back on the Master");
     }
 
     #[test]

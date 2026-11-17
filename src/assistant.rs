@@ -9,6 +9,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 
 use serde_json::{json, Value};
 
+use crate::control::{DspKind, Edge, Graph, NodeId, NodeKind, PortKind};
 use crate::llm::{self, Endpoint, LlmError, Role, Route, Transport};
 
 pub fn config_path() -> std::path::PathBuf {
@@ -381,7 +382,8 @@ fn system_prompt() -> String {
      one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
-     Wire only nodes of the same rig. Every rig sounds at once.\n\
+     Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
+     the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
      the chat then shows Confirm / Cancel buttons. Ask the user in one short sentence and \
      wait — their click runs or cancels it.\n\
@@ -801,14 +803,34 @@ fn coerce_arg(schema: &Value, value: Value) -> Result<Value, String> {
     }
 }
 
-/// What the user's own words spell out, plus the rig Jev read from them.
+/// What a request states: the user's own words, and what Jev read from them.
 struct Facts<'a> {
     request: &'a str,
     /// 0-based index of the rig the request names.
     rig: Option<u64>,
+    /// 0-based index of the rig in view (from the app's [context] line),
+    /// when Jev read that the request names no rig. A rig Jev is unsure of
+    /// leaves both empty.
+    view: Option<u64>,
+    /// Jev's pick for each slot question it is sure of.
+    picked: Vec<(&'static str, String)>,
 }
 
 impl Facts<'_> {
+    fn pick(&self, slot: &Slot) -> Option<&str> {
+        self.picked.iter().find(|(key, _)| *key == slot.key).map(|(_, pick)| pick.as_str())
+    }
+
+    /// The rig to work on where a request may leave it open: the one it
+    /// names, else the one in view.
+    fn rig_or_view(&self) -> Option<u64> {
+        self.rig.or(self.view)
+    }
+
+    fn words(&self) -> Vec<String> {
+        self.request.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect()
+    }
+
     fn numbers(&self) -> Vec<f64> {
         self.request
             .split(|c: char| !(c.is_ascii_digit() || c == '.'))
@@ -846,23 +868,107 @@ impl Facts<'_> {
             Some((12 * (octave + 1) + pitch + accidental) as u64)
         })
     }
+
+    /// The words that describe the sound asked for: "warm" and "pad" in
+    /// "Load a warm pad into rig 2."
+    fn sound_words(&self) -> Vec<String> {
+        const FILLER: &[&str] = &[
+            "a", "an", "the", "some", "me", "my", "i", "we", "us", "you", "to", "into", "in", "on", "onto", "for", "of", "with",
+            "and", "please", "load", "give", "get", "want", "need", "use", "play", "put", "set", "make", "change", "switch",
+            "pick", "choose", "find", "select", "sound", "sounds", "patch", "preset", "instrument", "synth", "surge", "nice",
+            "good", "new", "something", "like", "that", "this", "it", "its", "can", "could", "would", "have", "let", "lets",
+            "try", "now", "kind", "sort", "type", "one", "up", "s",
+        ];
+        let words = self.words();
+        let mut kept = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            // "rig 2", "rig B": the word after "rig" names it.
+            if words[i] == "rig" { i += 2; continue; }
+            if !FILLER.contains(&words[i].as_str()) { kept.push(words[i].clone()); }
+            i += 1;
+        }
+        kept
+    }
 }
 
-/// A request Jev settles alone: one tool call, built from its typed answers
-/// and from what the request spells out. No chat model is involved.
+/// A typed question with a closed set of answers. Jev picks one; a plan
+/// reads the pick.
+struct Slot {
+    key: &'static str,
+    ask: &'static str,
+    /// Each option and what it means.
+    options: &'static [(&'static str, &'static str)],
+}
+
+/// The answer that picks none of a slot's options.
+const NO_PICK: &str = "none";
+
+/// The built-in effects, by the name add_node takes.
+const EFFECT: Slot = Slot {
+    key: "effect",
+    ask: "Which ONE built-in effect does the user's request name?",
+    options: &[
+        ("reverb", "A reverb."), ("delay", "A delay / echo."), ("filter", "A filter."), ("eq3", "An EQ / equalizer."),
+        ("limiter", "A limiter."), ("saturation", "A saturation / drive / distortion."), ("gain", "A gain unit."),
+        ("pan", "A panner unit."),
+    ],
+};
+
+/// The kinds of sound a request can ask for, by the word the patch search takes.
+const SOUND: Slot = Slot {
+    key: "sound",
+    ask: "Which ONE kind of synth sound does the user's request ask for?",
+    options: &[
+        ("pad", "A pad: sustained, atmospheric."), ("bass", "A bass."), ("lead", "A lead or solo synth."),
+        ("keys", "Keys: piano, electric piano, Rhodes, Wurlitzer, clavinet."), ("organ", "An organ."),
+        ("string", "Strings."), ("brass", "Brass."), ("pluck", "A plucked sound."), ("bell", "Bells, mallets, chimes."),
+        ("fx", "A sound effect."),
+    ],
+};
+
+const SLOTS: &[&Slot] = &[&EFFECT, &SOUND];
+
+/// One step of a shortcut's plan.
+#[derive(Debug, PartialEq)]
+enum Step {
+    /// Tool calls for the app, run as one batch like a model step's.
+    Run(Vec<ToolCall>),
+    /// The plan is done: what the agent says.
+    Say(String),
+}
+
+/// A request Jev settles without a chat model: a plan of tool calls built
+/// from its typed answers, from what the request spells out and from what
+/// the tools report back.
 struct Shortcut {
     key: &'static str,
     /// The criterion Jev matches the request against.
     means: &'static str,
-    /// The tool call; None when the request leaves open what the tool needs
-    /// (the chat model takes over).
-    call: fn(&Facts) -> Option<ToolCall>,
-    /// What the agent says afterwards, given the tool's result line.
-    say: fn(&Facts, &str) -> String,
+    /// The next step, given the results of the calls run so far (none at
+    /// first). None = the request or the patch leaves open what a tool
+    /// needs: the chat model takes over and sees those calls and results.
+    plan: fn(&Facts, &[String]) -> Option<Step>,
+}
+
+fn call(name: &str, args: Value) -> ToolCall {
+    ToolCall { name: name.to_string(), args }
+}
+
+fn run(name: &str, args: Value) -> Option<Step> {
+    Some(Step::Run(vec![call(name, args)]))
+}
+
+/// A plan of one tool call: run it, then answer with what it reported.
+fn once(done: &[String], args: impl FnOnce() -> Option<ToolCall>, say: impl FnOnce(&str) -> String) -> Option<Step> {
+    match done.last() {
+        None => Some(Step::Run(vec![args()?])),
+        Some(result) => Some(Step::Say(say(result))),
+    }
 }
 
 /// The tool's own result line as a sentence.
-fn say_result(_: &Facts, result: &str) -> String {
+fn say_result(result: &str) -> String {
     let mut chars = result.chars();
     let sentence: String = chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default();
     if sentence.ends_with(['.', '!', '?']) { sentence } else { format!("{sentence}.") }
@@ -873,55 +979,255 @@ fn say_result(_: &Facts, result: &str) -> String {
 fn say_mix(f: &Facts, result: &str, what: &str) -> String {
     match f.rig {
         Some(rig) if result.starts_with(&format!("rig {rig}:")) => format!("Rig {} {what}.", rig + 1),
-        _ => say_result(f, result),
+        _ => say_result(result),
     }
 }
 
-fn shortcut_call(name: &str, args: Value) -> Option<ToolCall> {
-    Some(ToolCall { name: name.to_string(), args })
+/// Set one field of the named rig's mixer strip.
+fn mix(f: &Facts, done: &[String], field: &str, value: Value, what: &str) -> Option<Step> {
+    once(done, || Some(call("set_rig_mix", json!({ "rig": f.rig?, field: value }))), |r| say_mix(f, r, what))
+}
+
+/// "A bit" quieter or louder: about 3 dB.
+const VOLUME_STEP: f64 = 0.7;
+/// A pan nudge: half the way from the centre to one side.
+const PAN_STEP: f64 = 0.5;
+
+fn quieter(vol: f64) -> f64 { vol * VOLUME_STEP }
+fn louder(vol: f64) -> f64 { (vol.max(0.1) / VOLUME_STEP).min(1.0) }
+fn left(pan: f64) -> f64 { (pan - PAN_STEP).max(-1.0) }
+fn right(pan: f64) -> f64 { (pan + PAN_STEP).min(1.0) }
+
+fn say_vol(vol: f64) -> String {
+    format!("at {:.0} %", vol * 100.0)
+}
+
+fn say_pan(pan: f64) -> String {
+    match (pan * 100.0).round() as i64 {
+        0 => "panned to the centre".to_string(),
+        p if p < 0 => format!("panned {} % left", -p),
+        p => format!("panned {p} % right"),
+    }
+}
+
+/// Move one field of the named rig's mixer strip a step from where it is:
+/// read the strip, then set the new value.
+fn nudge(f: &Facts, done: &[String], field: &str, step: fn(f64) -> f64, say: fn(f64) -> String) -> Option<Step> {
+    let rig = f.rig?;
+    let [rigs, set @ ..] = done else { return run("get_rigs", json!({})) };
+    let rigs: Value = serde_json::from_str(rigs).ok()?;
+    let now = rigs["rigs"].as_array()?.iter().find(|r| r["rig"] == rig)?[field].as_f64()?;
+    let next = (step(now) * 100.0).round() / 100.0;
+    match set.last() {
+        Some(result) => Some(Step::Say(say_mix(f, result, &format!("is now {}", say(next))))),
+        None if (next - now).abs() < 0.005 => Some(Step::Say(format!("Rig {} is already {}.", rig + 1, say(now)))),
+        None => run("set_rig_mix", json!({ "rig": rig, field: next })),
+    }
+}
+
+fn graph_of(result: &str) -> Option<Graph> {
+    serde_json::from_str(result).ok()
+}
+
+fn rig_master(g: &Graph, rig: u64) -> Option<NodeId> {
+    g.nodes.iter().find(|n| n.rig as u64 == rig && n.kind == NodeKind::MasterOut).map(|n| n.id)
+}
+
+fn is_audio(e: &&Edge) -> bool {
+    e.kind == PortKind::Audio
+}
+
+/// The id of the node an add_node result names (the app appends it once the
+/// engine applied the edit).
+fn new_node_id(result: &str) -> Option<u64> {
+    result.split("new node id ").nth(1)?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// Did every edit of a batch take effect?
+fn applied(results: &[String]) -> bool {
+    !results.is_empty() && results.iter().all(|r| !r.contains("NOT applied") && !r.starts_with("error"))
+}
+
+fn effect_kind(effect: &str) -> Option<(DspKind, &'static str)> {
+    Some(match effect {
+        "reverb" => (DspKind::Reverb, "Reverb"),
+        "delay" => (DspKind::Delay, "Delay"),
+        "filter" => (DspKind::Filter, "Filter"),
+        "eq3" => (DspKind::Eq3, "EQ"),
+        "limiter" => (DspKind::Limiter, "Limiter"),
+        "saturation" => (DspKind::Saturation, "Saturation"),
+        "gain" => (DspKind::Gain, "Gain"),
+        "pan" => (DspKind::Pan, "Panner"),
+        _ => return None,
+    })
+}
+
+/// Where a new effect goes: in front of the rig's Master, taking over every
+/// audio cable that feeds it (a metronome keeps its own cable). None when
+/// nothing feeds the Master, or when the request asks for a position
+/// ("before the delay") in a chain that already has effects.
+fn chain_end(g: &Graph, rig: u64, f: &Facts) -> Option<(NodeId, Vec<Edge>)> {
+    let master = rig_master(g, rig)?;
+    let kind_of = |e: &Edge| g.node(e.from.node).map(|n| &n.kind);
+    let feeds: Vec<Edge> = g.edges.iter().filter(is_audio)
+        .filter(|e| e.to.node == master && kind_of(e) != Some(&NodeKind::Dsp(DspKind::Metronome)))
+        .cloned().collect();
+    let only_sources = feeds.iter().all(|e| matches!(kind_of(e), Some(NodeKind::Clap { .. } | NodeKind::AudioIn { .. })));
+    let names_a_place = f.words().iter().any(|w| ["after", "before", "between", "behind", "front"].contains(&w.as_str()));
+    (!feeds.is_empty() && (only_sources || !names_a_place)).then_some((master, feeds))
+}
+
+/// Add one effect to a rig and wire it in front of the Master.
+fn add_effect(f: &Facts, done: &[String]) -> Option<Step> {
+    let effect = f.pick(&EFFECT)?;
+    let (_, name) = effect_kind(effect)?;
+    let rig = f.rig_or_view()?;
+    match done {
+        [] => run("get_graph", json!({})),
+        [graph] => {
+            chain_end(&graph_of(graph)?, rig, f)?;
+            run("add_node", json!({ "kind": "dsp", "dsp": effect, "rig": rig }))
+        }
+        [graph, added] => {
+            let (master, feeds) = chain_end(&graph_of(graph)?, rig, f)?;
+            let fx = new_node_id(added)?;
+            let mut calls: Vec<ToolCall> = feeds.iter().map(|e| call("disconnect", json!({ "id": e.id }))).collect();
+            let mut wire = |c: ToolCall| if !calls.contains(&c) { calls.push(c) };
+            for e in &feeds {
+                wire(call("connect", json!({ "from_node": e.from.node, "from_port": e.from.port, "to_node": fx })));
+            }
+            for e in &feeds {
+                wire(call("connect", json!({ "from_node": fx, "to_node": master, "to_port": e.to.port })));
+            }
+            Some(Step::Run(calls))
+        }
+        [_, _, wired @ ..] => applied(wired).then(|| Step::Say(format!("{name} added to Rig {}, in front of Master.", rig + 1))),
+    }
+}
+
+/// Remove a rig's one effect of a kind and close the gap it leaves.
+fn remove_effect(f: &Facts, done: &[String]) -> Option<Step> {
+    let (kind, name) = effect_kind(f.pick(&EFFECT)?)?;
+    let rig = f.rig_or_view()?;
+    match done {
+        [] => run("get_graph", json!({})),
+        [graph] => {
+            let g = graph_of(graph)?;
+            let mut units = g.nodes.iter().filter(|n| n.rig as u64 == rig && n.kind == NodeKind::Dsp(kind.clone()));
+            // Which of two delays is meant is the chat model's question.
+            let (Some(fx), None) = (units.next().map(|n| n.id), units.next()) else { return None };
+            let mut calls = vec![call("remove_node", json!({ "node": fx }))];
+            for out in g.edges.iter().filter(is_audio).filter(|e| e.from.node == fx) {
+                for src in g.edges.iter().filter(is_audio).filter(|e| e.to.node == fx) {
+                    let wired = g.edges.iter().filter(is_audio).any(|e| e.from == src.from && e.to == out.to);
+                    let c = call("connect", json!({ "from_node": src.from.node, "from_port": src.from.port, "to_node": out.to.node, "to_port": out.to.port }));
+                    if !wired && !calls.contains(&c) { calls.push(c); }
+                }
+            }
+            Some(Step::Run(calls))
+        }
+        [_, removed @ ..] => applied(removed).then(|| Step::Say(format!("{name} removed from Rig {}.", rig + 1))),
+    }
+}
+
+/// A running metronome in the rig: start the one that is there (wiring it
+/// to the Master if it is not), else add one, wire it and start it.
+fn metronome(f: &Facts, done: &[String]) -> Option<Step> {
+    let rig = f.rig_or_view()?;
+    let [graph, since @ ..] = done else { return run("get_graph", json!({})) };
+    let g = graph_of(graph)?;
+    let master = rig_master(&g, rig)?;
+    let wire = |node: u64| call("connect", json!({ "from_node": node, "to_node": master }));
+    let start = |node: u64| call("set_node_playing", json!({ "node": node, "playing": true }));
+    let added = since.first().and_then(|r| new_node_id(r));
+    match (since, added) {
+        ([], _) => match g.nodes.iter().find(|n| n.rig as u64 == rig && n.kind == NodeKind::Dsp(DspKind::Metronome)) {
+            Some(m) if g.edges.iter().filter(is_audio).any(|e| e.from.node == m.id && e.to.node == master) => Some(Step::Run(vec![start(m.id as u64)])),
+            Some(m) => Some(Step::Run(vec![wire(m.id as u64), start(m.id as u64)])),
+            None => run("add_node", json!({ "kind": "dsp", "dsp": "metronome", "rig": rig })),
+        },
+        ([_], Some(node)) => Some(Step::Run(vec![wire(node), start(node)])),
+        ([.., started], _) if applied(since) && started.ends_with(" playing") => Some(Step::Say(
+            if added.is_some() { format!("Metronome added to Rig {} and running.", rig + 1) } else { "The metronome is running.".to_string() },
+        )),
+        _ => None,
+    }
+}
+
+/// Load a sound of the kind Jev picked. The patch search is asked for the
+/// user's own words first ("warm pad"), then for the kind alone.
+fn load_sound(f: &Facts, done: &[String]) -> Option<Step> {
+    let kind = f.pick(&SOUND)?;
+    let rig = f.rig_or_view()?;
+    let described = f.sound_words().join(" ");
+    let mut queries: Vec<String> = Vec::new();
+    for q in [if described.contains(kind) { described.clone() } else { format!("{described} {kind}") }, described.clone(), kind.to_string()] {
+        let q = q.trim().to_string();
+        if !q.is_empty() && !queries.contains(&q) { queries.push(q); }
+    }
+    let misses = done.iter().filter(|r| r.starts_with("no ")).count();
+    let query = queries.get(misses)?;
+    match done.last().map(String::as_str) {
+        Some(hits) if hits.starts_with('{') => run("load_sound", json!({ "query": query, "rig": rig })),
+        Some(loaded) if loaded.starts_with("loaded '") => Some(Step::Say(format!("Rig {} now plays {}.", rig + 1, loaded.split('\'').nth(1)?))),
+        Some(other) if !other.starts_with("no ") => None,
+        _ => run("list_sounds", json!({ "query": query })),
+    }
 }
 
 const SHORTCUTS: &[Shortcut] = &[
-    Shortcut { key: "tempo", means: "Set the tempo to a stated BPM value.", say: say_result,
-        call: |f| shortcut_call("set_bpm", json!({ "bpm": f.bpm()? })) },
+    Shortcut { key: "tempo", means: "Set the tempo to a stated BPM value.",
+        plan: |f, done| once(done, || Some(call("set_bpm", json!({ "bpm": f.bpm()? }))), say_result) },
     Shortcut { key: "volume", means: "Set one named rig's volume to a stated percentage.",
-        say: |f, r| say_mix(f, r, &format!("is at {:.0} %", f.percent().unwrap_or(0.0) * 100.0)),
-        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "vol": f.percent()? })) },
-    Shortcut { key: "mute", means: "Mute one named rig.", say: |f, r| say_mix(f, r, "is muted"),
-        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "mute": true })) },
-    Shortcut { key: "unmute", means: "Unmute one named rig.", say: |f, r| say_mix(f, r, "is unmuted"),
-        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "mute": false })) },
-    Shortcut { key: "solo", means: "Solo one named rig.", say: |f, r| say_mix(f, r, "is soloed"),
-        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "solo": true })) },
-    Shortcut { key: "unsolo", means: "Take one named rig out of solo.", say: |f, r| say_mix(f, r, "is out of solo"),
-        call: |f| shortcut_call("set_rig_mix", json!({ "rig": f.rig?, "solo": false })) },
-    Shortcut { key: "split", means: "Split the keyboard at a stated note, and nothing more (no word about which instrument plays which half).", say: say_result,
-        call: |f| shortcut_call("set_split", json!({ "point": f.note()? })) },
-    Shortcut { key: "unsplit", means: "Remove the keyboard split.", say: say_result,
-        call: |_| shortcut_call("set_split", json!({})) },
+        plan: |f, done| mix(f, done, "vol", json!(f.percent()?), &format!("is {}", say_vol(f.percent()?))) },
+    Shortcut { key: "quieter", means: "Make one named rig quieter, with no amount stated ('a bit quieter', 'turn it down').",
+        plan: |f, done| nudge(f, done, "vol", quieter, say_vol) },
+    Shortcut { key: "louder", means: "Make one named rig louder, with no amount stated ('a bit louder', 'turn it up').",
+        plan: |f, done| nudge(f, done, "vol", louder, say_vol) },
+    Shortcut { key: "pan_left", means: "Pan one named rig to the left, with no amount stated.",
+        plan: |f, done| nudge(f, done, "pan", left, say_pan) },
+    Shortcut { key: "pan_right", means: "Pan one named rig to the right, with no amount stated.",
+        plan: |f, done| nudge(f, done, "pan", right, say_pan) },
+    Shortcut { key: "mute", means: "Mute one named rig.", plan: |f, done| mix(f, done, "mute", json!(true), "is muted") },
+    Shortcut { key: "unmute", means: "Unmute one named rig.", plan: |f, done| mix(f, done, "mute", json!(false), "is unmuted") },
+    Shortcut { key: "solo", means: "Solo one named rig.", plan: |f, done| mix(f, done, "solo", json!(true), "is soloed") },
+    Shortcut { key: "unsolo", means: "Take one named rig out of solo.", plan: |f, done| mix(f, done, "solo", json!(false), "is out of solo") },
+    Shortcut { key: "split", means: "Split the keyboard at a stated note, and nothing more (no word about which instrument plays which half).",
+        plan: |f, done| once(done, || Some(call("set_split", json!({ "point": f.note()? }))), say_result) },
+    Shortcut { key: "unsplit", means: "Remove the keyboard split.",
+        plan: |_, done| once(done, || Some(call("set_split", json!({}))), say_result) },
+    Shortcut { key: "add_effect", means: "Add ONE built-in effect (reverb, delay, filter, EQ, limiter, saturation, gain, panner) to a rig and wire it into the signal chain (the request may say 'wire it in', 'after the synth' or 'before the master'), and nothing more (no settings, no second change).",
+        plan: add_effect },
+    Shortcut { key: "remove_effect", means: "Remove ONE effect unit (e.g. the delay) from a rig, and nothing more.",
+        plan: remove_effect },
+    Shortcut { key: "load_sound", means: "Load a kind of sound (e.g. a warm pad, a bass, a piano) into an existing rig's synth, and nothing more (no new rig, no level).",
+        plan: load_sound },
     Shortcut { key: "add_rig", means: "Add a new, plain rig (no sound, name or level asked for).",
         // The tool appends the rig list as JSON for a model to read.
-        say: |f, r| say_result(f, r.split(" {").next().unwrap_or(r).trim()),
-        call: |_| shortcut_call("add_rig", json!({})) },
+        plan: |_, done| once(done, || Some(call("add_rig", json!({}))), |r| say_result(r.split(" {").next().unwrap_or(r).trim())) },
     Shortcut { key: "delete_rig", means: "Delete one named rig.",
-        say: |f, r| if r.contains("Confirm / Cancel") {
+        plan: |f, done| once(done, || Some(call("delete_rig", json!({ "rig": f.rig? }))), |r| if r.contains("Confirm / Cancel") {
             "That deletes the rig and everything in it. Confirm or cancel below.".to_string()
         } else {
-            say_result(f, r)
-        },
-        call: |f| shortcut_call("delete_rig", json!({ "rig": f.rig? })) },
-    Shortcut { key: "play", means: "Start the transport / the metronome that is already there.", say: say_result,
-        call: |_| shortcut_call("transport_play", json!({})) },
-    Shortcut { key: "stop", means: "Stop the transport.", say: say_result,
-        call: |_| shortcut_call("transport_stop", json!({})) },
-    Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.", say: say_result,
-        call: |f| shortcut_call("select_rig", json!({ "rig": f.rig? })) },
-    Shortcut { key: "undo", means: "Undo the last change.", say: say_result,
-        call: |_| shortcut_call("undo", json!({})) },
-    Shortcut { key: "redo", means: "Redo the change that was just undone.", say: say_result,
-        call: |_| shortcut_call("redo", json!({})) },
-    Shortcut { key: "flip", means: "Flip the rack to its other side (front / back).", say: say_result,
-        call: |_| shortcut_call("flip_rack", json!({})) },
+            say_result(r)
+        }) },
+    Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.",
+        plan: |f, done| once(done, || Some(call("select_rig", json!({ "rig": f.rig? }))), say_result) },
+    Shortcut { key: "metronome", means: "Add a metronome (a click), or start the metronome.", plan: metronome },
+    Shortcut { key: "play", means: "Start the transport (play), with no word about a metronome.",
+        plan: |_, done| once(done, || Some(call("transport_play", json!({}))), say_result) },
+    Shortcut { key: "stop", means: "Stop the transport.",
+        plan: |_, done| once(done, || Some(call("transport_stop", json!({}))), say_result) },
+    Shortcut { key: "record", means: "Start recording.",
+        plan: |_, done| once(done, || Some(call("record_start", json!({}))), say_result) },
+    Shortcut { key: "record_stop", means: "Stop the recording.",
+        plan: |_, done| once(done, || Some(call("record_stop", json!({}))), say_result) },
+    Shortcut { key: "undo", means: "Undo the last change.",
+        plan: |_, done| once(done, || Some(call("undo", json!({}))), say_result) },
+    Shortcut { key: "redo", means: "Redo the change that was just undone.",
+        plan: |_, done| once(done, || Some(call("redo", json!({}))), say_result) },
+    Shortcut { key: "flip", means: "Flip the rack to its other side (front / back).",
+        plan: |_, done| once(done, || Some(call("flip_rack", json!({}))), say_result) },
 ];
 
 /// The answer that hands the request to the chat model.
@@ -929,41 +1235,98 @@ const NOT_A_SHORTCUT: &str = "other";
 /// Below this probability Jev's pick is not acted on.
 const DECISION_CONFIDENCE: f64 = 0.85;
 const MAX_RIGS: u64 = 8;
+/// Batches one plan may run. The longest plan takes three.
+const MAX_PLAN_BATCHES: usize = 6;
 
 /// The typed questions Jev answers about a request.
 fn decision_questions() -> Value {
     let mut actions = serde_json::Map::new();
     for s in SHORTCUTS { actions.insert(s.key.to_string(), json!(s.means)); }
     actions.insert(NOT_A_SHORTCUT.to_string(), json!(
-        "Anything else: a question, a request for more than one change, adding, removing or wiring units, \
-         loading or choosing sounds, relative changes such as 'a bit quieter', or anything unclear."));
+        "Anything else: a question, a request for more than one change, wiring or rewiring units, a new rig with a sound \
+         or a level, an effect with settings or placed between two other units, or anything unclear."));
     let mut rigs = serde_json::Map::new();
     for n in 1..=MAX_RIGS { rigs.insert(format!("rig_{n}"), json!(format!("The request names rig {n} (by number, letter or name; see 'all rigs' in the context)."))); }
-    rigs.insert("none".to_string(), json!("The request names no rig."));
-    json!({
+    rigs.insert(NO_PICK.to_string(), json!("The request names no rig, or says 'this rig' / 'the current rig'."));
+    let mut questions = json!({
         "action": { "type": "choice", "instructions": "Which ONE action does the user's request (the text after the [context] line) ask for?", "criteria": actions },
         "rig": { "type": "choice", "instructions": "Which rig does the user's request name?", "criteria": rigs },
-    })
+    });
+    for slot in SLOTS {
+        let mut options = serde_json::Map::new();
+        for (option, means) in slot.options { options.insert(option.to_string(), json!(means)); }
+        options.insert(NO_PICK.to_string(), json!("None of these."));
+        questions[slot.key] = json!({ "type": "choice", "instructions": slot.ask, "criteria": options });
+    }
+    questions
 }
 
-/// What Jev's answers settle: the shortcut and its tool call, when Jev is
-/// sure of one and the request spells out what the tool needs.
-fn settle(decision: &llm::Decisions, user: &str) -> Option<(&'static Shortcut, ToolCall)> {
-    let (action, p) = decision.choice("action")?;
-    if p < DECISION_CONFIDENCE { return None; }
+/// What Jev's answers settle: a shortcut, the facts its plan reads, and the
+/// plan's first step — when Jev is sure of the shortcut and the request
+/// spells out what that step needs.
+fn settle<'a>(decision: &llm::Decisions, user: &'a str) -> Option<(&'static Shortcut, Facts<'a>, Step)> {
+    let sure = |question: &str| decision.choice(question).filter(|(_, p)| *p >= DECISION_CONFIDENCE).map(|(pick, _)| pick);
+    let action = sure("action")?;
     let shortcut = SHORTCUTS.iter().find(|s| s.key == action)?;
-    let rig = decision.choice("rig")
-        .filter(|(_, p)| *p >= DECISION_CONFIDENCE)
-        .and_then(|(rig, _)| rig.strip_prefix("rig_")?.parse::<u64>().ok())
-        .map(|n| n - 1);
-    // The app prepends a [context: …] line; numbers and notes come from the
-    // user's own words only.
-    let request = match user.split_once('\n') {
-        Some((context, rest)) if context.starts_with("[context:") => rest,
-        _ => user,
+    // The app prepends a [context: …] line; numbers, notes and words come
+    // from the user's own words only.
+    let (context, request) = match user.split_once('\n') {
+        Some((context, rest)) if context.starts_with("[context:") => (context, rest),
+        _ => ("", user),
     };
-    let call = (shortcut.call)(&Facts { request, rig })?;
-    Some((shortcut, call))
+    let facts = Facts {
+        request,
+        rig: sure("rig").and_then(|rig| rig.strip_prefix("rig_")?.parse::<u64>().ok()).map(|n| n - 1),
+        view: decision.choice("rig").filter(|(pick, _)| *pick == NO_PICK)
+            .and_then(|_| context.split("(index ").nth(1)?.split(')').next()?.parse().ok()),
+        picked: SLOTS.iter()
+            .filter_map(|slot| Some((slot.key, sure(slot.key).filter(|pick| *pick != NO_PICK)?.to_string())))
+            .collect(),
+    };
+    let first = (shortcut.plan)(&facts, &[])?;
+    Some((shortcut, facts, first))
+}
+
+/// Run one shortcut's plan against the app the way the worker does, for
+/// tests of what the app's tools answer. `view` is the rig in view, `picks`
+/// are Jev's slot answers. Returns what the agent says; None where the plan
+/// hands over to the chat model.
+#[cfg(test)]
+pub fn run_shortcut(key: &str, request: &str, view: u64, picks: &[(&'static str, &str)], mut app: impl FnMut(Vec<ToolCall>) -> Vec<String>) -> Option<String> {
+    let shortcut = SHORTCUTS.iter().find(|s| s.key == key)?;
+    let facts = Facts { request, rig: None, view: Some(view), picked: picks.iter().map(|(slot, pick)| (*slot, pick.to_string())).collect() };
+    let mut done = Vec::new();
+    for _ in 0..MAX_PLAN_BATCHES {
+        match (shortcut.plan)(&facts, &done)? {
+            Step::Say(text) => return Some(text),
+            Step::Run(calls) => done.extend(app(calls)),
+        }
+    }
+    None
+}
+
+/// Requests `kabelsalat jev-test` asks about.
+const JEV_SAMPLES: &[&str] = &[
+    "Set the tempo to 100 BPM.", "What tempo are we at?", "Split the keyboard at C4.",
+    "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.", "Load a warm pad.",
+    "Load a bass sound into rig 2.", "give me a rhodes", "load a flute", "Load the patch Pads/Dreamscape.",
+    "Add a reverb to rig 1 and wire it in.", "Add a reverb to this rig", "Insert a reverb into rig 2.",
+    "Put a delay after the synth.", "Put a filter between the synth and the delay.", "Add a reverb with a long tail to rig 1.",
+    "Add a chorus to rig 1.", "Add a reverb to rig 1 and set the tempo to 120 BPM.", "Remove the delay from rig 1.",
+    "Add a metronome and start it.", "Start the metronome.", "play", "stop", "Start recording.", "stop the recording",
+    "Add a new rig.", "Make a new rig with a bass sound, quieter than rig 1.", "Set rig 2 volume to 50 %.",
+    "Make rig 2 a bit quieter.", "make rig B a bit louder", "turn rig 1 down by 6 dB", "Pan rig 1 to the left.",
+    "pan rig 2 right", "Pan rig 1 hard left and rig 2 hard right.", "Mute rig 1.", "unmute rig 1", "solo the second rig",
+    "Delete rig 2.", "show rig 2", "undo that", "Why is there no sound?",
+];
+
+/// What a decision leads to, for the test printout.
+fn settled_as(d: &llm::Decisions, user: &str) -> String {
+    match settle(d, user) {
+        Some((_, _, Step::Run(calls))) => format!("-> {}", calls.iter().map(|c| format!("{}({})", c.name, c.args)).collect::<Vec<_>>().join(" ")),
+        Some((_, _, Step::Say(text))) => format!("-> says: {text}"),
+        None => "-> chat model".to_string(),
+    }
 }
 
 /// `kabelsalat jev-test`: ask the configured decisions model about sample
@@ -973,22 +1336,14 @@ pub fn run_jev_test() -> anyhow::Result<()> {
     let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
     let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
     let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B]";
-    let samples = [
-        "Set the tempo to 100 BPM.", "What tempo are we at?", "Split the keyboard at C4.",
-        "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.", "Load a warm pad.",
-        "Add a reverb to rig 1 and wire it in.", "Put a delay after the synth.", "Remove the delay from rig 1.",
-        "Add a metronome and start it.", "Add a new rig.", "Set rig 2 volume to 50 %.", "Mute rig 1.", "Delete rig 2.",
-        "Make a new rig with a bass sound, quieter than rig 1.", "make rig B a bit quieter", "solo the second rig", "undo that", "stop",
-    ];
     println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
-    for request in samples {
+    for request in JEV_SAMPLES {
         let user = format!("{context}\n{request}");
         let d = client.decide(&route, &key, json!(user), decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let show = |q: &str| d.choice(q).map_or("refused".to_string(), |(c, p)| format!("{c} {p:.2}"));
-        let settled = settle(&d, &user).map_or("-> chat model".to_string(), |(_, call)| format!("-> {}({})", call.name, call.args));
-        println!("  {:>5} ms  action {:<16} rig {:<11} {settled:<44} {request}", d.ms, show("action"), show("rig"));
+        println!("  {:>5} ms  action {:<18} rig {:<10} effect {:<15} sound {:<11} {:<48} {request}  [{}]",
+            d.ms, show("action"), show("rig"), show(EFFECT.key), show(SOUND.key), settled_as(&d, &user), d.model);
     }
-    println!("jev-test: answered by {}", client.decide(&route, &key, json!("stop"), decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?.model);
     Ok(())
 }
 
@@ -1073,7 +1428,7 @@ enum TurnEnd {
 }
 
 /// The agent loop: one turn per user message. A decisions model (Jev) is
-/// asked first and settles a simple request with one tool call; everything
+/// asked first and settles a simple request with a plan of tool calls; everything
 /// else goes to the acting chat model, whose tool calls travel to the app as
 /// ONE batch per model step and come back as one batch of results.
 fn worker<T: Transport>(
@@ -1128,9 +1483,10 @@ fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWork
 
 const NOT_RUN: &str = "no result: the call did not run";
 
-/// Ask Jev about the request. When it is sure of a shortcut, run that one
-/// tool call and answer; None = the acting model takes the turn (also when
-/// the decision itself fails: the fast path must never cost a request).
+/// Ask Jev about the request. When it is sure of a shortcut, run that
+/// shortcut's plan and answer; None = the acting model takes the turn (also
+/// when the decision itself fails: the fast path must never cost a
+/// request), from wherever the plan left off.
 fn decide_turn<T: Transport>(
     client: &mut llm::Client<T>,
     jev: &Route,
@@ -1142,27 +1498,38 @@ fn decide_turn<T: Transport>(
 ) -> Option<TurnEnd> {
     let decision = client.decide(jev, &key_for(jev.endpoint)?, json!(user), decision_questions()).ok()?;
     let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
-    let (shortcut, call) = settle(&decision, user)?;
-    // The conversation records the call like a chat model's, so a later
-    // chat step knows what was done.
-    convo.push(json!({ "role": "assistant", "content": null, "tool_calls": [{
-        "id": "jev", "type": "function", "function": { "name": call.name, "arguments": call.args.to_string() },
-    }]}));
-    let tool_message = |content: &str| json!({ "role": "tool", "tool_call_id": "jev", "content": content });
-    let result = match run_batch(vec![call.clone()], rx, tx) {
-        Ok(ran) => ran.into_iter().next().unwrap_or_else(|| NOT_RUN.to_string()),
-        Err(end) => {
-            convo.push(tool_message(NOT_RUN));
-            return Some(end);
+    let (shortcut, facts, mut step) = settle(&decision, user)?;
+    let mut done: Vec<String> = Vec::new();
+    for round in 0..MAX_PLAN_BATCHES {
+        let calls = match step {
+            Step::Say(text) => {
+                convo.push(json!({ "role": "assistant", "content": text }));
+                let _ = tx.send(FromWorker::Text(text));
+                return Some(TurnEnd::Answered);
+            }
+            Step::Run(calls) => calls,
+        };
+        // The conversation records the calls like a chat model's, so a
+        // later chat step knows what was done.
+        let ids: Vec<String> = (0..calls.len()).map(|i| format!("jev-{round}-{i}")).collect();
+        convo.push(json!({ "role": "assistant", "content": null, "tool_calls": calls.iter().zip(&ids).map(|(c, id)| json!({
+            "id": id, "type": "function", "function": { "name": c.name, "arguments": c.args.to_string() },
+        })).collect::<Vec<_>>() }));
+        let (ran, stopped) = match run_batch(calls, rx, tx) {
+            Ok(ran) => (ran, None),
+            Err(end) => (Vec::new(), Some(end)),
+        };
+        // Every call gets its tool message, even when the turn stops here.
+        let mut ran = ran.into_iter();
+        for id in &ids {
+            let result = ran.next().unwrap_or_else(|| NOT_RUN.to_string());
+            convo.push(json!({ "role": "tool", "tool_call_id": id, "content": result }));
+            done.push(result);
         }
-    };
-    convo.push(tool_message(&result));
-    let request = user.split_once('\n').map_or(user, |(_, rest)| rest);
-    let rig = call.args.get("rig").and_then(|r| r.as_u64());
-    let text = (shortcut.say)(&Facts { request, rig }, &result);
-    convo.push(json!({ "role": "assistant", "content": text }));
-    let _ = tx.send(FromWorker::Text(text));
-    Some(TurnEnd::Answered)
+        if stopped.is_some() { return stopped; }
+        step = (shortcut.plan)(&facts, &done)?;
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1573,12 +1940,21 @@ mod tests {
         assert!(a.turn.wall.is_some());
     }
 
-    /// Jev's answer to the two decision questions.
-    fn decision(action: &str, p: f64, rig: &str) -> Result<Reply, String> {
-        status(200, &json!({"model": "typesafe/jev-1.14", "answers": {
+    /// Jev's answer to the decision questions: the action and the rig, and
+    /// a pick for each slot named in `slots`.
+    fn decision_with(action: &str, p: f64, rig: (&str, f64), slots: &[(&str, &str)]) -> Result<Reply, String> {
+        let mut answers = json!({
             "action": {"type": "choice", "choice": action, "probabilities": {action: p}},
-            "rig": {"type": "choice", "choice": rig, "probabilities": {rig: 0.97}},
-        }}).to_string())
+            "rig": {"type": "choice", "choice": rig.0, "probabilities": {rig.0: rig.1}},
+        });
+        for (slot, pick) in slots {
+            answers[*slot] = json!({"type": "choice", "choice": pick, "probabilities": {*pick: 0.99}});
+        }
+        status(200, &json!({"model": "typesafe/jev-1.14", "answers": answers}).to_string())
+    }
+
+    fn decision(action: &str, p: f64, rig: &str) -> Result<Reply, String> {
+        decision_with(action, p, (rig, 0.97), &[])
     }
 
     fn asked(context_free: &str) -> ToWorker {
@@ -1618,10 +1994,13 @@ mod tests {
             assert!(requests.last().unwrap()["messages"].is_array(), "{request}: the last request is a chat completion");
         };
         let answer = || text("m", "from the chat model");
-        chat(vec![decision("other", 0.99, "none"), answer()], "Put a delay after the synth.");
+        chat(vec![decision("other", 0.99, "none"), answer()], "Put a filter between the synth and the delay.");
         chat(vec![decision("tempo", 0.6, "none"), answer()], "something about tempo 100");
-        chat(vec![decision("volume", 0.99, "rig_2"), answer()], "make rig 2 quieter");
+        chat(vec![decision("volume", 0.99, "rig_2"), answer()], "rig 2 volume, please");
         chat(vec![decision("mute", 0.99, "none"), answer()], "mute it");
+        chat(vec![decision("add_effect", 0.99, "rig_1"), answer()], "add a chorus to rig 1");
+        chat(vec![decision_with("add_effect", 0.99, ("rig_2", 0.6), &[("effect", "reverb")]), answer()], "add a reverb to, hm, rig 2?");
+        chat(vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "none")]), answer()], "load a flute");
         chat(vec![status(401, "{}"), answer()], "Set the tempo to 100 BPM.");
         chat(vec![status(200, r#"{"answers":{"action":{"type":"refusal"}}}"#), answer()], "Set the tempo to 100 BPM.");
     }
@@ -1646,9 +2025,192 @@ mod tests {
         assert!(msgs.iter().any(|m| m["role"] == "assistant" && m["content"] == "Tempo set to 100 BPM."));
     }
 
+    const RIGS: &str = r#"{"rigs":[{"rig":0,"name":"Rig A","vol":1.0,"pan":0.0,"mute":false,"solo":false},{"rig":1,"name":"Rig B","vol":1.0,"pan":0.5,"mute":false,"solo":false}],"active":0}"#;
+
+    #[test]
+    fn a_bit_quieter_reads_the_level_and_sets_one_step_less() {
+        let (events, requests) = drive_with_jev(
+            vec![decision("quieter", 0.99, "rig_2")],
+            vec![asked("Make rig 2 a bit quieter."), results(&[RIGS]), results(&["rig 1: vol 0.70 pan 0.50 mute false solo false"])],
+        );
+        assert_eq!(requests.len(), 1, "no chat model");
+        assert_eq!(ran(&events), vec![call("get_rigs", json!({})), call("set_rig_mix", json!({"rig": 1, "vol": 0.7}))]);
+        assert_eq!(said(&events), vec!["Rig 2 is now at 70 %."]);
+    }
+
+    #[test]
+    fn a_nudge_that_has_nowhere_to_go_says_so_and_changes_nothing() {
+        let (events, _) = drive_with_jev(vec![decision("louder", 0.99, "rig_1")], vec![asked("rig 1 a bit louder"), results(&[RIGS])]);
+        assert_eq!(ran(&events), vec![call("get_rigs", json!({}))]);
+        assert_eq!(said(&events), vec!["Rig 1 is already at 100 %."]);
+        let (events, _) = drive_with_jev(
+            vec![decision("pan_right", 0.99, "rig_2")],
+            vec![asked("pan rig 2 right"), results(&[RIGS]), results(&["rig 1: vol 1.00 pan 1.00 mute false solo false"])],
+        );
+        assert_eq!(ran(&events)[1], call("set_rig_mix", json!({"rig": 1, "pan": 1.0})), "half a side further, capped");
+        assert_eq!(said(&events), vec!["Rig 2 is now panned 100 % right."]);
+    }
+
+    /// Rig A of the app's two-rig demo: Keys → Surge → Delay → Master (left
+    /// jack), with the synth also on the Master's right jack.
+    fn rig_with_delay() -> (Graph, [NodeId; 3]) {
+        use crate::control::{name_bytes, PortRef};
+        let mut g = crate::control::standard_rig_graph(true);
+        let synth = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Clap { .. })).unwrap().id;
+        let master = rig_master(&g, 0).unwrap();
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        g.edges.retain(|e| e.id != 2);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: delay, port: 0 }, PortKind::Audio);
+        g.connect_with_id(4, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        (g, [synth, delay, master])
+    }
+
+    fn as_json(g: &Graph) -> String {
+        serde_json::to_string(g).unwrap()
+    }
+
+    #[test]
+    fn an_effect_is_added_and_wired_in_front_of_the_master() {
+        let g = crate::control::standard_rig_graph(true);
+        let (synth, master) = (2, rig_master(&g, 0).unwrap());
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("add_effect", 0.95, ("none", 0.6), &[("effect", "reverb")])],
+            vec![
+                asked("Add a reverb to this rig"),
+                results(&[&as_json(&g)]),
+                results(&["added dsp node to rig 0 'Rig A' (wire it with connect) [applied: new node id 3]"]),
+                results(&["disconnected cable 2 [applied: removed cable 2]", "disconnected cable 3 [applied: removed cable 3]",
+                    "connected 2 -> 3 (audio) [applied: new cable id 4]", "connected 3 -> 1 (audio) [applied: new cable id 5]",
+                    "connected 3 -> 1 (audio) [applied: new cable id 6]"]),
+            ],
+        );
+        assert_eq!(requests.len(), 1, "no chat model");
+        assert_eq!(ran(&events), vec![
+            call("get_graph", json!({})),
+            call("add_node", json!({"kind": "dsp", "dsp": "reverb", "rig": 0})),
+            call("disconnect", json!({"id": 2})),
+            call("disconnect", json!({"id": 3})),
+            call("connect", json!({"from_node": synth, "from_port": 0, "to_node": 3})),
+            call("connect", json!({"from_node": 3, "to_node": master, "to_port": 0})),
+            call("connect", json!({"from_node": 3, "to_node": master, "to_port": 1})),
+        ]);
+        let batches = events.iter().filter(|e| matches!(e, FromWorker::ToolCalls(_))).count();
+        assert_eq!(batches, 3, "read, add, rewire");
+        assert_eq!(said(&events), vec!["Reverb added to Rig 1, in front of Master."]);
+    }
+
+    #[test]
+    fn a_plan_that_gets_stuck_hands_its_calls_and_results_to_the_chat_model() {
+        let g = crate::control::standard_rig_graph(true);
+        let not_applied = "added dsp node to rig 0 'Rig A' — NOT applied: the engine changed nothing (check the ids with get_graph)";
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("add_effect", 0.95, ("rig_1", 0.97), &[("effect", "delay")]), text("m", "The delay could not be added.")],
+            vec![asked("Add a delay to rig 1."), results(&[&as_json(&g)]), results(&[not_applied])],
+        );
+        assert_eq!(ran(&events).len(), 2, "the plan stops at the edit that did nothing");
+        assert_eq!(said(&events), vec!["The delay could not be added."]);
+        let msgs = messages(&requests[1]);
+        assert_no_orphans(&msgs[1..]);
+        assert!(msgs.iter().any(|m| m["role"] == "tool" && m["content"] == not_applied), "the chat model sees why");
+    }
+
+    #[test]
+    fn an_effect_at_a_stated_place_in_a_chain_with_effects_is_left_to_the_chat_model() {
+        let (g, _) = rig_with_delay();
+        let decided = || decision_with("add_effect", 0.95, ("rig_1", 0.97), &[("effect", "filter")]);
+        let (events, _) = drive_with_jev(
+            vec![decided(), text("m", "Done.")],
+            vec![asked("Add a filter to rig 1 before the delay."), results(&[&as_json(&g)])],
+        );
+        assert_eq!(ran(&events), vec![call("get_graph", json!({}))], "nothing is added");
+        let (events, _) = drive_with_jev(
+            vec![decided()],
+            vec![asked("Add a filter to rig 1."), results(&[&as_json(&g)]), results(&["added [applied: new node id 9]"]), results(&["ok", "ok", "ok", "ok", "ok", "ok"])],
+        );
+        let sources: Vec<u64> = ran(&events).iter().filter(|c| c.name == "connect" && c.args["to_node"] == 9).map(|c| c.args["from_node"].as_u64().unwrap()).collect();
+        assert_eq!(sources.len(), 2, "with no place stated, everything that fed the Master feeds the filter");
+    }
+
+    #[test]
+    fn removing_an_effect_closes_the_gap_it_leaves() {
+        let (g, [synth, delay, master]) = rig_with_delay();
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("remove_effect", 0.95, ("rig_1", 0.97), &[("effect", "delay")])],
+            vec![asked("Remove the delay from rig 1."), results(&[&as_json(&g)]), results(&["removed node 3 (and its cables) [applied: removed node 3]", "connected [applied: new cable id 5]"])],
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(ran(&events), vec![
+            call("get_graph", json!({})),
+            call("remove_node", json!({"node": delay})),
+            call("connect", json!({"from_node": synth, "from_port": 0, "to_node": master, "to_port": 0})),
+        ]);
+        assert_eq!(said(&events), vec!["Delay removed from Rig 1."]);
+    }
+
+    #[test]
+    fn which_of_two_delays_to_remove_is_the_chat_models_question() {
+        let (events, _) = drive_with_jev(
+            vec![decision_with("remove_effect", 0.95, ("none", 0.9), &[("effect", "delay")]), text("m", "Which one?")],
+            vec![asked("Remove the delay."), results(&[&as_json(&Graph::demo_patch())])],
+        );
+        assert_eq!(ran(&events), vec![call("get_graph", json!({}))]);
+        assert_eq!(said(&events), vec!["Which one?"]);
+    }
+
+    #[test]
+    fn the_metronome_is_started_where_it_is_and_added_where_it_is_not() {
+        use crate::control::{name_bytes, PortRef};
+        let bare = crate::control::standard_rig_graph(true);
+        let master = rig_master(&bare, 0).unwrap();
+        let (events, _) = drive_with_jev(
+            vec![decision("metronome", 0.95, "none")],
+            vec![asked("Add a metronome and start it."), results(&[&as_json(&bare)]), results(&["added dsp node [applied: new node id 3]"]),
+                results(&["connected 3 -> 1 (audio) [applied: new cable id 4]", "node 3 playing"])],
+        );
+        assert_eq!(ran(&events)[1..], [
+            call("add_node", json!({"kind": "dsp", "dsp": "metronome", "rig": 0})),
+            call("connect", json!({"from_node": 3, "to_node": master})),
+            call("set_node_playing", json!({"node": 3, "playing": true})),
+        ]);
+        assert_eq!(said(&events), vec!["Metronome added to Rig 1 and running."]);
+
+        let mut with_click = bare.clone();
+        let click = with_click.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
+        with_click.connect_with_id(4, PortRef { node: click, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (events, _) = drive_with_jev(
+            vec![decision("metronome", 0.95, "none")],
+            vec![asked("Start the metronome."), results(&[&as_json(&with_click)]), results(&["node 3 playing"])],
+        );
+        assert_eq!(ran(&events)[1..], [call("set_node_playing", json!({"node": click, "playing": true}))], "no second metronome");
+        assert_eq!(said(&events), vec!["The metronome is running."]);
+    }
+
+    #[test]
+    fn a_sound_is_searched_by_the_users_words_then_by_its_kind() {
+        let (events, requests) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("none", 0.9), &[("sound", "pad")])],
+            vec![asked("Load a warm pad."), results(&[r#"{"patches":["Pads/Warm Pad"]}"#]), results(&["loaded 'Pads/Warm Pad' into rig 0 'Rig A'"])],
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(ran(&events), vec![call("list_sounds", json!({"query": "warm pad"})), call("load_sound", json!({"query": "warm pad", "rig": 0}))]);
+        assert_eq!(said(&events), vec!["Rig 1 now plays Pads/Warm Pad."]);
+
+        let miss = "no Surge patch matches";
+        let (events, _) = drive_with_jev(
+            vec![decision_with("load_sound", 0.99, ("rig_2", 0.99), &[("sound", "bass")])],
+            vec![asked("Give rig 2 a wobbly growling bass."), results(&[miss]), results(&[r#"{"patches":["Basses/Attacky"]}"#]),
+                results(&["loaded 'Basses/Attacky' into rig 1 'Rig B'"])],
+        );
+        let ran = ran(&events);
+        let queries: Vec<&str> = ran.iter().map(|c| c.args["query"].as_str().unwrap()).collect();
+        assert_eq!(queries, vec!["wobbly growling bass", "bass", "bass"], "the words, then the kind alone, which is loaded");
+        assert_eq!(ran.last().unwrap().args["rig"], 1);
+        assert_eq!(said(&events), vec!["Rig 2 now plays Basses/Attacky."]);
+    }
+
     #[test]
     fn values_come_from_the_users_own_words() {
-        let facts = |request| Facts { request, rig: None };
+        let facts = |request| Facts { request, rig: None, view: None, picked: Vec::new() };
         assert_eq!(facts("Set the tempo to 100 BPM.").bpm(), Some(100.0));
         assert_eq!(facts("faster please").bpm(), None);
         assert_eq!(facts("Set rig 2 volume to 50 %.").percent(), Some(0.5));
@@ -1659,19 +2221,55 @@ mod tests {
         assert_eq!(facts("split at Bb2").note(), Some(46));
         assert_eq!(facts("split at middle C").note(), Some(60));
         assert_eq!(facts("split the keyboard somewhere").note(), None);
+        assert_eq!(facts("Load a warm pad into rig 2, please.").sound_words(), vec!["warm", "pad"]);
+        assert_eq!(facts("give me a Rhodes on rig B").sound_words(), vec!["rhodes"]);
         // The [context] line holds numbers too; only the request counts.
         let d = llm::Decisions { answers: [("action".to_string(), llm::Answer::Choice { choice: "tempo".into(), p: 1.0 })].into(), model: String::new(), ms: 0, attempts: 1 };
         assert!(settle(&d, "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 100)]\nset the tempo").is_none());
     }
 
+    /// What the app would answer, for a plan run without the app.
+    fn canned(call: &ToolCall, graph: &str) -> String {
+        match call.name.as_str() {
+            "get_rigs" => RIGS.to_string(),
+            "get_graph" => graph.to_string(),
+            "add_node" => "added [applied: new node id 40]".to_string(),
+            "list_sounds" => r#"{"patches":["Pads/Warm Pad"]}"#.to_string(),
+            "load_sound" => "loaded 'Pads/Warm Pad' into rig 1 'Rig B'".to_string(),
+            "set_node_playing" => "node 40 playing".to_string(),
+            "set_rig_mix" => "rig 1: vol 0.50 pan 0.00 mute false solo false".to_string(),
+            _ => "done [applied: new cable id 41]".to_string(),
+        }
+    }
+
     #[test]
-    fn every_shortcut_calls_a_tool_that_exists_with_arguments_it_takes() {
+    fn every_shortcut_runs_to_an_answer_on_tools_that_exist_with_arguments_they_take() {
         let tools = tools();
-        let facts = Facts { request: "rig 2 to 50 % at C4, 100 BPM", rig: Some(1) };
+        let (rig_a, _) = rig_with_delay();
+        let mut rig_b = crate::control::standard_rig_graph(true);
+        for n in &mut rig_b.nodes { n.rig = 1; n.id += 10; }
+        for e in &mut rig_b.edges { e.id += 10; e.from.node += 10; e.to.node += 10; }
+        let mut graph = rig_a;
+        graph.nodes.extend(rig_b.nodes);
+        graph.edges.extend(rig_b.edges);
+        let graph = as_json(&graph);
         for s in SHORTCUTS {
-            let call = (s.call)(&facts).unwrap_or_else(|| panic!("{}: no call from a request that states everything", s.key));
-            let checked = parse_tool_call(&tools, &call.name, &call.args.to_string()).unwrap_or_else(|e| panic!("{}: {e}", s.key));
-            assert_eq!(checked.as_object().unwrap().len(), call.args.as_object().unwrap().len(), "{}", s.key);
+            // Rig 1 has the delay to remove; every other request names rig 2.
+            let rig = if s.key == "remove_effect" { 0 } else { 1 };
+            let facts = Facts { request: "a warm pad, 50 % at C4, 100 BPM", rig: Some(rig), view: None, picked: vec![("effect", "delay".into()), ("sound", "pad".into())] };
+            let mut done: Vec<String> = Vec::new();
+            let mut said = None;
+            for _ in 0..=MAX_PLAN_BATCHES {
+                match (s.plan)(&facts, &done).unwrap_or_else(|| panic!("{}: the plan gives up after {done:?}", s.key)) {
+                    Step::Say(text) => { said = Some(text); break; }
+                    Step::Run(calls) => for c in calls {
+                        let checked = parse_tool_call(&tools, &c.name, &c.args.to_string()).unwrap_or_else(|e| panic!("{}: {e}", s.key));
+                        assert_eq!(checked, c.args, "{}: {} takes the arguments as they are", s.key, c.name);
+                        done.push(canned(&c, &graph));
+                    },
+                }
+            }
+            assert!(said.is_some_and(|text| !text.is_empty()), "{}: no answer within {MAX_PLAN_BATCHES} batches", s.key);
         }
     }
 }

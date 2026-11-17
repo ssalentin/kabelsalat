@@ -410,6 +410,9 @@ Learned so far (2026-11-15, UI polish pass):
     0.88 for a request that names neither). The seeing model
     (`agent_perceive_model`) acts for that turn; re-measure before sending
     images to Jev.
+83. **Assistant dock uses `exact_size`, a 176 px floor, and a clipped single-row header:**
+    `default_size` froze the panel at its first-frame height and `150` px left
+    one transcript line clipped by the header (`bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950`).
 
 ## Working on kabelsalat
 

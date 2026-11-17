@@ -4,7 +4,7 @@
 # from the host (linuxdeploy's excludelist), so pipewire-alsa keeps working.
 # usage: packaging/appimage.sh <binary> <version> <outdir>
 set -euo pipefail
-bin=$1 version=$2 out=$3
+bin=$(realpath "$1") version=$2 out=$(mkdir -p "$3" && realpath "$3")
 root=$(cd "$(dirname "$0")/.." && pwd)
 arch=$(uname -m)
 tag=1-alpha-20251107-1

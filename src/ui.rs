@@ -18421,6 +18421,29 @@ mod ui_polish_agent_tests {
         assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
     }
 
+    /// The load_sound plan against the app's real answers, on a rig whose
+    /// instrument is not Surge.
+    #[test]
+    fn the_sound_shortcut_loads_from_the_library_of_the_rigs_instrument() {
+        let (mut app, mut drain) = app_of_instruments();
+        while drain.pop().is_some() {}
+        let organ = node_named(&app, 1, "ORGAN");
+        let mut ran = Vec::new();
+        let said = crate::assistant::run_shortcut("load_sound", "Give the organ rig a jazz drawbar preset.", 1, &[("sound", "organ")], |calls| {
+            ran.extend(calls.iter().map(|c| c.name.clone()));
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said.as_deref(), Some("Rig 2 now plays Jazz 1 all."));
+        assert_eq!(ran, ["list_sounds", "list_sounds", "load_sound"], "'jazz drawbar organ' misses (one preset is called organ), 'jazz drawbar' finds it");
+        assert!(matches!(drain.pop(), Some(Command::ProgramChange { node, program: 0 }) if node == organ));
+        // Nothing in the organ's library is a pad: the chat model explains.
+        let said = crate::assistant::run_shortcut("load_sound", "Load a warm pad.", 1, &[("sound", "pad")], |calls| {
+            calls.iter().map(|c| app.exec_tool(&c.name, &c.args)).collect()
+        });
+        assert_eq!(said, None);
+        assert!(drain.pop().is_none());
+    }
+
     /// The plans read what the app's tools answer: the graph as JSON, the
     /// ids an engine edit names, a started node. Here they run against the
     /// real tools and the real engine barrier.

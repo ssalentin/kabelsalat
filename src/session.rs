@@ -45,7 +45,7 @@ use crate::control::{
 // Param ids are per-node; these mirror the engine's current knob table
 // (task-10 generalizes it — the session stores opaque (node, param, value)
 // triples either way).
-use crate::engine::{P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
+use crate::engine::{RigMix, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM};
 
 /// On-disk format version. Bump on breaking layout changes; `load` rejects
 /// versions it does not understand with a plain-language error.
@@ -56,6 +56,12 @@ pub const SESSION_FILE: &str = "session.json";
 pub const STATE_DIR: &str = "state";
 /// Package directory extension.
 pub const PACKAGE_EXT: &str = "ksalat";
+/// The manifest inside a single-rig preset package.
+pub const RIG_PRESET_FILE: &str = "rig.json";
+/// Package directory extension for single-rig presets.
+pub const RIG_PRESET_EXT: &str = "ksalat-rig";
+/// On-disk format version for single-rig preset manifests.
+pub const RIG_PRESET_FORMAT_VERSION: u32 = 1;
 
 /// The Surge XT CLAP id — the reference plugin (docs/ARCHITECTURE.md §1), native on ARM.
 const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
@@ -268,17 +274,7 @@ impl Session {
 
     /// `parent/name.ksalat` with a plain-language check on the name.
     pub fn package_path(parent: &Path, name: &str) -> Result<PathBuf> {
-        let trimmed = name.trim();
-        if trimmed.is_empty()
-            || trimmed == "."
-            || trimmed == ".."
-            || trimmed.contains('/')
-            || trimmed.contains('\\')
-            || trimmed.contains('\0')
-        {
-            bail!("'{name}' is not a usable session name — avoid slashes and dots-only names.");
-        }
-        Ok(parent.join(format!("{trimmed}.{PACKAGE_EXT}")))
+        validate_package_path(parent, name, PACKAGE_EXT, "session")
     }
 
     /// Atomically save into the package directory `package` (e.g.
@@ -286,54 +282,14 @@ impl Session {
     /// wholesale and is never modified in place; on any error it stays intact.
     pub fn save(&self, package: &Path) -> Result<()> {
         self.validate()?;
-        let basename = package
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("The session package path has no usable directory name.")?;
-        let parent = package.parent().unwrap_or(Path::new(""));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create the folder {}.", parent.display()))?;
-        if package.exists() && !package.is_dir() {
-            bail!(
-                "{} already exists and is not a session package — choose another name.",
-                package.display()
-            );
-        }
-
-        // Stage a complete new package next to the target (same filesystem,
-        // so the final swap is a rename).
-        let staging = parent.join(format!(".{basename}.staging-{}", unique_suffix()));
-        fs::create_dir(&staging)
-            .with_context(|| format!("Could not stage the session at {}.", staging.display()))?;
-
-        let result = self
-            .write_package(&staging)
-            .and_then(|()| swap_package(package, &staging));
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        result
+        stage_package(package, "session", |staging| self.write_package(staging))
     }
 
     /// Write manifest + blobs into a fresh staging directory. Files are
     /// written temp-then-renamed and fsynced; the manifest goes last so a
     /// half-written staging dir is never a valid package.
     fn write_package(&self, dir: &Path) -> Result<()> {
-        let mut refs = Vec::new();
-        if !self.states.is_empty() {
-            let state_dir = dir.join(STATE_DIR);
-            fs::create_dir(&state_dir)?;
-            for s in &self.states {
-                let rel = format!("{STATE_DIR}/node-{}.bin", s.node);
-                write_atomic(&dir.join(&rel), &s.data)
-                    .with_context(|| format!("Could not write plugin state for node {}.", s.node))?;
-                refs.push(StateRef {
-                    node: s.node,
-                    plugin_id: s.plugin_id.clone(),
-                    file: rel,
-                });
-            }
-        }
+        let refs = write_state_files(dir, &self.states)?;
         let manifest = SessionFile {
             format: FORMAT_VERSION,
             name: self.name.clone(),
@@ -369,21 +325,7 @@ impl Session {
                 FORMAT_VERSION
             );
         }
-        let mut states = Vec::new();
-        for r in &manifest.states {
-            let rel = safe_relative(&r.file)?;
-            let data = fs::read(package.join(&rel)).with_context(|| {
-                format!(
-                    "The session is missing its plugin state file '{}' (node {}).",
-                    r.file, r.node
-                )
-            })?;
-            states.push(PluginState {
-                node: r.node,
-                plugin_id: r.plugin_id.clone(),
-                data,
-            });
-        }
+        let states = read_state_files(package, &manifest.states, "session")?;
         let session = Session {
             name: manifest.name,
             graph: manifest.graph,
@@ -395,6 +337,82 @@ impl Session {
         session.validate()?;
         Ok(session)
     }
+}
+
+fn validate_package_path(parent: &Path, name: &str, ext: &str, kind: &str) -> Result<PathBuf> {
+    let trimmed = name.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+    {
+        bail!("'{name}' is not a usable {kind} name — avoid slashes and dots-only names.");
+    }
+    Ok(parent.join(format!("{trimmed}.{ext}")))
+}
+
+fn stage_package(package: &Path, kind: &str, write: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let basename = package
+        .file_name()
+        .and_then(|s| s.to_str())
+        .with_context(|| format!("The {kind} package path has no usable directory name."))?;
+    let parent = package.parent().unwrap_or(Path::new(""));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Could not create the folder {}.", parent.display()))?;
+    if package.exists() && !package.is_dir() {
+        bail!(
+            "{} already exists and is not a {kind} package — choose another name.",
+            package.display()
+        );
+    }
+    let staging = parent.join(format!(".{basename}.staging-{}", unique_suffix()));
+    fs::create_dir(&staging)
+        .with_context(|| format!("Could not stage the {kind} at {}.", staging.display()))?;
+    let result = write(&staging).and_then(|()| swap_package(package, &staging));
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn write_state_files(dir: &Path, states: &[PluginState]) -> Result<Vec<StateRef>> {
+    let mut refs = Vec::new();
+    if !states.is_empty() {
+        let state_dir = dir.join(STATE_DIR);
+        fs::create_dir(&state_dir)?;
+        for s in states {
+            let rel = format!("{STATE_DIR}/node-{}.bin", s.node);
+            write_atomic(&dir.join(&rel), &s.data)
+                .with_context(|| format!("Could not write plugin state for node {}.", s.node))?;
+            refs.push(StateRef {
+                node: s.node,
+                plugin_id: s.plugin_id.clone(),
+                file: rel,
+            });
+        }
+    }
+    Ok(refs)
+}
+
+fn read_state_files(package: &Path, refs: &[StateRef], kind: &str) -> Result<Vec<PluginState>> {
+    let mut states = Vec::new();
+    for r in refs {
+        let rel = safe_relative(&r.file)?;
+        let data = fs::read(package.join(&rel)).with_context(|| {
+            format!(
+                "The {kind} is missing its plugin state file '{}' (node {}).",
+                r.file, r.node
+            )
+        })?;
+        states.push(PluginState {
+            node: r.node,
+            plugin_id: r.plugin_id.clone(),
+            data,
+        });
+    }
+    Ok(states)
 }
 
 // ---------------------------------------------------------------------------
@@ -607,35 +625,14 @@ impl MultiRigSession {
     /// previous package untouched on any error.
     pub fn save(&self, package: &Path) -> Result<()> {
         self.validate()?;
-        let basename = package
-            .file_name()
-            .and_then(|s| s.to_str())
-            .context("The session package path has no usable directory name.")?;
-        let parent = package.parent().unwrap_or(Path::new(""));
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Could not create the folder {}.", parent.display()))?;
-        if package.exists() && !package.is_dir() {
-            bail!(
-                "{} already exists and is not a session package — choose another name.",
-                package.display()
-            );
-        }
-        let staging = parent.join(format!(".{basename}.staging-{}", unique_suffix()));
-        fs::create_dir(&staging)
-            .with_context(|| format!("Could not stage the session at {}.", staging.display()))?;
-        let result = (|| -> Result<()> {
+        stage_package(package, "session", |staging| {
             let manifest = MultiRigFile {
                 format: MULTI_RIG_FORMAT_VERSION,
                 session: self.clone(),
             };
             let json = serde_json::to_vec_pretty(&manifest)?;
-            write_atomic(&staging.join(MULTI_RIG_FILE), &json)?;
-            swap_package(package, &staging)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&staging);
-        }
-        result
+            write_atomic(&staging.join(MULTI_RIG_FILE), &json)
+        })
     }
 
     /// Load a multi-rig package. Falls back to a single-graph [`Session`]
@@ -679,6 +676,195 @@ struct MultiRigFile {
     format: u32,
     #[serde(flatten)]
     session: MultiRigSession,
+}
+
+// ---------------------------------------------------------------------------
+// Single-rig presets (#34): one rig's patch, knobs, blobs, matrix, mix, name
+// ---------------------------------------------------------------------------
+
+/// Per-CLAP-node input switches and loaded patch display name inside a [`RigPreset`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RigClapMeta {
+    pub node: NodeId,
+    #[serde(default = "default_true")]
+    pub keyboard: bool,
+    #[serde(default = "default_true")]
+    pub hardware: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_name: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A saved single-rig configuration: one rig-relative [`Session`] (`node.rig == 0`
+/// for every node) plus the rig's display name, mixer settings, hardware MIDI
+/// device binding, and per-synth source switches / patch name.
+#[derive(Clone, Debug)]
+pub struct RigPreset {
+    pub name: String,
+    pub rig_name: String,
+    pub session: Session,
+    pub mix: RigMix,
+    pub midi_device: Option<u32>,
+    pub clap_meta: Vec<RigClapMeta>,
+}
+
+impl RigPreset {
+    pub fn new(name: impl Into<String>, rig_name: impl Into<String>, session: Session) -> Self {
+        Self {
+            name: name.into(),
+            rig_name: rig_name.into(),
+            session,
+            mix: RigMix::DEFAULT,
+            midi_device: None,
+            clap_meta: Vec::new(),
+        }
+    }
+
+    pub fn package_path(parent: &Path, name: &str) -> Result<PathBuf> {
+        validate_package_path(parent, name, RIG_PRESET_EXT, "rig preset")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            bail!("The rig preset needs a name before it can be saved.");
+        }
+        self.session.validate()?;
+        if self.session.graph.nodes.iter().any(|n| n.rig != 0) {
+            bail!("A rig preset must hold one rig-relative graph (node.rig == 0).");
+        }
+        if !self.mix.vol.is_finite() || !self.mix.pan.is_finite() {
+            bail!("The rig mixer settings contain a non-finite number.");
+        }
+        for m in &self.clap_meta {
+            match self.session.graph.node(m.node) {
+                Some(n) if matches!(n.kind, NodeKind::Clap { .. }) => {}
+                _ => bail!("Rig preset metadata references node {} which is not a CLAP synth.", m.node),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn save(&self, package: &Path) -> Result<()> {
+        self.validate()?;
+        stage_package(package, "rig preset", |staging| {
+            let refs = write_state_files(staging, self.session.plugin_states())?;
+            let manifest = RigPresetFile {
+                format: RIG_PRESET_FORMAT_VERSION,
+                name: self.name.clone(),
+                rig_name: self.rig_name.clone(),
+                graph: self.session.graph.clone(),
+                params: self.session.params().to_vec(),
+                matrix: self.session.matrix().cloned(),
+                states: refs,
+                mix: self.mix,
+                midi_device: self.midi_device,
+                clap_meta: self.clap_meta.clone(),
+            };
+            let json = serde_json::to_vec_pretty(&manifest)?;
+            write_atomic(&staging.join(RIG_PRESET_FILE), &json)
+        })
+    }
+
+    pub fn load(package: &Path) -> Result<RigPreset> {
+        let manifest_path = package.join(RIG_PRESET_FILE);
+        let text = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "Could not read {} — is this a kabelsalat rig preset?",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: RigPresetFile = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid rig preset JSON.", manifest_path.display()))?;
+        if manifest.format != RIG_PRESET_FORMAT_VERSION {
+            bail!(
+                "This rig preset uses format version {} but this build understands version {}. \
+                 It may have been written by a newer kabelsalat.",
+                manifest.format,
+                RIG_PRESET_FORMAT_VERSION
+            );
+        }
+        let states = read_state_files(package, &manifest.states, "rig preset")?;
+        let mut session = Session::new(manifest.name.clone(), manifest.graph);
+        for p in manifest.params {
+            session.set_param(p.node, p.param, p.value);
+        }
+        for s in states {
+            session.set_plugin_state(s.node, s.plugin_id, s.data);
+        }
+        session.set_matrix(manifest.matrix);
+        let preset = RigPreset {
+            name: manifest.name,
+            rig_name: manifest.rig_name,
+            session,
+            mix: manifest.mix,
+            midi_device: manifest.midi_device,
+            clap_meta: manifest.clap_meta,
+        };
+        preset.validate()?;
+        Ok(preset)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct RigPresetFile {
+    format: u32,
+    name: String,
+    #[serde(default)]
+    rig_name: String,
+    graph: Graph,
+    #[serde(default)]
+    params: Vec<ParamValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    matrix: Option<Value>,
+    #[serde(default)]
+    states: Vec<StateRef>,
+    #[serde(default)]
+    mix: RigMix,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    midi_device: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    clap_meta: Vec<RigClapMeta>,
+}
+
+/// Default directory for saved rig presets (sibling to `~/kabelsalat-sessions`).
+pub fn rig_presets_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let dir = PathBuf::from(home).join("kabelsalat-rig-presets");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+/// Sorted list of saved rig preset names in `dir`.
+pub fn list_rig_presets(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == RIG_PRESET_EXT) {
+                        p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// Delete a saved rig preset package by name from `dir`.
+pub fn delete_rig_preset(dir: &Path, name: &str) -> Result<()> {
+    let path = RigPreset::package_path(dir, name)?;
+    if !path.exists() {
+        bail!("rig preset '{name}' does not exist");
+    }
+    fs::remove_dir_all(&path)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,5 +1567,71 @@ mod tests {
         for bad in ["", "  ", "..", "a/b", "a\\b"] {
             assert!(Session::package_path(parent, bad).is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn rig_preset_round_trip_list_and_guards() {
+        let dir = test_dir("rig-presets");
+        let mut s = sample_session();
+        s.name = "Lead Preset".into();
+        let mut preset = RigPreset::new("Lead Preset", "Lead", s);
+        preset.mix = RigMix { vol: 0.65, pan: -0.35, mute: false, solo: true };
+        preset.midi_device = Some(3);
+        preset.clap_meta = vec![RigClapMeta {
+            node: 1,
+            keyboard: false,
+            hardware: true,
+            patch_name: Some("Wurli".into()),
+        }];
+
+        let pkg = RigPreset::package_path(&dir, "Lead Preset").unwrap();
+        preset.save(&pkg).unwrap();
+        assert!(pkg.join(RIG_PRESET_FILE).is_file());
+        assert!(pkg.join(STATE_DIR).join("node-1.bin").is_file());
+        assert_eq!(list_rig_presets(&dir), vec!["Lead Preset".to_string()]);
+
+        let loaded = RigPreset::load(&pkg).unwrap();
+        assert_eq!(loaded.name, "Lead Preset");
+        assert_eq!(loaded.rig_name, "Lead");
+        assert_eq!(loaded.mix, preset.mix);
+        assert_eq!(loaded.midi_device, Some(3));
+        assert_eq!(loaded.clap_meta, preset.clap_meta);
+        assert_eq!(content(&loaded.session), content(&preset.session));
+        assert_eq!(blobs(&loaded.session), blobs(&preset.session));
+
+        let mut bad = preset.clone();
+        bad.session.graph.nodes[0].rig = 2;
+        assert!(bad.validate().is_err());
+
+        let evil = dir.join("Evil.ksalat-rig");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(
+            evil.join(RIG_PRESET_FILE),
+            json!({
+                "format": RIG_PRESET_FORMAT_VERSION,
+                "name": "Evil",
+                "graph": serde_json::to_value(Graph::default()).unwrap(),
+                "states": [{"node": 0, "plugin_id": "x", "file": "../leak.bin"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(RigPreset::load(&evil).unwrap_err().to_string().contains("outside the package"));
+        fs::write(
+            evil.join(RIG_PRESET_FILE),
+            json!({
+                "format": RIG_PRESET_FORMAT_VERSION + 1,
+                "name": "Future",
+                "graph": serde_json::to_value(Graph::default()).unwrap(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(RigPreset::load(&evil).unwrap_err().to_string().contains("newer kabelsalat"));
+
+        delete_rig_preset(&dir, "Lead Preset").unwrap();
+        delete_rig_preset(&dir, "Evil").unwrap();
+        assert!(list_rig_presets(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

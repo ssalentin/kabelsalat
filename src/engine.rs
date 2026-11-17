@@ -494,7 +494,8 @@ fn block_peak(buf: &[f32]) -> f32 {
 }
 
 /// Per-rig mixer state (AUM overview strip). Unity by default.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RigMix {
     pub vol: f32,
     pub pan: f32,

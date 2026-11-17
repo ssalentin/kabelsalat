@@ -84,6 +84,8 @@ struct State {
     record: Arc<crate::record::RecorderShared>,
     /// "Sync to transport" mirror (the engine is authoritative via SetRecordSync).
     record_sync: bool,
+    /// Single-rig preset directory (isolated in unit tests).
+    rig_presets_dir: std::path::PathBuf,
 }
 
 #[derive(Clone)]
@@ -144,6 +146,24 @@ struct DeleteRigArgs {
     rig: usize,
     /// Must be true: deleting removes the rig's units, cables and synth state.
     confirm: bool,
+}
+
+/// Arguments for `save_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SaveRigArgs {
+    /// Preset name (no slashes).
+    name: String,
+    /// Rig index (0-based, see get_rigs). Defaults to the active rig.
+    rig: Option<usize>,
+}
+
+/// Arguments for `load_rig`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadRigArgs {
+    /// Saved rig preset name (see list_rig_presets).
+    name: String,
+    /// Optional rig index to replace; omit to load as a new rig.
+    rig: Option<usize>,
 }
 
 /// Arguments for `install_instrument`.
@@ -1715,6 +1735,116 @@ impl McpServer {
         self.edit_rigs(Some(args.rig), None)
     }
 
+    /// Save one rig as a named rig preset.
+    #[tool(name = "save_rig", description = "Save one rig (units, cables, knobs, plugin states, matrix routes, mix, name) as a named rig preset in ~/kabelsalat-rig-presets, independent of whole sessions. rig defaults to the active rig.")]
+    fn save_rig(&self, Parameters(args): Parameters<SaveRigArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            let mut a = json!({"name": args.name});
+            if let Some(r) = args.rig { a["rig"] = json!(r); }
+            return Self::ui_bridge_tool("save_rig", a);
+        }
+        let st = self.state.lock().unwrap();
+        let meta = match rig_meta(&st) { Ok(m) => m, Err(e) => return tool_err(e) };
+        let (graphs, _) = control::split_rigs(&st.graph);
+        let active = st.rigs.lock().map(|s| s.active).unwrap_or(0);
+        let rig = args.rig.unwrap_or(active);
+        if rig >= graphs.len() {
+            return tool_err(format!("no rig {rig}: there are {}", graphs.len()));
+        }
+        let rig_name = meta.get(rig).map(|m| m.name.clone()).filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("Rig {}", (b'A' + rig.min(25) as u8) as char));
+        let sess = crate::session::Session::new(args.name.trim(), graphs[rig].clone());
+        let mut preset = crate::session::RigPreset::new(args.name.trim(), rig_name.clone(), sess);
+        preset.midi_device = meta.get(rig).and_then(|m| m.midi_device);
+        if let Some(gp) = &st.graph_pub {
+            if let Ok(g) = gp.lock() {
+                preset.mix = g.mix[rig.min(7)];
+            }
+        }
+        let path = match crate::session::RigPreset::package_path(&st.rig_presets_dir, &args.name) {
+            Ok(p) => p,
+            Err(e) => return tool_err(format!("{e:#}")),
+        };
+        if let Err(e) = preset.save(&path) {
+            return tool_err(format!("save_rig failed: {e:#}"));
+        }
+        ok_json(json!({"saved": preset.name, "rig": rig, "rig_name": rig_name, "path": path.display().to_string()}))
+    }
+
+    /// Load a saved rig preset (as a new rig or replacing an existing rig).
+    #[tool(name = "load_rig", description = "Load a saved rig preset by name, restoring units, cables, knobs, plugin states, matrix routes, mix and rig name. Omit rig to add as a new rig, or pass rig=<index> to replace an existing rig.")]
+    fn load_rig(&self, Parameters(args): Parameters<LoadRigArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            let mut a = json!({"name": args.name});
+            if let Some(r) = args.rig { a["rig"] = json!(r); }
+            return Self::ui_bridge_tool("load_rig", a);
+        }
+        let mut st = self.state.lock().unwrap();
+        let path = match crate::session::RigPreset::package_path(&st.rig_presets_dir, &args.name) {
+            Ok(p) => p,
+            Err(e) => return tool_err(format!("{e:#}")),
+        };
+        let preset = match crate::session::RigPreset::load(&path) {
+            Ok(p) => p,
+            Err(e) => return tool_err(format!("load_rig failed: {e:#}")),
+        };
+        let meta = match rig_meta(&st) { Ok(m) => m, Err(e) => return tool_err(e) };
+        let (graphs, _) = control::split_rigs(&st.graph);
+        let mut rigs: Vec<Rig> = graphs.into_iter().enumerate().map(|(i, g)| {
+            let m = meta.get(i);
+            let name = m.map(|m| m.name.clone()).filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("Rig {}", (b'A' + i.min(25) as u8) as char));
+            Rig::new(name, g, m.and_then(|m| m.midi_device))
+        }).collect();
+        let mut mixes = [crate::engine::RigMix::DEFAULT; 8];
+        if let Some(gp) = &st.graph_pub {
+            if let Ok(g) = gp.lock() { mixes = g.mix; }
+        }
+        let preset_rig_name = if preset.rig_name.trim().is_empty() { preset.name.clone() } else { preset.rig_name.clone() };
+        let loaded_rig = Rig::new(preset_rig_name.clone(), preset.session.graph.clone(), preset.midi_device);
+        let target = match args.rig {
+            None => {
+                if rigs.len() >= 8 { return tool_err("at most 8 rigs"); }
+                rigs.push(loaded_rig);
+                rigs.len() - 1
+            }
+            Some(r) => {
+                if r >= rigs.len() { return tool_err(format!("no rig {r}: there are {}", rigs.len())); }
+                rigs[r] = loaded_rig;
+                r
+            }
+        };
+        mixes[target.min(7)] = preset.mix;
+        let bases = control::rig_bases(&rigs);
+        if let Err(e) = send_cmd(&mut st, Command::LoadRigs { rigs: rigs.clone(), active: target }) {
+            return tool_err(e);
+        }
+        for p in preset.session.params() {
+            let _ = send_cmd(&mut st, Command::SetParam { node: bases[target] + p.node, param: p.param, value: p.value });
+        }
+        for (i, m) in mixes.iter().enumerate().take(rigs.len()) {
+            let _ = send_cmd(&mut st, Command::SetRigMix {
+                rig: i as u8, vol: Some(m.vol), pan: Some(m.pan), mute: Some(m.mute), solo: Some(m.solo),
+            });
+        }
+        st.graph = merge_rigs(&rigs);
+        let metas: Vec<crate::control::RigMeta> = rigs.iter()
+            .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+        if let Ok(mut s) = st.rigs.lock() { s.rigs = metas.clone(); s.active = target; }
+        ok_json(json!({"loaded": preset.name, "rig": target, "rigs": metas, "active": target}))
+    }
+
+    /// List saved single-rig presets.
+    #[tool(name = "list_rig_presets", description = "List saved single-rig preset names in ~/kabelsalat-rig-presets.")]
+    fn list_rig_presets(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("list_rig_presets", json!({}));
+        }
+        let presets = crate::session::list_rig_presets(&st.rig_presets_dir);
+        ok_json(json!({"presets": presets}))
+    }
+
     /// Query the multi-rig state.
     /// Search installed Surge patches.
     #[tool(name = "list_sounds", description = "Search the installed Surge patches (factory + 3rd-party, ~3000) by words in 'Category/Name', e.g. 'flute', 'pad warm'. Returns up to 25 entries.")]
@@ -2216,6 +2346,7 @@ pub fn run() -> anyhow::Result<()> {
         cc_maps: std::collections::HashMap::new(),
         record: audio.record,
         record_sync: false,
+        rig_presets_dir: crate::session::rig_presets_dir(),
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout);
@@ -2249,6 +2380,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         cc_maps: std::collections::HashMap::new(),
         record: Arc::new(crate::record::RecorderShared::new()),
         record_sync: false,
+        rig_presets_dir: crate::session::rig_presets_dir(),
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -2326,6 +2458,10 @@ mod tests {
             cc_maps: std::collections::HashMap::new(),
             record: Arc::new(crate::record::RecorderShared::new()),
             record_sync: false,
+            rig_presets_dir: std::env::var_os("CARGO_TARGET_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+                .join(format!("test-mcp-rig-presets-{}", std::process::id())),
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),
@@ -2436,6 +2572,35 @@ mod tests {
         engine.render(&mut buf, 64);
         assert_eq!(engine.graph().nodes.len(), 3);
         assert!(is_err(server.delete_rig(Parameters(DeleteRigArgs { rig: 0, confirm: true }))), "last rig stays");
+    }
+
+    #[test]
+    fn save_load_list_rig_presets_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let _ = tool_json(&server.add_rig(Parameters(AddRigArgs { name: Some("Lead".into()), plugin_id: None })));
+        engine.render(&mut buf, 64);
+        let _ = tool_json(&server.set_rig_mix(Parameters(SetRigMixArgs {
+            rig: 1,
+            vol: Some(0.6),
+            pan: Some(-0.25),
+            mute: Some(false),
+            solo: Some(true),
+        })));
+        engine.render(&mut buf, 64);
+
+        let saved = tool_json(&server.save_rig(Parameters(SaveRigArgs { name: "Lead Pack".into(), rig: Some(1) })));
+        assert_eq!(saved["saved"], json!("Lead Pack"));
+        let listed = tool_json(&server.list_rig_presets());
+        assert_eq!(listed["presets"], json!(["Lead Pack"]));
+
+        let loaded = tool_json(&server.load_rig(Parameters(LoadRigArgs { name: "Lead Pack".into(), rig: Some(0) })));
+        assert_eq!(loaded["rig"], json!(0));
+        engine.render(&mut buf, 64);
+        let rigs = tool_json(&server.get_rigs());
+        assert_eq!(rigs["rigs"][0]["name"], json!("Lead"));
+        let dir = server.state.lock().unwrap().rig_presets_dir.clone();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

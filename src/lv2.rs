@@ -319,6 +319,8 @@ extern "C" {
     fn lilv_port_get_symbol(plugin: *const LilvPlugin, port: *const LilvPort) -> *const LilvNode;
     fn lilv_port_get_name(plugin: *const LilvPlugin, port: *const LilvPort) -> *mut LilvNode;
     fn lilv_port_is_a(plugin: *const LilvPlugin, port: *const LilvPort, class: *const LilvNode) -> bool;
+    fn lilv_port_has_property(plugin: *const LilvPlugin, port: *const LilvPort, property: *const LilvNode) -> bool;
+    fn lilv_port_get_value(plugin: *const LilvPlugin, port: *const LilvPort, predicate: *const LilvNode) -> *mut LilvNodes;
     fn lilv_port_get_range(
         plugin: *const LilvPlugin,
         port: *const LilvPort,
@@ -440,6 +442,151 @@ static LILV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn lilv_guard() -> std::sync::MutexGuard<'static, ()> {
     LILV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+const LV2_PARAMETERS_PREFIX: &str = "http://lv2plug.in/ns/ext/parameters#";
+
+/// What the main-controls rule reads from a control port's metadata.
+#[derive(Default)]
+struct PortFacts {
+    /// Every `lv2:designation` URI of the port.
+    designations: Vec<String>,
+    /// `pprops:notOnGUI` or `pprops:notAutomatic`.
+    hidden: bool,
+    /// `lv2:toggled`, `lv2:enumeration` or `lv2:integer`.
+    stepped: bool,
+}
+
+/// One control input as a main-control candidate. `nth` is its ordinal among
+/// the control inputs, the id `Lv2Plugin::set_control_normalized` takes.
+///
+/// A `param:` designation (gain, cutoffFrequency, …) marks a main control.
+/// Any other designation (`lv2:freeWheeling`, `lv2:enabled`, …) is the host's
+/// to drive, so that port is not a control for the player at all.
+fn control_candidate(nth: usize, meta: &ControlMeta, facts: &PortFacts) -> crate::main_controls::Candidate {
+    let designated = facts.designations.iter().any(|d| d.starts_with(LV2_PARAMETERS_PREFIX));
+    let host_owned = !designated && !facts.designations.is_empty();
+    crate::main_controls::Candidate {
+        id: nth as u32,
+        name: if meta.name.is_empty() { meta.symbol.clone() } else { meta.name.clone() },
+        group: String::new(),
+        min: meta.min as f64,
+        max: meta.max as f64,
+        default: meta.default as f64,
+        usable: !facts.hidden && !host_owned,
+        stepped: facts.stepped,
+        designated,
+    }
+}
+
+unsafe fn read_port_facts(world: *mut LilvWorld, plugin: *const LilvPlugin, port_index: usize) -> PortFacts {
+    let uri = |u: &[u8]| lilv_new_uri(world, u.as_ptr() as *const c_char);
+    let port = lilv_plugin_get_port_by_index(plugin, port_index as u32);
+    let has = |u: &[u8]| {
+        let node = uri(u);
+        let yes = lilv_port_has_property(plugin, port, node);
+        lilv_node_free(node);
+        yes
+    };
+    let mut facts = PortFacts {
+        designations: Vec::new(),
+        hidden: has(b"http://lv2plug.in/ns/ext/port-props#notOnGUI\0")
+            || has(b"http://lv2plug.in/ns/ext/port-props#notAutomatic\0"),
+        stepped: has(b"http://lv2plug.in/ns/lv2core#toggled\0")
+            || has(b"http://lv2plug.in/ns/lv2core#enumeration\0")
+            || has(b"http://lv2plug.in/ns/lv2core#integer\0"),
+    };
+    let designation = uri(b"http://lv2plug.in/ns/lv2core#designation\0");
+    let nodes = lilv_port_get_value(plugin, port, designation);
+    if !nodes.is_null() {
+        let mut it = lilv_nodes_begin(nodes);
+        while !lilv_nodes_is_end(nodes, it) {
+            let n = lilv_nodes_get(nodes, it);
+            if !n.is_null() && lilv_node_is_uri(n) {
+                facts.designations.push(node_borrowed(n));
+            }
+            it = lilv_nodes_next(nodes, it);
+        }
+        lilv_nodes_free(nodes);
+    }
+    lilv_node_free(designation);
+    facts
+}
+
+/// Resolve a plugin's main controls from its port metadata, without
+/// instantiating it. Loads a lilv world (blocking): call it from a worker
+/// thread, or use [`main_controls_cached`] from the UI.
+pub fn main_controls_for_uri(uri: &str) -> crate::main_controls::MainControls {
+    let _lilv = lilv_guard();
+    unsafe {
+        let world = lilv_world_new();
+        if world.is_null() {
+            return Default::default();
+        }
+        lilv_world_load_all(world);
+        let plugin = find_plugin(world, uri);
+        let candidates: Vec<_> = if plugin.is_null() {
+            Vec::new()
+        } else {
+            read_control_meta(world, plugin)
+                .iter()
+                .enumerate()
+                .map(|(nth, meta)| control_candidate(nth, meta, &read_port_facts(world, plugin, meta.port_index)))
+                .collect()
+        };
+        lilv_world_free(world);
+        crate::main_controls::resolve(&[], &candidates)
+    }
+}
+
+type MainControlsCache = std::sync::Mutex<Vec<(String, Option<crate::main_controls::MainControls>)>>;
+static MAIN_CONTROLS: MainControlsCache = std::sync::Mutex::new(Vec::new());
+
+/// Main controls per plugin URI, resolved once on a worker thread. `None`
+/// while that thread runs: the caller asks again on a later frame. Tests
+/// never read the machine's plugins here: they see only what
+/// [`set_main_controls_for_test`] stored.
+pub fn main_controls_cached(uri: &str) -> Option<crate::main_controls::MainControls> {
+    let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, found)) = cache.iter().find(|(u, _)| u == uri) {
+        return found.clone();
+    }
+    if cfg!(test) {
+        return None;
+    }
+    cache.push((uri.to_string(), None));
+    drop(cache);
+    let uri = uri.to_string();
+    std::thread::spawn(move || {
+        let found = main_controls_for_uri(&uri);
+        store_main_controls(&uri, found);
+    });
+    None
+}
+
+/// [`main_controls_cached`] for callers that may block (headless MCP):
+/// resolves on the calling thread when the cache has no answer yet.
+pub fn main_controls_blocking(uri: &str) -> crate::main_controls::MainControls {
+    if let Some(found) = main_controls_cached(uri) {
+        return found;
+    }
+    if cfg!(test) {
+        return Default::default();
+    }
+    let found = main_controls_for_uri(uri);
+    store_main_controls(uri, found.clone());
+    found
+}
+
+fn store_main_controls(uri: &str, found: crate::main_controls::MainControls) {
+    let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(u, _)| u != uri);
+    cache.push((uri.to_string(), Some(found)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_main_controls_for_test(uri: &str, found: crate::main_controls::MainControls) {
+    store_main_controls(uri, found);
 }
 
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
@@ -1871,6 +2018,26 @@ mod tests {
 
     /// #38: an atom output starts every run as an empty Chunk of full capacity.
     /// #26: the declared class decides; ports only without one.
+    #[test]
+    fn a_param_designation_marks_a_main_control_and_any_other_one_belongs_to_the_host() {
+        let meta = |name: &str| ControlMeta { port_index: 9, symbol: "sym".into(), name: name.into(), min: 0.0, max: 2.0, default: 1.0 };
+        let facts = |d: &[&str]| PortFacts { designations: d.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+
+        let gain = control_candidate(3, &meta("Gain"), &facts(&["http://lv2plug.in/ns/ext/parameters#gain"]));
+        assert!(gain.designated && gain.usable);
+        assert_eq!((gain.id, gain.max), (3, 2.0), "the id is the control ordinal, not the port index");
+
+        let freewheel = control_candidate(0, &meta("Freewheel"), &facts(&["http://lv2plug.in/ns/lv2core#freeWheeling"]));
+        assert!(!freewheel.designated && !freewheel.usable);
+
+        let plain = control_candidate(1, &meta(""), &facts(&[]));
+        assert!(plain.usable && !plain.designated);
+        assert_eq!(plain.name, "sym", "an unnamed port goes by its symbol");
+
+        let hidden = control_candidate(2, &meta("Internal"), &PortFacts { hidden: true, ..Default::default() });
+        assert!(!hidden.usable);
+    }
+
     #[test]
     fn instrument_class_comes_from_the_declared_types() {
         let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

@@ -138,7 +138,8 @@ macro_rules! knobs {
 pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
     match kind {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
-        NodeKind::Clap { .. } => knobs!(ks("TONE", 0.35, None, &[]), ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
+        // The plugin's main controls join LEVEL on the face (`main_controls`).
+        NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
         NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
@@ -151,7 +152,9 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
             DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
             DspKind::Metronome => &[],
         },
-        NodeKind::Lv2 { .. } => knobs!(ks("GAIN", 0.9, Some(0), &[])),
+        // An LV2 unit's knobs are its plugin's main controls (`main_controls`):
+        // param 0 is whatever port the plugin lists first, never a "gain".
+        NodeKind::Lv2 { .. } => &[],
         // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
         NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
         NodeKind::AudioIn { .. } => knobs!(
@@ -1119,6 +1122,12 @@ impl GraphEngine {
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
+    }
+
+    /// Current plain value of an LV2 node's nth control input (verification).
+    pub fn lv2_control_value(&self, node: NodeId, nth: usize) -> Option<f32> {
+        let slot = self.lv2.iter().find(|s| s.node == node)?;
+        slot.plugin.control_descs().get(nth).map(|c| c.value)
     }
 
     fn has_midi_cable(&self, dest: NodeId) -> bool {
@@ -4389,6 +4398,149 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         cutoff.module, cutoff.name, cutoff.id, val_low, val_high,
         gain_p.module, gain_p.name, gain_p.id, g_low, g_high, rms_low, rms_high
     );
+    Ok(())
+}
+
+/// `kabelsalat main-controls-test`: for every installed instrument, print its
+/// main controls and the rule that found them, then move the first one
+/// through the engine and read the plugin's own value back.
+pub fn main_controls_test() -> anyhow::Result<()> {
+    let clap = crate::host::list_clap_plugins();
+    let lv2 = crate::lv2::discover();
+    let mut tested = 0;
+    let mut failed: Vec<String> = Vec::new();
+    let mut run = |name: &str, result: Option<anyhow::Result<()>>| match result {
+        None => println!("{name}: not installed, skipped"),
+        Some(Ok(())) => tested += 1,
+        Some(Err(e)) => failed.push(format!("{name}: {e:#}")),
+    };
+    for name in ["Surge XT", "Dexed", "YANES"] {
+        let id = clap.iter().find(|p| p.name.eq_ignore_ascii_case(name)).map(|p| p.id.clone());
+        run(name, id.map(|id| clap_main_controls_check(name, &id)));
+    }
+    for (name, uri) in [("setBfree", "http://gareus.org/oss/lv2/b_synth"), ("Vitalium", "urn:distrho:vitalium")] {
+        let installed = lv2.iter().any(|p| p.uri == uri);
+        run(name, installed.then(|| lv2_main_controls_check(name, uri)));
+    }
+    anyhow::ensure!(failed.is_empty(), "main-controls-test FAILED:\n{}", failed.join("\n"));
+    anyhow::ensure!(tested > 0, "main-controls-test: no instrument installed");
+    println!("main-controls-test: OK ({tested} instruments)");
+    Ok(())
+}
+
+fn print_main_controls(name: &str, found: &crate::main_controls::MainControls, mut text: impl FnMut(&crate::main_controls::MainControl) -> String) {
+    if found.controls.is_empty() {
+        println!("main-controls-test: {name}: no main controls (the plugin declares no usable parameter)");
+        return;
+    }
+    println!("main-controls-test: {name}: {} main controls, source: {}", found.controls.len(), found.source.as_str());
+    for (i, c) in found.controls.iter().enumerate() {
+        let face = if i < crate::main_controls::FACE_MAIN_CONTROLS { "face" } else { "list" };
+        println!(
+            "  {}. [{face}] {:<28} page {:<24} id {:<10} = {} (range {}..{})",
+            i + 1, c.name, format!("\"{}\"", c.page), c.id, text(c), c.min, c.max
+        );
+    }
+}
+
+/// Keys → instrument → Master, the smallest rig an instrument plays in.
+fn instrument_graph(kind: crate::control::NodeKind) -> (Graph, NodeId) {
+    use crate::control::{name_bytes, NodeKind, PortKind, PortRef};
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let inst = g.add_node(kind, name_bytes("INSTRUMENT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    (g, inst)
+}
+
+fn clap_main_controls_check(name: &str, plugin_id: &str) -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, NodeKind};
+    let sr = 48000.0;
+    let (voice, mut main) = ClapVoice::new_plugin(sr, plugin_id)?;
+    let found = main.main_controls().clone();
+    print_main_controls(name, &found, |c| {
+        let v = main.param_value(c.id).unwrap_or(c.default);
+        main.param_text(c.id, v)
+    });
+    let Some(c) = found.controls.first() else { return Ok(()) };
+    let knob = voice.controller();
+    let (g, inst) = instrument_graph(NodeKind::Clap { plugin_id: name_bytes(plugin_id) });
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(inst, voice)]);
+    let mut buf = vec![0.0f32; 256 * 2];
+    let mut settle = |engine: &mut GraphEngine| for _ in 0..8 { engine.render(&mut buf, 2) };
+    settle(&mut engine);
+    let start = main.param_value(c.id).unwrap_or(f64::NAN);
+    // What a face knob sends: the voice controller, applied in the next block.
+    knob.set_param(clack_host::prelude::ClapId::new(c.id), c.plain(0.25));
+    settle(&mut engine);
+    let by_knob = main.param_value(c.id).unwrap_or(f64::NAN);
+    // What a MIDI-learned knob does: a hardware CC through the matrix.
+    bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: inst, cc: 20, param: Some(c.id), target: CcTarget::PluginParam });
+    bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 20, value: 127 });
+    settle(&mut engine);
+    let by_cc = main.param_value(c.id).unwrap_or(f64::NAN);
+    println!(
+        "main-controls-test: {name}: moved '{}' (id {}): start {start:.4} -> knob at 25% {by_knob:.4} ({}) -> CC 127 {by_cc:.4} ({})",
+        c.name, c.id, main.param_text(c.id, by_knob), main.param_text(c.id, by_cc)
+    );
+    let span = c.max - c.min;
+    anyhow::ensure!((by_knob - c.plain(0.25)).abs() < span * 0.02, "knob did not move '{}': wanted {}, plugin reads {by_knob}", c.name, c.plain(0.25));
+    anyhow::ensure!((by_cc - c.max).abs() < span * 0.02, "CC did not move '{}': wanted {}, plugin reads {by_cc}", c.name, c.max);
+    if name == "Surge XT" {
+        surge_macro_names_follow_the_patch(&mut main, &mut engine)?;
+    }
+    Ok(())
+}
+
+/// Surge names its macros per patch and announces nothing: the polls after
+/// a state load must pick the new names up once the audio thread applied it.
+fn surge_macro_names_follow_the_patch(main: &mut crate::host::ClapVoiceMain, engine: &mut GraphEngine) -> anyhow::Result<()> {
+    let patches = crate::host::list_surge_patches();
+    let Some(patch) = patches.iter().find(|p| p.name.eq_ignore_ascii_case("bell pad")) else {
+        println!("main-controls-test: Surge XT: factory patch 'Bell Pad' not installed, patch-reload check skipped");
+        return Ok(());
+    };
+    let names = |main: &crate::host::ClapVoiceMain| -> Vec<String> { main.main_controls().face().iter().map(|c| c.name.clone()).collect() };
+    let before = names(main);
+    main.load_state(&crate::host::fxp_to_state(&std::fs::read(&patch.path)?)?)?;
+    let mut buf = vec![0.0f32; 256 * 2];
+    let mut changed = false;
+    for _ in 0..10 {
+        for _ in 0..8 { engine.render(&mut buf, 2); }
+        changed |= main.poll_main_controls();
+    }
+    let after = names(main);
+    println!("main-controls-test: Surge XT: patch '{}/{}' loaded: face controls {before:?} -> {after:?}", patch.category, patch.name);
+    anyhow::ensure!(changed && after.iter().any(|n| n.starts_with("M1: ")), "Surge XT main controls did not follow the patch's named macros");
+    anyhow::ensure!(!main.poll_main_controls(), "a settled list must not report a change");
+    Ok(())
+}
+
+fn lv2_main_controls_check(name: &str, uri: &str) -> anyhow::Result<()> {
+    use crate::control::{command_bus, Command, Lv2Uri, NodeKind};
+    let sr = 48000.0;
+    let found = crate::lv2::main_controls_for_uri(uri);
+    print_main_controls(name, &found, |c| format!("{:.4} (default)", c.default));
+    let Some(c) = found.controls.first() else { return Ok(()) };
+    let (g, inst) = instrument_graph(NodeKind::Lv2 { uri: Lv2Uri::new(uri) });
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    bus.send(Command::LoadGraph { graph: g });
+    let mut buf = vec![0.0f32; 512 * 2];
+    let mut settle = |engine: &mut GraphEngine| for _ in 0..8 { engine.render(&mut buf, 2) };
+    settle(&mut engine);
+    let start = engine.lv2_control_value(inst, c.id as usize).ok_or_else(|| anyhow::anyhow!("{uri} did not load in the engine"))?;
+    let norm = if c.normalized(start as f64) < 0.5 { 0.9 } else { 0.1 };
+    // What a face knob sends, and what a CC bound to it applies.
+    bus.send(Command::SetParam { node: inst, param: c.id, value: norm as f64 });
+    settle(&mut engine);
+    let moved = engine.lv2_control_value(inst, c.id as usize).unwrap_or(f32::NAN);
+    println!("main-controls-test: {name}: moved '{}' (control {}): start {start:.4} -> knob at {:.0}% {moved:.4}", c.name, c.id, norm * 100.0);
+    anyhow::ensure!((moved as f64 - c.plain(norm)).abs() < (c.max - c.min) * 1e-3, "SetParam did not move '{}': wanted {}, plugin port reads {moved}", c.name, c.plain(norm));
     Ok(())
 }
 

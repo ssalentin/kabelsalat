@@ -43,7 +43,7 @@ Learned so far (2026-11-15, UI polish pass):
    "%[pixel:p{0,0}]" info:`); opaque white corners show as a white square on
    dark taskbars.
 3. **Cable colors:** keep audio jackets warm/neutral and MIDI jackets cool
-   (per-family palettes) — never mix the family hues; the TONE/WARM warming
+   (per-family palettes) — never mix the family hues; the WARM warming
    shift applies only to the neutral cream jacket, so tomato stays
    selection-only. Audio palette = cream/amber/rose/sand (a sage green
    slipped in and broke the warm family — check new hues against it).
@@ -322,7 +322,9 @@ Learned so far (2026-11-15, UI polish pass):
     rack knob (label, default, param, aliases); `make_unit`, the UI resolver
     and headless MCP all read it. Headless MCP used `dsp_param_choices` names,
     so `knob="RESO"` failed and `CEILING` bound the DRIVE knob. Add knobs
-    there, never as a literal in a face or a resolver.
+    there, never as a literal in a face or a resolver. A plugin's own
+    controls are the second table: its `MainControls` list, resolved by
+    `MainControls::find` in the app and in headless MCP alike (rule 90).
 68. **A knob on the face drives something, or is not bindable:** the
     system-audio GAIN knob was visual only (no SetParam path). A knob with
     `param: Some(..)` must reach the engine via `apply_engine_param`, and
@@ -437,8 +439,32 @@ Learned so far (2026-11-15, UI polish pass):
     nodes silently mapped to slot 0. Resolve with `voice_slot_of_node`
     (None past the pool or for non-CLAP nodes), never index by a rig index
     (`clap_units_past_the_voice_pool_never_index_voice_state`).
+90. **A plugin knob is one of the plugin's own controls, under the plugin's
+    name:** every LV2 unit had a `GAIN` knob on control port 0, whatever that
+    port was (Vitalium: `lv2_freewheel`; setBfree has no control port, so the
+    knob moved nothing), and a CLAP unit had a visual-only `TONE`. Plugin
+    knobs come from `main_controls::resolve` (remote-controls pages, then
+    `param:` designations, then the first usable continuous parameters,
+    macros first); a port with any other designation (`lv2:freeWheeling`,
+    `lv2:enabled`) is the host's and is never offered to the player. Check
+    with `kabelsalat main-controls-test`.
+91. **Re-read a plugin's controls after a state load, without waiting to be
+    told:** Surge XT names its macros per patch ("M1: Cutoff") and announces
+    no `params.rescan`, so the list read at instantiation kept "M1: -" after
+    a patch load. `ClapVoiceMain::load_state` arms the next
+    `poll_main_controls` calls, and the face rebuilds its main knobs when the
+    list changed (`real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin`).
+92. **A control the plugin left unnamed is not a main control:** only 274 of
+    3008 installed Surge patches name a macro; the others report "M1: -",
+    which moves nothing. `resolve` skips a slot whose name has no letter or
+    digit after its tag and continues with the next remote-controls page.
+93. **Find a knob by label or id, never by position:** plugin knobs sit in
+    front of a unit's own knobs, and how many there are follows the plugin
+    and the unit's width. `units[1].knobs[1]` stopped being LEVEL; use
+    `Unit::knob_index("LEVEL")` or `cc_target()`, and never rebuild a unit's
+    knob row while one of its knobs is dragged (rule 10).
 
-90. **A sound tool works in the library of the rig's own instrument:**
+94. **A sound tool works in the library of the rig's own instrument:**
     `list_sounds` / `load_sound` searched Surge patches for every rig, so a
     YANES or setBfree rig got Surge results and a load went into the wrong
     plugin. The instrument is the key (`sounds::Instrument`, from the node's
@@ -448,24 +474,24 @@ Learned so far (2026-11-15, UI polish pass):
     with `kabelsalat sound-library-test` (every installed catalog instrument
     lists, searches, loads one sound through the engine and sounds
     different) and `agent-eval --task yanes_bass` / `organ_jazz`.
-91. **Find out where a plugin keeps its sounds before writing a browser:**
+95. **Find out where a plugin keeps its sounds before writing a browser:**
     YANES has no preset files and no CLAP preset-discovery factory; its 146
     presets are the values of a stepped "Preset" parameter. setBfree has no
     LV2 presets; its 110 registrations are MIDI programmes it names in a
     MIDNAM document (`lv2::midi_programs`). Instantiate the plugin, list its
     parameters with their value texts and its extension data, and read its
     source, before assuming a file format.
-92. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
+96. **What `list_sounds` lists, `load_sound` loads:** `find` tries the exact
     label before any preference. Factory patches were preferred first, so
     the listed "Third/Pads/Warm Pad" loaded the factory "Pads/Warm Pad"
     (`a_listed_label_loads_exactly_that_sound`).
-93. **A search word no sound of the library holds is left out, never
+97. **A search word no sound of the library holds is left out, never
     fuzzy-ranked:** every setBfree programme is an organ and none is called
     one, so "jazz organ" found nothing. `sounds::search` drops such words
     (and reports them as `words_no_sound_has`) only when the full query
     finds nothing; words the library does hold are never dropped, so a
     "wobbly growling bass" still falls back to the kind as before.
-94. **A library scan never runs on the UI thread, and an agent call waits
+98. **A library scan never runs on the UI thread, and an agent call waits
     for it:** `sounds::Libraries` scans on its own thread (the first
     `list_sounds` walked about 3000 patch files on the UI thread) and
     `build_rack` starts the scans of the rack's instruments. In
@@ -474,14 +500,14 @@ Learned so far (2026-11-15, UI polish pass):
     cost a model step. A preset parameter is read from the live plugin on
     the UI thread, which is the CLAP main thread
     (`a_sound_tool_waits_for_the_library_scan`).
-95. **A request that names one sound is not "a kind of sound":** widening
+99. **A request that names one sound is not "a kind of sound":** widening
     the Jev `load_sound` criterion (so "a jazz drawbar preset" settles
     there) also pulled in "Load the patch Pads/Dreamscape", whose plan would
     fall back to any pad. The plan hands a request with a `Category/Name`
     label to the chat model. Compare `jev-test` outcomes for every sample
     before and after changing a criterion.
 
-96. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
+100. **A tool call a plan wrote carries `reasoning_content`:** a Jev plan
     that hands over after running tools puts its calls into the
     conversation; DeepSeek's thinking models (`deepseek-flash`) answer 400
     ("reasoning_content … must be passed back") to an assistant tool call
@@ -513,6 +539,7 @@ Learned so far (2026-11-15, UI polish pass):
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
   `sound-library-test` (`./target/debug/kabelsalat <name>`).

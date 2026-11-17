@@ -2278,6 +2278,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "audio_thread_priority",
+ "base64",
  "clack-extensions",
  "clack-host",
  "cpal",
@@ -2285,6 +2286,7 @@ dependencies = [
  "egui",
  "libc",
  "midir",
+ "png",
  "reqwest",
  "rmcp",
  "rtrb",

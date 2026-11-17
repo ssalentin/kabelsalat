@@ -25,6 +25,14 @@ struct LilvNode {
     _private: [u8; 0],
 }
 #[repr(C)]
+struct LilvNodes {
+    _private: [u8; 0],
+}
+#[repr(C)]
+struct LilvPluginClass {
+    _private: [u8; 0],
+}
+#[repr(C)]
 struct LilvIter {
     _private: [u8; 0],
 }
@@ -284,7 +292,15 @@ extern "C" {
     fn lilv_plugin_get_uri(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_name(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_num_ports(plugin: *const LilvPlugin) -> c_uint;
-    fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvNode;
+    fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvPluginClass;
+    fn lilv_plugin_class_get_uri(class: *const LilvPluginClass) -> *const LilvNode;
+    fn lilv_plugin_get_value(plugin: *const LilvPlugin, predicate: *const LilvNode) -> *mut LilvNodes;
+    fn lilv_nodes_begin(nodes: *const LilvNodes) -> *mut LilvIter;
+    fn lilv_nodes_get(nodes: *const LilvNodes, i: *mut LilvIter) -> *const LilvNode;
+    fn lilv_nodes_next(nodes: *const LilvNodes, i: *mut LilvIter) -> *mut LilvIter;
+    fn lilv_nodes_is_end(nodes: *const LilvNodes, i: *mut LilvIter) -> bool;
+    fn lilv_nodes_free(nodes: *mut LilvNodes);
+    fn lilv_node_is_uri(value: *const LilvNode) -> bool;
     fn lilv_node_as_string(value: *const LilvNode) -> *const c_char;
     fn lilv_node_as_uri(value: *const LilvNode) -> *const c_char;
     fn lilv_plugin_get_library_uri(plugin: *const LilvPlugin) -> *const LilvNode;
@@ -456,17 +472,43 @@ pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {
     }
 }
 
-/// Classify a plugin as an instrument by its LV2 plugin class
-/// (lv2core#InstrumentPlugin) — the authoritative designation, not a port
-/// heuristic (effects can have atom control ports; instruments can have audio
-/// inputs for modulation).
+/// Classify a plugin as an instrument (#26): its declared LV2 types decide
+/// (`lv2:InstrumentPlugin` yes, any other specific class — Delay, Compressor,
+/// Utility… — no); only a plugin that declares no specific class falls back
+/// to the ports. The old port-only guess called 198 of 208 installed effects
+/// instruments (LSP effects take MIDI for sidechain/control).
 unsafe fn classify_instrument(world: *mut LilvWorld, plugin: *const LilvPlugin) -> bool {
+    let types = plugin_types(world, plugin);
+    instrument_from_types(&types).unwrap_or_else(|| {
+        let (atom_in, audio_in, audio_out) = port_counts(world, plugin);
+        atom_in && audio_in == 0 && audio_out > 0
+    })
+}
+
+/// The class verdict: Some(true) for an instrument, Some(false) for any other
+/// specific LV2 class, None when only generic types (lv2:Plugin, doap:Project)
+/// are declared.
+fn instrument_from_types(types: &[String]) -> Option<bool> {
+    const GENERIC: &[&str] = &[
+        "http://lv2plug.in/ns/lv2core#Plugin",
+        "http://usefulinc.com/ns/doap#Project",
+    ];
+    if types.iter().any(|t| t == "http://lv2plug.in/ns/lv2core#InstrumentPlugin") {
+        return Some(true);
+    }
+    if types.iter().any(|t| t.starts_with(LV2_CORE_PREFIX) && !GENERIC.contains(&t.as_str())) {
+        return Some(false);
+    }
+    None
+}
+
+/// (has an atom/MIDI input, audio inputs, audio outputs).
+unsafe fn port_counts(world: *mut LilvWorld, plugin: *const LilvPlugin) -> (bool, u32, u32) {
     let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
     let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
     let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
-    let n = lilv_plugin_get_num_ports(plugin);
-    let (mut atom_in, mut audio_out, mut audio_in) = (false, 0u32, 0u32);
-    for i in 0..n {
+    let (mut atom_in, mut audio_in, mut audio_out) = (false, 0u32, 0u32);
+    for i in 0..lilv_plugin_get_num_ports(plugin) {
         let port = lilv_plugin_get_port_by_index(plugin, i);
         let is_in = lilv_port_is_a(plugin, port, input);
         if lilv_port_is_a(plugin, port, atom) && is_in {
@@ -479,12 +521,36 @@ unsafe fn classify_instrument(world: *mut LilvWorld, plugin: *const LilvPlugin) 
     lilv_node_free(audio);
     lilv_node_free(atom);
     lilv_node_free(input);
-    // Instrument hint: MIDI/atom input + audio output. Permissive by design —
-    // some effects also accept atom control, so the browser offers both add
-    // roles; the LV2 plugin class would be authoritative but LSP exposes it as
-    // a blank node lilv can't resolve to a URI here.
-    let _ = audio_in;
-    atom_in && audio_out > 0
+    (atom_in, audio_in, audio_out)
+}
+
+/// The plugin's declared LV2 types (`a lv2:InstrumentPlugin, lv2:Plugin`):
+/// every URI `rdf:type` plus the class lilv picked. Blank nodes are skipped.
+unsafe fn plugin_types(world: *mut LilvWorld, plugin: *const LilvPlugin) -> Vec<String> {
+    let mut out = Vec::new();
+    let rdf_type = lilv_new_uri(world, b"http://www.w3.org/1999/02/22-rdf-syntax-ns#type\0".as_ptr() as *const c_char);
+    let nodes = lilv_plugin_get_value(plugin, rdf_type);
+    if !nodes.is_null() {
+        let mut it = lilv_nodes_begin(nodes);
+        while !lilv_nodes_is_end(nodes, it) {
+            let n = lilv_nodes_get(nodes, it);
+            if !n.is_null() && lilv_node_is_uri(n) {
+                out.push(node_borrowed(n));
+            }
+            it = lilv_nodes_next(nodes, it);
+        }
+        lilv_nodes_free(nodes);
+    }
+    lilv_node_free(rdf_type);
+    let class = lilv_plugin_get_class(plugin);
+    if !class.is_null() {
+        let uri = lilv_plugin_class_get_uri(class);
+        if !uri.is_null() && lilv_node_is_uri(uri) {
+            let u = node_borrowed(uri);
+            if !out.contains(&u) { out.push(u); }
+        }
+    }
+    out
 }
 
 /// Read a borrowed node (owned by the plugin, e.g. get_uri) — do NOT free.
@@ -553,6 +619,23 @@ pub fn run_test() -> anyhow::Result<()> {
     println!("{} plugins installed", plugins.len());
     for p in plugins.iter().take(40) {
         println!("  {} ({} ports) — {}", p.name, p.num_ports, p.uri);
+    }
+    if std::env::var_os("KABELSALAT_LV2_TYPES").is_some() {
+        let _lilv = lilv_guard();
+        unsafe {
+            let world = lilv_world_new();
+            lilv_world_load_all(world);
+            let all = lilv_world_get_all_plugins(world);
+            let mut it = lilv_plugins_begin(all);
+            while !lilv_plugins_is_end(all, it) {
+                let pl = lilv_plugins_get(all, it);
+                let types: Vec<String> = plugin_types(world, pl).iter()
+                    .map(|t| t.rsplit('#').next().unwrap_or(t).to_string()).collect();
+                println!("TYPES {} | hint={} | {}", node_borrowed(lilv_plugin_get_uri(pl)), classify_instrument(world, pl), types.join(","));
+                it = lilv_plugins_next(all, it);
+            }
+            lilv_world_free(world);
+        }
     }
     let instruments: Vec<&Lv2PluginInfo> = plugins.iter().filter(|p| p.is_instrument).collect();
     println!("{} instruments (atom input + audio output):", instruments.len());
@@ -736,6 +819,12 @@ pub struct Lv2Plugin {
     // MIDI/atom instrument support.
     atom_in: Option<usize>,
     atom_buf: Vec<u8>,
+    /// The last MIDI event handed to the plugin (verification only).
+    last_event: Option<[u8; 3]>,
+    /// Atom OUTPUT ports (#38): a u64-backed (8-byte aligned) buffer each;
+    /// the header is reset to an empty Chunk of full capacity before run().
+    atom_out: Vec<(usize, Vec<u64>)>,
+    urid_chunk: u32,
     urid_sequence: u32,
     urid_midi: u32,
     is_inst: bool,
@@ -877,6 +966,7 @@ impl Lv2Plugin {
             let atom_class = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
             let urid_sequence = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/atom#Sequence\0".as_ptr() as *const c_char);
             let urid_midi = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/midi#MidiEvent\0".as_ptr() as *const c_char);
+            let urid_chunk = urid_map_cb(handle, b"http://lv2plug.in/ns/ext/atom#Chunk\0".as_ptr() as *const c_char);
             let nports = lilv_plugin_get_num_ports(plugin);
             let mut buffers: Vec<Vec<f32>> = (0..nports).map(|_| vec![0.0f32; block]).collect();
             let mut audio_in = Vec::new();
@@ -887,6 +977,7 @@ impl Lv2Plugin {
             let mut control_by_symbol = std::collections::HashMap::new();
             let mut atom_in: Option<usize> = None;
             let mut atom_buf = vec![0u8; 4096];
+            let mut atom_out: Vec<(usize, Vec<u64>)> = Vec::new();
             let desc = &*(*instance).lv2_descriptor;
             let h = (*instance).lv2_handle;
             let connect_port = desc.connect_port.expect("no connect_port");
@@ -900,6 +991,13 @@ impl Lv2Plugin {
                     atom_in = Some(i as usize);
                     init_atom_sequence(&mut atom_buf, urid_sequence);
                     connect_port(h, i, atom_buf.as_mut_ptr() as *mut c_void);
+                    continue;
+                }
+                if is_atom {
+                    let mut buf = vec![0u64; ATOM_OUT_BYTES / 8];
+                    reset_atom_output(&mut buf, urid_chunk);
+                    connect_port(h, i, buf.as_mut_ptr() as *mut c_void);
+                    atom_out.push((i as usize, buf)); // the heap block never moves
                     continue;
                 }
                 if is_audio && is_in {
@@ -934,7 +1032,7 @@ impl Lv2Plugin {
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
         }
     }
 
@@ -954,6 +1052,7 @@ impl Lv2Plugin {
             if let Some(b) = p.buffers.get_mut(i) { b.fill(0.0); }
         }
         if p.atom_in.is_some() { init_atom_sequence(&mut p.atom_buf, p.urid_sequence); }
+        p.last_event = None;
         p.set_active(true);
         Some(p)
     }
@@ -1021,34 +1120,32 @@ impl Lv2Plugin {
         self.is_inst
     }
 
-    /// Send a MIDI note-on to the atom input (frame 0 of the next block).
+    /// Queue a MIDI note-on for the next run() (frame 0). Events queue up
+    /// within a block, so every note of a chord reaches the plugin.
     pub fn note_on(&mut self, note: u8, velocity: u8) {
-        if self.atom_in.is_some() {
-            write_midi_event(&mut self.atom_buf, self.urid_sequence, self.urid_midi, 0, &[0x90, note, velocity]);
-        }
+        self.queue_midi([0x90, note, velocity]);
     }
 
-    /// Send a MIDI note-off to the atom input.
+    /// Queue a MIDI note-off for the next run().
     pub fn note_off(&mut self, note: u8) {
-        if self.atom_in.is_some() {
-            write_midi_event(&mut self.atom_buf, self.urid_sequence, self.urid_midi, 0, &[0x80, note, 0]);
+        self.queue_midi([0x80, note, 0]);
+    }
+
+    fn queue_midi(&mut self, ev: [u8; 3]) {
+        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &ev) {
+            self.last_event = Some(ev);
         }
     }
 
-    /// Read back the MIDI event currently in the atom buffer (for verification).
+    /// The last MIDI event handed to the plugin (for verification).
     pub fn last_midi_event(&self) -> Option<[u8; 3]> {
-        if self.atom_in.is_none() || self.atom_buf.len() < 35 {
-            return None;
-        }
-        let size = u32::from_le_bytes(self.atom_buf[0..4].try_into().ok()?);
-        if size <= 8 {
-            return None;
-        }
-        let data_len = u32::from_le_bytes(self.atom_buf[24..28].try_into().ok()?);
-        if data_len < 3 {
-            return None;
-        }
-        Some([self.atom_buf[32], self.atom_buf[33], self.atom_buf[34]])
+        self.last_event
+    }
+
+    /// Bytes the plugin wrote to its first atom output in the last run()
+    /// (the sequence body; 8 = an empty sequence). None without atom outputs.
+    pub fn atom_output_size(&self) -> Option<u32> {
+        self.atom_out.first().map(|(_, b)| (b[0] & 0xffff_ffff) as u32)
     }
 
     /// Process a stereo-interleaved block (allocation-free).
@@ -1066,8 +1163,16 @@ impl Lv2Plugin {
                     self.buffers[i][f] = input.get(f * 2).copied().unwrap_or(0.0);
                 }
             }
+            // Atom outputs: an empty Chunk of full capacity before every run (#38).
+            for (_, buf) in self.atom_out.iter_mut() {
+                reset_atom_output(buf, self.urid_chunk);
+            }
             let desc = &*(*self.instance).lv2_descriptor;
             (desc.run.expect("no run"))((*self.instance).lv2_handle, frames as u32);
+        }
+        // Inputs are consumed by run(): never deliver the same events twice.
+        if self.atom_in.is_some() {
+            init_atom_sequence(&mut self.atom_buf, self.urid_sequence);
         }
         if let Some(w) = self.worker.as_ref() {
             w.end_run();
@@ -1094,6 +1199,7 @@ impl Drop for Lv2Plugin {
             std::mem::forget(std::mem::replace(&mut self._map_data, Box::new(Lv2UridMap { handle: std::ptr::null_mut(), map: urid_map_cb })));
             std::mem::forget(std::mem::take(&mut self.buffers));
             std::mem::forget(std::mem::take(&mut self.atom_buf));
+            std::mem::forget(std::mem::take(&mut self.atom_out));
             // A parked never-free instance keeps its worker thread alive too.
             std::mem::forget(self.worker.take());
             std::mem::forget(self._worker_shared.take());
@@ -1161,31 +1267,41 @@ pub fn voice_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Capacity of each atom output port buffer, in bytes.
+const ATOM_OUT_BYTES: usize = 8192;
+
+/// Before run(), an atom OUTPUT port holds an atom:Chunk whose size is the
+/// space the plugin may write (LV2 atom spec); a zeroed buffer reads as 0
+/// bytes (setBfree: "LV message buffer is only 0 bytes").
+fn reset_atom_output(buf: &mut [u64], chunk_urid: u32) {
+    let capacity = (buf.len() * 8 - 8) as u64; // body bytes after the 8-byte header
+    buf[0] = capacity | ((chunk_urid as u64) << 32); // atom.size | atom.type (LE)
+}
+
+/// Append one MIDI event to an atom:Sequence (8-byte aligned, per the LV2
+/// atom spec). False (event dropped) if the buffer is full. Allocation-free.
+fn append_midi_event(buf: &mut [u8], midi_urid: u32, frame: i64, midi: &[u8]) -> bool {
+    let size = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize; // body bytes
+    let e = 8 + size; // next event offset (body starts at 8; seq header is 8 of it)
+    let padded = (16 + midi.len() + 7) & !7;
+    if e + padded > buf.len() {
+        return false;
+    }
+    buf[e..e + padded].fill(0);
+    buf[e..e + 8].copy_from_slice(&frame.to_le_bytes()); // time.frames
+    buf[e + 8..e + 12].copy_from_slice(&(midi.len() as u32).to_le_bytes()); // body.size
+    buf[e + 12..e + 16].copy_from_slice(&midi_urid.to_le_bytes()); // body.type
+    buf[e + 16..e + 16 + midi.len()].copy_from_slice(midi);
+    buf[0..4].copy_from_slice(&((size + padded) as u32).to_le_bytes());
+    true
+}
+
 /// Initialize an atom:Sequence buffer as empty (time unit = audio frames).
 fn init_atom_sequence(buf: &mut [u8], seq_urid: u32) {
     buf[0..4].copy_from_slice(&8u32.to_le_bytes()); // atom.size = unit+pad only
     buf[4..8].copy_from_slice(&seq_urid.to_le_bytes()); // atom.type = Sequence
     buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // body.unit = 0 (frames)
     buf[12..16].copy_from_slice(&0u32.to_le_bytes()); // body.pad
-}
-
-/// Write a single MIDI event into an atom:Sequence at `frame` (8-byte aligned,
-/// per the LV2 atom spec). Resets the sequence to hold just this event.
-fn write_midi_event(buf: &mut [u8], seq_urid: u32, midi_urid: u32, frame: i64, midi: &[u8]) {
-    let data_len = midi.len();
-    let padded = (16 + data_len + 7) & !7; // event header(16) + data, padded
-    buf[0..4].copy_from_slice(&(8 + padded as u32).to_le_bytes()); // atom.size
-    buf[4..8].copy_from_slice(&seq_urid.to_le_bytes());
-    buf[8..12].copy_from_slice(&0u32.to_le_bytes());
-    buf[12..16].copy_from_slice(&0u32.to_le_bytes());
-    let e = 16;
-    for b in &mut buf[e..e + padded] {
-        *b = 0;
-    }
-    buf[e..e + 8].copy_from_slice(&frame.to_le_bytes()); // time.frames
-    buf[e + 8..e + 12].copy_from_slice(&(data_len as u32).to_le_bytes()); // body.size
-    buf[e + 12..e + 16].copy_from_slice(&midi_urid.to_le_bytes()); // body.type
-    buf[e + 16..e + 16 + data_len].copy_from_slice(midi); // MIDI bytes
 }
 
 const LV2_CORE_PREFIX: &str = "http://lv2plug.in/ns/lv2core#";
@@ -1641,22 +1757,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn atom_midi_event_format() {
+    fn atom_midi_events_append_within_a_block() {
         let mut buf = vec![0u8; 256];
         let (seq, midi) = (42u32, 43u32);
         init_atom_sequence(&mut buf, seq);
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 8); // empty
-        write_midi_event(&mut buf, seq, midi, 0, &[0x90, 60, 100]);
+        assert!(append_midi_event(&mut buf, midi, 0, &[0x90, 60, 100]));
         // atom.size = 8 + pad(16+3=19 → 24) = 32
         assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 32);
         assert_eq!(u32::from_le_bytes(buf[4..8].try_into().unwrap()), seq);
-        // event at offset 16: time.frames = 0
+        // event at offset 16: time.frames = 0, body.size = 3, body.type = MidiEvent
         assert_eq!(i64::from_le_bytes(buf[16..24].try_into().unwrap()), 0);
-        // body.size = 3, body.type = MidiEvent URID
         assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 3);
         assert_eq!(u32::from_le_bytes(buf[28..32].try_into().unwrap()), midi);
-        // MIDI payload
         assert_eq!(&buf[32..35], &[0x90, 60, 100]);
+        // A second note of the chord follows at offset 40 — not a reset.
+        assert!(append_midi_event(&mut buf, midi, 0, &[0x90, 64, 100]));
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 56);
+        assert_eq!(&buf[32..35], &[0x90, 60, 100], "first note kept");
+        assert_eq!(&buf[56..59], &[0x90, 64, 100]);
+        // Full buffer: events are dropped, never written past the end.
+        let mut small = vec![0u8; 48];
+        init_atom_sequence(&mut small, seq);
+        assert!(append_midi_event(&mut small, midi, 0, &[0x80, 60, 0]));
+        assert!(!append_midi_event(&mut small, midi, 0, &[0x80, 61, 0]));
+        assert_eq!(u32::from_le_bytes(small[0..4].try_into().unwrap()), 32);
+    }
+
+    /// #38: an atom output starts every run as an empty Chunk of full capacity.
+    /// #26: the declared class decides; ports only without one.
+    #[test]
+    fn instrument_class_comes_from_the_declared_types() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let lv2 = |c: &str| format!("http://lv2plug.in/ns/lv2core#{c}");
+        let doap = "http://usefulinc.com/ns/doap#Project";
+        assert_eq!(instrument_from_types(&t(&[doap, &lv2("Plugin"), &lv2("InstrumentPlugin")])), Some(true));
+        assert_eq!(instrument_from_types(&t(&[doap, &lv2("Plugin"), &lv2("DelayPlugin")])), Some(false), "LSP delay takes MIDI but is an effect");
+        assert_eq!(instrument_from_types(&t(&[&lv2("UtilityPlugin")])), Some(false));
+        assert_eq!(instrument_from_types(&t(&[doap, &lv2("Plugin")])), None, "generic only → ports decide");
+        assert_eq!(instrument_from_types(&[]), None);
+    }
+
+    #[test]
+    fn atom_output_header_announces_its_capacity() {
+        let mut buf = vec![0u64; ATOM_OUT_BYTES / 8];
+        reset_atom_output(&mut buf, 7);
+        let bytes: Vec<u8> = buf[0].to_le_bytes().to_vec();
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize, ATOM_OUT_BYTES - 8);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 7);
+        assert_eq!(buf.as_ptr() as usize % 8, 0, "8-byte aligned");
     }
 
     #[test]

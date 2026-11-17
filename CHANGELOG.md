@@ -8,6 +8,11 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Confirm / Cancel buttons in the chat** (#32): when the assistant asks
+  before a destructive action (delete a rig, install an instrument), the chat
+  shows the two buttons; the click runs or cancels it.
+- **Live meters for other apps** in the mixer's System audio strips (YouTube,
+  …): measured per stream with `parec --monitor-stream`, dB-scaled.
 - **MCP `play_file` / `stop_file`** (#22): attached agents
   (`kabelsalat mcp --attach`) can start and stop backing tracks through the UI
   bridge; headless `stop_file` mutes the player.
@@ -64,6 +69,15 @@ releases may still change behaviour and session files.
   velocity, or CC number and value.
 
 ### Fixed
+- **Hanging LV2 notes** (setBfree): a note-off and a note-on in the same
+  audio block (legato) lost the note-off, and chords played only one note.
+  Every event now reaches the plugin once; atom outputs get a real buffer
+  (#38).
+- **Agents wiring over `mcp --attach`:** add_node → connect works at once and
+  auto cable ids no longer collide; get_graph reflects edits immediately (#37).
+- **Keyboard dock follows the window height** (#23).
+- **LV2 instrument detection** uses the plugin's declared class; LSP effects
+  no longer show up as instruments (#26).
 - **System audio GAIN knob works** (#21): it sets the capture gain through
   SetParam (so it is MIDI-bindable), starts muted, and follows
   `system_audio`/`set_system_audio` changes from any agent.

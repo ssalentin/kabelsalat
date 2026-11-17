@@ -39,6 +39,105 @@ pub struct AppStream {
     pub muted: bool,
 }
 
+/// Live levels of other apps' streams (the mixer's "System audio" meters):
+/// one `parec --monitor-stream` reader per playing stream, the way
+/// pavucontrol meters them. 8 kHz mono float is plenty for a meter and costs
+/// next to nothing. Readers live on their own threads (rule 48) and park in
+/// a blocking read (rule 47); a reader for a stream that is gone is killed.
+pub struct StreamMeters {
+    readers: std::collections::HashMap<u64, std::process::Child>,
+    levels: StreamLevels,
+}
+
+/// Peak (linear, smoothed) per sink-input index, with when it was measured.
+pub type StreamLevels = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, (f32, std::time::Instant)>>>;
+
+/// Samples per meter reading: 40 ms at 8 kHz (25 readings per second).
+const METER_RATE: u32 = 8000;
+const METER_CHUNK: usize = 320;
+
+impl StreamMeters {
+    pub fn new(levels: StreamLevels) -> Self {
+        Self { readers: Default::default(), levels }
+    }
+
+    /// Meter exactly these streams: start readers for new ones, stop those
+    /// whose stream ended (or whose reader exited, so it restarts).
+    pub fn sync(&mut self, streams: &[AppStream]) {
+        let wanted: std::collections::HashSet<u64> = streams.iter().map(|s| s.index).collect();
+        self.readers.retain(|idx, child| {
+            let alive = matches!(child.try_wait(), Ok(None));
+            if wanted.contains(idx) && alive { return true; }
+            let _ = child.kill();
+            let _ = child.wait();
+            false
+        });
+        if let Ok(mut l) = self.levels.lock() { l.retain(|idx, _| wanted.contains(idx)); }
+        for &idx in &wanted {
+            if self.readers.contains_key(&idx) { continue; }
+            if let Some(child) = spawn_meter_reader(idx, self.levels.clone()) {
+                self.readers.insert(idx, child);
+            }
+        }
+    }
+}
+
+impl Drop for StreamMeters {
+    fn drop(&mut self) {
+        for (_, mut c) in self.readers.drain() { let _ = c.kill(); let _ = c.wait(); }
+    }
+}
+
+fn spawn_meter_reader(index: u64, levels: StreamLevels) -> Option<std::process::Child> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("parec")
+        .args([
+            &format!("--monitor-stream={index}"), &format!("--rate={METER_RATE}"),
+            "--channels=1", "--format=float32le", "--latency-msec=40",
+            "--client-name=kabelsalat-meter",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut out = child.stdout.take()?;
+    std::thread::Builder::new()
+        .name(format!("kabelsalat-meter-{index}"))
+        .spawn(move || {
+            let mut buf = vec![0u8; METER_CHUNK * 4];
+            let mut level = 0.0f32;
+            while out.read_exact(&mut buf).is_ok() {
+                level = smooth_meter(level, chunk_peak(&buf));
+                if let Ok(mut l) = levels.lock() { l.insert(index, (level, std::time::Instant::now())); }
+            }
+        })
+        .ok()?;
+    Some(child)
+}
+
+/// Peak |sample| of a chunk of little-endian f32 samples.
+pub fn chunk_peak(bytes: &[u8]) -> f32 {
+    bytes.chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs())
+        .filter(|v| v.is_finite())
+        .fold(0.0, f32::max)
+}
+
+/// Meter ballistics per reading: instant rise, ~-6 dB per 40 ms fall.
+pub fn smooth_meter(prev: f32, peak: f32) -> f32 {
+    peak.max(prev * 0.5)
+}
+
+/// The level to show for a stream: silent when no reading arrived lately
+/// (a paused tab stops delivering data instead of sending zeros).
+pub fn stream_level(levels: &StreamLevels, index: u64) -> f32 {
+    levels.lock().ok()
+        .and_then(|l| l.get(&index).copied())
+        .filter(|(_, at)| at.elapsed() < std::time::Duration::from_millis(250))
+        .map_or(0.0, |(v, _)| v)
+}
+
 /// A change the UI or an agent asks for; applied on the scan thread.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamCmd {
@@ -176,6 +275,21 @@ pub fn scan_and_apply(wanted: Option<&str>) -> OutputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_meter_peaks_fall_and_go_silent_when_readings_stop() {
+        let bytes: Vec<u8> = [0.1f32, -0.5, 0.25, f32::NAN].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(chunk_peak(&bytes), 0.5, "abs peak, NaN ignored");
+        assert_eq!(smooth_meter(0.0, 0.5), 0.5, "instant rise");
+        assert_eq!(smooth_meter(0.5, 0.0), 0.25, "falls gradually");
+        let levels: StreamLevels = Default::default();
+        assert_eq!(stream_level(&levels, 7), 0.0, "unknown stream is silent");
+        levels.lock().unwrap().insert(7, (0.4, std::time::Instant::now()));
+        assert_eq!(stream_level(&levels, 7), 0.4);
+        let old = std::time::Instant::now() - std::time::Duration::from_millis(400);
+        levels.lock().unwrap().insert(7, (0.4, old));
+        assert_eq!(stream_level(&levels, 7), 0.0, "a paused tab stops sending: shown silent, not frozen");
+    }
 
     #[test]
     fn sinks_parse_default_first() {

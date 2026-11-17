@@ -326,6 +326,25 @@ Learned so far (2026-11-15, UI polish pass):
     system-audio GAIN knob was visual only (no SetParam path). A knob with
     `param: Some(..)` must reach the engine via `apply_engine_param`, and
     any engine state it shows is published back (here `GraphPub::system_gain`).
+69. **LV2 event inputs append and clear; outputs announce capacity:** each
+    note became the WHOLE atom sequence and it was never cleared, so a
+    note-off and a note-on in one block (legato) lost the note-off and
+    setBfree droned; chords played only their last note. `queue_midi`
+    appends, `process` re-inits the input after `run()`, and every atom
+    OUTPUT gets an 8-byte-aligned Chunk header of full capacity before
+    `run()` (#38). `lv2-instrument-engine-test` plays chord + legato.
+70. **Agents read the engine's graph, and structural edits wait for it:**
+    attached MCP validated ids against the UI's lagging copy, so
+    add_node → connect said "node does not exist" and auto cable ids
+    collided (#37). The bridge answers get_graph from `GraphPub`, and a
+    structural `cmd` returns once the engine published it (≤ 250 ms).
+71. **Panels that follow the window use `exact_size`:** egui keeps a
+    panel's first `default_size`, so the keyboard dock never resized
+    (#23). Derive the size from `ctx.content_rect()` each frame.
+72. **LV2 instruments are what they declare:** `lv2:InstrumentPlugin` in
+    the plugin's `rdf:type` decides; any other lv2core class means effect.
+    The port guess (MIDI in + audio out) called 198 of 208 effects
+    instruments; it is only the fallback for class-less plugins (#26).
 
 ## Working on kabelsalat
 

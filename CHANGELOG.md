@@ -8,6 +8,8 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Fixed
+- **Arch package:** declares the MIT license, installs `LICENSE` and takes
+  its version from the git tag (`0.1.0.r<n>.g<sha>`, was `0.0.1.r…`).
 - **Crash with more synths than voices:** an undo (or a source/device edit)
   in a session with five or more CLAP units panicked. Units past the voice
   pool now have no per-voice state, and agent tools say so.
@@ -16,6 +18,12 @@ releases may still change behaviour and session files.
 - **Assistant panel polish:** gave destructive `Confirm` buttons an outlined danger treatment (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text) distinct from `Send`, removed the duplicate live status from the header, switched action chips to rig display names (`rig_name`), hid read-only steps from the chip row (counting them in the cost line), raised contrast on role labels, chip text, `Cancel`, step metadata, and the attachment `×`, aligned `Confirm`/`Cancel` and the attachment chip to the transcript column, and replaced debug pixel-dimension text with a cached 32 px attachment thumbnail texture.
 
 ### Added
+- **Packages for every release, on x86_64 and aarch64:** a Flatpak bundle
+  (`io.github.ssalentin.kabelsalat`), an AppImage, a plain `.tar.gz` and an
+  Arch package, built by GitHub Actions on each `vX.Y.Z` tag and attached to
+  the release. Every push and pull request builds and runs the unit suite on
+  both architectures. See `docs/PACKAGING.md`.
+- `kabelsalat --version` and `kabelsalat --help`.
 - **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in

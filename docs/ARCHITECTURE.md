@@ -6,8 +6,9 @@ This document explains how kabelsalat is built and why. It is not a task list:
 planned work, bugs and ideas are tracked as
 [GitHub issues](https://github.com/ssalentin/kabelsalat/issues) grouped into
 [milestones](https://github.com/ssalentin/kabelsalat/milestones), released
-changes are in [CHANGELOG.md](../CHANGELOG.md), and the working rules for
-contributors and agents are in [AGENTS.md](../AGENTS.md).
+changes are in [CHANGELOG.md](../CHANGELOG.md), CI and release packaging in
+[PACKAGING.md](PACKAGING.md), and the working rules for contributors and
+agents are in [AGENTS.md](../AGENTS.md).
 
 ## Module map (src/)
 

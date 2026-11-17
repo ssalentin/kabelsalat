@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ssalentin.kabelsalat</id>
+  <name>kabelsalat</name>
+  <summary>Live rack for synths and effects, wired with patch cables</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.ssalentin">
+    <name>Sebastian Salentin</name>
+  </developer>
+  <description>
+    <p>
+      kabelsalat turns your computer into a live setup: synths and effects sit
+      in a rack, connected by patch cables that you can see and grab, and
+      everything you play goes straight to the speakers.
+    </p>
+    <ul>
+      <li>Host CLAP and LV2 instruments and effects (Surge XT, Dexed, Vitalium, …)</li>
+      <li>Patch on the back of the rack with animated cables</li>
+      <li>Run several rigs at once, each played from its own keyboard</li>
+      <li>Route MIDI anywhere: splits, channels, transposition, velocity ranges</li>
+      <li>Mix, record what you hear to WAV, and let an assistant set things up</li>
+    </ul>
+    <p>
+      Plugins are not bundled. The app finds those in ~/.clap and ~/.lv2, the
+      host system's plugin folders and Flathub's LinuxAudio plugin extensions.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.ssalentin.kabelsalat.desktop</launchable>
+  <url type="homepage">https://github.com/ssalentin/kabelsalat</url>
+  <url type="bugtracker">https://github.com/ssalentin/kabelsalat/issues</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The rack: a keyboard, a Surge XT synth with a delay, and the master output</caption>
+      <image>https://raw.githubusercontent.com/ssalentin/kabelsalat/main/docs/shots/front.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The back of the rack with MIDI and audio cables</caption>
+      <image>https://raw.githubusercontent.com/ssalentin/kabelsalat/main/docs/shots/back.png</image>
+    </screenshot>
+  </screenshots>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Music</category>
+  </categories>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-16">
+      <url type="details">https://github.com/ssalentin/kabelsalat/releases/tag/v0.1.0</url>
+    </release>
+  </releases>
+</component>

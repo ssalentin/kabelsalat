@@ -43,6 +43,7 @@ use clack_extensions::params::{
     HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
     ParamInfoFlags, ParamRescanFlags, PluginParams,
 };
+use clack_extensions::remote_controls::{PluginRemoteControls, RemoteControlsPageBuffer};
 use clack_extensions::state::{HostState, HostStateImpl, PluginState};
 use clack_host::events::event_types::{
     MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags,
@@ -52,6 +53,7 @@ use clack_host::host::{HostError, HostExtensions};
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
+use crate::main_controls::{self, Candidate, MainControls, RemotePage};
 use crate::transport::{Transport, BEATS_PER_BAR};
 
 use x11rb::connection::Connection;
@@ -81,6 +83,7 @@ struct HostShared {
     gui: OnceLock<Option<PluginGui>>,
     latency: OnceLock<Option<PluginLatency>>,
     audio_ports: OnceLock<Option<PluginAudioPorts>>,
+    remote_controls: OnceLock<Option<PluginRemoteControls>>,
     // Plugin -> host requests (lock-free flags).
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
@@ -102,6 +105,7 @@ impl<'a> SharedHandler<'a> for HostShared {
         let _ = self.gui.set(instance.get_extension());
         let _ = self.latency.set(instance.get_extension());
         let _ = self.audio_ports.set(instance.get_extension());
+        let _ = self.remote_controls.set(instance.get_extension());
     }
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
@@ -207,6 +211,7 @@ struct Exts {
     gui: Option<PluginGui>,
     latency: Option<PluginLatency>,
     audio_ports: Option<PluginAudioPorts>,
+    remote_controls: Option<PluginRemoteControls>,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,14 +346,16 @@ impl ClapVoice {
             gui: h.gui.get().copied().flatten(),
             latency: h.latency.get().copied().flatten(),
             audio_ports: h.audio_ports.get().copied().flatten(),
+            remote_controls: h.remote_controls.get().copied().flatten(),
         });
         println!(
-            "extensions: params={} state={} gui={} latency={} audio-ports={}",
+            "extensions: params={} state={} gui={} latency={} audio-ports={} remote-controls={}",
             exts.params.is_some(),
             exts.state.is_some(),
             exts.gui.is_some(),
             exts.latency.is_some(),
-            exts.audio_ports.is_some()
+            exts.audio_ports.is_some(),
+            exts.remote_controls.is_some()
         );
 
         let (in_count, in_ch, out_chs, main_out) =
@@ -413,11 +420,14 @@ impl ClapVoice {
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
         };
-        let main = ClapVoiceMain {
+        let mut main = ClapVoiceMain {
             instance: plugin,
             exts,
+            main_controls: MainControls::default(),
+            main_controls_rechecks: 0,
             _entry: entry,
         };
+        main.refresh_main_controls();
         Ok((voice, main))
     }
 
@@ -673,12 +683,22 @@ mod transport_event_tests {
     }
 }
 
+/// Main-control polls that look again after a state load (about a second
+/// at the UI's poll rate): the state lands on the audio thread a few blocks
+/// later.
+const MAIN_CONTROLS_RECHECKS: u8 = 10;
+
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
 /// `!Send`), state save/restore, GUI access and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
 pub struct ClapVoiceMain {
     instance: PluginInstance<TestHost>,
     exts: Exts,
+    /// Resolved when the instance is created, and again only when the plugin
+    /// reports changed parameter info. Never per frame: it walks every param.
+    main_controls: MainControls,
+    /// Polls left that re-read the main controls after a state load.
+    main_controls_rechecks: u8,
     _entry: PluginEntry,
 }
 
@@ -712,6 +732,7 @@ impl ClapVoiceMain {
     pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
+        self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
         Ok(())
     }
 
@@ -757,6 +778,76 @@ impl ClapVoiceMain {
             });
         }
         out
+    }
+
+    /// The instrument's main controls (see `main_controls::resolve`).
+    pub fn main_controls(&self) -> &MainControls {
+        &self.main_controls
+    }
+
+    /// Re-read the main controls when they may have changed: the plugin
+    /// announced new parameter info, or a state was loaded (a patch renames
+    /// its macros; Surge applies the state on the audio thread a few blocks
+    /// later and announces nothing, so the next few polls look again). True
+    /// when the list changed. Call it a few times per second, not per frame.
+    pub fn poll_main_controls(&mut self) -> bool {
+        let announced = self.instance.access_handler(|h| h.params_rescan.replace(false));
+        if !announced && self.main_controls_rechecks == 0 {
+            return false;
+        }
+        self.main_controls_rechecks = self.main_controls_rechecks.saturating_sub(1);
+        let before = std::mem::take(&mut self.main_controls);
+        self.refresh_main_controls();
+        before != self.main_controls
+    }
+
+    fn refresh_main_controls(&mut self) {
+        let pages = self.remote_pages();
+        let params = self.param_candidates();
+        self.main_controls = main_controls::resolve(&pages, &params);
+    }
+
+    fn remote_pages(&mut self) -> Vec<RemotePage> {
+        let Some(rc) = self.exts.remote_controls else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let mut buf = RemoteControlsPageBuffer::new();
+        (0..rc.count(&handle))
+            .filter_map(|i| {
+                let page = rc.get(&handle, i, &mut buf)?;
+                Some(RemotePage {
+                    name: String::from_utf8_lossy(page.page_name).into_owned(),
+                    slots: page.param_ids.map(|id| id.map(|id| id.get())),
+                })
+            })
+            .collect()
+    }
+
+    fn param_candidates(&mut self) -> Vec<Candidate> {
+        let Some(params) = self.exts.params else {
+            return Vec::new();
+        };
+        let handle = self.instance.plugin_handle();
+        let mut info_buf = ParamInfoBuffer::new();
+        (0..params.count(&handle))
+            .filter_map(|i| {
+                let info = params.get_info(&handle, i, &mut info_buf)?;
+                Some(Candidate {
+                    id: info.id.get(),
+                    name: String::from_utf8_lossy(info.name).into_owned(),
+                    group: String::from_utf8_lossy(info.module).into_owned(),
+                    min: info.min_value,
+                    max: info.max_value,
+                    default: info.default_value,
+                    usable: info.flags.contains(ParamInfoFlags::IS_AUTOMATABLE)
+                        && !info.flags.contains(ParamInfoFlags::IS_HIDDEN)
+                        && !info.flags.contains(ParamInfoFlags::IS_READONLY),
+                    stepped: info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                    designated: false,
+                })
+            })
+            .collect()
     }
 
     /// Current plain value of a single parameter (main thread only).

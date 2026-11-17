@@ -38,7 +38,7 @@ finish-args:
   - --filesystem=~/.lv2:create
   - --filesystem=host-os:ro
   - --env=CLAP_PATH=/app/extensions/Plugins/clap:/run/host/usr/lib/clap:/run/host/usr/lib64/clap:/run/host/usr/local/lib/clap
-  - --env=LV2_PATH=/app/extensions/Plugins/lv2:/run/host/usr/lib/lv2:/run/host/usr/lib64/lv2:/run/host/usr/local/lib/lv2
+  - --env=LV2_PATH=/app/lib/lv2:/app/extensions/Plugins/lv2:/run/host/usr/lib/lv2:/run/host/usr/lib64/lv2:/run/host/usr/local/lib/lv2
 
 add-extensions:
   org.freedesktop.LinuxAudio.Plugins:
@@ -50,6 +50,7 @@ add-extensions:
     no-autodownload: true
 
 cleanup:
+  - /bin/lv2_validate
   - /include
   - /lib/pkgconfig
   - /share/doc

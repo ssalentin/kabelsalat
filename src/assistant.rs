@@ -93,6 +93,26 @@ pub fn save_count_in(enabled: bool, bars: u8) -> std::io::Result<()> {
     save_count_in_to(&config_path(), enabled, bars)
 }
 
+pub fn load_reduce_motion_from(path: &std::path::Path) -> bool {
+    let v: Option<Value> = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok());
+    v.as_ref().and_then(|v| v.get("ui_reduce_motion")).and_then(Value::as_bool).unwrap_or(false)
+}
+
+pub fn save_reduce_motion_to(path: &std::path::Path, reduce: bool) -> std::io::Result<()> {
+    save_config_values_to(path, &[("ui_reduce_motion", json!(reduce))])
+}
+
+/// Persisted `ui_reduce_motion` flag in config.json (default false, test-safe no-op under cfg(test)).
+pub fn load_reduce_motion() -> bool {
+    if cfg!(test) { return false; }
+    load_reduce_motion_from(&config_path())
+}
+
+pub fn save_reduce_motion(reduce: bool) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_reduce_motion_to(&config_path(), reduce)
+}
+
 #[derive(Clone)]
 pub struct ChatLine {
     pub role: String,
@@ -133,10 +153,51 @@ pub enum ToWorker {
     ToolResults(Vec<ToolOutput>),
 }
 
+/// Live phase of an in-flight assistant turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunPhase {
+    Deciding,
+    Thinking { step: usize, model: String, seeing: bool },
+}
+
+impl RunPhase {
+    pub fn route_name(model: &str) -> &str {
+        let low = model.to_ascii_lowercase();
+        if low.contains("jev-router") {
+            "Jev router"
+        } else if low.contains("jev") {
+            "Jev"
+        } else if low.contains("deepseek") {
+            "DeepSeek"
+        } else if low.contains("gemini") {
+            "Gemini"
+        } else if low.contains("claude") {
+            "Claude"
+        } else {
+            model.rsplit('/').next().unwrap_or(model)
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            RunPhase::Deciding => "Jev · deciding".to_string(),
+            RunPhase::Thinking { step, model, seeing } => {
+                let route = Self::route_name(model);
+                if *seeing && *step <= 1 {
+                    format!("{route} · looking at the image")
+                } else {
+                    format!("{route} · step {step}")
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum FromWorker {
     /// Chat models the DeepSeek key can use (GET /models), fetched once.
     Models(Vec<String>),
+    Phase(RunPhase),
     Text(String),
     /// Every valid tool call of one model step, in call order. The host runs
     /// them and answers with one `ToWorker::ToolResults`.
@@ -206,6 +267,7 @@ pub struct Assistant {
     pub history: Vec<ChatLine>,
     pub busy: bool,
     pub key_set: bool,
+    pub phase: Option<RunPhase>,
     routes: Routes,
     /// Models offered in the picker.
     pub models: Vec<String>,
@@ -239,6 +301,7 @@ impl Assistant {
             history: Vec::new(),
             busy: false,
             key_set: route.endpoint.key().is_some(),
+            phase: None,
             routes: Routes {
                 act: std::sync::Arc::new(std::sync::Mutex::new(route)),
                 decide,
@@ -316,10 +379,21 @@ impl Assistant {
     pub fn send_user_message(&mut self, shown: String, sent: UserMessage) {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
+        self.phase = Some(if sent.image.is_some() {
+            RunPhase::Thinking { step: 1, model: self.routes.perceive.model.clone(), seeing: true }
+        } else if self.routes.decide.is_some() {
+            RunPhase::Deciding
+        } else {
+            RunPhase::Thinking { step: 1, model: self.model(), seeing: false }
+        });
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::User(sent));
         }
+    }
+
+    pub fn phase_label(&self) -> String {
+        self.phase.as_ref().map_or_else(|| "Assistant · working".to_string(), RunPhase::label)
     }
 
     /// Answer a batch from `poll`: one result per call, in call order.
@@ -336,6 +410,7 @@ impl Assistant {
         let mut batches = Vec::new();
         while let Some(ev) = self.rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             match ev {
+                FromWorker::Phase(p) => self.phase = Some(p),
                 FromWorker::Text(t) => self.history.push(ChatLine { role: "assistant".into(), text: t }),
                 FromWorker::ToolCalls(batch) => {
                     self.turn.tools.extend(batch.iter().map(|c| c.name.clone()));
@@ -349,10 +424,12 @@ impl Assistant {
                 }
                 FromWorker::Done => {
                     self.busy = false;
+                    self.phase = None;
                     self.turn.wall = self.turn.started.map(|t| t.elapsed());
                 }
                 FromWorker::Error(e) => {
                     self.busy = false;
+                    self.phase = None;
                     self.turn.errors.push(e.clone());
                     self.history.push(ChatLine { role: "error".into(), text: e });
                 }
@@ -1616,7 +1693,9 @@ fn decide_turn<T: Transport>(
     // `jev-test --image`: Jev reads a note in an image, but cannot return a
     // value it states, and what it sees leaks into the rig and slot answers.
     if user.image.is_some() { return None; }
-    let decision = client.decide(jev, &key_for(jev.endpoint)?, &user.text, None, decision_questions()).ok()?;
+    let key = key_for(jev.endpoint)?;
+    let _ = tx.send(FromWorker::Phase(RunPhase::Deciding));
+    let decision = client.decide(jev, &key, &user.text, None, decision_questions()).ok()?;
     let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
     let (shortcut, facts, mut step) = settle(&decision, &user.text)?;
     let mut done: Vec<String> = Vec::new();
@@ -1660,7 +1739,7 @@ fn run_turn<T: Transport>(
     rx: &Receiver<ToWorker>,
     tx: &Sender<FromWorker>,
 ) -> TurnEnd {
-    for _ in 0..MAX_STEPS {
+    for step_idx in 0..MAX_STEPS {
         convo.fit(CONTEXT_BUDGET);
         // The acting model may not see images: from the step an image
         // enters the turn, the seeing model acts.
@@ -1673,6 +1752,11 @@ fn run_turn<T: Transport>(
             let need = if sees { format!("an image needs {} ({})", route.model, spec.label) } else { format!("no {} API key", spec.label) };
             return TurnEnd::Failed(format!("{need}: add {} to {}", spec.key_field, config_path().display()));
         };
+        let _ = tx.send(FromWorker::Phase(RunPhase::Thinking {
+            step: step_idx + 1,
+            model: route.model.clone(),
+            seeing: sees,
+        }));
         let body = json!({ "messages": convo.request(system), "tools": tools, "tool_choice": "auto" });
         let done = match client.chat(&route, &key, body) {
             Ok(done) => done,
@@ -1750,6 +1834,23 @@ mod tests {
 
         save_count_in_to(&p, false, 9).unwrap();
         assert_eq!(load_count_in_from(&p), (false, crate::transport::MAX_COUNT_IN_BARS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_motion_persists_in_config_json_preserving_other_fields() {
+        let dir = std::env::temp_dir().join(format!("ksalat-rm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, r#"{"assistant_model":"deepseek-chat"}"#).unwrap();
+
+        assert!(!load_reduce_motion_from(&p));
+        save_reduce_motion_to(&p, true).unwrap();
+        assert!(load_reduce_motion_from(&p));
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["assistant_model"], json!("deepseek-chat"));
+        assert_eq!(raw["ui_reduce_motion"], json!(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2031,10 +2132,23 @@ mod tests {
     fn a_request_that_keeps_failing_ends_the_turn_and_the_next_turn_works() {
         let down = || Err("connection refused".to_string());
         let (events, requests) = drive(vec![down(), down(), down(), text("m", "back")], vec![user("one"), user("two")]);
-        assert!(matches!(&events[..2], [FromWorker::Error(e), FromWorker::Done] if e.contains("connection refused") && e.contains("3 attempts")), "{events:?}");
+        assert!(matches!(&events[..3], [FromWorker::Phase(_), FromWorker::Error(e), FromWorker::Done] if e.contains("connection refused") && e.contains("3 attempts")), "{events:?}");
         assert!(matches!(&events[events.len() - 2..], [FromWorker::Text(t), FromWorker::Done] if t == "back"));
         let users: Vec<&str> = messages(&requests[3]).iter().filter(|m| m["role"] == "user").map(|m| m["content"].as_str().unwrap()).collect();
         assert_eq!(users, vec!["one", "two"], "the failed request stays in the conversation");
+    }
+
+    #[test]
+    fn run_phase_labels_name_route_and_action() {
+        assert_eq!(RunPhase::Deciding.label(), "Jev · deciding");
+        assert_eq!(
+            RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }.label(),
+            "DeepSeek · step 2"
+        );
+        assert_eq!(
+            RunPhase::Thinking { step: 1, model: "google/gemini-3.8-flash".into(), seeing: true }.label(),
+            "Gemini · looking at the image"
+        );
     }
 
     #[test]

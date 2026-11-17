@@ -2123,7 +2123,7 @@ impl DemoApp {
             matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
-            assistant_input_h: 44.0,
+            assistant_input_h: 34.0,
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
@@ -8425,16 +8425,51 @@ impl DemoApp {
         }
     }
 
+    /// Assistant dock height: shares the stage height the rack can spare
+    /// (rule 22), clamped to a floor that guarantees >= 3 transcript lines at
+    /// minimum window size while capping at 360px on tall windows.
+    fn assistant_dock_h(avail_h: f32, rack_need_h: f32) -> f32 {
+        (avail_h - rack_need_h).clamp(176.0, 360.0).round()
+    }
+
+    /// Render one chat message body as a single wrapped `LayoutJob`, keeping
+    /// bold `**...**` spans and rack entity highlights without per-segment
+    /// horizontal gaps.
+    fn chat_body_job(text: &str, entities: &[String], wrap_w: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_w.max(80.0);
+        let base_font = FontId::proportional(13.0);
+        let bold_font = theme::medium_font(13.0);
+        for (k, part) in text.split("**").enumerate() {
+            if part.is_empty() { continue; }
+            let bold = k % 2 == 1;
+            for (seg, is_entity) in highlight_segments(part, entities) {
+                let fmt = if is_entity {
+                    egui::TextFormat {
+                        font_id: bold_font.clone(),
+                        color: theme::CREAM,
+                        background: theme::DARK_PANEL_HI,
+                        ..Default::default()
+                    }
+                } else {
+                    egui::TextFormat {
+                        font_id: if bold { bold_font.clone() } else { base_font.clone() },
+                        color: theme::INK,
+                        ..Default::default()
+                    }
+                };
+                job.append(&seg, 0.0, fmt);
+            }
+        }
+        job
+    }
+
     /// Assistant dock occupant: a WIDE bottom panel — chat transcript +
     /// always-visible input on the left, live patch context & agent activity
-    /// side column on the right when wide. `resizable(false)` with a
-    /// deterministic `default_size` keeps the height stable frame to frame
-    /// (the stored-size + per-frame `size_range` loop shrank it ~3px/frame).
+    /// side column on the right when wide. Uses `exact_size` (rule 71) so the
+    /// panel follows window resizes and never sticks at a tiny first-frame size.
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
-        // The rack keeps a comfortable face height (2026-11-15, user: "racks
-        // are squished when the agent loads"): the panel only gets the height
-        // the rack can spare, within 150..=340 px — never the other way round.
-        let max_h = (root.available_height() - self.rack_need_h()).clamp(150.0, 340.0);
+        let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
@@ -8442,22 +8477,27 @@ impl DemoApp {
         let mut focus_chat = self.focus_chat_request;
         let confirm_choice: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let resp = egui::Panel::bottom("dock")
-            .default_size(max_h.min(260.0))
+            .exact_size(panel_h)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let header_w = ui.available_width();
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 26.0),
+                    egui::vec2(header_w, 24.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                         ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
+                        if header_w >= 560.0 {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
+                        }
                         if self.assistant.busy {
                             ui.add_space(8.0);
                             ui.label(egui::RichText::new("● working").size(11.5).color(theme::AGENT_COLOR));
@@ -8466,7 +8506,7 @@ impl DemoApp {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
                                 self.dock = DockView::None;
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             let cur = self.assistant.model();
                             let mut pick: Option<String> = None;
                             egui::ComboBox::from_id_salt("assistant_model")
@@ -8478,20 +8518,23 @@ impl DemoApp {
                                 }).response.on_hover_text("chat model — switch any time, the conversation stays");
                             if let Some(m) = pick { self.switch_model(&m); }
                             if !self.assistant.history.is_empty() && !self.assistant.busy {
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
                                 if theme::chip_button(ui, "Clear", false).on_hover_text("clear visible transcript").clicked() {
                                     clear_chat = true;
                                 }
                             }
-                            if ui.available_width() > 360.0 {
+                            if ui.available_width() > 240.0 {
                                 if let Some(last) = self.agent_activity.log.front() {
                                     let active = AgentActivity::strength(Some(&(last.at + AGENT_TOUCH_SECS)), self.ui_time) > 0.01;
                                     if active {
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
-                                                .size(11.5)
-                                                .color(theme::AGENT_COLOR),
+                                        ui.add_space(8.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
+                                                    .size(11.5)
+                                                    .color(theme::AGENT_COLOR),
+                                            )
+                                            .truncate(),
                                         );
                                     }
                                 }
@@ -8499,9 +8542,7 @@ impl DemoApp {
                         });
                     },
                 );
-                ui.add_space(6.0);
                 Self::stage_hairline(ui);
-                ui.add_space(6.0);
 
                 let avail_w = ui.available_width();
                 let avail_h = ui.available_height().max(40.0);
@@ -8568,9 +8609,9 @@ impl DemoApp {
                     let col_h = ui.available_height().max(40.0);
                     // The attachment chip has a fixed row, so the history
                     // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 + 2.0 * ui.spacing().item_spacing.y } else { 0.0 };
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 18.0).max(34.0)) + attach_h;
-                    let hist_h = (col_h - reserve).max(16.0);
+                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 8.0 } else { 0.0 };
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
                         .min_scrolled_height(hist_h)
@@ -8584,7 +8625,7 @@ impl DemoApp {
                                         .size(12.5)
                                         .color(theme::INK_2),
                                 );
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for prompt in [
                                         "Add a reverb to this rig",
@@ -8598,6 +8639,7 @@ impl DemoApp {
                                     }
                                 });
                             }
+                            let body_w = (ui.available_width() - 96.0).max(120.0);
                             for line in &assistant.history {
                                 let (label, color, rule) = match line.role.as_str() {
                                     "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
@@ -8605,27 +8647,25 @@ impl DemoApp {
                                     "system" => ("SYSTEM", theme::INK_2, theme::HAIRLINE),
                                     _ => ("ERROR", theme::CLIP_BRIGHT, theme::CLIP_RED),
                                 };
-                                ui.horizontal_top(|ui| {
-                                    let (bar, _) = ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(bar, 1.0, rule);
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(label).font(theme::medium_font(10.5)).color(color));
-                                        ui.add_space(4.0);
-                                        for (k, part) in line.text.split("**").enumerate() {
-                                            if part.is_empty() { continue; }
-                                            for (seg, is_entity) in highlight_segments(part, &entities) {
-                                                let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
-                                                if k % 2 == 1 { t = t.strong(); }
-                                                if is_entity {
-                                                    t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
-                                                }
-                                                ui.label(t);
-                                            }
-                                        }
-                                    });
+                                let turn = ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add_space(6.0);
+                                    ui.add_sized(
+                                        [66.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(label).font(theme::medium_font(10.0)).color(color),
+                                        ),
+                                    );
+                                    let job = Self::chat_body_job(&line.text, &entities, body_w);
+                                    ui.label(job);
                                 });
-                                ui.add_space(5.0);
+                                let r = turn.response.rect;
+                                let bar = Rect::from_min_size(
+                                    Pos2::new(r.left(), r.top() + 2.0),
+                                    Vec2::new(2.0, (r.height() - 4.0).max(12.0)),
+                                );
+                                ui.painter().rect_filled(bar, 1.0, rule);
+                                ui.add_space(2.0);
                             }
                             if assistant.busy {
                                 ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
@@ -8641,10 +8681,9 @@ impl DemoApp {
                                         confirm_choice.set(Some(false));
                                     }
                                 });
-                                ui.add_space(5.0);
+                                ui.add_space(4.0);
                             }
                         });
-                    ui.add_space(4.0);
                     if let Some(label) = chat_image.as_ref().map(attachment_label) {
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), ATTACH_ROW_H),
@@ -8655,7 +8694,6 @@ impl DemoApp {
                                 }
                             },
                         );
-                        ui.add_space(4.0);
                     }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
@@ -8686,7 +8724,7 @@ impl DemoApp {
                         }
                     });
                     *input_rect = row.response.rect;
-                    *assistant_input_h = (4.0 + (ui.cursor().top() - row_top).max(26.0) + ui.spacing().item_spacing.y).max(34.0);
+                    *assistant_input_h = ((ui.cursor().top() - row_top).max(28.0) + ui.spacing().item_spacing.y).max(34.0);
                 };
 
                 if two_col {
@@ -17800,6 +17838,54 @@ mod ui_polish_agent_tests {
         let notes: Vec<u8> = events.lock().unwrap().iter().map(|e| e.note).collect();
         assert!(notes.contains(&60), "white key C plays note 60: {notes:?}");
         assert!(notes.contains(&61), "black key C# plays note 61: {notes:?}");
+    }
+
+    #[test]
+    fn bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split Keys at C4 and set Rig A volume to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Add a warm reverb after Surge A.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Added Reverb after Surge A and wired it to Master.".into(),
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for size in [Vec2::new(760.0, 520.0), Vec2::new(781.0, 950.0)] {
+            let mut texts = Vec::new();
+            for _ in 0..4 {
+                texts = run_frame(&mut app, &ctx, size, vec![]);
+            }
+            let header_bottom = texts.iter()
+                .find(|(t, _)| t == "Assistant")
+                .map(|(_, r)| r.bottom())
+                .expect("header painted");
+            let visible_turns: Vec<&(String, Rect)> = texts.iter()
+                .filter(|(t, r)| {
+                    (t == "YOU" || t == "ASSISTANT")
+                        && r.top() >= header_bottom
+                        && r.bottom() <= app.assistant_input_rect.top()
+                })
+                .collect();
+            assert!(
+                visible_turns.len() >= 3,
+                "size {size:?}: expected >= 3 unclipped transcript lines between header ({header_bottom}) and input ({:?}), got {}: {texts:?}",
+                app.assistant_input_rect,
+                visible_turns.len()
+            );
+        }
     }
 }
 

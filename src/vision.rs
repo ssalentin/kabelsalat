@@ -69,6 +69,14 @@ impl Image {
         }
     }
 
+    /// Decoded RGBA thumbnail pixels scaled to at most `max_side` on the longer edge.
+    pub fn thumbnail_rgba(&self, max_side: usize) -> Option<([usize; 2], Vec<u8>)> {
+        match self.format {
+            Format::Png => decode_png(&self.bytes).ok().map(|(sz, rgba)| downscale(sz, &rgba, max_side)),
+            Format::Jpeg => None,
+        }
+    }
+
     pub fn base64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(&self.bytes)
     }

@@ -955,28 +955,31 @@ struct ToolChip {
     state: ToolChipState,
 }
 
-/// Chips, collapse state, and final cost line associated with one user turn
-/// in `Assistant::history` (keyed by that `"user"` line's index).
+/// Chips, collapse state, read-only step count, and final cost line associated
+/// with one user turn in `Assistant::history` (keyed by that `"user"` index).
 #[derive(Clone, Debug, Default)]
 struct TranscriptRun {
     chips: Vec<ToolChip>,
+    read_count: usize,
     expanded: bool,
     cost_line: Option<String>,
 }
 
 /// Maximum tool chips shown in a finished or long run before `"+N more"`.
 const COLLAPSED_RUN_CHIPS: usize = 3;
+/// Left indent of transcript message text, chips, Confirm/Cancel, and attachments
+/// (6 px leading margin + 66 px role column + 6 px spacing).
+const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 
 /// One model step's tool calls, run in call order. An engine edit is a
 /// barrier: the next call runs only after the engine published the edit and
 /// the rack adopted it, so every later call — and the model's next step —
 /// sees what the calls before it really did.
 struct ToolBatch {
-    todo: VecDeque<ToolCall>,
+    todo: VecDeque<(ToolCall, Option<usize>)>,
     results: Vec<ToolOutput>,
-    waiting: Option<Waiting>,
+    waiting: Option<(Waiting, Option<usize>)>,
     user_idx: usize,
-    chip_cursor: usize,
 }
 
 /// What a tool batch waits for before its next call runs. The wait spans
@@ -988,16 +991,47 @@ enum Waiting {
     RackShot { said: String, deadline: std::time::Instant },
 }
 
-/// Height of the row that shows the chat's attached image.
-const ATTACH_ROW_H: f32 = 26.0;
+/// Thumbnail height and row height for the chat's attached image chip.
+const ATTACH_THUMB_H: f32 = 32.0;
+const ATTACH_ROW_H: f32 = 40.0;
 
-/// The attachment chip's text: what is attached, and that a click removes it.
-fn attachment_label(image: &Image) -> String {
-    let mut name: String = image.describe();
-    if name.chars().count() > 48 {
-        name = format!("…{}", name.chars().rev().take(47).collect::<Vec<_>>().into_iter().rev().collect::<String>());
+/// Cached egui texture for the currently attached chat image (loaded once per
+/// attachment and dropped immediately when the attachment is cleared).
+struct ChatThumb {
+    bytes: Arc<[u8]>,
+    tex: Option<egui::TextureHandle>,
+    size: [usize; 2],
+}
+
+fn truncate_attachment_name(name: &str) -> String {
+    if name.chars().count() > 40 {
+        format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+    } else {
+        name.to_string()
     }
-    format!("Image · {name}  ×")
+}
+
+fn sync_chat_thumb(ctx: &egui::Context, chat_image: &Option<Image>, chat_thumb: &mut Option<ChatThumb>) {
+    let Some(img) = chat_image.as_ref() else {
+        *chat_thumb = None;
+        return;
+    };
+    if chat_thumb.as_ref().is_some_and(|t| Arc::ptr_eq(&t.bytes, &img.bytes)) {
+        return;
+    }
+    let (tex, size) = match img.thumbnail_rgba(64) {
+        Some((sz, rgba)) => {
+            let color = egui::ColorImage::from_rgba_unmultiplied(sz, &rgba);
+            let handle = ctx.load_texture("assistant_chat_thumb", color, egui::TextureOptions::LINEAR);
+            (Some(handle), sz)
+        }
+        None => (None, [32, 32]),
+    };
+    *chat_thumb = Some(ChatThumb {
+        bytes: Arc::clone(&img.bytes),
+        tex,
+        size,
+    });
 }
 
 /// The tool that shows an agent the app window.
@@ -2000,6 +2034,8 @@ struct DemoApp {
     rack_shot: RackShot,
     /// The image attached to the chat message being written.
     chat_image: Option<Image>,
+    /// Thumbnail texture handle for `chat_image`, freed when removed.
+    chat_thumb: Option<ChatThumb>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Save-rig-preset modal: (rig index, preset name being edited).
@@ -2292,6 +2328,7 @@ impl DemoApp {
             active_run_user_idx: None,
             rack_shot: RackShot::default(),
             chat_image: None,
+            chat_thumb: None,
             rename_rig_dialog: None,
             save_rig_dialog: None,
             load_rig_dialog: None,
@@ -3710,7 +3747,7 @@ impl DemoApp {
         }
     }
 
-    fn human_tool_label(name: &str, args: &serde_json::Value) -> String {
+    fn human_tool_label(&self, name: &str, args: &serde_json::Value) -> String {
         match name {
             "set_split" => match args.get("point").and_then(|v| v.as_u64()) {
                 Some(p) => format!("Split keys → {}", note_name(p.min(127) as u8)),
@@ -3722,10 +3759,10 @@ impl DemoApp {
                     .and_then(|v| v.as_str())
                     .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
                     .or_else(|| args.get("kind").and_then(|v| v.as_str()))
-                    .unwrap_or("unit")
-                    .to_ascii_lowercase();
+                    .unwrap_or("unit");
+                let what = sentence_case(what);
                 match args.get("rig").and_then(|v| v.as_u64()) {
-                    Some(r) => format!("Add {what} → rig {}", r + 1),
+                    Some(r) => format!("Add {what} → {}", self.rig_name(r as usize)),
                     None => format!("Add {what}"),
                 }
             }
@@ -3744,14 +3781,18 @@ impl DemoApp {
             }
             "flip_rack" => "Flip rack".into(),
             "set_rig_source" => {
-                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1);
-                format!("Rig {node} sources")
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                let rig = self.rig_of_node(node);
+                format!("Set {} sources", self.rig_name(rig))
             }
             "set_rig_mix" => {
-                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0);
-                format!("Mix rig {}", rig + 1)
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Mix {}", self.rig_name(rig))
             }
-            "set_rig_device" => "Set MIDI input".into(),
+            "set_rig_device" => match args.get("rig").and_then(|v| v.as_u64()) {
+                Some(r) => format!("Set {} MIDI input", self.rig_name(r as usize)),
+                None => "Set MIDI input".into(),
+            },
             "get_matrix" => "Read MIDI matrix".into(),
             "set_matrix_cell" => {
                 if args.get("on").and_then(|v| v.as_bool()).unwrap_or(true) {
@@ -3772,9 +3813,21 @@ impl DemoApp {
                 Some(n) => format!("Add rig · {n}"),
                 None => "Add rig".into(),
             },
-            "delete_rig" => format!("Delete rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
-            "rename_rig" => format!("Rename rig → {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("rig")),
-            "select_rig" => format!("Switch to rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
+            "delete_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Delete {}", self.rig_name(rig))
+            }
+            "rename_rig" => {
+                let new_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("rig");
+                match args.get("rig").and_then(|v| v.as_u64()) {
+                    Some(r) => format!("Rename {} → {new_name}", self.rig_name(r as usize)),
+                    None => format!("Rename rig → {new_name}"),
+                }
+            }
+            "select_rig" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                format!("Switch to {}", self.rig_name(rig))
+            }
             "connect" => format!(
                 "Wire {} → {}",
                 args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -3813,14 +3866,20 @@ impl DemoApp {
 
     fn finalize_active_run(&mut self) {
         let Some(user_idx) = self.active_run_user_idx.take() else { return };
-        let cost = self.assistant.turn.summary().or_else(|| {
+        let base_cost = self.assistant.turn.summary().or_else(|| {
             self.assistant
                 .turn
                 .wall
                 .map(|w| format!("0 steps · {:.1} s · {}", w.as_secs_f64(), self.assistant.model()))
         });
         let run = self.transcript_runs.entry(user_idx).or_default();
-        run.cost_line = cost;
+        run.cost_line = base_cost.map(|c| {
+            if run.read_count > 0 {
+                format!("{c} · {} read{}", run.read_count, if run.read_count == 1 { "" } else { "s" })
+            } else {
+                c
+            }
+        });
     }
 
     /// Take in the worker's events and run its tool calls. The worker sends
@@ -3832,24 +3891,39 @@ impl DemoApp {
                 self.assistant.history.iter().rposition(|l| l.role == "user").unwrap_or(0)
             });
             self.active_run_user_idx = Some(user_idx);
-            let run = self.transcript_runs.entry(user_idx).or_default();
-            let chip_start = run.chips.len();
+            let mut entries = Vec::with_capacity(batch.len());
             for call in &batch {
-                run.chips.push(ToolChip {
-                    label: Self::human_tool_label(&call.name, &call.args),
-                    state: ToolChipState::Running,
-                });
+                if tool_is_read_only(&call.name) {
+                    entries.push(None);
+                } else {
+                    entries.push(Some(self.human_tool_label(&call.name, &call.args)));
+                }
+            }
+            let run = self.transcript_runs.entry(user_idx).or_default();
+            let mut todo = VecDeque::with_capacity(batch.len());
+            for (call, label) in batch.into_iter().zip(entries) {
+                let chip_idx = match label {
+                    Some(lbl) => {
+                        let idx = run.chips.len();
+                        run.chips.push(ToolChip { label: lbl, state: ToolChipState::Running });
+                        Some(idx)
+                    }
+                    None => {
+                        run.read_count += 1;
+                        None
+                    }
+                };
+                todo.push_back((call, chip_idx));
             }
             self.tool_batch = Some(ToolBatch {
-                todo: batch.into(),
+                todo,
                 results: Vec::new(),
                 waiting: None,
                 user_idx,
-                chip_cursor: chip_start,
             });
         }
         if let Some(mut batch) = self.tool_batch.take() {
-            if let Some(waiting) = batch.waiting.take() {
+            if let Some((waiting, chip_idx)) = batch.waiting.take() {
                 let outcome = match &waiting {
                     Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
                     Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
@@ -3859,27 +3933,35 @@ impl DemoApp {
                 };
                 match outcome {
                     Some(result) => {
-                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result.text);
-                        batch.chip_cursor += 1;
+                        if let Some(ci) = chip_idx {
+                            self.finish_chip(batch.user_idx, ci, &result.text);
+                        }
                         batch.results.push(result);
                     }
                     None => {
-                        batch.waiting = Some(waiting);
+                        batch.waiting = Some((waiting, chip_idx));
                         self.tool_batch = Some(batch);
                         return;
                     }
                 }
             }
-            while let Some(call) = batch.todo.pop_front() {
+            while let Some((call, chip_idx)) = batch.todo.pop_front() {
                 let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
                 let before = engine_edit.then(|| self.rack_ids());
                 let result = self.run_assistant_tool(&call.name, &call.args);
                 batch.waiting = match before {
-                    Some(before) => Some(Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT })),
-                    None if call.name == LOOK_TOOL => Some(Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT }),
+                    Some(before) => Some((
+                        Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
+                        chip_idx,
+                    )),
+                    None if call.name == LOOK_TOOL => Some((
+                        Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT },
+                        chip_idx,
+                    )),
                     None => {
-                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result);
-                        batch.chip_cursor += 1;
+                        if let Some(ci) = chip_idx {
+                            self.finish_chip(batch.user_idx, ci, &result);
+                        }
                         batch.results.push(result.into());
                         continue;
                     }
@@ -6749,6 +6831,7 @@ impl DemoApp {
             return;
         }
         let image = self.chat_image.take();
+        self.chat_thumb = None;
         let shown = match &image {
             Some(image) => format!("{t} [image: {}]", image.name).trim_start().to_string(),
             None => t.clone(),
@@ -6766,7 +6849,10 @@ impl DemoApp {
     /// A file that is no image is named in the transcript.
     fn attach_chat_image(&mut self, image: Result<Image, String>) {
         match image {
-            Ok(image) => self.chat_image = Some(image),
+            Ok(image) => {
+                self.chat_image = Some(image);
+                self.chat_thumb = None;
+            }
             Err(why) => self.assistant.history.push(ChatLine { role: "error".into(), text: format!("not attached: {why}") }),
         }
         if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
@@ -7327,7 +7413,7 @@ impl DemoApp {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(theme::INK));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if Self::danger_button(ui, "Delete", false).clicked() {
+                                if theme::danger_button(ui, "Delete", false).clicked() {
                                     delete_name = Some(name.clone());
                                 }
                                 ui.add_space(6.0);
@@ -7702,47 +7788,6 @@ impl DemoApp {
             .inner
     }
 
-    fn danger_button(ui: &mut egui::Ui, text: &str, filled: bool) -> egui::Response {
-        ui.scope(|ui| {
-            let (fill, stroke, txt) = if filled {
-                (theme::CLIP_RED, theme::CLIP_RED, theme::ON_ACCENT)
-            } else {
-                (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CLIP_BRIGHT)
-            };
-            let base = egui::style::WidgetVisuals {
-                bg_fill: fill,
-                weak_bg_fill: fill,
-                bg_stroke: Stroke::new(1.0, stroke),
-                corner_radius: 2.0.into(),
-                fg_stroke: Stroke::new(1.0, txt),
-                expansion: 0.0,
-            };
-            let hot_fill = if filled {
-                theme::mix(theme::CLIP_RED, theme::INK, 0.08)
-            } else {
-                theme::mix(theme::DARK_PANEL_HI, theme::CLIP_RED, 0.14)
-            };
-            let hot = egui::style::WidgetVisuals {
-                bg_fill: hot_fill,
-                weak_bg_fill: hot_fill,
-                bg_stroke: Stroke::new(1.0, if filled { hot_fill } else { theme::CLIP_RED }),
-                ..base
-            };
-            let v = ui.visuals_mut();
-            v.widgets.inactive = base;
-            v.widgets.hovered = hot;
-            v.widgets.active = hot;
-            v.widgets.open = base;
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
-            ui.add(
-                egui::Button::new(egui::RichText::new(text).size(12.5).color(txt))
-                    .corner_radius(2.0)
-                    .min_size(egui::vec2(0.0, 26.0)),
-            )
-        })
-        .inner
-    }
-
     fn stage_hairline(ui: &mut egui::Ui) {
         let w = ui.available_width().max(1.0);
         let (r, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
@@ -7944,11 +7989,11 @@ impl DemoApp {
                                                 *confirm_delete = None;
                                             }
                                             ui.add_space(6.0);
-                                            if Self::danger_button(ui, "Confirm delete", true).clicked() {
+                                            if theme::danger_button(ui, "Confirm delete", true).clicked() {
                                                 *delete_session = Some(name.clone());
                                             }
                                         } else {
-                                            if Self::danger_button(ui, "Delete", false)
+                                            if theme::danger_button(ui, "Delete", false)
                                                 .on_hover_text(format!("delete '{name}' from disk"))
                                                 .clicked()
                                             {
@@ -8865,7 +8910,7 @@ impl DemoApp {
                 theme::alpha(theme::AGENT_COLOR, 0.14),
                 theme::alpha(theme::AGENT_COLOR, pulse),
                 "●",
-                theme::AGENT_COLOR,
+                theme::AGENT_TEXT,
                 theme::INK,
                 "",
             ),
@@ -8873,7 +8918,7 @@ impl DemoApp {
                 theme::DARK_PANEL_HI,
                 theme::alpha(theme::AGENT_COLOR, 0.50),
                 "✓",
-                theme::AGENT_COLOR,
+                theme::AGENT_TEXT,
                 theme::CREAM,
                 "",
             ),
@@ -8882,11 +8927,11 @@ impl DemoApp {
                 theme::CABLE_AMBER,
                 "–",
                 theme::CABLE_AMBER,
-                theme::CREAM_MID,
+                theme::CREAM,
                 " · not applied",
             ),
             ToolChipState::Failed => (
-                theme::alpha(theme::CLIP_RED, 0.18),
+                theme::DANGER_BG,
                 theme::CLIP_RED,
                 "!",
                 theme::CLIP_BRIGHT,
@@ -8963,19 +9008,7 @@ impl DemoApp {
                         ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
                         if header_w >= 560.0 {
                             ui.add_space(6.0);
-                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
-                        }
-                        if self.assistant.busy {
-                            ui.add_space(8.0);
-                            Self::paint_busy_dots(ui, ui_time, reduce_motion);
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(self.assistant.phase_label())
-                                        .size(11.5)
-                                        .color(theme::AGENT_COLOR),
-                                )
-                                .truncate(),
-                            );
+                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::CREAM_META));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
@@ -9031,12 +9064,13 @@ impl DemoApp {
                 let side_w = if two_col { (avail_w * 0.30).round().clamp(260.0, 360.0) } else { 0.0 };
                 let main_w = if two_col { (avail_w - side_w - 25.0).round().max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
-                let confirm_label = self.pending_confirm.as_ref().map(|p| p.label.clone());
+                let confirm_prompt = self.pending_confirm.as_ref().map(|p| (p.label.clone(), p.tool == "delete_rig"));
 
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
                                  chat_input: &mut String,
                                  chat_image: &mut Option<Image>,
+                                 chat_thumb: &mut Option<ChatThumb>,
                                  assistant: &mut Assistant,
                                  transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
@@ -9091,7 +9125,7 @@ impl DemoApp {
                     let col_h = ui.available_height().max(40.0);
                     // The attachment chip has a fixed row, so the history
                     // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 8.0 } else { 0.0 };
+                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 } else { 0.0 };
                     let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
                     let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
@@ -9128,8 +9162,8 @@ impl DemoApp {
                                     if let Some(prev_idx) = current_run_idx {
                                         if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
                                             ui.horizontal(|ui| {
-                                                ui.add_space(78.0);
-                                                ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                                ui.label(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META));
                                             });
                                             ui.add_space(4.0);
                                         }
@@ -9137,9 +9171,9 @@ impl DemoApp {
                                     current_run_idx = Some(idx);
                                 }
                                 let (label, color, rule) = match line.role.as_str() {
-                                    "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
-                                    "assistant" => ("ASSISTANT", theme::AGENT_COLOR, theme::AGENT_COLOR),
-                                    "system" => ("SYSTEM", theme::INK_2, theme::HAIRLINE),
+                                    "user" => ("YOU", theme::CREAM, theme::HAIRLINE_DARK),
+                                    "assistant" => ("ASSISTANT", theme::AGENT_TEXT, theme::AGENT_COLOR),
+                                    "system" => ("SYSTEM", theme::CREAM_META, theme::HAIRLINE),
                                     _ => ("ERROR", theme::CLIP_BRIGHT, theme::CLIP_RED),
                                 };
                                 let turn = ui.horizontal_top(|ui| {
@@ -9148,7 +9182,7 @@ impl DemoApp {
                                     ui.add_sized(
                                         [66.0, 18.0],
                                         egui::Label::new(
-                                            egui::RichText::new(label).font(theme::medium_font(10.0)).color(color),
+                                            egui::RichText::new(label).font(theme::medium_font(10.5)).color(color),
                                         ),
                                     );
                                     let job = Self::chat_body_job(&line.text, &entities, body_w);
@@ -9165,7 +9199,7 @@ impl DemoApp {
                                         if !run.chips.is_empty() {
                                             ui.add_space(2.0);
                                             ui.horizontal_wrapped(|ui| {
-                                                ui.add_space(78.0);
+                                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
                                                 ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
                                                 let total = run.chips.len();
                                                 let show_n = if !run.expanded && total > COLLAPSED_RUN_CHIPS {
@@ -9192,8 +9226,8 @@ impl DemoApp {
                                 if let Some(prev_idx) = current_run_idx {
                                     if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
                                         ui.horizontal(|ui| {
-                                            ui.add_space(78.0);
-                                            ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                            ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                            ui.label(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META));
                                         });
                                         ui.add_space(4.0);
                                     }
@@ -9201,17 +9235,22 @@ impl DemoApp {
                             }
                             if assistant.busy {
                                 ui.horizontal(|ui| {
-                                    ui.add_space(78.0);
+                                    ui.add_space(TRANSCRIPT_TEXT_INDENT);
                                     Self::paint_busy_dots(ui, ui_time, reduce_motion);
-                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_COLOR));
+                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_TEXT));
                                 });
                             }
                             if !assistant.busy || demo_agent_hold {
-                                if let Some(label) = &confirm_label {
+                                if let Some((label, destructive)) = &confirm_prompt {
                                     // #32: the click answers the assistant's question.
                                     ui.horizontal(|ui| {
-                                        ui.add_space(6.0);
-                                        if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
+                                        ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                        let confirm_btn = if *destructive {
+                                            theme::danger_button(ui, &format!("Confirm · {label}"), false)
+                                        } else {
+                                            theme::primary_button(ui, &format!("Confirm · {label}"))
+                                        };
+                                        if confirm_btn.clicked() {
                                             confirm_choice.set(Some(true));
                                         }
                                         ui.add_space(6.0);
@@ -9223,16 +9262,59 @@ impl DemoApp {
                                 }
                             }
                         });
-                    if let Some(label) = chat_image.as_ref().map(attachment_label) {
+                    sync_chat_thumb(ui.ctx(), chat_image, chat_thumb);
+                    if let Some(img) = chat_image.as_ref() {
+                        let mut remove_image = false;
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), ATTACH_ROW_H),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
-                                if theme::chip_button(ui, &label, true).on_hover_text("remove the image").clicked() {
-                                    *chat_image = None;
-                                }
+                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
+                                egui::Frame::new()
+                                    .fill(theme::DARK_PANEL_HI)
+                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                                    .corner_radius(2.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 8.0;
+                                            let thumb_info = chat_thumb.as_ref();
+                                            let [tw, th] = thumb_info.map_or([32, 32], |t| t.size);
+                                            let aspect = (tw as f32 / th.max(1) as f32).clamp(0.6, 2.0);
+                                            let thumb_sz = egui::vec2((ATTACH_THUMB_H * aspect).round(), ATTACH_THUMB_H);
+                                            let (rect, _) = ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
+                                            if let Some(tex) = thumb_info.and_then(|t| t.tex.as_ref()) {
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    rect,
+                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                ui.painter().rect_stroke(rect, 1.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                            } else {
+                                                ui.painter().rect_filled(rect, 2.0, theme::PAPER_SINK);
+                                                ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "IMG", theme::medium_font(9.5), theme::CREAM_META);
+                                            }
+                                            let name = truncate_attachment_name(&img.name);
+                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(theme::CREAM)).truncate());
+                                            let close = ui.add(
+                                                egui::Button::new(egui::RichText::new("×").font(theme::medium_font(13.0)).color(theme::CREAM))
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::NONE)
+                                                    .min_size(egui::vec2(22.0, 24.0)),
+                                            ).on_hover_text("remove the image");
+                                            if close.clicked() {
+                                                remove_image = true;
+                                            }
+                                        });
+                                    });
                             },
                         );
+                        if remove_image {
+                            *chat_image = None;
+                            *chat_thumb = None;
+                        }
                     }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
@@ -9277,6 +9359,7 @@ impl DemoApp {
                                     &mut self.key_input,
                                     &mut self.chat_input,
                                     &mut self.chat_image,
+                                    &mut self.chat_thumb,
                                     &mut self.assistant,
                                     &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
@@ -9310,7 +9393,7 @@ impl DemoApp {
                                     theme::section_label(ui, "Agent Activity");
                                     // What the last request cost: model steps, model time, answering model.
                                     if let Some(cost) = self.assistant.turn.summary() {
-                                        ui.add(egui::Label::new(egui::RichText::new(cost).size(10.5).color(theme::INK_2)).truncate());
+                                        ui.add(egui::Label::new(egui::RichText::new(cost).size(10.5).color(theme::CREAM_META)).truncate());
                                     }
                                 });
                                 ui.add_space(4.0);
@@ -9359,6 +9442,7 @@ impl DemoApp {
                         &mut self.key_input,
                         &mut self.chat_input,
                         &mut self.chat_image,
+                        &mut self.chat_thumb,
                         &mut self.assistant,
                         &mut self.transcript_runs,
                         &mut self.assistant_input_h,
@@ -14290,13 +14374,14 @@ impl DemoApp {
             0,
             TranscriptRun {
                 chips: vec![
-                    ToolChip { label: Self::human_tool_label("set_split", &serde_json::json!({"point": 60})), state: ToolChipState::Done },
-                    ToolChip { label: Self::human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85})), state: ToolChipState::Done },
-                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
-                    ToolChip { label: Self::human_tool_label(LOOK_TOOL, &serde_json::json!({})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("set_split", &serde_json::json!({"point": 60})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 0})), state: ToolChipState::Done },
+                    ToolChip { label: self.human_tool_label("set_bpm", &serde_json::json!({"bpm": 112})), state: ToolChipState::Done },
                 ],
+                read_count: 2,
                 expanded: false,
-                cost_line: Some("2 steps · 1.1 s · deepseek-chat".into()),
+                cost_line: Some("2 steps · 1.1 s · deepseek-chat · 2 reads".into()),
             },
         );
         self.assistant.history.push(ChatLine {
@@ -14312,9 +14397,9 @@ impl DemoApp {
             2,
             TranscriptRun {
                 chips: vec![
-                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
-                    ToolChip { label: Self::human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
+                    ToolChip { label: self.human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
                 ],
+                read_count: 1,
                 expanded: true,
                 cost_line: None,
             },
@@ -14325,7 +14410,24 @@ impl DemoApp {
             model: "deepseek-chat".into(),
             seeing: false,
         });
-        self.chat_image = Image::from_rgba("rack-sketch.png", [4, 4], &[40u8; 4 * 4 * 4]).ok();
+        let mut sketch = vec![28u8; 24 * 16 * 4];
+        for y in 0..16usize {
+            for x in 0..24usize {
+                let i = (y * 24 + x) * 4;
+                sketch[i + 3] = 255;
+                if (y == 4 && (3..=19).contains(&x)) || (y == 11 && (3..=12).contains(&x)) {
+                    sketch[i] = theme::CREAM.r();
+                    sketch[i + 1] = theme::CREAM.g();
+                    sketch[i + 2] = theme::CREAM.b();
+                } else if (6..=9).contains(&y) && (15..=20).contains(&x) {
+                    sketch[i] = theme::ACCENT.r();
+                    sketch[i + 1] = theme::ACCENT.g();
+                    sketch[i + 2] = theme::ACCENT.b();
+                }
+            }
+        }
+        self.chat_image = Image::from_rgba("rack-sketch.png", [24, 16], &sketch).ok();
+        self.chat_thumb = None;
         self.pending_confirm = Some(PendingConfirm {
             tool: "delete_rig".into(),
             args: serde_json::json!({"rig": 1}),
@@ -17998,9 +18100,8 @@ mod ui_polish_agent_tests {
         app.tool_batch = Some(ToolBatch {
             todo: VecDeque::new(),
             results: Vec::new(),
-            waiting: Some(Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }),
+            waiting: Some((Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }, None)),
             user_idx: 0,
-            chip_cursor: 0,
         });
         app.poll_assistant();
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
@@ -18073,9 +18174,11 @@ mod ui_polish_agent_tests {
         assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("rack.png (8×4 px)"));
 
         let texts = run_frame(&mut app, &ctx, WINDOW, vec![]);
-        let chip = texts.iter().find(|(t, _)| t.starts_with("Image · rack.png")).map(|(_, r)| *r).expect("the chip names the image");
-        click_at(&mut app, &ctx, WINDOW, chip.center());
-        assert!(app.chat_image.is_none(), "clicking the chip removes the image");
+        assert!(texts.iter().any(|(t, _)| t == "rack.png"), "the chip names the image: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("px)")), "no debug pixel size in chip: {texts:?}");
+        let remove = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(_, r)| *r).expect("attachment remove button");
+        click_at(&mut app, &ctx, WINDOW, remove.center());
+        assert!(app.chat_image.is_none(), "clicking × removes the image");
 
         run_frame(&mut app, &ctx, WINDOW, paste());
         assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("pasted image (8×4 px)"));
@@ -18102,7 +18205,7 @@ mod ui_polish_agent_tests {
         for frame in 0..3 {
             let texts = run_frame(&mut app, &ctx, min_size, vec![]);
             let panel = app.assistant_rect;
-            let chip = texts.iter().find(|(t, _)| t.starts_with("Image · ")).map(|(_, r)| *r).expect("chip painted");
+            let chip = texts.iter().find(|(t, _)| t.contains("screenshot-name")).map(|(_, r)| *r).expect("chip painted");
             assert!(panel.contains_rect(chip), "frame {frame}: chip {chip:?} outside the panel {panel:?}");
             assert!(panel.contains_rect(app.assistant_input_rect), "frame {frame}: input row {:?} outside the panel {panel:?}", app.assistant_input_rect);
             assert!(chip.bottom() <= app.assistant_input_rect.top() + 0.5, "frame {frame}: the chip sits above the input row");
@@ -18692,9 +18795,10 @@ mod ui_polish_agent_tests {
         ] {
             app.assistant.phase = Some(phase);
             let texts = run_frame(&mut app, &ctx, size, vec![]);
-            assert!(
-                texts.iter().any(|(t, _)| t == expected),
-                "expected phase '{expected}' in UI, got {texts:?}"
+            assert_eq!(
+                texts.iter().filter(|(t, _)| t == expected).count(),
+                1,
+                "expected exactly one phase '{expected}' in UI, got {texts:?}"
             );
             assert!(
                 texts.iter().all(|(t, _)| !t.contains("thinking…")),
@@ -18712,27 +18816,29 @@ mod ui_polish_agent_tests {
         let user_idx = app.assistant.history.len();
         app.assistant.history.push(ChatLine { role: "user".into(), text: "Wire up a reverb on rig 2".into() });
         app.assistant.history.push(ChatLine { role: "assistant".into(), text: "Added Reverb on rig 2.".into() });
+        let chips = vec![
+            ToolChip {
+                label: app.human_tool_label("set_split", &serde_json::json!({"point": 60})),
+                state: ToolChipState::Done,
+            },
+            ToolChip {
+                label: app.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})),
+                state: DemoApp::classify_tool_result("added — NOT applied: engine changed nothing"),
+            },
+            ToolChip {
+                label: app.human_tool_label("set_bpm", &serde_json::json!({"bpm": 120})),
+                state: ToolChipState::Running,
+            },
+            ToolChip {
+                label: app.human_tool_label("remove_node", &serde_json::json!({"node": 99})),
+                state: ToolChipState::Failed,
+            },
+        ];
         app.transcript_runs.insert(
             user_idx,
             TranscriptRun {
-                chips: vec![
-                    ToolChip {
-                        label: DemoApp::human_tool_label("set_split", &serde_json::json!({"point": 60})),
-                        state: ToolChipState::Done,
-                    },
-                    ToolChip {
-                        label: DemoApp::human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})),
-                        state: DemoApp::classify_tool_result("added — NOT applied: engine changed nothing"),
-                    },
-                    ToolChip {
-                        label: DemoApp::human_tool_label(LOOK_TOOL, &serde_json::json!({})),
-                        state: ToolChipState::Running,
-                    },
-                    ToolChip {
-                        label: DemoApp::human_tool_label("remove_node", &serde_json::json!({"node": 99})),
-                        state: ToolChipState::Failed,
-                    },
-                ],
+                chips,
+                read_count: 0,
                 expanded: false,
                 cost_line: Some("2 steps · 1.4 s · deepseek-chat".into()),
             },
@@ -18762,14 +18868,14 @@ mod ui_polish_agent_tests {
             collect(&cs.shape, &mut texts, &mut rects);
         }
         assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing split chip: {texts:?}");
-        assert!(texts.iter().any(|(t, _)| t.contains("Add reverb → rig 2") && t.contains("not applied")), "missing not-applied chip: {texts:?}");
-        assert!(texts.iter().any(|(t, _)| t.contains("Look at the rack")), "missing running chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Add Reverb → Rig B") && t.contains("not applied")), "missing not-applied chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Tempo → 120 BPM")), "missing running chip: {texts:?}");
         assert!(!texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "4th chip collapsed initially");
         let more_rect = texts.iter().find(|(t, _)| t == "+1 more").map(|(_, r)| *r).expect("+1 more collapse chip");
         assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.4 s · deepseek-chat"), "missing cost line: {texts:?}");
 
         // Rule 7 padding on visible chips: enclosing filled rect extends >= 7.5px H and >= 3.5px V around text.
-        for label in ["Split keys → C4", "Look at the rack", "+1 more"] {
+        for label in ["Split keys → C4", "Tempo → 120 BPM", "+1 more"] {
             let tr = texts.iter().find(|(t, _)| t.contains(label)).map(|(_, r)| *r).unwrap();
             let boxed = rects.iter().any(|br| {
                 br.contains_rect(tr)
@@ -18954,14 +19060,17 @@ mod ui_polish_agent_tests {
 
         // Finished run: user message, action chips, assistant message, cost line.
         assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing finished chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Mix Rig A")), "chip must use rig display name: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "+1 more"), "missing collapsed chip button: {texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat"), "missing cost line: {texts:?}");
-        // Running run: animated status label + running chip (no static "thinking…").
-        assert!(texts.iter().any(|(t, _)| t == "DeepSeek · step 2"), "missing live phase label: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat · 2 reads"), "missing cost line: {texts:?}");
+        // Running run: animated status label + running chip (no static "thinking…", no duplicate live status, no read-only chips).
+        assert_eq!(texts.iter().filter(|(t, _)| t == "DeepSeek · step 2").count(), 1, "live phase label must appear once: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
         // Attached image chip + Confirm / Cancel prompt + Replay chip.
-        assert!(texts.iter().any(|(t, _)| t.contains("rack-sketch.png")), "missing attached image chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "rack-sketch.png"), "missing attached image chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "debug size text must be gone: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "Replay"), "missing replay chip: {texts:?}");
@@ -18987,6 +19096,223 @@ mod ui_polish_agent_tests {
         assert!(app.cables.iter().any(|c| c.draw_in < 1.0), "Shift+F12 must trigger cable draw-in");
         app.update(0.15);
         assert!(app.agent_activity.node_pulse(synth_node, app.ui_time, false) > 0.0, "Shift+F12 must pulse touched synth unit");
+    }
+
+    fn collect_painted(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<(Rect, Color32, Stroke)>) {
+        match shape {
+            egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+            egui::Shape::Rect(r) => rects.push((r.rect, r.fill, r.stroke)),
+            egui::Shape::Vec(v) => for s in v { collect_painted(s, texts, rects) },
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn agent_panel_defect1_danger_confirm_differs_from_send() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_demo_agent(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
+
+        let confirm_r = texts.iter().find(|(t, _)| t == "Confirm · Delete rig 2 · Rig B").map(|(_, r)| *r).expect("confirm text");
+        let send_r = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("send text");
+        let enclosing_fill = |tr: Rect| {
+            rects.iter()
+                .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(tr))
+                .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+                .map(|(_, fill, stroke)| (*fill, *stroke))
+        };
+        let (confirm_fill, confirm_stroke) = enclosing_fill(confirm_r).expect("confirm button rect");
+        let (send_fill, _) = enclosing_fill(send_r).expect("send button rect");
+        assert_eq!(send_fill, theme::ACCENT_DEEP, "Send CTA keeps ACCENT_DEEP fill");
+        assert_eq!(confirm_fill, theme::DANGER_BG, "destructive Confirm uses DANGER_BG fill");
+        assert_eq!(confirm_stroke.color, theme::CLIP_RED, "destructive Confirm uses CLIP_RED border");
+        assert_ne!(confirm_fill, send_fill, "danger button fill must differ from Send fill");
+    }
+
+    #[test]
+    fn agent_panel_defect3_chips_use_rig_display_names() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        assert_eq!(app.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.8})), "Mix Rig A");
+        assert_eq!(app.human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})), "Add Reverb → Rig B");
+        assert_eq!(app.human_tool_label("delete_rig", &serde_json::json!({"rig": 1})), "Delete Rig B");
+        assert_eq!(app.human_tool_label("select_rig", &serde_json::json!({"rig": 1})), "Switch to Rig B");
+
+        app.exec_tool("rename_rig", &serde_json::json!({"rig": 0, "name": "Lead"}));
+        assert_eq!(app.human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.5})), "Mix Lead");
+        let node = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Keys)).unwrap().node_id;
+        assert_eq!(app.human_tool_label("set_rig_source", &serde_json::json!({"node": node})), "Set Lead sources");
+    }
+
+    #[test]
+    fn agent_panel_defect4_read_only_tools_omitted_from_chip_row() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
+        app.assistant = assistant;
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.submit_chat("check graph and lower rig 1".into());
+        let _ = worker_rx.try_recv(); // drain ToWorker::User
+        app.assistant.busy = true;
+        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
+            call("get_graph", serde_json::json!({})),
+            call("get_rigs", serde_json::json!({})),
+            call("list_sounds", serde_json::json!({"query": "pad"})),
+            call("set_rig_mix", serde_json::json!({"rig": 0, "vol": 0.6})),
+        ])).unwrap();
+        app.poll_assistant();
+        let _ = worker_rx.try_recv(); // drain ToWorker::ToolResults
+
+        let user_idx = app.active_run_user_idx.unwrap();
+        let run = &app.transcript_runs[&user_idx];
+        assert_eq!(run.read_count, 3, "read-only tools counted for metadata");
+        assert_eq!(run.chips.len(), 1, "only mutating tool creates a chip: {:?}", run.chips);
+        assert_eq!(run.chips[0].label, "Mix Rig A");
+        assert_eq!(run.chips[0].state, ToolChipState::Done);
+
+        app.assistant.busy = false;
+        app.assistant.turn.wall = Some(std::time::Duration::from_millis(400));
+        app.finalize_active_run();
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let texts = run_frame(&mut app, &ctx, Vec2::new(781.0, 950.0), vec![]);
+        assert!(texts.iter().any(|(t, _)| t.contains("Mix Rig A")), "mutating chip painted: {texts:?}");
+        for hidden in ["Read rack graph", "List rigs", "Search patches"] {
+            assert!(texts.iter().all(|(t, _)| !t.contains(hidden)), "read-only chip '{hidden}' leaked: {texts:?}");
+        }
+        assert!(texts.iter().any(|(t, _)| t.contains("3 reads")), "read count in cost line: {texts:?}");
+    }
+
+    #[test]
+    fn agent_panel_defect5_contrast_ratios_and_hierarchy() {
+        let body = theme::contrast_ratio(theme::INK, theme::PAPER);
+        let you_lbl = theme::contrast_ratio(theme::CREAM, theme::PAPER);
+        let asst_lbl = theme::contrast_ratio(theme::AGENT_TEXT, theme::PAPER);
+        let sys_lbl = theme::contrast_ratio(theme::CREAM_META, theme::PAPER);
+        let err_lbl = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::PAPER);
+        let meta = theme::contrast_ratio(theme::CREAM_META, theme::PAPER);
+        let chip_done = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let chip_not_applied = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL);
+        let chip_failed = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
+        let cancel_btn = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let attach_name = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let attach_x = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
+        let danger_confirm = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
+
+        for (name, r) in [
+            ("YOU", you_lbl),
+            ("ASSISTANT", asst_lbl),
+            ("SYSTEM", sys_lbl),
+            ("ERROR", err_lbl),
+            ("metadata", meta),
+            ("chip Done", chip_done),
+            ("chip NotApplied", chip_not_applied),
+            ("chip Failed", chip_failed),
+            ("Cancel", cancel_btn),
+            ("attachment name", attach_name),
+            ("attachment ×", attach_x),
+            ("danger Confirm", danger_confirm),
+        ] {
+            assert!(r >= 4.5, "{name} contrast {r:.2}:1 < 4.5:1");
+        }
+        assert!(meta < body, "metadata ({meta:.2}:1) stays dimmer than message body ({body:.2}:1)");
+    }
+
+    #[test]
+    fn agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_demo_agent(false);
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 950.0);
+
+        let run_capture = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            let mut texts = Vec::new();
+            let mut rects = Vec::new();
+            for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
+            let set_ids: Vec<egui::TextureId> = out.textures_delta.set.iter().map(|(id, _)| *id).collect();
+            let free_ids = out.textures_delta.free.clone();
+            out.textures_delta.clear();
+            (texts, rects, set_ids, free_ids)
+        };
+
+        // Frame 1: thumbnail texture created once.
+        let (_, _, set1, _) = run_capture(&mut app, vec![]);
+        let tex_id = app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()).expect("thumbnail texture loaded");
+        assert!(set1.contains(&tex_id), "frame 1 uploads thumbnail texture {tex_id:?}");
+
+        // Settle layout and verify Frame N does NOT re-upload thumbnail texture.
+        let _ = run_capture(&mut app, vec![]);
+        let (texts, rects, set3, _) = run_capture(&mut app, vec![]);
+        assert!(!set3.contains(&tex_id), "thumbnail texture must not be recreated on subsequent frames");
+        assert_eq!(app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()), Some(tex_id));
+
+        // Alignment: Confirm/Cancel and attachment chip share the transcript text column left edge.
+        let msg_left = texts.iter().find(|(t, _)| t.contains("Brighten Surge A")).map(|(_, r)| r.left()).expect("msg text");
+        let chip_text_r = texts.iter().find(|(t, _)| t.contains("Split keys → C4")).map(|(_, r)| *r).expect("chip text");
+        let chip_box = rects.iter()
+            .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(chip_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("chip box").0;
+        let confirm_text_r = texts.iter().find(|(t, _)| t == "Confirm · Delete rig 2 · Rig B").map(|(_, r)| *r).expect("confirm");
+        let confirm_box = rects.iter()
+            .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(confirm_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("confirm button box").0;
+        let attach_text_r = texts.iter().find(|(t, _)| t == "rack-sketch.png").map(|(_, r)| *r).expect("attach name");
+        let attach_box = rects.iter()
+            .filter(|(r, fill, _)| *fill == theme::DARK_PANEL_HI && r.contains_rect(attach_text_r))
+            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
+            .expect("attach chip box").0;
+        assert!(
+            (confirm_box.left() - chip_box.left()).abs() <= 0.5 && (confirm_box.left() - msg_left).abs() <= 2.0,
+            "Confirm left ({}) != transcript column (chip {}, msg {msg_left})",
+            confirm_box.left(),
+            chip_box.left()
+        );
+        assert!(
+            (attach_box.left() - chip_box.left()).abs() <= 0.5 && (attach_box.left() - msg_left).abs() <= 2.0,
+            "Attachment chip left ({}) != transcript column (chip {}, msg {msg_left})",
+            attach_box.left(),
+            chip_box.left()
+        );
+        assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "no debug pixel dimensions: {texts:?}");
+
+        // Remove via × -> texture handle dropped and freed in textures_delta.free.
+        let x_pos = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).unwrap().1.center();
+        let mut freed = Vec::new();
+        for pressed in [true, false] {
+            let ev = vec![
+                egui::Event::PointerMoved(x_pos),
+                egui::Event::PointerButton {
+                    pos: x_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                },
+            ];
+            freed.extend(run_capture(&mut app, ev).3);
+        }
+        freed.extend(run_capture(&mut app, vec![]).3);
+        assert!(app.chat_image.is_none() && app.chat_thumb.is_none(), "attachment and thumb cleared");
+        assert!(freed.contains(&tex_id), "removed attachment must free thumbnail texture {tex_id:?}, freed: {freed:?}");
     }
 }
 

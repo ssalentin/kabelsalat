@@ -43,7 +43,7 @@ Learned so far (2026-11-15, UI polish pass):
    "%[pixel:p{0,0}]" info:`); opaque white corners show as a white square on
    dark taskbars.
 3. **Cable colors:** keep audio jackets warm/neutral and MIDI jackets cool
-   (per-family palettes) — never mix the family hues; the TONE/WARM warming
+   (per-family palettes) — never mix the family hues; the WARM warming
    shift applies only to the neutral cream jacket, so tomato stays
    selection-only. Audio palette = cream/amber/rose/sand (a sage green
    slipped in and broke the warm family — check new hues against it).
@@ -321,7 +321,9 @@ Learned so far (2026-11-15, UI polish pass):
     rack knob (label, default, param, aliases); `make_unit`, the UI resolver
     and headless MCP all read it. Headless MCP used `dsp_param_choices` names,
     so `knob="RESO"` failed and `CEILING` bound the DRIVE knob. Add knobs
-    there, never as a literal in a face or a resolver.
+    there, never as a literal in a face or a resolver. A plugin's own
+    controls are the second table: its `MainControls` list, resolved by
+    `MainControls::find` in the app and in headless MCP alike (rule 90).
 68. **A knob on the face drives something, or is not bindable:** the
     system-audio GAIN knob was visual only (no SetParam path). A knob with
     `param: Some(..)` must reach the engine via `apply_engine_param`, and
@@ -436,6 +438,30 @@ Learned so far (2026-11-15, UI polish pass):
     nodes silently mapped to slot 0. Resolve with `voice_slot_of_node`
     (None past the pool or for non-CLAP nodes), never index by a rig index
     (`clap_units_past_the_voice_pool_never_index_voice_state`).
+90. **A plugin knob is one of the plugin's own controls, under the plugin's
+    name:** every LV2 unit had a `GAIN` knob on control port 0, whatever that
+    port was (Vitalium: `lv2_freewheel`; setBfree has no control port, so the
+    knob moved nothing), and a CLAP unit had a visual-only `TONE`. Plugin
+    knobs come from `main_controls::resolve` (remote-controls pages, then
+    `param:` designations, then the first usable continuous parameters,
+    macros first); a port with any other designation (`lv2:freeWheeling`,
+    `lv2:enabled`) is the host's and is never offered to the player. Check
+    with `kabelsalat main-controls-test`.
+91. **Re-read a plugin's controls after a state load, without waiting to be
+    told:** Surge XT names its macros per patch ("M1: Cutoff") and announces
+    no `params.rescan`, so the list read at instantiation kept "M1: -" after
+    a patch load. `ClapVoiceMain::load_state` arms the next
+    `poll_main_controls` calls, and the face rebuilds its main knobs when the
+    list changed (`real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin`).
+92. **A control the plugin left unnamed is not a main control:** only 274 of
+    3008 installed Surge patches name a macro; the others report "M1: -",
+    which moves nothing. `resolve` skips a slot whose name has no letter or
+    digit after its tag and continues with the next remote-controls page.
+93. **Find a knob by label or id, never by position:** plugin knobs sit in
+    front of a unit's own knobs, and how many there are follows the plugin
+    and the unit's width. `units[1].knobs[1]` stopped being LEVEL; use
+    `Unit::knob_index("LEVEL")` or `cc_target()`, and never rebuild a unit's
+    knob row while one of its knobs is dragged (rule 10).
 
 ## Working on kabelsalat
 
@@ -460,6 +486,7 @@ Learned so far (2026-11-15, UI polish pass):
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
   (`./target/debug/kabelsalat <name>`).

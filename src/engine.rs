@@ -1324,6 +1324,14 @@ impl GraphEngine {
                     }
                 }
             }
+            Command::ProgramChange { node, program } => {
+                let program = program.min(127);
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                    s.plugin.program_change(program);
+                } else if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
+                    s.voice.program_change_rt(program);
+                }
+            }
             Command::LoadGraph { graph } => {
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
@@ -3812,6 +3820,200 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
     }
     anyhow::ensure!(worst[1] < std::time::Duration::from_millis(5), "render blocked {:?} with the loader", worst[1]);
     println!("lv2-async-test: OK — the loader keeps every render block under one buffer while {uri} loads");
+    Ok(())
+}
+
+/// What a held note sounds like, coarsely: loudness, pitch-ish zero-crossing
+/// rate and brightness (high-frequency share).
+#[derive(Clone, Copy)]
+struct Timbre {
+    rms: f32,
+    zero_cross_hz: f32,
+    brightness: f32,
+}
+
+impl Timbre {
+    /// How far apart two timbres are: the sum of their relative differences.
+    fn distance(self, other: Timbre) -> f32 {
+        let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(b.abs()).max(1e-6);
+        rel(self.rms, other.rms) + rel(self.zero_cross_hz, other.zero_cross_hz) + rel(self.brightness, other.brightness)
+    }
+}
+
+/// Hold `note` for half a second at the engine's master and describe it,
+/// then release it and let the tail ring out.
+fn timbre_of_note(engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8, sr: f64) -> Timbre {
+    use crate::control::Command;
+    use crate::matrix::SourceId;
+    let mut buf = vec![0.0f32; 512 * 2];
+    bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    let (mut zc, mut sq, mut dsq, mut n, mut prev) = (0usize, 0.0f64, 0.0f64, 0usize, 0.0f32);
+    for _ in 0..(sr as usize / 2 / 512) {
+        engine.render(&mut buf, 2);
+        for f in buf.chunks(2) {
+            let x = f[0];
+            if (x > 0.0) != (prev > 0.0) { zc += 1; }
+            sq += (x * x) as f64;
+            dsq += ((x - prev) * (x - prev)) as f64;
+            prev = x;
+            n += 1;
+        }
+    }
+    bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    for _ in 0..(sr as usize * 2 / 512) { engine.render(&mut buf, 2); }
+    let rms = (sq / n as f64).sqrt() as f32;
+    Timbre { rms, zero_cross_hz: zc as f32 / n as f32 * sr as f32 / 2.0, brightness: (dsq / n as f64).sqrt() as f32 / rms.max(1e-9) }
+}
+
+/// One instrument of `sound-library-test`: its library, a search, and one
+/// sound loaded through the engine. Ok(line) describes what was proven.
+fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> anyhow::Result<String> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::sounds::{Instrument, Libraries, Load, Lookup, Target};
+    let sr = 48000.0;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let kind = match instrument {
+        Instrument::Clap(id) => NodeKind::Clap { plugin_id: name_bytes(id) },
+        Instrument::Lv2(uri) => NodeKind::Lv2 { uri: Lv2Uri::new(uri) },
+    };
+    let node = g.add_node(kind, name_bytes("INSTRUMENT"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+
+    let mut buf = vec![0.0f32; 512 * 2];
+    let (mut engine, mut clap) = match instrument {
+        Instrument::Clap(id) => {
+            let (voice, main) = crate::host::ClapVoice::new_plugin(sr, id)?;
+            let controller = voice.controller();
+            (GraphEngine::new(g, drain, sr, vec![(node, voice)]), Some((main, controller)))
+        }
+        Instrument::Lv2(uri) => {
+            // The app's path: the loader thread instantiates the plugin.
+            let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+            engine.spawn_lv2_loader();
+            bus.send(Command::LoadGraph { graph: g });
+            let start = std::time::Instant::now();
+            while !engine.lv2.iter().any(|s| s.node == node) {
+                anyhow::ensure!(start.elapsed() < std::time::Duration::from_secs(10), "{uri} never attached");
+                engine.render(&mut buf, 2);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            (engine, None)
+        }
+    };
+
+    let library = match Libraries::blocking(crate::sounds::scan).get(instrument) {
+        Lookup::Ready(library) => library,
+        Lookup::AskPlugin => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("a preset parameter needs the live plugin"))?;
+            let params = main.param_list();
+            std::sync::Arc::new(crate::sounds::preset_param_library(&params, |id, value| main.param_text(id, value)))
+        }
+        Lookup::Scanning => anyhow::bail!("a blocking library never reports a scan in progress"),
+    };
+    anyhow::ensure!(!library.sounds.is_empty(), "no {} found (its parameters: {})", library.kind, library.params.iter().take(6).cloned().collect::<Vec<_>>().join(", "));
+    let hits = crate::sounds::search(&library.sounds, query, 5).labels;
+    let label = hits.first().ok_or_else(|| anyhow::anyhow!("no {} matches '{query}' ({} in the library)", library.kind, library.sounds.len()))?;
+    let sound = crate::sounds::find(&library.sounds, label).ok_or_else(|| anyhow::anyhow!("'{label}' was listed but is not found"))?;
+    anyhow::ensure!(sound.label() == *label, "'{label}' was listed, but find picks '{}'", sound.label());
+
+    for _ in 0..20 { engine.render(&mut buf, 2); }
+    let before = timbre_of_note(&mut engine, &mut bus, 60, sr);
+    let state_before = clap.as_mut().and_then(|(main, _)| main.save_state().ok());
+    crate::sounds::load(sound, Target { node, clap: clap.as_mut().map(|(main, controller)| (main, &*controller)), bus: Some(&mut bus) })
+        .map_err(|e| anyhow::anyhow!("loading '{label}': {e}"))?;
+    // A plugin applies state and parameters on the audio thread; an LV2
+    // preset comes back from the loader thread.
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let readback = match &sound.load {
+        Load::ParamValue { param, value } => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+            let now = main.param_value(*param);
+            anyhow::ensure!(now == Some(*value), "parameter {param} reads {now:?} after loading '{label}', expected {value}");
+            format!("parameter {param} = {value} ('{}')", main.param_text(*param, *value))
+        }
+        Load::MidiProgram(program) => {
+            let last = engine.lv2_last_note(node);
+            anyhow::ensure!(last == Some([0xC0, *program, 0]), "the plugin's last MIDI event is {last:?}, expected programme change {program}");
+            format!("programme change {program} reached the plugin")
+        }
+        Load::SurgePatch(_) | Load::DexedVoice { .. } => {
+            let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+            let state = main.save_state()?;
+            anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
+            "plugin state changed".to_string()
+        }
+        Load::Lv2Preset(uri) => {
+            let preset = crate::lv2::discover_presets(instrument.id())
+                .into_iter().find(|p| p.uri == *uri).ok_or_else(|| anyhow::anyhow!("preset {uri} vanished"))?;
+            let slot = engine.lv2.iter().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+            let controls = slot.plugin.control_descs();
+            let (set, total) = preset.values.iter().fold((0, 0), |(set, total), (symbol, value)| {
+                match controls.iter().find(|c| c.symbol == *symbol) {
+                    Some(c) => (set + ((c.value - value).abs() < 1e-5) as usize, total + 1),
+                    None => (set, total),
+                }
+            });
+            anyhow::ensure!(total > 0 && set == total, "{set} of {total} preset controls hold the preset's value");
+            format!("{set}/{total} controls hold the preset's values")
+        }
+    };
+    let after = timbre_of_note(&mut engine, &mut bus, 60, sr);
+    anyhow::ensure!(after.rms > 1e-4, "'{label}' is silent (rms {:.5})", after.rms);
+    let distance = before.distance(after);
+    anyhow::ensure!(distance > 0.1, "'{label}' sounds like the sound before it (distance {distance:.3})");
+    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2})",
+        library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
+}
+
+/// `sound-library-test`: every catalog instrument installed on this machine
+/// lists its sound library, answers a search and loads one sound through
+/// the real engine, proven by a readback and by the note sounding different.
+pub fn sound_library_test() -> anyhow::Result<()> {
+    use crate::sounds::Instrument;
+    // A search the instrument's library should answer.
+    let query = |id: &str| match id {
+        "setbfree" => "jazz",
+        "dexed" => "brass",
+        "vitalium" => "pad",
+        _ => "bass",
+    };
+    let clap = crate::host::list_clap_plugins();
+    let lv2 = crate::lv2::discover();
+    let (mut tested, mut failed) = (0, Vec::new());
+    for entry in crate::catalog::CATALOG {
+        let instrument = match entry.clap_id {
+            Some(id) => clap.iter().any(|p| p.id == id).then(|| Instrument::Clap(id.to_string())),
+            None => entry.lv2_uris.iter().find(|u| lv2.iter().any(|p| p.uri == **u)).map(|u| Instrument::Lv2(u.to_string())),
+        };
+        let Some(instrument) = instrument else {
+            println!("  {:<9} not installed, skipped", entry.name);
+            continue;
+        };
+        tested += 1;
+        if let Instrument::Clap(id) = &instrument {
+            let providers = crate::host::clap_preset_providers(id)?;
+            println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
+                if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
+        }
+        match sound_library_check(&instrument, query(entry.id)) {
+            Ok(line) => println!("  {:<9} {line}", entry.name),
+            Err(e) => {
+                println!("  {:<9} FAILED: {e:#}", entry.name);
+                failed.push(entry.name);
+            }
+        }
+    }
+    anyhow::ensure!(tested > 0, "no catalog instrument is installed");
+    anyhow::ensure!(failed.is_empty(), "sound-library-test: {} of {tested} instrument(s) failed: {}", failed.len(), failed.join(", "));
+    println!("sound-library-test: OK — {tested} instrument(s): library listed, searched, one sound loaded through the engine and heard");
     Ok(())
 }
 

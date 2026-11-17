@@ -304,6 +304,7 @@ extern "C" {
     fn lilv_node_as_string(value: *const LilvNode) -> *const c_char;
     fn lilv_node_as_uri(value: *const LilvNode) -> *const c_char;
     fn lilv_plugin_get_library_uri(plugin: *const LilvPlugin) -> *const LilvNode;
+    fn lilv_plugin_has_extension_data(plugin: *const LilvPlugin, uri: *const LilvNode) -> bool;
     fn lilv_file_uri_parse(uri: *const c_char, hostname: *mut *mut c_char) -> *mut c_char;
     fn lilv_free(ptr: *mut c_void);
     fn lilv_node_free(val: *mut LilvNode);
@@ -797,6 +798,61 @@ unsafe fn query_worker_interface(desc: &Lv2Descriptor) -> Option<Lv2WorkerInterf
     }
 }
 
+const LV2_MIDNAM_INTERFACE_URI: &[u8] = b"http://ardour.org/lv2/midnam#interface\0";
+
+/// Ardour's MIDNAM interface (`extension_data(midnam#interface)`): the plugin
+/// hands out a MIDNAM XML document that names its MIDI programmes.
+#[repr(C)]
+struct Lv2MidnamInterface {
+    midnam: Option<extern "C" fn(Lv2Handle) -> *mut c_char>,
+    model: Option<extern "C" fn(Lv2Handle) -> *mut c_char>,
+    free: Option<extern "C" fn(*mut c_char)>,
+}
+
+/// `(MIDI programme number, name)` of every `<Patch>` in a MIDNAM document.
+pub fn parse_midnam_programs(xml: &str) -> Vec<(u8, String)> {
+    let attr = |tag: &str, name: &str| -> Option<String> {
+        let at = tag.find(&format!("{name}=\""))? + name.len() + 2;
+        let end = tag[at..].find('"')?;
+        Some(tag[at..at + end].replace("&amp;", "&").replace("&apos;", "'").replace("&quot;", "\"").replace("&lt;", "<").replace("&gt;", ">"))
+    };
+    xml.split("<Patch ").skip(1).filter_map(|rest| {
+        let tag = &rest[..rest.find('>')?];
+        let program: u8 = attr(tag, "ProgramChange")?.trim().parse().ok().filter(|p| *p < 128)?;
+        let name = attr(tag, "Name")?.trim().to_string();
+        (!name.is_empty()).then_some((program, name))
+    }).collect()
+}
+
+/// The MIDI programmes `uri` names in its MIDNAM document; empty when it does
+/// not declare the interface. Instantiates the plugin to ask it, so this
+/// belongs on a scan or loader thread (rule 46), never the audio or UI thread.
+pub fn midi_programs(uri: &str) -> Vec<(u8, String)> {
+    let declared = {
+        let _lilv = lilv_guard();
+        unsafe {
+            let world = lilv_world_new();
+            if world.is_null() {
+                return Vec::new();
+            }
+            lilv_world_load_all(world);
+            let plugin = find_plugin(world, uri);
+            let ext = lilv_new_uri(world, LV2_MIDNAM_INTERFACE_URI.as_ptr() as *const c_char);
+            let declared = !plugin.is_null() && lilv_plugin_has_extension_data(plugin, ext);
+            lilv_node_free(ext);
+            lilv_world_free(world);
+            declared
+        }
+    };
+    if !declared {
+        return Vec::new();
+    }
+    let Ok(plugin) = Lv2Plugin::load(uri, 48000.0, 256) else { return Vec::new() };
+    let programs = plugin.midnam().map(|xml| parse_midnam_programs(&xml)).unwrap_or_default();
+    retire(plugin);
+    programs
+}
+
 // ---------------------------------------------------------------------------
 // Reusable LV2 plugin wrapper (foundation for engine rig nodes)
 // ---------------------------------------------------------------------------
@@ -1129,6 +1185,35 @@ impl Lv2Plugin {
     /// Queue a MIDI note-off for the next run().
     pub fn note_off(&mut self, note: u8) {
         self.queue_midi([0x80, note, 0]);
+    }
+
+    /// Queue a MIDI programme change for the next run() (allocation-free).
+    pub fn program_change(&mut self, program: u8) {
+        let program = program.min(127);
+        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &[0xC0, program]) {
+            self.last_event = Some([0xC0, program, 0]);
+        }
+    }
+
+    /// The plugin's MIDNAM document, when it implements the interface.
+    pub fn midnam(&self) -> Option<String> {
+        unsafe {
+            let desc = &*(*self.instance).lv2_descriptor;
+            let ptr = (desc.extension_data?)(LV2_MIDNAM_INTERFACE_URI.as_ptr() as *const c_char);
+            if ptr.is_null() {
+                return None;
+            }
+            let iface = &*(ptr as *const Lv2MidnamInterface);
+            let text = (iface.midnam?)((*self.instance).lv2_handle);
+            if text.is_null() {
+                return None;
+            }
+            let xml = CStr::from_ptr(text).to_string_lossy().into_owned();
+            if let Some(free) = iface.free {
+                free(text);
+            }
+            Some(xml)
+        }
     }
 
     fn queue_midi(&mut self, ev: [u8; 3]) {
@@ -1806,6 +1891,35 @@ mod tests {
         assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize, ATOM_OUT_BYTES - 8);
         assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 7);
         assert_eq!(buf.as_ptr() as usize % 8, 0, "8-byte aligned");
+    }
+
+    /// Rule 63: lines of the document setBfree 0.8 hands out, not a retyped shape.
+    #[test]
+    fn midnam_programs_are_read_from_setbfrees_document() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MIDINameDocument>
+  <Author>setBfree -- Robin Gareus</Author>
+  <MasterDeviceNames>
+    <Model>setBfree:0xffffb414d</Model>
+    <ChannelNameSet Name="Upper Manual">
+      <AvailableForChannels>
+        <AvailableChannel Channel="1" Available="true"/>
+      </AvailableForChannels>
+      <PatchBank Name="Organ Presets">
+      <Patch Number="000" Name="Jazz 1 all" ProgramChange="0"/>
+      <Patch Number="022" Name="8' solo" ProgramChange="22"/>
+      <Patch Number="064" Name="L:Flute &amp; String" ProgramChange="64"/>
+      <Patch Number="085" Name="U:Flutes 8'&amp;4'" ProgramChange="85"/>
+      </PatchBank>
+    </ChannelNameSet>
+  </MasterDeviceNames>
+</MIDINameDocument>"#;
+        assert_eq!(parse_midnam_programs(xml), vec![
+            (0, "Jazz 1 all".to_string()), (22, "8' solo".to_string()),
+            (64, "L:Flute & String".to_string()), (85, "U:Flutes 8'&4'".to_string()),
+        ]);
+        assert!(parse_midnam_programs("<MIDINameDocument/>").is_empty());
+        assert!(parse_midnam_programs(r#"<Patch Number="1" Name="Out of range" ProgramChange="128"/>"#).is_empty());
     }
 
     #[test]

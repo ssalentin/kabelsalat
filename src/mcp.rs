@@ -259,17 +259,23 @@ struct SetNodePlayingArgs {
 /// Arguments for `list_sounds`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListSoundsArgs {
-    /// Words matched against "Category/Name", e.g. "flute" or "pad warm".
+    /// Words matched against the sounds' names, e.g. "flute", "pad warm", "jazz".
     query: String,
+    /// Rig index whose instrument is searched (default: the rig in view; headless: 0).
+    rig: Option<usize>,
+    /// Instrument node id, for a rig with several different instruments.
+    node: Option<NodeId>,
 }
 
 /// Arguments for `load_sound`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LoadSoundArgs {
-    /// Patch query (words or "Category/Name" from list_sounds).
+    /// Sound query (words, or an entry of list_sounds).
     query: String,
-    /// Rig index (default: the rig in view).
+    /// Rig index (default: the rig in view; headless: 0).
     rig: Option<usize>,
+    /// Instrument node id, for a rig with several different instruments.
+    node: Option<NodeId>,
 }
 
 /// Arguments for `set_split`.
@@ -557,6 +563,40 @@ fn rig_meta(st: &State) -> Result<Vec<crate::control::RigMeta>, String> {
         return Ok(snap.rigs);
     }
     Ok(st.rigs.lock().map(|s| s.rigs.clone()).unwrap_or_default())
+}
+
+fn sound_args(query: &str, rig: Option<usize>, node: Option<NodeId>) -> Value {
+    let mut a = json!({"query": query});
+    if let Some(r) = rig { a["rig"] = json!(r); }
+    if let Some(n) = node { a["node"] = json!(n); }
+    a
+}
+
+/// The instruments of a headless graph, as the sound tools address them.
+/// LV2 nodes count when their plugin declares itself an instrument.
+fn headless_instruments(graph: &Graph, lv2: &[crate::lv2::Lv2PluginInfo]) -> Vec<crate::sounds::Unit> {
+    graph.nodes.iter().filter_map(|n| {
+        let instrument = crate::sounds::Instrument::of(&n.kind)?;
+        if let crate::sounds::Instrument::Lv2(uri) = &instrument {
+            if !lv2.iter().any(|p| p.uri == *uri && p.is_instrument) { return None; }
+        }
+        Some(crate::sounds::Unit { node: n.id, rig: n.rig as usize, name: name_str(&n.name).to_string(), instrument, slot: None })
+    }).collect()
+}
+
+/// The instrument a headless sound tool means and its library, scanned in
+/// the caller (no UI thread here). A plugin's own preset list is only
+/// known to the running app.
+fn headless_sound_library(graph: &Graph, rig: Option<usize>, node: Option<NodeId>) -> Result<(crate::sounds::Unit, Arc<crate::sounds::Library>), String> {
+    static LIBRARIES: std::sync::OnceLock<crate::sounds::Libraries> = std::sync::OnceLock::new();
+    let has_lv2 = graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. }));
+    let lv2 = if has_lv2 { crate::lv2::discover() } else { Vec::new() };
+    let rig = rig.unwrap_or(0);
+    let unit = crate::sounds::pick_unit(&headless_instruments(graph, &lv2), rig, &format!("Rig {}", rig + 1), node)?;
+    match LIBRARIES.get_or_init(|| crate::sounds::Libraries::blocking(crate::sounds::scan)).get(&unit.instrument) {
+        crate::sounds::Lookup::Ready(library) => Ok((unit, library)),
+        _ => Err(format!("{}'s presets are read from the live plugin: attach to the running app (kabelsalat mcp --attach)", unit.name)),
+    }
 }
 
 fn send_cmd(st: &mut State, cmd: Command) -> Result<(), String> {
@@ -1856,24 +1896,41 @@ impl McpServer {
         ok_json(json!({"presets": presets}))
     }
 
-    /// Query the multi-rig state.
-    /// Search installed Surge patches.
-    #[tool(name = "list_sounds", description = "Search the installed Surge patches (factory + 3rd-party, ~3000) by words in 'Category/Name', e.g. 'flute', 'pad warm'. Returns up to 25 entries.")]
+    /// Search the sound library of a rig's instrument.
+    #[tool(name = "list_sounds", description = "Search the sound library of ONE instrument: Surge patches, Dexed DX7 cartridge voices, an LV2 instrument's presets and MIDI programmes (setBfree's organ registrations, Vitalium's presets), or a plugin's own preset list (YANES). rig: whose instrument (default: the rig in view); node: the instrument's node id when a rig holds several different ones. Returns up to 25 sounds plus the instrument and the library they are from. A CLAP plugin's own preset list needs the running app (kabelsalat mcp --attach).")]
     fn list_sounds(&self, Parameters(args): Parameters<ListSoundsArgs>) -> Result<CallToolResult, McpError> {
-        let hits = crate::host::search_surge_patches(&crate::host::list_surge_patches(), &args.query, 25);
-        ok_json(json!({"patches": hits}))
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("list_sounds", sound_args(&args.query, args.rig, args.node));
+        }
+        match headless_sound_library(&st.graph, args.rig, args.node) {
+            Ok((unit, library)) => {
+                let answer = crate::sounds::list_answer(&unit, &library, &args.query);
+                serde_json::from_str::<Value>(&answer).map_or_else(|_| tool_err(answer), ok_json)
+            }
+            Err(e) => tool_err(e),
+        }
     }
 
-    /// Load a Surge patch into a rig's synth (needs the running app).
-    #[tool(name = "load_sound", description = "Load a Surge patch into a rig's synth so it sounds like that instrument (a new rig plays the init patch otherwise). query: words or 'Category/Name' from list_sounds; rig: index (default: the rig in view). Needs the running app (kabelsalat mcp --attach): the synths live on its UI thread.")]
+    /// Load a sound into a rig's instrument.
+    #[tool(name = "load_sound", description = "Load a sound into a rig's instrument from that instrument's own library (see list_sounds): a Surge patch, a Dexed voice, an LV2 preset or MIDI programme, a plugin preset. query: words or an entry of list_sounds; rig: index (default: the rig in view); node: the instrument's node id when a rig holds several different ones. CLAP instruments (Surge, Dexed, YANES) need the running app (kabelsalat mcp --attach): their plugins live on its UI thread.")]
     fn load_sound(&self, Parameters(args): Parameters<LoadSoundArgs>) -> Result<CallToolResult, McpError> {
-        let mut a = json!({"query": args.query});
-        if let Some(r) = args.rig { a["rig"] = json!(r); }
-        match bridge::request(&json!({"op": "ui", "tool": "load_sound", "args": a})) {
-            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) =>
-                ok_json(reply.get("data").cloned().unwrap_or(Value::Null)),
-            Ok(reply) => tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("load_sound failed").to_string()),
-            Err(e) => tool_err(format!("load_sound needs the running app (attach): {e:#}")),
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("load_sound", sound_args(&args.query, args.rig, args.node));
+        }
+        let (unit, library) = match headless_sound_library(&st.graph, args.rig, args.node) {
+            Ok(found) => found,
+            Err(e) => return tool_err(e),
+        };
+        let sound = match crate::sounds::find_or_explain(&unit, &library, &args.query) {
+            Ok(sound) => sound,
+            Err(e) => return tool_err(e),
+        };
+        let Backend::Local(bus) = &mut st.backend else { unreachable!("the remote backend returned above") };
+        match crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap: None, bus: Some(bus) }) {
+            Ok(()) => ok_json(json!(crate::sounds::loaded_answer(&unit, sound, &format!("Rig {}", unit.rig + 1)))),
+            Err(e) => tool_err(format!("load_sound failed: {e} — {} needs the running app (kabelsalat mcp --attach)", unit.name)),
         }
     }
 
@@ -2703,6 +2760,27 @@ mod tests {
         };
         assert!(is_err(server.set_node_playing(Parameters(SetNodePlayingArgs { node: 2, playing: true }))));
         assert!(is_err(server.set_node_playing(Parameters(SetNodePlayingArgs { node: 999, playing: true }))));
+    }
+
+    /// Headless sound tools address the same units as the app's: CLAP
+    /// synths and LV2 plugins that declare themselves instruments.
+    #[test]
+    fn headless_sound_tools_see_instruments_not_effects() {
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:organ") }, name_bytes("ORGAN"));
+        g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:reverb") }, name_bytes("VERB"));
+        g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument };
+        let units = headless_instruments(&g, &[lv2("urn:test:organ", true), lv2("urn:test:reverb", false)]);
+        assert_eq!(units.iter().map(|u| (u.node, u.name.as_str())).collect::<Vec<_>>(), [(surge, "SURGE"), (organ, "ORGAN")]);
+        assert_eq!(units[1].instrument, crate::sounds::Instrument::Lv2("urn:test:organ".into()));
+        let which = crate::sounds::pick_unit(&units, 0, "Rig 1", None).unwrap_err();
+        assert!(which.contains("2 different instruments"), "{which}");
+        assert_eq!(sound_args("jazz", Some(1), Some(organ)), json!({"query": "jazz", "rig": 1, "node": organ}));
+        assert_eq!(sound_args("jazz", None, None), json!({"query": "jazz"}));
     }
 
     #[test]

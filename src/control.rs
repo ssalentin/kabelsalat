@@ -676,6 +676,9 @@ pub enum Command {
     SetCountIn { enabled: bool, bars: u8 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },
+    /// Send a MIDI programme change (0..=127) to ONE instrument node: how an
+    /// instrument with built-in programmes (setBfree) changes its sound.
+    ProgramChange { node: NodeId, program: u8 },
     /// Start recording the final master output to a new timestamped WAV under
     /// ~/Music/kabelsalat/. Idempotent — a second start while recording is a
     /// no-op. The writer thread generates the path, so no path crosses the
@@ -717,7 +720,7 @@ impl Command {
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::MatrixRule { .. }
-            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. })
+            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::ProgramChange { .. })
     }
 }
 

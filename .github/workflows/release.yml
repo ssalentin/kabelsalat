@@ -4,6 +4,13 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Existing release tag (e.g. v0.1.0) to build the tarball and AppImages
+          for and attach to its release. Empty: test build of this ref, no release.
+        required: false
+        default: ''
 
 concurrency:
   group: release-${{ github.ref }}
@@ -16,11 +23,27 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      BACKFILL_TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v7
       - id: version
         name: Version and release metadata
         run: |
+          if [ -n "$BACKFILL_TAG" ]; then
+            # Backfill an existing tag: its own Cargo.toml decides the version.
+            git fetch --depth=1 origin "refs/tags/$BACKFILL_TAG:refs/tags/$BACKFILL_TAG"
+            crate=$(git show "$BACKFILL_TAG:Cargo.toml" | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n1)
+            if [ "${BACKFILL_TAG#v}" != "$crate" ]; then
+              echo "::error::tag $BACKFILL_TAG does not match its Cargo.toml version $crate"
+              exit 1
+            fi
+            gh release view "$BACKFILL_TAG" > /dev/null
+            echo "version=$crate" >> "$GITHUB_OUTPUT"
+            echo "tag=$BACKFILL_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version=${GITHUB_REF_NAME#v}
@@ -37,6 +60,9 @@ jobs:
             version="$crate-dev.${GITHUB_SHA::7}"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          [ "$GITHUB_REF_TYPE" = tag ] && echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   binaries:
     name: tarball + AppImage (${{ matrix.arch }})
@@ -54,21 +80,52 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v7
+      - if: inputs.tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          path: tag-src
+      # The packaging scripts come from this ref; the source from the
+      # backfilled tag when there is one. The tag's tree moves out of this
+      # checkout, or cargo takes ./Cargo.toml for its workspace root.
+      - name: Source tree
+        run: |
+          if [ -d tag-src ]; then
+            mv tag-src "$RUNNER_TEMP/src"
+            echo "SRC=$RUNNER_TEMP/src" >> "$GITHUB_ENV"
+          else
+            echo "SRC=$PWD" >> "$GITHUB_ENV"
+          fi
       - name: Install build dependencies
         run: scripts/ci/ubuntu-deps.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.SRC }}
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --manifest-path "$SRC/Cargo.toml"
       - name: Tarball
-        run: packaging/tarball.sh target/release/kabelsalat "$VERSION" dist
+        run: packaging/tarball.sh "$SRC/target/release/kabelsalat" "$VERSION" dist
       - name: AppImage
-        run: packaging/appimage.sh target/release/kabelsalat "$VERSION" dist
+        run: packaging/appimage.sh "$SRC/target/release/kabelsalat" "$VERSION" dist
       - name: Smoke test
         run: |
+          # Tags before --version existed (v0.1.0) print their usage ("modes:")
+          # for it and exit 1; that still proves the binary loads and starts.
+          smoke() {
+            if [ -n "${{ inputs.tag }}" ]; then
+              out=$("$@" --version 2>&1 || true); echo "$out"
+              grep -qE "^(kabelsalat $VERSION|modes:)" <<<"$out"
+            else
+              "$@" --version
+            fi
+          }
           tar -xzf "dist/kabelsalat-$VERSION-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat" --version
-          "dist/kabelsalat-$VERSION-${{ matrix.arch }}.AppImage" --appimage-extract-and-run --version
+          smoke "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat"
+          smoke "dist/kabelsalat-${{ matrix.arch }}.AppImage" --appimage-extract-and-run
+          "dist/kabelsalat-${{ matrix.arch }}.AppImage" --appimage-updateinformation \
+            | grep -qx "gh-releases-zsync|${GITHUB_REPOSITORY/\//|}|latest|kabelsalat-${{ matrix.arch }}.AppImage.zsync"
+          test -s "dist/kabelsalat-${{ matrix.arch }}.AppImage.zsync"
       - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
@@ -78,6 +135,7 @@ jobs:
   flatpak:
     name: Flatpak (${{ matrix.arch }})
     needs: version
+    if: ${{ !inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -114,6 +172,7 @@ jobs:
   arch-package:
     name: Arch package (${{ matrix.arch }})
     needs: version
+    if: ${{ !inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,13 +205,18 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.ref_type == 'tag'
+    # A pushed tag publishes everything; a backfill attaches what it built
+    # (flatpak and arch-package are skipped then, so they may not succeed).
+    if: >-
+      ${{ !cancelled() && needs.version.outputs.tag != '' && needs.binaries.result == 'success'
+      && (inputs.tag || (needs.flatpak.result == 'success' && needs.arch-package.result == 'success')) }}
     needs: [version, binaries, flatpak, arch-package]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
@@ -164,16 +228,12 @@ jobs:
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Create or update the GitHub release
         run: |
-          {
-            scripts/ci/release-notes.sh "$VERSION"
-            printf '\n## Download\n\n'
-            printf 'Recommended: **kabelsalat-%s-<arch>.AppImage** (x86_64 or aarch64): `chmod +x` it and run it. ' "$VERSION"
-            printf 'It finds your installed CLAP/LV2 plugins and gets realtime audio priority. '
-            printf 'The Flatpak, tarball and Arch packages are attached too; see docs/PACKAGING.md for their limits.\n'
-          } > "$RUNNER_TEMP/notes.md"
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          scripts/ci/release-notes.sh "$VERSION" dist "$TAG" "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
           else
-            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+            gh release create "$TAG" dist/* --verify-tag \
               --title "kabelsalat $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           fi

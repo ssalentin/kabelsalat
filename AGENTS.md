@@ -393,7 +393,8 @@ Learned so far (2026-11-15, UI polish pass):
     measure.
 79. **Build output never goes to tmpfs, also not as a copy:** a 690 MB debug
     binary copied into a scratch directory under `/tmp` filled the volume
-    and every command lost its output. Keep binaries and eval output under
+    and every command lost its output. Downloads too: 220 MB of plugin
+    archives in the session scratchpad (`/tmp/claude-*`) filled it again. Keep binaries and eval output under
     `~/.cache/ksalat-*` and strip copies.
 80. **An engine barrier opens on the engine's answer, never on the rack's
     own move:** `disconnect` unplugs its cable in the rack at once, so the
@@ -611,7 +612,37 @@ Learned so far (2026-11-15, UI polish pass):
     `organ_pending` (fixed size, no allocation) holds them and `attach_lv2`
     replays them; `LoadGraph` clears it. Check with `kabelsalat organ-test`,
     which sends the registration before the instance exists.
-114. **A small window shows the whole app, not a corner of it:** the rack
+114. **A catalog route names the CPU it runs on:** this machine is aarch64,
+    and upstream Linux releases (Odin 2, Floe) are x86_64 only, so an entry
+    lists routes best first (`routes`) and `local_route` takes the first that
+    `runs_on` this CPU; with none, the card says so and offers no Install.
+    Check `uname -m` and `file` a bundle before trusting a prebuilt one.
+115. **An install step that clones starts from a fresh folder:** a retry
+    after a failed install found the earlier clone in the build cache and
+    `git clone` refused it. `plan` puts `rm -rf` of its own cache folder
+    before every clone or download (`fresh_dir`).
+116. **A test of an installed bundle loads that bundle by path:** the
+    catalog test played the user's `~/.clap/Odin2.clap` instead of the one it
+    had just installed, because the host searches `~/.clap` before
+    `$CLAP_PATH`. Use `ClapVoice::new_from_bundle`, never a search by id.
+117. **A row that starts with a label sets its height first:** egui centres
+    each widget on the row as tall as it is so far, so an "Installed" label
+    before 26 px buttons sat 3 to 6 px high (and a wrapping layout ignores
+    the cross alignment altogether). `ui.set_min_height(26.0)` before the
+    label (`a_catalog_source_code_button_opens_the_repo` compares centres).
+
+114. **A release has its packages, or the workflow says why:** v0.1.0 was
+    tagged before `release.yml` existed, so its release shipped without one
+    file and nothing failed. Release notes link each AppImage by URL
+    (`release-notes.sh` fails when there is none); a tag without packages is
+    backfilled with `gh workflow run release.yml -f tag=vX.Y.Z`. After a
+    tag push, check `gh release view vX.Y.Z --json assets`.
+115. **Packaging scripts resolve their path arguments before any `cd`:**
+    `appimage.sh` changed into its work directory and then handed linuxdeploy
+    the caller's relative `./target/release/kabelsalat` ("No such file"), so
+    the first release run failed on both arches. Use `realpath` on every
+    path argument at the top of a script that changes directory.
+118. **A small window shows the whole app, not a corner of it:** the rack
     had fixed 200/220 px column floors and 60 px margins, so below ~950 px
     it panned and cut Keys and Master off; stage sheets kept 30 px margins
     and a 200 px minimum that painted into the docks; the mixer's dB marks
@@ -625,12 +656,12 @@ Learned so far (2026-11-15, UI polish pass):
     sizes. See the result without the desktop:
     `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
     (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
-115. **UI scale follows the monitor the window is on:** `ui_scale_target`
+119. **UI scale follows the monitor the window is on:** `ui_scale_target`
     read the FOCUSED monitor once at launch, so a window on the 1.0x
     external screen ran at the laptop's 1.6x (a 1368 px window laid out as
     855 px). `hypr_window_scale` finds this pid's window in `hyprctl
     clients` and is re-read every 2 s on its own thread (rule 48).
-116. **Tracked text advances by a width that is never zero:**
+120. **Tracked text advances by a width that is never zero:**
     `layout_tracked` used `glyph_width`, which answered 0 in a busy test
     run and stacked "kabelsalat" on one spot; the laid-out glyph's width
     is the fallback.
@@ -663,7 +694,8 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test` (`./target/debug/kabelsalat <name>`).
+  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree

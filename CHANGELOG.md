@@ -8,6 +8,21 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
+  installs from its prebuilt release on x86_64 and builds from source on
+  aarch64; its 260 factory patches are fetched too, so the assistant can list,
+  search and load them. Floe installs from its release on x86_64; it publishes
+  no aarch64 Linux build, and its card says so there. Release downloads are
+  checked against a pinned SHA-256.
+- **Catalog cards say what you install:** a short description, the licence,
+  how it is installed on this machine, and buttons that open the source code
+  and the project's website. `list_instruments` reports the same fields.
+- **AppImage download links in every release:** release notes link the
+  x86_64 and aarch64 AppImages directly, and the Release workflow can attach
+  packages to a tag that was released before it existed (`-f tag=v0.1.0`).
+  The README links the newest AppImage for each architecture directly; the
+  AppImages are named `kabelsalat-<arch>.AppImage`, and AppImageUpdate or
+  Gear Lever update them in place.
 - **Organ face for setBfree:** nine drawbars to pull (16′ … 1′) and LESLIE
   (stop/slow/fast), PERC, DRIVE and REVERB knobs. setBfree only listens to MIDI
   controllers, so the face sends its CCs; values are saved with the session,
@@ -45,6 +60,9 @@ releases may still change behaviour and session files.
   longer stacks its dB marks. The rig strip hint is shown only where it fits.
 - **UI scale on a second monitor:** the scale follows the monitor the window
   is on (it kept the laptop's 1.6x on a 1.0x external screen).
+- **A failed catalog install could not be retried:** the next attempt found
+  the earlier clone in the build cache and `git clone` refused it. Every
+  install now starts from a fresh cache folder.
 - **A stuck source could silence everything:** an instrument outputting a
   constant (DC) filled the master meter while every rig went quiet, and sent
   the offset to the speakers. The master now blocks DC.

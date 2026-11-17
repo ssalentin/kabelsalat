@@ -170,8 +170,7 @@ struct LoadRigArgs {
 /// Arguments for `install_instrument`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct InstallInstrumentArgs {
-    /// Catalog instrument id (see list_instruments): setbfree, surge-xt,
-    /// dexed, vitalium, yanes.
+    /// Catalog instrument id from list_instruments, e.g. setbfree, surge-xt, odin2.
     id: String,
     /// Must be true: installing changes the user's system.
     confirm: bool,
@@ -2062,7 +2061,7 @@ impl McpServer {
     }
 
     /// List the built-in instrument catalog with installed/running state.
-    #[tool(name = "list_instruments", description = "List the built-in instrument catalog (setBfree, Surge XT, Dexed, Vitalium, YANES): id, format (CLAP/LV2), description, GitHub repo, install route (distro package or build-from-source) and whether each is installed. Attached mode reports the live app's installed/running state; headless mode uses on-disk bundle detection.")]
+    #[tool(name = "list_instruments", description = "List the built-in instrument catalog: id, name, format (CLAP/LV2), description, about text, licence, homepage, source code URL, install route (distro package, build from source, or prebuilt GitHub release) and whether each is installed. Attached mode reports the live app's installed/running state; headless mode uses on-disk bundle detection.")]
     fn list_instruments(&self) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if remote {
@@ -2076,31 +2075,14 @@ impl McpServer {
         let scan = crate::catalog::ScanSet::default();
         let entries: Vec<Value> = crate::catalog::CATALOG
             .iter()
-            .map(|e| {
-                let (route, pkg_or_repo) = match e.route {
-                    crate::catalog::InstallRoute::DistroPackage { pkg } => ("distro", Some(pkg)),
-                    crate::catalog::InstallRoute::Source { repo, .. } => ("source", Some(repo)),
-                };
-                json!({
-                    "id": e.id,
-                    "name": e.name,
-                    "format": e.format.label(),
-                    "description": e.description,
-                    "repo": e.repo,
-                    "route": route,
-                    "pkg_or_repo": pkg_or_repo,
-                    "installed": crate::catalog::installed(e, &scan, &roots),
-                    "installing": false,
-                    "url": crate::catalog::repo_url(e.repo),
-                })
-            })
+            .map(|e| crate::catalog::entry_json(e, crate::catalog::installed(e, &scan, &roots), false))
             .collect();
         ok_json(json!({"instruments": entries}))
     }
 
     /// Install a catalog instrument (destructive: requires confirm, and the
     /// running app which owns the install worker + log + rescan).
-    #[tool(name = "install_instrument", description = "Install a catalog instrument (from list_instruments): a distro package via sudo pacman, or a build from GitHub source into ~/.clap / ~/.lv2. DESTRUCTIVE: requires confirm=true after asking the user. Runs in the background in the GUI app (live log + plugin rescan), so it needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "install_instrument", description = "Install a catalog instrument (from list_instruments): a distro package via sudo pacman, a build from GitHub source, or a checksum-verified prebuilt GitHub release, into ~/.clap / ~/.lv2. DESTRUCTIVE: requires confirm=true after asking the user. Runs in the background in the GUI app (live log + plugin rescan), so it needs the running app (kabelsalat mcp --attach).")]
     fn install_instrument(&self, Parameters(args): Parameters<InstallInstrumentArgs>) -> Result<CallToolResult, McpError> {
         if !args.confirm {
             return tool_err("not installed: pass confirm=true (ask the user first — installing changes the system)");

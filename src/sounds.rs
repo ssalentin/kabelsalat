@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 pub const SURGE_ID: &str = "org.surge-synth-team.surge-xt";
 pub const DEXED_ID: &str = "com.digital-suburban.dexed";
+pub const ODIN_ID: &str = "com.thewavewarden.odin2";
 
 /// The instrument a rig node hosts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -47,6 +48,9 @@ pub enum Load {
     SurgePatch(PathBuf),
     /// One voice of a DX7 cartridge, written into Dexed's CLAP state.
     DexedVoice { syx: PathBuf, program: usize },
+    /// A binary JUCE `ValueTree` patch (Odin 2's `.odin`), loaded as the
+    /// plugin's CLAP state (`juce::value_tree_to_state`).
+    ValueTreePatch(PathBuf),
     /// An installed `pset:Preset`, applied by the engine's LV2 loader thread.
     Lv2Preset(String),
     /// A MIDI programme change, sent to the instrument by the engine.
@@ -88,6 +92,9 @@ pub enum Source {
     SurgePatches,
     /// DX7 `.syx` cartridges in Dexed's folder.
     DexedCartridges,
+    /// `.odin` patches in Odin 2's soundbank folder. The factory ones are
+    /// compiled into the plugin, so the catalog install copies them there.
+    OdinSoundbanks,
     /// `pset:Preset` files in the LV2 bundles, plus the programmes the
     /// plugin names in its MIDNAM document.
     Lv2Bundles,
@@ -107,6 +114,7 @@ impl Instrument {
         match self {
             Instrument::Clap(id) if id == SURGE_ID => Source::SurgePatches,
             Instrument::Clap(id) if id == DEXED_ID => Source::DexedCartridges,
+            Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
             Instrument::Clap(_) => Source::PresetParameter,
             Instrument::Lv2(_) => Source::Lv2Bundles,
         }
@@ -119,6 +127,7 @@ pub fn scan(instrument: &Instrument) -> Library {
     match instrument.source() {
         Source::SurgePatches => surge_library(),
         Source::DexedCartridges => dexed_library(),
+        Source::OdinSoundbanks => odin_library(&odin_soundbanks_dir()),
         Source::Lv2Bundles => lv2_library(instrument.id()),
         // Nothing on disk: the plugin is asked.
         Source::PresetParameter => Library::default(),
@@ -143,6 +152,35 @@ fn dexed_library() -> Library {
         load: Load::DexedVoice { syx: p.syx_path, program: p.program },
     }).collect();
     Library { kind: "DX7 cartridge voices".into(), sounds, params: Vec::new() }
+}
+
+/// Where Odin 2 on Linux keeps its soundbanks (`ODIN_STORAGE_PATH`).
+pub fn odin_soundbanks_dir() -> PathBuf {
+    crate::catalog::home_dir().join(".local/share/odin2/Soundbanks")
+}
+
+/// One sound per `.odin` file: `<soundbank>/<category>/<name>.odin`, the
+/// category being the folder inside the soundbank.
+fn odin_library(soundbanks: &std::path::Path) -> Library {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, factory: bool, out: &mut Vec<Sound>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.is_dir() {
+                walk(&path, base, factory, out);
+            } else if path.extension().is_some_and(|x| x == "odin") {
+                let category = path.parent().and_then(|d| d.strip_prefix(base).ok()).map(|r| r.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                out.push(Sound { category, name, preferred: factory, load: Load::ValueTreePatch(path) });
+            }
+        }
+    }
+    let mut sounds = Vec::new();
+    for bank in std::fs::read_dir(soundbanks).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let factory = bank.file_name().is_some_and(|n| n == "Factory Presets");
+        walk(&bank, &bank, factory, &mut sounds);
+    }
+    sounds.sort_by_key(|s| (s.category.to_lowercase(), s.name.to_lowercase()));
+    Library { kind: "Odin 2 patches".into(), sounds, params: Vec::new() }
 }
 
 /// An LV2 instrument's installed presets plus the MIDI programmes it names.
@@ -292,6 +330,11 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
         Load::DexedVoice { syx, program } => crate::host::load_dexed_voice(plugin()?.0, syx, *program).map_err(|e| e.to_string()),
+        Load::ValueTreePatch(path) => {
+            let data = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
+            let state = crate::juce::value_tree_to_state(&data).map_err(|e| format!("{}: {e}", path.display()))?;
+            plugin()?.0.load_state(&state).map_err(|e| e.to_string())
+        }
         Load::ParamValue { param, value } => {
             plugin()?.1.set_param(clack_host::prelude::ClapId::new(*param), *value);
             Ok(())
@@ -490,6 +533,26 @@ impl Libraries {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn odin_soundbanks_list_one_sound_per_patch_file() {
+        let root = std::env::temp_dir().join(format!("ksalat-odin-banks-{}", std::process::id()));
+        let factory = root.join("Factory Presets/Bass");
+        let user = root.join("User Patches");
+        std::fs::create_dir_all(&factory).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(factory.join("Deep Sub.odin"), b"").unwrap();
+        std::fs::write(user.join("Mine.odin"), b"").unwrap();
+        std::fs::write(user.join("notes.txt"), b"").unwrap();
+        let library = odin_library(&root);
+        let labels: Vec<String> = library.sounds.iter().map(Sound::label).collect();
+        assert_eq!(labels, ["Mine", "Bass/Deep Sub"]);
+        assert!(library.sounds[1].preferred, "factory patches win a tie");
+        assert!(!library.sounds[0].preferred);
+        assert_eq!(library.sounds[1].load, Load::ValueTreePatch(factory.join("Deep Sub.odin")));
+        assert_eq!(Instrument::Clap(ODIN_ID.into()).source(), Source::OdinSoundbanks);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn sound(category: &str, name: &str, preferred: bool) -> Sound {
         Sound { category: category.into(), name: name.into(), preferred, load: Load::MidiProgram(0) }

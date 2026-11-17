@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Version and release metadata
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=${GITHUB_REF_NAME#v}
+            if [ "$version" != "$crate" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+              exit 1
+            fi
+            scripts/ci/release-notes.sh "$version" > /dev/null
+            if ! grep -q "<release version=\"$version\"" packaging/flatpak/io.github.ssalentin.kabelsalat.metainfo.xml; then
+              echo "::error::the metainfo has no <release version=\"$version\"> entry"
+              exit 1
+            fi
+          else
+            version="$crate-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: tarball + AppImage (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: scripts/ci/ubuntu-deps.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Tarball
+        run: packaging/tarball.sh target/release/kabelsalat "$VERSION" dist
+      - name: AppImage
+        run: packaging/appimage.sh target/release/kabelsalat "$VERSION" dist
+      - name: Smoke test
+        run: |
+          tar -xzf "dist/kabelsalat-$VERSION-linux-${{ matrix.arch }}.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/kabelsalat-$VERSION-linux-${{ matrix.arch }}/kabelsalat" --version
+          "dist/kabelsalat-$VERSION-${{ matrix.arch }}.AppImage" --appimage-extract-and-run --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/cache@v6
+        with:
+          path: .flatpak-builder
+          key: flatpak-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'packaging/flatpak/*') }}
+          restore-keys: flatpak-${{ matrix.arch }}-
+      - name: Build bundle
+        run: packaging/flatpak/build.sh "$VERSION" dist .flatpak-builder
+      - name: Smoke test
+        run: |
+          flatpak install --user -y --noninteractive "dist/kabelsalat-$VERSION-${{ matrix.arch }}.flatpak"
+          flatpak run --command=kabelsalat io.github.ssalentin.kabelsalat --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: flatpak-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  arch-package:
+    name: Arch package (${{ matrix.arch }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: archlinux:base-devel
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: menci/archlinuxarm:base-devel
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    steps:
+      # actions/checkout needs git for a real clone; makepkg reads its history.
+      - run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: makepkg
+        run: packaging/arch-makepkg.sh dist
+      - name: Smoke test
+        run: |
+          pacman -U --noconfirm dist/*.pkg.tar.*
+          kabelsalat --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: arch-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [version, binaries, flatpak, arch-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Create or update the GitHub release
+        run: |
+          scripts/ci/release-notes.sh "$VERSION" > "$RUNNER_TEMP/notes.md"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag \
+              --title "kabelsalat $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
+          fi

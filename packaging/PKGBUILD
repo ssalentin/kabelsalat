@@ -1,12 +1,12 @@
 # Maintainer: Sebastian Salentin
 pkgname=kabelsalat-git
 _pkgname=kabelsalat
-pkgver=0.0.1
+pkgver=0.1.0
 pkgrel=1
 pkgdesc='Live audio/MIDI wiring, alive: an AUM-style CLAP and LV2 plugin host with animated cables'
 arch=('x86_64' 'aarch64')
 url='https://github.com/ssalentin/kabelsalat'
-license=('unknown')
+license=('MIT')
 depends=('alsa-lib' 'lilv' 'dbus' 'gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'libglvnd')
 makedepends=('cargo' 'git')
 optdepends=(
@@ -24,7 +24,7 @@ options=('!lto')
 
 pkgver() {
   cd "$_pkgname"
-  printf '0.0.1.r%s.g%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
 prepare() {
@@ -46,4 +46,5 @@ package() {
   install -Dm644 packaging/$_pkgname.desktop "$pkgdir/usr/share/applications/$_pkgname.desktop"
   install -Dm644 assets/logo.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/$_pkgname.svg"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

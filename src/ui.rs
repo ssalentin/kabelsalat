@@ -5640,11 +5640,12 @@ impl DemoApp {
                     let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
                     ui.horizontal(|ui| {
                         no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
-                        if node_at > 0.01 {
+                        if Self::agent_badge_alpha(node_at) > 0.05 {
+                            let badge_a = Self::agent_badge_alpha(node_at);
                             let (br, _) = ui.allocate_exact_size(egui::vec2(44.0, 15.0), egui::Sense::hover());
-                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, node_at));
+                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, badge_a));
                             ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "AGENT",
-                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, node_at));
+                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
                         }
                     });
                     // Single-graph mode: all nodes share rig 0 — don't label
@@ -11014,12 +11015,19 @@ impl DemoApp {
         }));
     }
 
+    /// Opacity for the `AGENT` pill badge: fades out cleanly before the dark
+    /// label text loses contrast against the `#1C1C1C` unit plate (rule 84).
+    fn agent_badge_alpha(alpha_t: f32) -> f32 {
+        ((alpha_t - 0.38) / 0.62).clamp(0.0, 1.0)
+    }
+
     /// Crisp "AGENT" pill badge inside a rack unit header (rack-local rect).
     fn draw_agent_badge(&self, painter: &egui::Painter, rect: Rect, alpha_t: f32) {
-        if alpha_t <= 0.01 { return; }
+        let badge_a = Self::agent_badge_alpha(alpha_t);
+        if badge_a <= 0.05 { return; }
         let sr = self.xf.rect(rect);
-        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, alpha_t));
-        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, alpha_t));
+        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, badge_a));
+        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
     }
 
     fn draw_front(&self, painter: &egui::Painter) {
@@ -11090,7 +11098,7 @@ impl DemoApp {
                 self.draw_knob(painter, ui, ki);
             }
 
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = if self.split_rects(ui).is_some() {
                     Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
                 } else {
@@ -11953,7 +11961,7 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
                 self.draw_agent_badge(painter, badge, agent_t);
             }
@@ -17885,6 +17893,53 @@ mod ui_polish_agent_tests {
                 app.assistant_input_rect,
                 visible_turns.len()
             );
+        }
+    }
+
+    #[test]
+    fn bug2_untouched_units_paint_no_agent_badge_rect() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.demo_agent_hold = true;
+        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..60 {
+            app.update(0.04); // 2.4s: near end of fade on units not held by demo_agent_hold
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        fn walk_rects(shape: &egui::Shape, rects: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => for s in v { walk_rects(s, rects) },
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            walk_rects(&cs.shape, &mut rects);
+        }
+        for (ui_idx, u) in app.units.iter().enumerate() {
+            if matches!(u.node_kind, UnitKind::Clap | UnitKind::Dsp(_)) {
+                let r = app.unit_rects[ui_idx];
+                let badge_local = Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0));
+                let badge_screen = app.xf.rect(badge_local);
+                let stray: Vec<_> = rects.iter()
+                    .filter(|(rr, _)| (rr.center() - badge_screen.center()).length() < 2.0 && (rr.width() - badge_screen.width()).abs() < 2.0)
+                    .collect();
+                assert!(
+                    stray.is_empty(),
+                    "untouched/faded unit {} has stray badge rect {stray:?}",
+                    u.name
+                );
+            }
         }
     }
 }

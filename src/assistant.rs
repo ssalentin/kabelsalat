@@ -93,6 +93,26 @@ pub fn save_count_in(enabled: bool, bars: u8) -> std::io::Result<()> {
     save_count_in_to(&config_path(), enabled, bars)
 }
 
+pub fn load_reduce_motion_from(path: &std::path::Path) -> bool {
+    let v: Option<Value> = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok());
+    v.as_ref().and_then(|v| v.get("ui_reduce_motion")).and_then(Value::as_bool).unwrap_or(false)
+}
+
+pub fn save_reduce_motion_to(path: &std::path::Path, reduce: bool) -> std::io::Result<()> {
+    save_config_values_to(path, &[("ui_reduce_motion", json!(reduce))])
+}
+
+/// Persisted `ui_reduce_motion` flag in config.json (default false, test-safe no-op under cfg(test)).
+pub fn load_reduce_motion() -> bool {
+    if cfg!(test) { return false; }
+    load_reduce_motion_from(&config_path())
+}
+
+pub fn save_reduce_motion(reduce: bool) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_reduce_motion_to(&config_path(), reduce)
+}
+
 #[derive(Clone)]
 pub struct ChatLine {
     pub role: String,
@@ -1814,6 +1834,23 @@ mod tests {
 
         save_count_in_to(&p, false, 9).unwrap();
         assert_eq!(load_count_in_from(&p), (false, crate::transport::MAX_COUNT_IN_BARS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reduce_motion_persists_in_config_json_preserving_other_fields() {
+        let dir = std::env::temp_dir().join(format!("ksalat-rm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&p, r#"{"assistant_model":"deepseek-chat"}"#).unwrap();
+
+        assert!(!load_reduce_motion_from(&p));
+        save_reduce_motion_to(&p, true).unwrap();
+        assert!(load_reduce_motion_from(&p));
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(raw["assistant_model"], json!("deepseek-chat"));
+        assert_eq!(raw["ui_reduce_motion"], json!(true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

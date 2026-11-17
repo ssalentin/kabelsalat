@@ -293,10 +293,7 @@ impl Assistant {
         // switches the front off, e.g. agent_decide_model = "off".
         let decide = Some(Route::configured(Role::Decide))
             .filter(|r| decide && r.endpoint.spec().decisions_url.is_some() && r.endpoint.key().is_some());
-        let mut models: Vec<String> = Vec::new();
-        if Endpoint::OpenRouter.key().is_some() { models.push(llm::JEV_ROUTER.into()); }
-        models.extend([llm::DEEPSEEK_CHAT.to_string(), "deepseek-reasoner".to_string()]);
-        if !models.contains(&route.model) { models.insert(0, route.model.clone()); }
+        let models = picker_models(Endpoint::OpenRouter.key().is_some(), Endpoint::DeepSeek.key().is_some(), &route.model);
         let mut a = Self {
             history: Vec::new(),
             busy: false,
@@ -347,6 +344,11 @@ impl Assistant {
 
     pub fn model(&self) -> String {
         self.routes.act.lock().map(|r| r.model.clone()).unwrap_or_default()
+    }
+
+    /// Whether Jev's decision front answers requests before the chat model.
+    pub fn decides_first(&self) -> bool {
+        self.routes.decide.is_some()
     }
 
     /// Switch the acting model (persisted; applies from the next request).
@@ -846,6 +848,22 @@ pub(crate) fn tools() -> Value {
 }
 
 /// Which chat models can the DeepSeek key use? (once, for the picker)
+/// The chat models the picker offers. The Jev router is a chat-model router,
+/// not Jev's decision front (that runs before every request on its own): it
+/// is offered only where it is the default, with OpenRouter as the only key.
+/// The current model is always listed.
+fn picker_models(openrouter: bool, deepseek: bool, current: &str) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    if openrouter && !deepseek {
+        models.push(llm::JEV_ROUTER.into());
+    }
+    models.extend([llm::DEEPSEEK_CHAT.to_string(), "deepseek-reasoner".to_string()]);
+    if !models.iter().any(|m| m == current) {
+        models.insert(0, current.to_string());
+    }
+    models
+}
+
 fn fetch_deepseek_models() -> Option<Vec<String>> {
     let key = Endpoint::DeepSeek.key()?;
     let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
@@ -1816,6 +1834,19 @@ fn assistant_message(message: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// The picker never offers the Jev router next to DeepSeek: picking it
+    /// looked like "turning Jev on" and made every chat step 2-8 s.
+    #[test]
+    fn picker_offers_the_jev_router_only_without_a_deepseek_key() {
+        let both = picker_models(true, true, llm::DEEPSEEK_CHAT);
+        assert!(!both.iter().any(|m| m == llm::JEV_ROUTER), "{both:?}");
+        assert!(picker_models(true, false, llm::JEV_ROUTER).iter().any(|m| m == llm::JEV_ROUTER));
+        // A configured router stays visible (and switchable away from).
+        let cur = picker_models(true, true, llm::JEV_ROUTER);
+        assert_eq!(cur[0], llm::JEV_ROUTER);
+        assert!(cur.iter().any(|m| m == llm::DEEPSEEK_CHAT));
+    }
     use super::*;
 
     #[test]

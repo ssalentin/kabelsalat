@@ -1587,6 +1587,23 @@ struct BpmRects {
     plus: Option<Rect>,
 }
 
+/// One split zone's octave stepper on a Keys face (rack-local): − / value / +.
+#[derive(Clone, Copy, Debug)]
+struct ZoneRects {
+    minus: Rect,
+    value: Rect,
+    plus: Rect,
+}
+
+impl ZoneRects {
+    fn all(&self) -> Rect { self.minus.union(self.value).union(self.plus) }
+}
+
+/// Zone octave stepper widths: the ± buttons (BPM-sized) and the readout
+/// ("HIGH +3" in Medium 12 plus ≥ 8 px padding each side, rule 7).
+const ZONE_STEP_W: f32 = BPM_STEP_W;
+const ZONE_VALUE_W: f32 = 70.0;
+
 /// Metronome-face tap-tempo + count-in chip rects (rack-local).
 #[derive(Clone, Copy, Debug)]
 struct MetroActionRects {
@@ -3662,6 +3679,17 @@ impl DemoApp {
             }
             self.base_graph.set_split(n.id, n.split);
             if let Some(sg) = shared.as_mut() { sg.set_split(n.id, n.split); }
+            // Zone octaves ride along (set_split above reset them on unsplit).
+            if n.split.is_some() {
+                let was_oct = self.base_graph.node(n.id).map(|o| o.zone_octave);
+                if was_oct.is_some_and(|w| w != n.zone_octave) && now >= self.ui_node_grace.get(&n.id).copied().unwrap_or(-1.0) {
+                    touched_nodes.push(n.id);
+                }
+                for zone in 0..2u8 {
+                    self.base_graph.set_zone_octave(n.id, zone, n.zone_octave[zone as usize]);
+                    if let Some(sg) = shared.as_mut() { sg.set_zone_octave(n.id, zone, n.zone_octave[zone as usize]); }
+                }
+            }
             for (i, u) in self.units.iter_mut().enumerate() {
                 if u.node_id != n.id || !matches!(u.node_kind, UnitKind::Keys) || u.split == n.split { continue; }
                 set_unit_split(u, n.split);
@@ -3944,10 +3972,15 @@ impl DemoApp {
 
     fn human_tool_label(&self, name: &str, args: &serde_json::Value) -> String {
         match name {
-            "set_split" => match args.get("point").and_then(|v| v.as_u64()) {
-                Some(p) => format!("Split keys → {}", note_name(p.min(127) as u8)),
-                None => "Unsplit keys".into(),
-            },
+            "set_split" => {
+                let oct = |k: &str, name: &str| args.get(k).and_then(|v| v.as_i64()).map(|o| format!(" · {name} {o:+}"));
+                let octs = format!("{}{}", oct("low_octave", "low").unwrap_or_default(), oct("high_octave", "high").unwrap_or_default());
+                match args.get("point").and_then(|v| v.as_u64()) {
+                    Some(p) => format!("Split keys → {}{octs}", note_name(p.min(127) as u8)),
+                    None if !octs.is_empty() => format!("Zone octaves{octs}"),
+                    None => "Unsplit keys".into(),
+                }
+            }
             "add_node" => {
                 let what = args
                     .get("name")
@@ -4887,7 +4920,9 @@ impl DemoApp {
                 format!("rig {node} sources: keyboard={keyboard} hardware={hardware}")
             }
             "set_split" => {
-                let point = args.get("point").and_then(|v| v.as_u64()).map(|p| p.min(127) as u8);
+                let octave = |k: &str| args.get(k).and_then(|v| v.as_i64())
+                    .map(|o| o.clamp(-(crate::control::ZONE_OCTAVE_MAX as i64), crate::control::ZONE_OCTAVE_MAX as i64) as i8);
+                let (low, high) = (octave("low_octave"), octave("high_octave"));
                 // Default: the Keys node in view (each rig has its own).
                 let unit = match args.get("node").and_then(|v| v.as_u64()) {
                     Some(n) => self.units.iter().position(|u| u.node_id == n as u32),
@@ -4897,7 +4932,19 @@ impl DemoApp {
                     return "set_split needs a Keys node (get_graph kind Keys) — only keyboards split".into();
                 };
                 let node = self.units[unit].node_id;
+                // Only octaves: keep the split (C4 if there is none yet).
+                let point = match args.get("point").and_then(|v| v.as_u64()) {
+                    Some(p) => Some(p.min(127) as u8),
+                    None if low.is_some() || high.is_some() => Some(self.units[unit].split.unwrap_or(DEFAULT_SPLIT)),
+                    None => None,
+                };
                 self.set_keys_split(unit, point);
+                let mut oct = if point.is_some() { self.zone_octaves(unit) } else { [0; 2] };
+                for (zone, o) in [(0u8, low), (1u8, high)] {
+                    if let Some(o) = o {
+                        if let Some(set) = self.set_zone_octave(unit, zone, o) { oct[zone as usize] = set; }
+                    }
+                }
                 if self.graph_pub.is_some() {
                     self.pending_agent_origin = Some((origin, now + 1.0));
                 }
@@ -4907,8 +4954,8 @@ impl DemoApp {
                 };
                 self.agent_activity.record(origin, summary, vec![node], now);
                 match point {
-                    Some(p) => format!("keys node {node} split at note {p} ({}): port 0 = LOW (below), port 1 = HIGH (at/above) — wire HIGH with connect from_port 1", note_name(p)),
-                    None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed"),
+                    Some(p) => format!("keys node {node} split at note {p} ({}): port 0 = LOW (below, octave {:+}), port 1 = HIGH (at/above, octave {:+}) — wire HIGH with connect from_port 1", note_name(p), oct[0], oct[1]),
+                    None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed, octaves reset"),
                 }
             }
             "save_session" => {
@@ -10974,6 +11021,72 @@ impl DemoApp {
         Some((chip, readout))
     }
 
+    /// Octave steppers of a split Keys face, `[LOW, HIGH]` (rack-local): a
+    /// row under the SPLIT control, right-aligned with it; HIGH stacks above
+    /// LOW when one row does not fit. None while unsplit, or when the face
+    /// has no room left above its knob row (never squeeze, rule 22).
+    fn zone_rects(&self, unit: usize) -> Option<[ZoneRects; 2]> {
+        if self.units.get(unit)?.split.is_none() { return None; }
+        let (chip, readout) = self.split_rects(unit)?;
+        let r = *self.unit_rects.get(unit)?;
+        let group_w = 2.0 * (ZONE_STEP_W + 4.0) + ZONE_VALUE_W;
+        let at = |x: f32, y: f32| {
+            let minus = Rect::from_min_size(Pos2::new(x, y), Vec2::new(ZONE_STEP_W, FACE_CTL_H));
+            let value = Rect::from_min_size(Pos2::new(minus.right() + 4.0, y), Vec2::new(ZONE_VALUE_W, FACE_CTL_H));
+            let plus = Rect::from_min_size(Pos2::new(value.right() + 4.0, y), Vec2::new(ZONE_STEP_W, FACE_CTL_H));
+            ZoneRects { minus, value, plus }
+        };
+        let right = readout.right();
+        // The rows sit beside the unit's title + subtitle: keep clear of both.
+        let u = &self.units[unit];
+        let header_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x)
+            .max(u.sub_g.as_ref().map_or(0.0, |g| g.size.x));
+        let left_limit = r.left() + FACE_X + header_w + 12.0;
+        // Room down to the knob row's top edge (labels sit below the knobs).
+        let floor = self.knob_row_y(unit) - KNOB_R - 10.0;
+        let y1 = chip.bottom() + 8.0;
+        if right - (2.0 * group_w + 10.0) >= left_limit && y1 + FACE_CTL_H <= floor {
+            let high = at(right - group_w, y1);
+            let low = at(right - 2.0 * group_w - 10.0, y1);
+            return Some([low, high]);
+        }
+        let y2 = y1 + FACE_CTL_H + 6.0;
+        if right - group_w >= left_limit && y2 + FACE_CTL_H <= floor {
+            return Some([at(right - group_w, y2), at(right - group_w, y1)]);
+        }
+        None
+    }
+
+    /// The `[LOW, HIGH]` octave shifts of a Keys unit's split zones, as the
+    /// engine published them (base graph mirror).
+    fn zone_octaves(&self, unit: usize) -> [i8; 2] {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .map_or([0; 2], |n| n.zone_octave)
+    }
+
+    /// Shift one split zone of a Keys unit (face stepper, assistant). The
+    /// engine releases held notes and publishes; headless applies locally.
+    /// Returns the octave set, or None if the unit is not a split Keys unit.
+    fn set_zone_octave(&mut self, unit: usize, zone: u8, octave: i8) -> Option<i8> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Keys) || zone > 1 { return None; }
+        // With an engine, a split sent just before is on the bus ahead of
+        // this (FIFO) and the engine ignores an unsplit node; headless
+        // needs the split applied already.
+        if self.graph_pub.is_none() && u.split.is_none() { return None; }
+        let node = u.node_id;
+        let o = octave.clamp(-crate::control::ZONE_OCTAVE_MAX, crate::control::ZONE_OCTAVE_MAX);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetZoneOctave { node, zone, octave: o });
+        }
+        if self.graph_pub.is_none() {
+            self.base_graph.set_zone_octave(node, zone, o);
+            if let Ok(mut sg) = self.shared_graph.lock() { sg.set_zone_octave(node, zone, o); }
+        }
+        Some(o)
+    }
+
     /// Split point shown on a Keys face: the live drag value while dragging
     /// its readout, else the unit's (engine-mirrored) split.
     fn shown_split(&self, unit: usize) -> Option<u8> {
@@ -12031,6 +12144,23 @@ impl DemoApp {
                         self.ui_node_grace.insert(nid, self.ui_time + 0.6);
                         self.set_keys_split(ui, next);
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.minus.contains(l.to_pos2()) || z.plus.contains(l.to_pos2()))) => {
+                        // Keys-face zone octave − / +.
+                        let p = l.to_pos2();
+                        let zones = self.zone_rects(ui).unwrap();
+                        let oct = self.zone_octaves(ui);
+                        for (zi, z) in zones.iter().enumerate() {
+                            let step = if z.minus.contains(p) { -1 } else if z.plus.contains(p) { 1 } else { continue };
+                            let nid = self.units[ui].node_id;
+                            self.ui_node_grace.insert(nid, self.ui_time + 0.6);
+                            self.set_zone_octave(ui, zi as u8, oct[zi] + step);
+                        }
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.value.contains(l.to_pos2()))) => {
+                        // A click on a zone readout is not a ping.
+                    }
                     Some(Hit::Unit(ui)) if self.side == Side::Front && self.on_face_field(ui, l.to_pos2()) => {
                         // A click on a drag readout (split point / BPM) is not a ping.
                     }
@@ -12675,6 +12805,7 @@ impl DemoApp {
                 UnitKind::Keys => {
                     self.draw_notes_display(painter, ui);
                     self.draw_split_face(painter, ui);
+                    self.draw_zone_octaves(painter, ui);
                 }
                 UnitKind::Clap => self.draw_surge_display(painter, ui),
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
@@ -12772,6 +12903,31 @@ impl DemoApp {
                 self.paint_face_field(painter, readout, false);
                 self.face_text(painter, readout.center(), "OFF", FontId::proportional(11.0), SUBTEXT);
             }
+        }
+    }
+
+    /// Keys face, split: one octave stepper per zone ("LOW +1"), BPM style.
+    fn draw_zone_octaves(&self, painter: &egui::Painter, unit: usize) {
+        let Some(zones) = self.zone_rects(unit) else { return };
+        let oct = self.zone_octaves(unit);
+        for (zi, z) in zones.iter().enumerate() {
+            for (rect, plus) in [(z.minus, false), (z.plus, true)] {
+                let limit = if plus { oct[zi] >= crate::control::ZONE_OCTAVE_MAX } else { oct[zi] <= -crate::control::ZONE_OCTAVE_MAX };
+                let hov = !limit && self.face_hovered(painter, unit, rect);
+                self.paint_face_chip(painter, rect, "", false, hov);
+                let col = if limit { theme::MUTED } else if hov { theme::CREAM } else { theme::CREAM_MID };
+                let c = rect.center();
+                let st = Stroke::new(1.5, col);
+                painter.line_segment([self.xf.p(c.to_vec2() + Vec2::new(-4.5, 0.0)), self.xf.p(c.to_vec2() + Vec2::new(4.5, 0.0))], st);
+                if plus {
+                    painter.line_segment([self.xf.p(c.to_vec2() + Vec2::new(0.0, -4.5)), self.xf.p(c.to_vec2() + Vec2::new(0.0, 4.5))], st);
+                }
+            }
+            self.paint_face_field(painter, z.value, false);
+            let name = if zi == 0 { "LOW" } else { "HIGH" };
+            let txt = if oct[zi] == 0 { format!("{name} 0") } else { format!("{name} {:+}", oct[zi]) };
+            let col = if oct[zi] == 0 { SUBTEXT } else { TEXT };
+            self.face_text(painter, z.value.center(), &txt, theme::medium_font(12.0), col);
         }
     }
 
@@ -18193,6 +18349,36 @@ mod split_bpm_tests {
     }
 
     #[test]
+    fn zone_octaves_from_the_face_and_the_agent() {
+        let (mut app, ctx) = demo();
+        let k = keys(&app);
+        assert!(app.zone_rects(k).is_none(), "no steppers while unsplit");
+        // Agent: octaves alone split at C4 and shift the zone.
+        let r = app.exec_tool("set_split", &serde_json::json!({"low_octave": 1}));
+        assert!(r.contains("split at note 60") && r.contains("octave +1"), "{r}");
+        assert_eq!(app.zone_octaves(k), [1, 0]);
+        // Face: the steppers show at the default window size; + on LOW.
+        frame(&mut app, &ctx, vec![]);
+        let z = app.zone_rects(k).expect("steppers on a split Keys face");
+        let at = app.xf.p(z[0].plus.center().to_vec2());
+        click(&mut app, &ctx, at);
+        assert_eq!(app.zone_octaves(k), [2, 0], "LOW + raised the low zone");
+        let z = app.zone_rects(k).unwrap();
+        let at = app.xf.p(z[1].minus.center().to_vec2());
+        click(&mut app, &ctx, at);
+        assert_eq!(app.zone_octaves(k), [2, -1], "HIGH − lowered the high zone");
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "LOW +2") && texts.iter().any(|t| t == "HIGH -1"), "{texts:?}");
+        // Saved with the session (a Keys node property).
+        let s = app.capture_session("zones").unwrap();
+        assert_eq!(s.graph.node(app.units[k].node_id).unwrap().zone_octave, [2, -1]);
+        // Unsplit resets them.
+        app.exec_tool("set_split", &serde_json::json!({}));
+        assert_eq!(app.units[k].split, None);
+        assert_eq!(app.zone_octaves(k), [0, 0]);
+    }
+
+    #[test]
     fn split_round_trips_through_sessions() {
         let (mut app, _ctx) = demo();
         let k = keys(&app);
@@ -20721,6 +20907,10 @@ mod face_layout_tests {
             v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
+        if let Some(z) = app.zone_rects(ui) {
+            v.push(("zone low".into(), z[0].all()));
+            v.push(("zone high".into(), z[1].all()));
+        }
         if let Some(c) = app.transport_chip_rect(ui) { v.push(("play".into(), c.expand2(Vec2::new(0.0, 0.0)).union(Rect::from_center_size(Pos2::new(c.right() + 16.0, c.center().y), Vec2::splat(14.0))))); }
         if let Some(b) = app.bpm_rects(ui) {
             let mut br = b.value;
@@ -20772,6 +20962,20 @@ mod face_layout_tests {
     #[test]
     fn demo_faces_are_padded_and_clear() {
         check(DemoApp::new_with_sink(None), "demo");
+    }
+
+    #[test]
+    fn split_keys_faces_with_zone_octaves_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        let k = app.keys_unit.unwrap();
+        app.set_keys_split(k, Some(60));
+        app.set_zone_octave(k, 0, 1);
+        check(app, "split keys");
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let k = app.keys_unit.unwrap();
+        app.set_keys_split(k, Some(60));
+        check(app, "split keys, two rigs");
     }
 
     #[test]

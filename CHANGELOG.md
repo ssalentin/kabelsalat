@@ -7,6 +7,12 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+### Added
+- **Octave per split zone:** a split Keys face shows LOW and HIGH octave
+  steppers (−3…+3). A bass below the split no longer has to sound as deep as
+  the low keys it is played on; the assistant sets the LOW zone an octave up
+  when it puts a bass there. Saved with the session.
+
 ### Changed
 - **Rope cables:** patch cables are now Verlet ropes (gravity, slack, plugged
   ends pinned, a free end falls) instead of spring-driven Bézier curves.

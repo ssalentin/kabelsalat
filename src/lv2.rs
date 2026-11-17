@@ -558,19 +558,34 @@ pub fn main_controls_cached(uri: &str) -> Option<crate::main_controls::MainContr
     let uri = uri.to_string();
     std::thread::spawn(move || {
         let found = main_controls_for_uri(&uri);
-        let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = cache.iter_mut().find(|(u, _)| *u == uri) {
-            entry.1 = Some(found);
-        }
+        store_main_controls(&uri, found);
     });
     None
 }
 
-#[cfg(test)]
-pub(crate) fn set_main_controls_for_test(uri: &str, found: crate::main_controls::MainControls) {
+/// [`main_controls_cached`] for callers that may block (headless MCP):
+/// resolves on the calling thread when the cache has no answer yet.
+pub fn main_controls_blocking(uri: &str) -> crate::main_controls::MainControls {
+    if let Some(found) = main_controls_cached(uri) {
+        return found;
+    }
+    if cfg!(test) {
+        return Default::default();
+    }
+    let found = main_controls_for_uri(uri);
+    store_main_controls(uri, found.clone());
+    found
+}
+
+fn store_main_controls(uri: &str, found: crate::main_controls::MainControls) {
     let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
     cache.retain(|(u, _)| u != uri);
     cache.push((uri.to_string(), Some(found)));
+}
+
+#[cfg(test)]
+pub(crate) fn set_main_controls_for_test(uri: &str, found: crate::main_controls::MainControls) {
+    store_main_controls(uri, found);
 }
 
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {

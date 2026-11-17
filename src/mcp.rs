@@ -1370,16 +1370,23 @@ impl McpServer {
         }
     }
 
-    /// Same table as the rack faces (`engine::knob_specs`): labels like
-    /// "RESO"/"CEIL" are canonical, long names ("RESONANCE") are aliases.
+    /// Same tables as the rack faces: `engine::knob_specs` (labels like
+    /// "RESO"/"CEIL" are canonical, long names are aliases), and for an LV2
+    /// plugin its main controls, by full name or knob label.
     fn resolve_headless_knob(kind: &NodeKind, knob: &str) -> Result<u32, String> {
-        let spec = crate::engine::find_knob_spec(kind, knob)
-            .ok_or_else(|| format!("no knob '{knob}' on this node"))?;
-        spec.param.ok_or_else(|| format!("knob '{}' is local-only", spec.label))
+        if let Some(spec) = crate::engine::find_knob_spec(kind, knob) {
+            return spec.param.ok_or_else(|| format!("knob '{}' is local-only", spec.label));
+        }
+        if let NodeKind::Lv2 { uri } = kind {
+            if let Some(c) = crate::lv2::main_controls_blocking(uri.as_str()).find(knob) {
+                return Ok(c.id);
+            }
+        }
+        Err(format!("no knob '{knob}' on this node"))
     }
 
     /// Bind or unbind one CC on a matrix rule.
-    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL'). Omit param/knob to unbind that CC.")]
+    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL', or knob=<a main control's name from list_params>). Omit param/knob to unbind that CC.")]
     fn set_cc_map(&self, Parameters(args): Parameters<SetCcMapArgs>) -> Result<CallToolResult, McpError> {
         if args.cc > 127 {
             return tool_err("cc must be 0..=127");
@@ -1565,7 +1572,7 @@ impl McpServer {
     }
 
     /// List bindable parameter ids and names for a node.
-    #[tool(name = "list_params", description = "List parameter ids and names for a node (for set_cc_map / learn_cc). CLAP plugin params require --attach to the running GUI app.")]
+    #[tool(name = "list_params", description = "List a node's parameters for set_cc_map / learn_cc. main_controls comes first: the few parameters the plugin's designer marked as most important (page, name, id, value, text, and the face knob showing it). Prefer them, and pass a main control's name as knob=<name>. params is the full list (id, name), filtered by query. CLAP plugin params require --attach to the running GUI app.")]
     fn list_params(&self, Parameters(args): Parameters<ListParamsArgs>) -> Result<CallToolResult, McpError> {
         let remote = {
             let st = self.state.lock().unwrap();
@@ -1607,11 +1614,37 @@ impl McpServer {
             .take(50)
             .map(|(id, name)| json!({"id": id, "name": name}))
             .collect();
-        let knobs: Vec<Value> = crate::engine::knob_specs(&n.kind)
+        let mut knobs: Vec<Value> = crate::engine::knob_specs(&n.kind)
             .iter()
             .filter_map(|k| k.param.map(|p| json!({"label": k.label, "param": p, "target": "knob"})))
             .collect();
-        ok_json(json!({"node": args.node, "total": total, "params": params, "knobs": knobs}))
+        // No plugin runs headless: an LV2 control shows the default it starts at.
+        let found = match &n.kind {
+            NodeKind::Lv2 { uri } => crate::lv2::main_controls_blocking(uri.as_str()),
+            _ => Default::default(),
+        };
+        let main_controls: Vec<Value> = found
+            .controls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let knob = (i < crate::main_controls::FACE_MAIN_CONTROLS).then(|| crate::main_controls::knob_label(&c.name));
+                json!({
+                    "page": c.page, "name": c.name, "id": c.id, "value": c.default, "text": format!("{:.3}", c.default),
+                    "min": c.min, "max": c.max, "target": "knob", "knob": knob,
+                })
+            })
+            .collect();
+        knobs.extend(found.face().iter().map(|c| json!({"label": crate::main_controls::knob_label(&c.name), "param": c.id, "target": "knob"})));
+        let source = (!main_controls.is_empty()).then_some(found.source.as_str());
+        ok_json(json!({
+            "node": args.node,
+            "main_controls_source": source,
+            "main_controls": main_controls,
+            "total": total,
+            "params": params,
+            "knobs": knobs,
+        }))
     }
 
     /// Arm MIDI-learn in the running GUI app.
@@ -2522,6 +2555,39 @@ mod tests {
         let res = tool_json(&server.set_cc_map(Parameters(set)));
         assert_eq!(res["param"], json!(crate::engine::P_MIX), "{res}");
         assert_eq!(res["target"], json!("knob"));
+    }
+
+    /// An LV2 node's main controls reach a headless agent first, and their
+    /// names bind like the app's face knobs (the same `MainControls::find`).
+    #[test]
+    fn headless_list_params_leads_with_an_lv2_plugins_main_controls() {
+        use crate::main_controls::{MainControl, MainControls, MainSource};
+        let uri = "urn:kabelsalat:test-headless-synth";
+        let control = |id: u32, name: &str| MainControl { id, name: name.into(), page: String::new(), min: 0.0, max: 1.0, default: 0.5 };
+        crate::lv2::set_main_controls_for_test(uri, MainControls {
+            source: MainSource::Designation,
+            controls: vec![control(7, "Filter Cutoff"), control(2, "Resonance")],
+        });
+        let kind = NodeKind::Lv2 { uri: control::Lv2Uri::new(uri) };
+        assert_eq!(McpServer::resolve_headless_knob(&kind, "filter cutoff"), Ok(7), "by full name");
+        assert_eq!(McpServer::resolve_headless_knob(&kind, "RESO"), Ok(2), "by knob label");
+        assert!(McpServer::resolve_headless_knob(&kind, "GAIN").is_err(), "no knob on port 0 by a made-up name");
+
+        let (server, mut engine) = local_server();
+        let added: AddNodeArgs = serde_json::from_value(json!({"kind": "lv2", "uri": uri, "name": "Synth"})).unwrap();
+        let node = tool_json(&server.add_node(Parameters(added)))["id"].as_u64().unwrap() as u32;
+        engine.render(&mut vec![0.0f32; 64 * 2], 64);
+        let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node, query: None })));
+        assert_eq!(out["main_controls_source"], json!("designation"), "{out}");
+        assert_eq!(out["main_controls"][0]["name"], json!("Filter Cutoff"));
+        assert_eq!(out["main_controls"][0]["id"], json!(7));
+        assert_eq!(out["main_controls"][1]["knob"], json!("RESO"));
+        let labels: Vec<&str> = out["knobs"].as_array().unwrap().iter().map(|k| k["label"].as_str().unwrap()).collect();
+        assert_eq!(labels, ["CUTOFF", "RESO"], "the knobs the app's face shows");
+        // A node without a plugin has none, and says so with an empty list.
+        let delay = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: None })));
+        assert_eq!(delay["main_controls"], json!([]));
+        assert_eq!(delay["main_controls_source"], Value::Null);
     }
 
     /// #22: play_file needs the app (the path cannot cross the command bus);

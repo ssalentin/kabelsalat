@@ -614,8 +614,6 @@ struct ClapPin {
 
 /// Most plugin parameters on one synth face (main controls and pins together).
 const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
-/// Longest knob label in characters; `fit_label` then fits it to the slot.
-const KNOB_LABEL_CHARS: usize = 9;
 /// Width a knob label may use: one knob slot minus a gap to its neighbour.
 const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
 /// How often plugin knobs follow their plugin (values and renamed controls).
@@ -660,8 +658,8 @@ struct Unit {
     ins: [PortKind; 3],
     outs: [PortKind; 3],
     knobs: Vec<Knob>,
-    /// Which plugin instance the main-control knobs were built from (a CLAP
-    /// voice id, 0 for an LV2 URI); None until that plugin is known.
+    /// Which plugin the main-control knobs were built from (a CLAP voice id,
+    /// 0 for an LV2 plugin); None until that plugin's controls are known.
     main_from: Option<u64>,
     jacks: Vec<Jack>,
     led: f32,
@@ -759,7 +757,7 @@ enum MainTarget {
 fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarget) -> Knob {
     let norm = c.normalized(value);
     Knob {
-        label: crate::main_controls::knob_label(&c.name, KNOB_LABEL_CHARS),
+        label: crate::main_controls::knob_label(&c.name),
         value: norm,
         display_value: norm,
         glide_from: norm,
@@ -831,7 +829,8 @@ fn set_unit_split(u: &mut Unit, split: Option<u8>) {
 
 /// Value of the knob bound to `param`, or `default` if the unit has no such knob.
 fn knob_val(u: &Unit, param: u32, default: f32) -> f32 {
-    u.knobs.iter().find(|k| k.param == Some(param)).map(|k| k.value).unwrap_or(default)
+    // The unit's own knobs only: an LV2 control port shares the id space.
+    u.knobs.iter().find(|k| k.source == KnobSource::BuiltIn && k.param == Some(param)).map(|k| k.value).unwrap_or(default)
 }
 
 /// Visual breathing factor for audio leaving a unit (the engine does the real
@@ -2579,8 +2578,6 @@ impl DemoApp {
                     if u.lv2_inst {
                         u.sub = "lv2 synth".into();
                         u.sub_g = None;
-                        // An instrument's knobs are its main controls (sync_main_knobs).
-                        u.knobs.clear();
                     }
                 }
             }
@@ -9985,18 +9982,16 @@ impl DemoApp {
                 let idx = self.clap_pool_idx(self.rig_of_unit(unit)?)?;
                 self._surge_main.get(idx).map(|m| m.main_controls().clone())
             }
-            UnitKind::Dsp(_) if u.lv2_inst => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+            _ => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
                 Some(NodeKind::Lv2 { uri }) => crate::lv2::main_controls_cached(uri.as_str()),
                 _ => None,
             },
-            _ => None,
         }
     }
 
     /// Current values of the LV2 main-control knobs, as session params.
     fn lv2_main_values(&self) -> Vec<crate::session::ParamValue> {
         self.units.iter()
-            .filter(|u| u.lv2_inst)
             .flat_map(|u| u.knobs.iter().filter_map(move |k| {
                 let param = k.param.filter(|_| matches!(k.source, KnobSource::Main(_)))?;
                 Some(crate::session::ParamValue { node: u.node_id, param, value: k.value as f64 })
@@ -10032,7 +10027,8 @@ impl DemoApp {
                         follow_plugin_values(u, main, self.ui_time, self.reduce_motion);
                     }
                 }
-                UnitKind::Dsp(_) if self.units[ui].lv2_inst && self.units[ui].main_from.is_none() => {
+                // An LV2 unit, once its plugin's controls are resolved.
+                UnitKind::Dsp(_) if self.units[ui].main_from.is_none() => {
                     let Some(found) = self.unit_main_controls(ui) else { continue };
                     let u = &mut self.units[ui];
                     set_main_knobs(u, found.face(), MainTarget::Lv2, |c| c.default);
@@ -10100,7 +10096,7 @@ impl DemoApp {
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
         // After the other plugin knobs, left of the unit's own.
         u.knobs.insert(plugin_knobs, Knob {
-            label: crate::main_controls::knob_label(&p.name, KNOB_LABEL_CHARS),
+            label: crate::main_controls::knob_label(&p.name),
             value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
             param: None, hidden: false, sent: Some(norm),
@@ -19953,8 +19949,8 @@ mod main_control_tests {
 
     const LV2_SYNTH: &str = "urn:kabelsalat:test-synth";
 
-    /// Keys → an LV2 instrument → Master, with the instrument's controls
-    /// already resolved (the app resolves them on a worker thread).
+    /// Keys → an LV2 plugin → Master, with the plugin's controls already
+    /// resolved (the app resolves them on a worker thread).
     pub(super) fn lv2_synth_rack(params: &[crate::session::ParamValue]) -> (DemoApp, usize) {
         crate::lv2::set_main_controls_for_test(LV2_SYNTH, MainControls { source: MainSource::Fallback, ..synth_controls() });
         let mut g = Graph::default();
@@ -19966,9 +19962,6 @@ mod main_control_tests {
         let mut app = DemoApp::new_with_sink(None);
         app.build_rack(&g, params);
         let unit = app.units.iter().position(|u| u.node_id == synth).unwrap();
-        // build_rack classifies instruments from the installed plugins; this one is not installed.
-        app.units[unit].lv2_inst = true;
-        app.units[unit].knobs.clear();
         (app, unit)
     }
 
@@ -20062,8 +20055,6 @@ mod main_control_tests {
         let graph = app.base_graph.clone();
         app.build_rack(&graph, &[]);
         app.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
-        app.units[unit].lv2_inst = true;
-        app.units[unit].knobs.clear();
         frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
         let k = &app.units[unit].knobs[0];
         assert!((k.value - 0.1).abs() < 1e-6, "the value survives the rebuild");

@@ -152,7 +152,9 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
             DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
             DspKind::Metronome => &[],
         },
-        NodeKind::Lv2 { .. } => knobs!(ks("GAIN", 0.9, Some(0), &[])),
+        // An LV2 unit's knobs are its plugin's main controls (`main_controls`):
+        // param 0 is whatever port the plugin lists first, never a "gain".
+        NodeKind::Lv2 { .. } => &[],
         // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
         NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
         NodeKind::AudioIn { .. } => knobs!(

@@ -19,7 +19,7 @@
 //! arc-length LUTs, cached galleys, fixed pulse arrays — no per-frame
 //! allocation storms. Pure snapshot-style simulation; never touches audio.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -518,9 +518,19 @@ impl PortKind {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Side { Front, Back }
 
+const KNOB_GLIDE_SECS: f32 = 0.20;
+const CABLE_DRAW_IN_SECS: f32 = 0.28;
+const UNIT_FADE_SECS: f32 = 0.24;
+const AGENT_PULSE_SECS: f32 = 0.38;
+
 struct Knob {
     label: String,
+    /// Target/logical value published immediately to the engine (rule 31).
     value: f32,
+    /// Visual needle/arc value (equals `value` on drag/load, glides on agent edits).
+    display_value: f32,
+    glide_from: f32,
+    glide_t: f32,
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
@@ -537,6 +547,27 @@ struct Knob {
 }
 
 impl Knob {
+    fn set_immediate(&mut self, v: f32) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        self.display_value = v;
+        self.glide_from = v;
+        self.glide_t = 1.0;
+    }
+
+    fn glide_to(&mut self, v: f32, reduce_motion: bool) {
+        let v = v.clamp(0.0, 1.0);
+        self.value = v;
+        if reduce_motion || (self.display_value - v).abs() < 1e-4 {
+            self.display_value = v;
+            self.glide_from = v;
+            self.glide_t = 1.0;
+        } else {
+            self.glide_from = self.display_value;
+            self.glide_t = 0.0;
+        }
+    }
+
     /// Engine or plugin target this knob controls, if bindable to MIDI CC.
     fn cc_target(&self) -> Option<(u32, crate::matrix::CcTarget)> {
         if let Some(pin) = self.clap {
@@ -630,13 +661,37 @@ impl Unit {
 
 /// Build a knob. `param` = engine param id it publishes (None = visual-only).
 fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: false, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: false,
+        sent: None,
+        clap: None,
+        label_g: None,
+    }
 }
 
 /// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
 /// and persisted; the face renders its state as a chip instead.
 fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob { label: label.to_string(), value: default, default, param, hidden: true, sent: None, clap: None, label_g: None }
+    Knob {
+        label: label.to_string(),
+        value: default,
+        display_value: default,
+        glide_from: default,
+        glide_t: 1.0,
+        default,
+        param,
+        hidden: true,
+        sent: None,
+        clap: None,
+        label_g: None,
+    }
 }
 
 /// Keys back-panel jacks: one MIDI OUT unsplit; LOW (port 0) + HIGH
@@ -884,6 +939,34 @@ const ENGINE_EDIT_TOOLS: &[&str] = &["add_node", "connect", "disconnect", "remov
 /// How long a tool batch waits for the engine to publish one edit.
 const ENGINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Outcome state of an in-run action chip rendered under the user's message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolChipState {
+    Running,
+    Done,
+    NotApplied,
+    Failed,
+}
+
+/// One tool call chip rendered inside a chat turn run.
+#[derive(Clone, Debug)]
+struct ToolChip {
+    label: String,
+    state: ToolChipState,
+}
+
+/// Chips, collapse state, and final cost line associated with one user turn
+/// in `Assistant::history` (keyed by that `"user"` line's index).
+#[derive(Clone, Debug, Default)]
+struct TranscriptRun {
+    chips: Vec<ToolChip>,
+    expanded: bool,
+    cost_line: Option<String>,
+}
+
+/// Maximum tool chips shown in a finished or long run before `"+N more"`.
+const COLLAPSED_RUN_CHIPS: usize = 3;
+
 /// One model step's tool calls, run in call order. An engine edit is a
 /// barrier: the next call runs only after the engine published the edit and
 /// the rack adopted it, so every later call — and the model's next step —
@@ -892,6 +975,8 @@ struct ToolBatch {
     todo: VecDeque<ToolCall>,
     results: Vec<ToolOutput>,
     waiting: Option<Waiting>,
+    user_idx: usize,
+    chip_cursor: usize,
 }
 
 /// What a tool batch waits for before its next call runs. The wait spans
@@ -1256,6 +1341,8 @@ struct Cable {
     audio_tick: f32,
 
     age: f32,
+    /// Visual draw-in progress (0..1 from src to dst for agent-added cables).
+    draw_in: f32,
     dying: f32, // < 0 alive; else unplug-fall progress (seconds)
     detach_dst: bool,
     drift: f32,
@@ -1278,7 +1365,7 @@ impl Cable {
             n: 0, total_len: 0.0, curve: [Pos2::ZERO; 4],
             pulses: [dead; MAX_PULSES],
             level: 0.0, env: 0.0, phase: (seed % 628) as f32 / 100.0, audio_tick: 0.0,
-            age: 0.0, dying: -1.0, detach_dst: true, drift: 0.0,
+            age: 0.0, draw_in: 1.0, dying: -1.0, detach_dst: true, drift: 0.0,
             next_event: 0.0, pat_idx: 0, rng: seed | 1,
         }
     }
@@ -1555,12 +1642,29 @@ struct AgentAction {
     nodes: Vec<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct FadingUnit {
+    rect: Rect,
+    alpha: f32,
+    agent: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FadingCable {
+    curve: [Pos2; 4],
+    color: Color32,
+    width: f32,
+    alpha: f32,
+    agent: bool,
+}
+
 /// Model-first store of recent agent edits, keyed by stable domain IDs
 /// (`NodeId`, `EdgeId`, `(SourceId, NodeId)`, rig index) so `build_rack`
 /// rebuilds never drop or shift highlights.
 #[derive(Default)]
 struct AgentActivity {
     nodes: std::collections::HashMap<u32, f32>,
+    node_pulse_at: std::collections::HashMap<u32, f32>,
     edges: std::collections::HashMap<u32, f32>,
     matrix_cells: std::collections::HashMap<(SourceId, u32), f32>,
     rigs: std::collections::HashMap<usize, f32>,
@@ -1569,6 +1673,14 @@ struct AgentActivity {
 
 impl AgentActivity {
     fn touch_node(&mut self, node: u32, now: f32) {
+        if self.nodes.get(&node).is_none_or(|&exp| exp <= now) {
+            self.node_pulse_at.insert(node, now);
+        }
+        self.nodes.insert(node, now + AGENT_TOUCH_SECS);
+    }
+
+    fn trigger_node_pulse(&mut self, node: u32, now: f32) {
+        self.node_pulse_at.insert(node, now);
         self.nodes.insert(node, now + AGENT_TOUCH_SECS);
     }
 
@@ -1586,7 +1698,7 @@ impl AgentActivity {
 
     fn record(&mut self, origin: AgentOrigin, summary: impl Into<String>, nodes: Vec<u32>, now: f32) {
         for &n in &nodes {
-            self.touch_node(n, now);
+            self.trigger_node_pulse(n, now);
         }
         self.log.push_front(AgentAction {
             origin,
@@ -1610,6 +1722,13 @@ impl AgentActivity {
         Self::strength(self.nodes.get(&node), now)
     }
 
+    fn node_pulse(&self, node: u32, now: f32, reduce_motion: bool) -> f32 {
+        if reduce_motion { return 0.0; }
+        let Some(&start) = self.node_pulse_at.get(&node) else { return 0.0 };
+        let t = (now - start) / AGENT_PULSE_SECS;
+        if (0.0..1.0).contains(&t) { (t * std::f32::consts::PI).sin() } else { 0.0 }
+    }
+
     fn edge_alpha(&self, edge: u32, now: f32) -> f32 {
         Self::strength(self.edges.get(&edge), now)
     }
@@ -1631,6 +1750,7 @@ impl AgentActivity {
 
     fn prune(&mut self, now: f32) {
         self.nodes.retain(|_, exp| *exp > now);
+        self.node_pulse_at.retain(|id, _| self.nodes.contains_key(id));
         self.edges.retain(|_, exp| *exp > now);
         self.matrix_cells.retain(|_, exp| *exp > now);
         self.rigs.retain(|_, exp| *exp > now);
@@ -1828,6 +1948,10 @@ struct DemoApp {
     /// `--demo-agent` screenshot hook: keeps the demo agent's touch fresh every
     /// frame so the rack highlight stays visible instead of fading after 2.6s.
     demo_agent_hold: bool,
+    /// Disables rack animations (`ui_reduce_motion` in config.json).
+    reduce_motion: bool,
+    fading_units: Vec<FadingUnit>,
+    fading_cables: Vec<FadingCable>,
     /// Last frame's dock panel rect (tests + keyboard hit-testing).
     dock_rect: Rect,
     /// Last frame's key area inside the dock keyboard (points).
@@ -1868,6 +1992,11 @@ struct DemoApp {
     pending_confirm: Option<PendingConfirm>,
     /// The assistant's tool calls in flight (one model step).
     tool_batch: Option<ToolBatch>,
+    /// Per-turn tool chips and finished cost line, keyed by the `"user"`
+    /// message index in `assistant.history`.
+    transcript_runs: HashMap<usize, TranscriptRun>,
+    /// Index in `assistant.history` of the `"user"` turn currently running.
+    active_run_user_idx: Option<usize>,
     rack_shot: RackShot,
     /// The image attached to the chat message being written.
     chat_image: Option<Image>,
@@ -2123,7 +2252,7 @@ impl DemoApp {
             matrix_block_h: 0.0,
             stage_rect: Rect::NOTHING,
             assistant_rect: Rect::NOTHING,
-            assistant_input_h: 44.0,
+            assistant_input_h: 34.0,
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
@@ -2134,6 +2263,9 @@ impl DemoApp {
             dock: DockView::None,
             focus_chat_request: false,
             demo_agent_hold: false,
+            reduce_motion: crate::assistant::load_reduce_motion(),
+            fading_units: Vec::new(),
+            fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
             dock_kb_rect: Rect::NOTHING,
             hw_leds: Vec::new(),
@@ -2156,6 +2288,8 @@ impl DemoApp {
             confirm_delete_rig: None,
             pending_confirm: None,
             tool_batch: None,
+            transcript_runs: HashMap::new(),
+            active_run_user_idx: None,
             rack_shot: RackShot::default(),
             chat_image: None,
             rename_rig_dialog: None,
@@ -2294,7 +2428,7 @@ impl DemoApp {
         for p in params {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
                 if let Some(k) = u.knobs.iter_mut().find(|k| k.param == Some(p.param)) {
-                    k.value = p.value as f32;
+                    k.set_immediate(p.value as f32);
                     k.default = p.value as f32;
                 }
             }
@@ -3126,11 +3260,12 @@ impl DemoApp {
             for cmd in remote_cmds {
                 match cmd {
                     Command::SetParam { node, param, value } => {
-                        let v = value as f32;
+                        let v = (value as f32).clamp(0.0, 1.0);
+                        let rm = self.reduce_motion;
                         if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
                             for k in &mut u.knobs {
                                 if k.param == Some(param) {
-                                    k.value = v.clamp(0.0, 1.0);
+                                    k.glide_to(v, rm);
                                 }
                             }
                         }
@@ -3181,7 +3316,7 @@ impl DemoApp {
                 for u in &mut self.units {
                     for k in &mut u.knobs {
                         if k.param == Some(crate::engine::P_SYSTEM_GAIN) && (k.value - g.system_gain).abs() > 1e-4 {
-                            k.value = g.system_gain;
+                            k.glide_to(g.system_gain, self.reduce_motion);
                             k.sent = Some(g.system_gain);
                         }
                     }
@@ -3474,7 +3609,72 @@ impl DemoApp {
             self.sync_clap_slots(&adopted);
             return;
         }
+        // Preserve in-flight knob glides & cable draw-ins across the structural rebuild,
+        // and snapshot removed visible units/cables so they fade out instead of vanishing.
+        let mut knob_glides: Vec<(u32, Option<u32>, usize, f32, f32, f32)> = Vec::new();
+        for u in &self.units {
+            for (ki, k) in u.knobs.iter().enumerate() {
+                if k.glide_t < 1.0 {
+                    knob_glides.push((u.node_id, k.param, ki, k.display_value, k.glide_from, k.glide_t));
+                }
+            }
+        }
+        let mut cable_draws: Vec<(u32, f32)> = self.cables.iter()
+            .filter(|c| c.draw_in < 1.0)
+            .map(|c| (c.id, c.draw_in))
+            .collect();
+        if !self.reduce_motion {
+            for (ui, u) in self.units.iter().enumerate() {
+                if !adopted.nodes.iter().any(|n| n.id == u.node_id) && self.visible(ui) {
+                    if let Some(&r) = self.unit_rects.get(ui) {
+                        if r.width().is_finite() && r.height().is_finite() && r.is_positive() {
+                            self.fading_units.push(FadingUnit {
+                                rect: r,
+                                alpha: 1.0,
+                                agent: origin != AgentOrigin::Remote || self.agent_activity.node_alpha(u.node_id, now) > 0.01,
+                            });
+                        }
+                    }
+                }
+            }
+            for c in &self.cables {
+                if c.dying < 0.0
+                    && !adopted.edges.iter().any(|e| e.id == c.id)
+                    && self.visible(c.src)
+                    && self.visible(c.dst)
+                    && c.curve[0].x.is_finite()
+                    && c.curve[3].x.is_finite()
+                {
+                    let width = match c.kind { PortKind::Midi => 2.8, PortKind::Audio => 3.2 };
+                    self.fading_cables.push(FadingCable {
+                        curve: c.curve,
+                        color: self.cable_color(c),
+                        width,
+                        alpha: 1.0,
+                        agent: origin != AgentOrigin::Remote || self.agent_activity.edge_alpha(c.id, now) > 0.01,
+                    });
+                }
+            }
+        }
         self.build_rack(&adopted, &[]);
+        for (nid, param, ki, disp, from, gt) in knob_glides {
+            if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
+                let pos = param.and_then(|p| u.knobs.iter().position(|k| k.param == Some(p))).unwrap_or(ki);
+                if let Some(k) = u.knobs.get_mut(pos) {
+                    k.display_value = disp;
+                    k.glide_from = from;
+                    k.glide_t = gt;
+                }
+            }
+        }
+        for c in &mut self.cables {
+            if let Some(&(_, d)) = cable_draws.iter().find(|&&(id, _)| id == c.id) {
+                c.draw_in = d;
+            } else if !self.reduce_motion && diff_edges.contains(&c.id) {
+                c.draw_in = 0.0;
+            }
+        }
+        cable_draws.clear();
         self.sync_clap_slots(&adopted);
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
@@ -3490,46 +3690,208 @@ impl DemoApp {
         self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
+    fn classify_tool_result(result: &str) -> ToolChipState {
+        if result.contains("NOT applied") || result.contains("Confirm / Cancel") {
+            return ToolChipState::NotApplied;
+        }
+        let lower = result.trim_start().to_ascii_lowercase();
+        if lower.starts_with("error:")
+            || lower.starts_with("unknown ")
+            || lower.starts_with("failed")
+            || lower.starts_with("cannot ")
+            || lower.starts_with("invalid ")
+            || lower.starts_with("missing ")
+            || lower.starts_with("no ")
+            || lower.starts_with("not ")
+        {
+            ToolChipState::Failed
+        } else {
+            ToolChipState::Done
+        }
+    }
+
+    fn human_tool_label(name: &str, args: &serde_json::Value) -> String {
+        match name {
+            "set_split" => match args.get("point").and_then(|v| v.as_u64()) {
+                Some(p) => format!("Split keys → {}", note_name(p.min(127) as u8)),
+                None => "Unsplit keys".into(),
+            },
+            "add_node" => {
+                let what = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
+                    .or_else(|| args.get("kind").and_then(|v| v.as_str()))
+                    .unwrap_or("unit")
+                    .to_ascii_lowercase();
+                match args.get("rig").and_then(|v| v.as_u64()) {
+                    Some(r) => format!("Add {what} → rig {}", r + 1),
+                    None => format!("Add {what}"),
+                }
+            }
+            LOOK_TOOL => "Look at the rack".into(),
+            "get_graph" => "Read rack graph".into(),
+            "get_status" => "Check status".into(),
+            "get_rigs" => "List rigs".into(),
+            "measure_mix" => "Measure mix".into(),
+            "play_note" => {
+                let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
+                format!("Play {}", note_name(note))
+            }
+            "set_octave" => {
+                let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
+                format!("Octave → C{oct}")
+            }
+            "flip_rack" => "Flip rack".into(),
+            "set_rig_source" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1);
+                format!("Rig {node} sources")
+            }
+            "set_rig_mix" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("Mix rig {}", rig + 1)
+            }
+            "set_rig_device" => "Set MIDI input".into(),
+            "get_matrix" => "Read MIDI matrix".into(),
+            "set_matrix_cell" => {
+                if args.get("on").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    "Enable MIDI route".into()
+                } else {
+                    "Mute MIDI route".into()
+                }
+            }
+            "set_matrix_rule" => "Set MIDI rule".into(),
+            "list_params" => "List parameters".into(),
+            "set_cc_map" => "Map MIDI CC".into(),
+            "clear_cc_map" => "Clear MIDI CC".into(),
+            "list_cc_maps" => "List MIDI CCs".into(),
+            "learn_cc" => "Learn MIDI CC".into(),
+            "list_sounds" => "Search patches".into(),
+            "load_sound" => format!("Load '{}'", args.get("query").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "add_rig" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => format!("Add rig · {n}"),
+                None => "Add rig".into(),
+            },
+            "delete_rig" => format!("Delete rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
+            "rename_rig" => format!("Rename rig → {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("rig")),
+            "select_rig" => format!("Switch to rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
+            "connect" => format!(
+                "Wire {} → {}",
+                args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0),
+                args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0)
+            ),
+            "disconnect" => format!("Unplug cable {}", args.get("id").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "remove_node" => format!("Remove unit {}", args.get("node").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "load_template" => format!("Template · {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "transport_play" => "Start transport".into(),
+            "transport_stop" => "Stop transport".into(),
+            "set_bpm" => format!("Tempo → {} BPM", args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0).round() as u32),
+            "set_count_in" => "Set count-in".into(),
+            "record_start" => "Start recording".into(),
+            "record_stop" => "Stop recording".into(),
+            "record_status" => "Recording status".into(),
+            "system_audio" => "System audio level".into(),
+            "play_file" => "Play audio file".into(),
+            "stop_file" => "Stop audio file".into(),
+            "set_player" => "File player level".into(),
+            "list_plugins" => "List plugins".into(),
+            "list_instruments" => "List instruments".into(),
+            "install_instrument" => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
+            "undo" => "Undo last edit".into(),
+            "redo" => "Redo edit".into(),
+            _ => name.replace('_', " "),
+        }
+    }
+
+    fn finish_chip(&mut self, user_idx: usize, chip_idx: usize, result: &str) {
+        if let Some(run) = self.transcript_runs.get_mut(&user_idx) {
+            if let Some(chip) = run.chips.get_mut(chip_idx) {
+                chip.state = Self::classify_tool_result(result);
+            }
+        }
+    }
+
+    fn finalize_active_run(&mut self) {
+        let Some(user_idx) = self.active_run_user_idx.take() else { return };
+        let cost = self.assistant.turn.summary().or_else(|| {
+            self.assistant
+                .turn
+                .wall
+                .map(|w| format!("0 steps · {:.1} s · {}", w.as_secs_f64(), self.assistant.model()))
+        });
+        let run = self.transcript_runs.entry(user_idx).or_default();
+        run.cost_line = cost;
+    }
+
     /// Take in the worker's events and run its tool calls. The worker sends
     /// one batch per model step and waits for all of its results.
     fn poll_assistant(&mut self) {
+        let was_busy = self.assistant.busy;
         if let Some(batch) = self.assistant.poll().pop() {
-            self.tool_batch = Some(ToolBatch { todo: batch.into(), results: Vec::new(), waiting: None });
+            let user_idx = self.active_run_user_idx.unwrap_or_else(|| {
+                self.assistant.history.iter().rposition(|l| l.role == "user").unwrap_or(0)
+            });
+            self.active_run_user_idx = Some(user_idx);
+            let run = self.transcript_runs.entry(user_idx).or_default();
+            let chip_start = run.chips.len();
+            for call in &batch {
+                run.chips.push(ToolChip {
+                    label: Self::human_tool_label(&call.name, &call.args),
+                    state: ToolChipState::Running,
+                });
+            }
+            self.tool_batch = Some(ToolBatch {
+                todo: batch.into(),
+                results: Vec::new(),
+                waiting: None,
+                user_idx,
+                chip_cursor: chip_start,
+            });
         }
-        let Some(mut batch) = self.tool_batch.take() else { return };
-        if let Some(waiting) = batch.waiting.take() {
-            let outcome = match &waiting {
-                Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
-                Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
-                    None if std::time::Instant::now() < *deadline => None,
-                    shot => Some(rack_shot_output(said, shot)),
-                },
-            };
-            match outcome {
-                Some(result) => batch.results.push(result),
-                None => {
-                    batch.waiting = Some(waiting);
-                    self.tool_batch = Some(batch);
-                    return;
+        if let Some(mut batch) = self.tool_batch.take() {
+            if let Some(waiting) = batch.waiting.take() {
+                let outcome = match &waiting {
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
+                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
+                        None if std::time::Instant::now() < *deadline => None,
+                        shot => Some(rack_shot_output(said, shot)),
+                    },
+                };
+                match outcome {
+                    Some(result) => {
+                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result.text);
+                        batch.chip_cursor += 1;
+                        batch.results.push(result);
+                    }
+                    None => {
+                        batch.waiting = Some(waiting);
+                        self.tool_batch = Some(batch);
+                        return;
+                    }
                 }
             }
+            while let Some(call) = batch.todo.pop_front() {
+                let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
+                let before = engine_edit.then(|| self.rack_ids());
+                let result = self.run_assistant_tool(&call.name, &call.args);
+                batch.waiting = match before {
+                    Some(before) => Some(Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT })),
+                    None if call.name == LOOK_TOOL => Some(Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT }),
+                    None => {
+                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result);
+                        batch.chip_cursor += 1;
+                        batch.results.push(result.into());
+                        continue;
+                    }
+                };
+                self.tool_batch = Some(batch);
+                return;
+            }
+            self.assistant.send_tool_results(batch.results);
         }
-        while let Some(call) = batch.todo.pop_front() {
-            let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
-            let before = engine_edit.then(|| self.rack_ids());
-            let result = self.run_assistant_tool(&call.name, &call.args);
-            batch.waiting = match before {
-                Some(before) => Some(Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT })),
-                None if call.name == LOOK_TOOL => Some(Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT }),
-                None => {
-                    batch.results.push(result.into());
-                    continue;
-                }
-            };
-            self.tool_batch = Some(batch);
-            return;
+        if was_busy && !self.assistant.busy {
+            self.finalize_active_run();
         }
-        self.assistant.send_tool_results(batch.results);
     }
 
     /// Node ids and living cable ids of the rack.
@@ -3604,6 +3966,9 @@ impl DemoApp {
                 format!("[The user clicked Cancel: do not run {} ({}).] Acknowledge briefly.", p.tool, p.label),
             );
         }
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
     }
 
     fn sessions_dir() -> std::path::PathBuf {
@@ -4234,6 +4599,19 @@ impl DemoApp {
             }
             "system_audio" => {
                 let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
+                let rm = self.reduce_motion;
+                let mut touched = Vec::new();
+                for u in &mut self.units {
+                    for k in &mut u.knobs {
+                        if k.param == Some(crate::engine::P_SYSTEM_GAIN) {
+                            k.glide_to(gain, rm);
+                            touched.push(u.node_id);
+                        }
+                    }
+                }
+                if !touched.is_empty() {
+                    self.agent_activity.record(origin, format!("System audio → {gain:.2}"), touched, now);
+                }
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::SetSystemAudio { gain });
                 }
@@ -4300,8 +4678,9 @@ impl DemoApp {
                 let channels = args.get("channels").and_then(|v| v.as_str()).map(parse_audio_channel);
                 if let Some(gain) = args.get("gain").and_then(|v| v.as_f64()) {
                     let g = gain.clamp(0.0, 1.0);
+                    let rm = self.reduce_motion;
                     if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_GAIN)) {
-                        k.value = g as f32;
+                        k.glide_to(g as f32, rm);
                     }
                     if let Some(bus) = &self.bus {
                         let _ = bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_GAIN, value: g });
@@ -5640,11 +6019,12 @@ impl DemoApp {
                     let head = if self.rig_count() > 1 { format!("{} · {}", u.rig as usize + 1, sentence_case(&u.name)) } else { sentence_case(&u.name) };
                     ui.horizontal(|ui| {
                         no_wrap(ui, egui::RichText::new(head).font(theme::medium_font(15.0)).color(theme::INK));
-                        if node_at > 0.01 {
+                        if Self::agent_badge_alpha(node_at) > 0.05 {
+                            let badge_a = Self::agent_badge_alpha(node_at);
                             let (br, _) = ui.allocate_exact_size(egui::vec2(44.0, 15.0), egui::Sense::hover());
-                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, node_at));
+                            ui.painter().rect_filled(br, 2.0, theme::alpha(theme::AGENT_COLOR, badge_a));
                             ui.painter().text(br.center(), egui::Align2::CENTER_CENTER, "AGENT",
-                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, node_at));
+                                theme::medium_font(9.0), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
                         }
                     });
                     // Single-graph mode: all nodes share rig 0 — don't label
@@ -6377,6 +6757,9 @@ impl DemoApp {
         self.undo_job = None; // a new request = a new undo step
         self.pending_confirm = None; // a typed answer replaces the buttons
         self.assistant.send_user_message(shown, UserMessage { text, image });
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
     }
 
     /// Attach an image to the chat message being written and show the chat.
@@ -8425,16 +8808,135 @@ impl DemoApp {
         }
     }
 
+    /// Assistant dock height: shares the stage height the rack can spare
+    /// (rule 22), clamped to a floor that guarantees >= 3 transcript lines at
+    /// minimum window size while capping at 360px on tall windows.
+    fn assistant_dock_h(avail_h: f32, rack_need_h: f32) -> f32 {
+        (avail_h - rack_need_h).clamp(176.0, 360.0).round()
+    }
+
+    /// Render one chat message body as a single wrapped `LayoutJob`, keeping
+    /// bold `**...**` spans and rack entity highlights without per-segment
+    /// horizontal gaps.
+    fn chat_body_job(text: &str, entities: &[String], wrap_w: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap_w.max(80.0);
+        let base_font = FontId::proportional(13.0);
+        let bold_font = theme::medium_font(13.0);
+        for (k, part) in text.split("**").enumerate() {
+            if part.is_empty() { continue; }
+            let bold = k % 2 == 1;
+            for (seg, is_entity) in highlight_segments(part, entities) {
+                let fmt = if is_entity {
+                    egui::TextFormat {
+                        font_id: bold_font.clone(),
+                        color: theme::CREAM,
+                        background: theme::DARK_PANEL_HI,
+                        ..Default::default()
+                    }
+                } else {
+                    egui::TextFormat {
+                        font_id: if bold { bold_font.clone() } else { base_font.clone() },
+                        color: theme::INK,
+                        ..Default::default()
+                    }
+                };
+                job.append(&seg, 0.0, fmt);
+            }
+        }
+        job
+    }
+
+    fn paint_busy_dots(ui: &mut egui::Ui, ui_time: f32, reduce_motion: bool) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 14.0), egui::Sense::hover());
+        let p = ui.painter();
+        for i in 0..3 {
+            let wave = if reduce_motion { 0.6 } else { (ui_time * 5.0 - i as f32 * 0.95).sin() * 0.5 + 0.5 };
+            let a = 0.25 + 0.75 * wave;
+            let x = rect.left() + 4.0 + i as f32 * 6.5;
+            p.circle_filled(Pos2::new(x, rect.center().y), 2.2 + 0.5 * wave, theme::alpha(theme::AGENT_COLOR, a));
+        }
+    }
+
+    fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32, reduce_motion: bool) {
+        let pulse = if reduce_motion { 0.8 } else { 0.45 + 0.45 * ((ui_time * 5.5).sin() * 0.5 + 0.5) };
+        let (fill, border, glyph, glyph_color, txt_color, suffix) = match chip.state {
+            ToolChipState::Running => (
+                theme::alpha(theme::AGENT_COLOR, 0.14),
+                theme::alpha(theme::AGENT_COLOR, pulse),
+                "●",
+                theme::AGENT_COLOR,
+                theme::INK,
+                "",
+            ),
+            ToolChipState::Done => (
+                theme::DARK_PANEL_HI,
+                theme::alpha(theme::AGENT_COLOR, 0.50),
+                "✓",
+                theme::AGENT_COLOR,
+                theme::CREAM,
+                "",
+            ),
+            ToolChipState::NotApplied => (
+                theme::DARK_PANEL,
+                theme::CABLE_AMBER,
+                "–",
+                theme::CABLE_AMBER,
+                theme::CREAM_MID,
+                " · not applied",
+            ),
+            ToolChipState::Failed => (
+                theme::alpha(theme::CLIP_RED, 0.18),
+                theme::CLIP_RED,
+                "!",
+                theme::CLIP_BRIGHT,
+                theme::CLIP_BRIGHT,
+                "",
+            ),
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append(glyph, 0.0, egui::TextFormat {
+            font_id: theme::medium_font(10.5),
+            color: glyph_color,
+            ..Default::default()
+        });
+        job.append(" ", 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        job.append(&chip.label, 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        if !suffix.is_empty() {
+            job.append(suffix, 0.0, egui::TextFormat {
+                font_id: egui::FontId::proportional(10.5),
+                color: glyph_color,
+                ..Default::default()
+            });
+        }
+        // Rule 7: >= 8px horizontal and >= 4px vertical internal padding inside chip box.
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(job).selectable(false));
+            });
+    }
+
     /// Assistant dock occupant: a WIDE bottom panel — chat transcript +
     /// always-visible input on the left, live patch context & agent activity
-    /// side column on the right when wide. `resizable(false)` with a
-    /// deterministic `default_size` keeps the height stable frame to frame
-    /// (the stored-size + per-frame `size_range` loop shrank it ~3px/frame).
+    /// side column on the right when wide. Uses `exact_size` (rule 71) so the
+    /// panel follows window resizes and never sticks at a tiny first-frame size.
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
-        // The rack keeps a comfortable face height (2026-11-15, user: "racks
-        // are squished when the agent loads"): the panel only gets the height
-        // the rack can spare, within 150..=340 px — never the other way round.
-        let max_h = (root.available_height() - self.rack_need_h()).clamp(150.0, 340.0);
+        let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
+        let ui_time = self.ui_time;
+        let reduce_motion = self.reduce_motion;
+        let demo_agent_hold = self.demo_agent_hold;
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
@@ -8442,31 +8944,44 @@ impl DemoApp {
         let mut focus_chat = self.focus_chat_request;
         let confirm_choice: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let resp = egui::Panel::bottom("dock")
-            .default_size(max_h.min(260.0))
+            .exact_size(panel_h)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(theme::PAPER)
                     .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .inner_margin(egui::Margin::symmetric(14, 10)),
+                    .inner_margin(egui::Margin::symmetric(14, 8)),
             )
             .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let header_w = ui.available_width();
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 26.0),
+                    egui::vec2(header_w, 24.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
+                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
                         ui.label(egui::RichText::new("Assistant").font(theme::medium_font(15.0)).color(theme::INK));
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
+                        if header_w >= 560.0 {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("F12 hides").size(11.5).color(theme::INK_2));
+                        }
                         if self.assistant.busy {
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new("● working").size(11.5).color(theme::AGENT_COLOR));
+                            Self::paint_busy_dots(ui, ui_time, reduce_motion);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.assistant.phase_label())
+                                        .size(11.5)
+                                        .color(theme::AGENT_COLOR),
+                                )
+                                .truncate(),
+                            );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
                                 self.dock = DockView::None;
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(6.0);
                             let cur = self.assistant.model();
                             let mut pick: Option<String> = None;
                             egui::ComboBox::from_id_salt("assistant_model")
@@ -8477,21 +8992,30 @@ impl DemoApp {
                                     }
                                 }).response.on_hover_text("chat model — switch any time, the conversation stays");
                             if let Some(m) = pick { self.switch_model(&m); }
+                            if self.demo_agent_hold {
+                                ui.add_space(6.0);
+                                if theme::chip_button(ui, "Replay", false).on_hover_text("replay rack animations (Shift+F12)").clicked() {
+                                    self.replay_agent_rack_animations();
+                                }
+                            }
                             if !self.assistant.history.is_empty() && !self.assistant.busy {
-                                ui.add_space(8.0);
+                                ui.add_space(6.0);
                                 if theme::chip_button(ui, "Clear", false).on_hover_text("clear visible transcript").clicked() {
                                     clear_chat = true;
                                 }
                             }
-                            if ui.available_width() > 360.0 {
+                            if ui.available_width() > 240.0 {
                                 if let Some(last) = self.agent_activity.log.front() {
                                     let active = AgentActivity::strength(Some(&(last.at + AGENT_TOUCH_SECS)), self.ui_time) > 0.01;
                                     if active {
-                                        ui.add_space(10.0);
-                                        ui.label(
-                                            egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
-                                                .size(11.5)
-                                                .color(theme::AGENT_COLOR),
+                                        ui.add_space(8.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(format!("{} · {}", last.origin.tag(), last.summary))
+                                                    .size(11.5)
+                                                    .color(theme::AGENT_COLOR),
+                                            )
+                                            .truncate(),
                                         );
                                     }
                                 }
@@ -8499,15 +9023,13 @@ impl DemoApp {
                         });
                     },
                 );
-                ui.add_space(6.0);
                 Self::stage_hairline(ui);
-                ui.add_space(6.0);
 
                 let avail_w = ui.available_width();
                 let avail_h = ui.available_height().max(40.0);
                 let two_col = avail_w >= 860.0;
-                let side_w = if two_col { (avail_w * 0.30).clamp(260.0, 360.0) } else { 0.0 };
-                let main_w = if two_col { (avail_w - side_w - 25.0).max(340.0) } else { avail_w };
+                let side_w = if two_col { (avail_w * 0.30).round().clamp(260.0, 360.0) } else { 0.0 };
+                let main_w = if two_col { (avail_w - side_w - 25.0).round().max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
                 let confirm_label = self.pending_confirm.as_ref().map(|p| p.label.clone());
 
@@ -8516,6 +9038,7 @@ impl DemoApp {
                                  chat_input: &mut String,
                                  chat_image: &mut Option<Image>,
                                  assistant: &mut Assistant,
+                                 transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
                                  starter_prompt: &mut Option<String>,
                                  submit_text: &mut Option<String>,
@@ -8568,9 +9091,9 @@ impl DemoApp {
                     let col_h = ui.available_height().max(40.0);
                     // The attachment chip has a fixed row, so the history
                     // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 + 2.0 * ui.spacing().item_spacing.y } else { 0.0 };
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 18.0).max(34.0)) + attach_h;
-                    let hist_h = (col_h - reserve).max(16.0);
+                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 8.0 } else { 0.0 };
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
                         .min_scrolled_height(hist_h)
@@ -8584,7 +9107,7 @@ impl DemoApp {
                                         .size(12.5)
                                         .color(theme::INK_2),
                                 );
-                                ui.add_space(6.0);
+                                ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     for prompt in [
                                         "Add a reverb to this rig",
@@ -8598,53 +9121,108 @@ impl DemoApp {
                                     }
                                 });
                             }
-                            for line in &assistant.history {
+                            let body_w = (ui.available_width() - 96.0).max(120.0);
+                            let mut current_run_idx: Option<usize> = None;
+                            for (idx, line) in assistant.history.iter().enumerate() {
+                                if line.role == "user" {
+                                    if let Some(prev_idx) = current_run_idx {
+                                        if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(78.0);
+                                                ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                    current_run_idx = Some(idx);
+                                }
                                 let (label, color, rule) = match line.role.as_str() {
                                     "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
                                     "assistant" => ("ASSISTANT", theme::AGENT_COLOR, theme::AGENT_COLOR),
                                     "system" => ("SYSTEM", theme::INK_2, theme::HAIRLINE),
                                     _ => ("ERROR", theme::CLIP_BRIGHT, theme::CLIP_RED),
                                 };
-                                ui.horizontal_top(|ui| {
-                                    let (bar, _) = ui.allocate_exact_size(egui::vec2(2.0, 16.0), egui::Sense::hover());
-                                    ui.painter().rect_filled(bar, 1.0, rule);
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(egui::RichText::new(label).font(theme::medium_font(10.5)).color(color));
-                                        ui.add_space(4.0);
-                                        for (k, part) in line.text.split("**").enumerate() {
-                                            if part.is_empty() { continue; }
-                                            for (seg, is_entity) in highlight_segments(part, &entities) {
-                                                let mut t = egui::RichText::new(seg).size(13.0).color(theme::INK);
-                                                if k % 2 == 1 { t = t.strong(); }
-                                                if is_entity {
-                                                    t = t.strong().color(theme::CREAM).background_color(theme::DARK_PANEL_HI);
-                                                }
-                                                ui.label(t);
-                                            }
-                                        }
-                                    });
+                                let turn = ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.add_space(6.0);
+                                    ui.add_sized(
+                                        [66.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(label).font(theme::medium_font(10.0)).color(color),
+                                        ),
+                                    );
+                                    let job = Self::chat_body_job(&line.text, &entities, body_w);
+                                    ui.label(job);
                                 });
-                                ui.add_space(5.0);
+                                let r = turn.response.rect;
+                                let bar = Rect::from_min_size(
+                                    Pos2::new(r.left(), r.top() + 2.0),
+                                    Vec2::new(2.0, (r.height() - 4.0).max(12.0)),
+                                );
+                                ui.painter().rect_filled(bar, 1.0, rule);
+                                if line.role == "user" {
+                                    if let Some(run) = transcript_runs.get_mut(&idx) {
+                                        if !run.chips.is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.add_space(78.0);
+                                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                                let total = run.chips.len();
+                                                let show_n = if !run.expanded && total > COLLAPSED_RUN_CHIPS {
+                                                    COLLAPSED_RUN_CHIPS
+                                                } else {
+                                                    total
+                                                };
+                                                for chip in &run.chips[..show_n] {
+                                                    Self::tool_chip_ui(ui, chip, ui_time, reduce_motion);
+                                                }
+                                                if show_n < total {
+                                                    let more = total - show_n;
+                                                    if theme::chip_button(ui, &format!("+{more} more"), false).clicked() {
+                                                        run.expanded = true;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                ui.add_space(2.0);
+                            }
+                            if !assistant.busy {
+                                if let Some(prev_idx) = current_run_idx {
+                                    if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(78.0);
+                                            ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                }
                             }
                             if assistant.busy {
-                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
-                            } else if let Some(label) = &confirm_label {
-                                // #32: the click answers the assistant's question.
                                 ui.horizontal(|ui| {
-                                    ui.add_space(6.0);
-                                    if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
-                                        confirm_choice.set(Some(true));
-                                    }
-                                    ui.add_space(6.0);
-                                    if theme::chip_button(ui, "Cancel", false).clicked() {
-                                        confirm_choice.set(Some(false));
-                                    }
+                                    ui.add_space(78.0);
+                                    Self::paint_busy_dots(ui, ui_time, reduce_motion);
+                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_COLOR));
                                 });
-                                ui.add_space(5.0);
+                            }
+                            if !assistant.busy || demo_agent_hold {
+                                if let Some(label) = &confirm_label {
+                                    // #32: the click answers the assistant's question.
+                                    ui.horizontal(|ui| {
+                                        ui.add_space(6.0);
+                                        if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
+                                            confirm_choice.set(Some(true));
+                                        }
+                                        ui.add_space(6.0);
+                                        if theme::chip_button(ui, "Cancel", false).clicked() {
+                                            confirm_choice.set(Some(false));
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
                             }
                         });
-                    ui.add_space(4.0);
                     if let Some(label) = chat_image.as_ref().map(attachment_label) {
                         ui.allocate_ui_with_layout(
                             egui::vec2(ui.available_width(), ATTACH_ROW_H),
@@ -8655,7 +9233,6 @@ impl DemoApp {
                                 }
                             },
                         );
-                        ui.add_space(4.0);
                     }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
@@ -8686,7 +9263,7 @@ impl DemoApp {
                         }
                     });
                     *input_rect = row.response.rect;
-                    *assistant_input_h = (4.0 + (ui.cursor().top() - row_top).max(26.0) + ui.spacing().item_spacing.y).max(34.0);
+                    *assistant_input_h = ((ui.cursor().top() - row_top).max(28.0) + ui.spacing().item_spacing.y).max(34.0);
                 };
 
                 if two_col {
@@ -8701,6 +9278,7 @@ impl DemoApp {
                                     &mut self.chat_input,
                                     &mut self.chat_image,
                                     &mut self.assistant,
+                                    &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
                                     &mut starter_prompt,
                                     &mut submit_text,
@@ -8782,6 +9360,7 @@ impl DemoApp {
                         &mut self.chat_input,
                         &mut self.chat_image,
                         &mut self.assistant,
+                        &mut self.transcript_runs,
                         &mut self.assistant_input_h,
                         &mut starter_prompt,
                         &mut submit_text,
@@ -8796,6 +9375,8 @@ impl DemoApp {
         self.focus_chat_request = focus_chat;
         if clear_chat {
             self.assistant.history.clear();
+            self.transcript_runs.clear();
+            self.active_run_user_idx = None;
             self.pending_confirm = None;
         }
         if let Some(choice) = confirm_choice.get() {
@@ -9121,7 +9702,8 @@ impl DemoApp {
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
         let label: String = p.name.to_uppercase().chars().take(9).collect();
         u.knobs.push(Knob {
-            label, value: norm, default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
+            label, value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
+            default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
             param: None, hidden: false, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
         });
         format!("pinned {} to the face", p.name)
@@ -9630,7 +10212,39 @@ impl DemoApp {
             }
         }
 
-        for u in &mut self.units { u.led *= (-dt / UNIT_LED_TAU).exp(); }
+        let rm = self.reduce_motion;
+        for u in &mut self.units {
+            u.led *= (-dt / UNIT_LED_TAU).exp();
+            for k in &mut u.knobs {
+                if k.glide_t < 1.0 {
+                    if rm {
+                        k.glide_t = 1.0;
+                        k.display_value = k.value;
+                    } else {
+                        k.glide_t = (k.glide_t + dt / KNOB_GLIDE_SECS).min(1.0);
+                        let e = 1.0 - (1.0 - k.glide_t).powi(3);
+                        k.display_value = if k.glide_t >= 1.0 {
+                            k.value
+                        } else {
+                            k.glide_from + (k.value - k.glide_from) * e
+                        };
+                    }
+                }
+            }
+        }
+        if rm {
+            self.fading_units.clear();
+            self.fading_cables.clear();
+        } else {
+            for f in &mut self.fading_units {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_units.retain(|f| f.alpha > 0.01);
+            for f in &mut self.fading_cables {
+                f.alpha -= dt / UNIT_FADE_SECS;
+            }
+            self.fading_cables.retain(|f| f.alpha > 0.01);
+        }
         for k in &mut self.key_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         for k in &mut self.note_leds { *k *= (-dt / KEY_LED_TAU).exp(); }
         // Held laptop keys stay lit (key repeats are swallowed, not re-fired);
@@ -9699,8 +10313,12 @@ impl DemoApp {
         for ci in 0..self.cables.len() {
             let ea = self.endpoint(&self.cables[ci], Dir::Out);
             let eb = self.endpoint(&self.cables[ci], Dir::In);
+            let rm = self.reduce_motion;
             let c = &mut self.cables[ci];
             c.age += dt;
+            if c.draw_in < 1.0 {
+                c.draw_in = if rm { 1.0 } else { (c.draw_in + dt / CABLE_DRAW_IN_SECS).min(1.0) };
+            }
             if c.dying >= 0.0 { c.dying += dt; }
             // Endpoints without a laid-out rect (a hidden rig's units, or a
             // rack rebuilt by a key handler AFTER this frame's layout) are
@@ -10104,7 +10722,7 @@ impl DemoApp {
         }
         if reset_knobs {
             for u in &mut self.units {
-                for k in &mut u.knobs { k.value = k.default; }
+                for k in &mut u.knobs { k.set_immediate(k.default); }
             }
         }
 
@@ -10268,7 +10886,7 @@ impl DemoApp {
             match self.drag {
                 Drag::Knob { unit, idx, start_val, press_y } => {
                     let v = (start_val + (press_y - s.y) * 0.006).clamp(0.0, 1.0);
-                    self.units[unit].knobs[idx].value = v;
+                    self.units[unit].knobs[idx].set_immediate(v);
                 }
                 Drag::Plug { id, end } => {
                     match self.live_cable(id) {
@@ -10673,7 +11291,7 @@ impl DemoApp {
     fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
         let Some(u) = self.units.get_mut(unit) else { return };
         let Some(k) = u.knobs.get_mut(knob) else { return };
-        k.value = v.clamp(0.0, 1.0);
+        k.set_immediate(v);
         if let (Some(p), Some(bus)) = (k.param, &self.bus) {
             if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
                 k.sent = Some(k.value);
@@ -10976,12 +11594,31 @@ impl DemoApp {
         }));
     }
 
+    /// Opacity for the `AGENT` pill badge: fades out cleanly before the dark
+    /// label text loses contrast against the `#1C1C1C` unit plate (rule 84).
+    fn agent_badge_alpha(alpha_t: f32) -> f32 {
+        ((alpha_t - 0.38) / 0.62).clamp(0.0, 1.0)
+    }
+
     /// Crisp "AGENT" pill badge inside a rack unit header (rack-local rect).
     fn draw_agent_badge(&self, painter: &egui::Painter, rect: Rect, alpha_t: f32) {
-        if alpha_t <= 0.01 { return; }
+        let badge_a = Self::agent_badge_alpha(alpha_t);
+        if badge_a <= 0.05 { return; }
         let sr = self.xf.rect(rect);
-        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, alpha_t));
-        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, alpha_t));
+        painter.rect_filled(sr, 2.0, alpha(theme::AGENT_COLOR, badge_a));
+        self.face_text(painter, rect.center(), "AGENT", theme::medium_font(9.5), theme::alpha(theme::AGENT_COLOR_TEXT, badge_a));
+    }
+
+    fn draw_fading_units(&self, painter: &egui::Painter) {
+        let xf = &self.xf;
+        for f in &self.fading_units {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let sr = xf.rect(f.rect);
+            painter.rect_filled(sr, 2.0, alpha(CHASSIS, a));
+            let col = if f.agent { theme::AGENT_COLOR } else { BORDER };
+            painter.rect_stroke(sr, 2.0, Stroke::new(1.4, alpha(col, a)), egui::StrokeKind::Inside);
+        }
     }
 
     fn draw_front(&self, painter: &egui::Painter) {
@@ -10992,6 +11629,7 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Single near-black family (§2.4): plates are the chassis color;
             // zones are drawn with 1px hairline rules that brighten on hover
             // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
@@ -11000,7 +11638,9 @@ impl DemoApp {
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -11052,7 +11692,7 @@ impl DemoApp {
                 self.draw_knob(painter, ui, ki);
             }
 
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = if self.split_rects(ui).is_some() {
                     Rect::from_min_size(Pos2::new(r.right() - 60.0, r.top() + 40.0), Vec2::new(46.0, 16.0))
                 } else {
@@ -11061,6 +11701,7 @@ impl DemoApp {
                 self.draw_agent_badge(painter, badge, agent_t);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     /// Is the pointer over rack-local `rect` of `unit` (front face hover)?
@@ -11570,7 +12211,7 @@ impl DemoApp {
         let node = u.node_id;
         let v = if on { 1.0f32 } else { 0.0f32 };
         if let Some(k) = self.units[unit].knobs.iter_mut().find(|k| k.param == Some(P_AUDIO_IN_MONITOR)) {
-            k.value = v;
+            k.set_immediate(v);
         }
         if let Some(bus) = &self.bus {
             if bus.lock().unwrap().send(Command::SetParam { node, param: P_AUDIO_IN_MONITOR, value: v as f64 }) {
@@ -11667,7 +12308,7 @@ impl DemoApp {
 
         // Flat value arc: hairline track + solid accent arc + flat end dot
         // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.value, theme::ACCENT);
+        theme::value_arc(painter, |l| xf.p(l), c, r, k.display_value, theme::ACCENT);
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -11684,7 +12325,7 @@ impl DemoApp {
         // Pointer: center → 0.62r needle, 2px cream.
         let a0 = 135.0f32.to_radians();
         let sweep = 270.0f32.to_radians();
-        let ang = a0 + sweep * k.value;
+        let ang = a0 + sweep * k.display_value;
         let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
         painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
@@ -11832,7 +12473,7 @@ impl DemoApp {
             self.clear_knob_bindings(node_id, param, target);
         } else if reset_val {
             let k = &mut self.units[unit].knobs[idx];
-            k.value = k.default;
+            k.set_immediate(k.default);
         }
     }
 
@@ -11844,13 +12485,16 @@ impl DemoApp {
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
+            let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
             if dragging {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
-                painter.rect_stroke(sr, 2.0, Stroke::new(1.8, alpha(theme::AGENT_COLOR, agent_t)), egui::StrokeKind::Inside);
+                let sw = 1.8 + 1.4 * pulse;
+                let sa = (agent_t * (0.82 + 0.18 * pulse)).min(1.0);
+                painter.rect_stroke(sr, 2.0, Stroke::new(sw, alpha(theme::AGENT_COLOR, sa)), egui::StrokeKind::Inside);
             } else {
                 // Faint default rule; hover eases to the accent (clear
                 // interactive state without shadows — DeepSeek review fix).
@@ -11915,7 +12559,7 @@ impl DemoApp {
             let r = self.unit_rects[ui];
             self.text_tracked(painter, r.min.to_vec2() + Vec2::new(32.0, 10.0), &u.back_g, SUBTEXT);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
-            if agent_t > 0.01 {
+            if Self::agent_badge_alpha(agent_t) > 0.05 {
                 let badge = Rect::from_min_size(Pos2::new(r.right() - 56.0, r.top() + 8.0), Vec2::new(46.0, 16.0));
                 self.draw_agent_badge(painter, badge, agent_t);
             }
@@ -11931,6 +12575,7 @@ impl DemoApp {
                 self.text_tracked(painter, c + Vec2::new(-jw / 2.0, 17.0), &j.label_g, SUBTEXT);
             }
         }
+        self.draw_fading_units(painter);
     }
 
     fn cable_alpha(c: &Cable, has_sel: bool, highlighted: bool) -> f32 {
@@ -11983,8 +12628,26 @@ impl DemoApp {
 
             let curve = [xf.p(c.curve[0].to_vec2()), xf.p(c.curve[1].to_vec2()),
                          xf.p(c.curve[2].to_vec2()), xf.p(c.curve[3].to_vec2())];
+            let draw_t = if c.draw_in >= 1.0 {
+                1.0
+            } else {
+                let t = c.draw_in.clamp(0.0, 1.0);
+                1.0 - (1.0 - t).powi(3)
+            };
+            if draw_t <= 0.01 { continue; }
             let mut col = self.cable_color(c);
             let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
+            let cable_shape = |w: f32, col: Color32| -> Shape {
+                if draw_t >= 0.999 {
+                    bezier_shape(curve, w, col)
+                } else {
+                    Shape::CubicBezier(
+                        egui::epaint::CubicBezierShape::from_points_stroke(
+                            curve, false, Color32::TRANSPARENT, Stroke::new(w, col),
+                        ).split_range(0.0..draw_t),
+                    )
+                }
+            };
 
             // One flat stroke per cable, round caps (§4.10). Selection = the
             // accent color swap + dimming the rest (cable_alpha) — no glow,
@@ -11993,10 +12656,18 @@ impl DemoApp {
                 col = theme::ACCENT;
                 width += 0.5;
             } else if edge_at > 0.01 {
-                painter.add(bezier_shape(curve, width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
+                painter.add(cable_shape(width + 3.0, alpha(theme::AGENT_COLOR, a * edge_at * 0.45)));
                 col = mix(col, theme::AGENT_COLOR, edge_at * 0.85);
             }
-            painter.add(bezier_shape(curve, width, alpha(col, a)));
+            painter.add(cable_shape(width, alpha(col, a)));
+        }
+        for f in &self.fading_cables {
+            let a = f.alpha.clamp(0.0, 1.0);
+            if a <= 0.01 { continue; }
+            let curve = [xf.p(f.curve[0].to_vec2()), xf.p(f.curve[1].to_vec2()),
+                         xf.p(f.curve[2].to_vec2()), xf.p(f.curve[3].to_vec2())];
+            let col = if f.agent { mix(f.color, theme::AGENT_COLOR, 0.7) } else { f.color };
+            painter.add(bezier_shape(curve, f.width, alpha(col, a)));
         }
     }
 
@@ -12056,6 +12727,12 @@ impl DemoApp {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
             let a = Self::cable_alpha(c, false, true);
             for end in [Dir::Out, Dir::In] {
+                let plug_a = if end == Dir::In && c.draw_in < 1.0 {
+                    a * ((c.draw_in - 0.55) / 0.45).clamp(0.0, 1.0)
+                } else {
+                    a
+                };
+                if plug_a <= 0.01 { continue; }
                 let over = if end == Dir::Out { c.over_a } else { c.over_b };
                 let base = if end == Dir::Out { c.prev_a } else { c.prev_b };
                 // Fan-in: stacked plugs on one jack spread slightly.
@@ -12080,10 +12757,10 @@ impl DemoApp {
                 let pr = match c.kind { PortKind::Audio => 8.0, PortKind::Midi => 1.0 };
                 let edge_at = self.agent_activity.edge_alpha(c.id, self.ui_time);
                 let stroke_col = if edge_at > 0.01 { mix(BORDER, theme::AGENT_COLOR, edge_at) } else { BORDER };
-                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, a));
-                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, a)), egui::StrokeKind::Inside);
+                painter.rect_filled(xf.rect(body), pr, alpha(PLUG, plug_a));
+                painter.rect_stroke(xf.rect(body), pr, Stroke::new(if edge_at > 0.01 { 1.5 } else { 1.0 }, alpha(stroke_col, plug_a)), egui::StrokeKind::Inside);
                 let band = Rect::from_min_size(body.min + Vec2::new(2.0, 3.0), Vec2::new(16.0, 3.5));
-                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), a));
+                painter.rect_filled(xf.rect(band), 1.5, alpha(self.cable_color(c), plug_a));
             }
         }
     }
@@ -12407,6 +13084,21 @@ fn drag_only(r: egui::Response) -> egui::Response {
 impl DemoApp {
     /// One app frame minus eframe plumbing (`ui()` delegates here) — tests
     /// drive the exact runtime path through a plain `egui::Context`.
+    fn has_active_animations(&self) -> bool {
+        if self.flipping || self.assistant.busy || self.agent_activity.has_active(self.ui_time) {
+            return true;
+        }
+        if self.reduce_motion {
+            return false;
+        }
+        self.load_fade < 1.0
+            || self.tap_flash_t > 0.0
+            || !self.fading_units.is_empty()
+            || !self.fading_cables.is_empty()
+            || self.units.iter().any(|u| u.knobs.iter().any(|k| k.glide_t < 1.0))
+            || self.cables.iter().any(|c| c.draw_in < 1.0 || c.dying >= 0.0 || c.age < 0.4)
+    }
+
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         // Subtitles first: a changed instrument name is laid out this frame.
@@ -12437,6 +13129,9 @@ impl DemoApp {
         // Dock toggles (F12 / C / V) — handled before the panels so they work
         // even while the chat field has keyboard focus. The dock occupant owns
         // the computer keyboard, but its own close/swap shortcuts never yield.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12)) {
+            self.replay_agent_rack_animations();
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12)) {
             self.toggle_dock(DockView::Assistant);
         }
@@ -12585,10 +13280,9 @@ impl DemoApp {
         self.load_rig_modal(&ctx);
         self.param_editor_window(&ctx);
 
-        // Full frame rate while focused (the cables are the show); ~30 fps in
-        // the background — meters and cables still move, at a third of the
-        // UI thread's CPU when the user works in another window.
-        if ctx.input(|i| i.focused) || self.agent_activity.has_active(self.ui_time) {
+        // Full frame rate while focused (the cables are the show) or while an
+        // animation / agent run is active; ~30 fps when unfocused and idle.
+        if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -13553,6 +14247,96 @@ fn ui_scale_target() -> f32 {
     })
 }
 
+impl DemoApp {
+    fn replay_agent_rack_animations(&mut self) {
+        let now = self.ui_time;
+        let rm = self.reduce_motion;
+        if let Some(synth_ui) = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)) {
+            let synth_node = self.units[synth_ui].node_id;
+            if let Some(k) = self.units[synth_ui].knobs.iter_mut().find(|k| !k.hidden && k.param.is_some()) {
+                let target = if k.display_value < 0.65 { 0.85 } else { 0.25 };
+                k.glide_to(target, rm);
+            }
+            self.agent_activity.trigger_node_pulse(synth_node, now);
+        }
+        if let Some(k) = self.keys_unit.and_then(|ui| self.units.get(ui)).map(|u| u.node_id) {
+            self.agent_activity.trigger_node_pulse(k, now);
+        }
+        if let Some(c) = self.cables.iter_mut().find(|c| c.dying < 0.0) {
+            c.draw_in = if rm { 1.0 } else { 0.0 };
+            self.agent_activity.touch_edge(c.id, now);
+        }
+    }
+
+    /// Stage `--demo-agent` offline for visual screenshots: finished run,
+    /// live running run with animated phase, attached image chip, Confirm /
+    /// Cancel prompt, and optional mid-flight rack animations.
+    fn stage_demo_agent(&mut self, animate_rack: bool) {
+        self.assistant.key_set = true;
+        self.dock = DockView::Assistant;
+        self.demo_agent_hold = true;
+        self.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        self.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+
+        self.assistant.history.clear();
+        self.transcript_runs.clear();
+        self.active_run_user_idx = None;
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split at C4 and level Rig A.".into(),
+        });
+        self.transcript_runs.insert(
+            0,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: Self::human_tool_label("set_split", &serde_json::json!({"point": 60})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label(LOOK_TOOL, &serde_json::json!({})), state: ToolChipState::Done },
+                ],
+                expanded: false,
+                cost_line: Some("2 steps · 1.1 s · deepseek-chat".into()),
+            },
+        );
+        self.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split **Keys** at C4 and set **Rig A** to 0.85.".into(),
+        });
+
+        self.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Brighten Surge A and remove Rig B.".into(),
+        });
+        self.transcript_runs.insert(
+            2,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip { label: Self::human_tool_label("get_graph", &serde_json::json!({})), state: ToolChipState::Done },
+                    ToolChip { label: Self::human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
+                ],
+                expanded: true,
+                cost_line: None,
+            },
+        );
+        self.assistant.busy = true;
+        self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
+            step: 2,
+            model: "deepseek-chat".into(),
+            seeing: false,
+        });
+        self.chat_image = Image::from_rgba("rack-sketch.png", [4, 4], &[40u8; 4 * 4 * 4]).ok();
+        self.pending_confirm = Some(PendingConfirm {
+            tool: "delete_rig".into(),
+            args: serde_json::json!({"rig": 1}),
+            label: "Delete rig 2 · Rig B".into(),
+        });
+        if animate_rack {
+            self.replay_agent_rack_animations();
+        }
+    }
+}
+
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
     // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
     // must reparent into our window; (2) winit has no fractional-scale support,
@@ -13738,20 +14522,10 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     if std::env::args().any(|a| a == "--metro") {
                         app.add_metronome_to_active_rig();
                     }
-                    if std::env::args().any(|a| a == "--demo-agent") {
-                        app.assistant.key_set = true;
-                        app.dock = DockView::Assistant;
-                        app.demo_agent_hold = true;
-                        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
-                        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
-                        app.assistant.history.push(ChatLine {
-                            role: "user".into(),
-                            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
-                        });
-                        app.assistant.history.push(ChatLine {
-                            role: "assistant".into(),
-                            text: "Split **Keys** at C4 and set **Rig A** volume to 0.85.".into(),
-                        });
+                    let demo_agent = std::env::args().any(|a| a == "--demo-agent");
+                    let demo_anim = std::env::args().any(|a| a == "--demo-agent-anim");
+                    if demo_agent || demo_anim {
+                        app.stage_demo_agent(demo_anim);
                     }
                     app
                 }
@@ -17225,6 +17999,8 @@ mod ui_polish_agent_tests {
             todo: VecDeque::new(),
             results: Vec::new(),
             waiting: Some(Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }),
+            user_idx: 0,
+            chip_cursor: 0,
         });
         app.poll_assistant();
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
@@ -17800,6 +18576,417 @@ mod ui_polish_agent_tests {
         let notes: Vec<u8> = events.lock().unwrap().iter().map(|e| e.note).collect();
         assert!(notes.contains(&60), "white key C plays note 60: {notes:?}");
         assert!(notes.contains(&61), "black key C# plays note 61: {notes:?}");
+    }
+
+    #[test]
+    fn bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Split the keyboard at C4 and level Rig A to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Split Keys at C4 and set Rig A volume to 0.85.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "user".into(),
+            text: "Add a warm reverb after Surge A.".into(),
+        });
+        app.assistant.history.push(ChatLine {
+            role: "assistant".into(),
+            text: "Added Reverb after Surge A and wired it to Master.".into(),
+        });
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        for size in [Vec2::new(760.0, 520.0), Vec2::new(781.0, 950.0)] {
+            let mut texts = Vec::new();
+            for _ in 0..4 {
+                texts = run_frame(&mut app, &ctx, size, vec![]);
+            }
+            let header_bottom = texts.iter()
+                .find(|(t, _)| t == "Assistant")
+                .map(|(_, r)| r.bottom())
+                .expect("header painted");
+            let visible_turns: Vec<&(String, Rect)> = texts.iter()
+                .filter(|(t, r)| {
+                    (t == "YOU" || t == "ASSISTANT")
+                        && r.top() >= header_bottom
+                        && r.bottom() <= app.assistant_input_rect.top()
+                })
+                .collect();
+            assert!(
+                visible_turns.len() >= 3,
+                "size {size:?}: expected >= 3 unclipped transcript lines between header ({header_bottom}) and input ({:?}), got {}: {texts:?}",
+                app.assistant_input_rect,
+                visible_turns.len()
+            );
+        }
+    }
+
+    #[test]
+    fn bug2_untouched_units_paint_no_agent_badge_rect() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.demo_agent_hold = true;
+        app.exec_tool("set_split", &serde_json::json!({"point": 60}));
+        app.exec_tool("set_rig_mix", &serde_json::json!({"rig": 0, "vol": 0.85}));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..60 {
+            app.update(0.04); // 2.4s: near end of fade on units not held by demo_agent_hold
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        fn walk_rects(shape: &egui::Shape, rects: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push((r.rect, r.fill)),
+                egui::Shape::Vec(v) => for s in v { walk_rects(s, rects) },
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            walk_rects(&cs.shape, &mut rects);
+        }
+        for (ui_idx, u) in app.units.iter().enumerate() {
+            if matches!(u.node_kind, UnitKind::Clap | UnitKind::Dsp(_)) {
+                let r = app.unit_rects[ui_idx];
+                let badge_local = Rect::from_min_size(Pos2::new(r.right() - 84.0, r.top() + 12.0), Vec2::new(46.0, 16.0));
+                let badge_screen = app.xf.rect(badge_local);
+                let stray: Vec<_> = rects.iter()
+                    .filter(|(rr, _)| (rr.center() - badge_screen.center()).length() < 2.0 && (rr.width() - badge_screen.width()).abs() < 2.0)
+                    .collect();
+                assert!(
+                    stray.is_empty(),
+                    "untouched/faded unit {} has stray badge rect {stray:?}",
+                    u.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn step2_live_status_shows_phase_and_route() {
+        use crate::assistant::{FromWorker, RunPhase};
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Split keys at C4".into() });
+        app.assistant.busy = true;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+
+        for (phase, expected) in [
+            (RunPhase::Deciding, "Jev · deciding"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
+            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+        ] {
+            app.assistant.phase = Some(phase);
+            let texts = run_frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                texts.iter().any(|(t, _)| t == expected),
+                "expected phase '{expected}' in UI, got {texts:?}"
+            );
+            assert!(
+                texts.iter().all(|(t, _)| !t.contains("thinking…")),
+                "static thinking… text must be gone: {texts:?}"
+            );
+        }
+        let _ = FromWorker::Done;
+    }
+
+    #[test]
+    fn step2_action_chips_have_rule7_padding_states_collapse_and_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let user_idx = app.assistant.history.len();
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Wire up a reverb on rig 2".into() });
+        app.assistant.history.push(ChatLine { role: "assistant".into(), text: "Added Reverb on rig 2.".into() });
+        app.transcript_runs.insert(
+            user_idx,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip {
+                        label: DemoApp::human_tool_label("set_split", &serde_json::json!({"point": 60})),
+                        state: ToolChipState::Done,
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})),
+                        state: DemoApp::classify_tool_result("added — NOT applied: engine changed nothing"),
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label(LOOK_TOOL, &serde_json::json!({})),
+                        state: ToolChipState::Running,
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label("remove_node", &serde_json::json!({"node": 99})),
+                        state: ToolChipState::Failed,
+                    },
+                ],
+                expanded: false,
+                cost_line: Some("2 steps · 1.4 s · deepseek-chat".into()),
+            },
+        );
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push(r.rect),
+                egui::Shape::Vec(v) => for s in v { collect(s, texts, rects) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            collect(&cs.shape, &mut texts, &mut rects);
+        }
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing split chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Add reverb → rig 2") && t.contains("not applied")), "missing not-applied chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Look at the rack")), "missing running chip: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "4th chip collapsed initially");
+        let more_rect = texts.iter().find(|(t, _)| t == "+1 more").map(|(_, r)| *r).expect("+1 more collapse chip");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.4 s · deepseek-chat"), "missing cost line: {texts:?}");
+
+        // Rule 7 padding on visible chips: enclosing filled rect extends >= 7.5px H and >= 3.5px V around text.
+        for label in ["Split keys → C4", "Look at the rack", "+1 more"] {
+            let tr = texts.iter().find(|(t, _)| t.contains(label)).map(|(_, r)| *r).unwrap();
+            let boxed = rects.iter().any(|br| {
+                br.contains_rect(tr)
+                    && (tr.left() - br.left()) >= 7.5
+                    && (br.right() - tr.right()) >= 7.5
+                    && (tr.top() - br.top()) >= 3.5
+                    && (br.bottom() - tr.bottom()) >= 3.5
+            });
+            assert!(boxed, "chip '{label}' ({tr:?}) violates rule 7 padding against {rects:?}");
+        }
+
+        // Click "+1 more" -> expands to show Failed 4th chip.
+        click_at(&mut app, &ctx, size, more_rect.center());
+        let expanded_texts = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(expanded_texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "expanded 4th chip missing: {expanded_texts:?}");
+        assert_eq!(DemoApp::classify_tool_result("unknown tool: foo"), ToolChipState::Failed);
+        assert_eq!(DemoApp::classify_tool_result("octave set to C4"), ToolChipState::Done);
+    }
+
+    #[test]
+    fn step3_knob_glides_visually_while_logical_value_updates_immediately() {
+        let (tx, mut drain) = crate::control::command_bus();
+        let mut app = DemoApp::new_with_sink(None);
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        app.reduce_motion = false;
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = app.units[synth_ui].node_id;
+        let (ki, param, start) = {
+            let (ki, k) = app.units[synth_ui].knobs.iter().enumerate().find(|(_, k)| k.param.is_some()).unwrap();
+            (ki, k.param.unwrap(), k.value)
+        };
+        let target = if start < 0.5 { 0.88 } else { 0.14 };
+
+        // Direct agent/remote param edit updates logical value (sound first) and glides display_value.
+        app.units[synth_ui].knobs[ki].glide_to(target, app.reduce_motion);
+        app.publish_patch();
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node: n, param: p, value } if *n == node && *p == param && (*value as f32 - target).abs() < 1e-5)),
+            "sound command must publish target immediately (rule 31): {cmds:?}"
+        );
+        let k = &app.units[synth_ui].knobs[ki];
+        assert!((k.value - target).abs() < 1e-6);
+        assert!((k.display_value - start).abs() < 1e-6);
+        assert!(k.glide_t == 0.0);
+
+        app.update(0.10); // halfway through 200ms glide
+        let mid = app.units[synth_ui].knobs[ki].display_value;
+        assert!(
+            (mid - start).abs() > 0.05 && (mid - target).abs() > 0.01,
+            "display_value must ease between {start} and {target}: {mid}"
+        );
+
+        app.update(0.15); // past 200ms -> exact convergence
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - target).abs() < 1e-6, "converged exactly: {}", k.display_value);
+
+        // reduce_motion disables glide and snaps immediately.
+        app.reduce_motion = true;
+        app.units[synth_ui].knobs[ki].glide_to(start, app.reduce_motion);
+        let k = &app.units[synth_ui].knobs[ki];
+        assert_eq!(k.glide_t, 1.0);
+        assert!((k.display_value - start).abs() < 1e-6);
+    }
+
+    #[test]
+    fn step3_cable_draw_in_unit_pulse_and_removed_unit_fade_respect_reduce_motion() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let node = app.units[0].node_id;
+
+        // 1. Cable draw-in starts at 0, advances smoothly, converges to 1.0.
+        app.cables[0].draw_in = 0.0;
+        app.update(0.14);
+        assert!(app.cables[0].draw_in > 0.3 && app.cables[0].draw_in < 0.7, "draw_in mid: {}", app.cables[0].draw_in);
+        app.update(0.20);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+
+        // 2. Unit pulse triggers once, fades after AGENT_PULSE_SECS, does not re-trigger on touch_node hold.
+        let t0 = app.ui_time;
+        app.agent_activity.trigger_node_pulse(node, t0);
+        app.update(0.19);
+        let p_mid = app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion);
+        assert!(p_mid > 0.5, "pulse active near midpoint: {p_mid}");
+        app.agent_activity.touch_node(node, app.ui_time); // hold while active must not reset pulse
+        app.update(0.25);
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+
+        // 3. Fading units & cables decay and clear cleanly; reduce_motion snaps them clear.
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.fading_cables.push(FadingCable { curve: [Pos2::ZERO; 4], color: theme::AUDIO_CREAM, width: 3.0, alpha: 1.0, agent: true });
+        app.update(0.12);
+        assert_eq!(app.fading_units.len(), 1);
+        assert!(app.fading_units[0].alpha < 0.6 && app.fading_units[0].alpha > 0.3);
+        app.update(0.20);
+        assert!(app.fading_units.is_empty());
+        assert!(app.fading_cables.is_empty());
+
+        app.reduce_motion = true;
+        app.cables[0].draw_in = 0.0;
+        app.fading_units.push(FadingUnit { rect: Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0)), alpha: 1.0, agent: true });
+        app.update(0.01);
+        assert_eq!(app.cables[0].draw_in, 1.0);
+        assert!(app.fading_units.is_empty());
+        assert_eq!(app.agent_activity.node_pulse(node, app.ui_time, app.reduce_motion), 0.0);
+    }
+
+    #[test]
+    fn step4_animations_request_repaint_while_active_and_stop_on_converge() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 800.0);
+
+        // Settle initial cable age / load_fade and egui's first-frame UI scale / layout passes.
+        for _ in 0..30 {
+            app.update(0.05);
+        }
+        let mut t = 1.0f64;
+        let mut run_unfocused = |app: &mut DemoApp| -> std::time::Duration {
+            t += 0.1;
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.focused = false;
+            raw.time = Some(t);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            out.viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+        };
+        for _ in 0..8 {
+            let _ = run_unfocused(&mut app);
+        }
+
+        // Idle + unfocused -> 30 fps throttled (>= 33ms delay), no immediate repaint.
+        assert!(!app.has_active_animations());
+        let idle_delay = run_unfocused(&mut app);
+        assert!(
+            idle_delay >= std::time::Duration::from_millis(30),
+            "idle delay: {idle_delay:?}, focused={}, causes={:?}",
+            ctx.input(|i| i.focused),
+            ctx.repaint_causes()
+        );
+
+        // Trigger a knob glide -> immediate repaint requested even while unfocused.
+        let synth_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let start = app.units[synth_ui].knobs[0].value;
+        app.units[synth_ui].knobs[0].glide_to(if start < 0.5 { 0.85 } else { 0.15 }, false);
+        assert!(app.has_active_animations());
+        let active_delay = run_unfocused(&mut app);
+        assert_eq!(active_delay, std::time::Duration::ZERO, "active animation must request immediate repaint");
+
+        // Advance past glide duration -> converges and drops back to throttled repaint
+        // once the prior active frame's 1-pass egui outstanding repaint drains.
+        for _ in 0..10 {
+            app.update(0.05);
+        }
+        assert!(!app.has_active_animations());
+        let _ = run_unfocused(&mut app);
+        let settled_delay = run_unfocused(&mut app);
+        assert!(settled_delay >= std::time::Duration::from_millis(30), "settled delay: {settled_delay:?}");
+    }
+
+    #[test]
+    fn step5_staged_demo_agent_shows_full_ui_and_replays_rack_animations() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.reduce_motion = false;
+        app.stage_demo_agent(false);
+
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        let mut texts = Vec::new();
+        for _ in 0..5 {
+            texts = run_frame(&mut app, &ctx, size, vec![]);
+        }
+
+        // Finished run: user message, action chips, assistant message, cost line.
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing finished chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "+1 more"), "missing collapsed chip button: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat"), "missing cost line: {texts:?}");
+        // Running run: animated status label + running chip (no static "thinking…").
+        assert!(texts.iter().any(|(t, _)| t == "DeepSeek · step 2"), "missing live phase label: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
+        assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
+        // Attached image chip + Confirm / Cancel prompt + Replay chip.
+        assert!(texts.iter().any(|(t, _)| t.contains("rack-sketch.png")), "missing attached image chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Replay"), "missing replay chip: {texts:?}");
+
+        // Replay rack animations via Shift+F12.
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.events.push(egui::Event::Key {
+            key: Key::F12,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::SHIFT,
+        });
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        let synth = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let synth_node = synth.node_id;
+        let gliding = synth.knobs.iter().any(|k| !k.hidden && k.param.is_some() && k.glide_t < 1.0 && (k.value - k.display_value).abs() > 0.05);
+        assert!(gliding, "Shift+F12 must trigger knob glide on Surge");
+        assert!(app.cables.iter().any(|c| c.draw_in < 1.0), "Shift+F12 must trigger cable draw-in");
+        app.update(0.15);
+        assert!(app.agent_activity.node_pulse(synth_node, app.ui_time, false) > 0.0, "Shift+F12 must pulse touched synth unit");
     }
 }
 

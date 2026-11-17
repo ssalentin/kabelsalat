@@ -65,6 +65,8 @@ pub const AGENT_COLOR: Color32 = LIVE_TEAL;
 pub const AGENT_TEXT: Color32 = Color32::from_rgb(0x72, 0xBA, 0xB5); // legible agent teal text on dark (8.8:1 on PAPER)
 pub const AGENT_COLOR_TEXT: Color32 = DARK_PANEL;
 pub const CLIP_RED: Color32 = Color32::from_rgb(0xD9, 0x25, 0x1C); // clip graphics
+/// Organ drawbar caps: the sub-octave bars (16', 5⅓') are brown on a tonewheel organ.
+pub const DRAWBAR_BROWN: Color32 = Color32::from_rgb(0x7A, 0x4E, 0x2E);
 pub const CLIP_TEXT: Color32 = Color32::from_rgb(0xB9, 0x1C, 0x14); // danger text on paper
 pub const CLIP_BRIGHT: Color32 = Color32::from_rgb(0xF0, 0x55, 0x4A); // danger text on dark
 pub const DANGER_BG: Color32 = Color32::from_rgb(0x2B, 0x18, 0x17); // outlined danger button fill (4.9:1 with CLIP_BRIGHT)

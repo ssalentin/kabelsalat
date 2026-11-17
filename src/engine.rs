@@ -152,6 +152,28 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
             DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
             DspKind::Metronome => &[],
         },
+        // setBfree has no control ports: its face drives MIDI CCs (`organ`).
+        // Drawbars are hidden knobs, painted as faders.
+        k @ NodeKind::Lv2 { .. } if crate::organ::is_organ(k) => {
+            const fn bar(label: &'static str, i: usize, out: bool, aliases: &'static [&'static str]) -> KnobSpec {
+                KnobSpec { label, default: if out { 1.0 } else { 0.0 }, param: Some(crate::organ::drawbar_param(i)), hidden: true, aliases }
+            }
+            knobs!(
+                bar("16'", 0, true, &["DRAWBAR 16", "DRAWBAR 1"]),
+                bar("5⅓'", 1, true, &["DRAWBAR 5 1/3", "DRAWBAR 2"]),
+                bar("8'", 2, true, &["DRAWBAR 8", "DRAWBAR 3"]),
+                bar("4'", 3, false, &["DRAWBAR 4", "DRAWBAR 4TH"]),
+                bar("2⅔'", 4, false, &["DRAWBAR 2 2/3", "DRAWBAR 5"]),
+                bar("2'", 5, false, &["DRAWBAR 2'", "DRAWBAR 6"]),
+                bar("1⅗'", 6, false, &["DRAWBAR 1 3/5", "DRAWBAR 7"]),
+                bar("1⅓'", 7, false, &["DRAWBAR 1 1/3", "DRAWBAR 8TH"]),
+                bar("1'", 8, false, &["DRAWBAR 1'", "DRAWBAR 9"]),
+                ks("LESLIE", 0.5, Some(crate::organ::P_LESLIE), &["ROTARY", "SPEAKER"]),
+                ks("PERC", 0.0, Some(crate::organ::P_PERC), &["PERCUSSION"]),
+                ks("DRIVE", 0.0, Some(crate::organ::P_DRIVE), &["OVERDRIVE"]),
+                ks("REVERB", 0.2, Some(crate::organ::P_REVERB), &[]),
+            )
+        }
         // An LV2 unit's knobs are its plugin's main controls (`main_controls`):
         // param 0 is whatever port the plugin lists first, never a "gain".
         NodeKind::Lv2 { .. } => &[],
@@ -663,6 +685,10 @@ pub struct GraphEngine {
     /// Master bus limiter (zero latency) in front of the warmth stage: many
     /// voices at once drove `tanh` into hard, buzzing saturation.
     master_lim: MasterLimiter,
+    /// Organ (setBfree) knob values that arrived before the node's LV2
+    /// instance was live (it loads on its own thread, rule 46); replayed by
+    /// `attach_lv2`. Fixed size: no allocation on the audio thread.
+    organ_pending: [Option<OrganPending>; 8],
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -810,6 +836,7 @@ impl GraphEngine {
             master_vol: 1.0,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
+            organ_pending: [None; 8],
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -895,6 +922,18 @@ impl GraphEngine {
         let node = slot.node;
         let inst = slot.plugin.is_instrument();
         self.lv2.push(slot);
+        // The face's organ values sent while the instance was loading.
+        if let Some(i) = self.organ_pending.iter().position(|p| p.is_some_and(|p| p.node == node)) {
+            let p = self.organ_pending[i].take().unwrap();
+            if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                for k in 0..crate::organ::PARAMS {
+                    if p.set & (1 << k) == 0 { continue; }
+                    if let Some((msgs, n)) = crate::organ::ccs(crate::organ::P_BASE + k as ParamId, p.values[k]) {
+                        for &(cc, val) in &msgs[..n] { s.plugin.control_change(cc, val); }
+                    }
+                }
+            }
+        }
         if inst {
             let device = self.graph.node(node)
                 .and_then(|n| self.rig_meta.get(n.rig as usize))
@@ -1381,8 +1420,26 @@ impl GraphEngine {
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
         let v = value as f32;
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
-            // LV2 knobs map param index → nth control port (normalized).
-            s.plugin.set_control_normalized(param as usize, v);
+            // setBfree's face controls are MIDI CCs (organ.rs); every other
+            // LV2 knob maps param index → nth control port (normalized).
+            match crate::organ::ccs(param, v) {
+                Some((msgs, n)) => {
+                    for &(cc, val) in &msgs[..n] { s.plugin.control_change(cc, val); }
+                }
+                None => s.plugin.set_control_normalized(param as usize, v),
+            }
+            true
+        } else if let Some(k) = crate::organ::index(param)
+            .filter(|_| self.graph.node(node).is_some_and(|n| crate::organ::is_organ(&n.kind)))
+        {
+            // setBfree still loading: keep the value for attach_lv2.
+            let slot = self.organ_pending.iter().position(|p| p.is_some_and(|p| p.node == node))
+                .or_else(|| self.organ_pending.iter().position(|p| p.is_none()));
+            if let Some(i) = slot {
+                let p = self.organ_pending[i].get_or_insert(OrganPending { node, values: [0.0; crate::organ::PARAMS], set: 0 });
+                p.values[k] = v;
+                p.set |= 1 << k;
+            }
             true
         } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
@@ -1605,6 +1662,8 @@ impl GraphEngine {
                 }
                 self.fit_route_out();
                 self.rig_meta.clear();
+                // Values parked for the old graph's organs (ids are reused).
+                self.organ_pending = [None; 8];
                 for i in 0..self.graph.nodes.len() {
                     if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
                         let id = self.graph.nodes[i].id;
@@ -2441,6 +2500,14 @@ impl GraphEngine {
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
     }
+}
+
+/// Organ knob values waiting for their setBfree instance (`organ_pending`).
+#[derive(Clone, Copy)]
+struct OrganPending {
+    node: NodeId,
+    values: [f32; crate::organ::PARAMS],
+    set: u16,
 }
 
 /// Zero-latency peak limiter for the master bus: holds the summed signal
@@ -4056,6 +4123,75 @@ pub fn metro_test() -> anyhow::Result<()> {
 
 /// LV2 instrument engine-routing test: a note sent through the control plane
 /// must reach the LV2 instrument's atom input (verified via readback).
+/// setBfree's face controls through the engine (`organ.rs`): drawbar
+/// registrations reach the real organ as its MIDI CCs, including values the
+/// face sends while the instance is still loading on the loader thread.
+pub fn organ_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::matrix::SourceId;
+    use crate::organ::{drawbar_param, B_SYNTH, DRAWBARS};
+    let sr = 48000.0;
+    anyhow::ensure!(crate::lv2::Lv2Plugin::load(B_SYNTH, sr, 512).is_ok(), "setBfree is not installed");
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(B_SYNTH) }, name_bytes("ORGAN"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    engine.spawn_lv2_loader();
+    let mut buf = vec![0.0f32; 512 * 2];
+    // Zero crossings per second of the left channel while `note` is held:
+    // a registration's pitch content (16' alone ≈ the fundamental an octave
+    // down, 1' alone ≈ three octaves up).
+    let measure = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, note: u8| -> (f32, f32) {
+        let mut buf = vec![0.0f32; 512 * 2];
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+        for _ in 0..20 { engine.render(&mut buf, 2); }
+        let (mut zc, mut prev, mut peak, mut n) = (0usize, 0.0f32, 0.0f32, 0usize);
+        for _ in 0..47 {
+            engine.render(&mut buf, 2);
+            for f in buf.chunks(2) {
+                if (f[0] >= 0.0) != (prev >= 0.0) { zc += 1; }
+                prev = f[0];
+                peak = peak.max(f[0].abs());
+                n += 1;
+            }
+        }
+        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+        for _ in 0..200 { engine.render(&mut buf, 2); }
+        (zc as f32 / (n as f32 / sr as f32), peak)
+    };
+    let registration = |bus: &mut crate::control::CommandBus, bars: [u8; DRAWBARS]| {
+        for (i, b) in bars.iter().enumerate() {
+            bus.send(Command::SetParam { node: organ, param: drawbar_param(i), value: crate::organ::drawbar_value(*b) as f64 });
+        }
+    };
+    // The face publishes right after the load, long before the instance is
+    // live (it loads on the loader thread): 1' only.
+    bus.send(Command::LoadGraph { graph: g });
+    registration(&mut bus, [0, 0, 0, 0, 0, 0, 0, 0, 8]);
+    let t0 = std::time::Instant::now();
+    while !engine.lv2.iter().any(|s| s.node == organ) && t0.elapsed().as_secs() < 10 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    anyhow::ensure!(engine.lv2.iter().any(|s| s.node == organ), "setBfree did not load within 10 s");
+    let (high, high_peak) = measure(&mut engine, &mut bus, 48);
+    registration(&mut bus, [8, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for _ in 0..10 { engine.render(&mut buf, 2); }
+    let (low, low_peak) = measure(&mut engine, &mut bus, 48);
+    println!("organ-test: C3 with 1' only: {high:.0} zero crossings/s (peak {high_peak:.3}); 16' only: {low:.0}/s (peak {low_peak:.3})");
+    anyhow::ensure!(high_peak > 1e-3 && low_peak > 1e-3, "the organ is silent");
+    // 1' sounds 4 octaves above 16': 16x the fundamental. Ask for 6x, so the
+    // Leslie's movement and the percussion cannot fake it.
+    anyhow::ensure!(high > 6.0 * low, "the drawbars did not change the registration ({high:.0} vs {low:.0} crossings/s): the CCs (or the ones sent while loading) did not arrive");
+    println!("organ-test: OK — drawbar CCs reach setBfree, also those sent while it loaded");
+    Ok(())
+}
+
 pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
     use crate::matrix::SourceId;

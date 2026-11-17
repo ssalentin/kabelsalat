@@ -8,6 +8,10 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Organ face for setBfree:** nine drawbars to pull (16′ … 1′) and LESLIE
+  (stop/slow/fast), PERC, DRIVE and REVERB knobs. setBfree only listens to MIDI
+  controllers, so the face sends its CCs; values are saved with the session,
+  work with MIDI learn, and a loaded programme shows its registration.
 - **Octave per split zone:** a split Keys face shows LOW and HIGH octave
   steppers (−3…+3). A bass below the split no longer has to sound as deep as
   the low keys it is played on; the assistant sets the LOW zone an octave up

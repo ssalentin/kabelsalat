@@ -604,6 +604,13 @@ Learned so far (2026-11-15, UI polish pass):
     before the limiter (`a_stuck_constant_is_blocked_and_does_not_duck_the_music`).
     When the output meter is full and nothing is heard, compare `get_status`
     `band_db` (all energy below 120 Hz = DC) and mute rigs one at a time.
+113. **A value sent to an LV2 node before its instance is live is parked,
+    not dropped:** LV2 plugins load on the loader thread (rule 46), so a fresh
+    setBfree's face values (SetParam right after the load) found no instance
+    and vanished: the face showed one registration, the organ played its own.
+    `organ_pending` (fixed size, no allocation) holds them and `attach_lv2`
+    replays them; `LoadGraph` clears it. Check with `kabelsalat organ-test`,
+    which sends the registration before the instance exists.
 
 ## Working on kabelsalat
 
@@ -633,7 +640,7 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test` (`./target/debug/kabelsalat <name>`).
+  `sound-library-test`, `organ-test` (`./target/debug/kabelsalat <name>`).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree

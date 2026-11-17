@@ -641,7 +641,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_params",
-            "description":"List bindable plugin/DSP parameters (id, name) and rack face knobs on a node, optionally filtered by query words. Use the returned id/target with set_cc_map or learn_cc.",
+            "description":"List a node's parameters. main_controls comes first: the few parameters the instrument's designer marked as most important (page, name, id, current value and text, and the face knob that shows it). Prefer them when the user asks to shape or map a sound, and pass a main control's name as knob=<name> to set_cc_map or learn_cc. params is the full list (id, name), filtered by query words: use it only when no main control fits. knobs are the rack face knobs.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"query":{"type":"string"}},"required":["node"]}
         }},
         {"type":"function","function":{
@@ -651,7 +651,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_cc_map",
-            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME'). Omit param/knob to unbind that CC.",
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Omit param/knob to unbind that CC.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{

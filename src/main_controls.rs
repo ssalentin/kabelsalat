@@ -7,6 +7,8 @@
 pub const MAX_MAIN_CONTROLS: usize = 8;
 /// Knobs a face shows from the list (beside its built-in knobs).
 pub const FACE_MAIN_CONTROLS: usize = 4;
+/// Longest knob label in characters (the face then fits it to a knob slot).
+pub const KNOB_LABEL_CHARS: usize = 9;
 
 /// One main control. `id` is what the host sends to move it: the CLAP param
 /// id, or the LV2 control-port ordinal (the engine's `SetParam` id).
@@ -62,10 +64,15 @@ impl MainControls {
         &self.controls[..self.controls.len().min(FACE_MAIN_CONTROLS)]
     }
 
-    /// A control by name (any case), as agents and CC bindings name it.
+    /// A control by the name agents and CC bindings use (any case): its
+    /// full name first, else its knob label. Rack faces and headless MCP
+    /// both resolve here, so a name means one control everywhere.
     pub fn find(&self, name: &str) -> Option<&MainControl> {
         let q = name.trim();
-        self.controls.iter().find(|c| c.name.eq_ignore_ascii_case(q))
+        self.controls
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(q))
+            .or_else(|| self.controls.iter().find(|c| knob_label(&c.name).eq_ignore_ascii_case(q)))
     }
 }
 
@@ -167,9 +174,11 @@ const ABBREVIATIONS: &[(&str, &str)] = &[
 ];
 
 /// A knob label for a control name: upper case, without its index tag, at
-/// most `max_chars`. Long names keep their LAST words ("A Filter 1 Cutoff" →
-/// "1 CUTOFF"), which say what the control does; a single long word is cut.
-pub fn knob_label(name: &str, max_chars: usize) -> String {
+/// most [`KNOB_LABEL_CHARS`]. Long names keep their LAST words ("A Filter 1
+/// Cutoff" → "1 CUTOFF"), which say what the control does; a single long
+/// word is cut.
+pub fn knob_label(name: &str) -> String {
+    let max_chars = KNOB_LABEL_CHARS;
     let words: Vec<String> = untagged(name)
         .to_uppercase()
         .split_whitespace()
@@ -305,20 +314,24 @@ mod tests {
         assert!((c.plain(0.5) - 10020.0).abs() < 1e-6);
         assert_eq!(c.normalized(1e9), 1.0, "clamped");
         assert!(m.find("Resonance").is_none());
+
+        let m = resolve(&[], &[param(1, "A Osc 1 Volume"), param(2, "B Osc 1 Volume")]);
+        assert_eq!(m.find("osc 1 vol").map(|c| c.id), Some(1), "a shared knob label names the first control");
+        assert_eq!(m.find("B Osc 1 Volume").map(|c| c.id), Some(2), "the full name tells them apart");
     }
 
     #[test]
     fn knob_labels_keep_the_words_that_say_what_the_control_does() {
-        assert_eq!(knob_label("Cutoff", 9), "CUTOFF");
-        assert_eq!(knob_label("A Filter 1 Cutoff", 9), "1 CUTOFF");
-        assert_eq!(knob_label("A Osc 1 Volume", 9), "OSC 1 VOL");
-        assert_eq!(knob_label("M1: Cutoff", 9), "CUTOFF", "the macro index is not the name");
-        assert_eq!(knob_label("M2: Resonance", 9), "RESO");
-        assert_eq!(knob_label("M5: Vibrato Rate", 9), "RATE");
-        assert_eq!(knob_label("Macro 1", 9), "MACRO 1");
-        assert_eq!(knob_label("Resonance", 9), "RESO");
-        assert_eq!(knob_label("Polyphony Limit Mode", 9), "MODE");
-        assert_eq!(knob_label("Supercalifragilistic", 9), "SUPERCALI");
-        assert_eq!(knob_label("  ", 9), "");
+        assert_eq!(knob_label("Cutoff"), "CUTOFF");
+        assert_eq!(knob_label("A Filter 1 Cutoff"), "1 CUTOFF");
+        assert_eq!(knob_label("A Osc 1 Volume"), "OSC 1 VOL");
+        assert_eq!(knob_label("M1: Cutoff"), "CUTOFF", "the macro index is not the name");
+        assert_eq!(knob_label("M2: Resonance"), "RESO");
+        assert_eq!(knob_label("M5: Vibrato Rate"), "RATE");
+        assert_eq!(knob_label("Macro 1"), "MACRO 1");
+        assert_eq!(knob_label("Resonance"), "RESO");
+        assert_eq!(knob_label("Polyphony Limit Mode"), "MODE");
+        assert_eq!(knob_label("Supercalifragilistic"), "SUPERCALI");
+        assert_eq!(knob_label("  "), "");
     }
 }

@@ -130,8 +130,31 @@ pub enum FromWorker {
     Models(Vec<String>),
     Text(String),
     ToolCall { id: String, name: String, args: Value },
+    /// One model round trip finished: how long it took and which model
+    /// answered (a router reports the model it picked).
+    Step(StepStat),
     Done,
     Error(String),
+}
+
+/// One model round trip of a turn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StepStat {
+    pub ms: u64,
+    pub model: String,
+}
+
+/// What the current (or last) turn cost: tallied as worker events pass
+/// through `Assistant::poll`, read by the Agent Activity panel and agent-eval.
+#[derive(Clone, Debug, Default)]
+pub struct TurnStats {
+    pub started: Option<std::time::Instant>,
+    /// Wall time from the user's message to the worker's Done.
+    pub wall: Option<std::time::Duration>,
+    pub steps: Vec<StepStat>,
+    /// Tool names in call order.
+    pub tools: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 pub struct Assistant {
@@ -144,19 +167,28 @@ pub struct Assistant {
     /// Models offered by the API (filled by the worker; a sane default list
     /// until it answers).
     pub models: Vec<String>,
+    pub turn: TurnStats,
     tx: Option<Sender<ToWorker>>,
     rx: Option<Receiver<FromWorker>>,
 }
 
 impl Assistant {
     pub fn new() -> Self {
+        Self::with_model(load_model())
+    }
+
+    /// An assistant on `model` for this process only: nothing is written to
+    /// the user's config (agent-eval compares models without changing the
+    /// one the app uses).
+    pub fn with_model(model: String) -> Self {
         let key = load_key();
         let mut a = Self {
             history: Vec::new(),
             busy: false,
             key_set: key.is_some(),
-            model: std::sync::Arc::new(std::sync::Mutex::new(load_model())),
+            model: std::sync::Arc::new(std::sync::Mutex::new(model)),
             models: vec!["deepseek-chat".into(), "deepseek-reasoner".into()],
+            turn: TurnStats::default(),
             tx: None,
             rx: None,
         };
@@ -177,6 +209,11 @@ impl Assistant {
         self.tx = Some(tx_in);
         self.rx = Some(rx_out);
         let model = self.model.clone();
+        // Its own thread: a slow model list must not delay the first request.
+        let (list_key, list_tx) = (key.clone(), tx_out.clone());
+        std::thread::spawn(move || {
+            if let Some(ids) = fetch_models(&list_key) { let _ = list_tx.send(FromWorker::Models(ids)); }
+        });
         std::thread::spawn(move || worker(key, model, rx_in, tx_out));
     }
 
@@ -191,14 +228,7 @@ impl Assistant {
     }
 
     pub fn send_user(&mut self, text: String) {
-        self.history.push(ChatLine {
-            role: "user".into(),
-            text: text.clone(),
-        });
-        self.busy = true;
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(ToWorker::User(text));
-        }
+        self.send_user_display(text.clone(), text);
     }
 
     /// Show `shown` in the transcript but send `sent` (e.g. with a state
@@ -206,6 +236,7 @@ impl Assistant {
     pub fn send_user_display(&mut self, shown: String, sent: String) {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
+        self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::User(sent));
         }
@@ -225,6 +256,15 @@ impl Assistant {
                     Ok(ev) => out.push(ev),
                     Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                 }
+            }
+        }
+        for ev in &out {
+            match ev {
+                FromWorker::Step(s) => self.turn.steps.push(s.clone()),
+                FromWorker::ToolCall { name, .. } => self.turn.tools.push(name.clone()),
+                FromWorker::Error(e) => self.turn.errors.push(e.clone()),
+                FromWorker::Done => self.turn.wall = self.turn.started.map(|t| t.elapsed()),
+                FromWorker::Models(_) | FromWorker::Text(_) => {}
             }
         }
         out
@@ -585,6 +625,15 @@ pub(crate) fn tools() -> Value {
     ])
 }
 
+/// Which models can this key use? (once; the UI falls back to defaults)
+fn fetch_models(key: &str) -> Option<Vec<String>> {
+    let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(20)).build().ok()?;
+    let v: Value = client.get("https://api.deepseek.com/models").bearer_auth(key).send().ok()?.json().ok()?;
+    let ids: Vec<String> = v.get("data")?.as_array()?
+        .iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect();
+    (!ids.is_empty()).then_some(ids)
+}
+
 fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Receiver<ToWorker>, tx: Sender<FromWorker>) {
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -596,15 +645,6 @@ fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Rece
             return;
         }
     };
-    // Which models can this key use? (once; the UI falls back to defaults)
-    if let Ok(r) = client.get("https://api.deepseek.com/models").bearer_auth(&key).send() {
-        if let Ok(v) = r.json::<Value>() {
-            let ids: Vec<String> = v.get("data").and_then(|d| d.as_array())
-                .map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect())
-                .unwrap_or_default();
-            if !ids.is_empty() { let _ = tx.send(FromWorker::Models(ids)); }
-        }
-    }
     let mut msgs: Vec<Value> = vec![json!({ "role": "system", "content": system_prompt() })];
     loop {
         let user_text = match rx.recv() {
@@ -619,6 +659,7 @@ fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Rece
                 "tools": tools(),
                 "tool_choice": "auto",
             });
+            let sent = std::time::Instant::now();
             let resp = client
                 .post("https://api.deepseek.com/chat/completions")
                 .bearer_auth(&key)
@@ -641,6 +682,10 @@ fn worker(key: String, model: std::sync::Arc<std::sync::Mutex<String>>, rx: Rece
                     break;
                 }
             };
+            let _ = tx.send(FromWorker::Step(StepStat {
+                ms: sent.elapsed().as_millis() as u64,
+                model: v.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string(),
+            }));
             if !status.is_success() {
                 let m = v
                     .pointer("/error/message")

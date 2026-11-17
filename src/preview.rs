@@ -673,6 +673,7 @@ impl eframe::App for PreviewApp {
                     let result = self.exec_tool(&name, &args);
                     self.assistant.send_tool_result(id, result);
                 }
+                assistant::FromWorker::Step(_) => {}
                 assistant::FromWorker::Done => self.assistant.busy = false,
                 assistant::FromWorker::Error(e) => {
                     self.assistant.busy = false;

@@ -211,8 +211,10 @@ The cables are not lines — they are patch cables, and they behave like it:
 - **Signal flow:** MIDI events launch visible pulses that travel source → destination
   along the cable; audio cables glow/breathe with their live level. You *see* the
   signal path while you play.
-- **Physics-lite:** dragging a node makes its cables swing and settle (damped spring);
-  plugging/unplugging animates. The graph feels alive, never static.
+- **Rope physics:** each cable is an 18-point Verlet rope (`src/rope.rs`) under
+  gravity, ends pinned to the jacks, stepped at a fixed 120 Hz; dragging a node or
+  grabbing a cable makes it swing and settle, an unplugged end falls free.
+  Plugging/unplugging animates. The graph feels alive, never static.
 - **Theme:** cable colors follow the Omarchy accent palette; audio vs MIDI visually
   distinct; selected cables highlight their full path.
 - **RT-safe by construction:** animation is driven purely by lock-free snapshots

@@ -64,6 +64,30 @@ pub fn save_config_field(field: &str, value: &str) -> std::io::Result<()> {
     save_config_values_to(&config_path(), &[(field, json!(value))])
 }
 
+/// Remove one field from a config JSON file (mode 0600), preserving other fields.
+pub fn remove_config_field_from(path: &std::path::Path, field: &str) -> std::io::Result<()> {
+    let Ok(raw) = std::fs::read_to_string(path) else { return Ok(()); };
+    let mut v: Value = serde_json::from_str(&raw).ok().filter(|v: &Value| v.is_object()).unwrap_or_else(|| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        if obj.remove(field).is_none() {
+            return Ok(());
+        }
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&v).unwrap())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Remove one field from config.json (test-safe no-op under cfg(test), rule 37).
+pub fn remove_config_field(field: &str) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    remove_config_field_from(&config_path(), field)
+}
+
 /// Load persisted count-in `(enabled, bars)` from `path` (defaults: `(false, 1)`).
 pub fn load_count_in_from(path: &std::path::Path) -> (bool, u8) {
     let v: Option<Value> = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok());
@@ -249,18 +273,15 @@ impl TurnStats {
 }
 
 type SharedRoute = std::sync::Arc<std::sync::Mutex<Route>>;
+type SharedOptRoute = std::sync::Arc<std::sync::Mutex<Option<Route>>>;
 
-/// Where each kind of request goes.
+/// Where each kind of request goes. Every role is read on each request so
+/// changes in Settings or `/model` take effect without restarting a chat.
 #[derive(Clone)]
 struct Routes {
-    /// The acting chat model, read on every request: switching takes effect
-    /// with the next step, the conversation is kept.
     act: SharedRoute,
-    /// The decisions model asked first about every request; None = every
-    /// request goes straight to a chat model.
-    decide: Option<Route>,
-    /// The chat model that acts while a turn carries an image.
-    perceive: Route,
+    decide: SharedOptRoute,
+    perceive: SharedRoute,
 }
 
 pub struct Assistant {
@@ -269,6 +290,10 @@ pub struct Assistant {
     pub key_set: bool,
     pub phase: Option<RunPhase>,
     routes: Routes,
+    keys_present: llm::Keys,
+    decide_enabled: bool,
+    decide_model: String,
+    act_overridden: bool,
     /// Models offered in the picker.
     pub models: Vec<String>,
     pub turn: TurnStats,
@@ -289,21 +314,37 @@ impl Assistant {
     }
 
     fn on_route(route: Route, decide: bool) -> Self {
-        // A decide model whose endpoint has no decisions API (or no key)
-        // switches the front off, e.g. agent_decide_model = "off".
-        let decide = Some(Route::configured(Role::Decide))
-            .filter(|r| decide && r.endpoint.spec().decisions_url.is_some() && r.endpoint.key().is_some());
-        let models = picker_models(Endpoint::OpenRouter.key().is_some(), Endpoint::DeepSeek.key().is_some(), &route.model);
+        let keys_present = llm::Keys {
+            openrouter: Endpoint::OpenRouter.key().is_some(),
+            deepseek: Endpoint::DeepSeek.key().is_some(),
+        };
+        let decide_cfg = load_config_str(Role::Decide.model_field());
+        let decide_enabled = decide && !matches!(decide_cfg.as_deref(), Some("off"));
+        let decide_route = if decide_enabled {
+            Route::configured(Role::Decide)
+        } else {
+            Route::for_model(llm::JEV)
+        };
+        let decide_model = decide_route.model.clone();
+        let decide_active = Some(decide_route)
+            .filter(|r| decide_enabled && r.endpoint.spec().decisions_url.is_some() && keys_present.has(r.endpoint));
+        let act_overridden = load_config_str(Role::Act.model_field()).is_some();
+        let models = picker_models(keys_present.openrouter, keys_present.deepseek, &route.model);
+        let key_set = keys_present.has(route.endpoint);
         let mut a = Self {
             history: Vec::new(),
             busy: false,
-            key_set: route.endpoint.key().is_some(),
+            key_set,
             phase: None,
             routes: Routes {
                 act: std::sync::Arc::new(std::sync::Mutex::new(route)),
-                decide,
-                perceive: Route::configured(Role::Perceive),
+                decide: std::sync::Arc::new(std::sync::Mutex::new(decide_active)),
+                perceive: std::sync::Arc::new(std::sync::Mutex::new(Route::configured(Role::Perceive))),
             },
+            keys_present,
+            decide_enabled,
+            decide_model,
+            act_overridden,
             models,
             turn: TurnStats::default(),
             tx: None,
@@ -318,14 +359,82 @@ impl Assistant {
     /// The user just stored a DeepSeek key. A route that still has no key
     /// (an OpenRouter model without an OpenRouter key) falls back to it.
     pub fn key_saved(&mut self) {
+        self.keys_present.deepseek = true;
         if let Ok(mut route) = self.routes.act.lock() {
-            if route.endpoint.key().is_none() { *route = Route::for_model(llm::DEEPSEEK_CHAT); }
+            if !self.keys_present.has(route.endpoint) {
+                *route = Route::for_model(llm::DEEPSEEK_CHAT);
+            }
         }
-        self.key_set = true;
-        self.start_worker();
+        self.restart_worker();
+    }
+
+    /// Save an API key for `endpoint` (test-safe no-op on disk under cfg(test))
+    /// and restart the worker so it takes effect immediately.
+    pub fn save_api_key(&mut self, endpoint: Endpoint, key: &str) -> std::io::Result<()> {
+        save_config_field(endpoint.spec().key_field, key)?;
+        self.keys_present.set(endpoint, true);
+        if endpoint == Endpoint::DeepSeek {
+            if let Ok(mut route) = self.routes.act.lock() {
+                if !self.keys_present.has(route.endpoint) {
+                    *route = Route::for_model(llm::DEEPSEEK_CHAT);
+                }
+            }
+        }
+        self.restart_worker();
+        Ok(())
+    }
+
+    /// Remove an API key for `endpoint` (test-safe no-op on disk under cfg(test))
+    /// and restart/stop the worker accordingly.
+    pub fn remove_api_key(&mut self, endpoint: Endpoint) -> std::io::Result<()> {
+        remove_config_field(endpoint.spec().key_field)?;
+        self.keys_present.set(endpoint, false);
+        self.restart_worker();
+        Ok(())
+    }
+
+    /// Drop any existing worker channels and start a fresh worker if a key is
+    /// available (never spawns network threads under cfg(test), rule 37).
+    pub fn restart_worker(&mut self) {
+        self.tx = None;
+        self.rx = None;
+        self.busy = false;
+        self.phase = None;
+
+        if !self.act_overridden {
+            if let Ok(mut act) = self.routes.act.lock() {
+                *act = Route::resolve(Role::Act, None, self.keys_present);
+            }
+        }
+        let act_route = self.route_for(Role::Act);
+        self.models = picker_models(self.keys_present.openrouter, self.keys_present.deepseek, &act_route.model);
+        self.sync_decide_route();
+        self.key_set = self.keys_present.has(act_route.endpoint)
+            || self.keys_present.deepseek
+            || self.keys_present.openrouter;
+        if self.key_set {
+            self.start_worker();
+        }
+    }
+
+    fn sync_decide_route(&mut self) {
+        let next = if self.decide_enabled {
+            let r = Route::for_model(&self.decide_model);
+            let ok_endpoint = r.endpoint.spec().decisions_url.is_some();
+            let ok_key = cfg!(test) || self.keys_present.has(r.endpoint);
+            (ok_endpoint && ok_key).then_some(r)
+        } else {
+            None
+        };
+        if let Ok(mut d) = self.routes.decide.lock() {
+            *d = next;
+        }
     }
 
     fn start_worker(&mut self) {
+        if cfg!(test) {
+            return;
+        }
         let (tx_in, rx_in) = channel::<ToWorker>();
         let (tx_out, rx_out) = channel::<FromWorker>();
         self.tx = Some(tx_in);
@@ -346,9 +455,94 @@ impl Assistant {
         self.routes.act.lock().map(|r| r.model.clone()).unwrap_or_default()
     }
 
+    pub fn keys(&self) -> llm::Keys {
+        self.keys_present
+    }
+
+    pub fn decide_enabled(&self) -> bool {
+        self.decide_enabled
+    }
+
+    /// Current route for `role` (`Decide` returns its configured model even
+    /// while disabled so Settings can display and edit it).
+    pub fn route_for(&self, role: Role) -> Route {
+        match role {
+            Role::Decide => self
+                .routes
+                .decide
+                .lock()
+                .ok()
+                .and_then(|d| d.clone())
+                .unwrap_or_else(|| Route::for_model(&self.decide_model)),
+            Role::Act => self
+                .routes
+                .act
+                .lock()
+                .map(|r| r.clone())
+                .unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT)),
+            Role::Perceive => self
+                .routes
+                .perceive
+                .lock()
+                .map(|r| r.clone())
+                .unwrap_or_else(|_| Route::for_model(llm::PERCEIVE_MODEL)),
+        }
+    }
+
     /// Whether Jev's decision front answers requests before the chat model.
     pub fn decides_first(&self) -> bool {
-        self.routes.decide.is_some()
+        self.routes.decide.lock().is_ok_and(|d| d.is_some())
+    }
+
+    pub fn set_decide_enabled(&mut self, on: bool) {
+        self.decide_enabled = on;
+        let persisted = if on { self.decide_model.as_str() } else { "off" };
+        let _ = save_config_field(Role::Decide.model_field(), persisted);
+        self.sync_decide_route();
+    }
+
+    /// Switch any role's model (persisted; applies from the next request).
+    pub fn set_role_model(&mut self, role: Role, m: &str) -> String {
+        let m = m.trim();
+        if m.is_empty() {
+            return "model id is empty".to_string();
+        }
+        match role {
+            Role::Act => self.set_model(m),
+            Role::Decide => {
+                if m.eq_ignore_ascii_case("off") {
+                    self.set_decide_enabled(false);
+                    return "decisions model turned off".to_string();
+                }
+                self.decide_model = m.to_string();
+                self.decide_enabled = true;
+                let _ = save_config_field(Role::Decide.model_field(), m);
+                self.sync_decide_route();
+                let route = Route::for_model(m);
+                let spec = route.endpoint.spec();
+                if route.endpoint.spec().decisions_url.is_none() {
+                    format!("decisions model set to {m}, but {} has no decisions API", spec.label)
+                } else if !self.keys_present.has(route.endpoint) && !cfg!(test) {
+                    format!("decisions model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
+                } else {
+                    format!("decisions model switched to {m}")
+                }
+            }
+            Role::Perceive => {
+                let route = Route::for_model(m);
+                let spec = route.endpoint.spec();
+                let missing_key = !self.keys_present.has(route.endpoint) && !cfg!(test);
+                if let Ok(mut cur) = self.routes.perceive.lock() {
+                    *cur = route;
+                }
+                let _ = save_config_field(Role::Perceive.model_field(), m);
+                if missing_key {
+                    format!("vision model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
+                } else {
+                    format!("vision model switched to {m}")
+                }
+            }
+        }
     }
 
     /// Switch the acting model (persisted; applies from the next request).
@@ -356,7 +550,8 @@ impl Assistant {
     pub fn set_model(&mut self, m: &str) -> String {
         let route = Route::for_model(m);
         let spec = route.endpoint.spec();
-        let missing_key = route.endpoint.key().is_none() && !cfg!(test);
+        let missing_key = !self.keys_present.has(route.endpoint) && !cfg!(test);
+        self.act_overridden = true;
         if let Ok(mut cur) = self.routes.act.lock() { *cur = route; }
         let _ = save_config_field(Role::Act.model_field(), m);
         if !self.models.iter().any(|x| x == m) { self.models.push(m.to_string()); }
@@ -382,8 +577,8 @@ impl Assistant {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
         self.phase = Some(if sent.image.is_some() {
-            RunPhase::Thinking { step: 1, model: self.routes.perceive.model.clone(), seeing: true }
-        } else if self.routes.decide.is_some() {
+            RunPhase::Thinking { step: 1, model: self.route_for(Role::Perceive).model, seeing: true }
+        } else if self.decides_first() {
             RunPhase::Deciding
         } else {
             RunPhase::Thinking { step: 1, model: self.model(), seeing: false }
@@ -862,6 +1057,33 @@ fn picker_models(openrouter: bool, deepseek: bool, current: &str) -> Vec<String>
         models.insert(0, current.to_string());
     }
     models
+}
+
+/// Model choices shown in Settings for `role`: the picker list plus known
+/// OpenRouter ids already used in code, keeping `current` present.
+pub fn role_model_choices(role: Role, keys: llm::Keys, current: &str) -> Vec<String> {
+    let mut list: Vec<String> = match role {
+        Role::Decide => vec![llm::JEV.to_string()],
+        Role::Act => {
+            let mut m = picker_models(keys.openrouter, keys.deepseek, current);
+            for extra in [llm::JEV_ROUTER, llm::CLAUDE_OPUS, llm::PERCEIVE_MODEL] {
+                if !m.iter().any(|x| x == extra) {
+                    m.push(extra.to_string());
+                }
+            }
+            m
+        }
+        Role::Perceive => vec![
+            llm::PERCEIVE_MODEL.to_string(),
+            llm::GEMINI_FLASH_25.to_string(),
+            llm::CLAUDE_OPUS.to_string(),
+        ],
+    };
+    let cur = current.trim();
+    if !cur.is_empty() && !cur.eq_ignore_ascii_case("off") && !list.iter().any(|x| x == cur) {
+        list.insert(0, cur.to_string());
+    }
+    list
 }
 
 fn fetch_deepseek_models() -> Option<Vec<String>> {
@@ -1648,7 +1870,8 @@ fn worker<T: Transport>(
             },
         };
         convo.start_turn(&user);
-        let end = match routes.decide.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
+        let jev_route = routes.decide.lock().ok().and_then(|d| d.clone());
+        let end = match jev_route.as_ref().and_then(|jev| decide_turn(&mut client, jev, key_for, &user, &mut convo, &rx, &tx)) {
             Some(end) => end,
             None => run_turn(&mut client, &routes, key_for, &system, &tools, &mut convo, &rx, &tx),
         };
@@ -1762,7 +1985,9 @@ fn run_turn<T: Transport>(
         // The acting model may not see images: from the step an image
         // enters the turn, the seeing model acts.
         let sees = convo.has_image();
-        let route = if sees { routes.perceive.clone() } else {
+        let route = if sees {
+            routes.perceive.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::PERCEIVE_MODEL))
+        } else {
             routes.act.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT))
         };
         let spec = route.endpoint.spec();
@@ -1917,8 +2142,8 @@ mod tests {
         drop(tx_in);
         let routes = Routes {
             act: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER))),
-            decide,
-            perceive: Route::for_model(SEEING),
+            decide: std::sync::Arc::new(std::sync::Mutex::new(decide)),
+            perceive: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(SEEING))),
         };
         worker(llm::Client::new(probe.clone()), routes, key_for, rx_in, tx_out);
         (rx_out.try_iter().collect(), probe.requests().into_iter().map(|(_, _, body)| body).collect())
@@ -2624,5 +2849,53 @@ mod tests {
         let (events, requests) = drive_with(vec![], vec![user_with_image("what is this?")], None, |_| None);
         assert!(requests.is_empty());
         assert!(matches!(&events[..], [FromWorker::Error(e), FromWorker::Done] if e.contains("an image needs google/gemini-3.8-flash") && e.contains("openrouter_api_key")), "{events:?}");
+    }
+
+    #[test]
+    fn remove_config_field_removes_only_target_and_preserves_mode() {
+        let dir = std::env::temp_dir().join(format!("ksalat-rm-field-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        std::fs::write(&p, r#"{"deepseek_api_key":"sk-test","agent_act_model":"deepseek-chat"}"#).unwrap();
+
+        remove_config_field_from(&p, "deepseek_api_key").unwrap();
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(raw.get("deepseek_api_key").is_none());
+        assert_eq!(raw["agent_act_model"], json!("deepseek-chat"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn role_model_choices_and_role_switching_update_routes() {
+        let keys = llm::Keys { openrouter: true, deepseek: true };
+        let act_choices = role_model_choices(Role::Act, keys, llm::DEEPSEEK_CHAT);
+        assert!(act_choices.iter().any(|m| m == llm::DEEPSEEK_CHAT));
+        assert!(act_choices.iter().any(|m| m == "deepseek-reasoner"));
+        assert!(act_choices.iter().any(|m| m == llm::JEV_ROUTER));
+        assert!(act_choices.iter().any(|m| m == llm::CLAUDE_OPUS));
+        assert!(act_choices.iter().any(|m| m == llm::PERCEIVE_MODEL));
+
+        let mut a = Assistant::new();
+        a.set_role_model(Role::Act, llm::CLAUDE_OPUS);
+        assert_eq!(a.route_for(Role::Act), Route { endpoint: Endpoint::OpenRouter, model: llm::CLAUDE_OPUS.into() });
+
+        a.set_role_model(Role::Perceive, llm::GEMINI_FLASH_25);
+        assert_eq!(a.route_for(Role::Perceive), Route { endpoint: Endpoint::OpenRouter, model: llm::GEMINI_FLASH_25.into() });
+
+        a.set_decide_enabled(false);
+        assert!(!a.decide_enabled());
+        assert!(!a.decides_first());
+        a.set_decide_enabled(true);
+        assert!(a.decide_enabled());
+        assert!(a.decides_first());
+        assert_eq!(a.route_for(Role::Decide), Route { endpoint: Endpoint::OpenRouter, model: llm::JEV.into() });
+
+        a.save_api_key(Endpoint::OpenRouter, "or-fake-for-test").unwrap();
+        assert!(a.keys().openrouter);
+        assert!(a.key_set);
+        a.remove_api_key(Endpoint::OpenRouter).unwrap();
+        assert!(!a.keys().openrouter);
+        assert!(!a.key_set);
     }
 }

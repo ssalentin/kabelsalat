@@ -115,6 +115,10 @@ releases may still change behaviour and session files.
 - After recording, the top bar names the saved take with **Play** and **Folder**.
 
 ### Changed
+- The assistant's model picker is labelled "chat:" and no longer offers the
+  `typesafe/jev-router` chat router when a DeepSeek key exists (it read like
+  "turn Jev on" and made chat steps 2-8 s). A "Jev decides first" note shows
+  that Jev's fast decisions run on their own.
 - **`agent_act_model` replaces `assistant_model`** in `config.json`; the old
   field is no longer read. A request stops after 24 model steps with a
   message instead of running on.

@@ -9018,13 +9018,22 @@ impl DemoApp {
                             let cur = self.assistant.model();
                             let mut pick: Option<String> = None;
                             egui::ComboBox::from_id_salt("assistant_model")
-                                .selected_text(egui::RichText::new(format!("model: {cur}")).size(12.0).color(theme::CREAM))
+                                .selected_text(egui::RichText::new(format!("chat: {cur}")).size(12.0).color(theme::CREAM))
                                 .show_ui(ui, |ui| {
                                     for m in self.assistant.models.clone() {
                                         if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
                                     }
-                                }).response.on_hover_text("chat model — switch any time, the conversation stays");
+                                }).response.on_hover_text(if self.assistant.decides_first() {
+                                    "chat model for what Jev does not settle (questions, multi-step wiring) — switch any time, the conversation stays"
+                                } else {
+                                    "chat model — switch any time, the conversation stays"
+                                });
                             if let Some(m) = pick { self.switch_model(&m); }
+                            if self.assistant.decides_first() && header_w >= 560.0 {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("Jev decides first").size(11.5).color(theme::AGENT_TEXT))
+                                    .on_hover_text("Jev answers clear requests itself in about 0.3 s; everything else goes to the chat model. No need to select it.");
+                            }
                             if self.demo_agent_hold {
                                 ui.add_space(6.0);
                                 if theme::chip_button(ui, "Replay", false).on_hover_text("replay rack animations (Shift+F12)").clicked() {

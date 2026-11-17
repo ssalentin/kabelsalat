@@ -22,11 +22,34 @@ releases may still change behaviour and session files.
   Everything else goes to the chat model as before. Needs
   `openrouter_api_key` in `config.json`; `agent_decide_model: "off"` turns it
   off.
+- **More requests settled by Jev's decision:** a rig a bit quieter or louder
+  (one step of about 3 dB from where it is), pan left or right, add one
+  built-in effect to a rig (wired in front of its Master), remove a rig's
+  effect (the gap is closed), load a sound by kind (pad, bass, lead, keys,
+  organ, strings, brass, pluck, bells, FX: the patch search gets the user's
+  words first, then the kind), add or start the metronome, start and stop
+  recording. Each is a plan of the same tool calls a chat model would make,
+  so Confirm / Cancel, undo and Agent Activity behave the same. Measured
+  with `agent-eval` at 0.3–0.4 s per request instead of 2–6 s. A request
+  Jev is unsure of, a question, or a request for two changes still goes to
+  the chat model.
+- **Images for the assistant:** drop a PNG or JPEG on the window, or paste
+  one into the open chat. It shows as a chip above the input (a click
+  removes it) and goes out with the next message. A turn with an image is
+  answered by the seeing model (`agent_perceive_model`, default
+  `google/gemini-3.8-flash` on OpenRouter), which has the same tools. An
+  image is sent only during its own turn; later turns keep one line that
+  names it.
+- **`look_at_rack`:** the assistant and MCP agents (`kabelsalat mcp
+  --attach`) can ask for a screenshot of the app window, scaled to at most
+  1400 px and PNG-encoded off the UI thread. MCP gets it as image content.
+- **`kabelsalat jev-test --image <file> <request>`** asks Jev about one
+  request without and with an image.
 - **Model routes per role** in `config.json`: `agent_decide_model`,
   `agent_act_model` (also set by `/model` in the chat) and
   `agent_perceive_model`. Ids with a vendor prefix (`vendor/model`) go to
   OpenRouter, bare ids to DeepSeek.
-- **`kabelsalat agent-eval`** runs the real agent loop over 14 scripted
+- **`kabelsalat agent-eval`** runs the real agent loop over 26 scripted
   requests on a headless app with an offline engine and reports pass rate,
   model steps, tool calls, wall time and the models that answered.
   **`kabelsalat jev-test`** shows what Jev decides for sample requests.
@@ -100,6 +123,12 @@ releases may still change behaviour and session files.
   clears `trigmask` bit 12 (tied envelope), but step 12 still opens the filter
   over the previous step and delay (~8% of onset energy). Scoring on the true
   silent steps (`9, 10, 15`) removes the ~5–8% false-rotation rate across runs.
+- **"Rig 1" is the first rig for the chat model too:** it took the user's
+  "rig 1" for the tool argument `rig=1` (the second rig) in 2 of 22 runs of
+  a two-change request. The system prompt now states the mapping.
+- **Several `disconnect` calls in one agent step all take effect:** every
+  second one reported `NOT applied` and its cable stayed, because the next
+  call ran before the engine had answered the one before it.
 - **The agent's `disconnect` works:** the cable came back in the same audio
   block because the rack re-sent it every frame; the tool reported success.
 - **No more doubled units from the agent:** a `get_graph` right after

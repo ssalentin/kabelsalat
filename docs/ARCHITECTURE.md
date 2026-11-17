@@ -40,7 +40,10 @@ agents are in [AGENTS.md](../AGENTS.md).
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
   voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
   MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
-  parameter (YANES). Each `Sound` carries its `Load` (plugin state, parameter
+  parameter (YANES). Aeolus has no presets and starts with every stop off:
+  `aeolus.rs` holds its organ's stop table and a set of registrations, each
+  written as the plugin's JSON state; a freshly instantiated Aeolus gets the
+  default registration in `ClapVoice::instantiate_entry`. Each `Sound` carries its `Load` (plugin state, parameter
   value, LV2 preset, programme change), and `load` sends each along its own
   path. `Libraries` scans on a thread of its own and keeps the results;
   `search` / `find` are the one search for every library, and the

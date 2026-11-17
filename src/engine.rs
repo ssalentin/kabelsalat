@@ -4458,7 +4458,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             anyhow::ensure!(last == Some([0xC0, *program, 0]), "the plugin's last MIDI event is {last:?}, expected programme change {program}");
             format!("programme change {program} reached the plugin")
         }
-        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) => {
+        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) | Load::AeolusRegistration(_) => {
             let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
             let state = main.save_state()?;
             anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
@@ -4497,6 +4497,7 @@ pub fn sound_library_test() -> anyhow::Result<()> {
         "setbfree" => "jazz",
         "dexed" => "brass",
         "vitalium" => "pad",
+        "aeolus" => "flute",
         _ => "bass",
     };
     let clap = crate::host::list_clap_plugins();

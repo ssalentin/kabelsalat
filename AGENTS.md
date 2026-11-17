@@ -642,6 +642,12 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **An instrument starts playable:** Aeolus starts with every stop off,
+    so the catalog install built, loaded and scanned it, and middle C peaked
+    at 0.000. Play a note on a fresh instance of every new catalog
+    instrument (`catalog-install-test <id>`); one that starts silent gets a
+    starting state (`aeolus::initial_state`, applied where every CLAP voice
+    is instantiated) and its sounds as a `Source` (rule 93).
 
 ## Working on kabelsalat
 

@@ -35,8 +35,8 @@ use crate::control::{
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
 use crate::engine::{
-    AudioInLevels, EdgeLevels, GraphEngine, P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX,
-    P_TIME, P_VOL, P_WARM,
+    AudioInLevels, EdgeLevels, GraphEngine, VoiceBack, VoiceMsg, VoiceSlot, P_AUDIO_IN_GAIN,
+    P_AUDIO_IN_MONITOR, P_LEVEL, P_MIX, P_TIME, P_VOL, P_WARM,
 };
 use crate::host::{
     list_clap_plugins, ClapPluginInfo, ClapVoice, ClapVoiceMain, ParamDesc, VoiceController,
@@ -88,6 +88,8 @@ const BLACK: Color32 = theme::DARK_PANEL; // true dark for glyphs on teal/lit fi
 /// The reference CLAP instrument (docs/ARCHITECTURE.md §1). The engine's two voices are Surge,
 /// so it is the only CLAP plugin that can currently be added from the browser.
 use crate::sounds::{DEXED_ID, SURGE_ID};
+/// Ring slots between the voice host (this thread) and the audio thread.
+const VOICE_RING: usize = 64;
 
 const MAX_SAMPLES: usize = 49; // arc-length LUT cap (48 segments per cable)
 const MAX_PULSES: usize = 12;
@@ -1296,7 +1298,6 @@ fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
 
 /// Nav item as a real button chip (§4.14, updated 2026-11-15): active/open =
 /// near-black fill + cream text; closed = recessed paper chip. No underlines.
-use crate::control::VOICE_POOL;
 
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
     // Hover names the shortcut (M / N / C / V / B / ,).
@@ -1761,9 +1762,19 @@ struct UndoSnap {
     rigs: Vec<crate::control::RigMeta>,
     mix: [crate::engine::RigMix; 8],
     active: usize,
-    patch_names: [Option<String>; VOICE_POOL],
-    /// Per-voice keyboard/hardware source switches (not in the session).
-    rig_sources: [(bool, bool); VOICE_POOL],
+    /// Per-voice source switches, device and patch name (not in the session).
+    voices: Vec<VoiceRow>,
+}
+
+/// One CLAP unit's entry of the per-voice slot tables (`rig_sources`,
+/// `rig_device`, `patch_names`) under its node id: how the tables travel
+/// across a reload that resets them (undo, rig edit).
+#[derive(Clone)]
+struct VoiceRow {
+    node: u32,
+    sources: (bool, bool),
+    device: Option<u32>,
+    patch_name: Option<String>,
 }
 
 /// Tools the running app serves to `kabelsalat mcp --attach` over the UI
@@ -2099,7 +2110,8 @@ struct DemoApp {
     /// Every instrument's sound library, scanned off this thread (rule 46).
     sounds: crate::sounds::Libraries,
     /// Current patch per synth voice slot (None = Surge's init patch).
-    patch_names: [Option<String>; VOICE_POOL],
+    /// A slot table like `rig_sources`.
+    patch_names: Vec<Option<String>>,
     /// Sound browser search text (synth editor).
     sound_filter: String,
     /// Last frame's MIDI-matrix block width (table + legend), for centering.
@@ -2204,9 +2216,12 @@ struct DemoApp {
     /// so note-offs can't orphan (vibez lesson, docs/vibez-notes.md).
     had_kb_focus: bool,
 
-    /// Per-rig input selection (keyboard, hardware) for rigs A=node1, B=node4.
-    /// The keyboard is ONE source: on-screen clicks and laptop typing.
-    rig_sources: [(bool, bool); VOICE_POOL],
+    /// Input selection (keyboard, hardware) per CLAP unit. The keyboard is
+    /// ONE source: on-screen clicks and laptop typing. A slot table: one
+    /// entry per CLAP unit in unit order (`clap_rigs`), refit by
+    /// `fit_voice_tables` whenever the units change, so it has an entry for
+    /// every CLAP unit however many there are.
+    rig_sources: Vec<(bool, bool)>,
 
     // --- Integrated app (task-4 merge): audio, assistant, input routing ---
     assistant: Assistant,
@@ -2233,8 +2248,9 @@ struct DemoApp {
     last_midi: Option<String>,
     /// The info line is shown in the hint row (no room in the top bar).
     info_in_hint: bool,
-    /// Per-rig hardware device selection (None = any), rigs A=node1, B=node4.
-    rig_device: [Option<u32>; VOICE_POOL],
+    /// Hardware device selection per CLAP unit (None = any). A slot table
+    /// like `rig_sources`.
+    rig_device: Vec<Option<u32>>,
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -2243,10 +2259,20 @@ struct DemoApp {
     surge_controllers: Vec<VoiceController>,
     clap_plugin_ids: Vec<String>,
     clap_voice_ids: Vec<u64>,
+    /// CLAP unit slot → index into the hosted voices (`_surge_main`, …):
+    /// the voice the engine bound to that unit's node.
     clap_slot_map: Vec<Option<usize>>,
+    /// Ids of hosted voices the engine was asked to hand back.
+    clap_leaving: Vec<u64>,
+    /// Capacity of the engine's voice table (grown by `VoiceMsg::Grow`).
+    engine_voice_cap: usize,
+    last_voices_rev: u64,
+    /// Graph revision adopted when this frame's load was sent: the engine's
+    /// voice binding is not adopted until it has published that load.
+    voice_hold_rev: Option<u64>,
     sample_rate: f64,
-    voice_tx: Option<rtrb::Producer<(u32, ClapVoice, Vec<f32>)>>,
-    voice_retire_rx: Option<rtrb::Consumer<ClapVoice>>,
+    voice_tx: Option<rtrb::Producer<VoiceMsg>>,
+    voice_retire_rx: Option<rtrb::Consumer<VoiceBack>>,
     _audio_stream: Option<cpal::Stream>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -2503,7 +2529,7 @@ impl DemoApp {
             session_rig_names: Vec::new(),
             load_as_rigs: None,
             had_kb_focus: true,
-            rig_sources: [(true, true); VOICE_POOL],
+            rig_sources: Vec::new(),
             assistant,
             key_input: String::new(),
             chat_input: String::new(),
@@ -2519,13 +2545,17 @@ impl DemoApp {
             hw_devices: Vec::new(),
             last_midi: None,
             info_in_hint: false,
-            rig_device: [None; VOICE_POOL],
+            rig_device: Vec::new(),
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
             clap_plugin_ids: Vec::new(),
             clap_voice_ids: Vec::new(),
             clap_slot_map: Vec::new(),
+            clap_leaving: Vec::new(),
+            engine_voice_cap: crate::engine::VOICE_TABLE_CAP,
+            last_voices_rev: 0,
+            voice_hold_rev: None,
             sample_rate: 48000.0,
             voice_tx: None,
             voice_retire_rx: None,
@@ -2592,12 +2622,14 @@ impl DemoApp {
     /// apply default knob values. This is the single path used by the demo,
     /// starter templates, and saved sessions.
     fn build_rack(&mut self, graph: &Graph, params: &[crate::session::ParamValue]) {
+        let old_clap_nodes: Vec<u32> = self.clap_rigs().into_iter().map(|(_, n)| n).collect();
         self.units.clear();
         self.cables.clear();
         self.base_graph = graph.clone();
         for node in &graph.nodes {
             self.units.push(make_unit(node));
         }
+        self.fit_voice_tables(&old_clap_nodes);
         // Classify LV2 instruments (hot-wire matrix sink columns). Rare
         // structural op: the discovery scan runs only when LV2 nodes exist.
         if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
@@ -3283,8 +3315,8 @@ impl DemoApp {
         controllers: Vec<VoiceController>,
         voice_ids: Vec<u64>,
         sample_rate: f64,
-        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
-        voice_retire_rx: rtrb::Consumer<ClapVoice>,
+        voice_tx: rtrb::Producer<VoiceMsg>,
+        voice_retire_rx: rtrb::Consumer<VoiceBack>,
         stream: cpal::Stream,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
@@ -3304,7 +3336,7 @@ impl DemoApp {
         self
     }
 
-    /// Bind the app to an engine and its synth voice pool: everything the
+    /// Bind the app to an engine and its startup synth voices: everything the
     /// agent's tools need (command bus, voice mains for load_sound/sessions).
     /// The real app adds the audio stream and device threads on top;
     /// agent-eval runs on exactly this with an offline engine.
@@ -3314,19 +3346,20 @@ impl DemoApp {
         controllers: Vec<VoiceController>,
         voice_ids: Vec<u64>,
         sample_rate: f64,
-        voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
-        voice_retire_rx: rtrb::Consumer<ClapVoice>,
+        voice_tx: rtrb::Producer<VoiceMsg>,
+        voice_retire_rx: rtrb::Consumer<VoiceBack>,
         bus: Arc<Mutex<CommandBus>>,
     ) {
         self.clap_plugin_ids = vec![SURGE_ID.to_string(); mains.len()];
         self.clap_voice_ids = voice_ids;
-        self.clap_slot_map = (0..mains.len()).map(Some).collect();
         self._surge_main = mains;
         self.surge_controllers = controllers;
         self.sample_rate = sample_rate;
         self.voice_tx = Some(voice_tx);
         self.voice_retire_rx = Some(voice_retire_rx);
         self.bus = Some(bus);
+        let graph = self.base_graph.clone();
+        self.sync_clap_slots(&graph, None);
         self.surge_status = "Surge loaded — play!".into();
     }
 
@@ -3567,8 +3600,23 @@ impl DemoApp {
             self.playing = now_playing;
         }
         let graph_rev_changed = g.rev != self.last_graph_rev;
+        // The engine's voice binding. While it has not published the load
+        // this app sent last, its table still describes the old graph.
+        let voices = if self.voice_hold_rev == Some(g.rev) {
+            None
+        } else {
+            self.voice_hold_rev = None;
+            (graph_rev_changed || g.voices_rev != self.last_voices_rev).then(|| {
+                self.last_voices_rev = g.voices_rev;
+                g.voices.clone()
+            })
+        };
         if !graph_rev_changed {
             drop(g);
+            if let Some(voices) = &voices {
+                let graph = self.base_graph.clone();
+                self.sync_clap_slots(&graph, Some(voices));
+            }
             if !mix_diff_rigs.is_empty() || transport_changed {
                 let pending_origin = self.take_pending_agent_origin();
                 let n_rigs = self.rig_count();
@@ -3814,8 +3862,9 @@ impl DemoApp {
             }
         }
 
+        let voices = voices.unwrap_or_default();
         if same {
-            self.sync_clap_slots(&adopted);
+            self.sync_clap_slots(&adopted, Some(&voices));
             return;
         }
         // Preserve in-flight knob glides & cable draw-ins across the structural rebuild,
@@ -3886,11 +3935,10 @@ impl DemoApp {
             }
         }
         cable_draws.clear();
-        self.sync_clap_slots(&adopted);
+        self.sync_clap_slots(&adopted, Some(&voices));
         self.rig_mix = mix; // build_rack resets the mixer (rule 20)
         // Reset per-rig source filters to the engine's rig bindings.
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         self.adopt_rig_devices();
         // build_rack resets the view to rig 0 — keep the engine's active rig.
         let active = self.rig_snapshot.lock().map(|s| s.active).unwrap_or(0);
@@ -4288,10 +4336,33 @@ impl DemoApp {
     fn capture_undo(&mut self) -> Option<UndoSnap> {
         let session = self.capture_session("Undo").ok()?;
         let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
-        Some(UndoSnap {
-            session, rigs, mix: self.rig_mix, active: self.active_rig,
-            patch_names: self.patch_names.clone(), rig_sources: self.rig_sources,
-        })
+        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, voices: self.voice_rows() })
+    }
+
+    fn voice_rows(&self) -> Vec<VoiceRow> {
+        self.clap_rigs().into_iter()
+            .map(|(slot, node)| VoiceRow {
+                node,
+                sources: self.rig_sources.get(slot).copied().unwrap_or((true, true)),
+                device: self.rig_device.get(slot).copied().flatten(),
+                patch_name: self.patch_names.get(slot).cloned().flatten(),
+            })
+            .collect()
+    }
+
+    /// Put rows back after a reload reset the tables (rule 20: after
+    /// `apply_session`), and tell the engine each unit's switches again.
+    fn restore_voice_rows(&mut self, rows: &[VoiceRow]) {
+        for row in rows {
+            let Some(slot) = self.voice_slot_of_node(row.node) else { continue };
+            self.rig_sources[slot] = row.sources;
+            self.rig_device[slot] = row.device;
+            self.patch_names[slot] = row.patch_name.clone();
+            self.send_rig_source(row.node);
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node: row.node, device: row.device });
+            }
+        }
     }
 
     /// Before an agent's first change in a job, snapshot the rack. A job is
@@ -4330,10 +4401,7 @@ impl DemoApp {
             s.active = active;
         }
         self.adopt_rig_devices();
-        self.patch_names = snap.patch_names;
-        // apply_session reset the source switches: restore and re-send them.
-        self.rig_sources = snap.rig_sources;
-        for (_, node) in self.clap_rigs() { self.send_rig_source(node); }
+        self.restore_voice_rows(&snap.voices);
         self.rig_mix = snap.mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
@@ -4479,80 +4547,114 @@ impl DemoApp {
         }
     }
 
-    /// Pool index in `_surge_main` / `surge_controllers` for CLAP rig slot `rig`.
+    /// Hosted-voice index in `_surge_main` / `surge_controllers` for CLAP slot `rig`.
     fn clap_pool_idx(&self, rig: usize) -> Option<usize> {
         self.clap_slot_map.get(rig).copied().flatten()
     }
 
-    /// Drain retired CLAP voices and match every `UnitKind::Clap` in `self.units`
-    /// to a `ClapVoiceMain` of matching `plugin_id`, instantiating new CLAP
-    /// plugins (e.g. Dexed) on the UI thread and delivering them to the engine.
-    fn sync_clap_slots(&mut self, graph: &Graph) {
+    /// Free the hosted voices the engine handed back (plugin main thread:
+    /// stop, deactivate, drop) and the tables it grew out of.
+    fn free_returned_voices(&mut self) {
         while let Some(rx) = self.voice_retire_rx.as_mut() {
-            let Ok(voice) = rx.pop() else { break };
-            if let Some(pos) = self.clap_voice_ids.iter().position(|&id| id == voice.voice_id()) {
+            let Ok(back) = rx.pop() else { break };
+            let VoiceBack::Voice(slot) = back else { continue };
+            let id = slot.voice_id();
+            self.clap_leaving.retain(|&l| l != id);
+            if let Some(pos) = self.clap_voice_ids.iter().position(|&v| v == id) {
                 let main = self._surge_main.remove(pos);
                 self.surge_controllers.remove(pos);
                 self.clap_plugin_ids.remove(pos);
                 self.clap_voice_ids.remove(pos);
-                main.retire(voice);
+                main.retire(slot.into_voice());
             }
         }
-        let clap_nodes: Vec<(u32, String)> = self
-            .units
-            .iter()
-            .filter(|u| matches!(u.node_kind, UnitKind::Clap))
-            .map(|u| {
-                let pid = graph
-                    .node(u.node_id)
-                    .and_then(|n| match &n.kind {
-                        NodeKind::Clap { plugin_id } => Some(crate::control::name_str(plugin_id).to_string()),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| SURGE_ID.to_string());
-                (u.node_id, pid)
+    }
+
+    /// Instantiate `plugin_id` on this (the plugins' main) thread and hand
+    /// its audio half to the engine. The engine binds it to a voiceless Clap
+    /// node of that plugin. Returns the hosted index.
+    fn host_voice(&mut self, plugin_id: &str) -> Result<usize, String> {
+        let (voice, main) = ClapVoice::new_plugin(self.sample_rate, plugin_id)
+            .map_err(|e| format!("Load {plugin_id} failed: {e}"))?;
+        let ctrl = voice.controller();
+        let id = voice.voice_id();
+        let slot = VoiceSlot::new(voice);
+        let Some(tx) = self.voice_tx.as_mut() else { return Err("no audio engine".into()) };
+        // The engine's table is full: send a larger one ahead of the voice.
+        let grow = self.clap_voice_ids.len() >= self.engine_voice_cap;
+        if tx.slots() < 1 + grow as usize {
+            main.retire(slot.into_voice());
+            return Err(format!("Voice channel busy, {plugin_id} loads in a moment"));
+        }
+        if grow {
+            let cap = self.engine_voice_cap * 2;
+            if let Some(Ok(mut g)) = self.graph_pub.as_ref().map(|p| p.lock()) {
+                g.reserve_voices(cap);
+            }
+            let _ = tx.push(VoiceMsg::Grow(Vec::with_capacity(cap)));
+            self.engine_voice_cap = cap;
+        }
+        let _ = tx.push(VoiceMsg::Add(slot));
+        self._surge_main.push(main);
+        self.surge_controllers.push(ctrl);
+        self.clap_plugin_ids.push(plugin_id.to_string());
+        self.clap_voice_ids.push(id);
+        Ok(self._surge_main.len() - 1)
+    }
+
+    /// Follow the engine's voice table: free what it handed back, map every
+    /// CLAP unit to the hosted voice that plays its node, host a voice for
+    /// each unit that has none, and ask back the voices no unit needs.
+    /// `published` is the engine's binding (`GraphPub::voices`). None = the
+    /// binding of a graph this frame loads into the engine: known before the
+    /// engine answers, because it binds by `control::bind_voices` too.
+    fn sync_clap_slots(&mut self, graph: &Graph, published: Option<&[(u64, u32)]>) {
+        self.free_returned_voices();
+        let nodes: Vec<(u32, String)> = graph.nodes.iter()
+            .filter_map(|n| match &n.kind {
+                NodeKind::Clap { plugin_id } => Some((n.id, crate::control::clap_plugin_key(name_str(plugin_id)).to_string())),
+                _ => None,
             })
             .collect();
-        let mut used = vec![false; self._surge_main.len()];
-        let mut new_map = Vec::with_capacity(clap_nodes.len());
-        for (node_id, pid) in clap_nodes {
-            let found = (0..self._surge_main.len()).find(|&i| {
-                !used[i]
-                    && (self.clap_plugin_ids[i] == pid
-                        || ((pid.is_empty() || pid == "Surge XT") && self.clap_plugin_ids[i] == SURGE_ID))
-            });
-            if let Some(i) = found {
-                used[i] = true;
-                new_map.push(Some(i));
-            } else if self.voice_tx.is_some() {
-                match ClapVoice::new_plugin(self.sample_rate, &pid) {
-                    Ok((voice, main)) => {
-                        let ctrl = voice.controller();
-                        let vid = voice.voice_id();
-                        if let Some(tx) = self.voice_tx.as_mut() {
-                            if tx.push((node_id, voice, vec![0.0; 8192 * 2])).is_err() {
-                                self.plugin_msg = format!("Voice channel full for {pid}");
-                                new_map.push(None);
-                                continue;
-                            }
-                        }
-                        self._surge_main.push(main);
-                        self.surge_controllers.push(ctrl);
-                        self.clap_plugin_ids.push(pid);
-                        self.clap_voice_ids.push(vid);
-                        used.push(true);
-                        new_map.push(Some(self._surge_main.len() - 1));
-                    }
-                    Err(e) => {
-                        self.plugin_msg = format!("Load {pid} failed: {e}");
-                        new_map.push(None);
-                    }
-                }
-            } else {
-                new_map.push(None);
+        // The node every hosted voice plays.
+        let mut plays: Vec<Option<u32>> = vec![None; self.clap_voice_ids.len()];
+        for &(id, node) in published.unwrap_or(&[]) {
+            if let Some(i) = self.clap_voice_ids.iter().position(|&v| v == id) {
+                if nodes.iter().any(|(n, _)| *n == node) { plays[i] = Some(node); }
             }
         }
-        self.clap_slot_map = new_map;
+        // Voices the engine has not bound (or published) yet go by its rule.
+        let free: Vec<(u64, &str)> = (0..plays.len())
+            .filter(|&i| plays[i].is_none() && !self.clap_leaving.contains(&self.clap_voice_ids[i]))
+            .map(|i| (self.clap_voice_ids[i], self.clap_plugin_ids[i].as_str()))
+            .collect();
+        let mut open = Graph::default();
+        open.nodes = graph.nodes.iter().filter(|n| !plays.contains(&Some(n.id))).cloned().collect();
+        let mut missing: Vec<(u32, String)> = Vec::new();
+        for (node, voice) in crate::control::bind_voices(&open, &free) {
+            match voice.and_then(|id| self.clap_voice_ids.iter().position(|&v| v == id)) {
+                Some(i) => plays[i] = Some(node),
+                None => missing.extend(nodes.iter().find(|(n, _)| *n == node).cloned()),
+            }
+        }
+        if self.voice_tx.is_some() {
+            for (node, pid) in missing {
+                match self.host_voice(&pid) {
+                    Ok(_) => plays.push(Some(node)),
+                    Err(e) => self.plugin_msg = e,
+                }
+            }
+            for i in 0..plays.len() {
+                let id = self.clap_voice_ids[i];
+                if plays[i].is_some() || self.clap_leaving.contains(&id) { continue; }
+                if let Some(tx) = self.voice_tx.as_mut() {
+                    if tx.push(VoiceMsg::Retire(id)).is_ok() { self.clap_leaving.push(id); }
+                }
+            }
+        }
+        self.clap_slot_map = self.clap_rigs().into_iter()
+            .map(|(_, node)| plays.iter().position(|p| *p == Some(node)))
+            .collect();
         self.rule_param_cache = None;
     }
 
@@ -4565,7 +4667,7 @@ impl DemoApp {
         self.session_rig_names = s.rig_names.clone();
         self.build_rack(&s.graph, s.params());
         self.begin_load_fade();
-        self.sync_clap_slots(&s.graph);
+        self.sync_clap_slots(&s.graph, None);
         // Restore plugin state into the remapped voices (rig order).
         let clap_nodes: Vec<u32> = self.units.iter()
             .filter(|u| matches!(u.node_kind, UnitKind::Clap))
@@ -4582,14 +4684,14 @@ impl DemoApp {
         // Rewire the engine, then publish every knob value.
         self.ui_transport_grace = self.ui_time + 0.6;
         self.load_graph_into_engine(&s.graph);
+        self.voice_hold_rev = Some(self.last_graph_rev);
         // The editor referenced the old voice mapping; close it.
         self.editor_open = false;
         self.editor_params.clear();
         self.editor_status = "editor closed (rack reloaded)".into();
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
             for u in &mut self.units {
@@ -4693,15 +4795,16 @@ impl DemoApp {
         }
         let rigs = vec![mk_rig("Rig A", true), mk_rig("Rig B", false)];
         let merged = crate::control::merge_rigs(&rigs);
+        self.build_rack(&merged, &[]);
+        self.begin_load_fade();
+        self.sync_clap_slots(&merged, None);
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap().send(Command::LoadRigs { rigs, active: 0 });
         }
-        self.build_rack(&merged, &[]);
-        self.begin_load_fade();
+        self.voice_hold_rev = Some(self.last_graph_rev);
         self.editor_open = false;
         self.editor_params.clear();
-        self.rig_sources = [(true, true); VOICE_POOL];
-        self.rig_device = [None; VOICE_POOL];
+        self.reset_rig_inputs();
         self.session_msg = "Loaded multi-rig demo — 1–9 / ←→ switch rigs".into();
     }
 
@@ -4802,7 +4905,7 @@ impl DemoApp {
                 });
                 let hardware = flag("hardware").unwrap_or(true);
                 let Some(rig) = self.voice_slot_of_node(node) else {
-                    return format!("set_rig_source: node {node} is not a voiced instrument (CLAP synth within the {VOICE_POOL}-voice pool) — see get_rigs");
+                    return format!("set_rig_source: node {node} is not a CLAP instrument — see get_rigs");
                 };
                 self.rig_sources[rig] = (keyboard, hardware);
                 self.send_rig_source(node);
@@ -5004,7 +5107,7 @@ impl DemoApp {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
                 let device = args.get("device").and_then(|v| v.as_u64()).map(|d| d as u32);
                 let Some(rig) = self.voice_slot_of_node(node) else {
-                    return format!("set_rig_device: node {node} is not a voiced instrument (CLAP synth within the {VOICE_POOL}-voice pool) — see get_rigs");
+                    return format!("set_rig_device: node {node} is not a CLAP instrument — see get_rigs");
                 };
                 self.rig_device[rig] = device;
                 if let Some(bus) = &self.bus {
@@ -5783,7 +5886,6 @@ impl DemoApp {
     }
 
     fn send_rig_source(&self, node: u32) {
-        // A CLAP unit past the voice pool has no voice and no source state.
         let Some(rig) = self.voice_slot_of_node(node) else { return };
         let (keyboard, hardware) = self.rig_sources[rig];
         if let Some(bus) = &self.bus {
@@ -6199,7 +6301,7 @@ impl DemoApp {
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
-        if rig >= self.rig_sources.len() { return; } // beyond the voice pool
+        if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
         let node = self.units[inst].node_id;
         {
@@ -6887,7 +6989,7 @@ impl DemoApp {
             .map(|s| s.rigs.iter().map(|m| m.midi_device).collect()).unwrap_or_default();
         for (slot, node) in self.clap_rigs() {
             let rig = self.units.iter().find(|u| u.node_id == node).map_or(0, |u| u.rig as usize);
-            if let (Some(Some(d)), true) = (devs.get(rig), slot < VOICE_POOL) {
+            if let (Some(Some(d)), true) = (devs.get(rig), slot < self.rig_sources.len()) {
                 self.rig_sources[slot] = (false, true);
                 self.rig_device[slot] = Some(*d);
             }
@@ -7142,15 +7244,6 @@ impl DemoApp {
     /// Most rigs the UI manages (the per-rig mixer mirror is `[RigMix; 8]`).
     const MAX_RIGS: usize = 8;
 
-    /// A fresh rig's patch: Keys→Surge→Master (stereo) while a pooled synth
-    /// voice is free (VOICE_POOL), else Keys→Master — a skeleton the user
-    /// fills from the Plugins browser.
-    fn new_rig_graph(&self) -> Graph {
-        let claps = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count();
-        let voices = if self._surge_main.is_empty() { VOICE_POOL } else { self._surge_main.len() };
-        crate::control::standard_rig_graph(claps < voices)
-    }
-
     /// Add a rig (`None`) or delete rig `Some(r)`, keeping every surviving
     /// rig's patch, knob values, synth state, device binding and mixer.
     /// The live patch is split per rig (rig-relative ids, rule 4), edited,
@@ -7178,6 +7271,7 @@ impl DemoApp {
             Ok(s) => s,
             Err(e) => { self.session_msg = format!("Rig edit failed: {e}"); return; }
         };
+        let voice_rows = self.voice_rows();
         let (graphs, old_bases) = crate::control::split_rigs(&s.graph);
         let devices: Vec<Option<u32>> = {
             let snap = self.rig_snapshot.lock().ok();
@@ -7200,7 +7294,7 @@ impl DemoApp {
                     .unwrap_or_else(|| format!("Rig {}", n + 1));
                 let graph = match plugin {
                     Some((id, label)) => crate::control::plugin_rig_graph(id, label),
-                    None => self.new_rig_graph(),
+                    None => crate::control::standard_rig_graph(true),
                 };
                 rigs.push((None, crate::control::Rig::new(name.clone(), graph, None)));
                 format!("Added {name}")
@@ -7239,6 +7333,12 @@ impl DemoApp {
             snap.active = active;
         }
         self.adopt_rig_devices();
+        // Switches, device and patch name follow each surviving unit to its
+        // new node id.
+        let voice_rows: Vec<VoiceRow> = voice_rows.into_iter()
+            .filter_map(|r| remap(r.node).map(|node| VoiceRow { node, ..r }))
+            .collect();
+        self.restore_voice_rows(&voice_rows);
         self.rig_mix = mix;
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
@@ -10438,12 +10538,39 @@ impl DemoApp {
         self.clap_rigs().into_iter().find(|(_, nid)| *nid == node_id).map(|(rig, _)| rig)
     }
 
-    /// The voice slot of a CLAP node: its index into the per-voice state
-    /// (`rig_sources`, `rig_device`, `patch_names`). None for any other node
-    /// and for CLAP units past the voice pool (they have no voice): the old
-    /// "0 if unknown" sent their edits to slot 0 or indexed past the arrays.
+    /// The voice slot of a CLAP node: its index into the per-voice slot
+    /// tables (`rig_sources`, `rig_device`, `patch_names`). None for any
+    /// node that is not a CLAP unit (the old "0 if unknown" sent their
+    /// edits to slot 0).
     fn voice_slot_of_node(&self, node: u32) -> Option<usize> {
-        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r).filter(|&r| r < VOICE_POOL)
+        self.clap_rigs().iter().find(|(_, n)| *n == node).map(|(r, _)| *r)
+    }
+
+    /// Refit the per-voice slot tables to the CLAP units after the units
+    /// changed: every entry stays with its unit (by node id), a new unit
+    /// starts at the defaults. `old_nodes` = the CLAP nodes the tables were
+    /// laid out for, in slot order.
+    fn fit_voice_tables(&mut self, old_nodes: &[u32]) {
+        let slots = self.clap_rigs();
+        let old_slot = |node: u32| old_nodes.iter().position(|&n| n == node);
+        let sources = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.rig_sources.get(i).copied()).unwrap_or((true, true)))
+            .collect();
+        let devices = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.rig_device.get(i).copied()).flatten())
+            .collect();
+        let names = slots.iter()
+            .map(|&(_, n)| old_slot(n).and_then(|i| self.patch_names.get(i).cloned()).flatten())
+            .collect();
+        self.rig_sources = sources;
+        self.rig_device = devices;
+        self.patch_names = names;
+    }
+
+    /// Every CLAP unit listens to the keyboard and all hardware again.
+    fn reset_rig_inputs(&mut self) {
+        self.rig_sources.fill((true, true));
+        self.rig_device.fill(None);
     }
 
     fn fire_keys(&mut self, semitone: usize, amp: f32) { self.fire_keys_with(semitone, amp, true); }
@@ -14802,13 +14929,7 @@ type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
 impl EvalRig {
     fn new(assistant: Assistant, plugins: &EvalPlugins) -> anyhow::Result<Self> {
         let sample_rate = 48000.0;
-        let mut voices = Vec::with_capacity(VOICE_POOL);
-        let mut mains = Vec::with_capacity(VOICE_POOL);
-        for i in 0..VOICE_POOL {
-            let (v, m) = ClapVoice::new(sample_rate)?;
-            voices.push((match i { 0 => 1, 1 => 4, _ => u32::MAX }, v));
-            mains.push(m);
-        }
+        let (voices, mains) = startup_voices(sample_rate)?;
         let controllers = voices.iter().map(|(_, v)| v.controller()).collect();
         let voice_ids = voices.iter().map(|(_, v)| v.voice_id()).collect();
         let (bus, drain) = crate::control::command_bus();
@@ -14817,8 +14938,8 @@ impl EvalRig {
         engine.set_rig_snapshot(app.rig_snapshot.clone());
         let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { graph: Graph::demo_patch(), ..Default::default() }));
         engine.set_graph_pub(graph_pub.clone());
-        let (voice_tx, voice_rx) = rtrb::RingBuffer::new(16);
-        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(16);
+        let (voice_tx, voice_rx) = rtrb::RingBuffer::new(VOICE_RING);
+        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(VOICE_RING);
         engine.set_voice_channels(voice_rx, retire_tx);
         engine.spawn_lv2_loader();
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
@@ -15104,12 +15225,26 @@ fn pin_current_thread_to_p_cores() {
 /// Load Surge XT and open the audio stream. Called on the main thread inside
 /// the eframe creator (CLAP main-thread rules). The voice itself moves into
 /// the cpal callback; the controller stays available for the note sink.
+/// One Surge voice per Clap node of the startup patch, bound to its node.
+/// Every further voice is hosted when a CLAP unit needs one
+/// (`DemoApp::sync_clap_slots`).
+fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Vec<ClapVoiceMain>)> {
+    let mut voices = Vec::new();
+    let mut mains = Vec::new();
+    for n in Graph::demo_patch().nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+        let (v, m) = ClapVoice::new(sample_rate)?;
+        voices.push((n.id, v));
+        mains.push(m);
+    }
+    Ok((voices, mains))
+}
+
 struct BuiltAudio {
     mains: Vec<ClapVoiceMain>,
     controllers: Vec<VoiceController>,
     voice_ids: Vec<u64>,
-    voice_tx: rtrb::Producer<(u32, ClapVoice, Vec<f32>)>,
-    voice_retire_rx: rtrb::Consumer<ClapVoice>,
+    voice_tx: rtrb::Producer<VoiceMsg>,
+    voice_retire_rx: rtrb::Consumer<VoiceBack>,
     stream: cpal::Stream,
     bus: CommandBus,
     level: Arc<std::sync::atomic::AtomicU32>,
@@ -15132,16 +15267,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let sample_rate = cfg.sample_rate() as f64;
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let ch = cfg.channels() as usize;
-    // Instrument voice pool: the demo's two stacks (nodes 1 and 4) plus
-    // spares for added rigs. Idle voices (unmapped) are not rendered.
-    let mut voices = Vec::with_capacity(VOICE_POOL);
-    let mut mains = Vec::with_capacity(VOICE_POOL);
-    for i in 0..VOICE_POOL {
-        let (v, m) = ClapVoice::new(sample_rate)?;
-        let node = match i { 0 => 1, 1 => 4, _ => u32::MAX };
-        voices.push((node, v));
-        mains.push(m);
-    }
+    let (voices, mains) = startup_voices(sample_rate)?;
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
     let voice_ids: Vec<u64> = voices.iter().map(|(_, v)| v.voice_id()).collect();
@@ -15151,13 +15277,14 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // realtime below; at normal priority even 512 frames underran.
     config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
     eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={VOICE_POOL}",
+        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={}",
         host.id().name(),
         device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
         sample_rate,
         ch,
         crate::bridge::BUFFER_FRAMES,
-        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0
+        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0,
+        voices.len()
     );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(
@@ -15195,8 +15322,8 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
-    let (voice_tx, voice_rx) = rtrb::RingBuffer::<(u32, ClapVoice, Vec<f32>)>::new(16);
-    let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<ClapVoice>::new(16);
+    let (voice_tx, voice_rx) = rtrb::RingBuffer::<VoiceMsg>::new(VOICE_RING);
+    let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<VoiceBack>::new(VOICE_RING);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
     // Audio In (issue #28): the UI opens input captures off the audio thread
     // and hands each ring consumer to the engine through this side channel.
@@ -16807,12 +16934,13 @@ mod rig_switch_tests {
         assert_eq!(live(&app, 1), 3, "Keys→Surge MIDI + Surge→Master L/R");
         let a_cables = live(&app, 0);
         assert!(a_cables > 0);
-        // Pool of 4 voices: rig C takes the last one, rig D is a skeleton.
-        app.edit_rigs(None);
-        assert_eq!(app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).count(), 4);
-        app.edit_rigs(None);
-        assert_eq!(app.rig_count(), 4);
-        assert!(app.units.iter().filter(|u| u.rig == 3).all(|u| !matches!(u.node_kind, UnitKind::Clap)), "no free voice → no voiceless synth");
+        // Every added rig gets its synth (the old four-voice pool left
+        // rig D a bare Keys + Master).
+        while app.rig_count() < DemoApp::MAX_RIGS { app.edit_rigs(None); }
+        for r in 1..DemoApp::MAX_RIGS as u8 {
+            assert_eq!(app.units.iter().filter(|u| u.rig == r && matches!(u.node_kind, UnitKind::Clap)).count(), 1, "rig {r} has a synth");
+            assert_eq!(live(&app, r), 3, "rig {r} is wired");
+        }
         assert_eq!(live(&app, 0), a_cables, "earlier rigs keep every cable");
         frame(&mut app, &ctx, vec![]);
     }
@@ -16883,30 +17011,55 @@ mod rig_switch_tests {
         assert!(app.pending_confirm.is_none());
     }
 
-    /// Live crash: with more CLAP units than voices (two Surges in rig A plus
-    /// three single-synth rigs), an undo restored sources for voice slot 4 and
-    /// `rig_sources[4]` (len 4) panicked; unknown nodes fell back to slot 0.
+    /// Live crash: with more CLAP units than the old four-voice pool, an
+    /// undo restored sources for voice slot 4 and `rig_sources[4]` (len 4)
+    /// panicked; unknown nodes fell back to slot 0. Per-voice state now has
+    /// a slot for every CLAP unit, and it stays with its unit.
     #[test]
-    fn clap_units_past_the_voice_pool_never_index_voice_state() {
+    fn any_number_of_clap_units_have_their_own_voice_state() {
         let mut app = DemoApp::new_with_sink(None);
         let mut g = Graph::demo_patch();
         let surge = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
-        let extra: Vec<u32> = (0..3).map(|i| g.add_node(surge(), name_bytes(&format!("EXTRA {i}")))).collect();
+        let extra: Vec<u32> = (0..10).map(|i| g.add_node(surge(), name_bytes(&format!("EXTRA {i}")))).collect();
         app.build_rack(&g, &[]);
         let slots = app.clap_rigs();
-        assert!(slots.len() > VOICE_POOL, "{} CLAP units for {VOICE_POOL} voices", slots.len());
-        let past = slots[VOICE_POOL].1;
-        assert_eq!(app.voice_slot_of_node(past), None);
+        assert_eq!(slots.len(), 12);
+        assert_eq!((app.rig_sources.len(), app.rig_device.len(), app.patch_names.len()), (12, 12, 12));
+        for &(slot, node) in &slots {
+            assert_eq!(app.voice_slot_of_node(node), Some(slot));
+        }
         assert_eq!(app.voice_slot_of_node(3), None, "Master is no voice (was slot 0)");
-        let before = app.rig_sources;
-        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": past, "keyboard": false}));
-        assert!(out.contains("not a voiced instrument"), "{out}");
-        let out = app.exec_tool("set_rig_device", &serde_json::json!({"node": past, "device": 0}));
-        assert!(out.contains("not a voiced instrument"), "{out}");
         let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": 3, "keyboard": false}));
-        assert!(out.contains("not a voiced instrument"), "{out}");
-        assert_eq!(app.rig_sources, before, "no voice slot changed");
-        app.send_rig_source(past);
+        assert!(out.contains("not a CLAP instrument"), "{out}");
+        assert!(app.rig_sources.iter().all(|s| *s == (true, true)), "no voice slot changed");
+
+        let (last, mid) = (extra[9], extra[4]);
+        let out = app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": false}));
+        assert!(!out.contains("not a"), "{out}");
+        let out = app.exec_tool("set_rig_device", &serde_json::json!({"node": last, "device": 0}));
+        assert!(!out.contains("not a"), "{out}");
+        let slot_of = |app: &DemoApp, node: u32| app.voice_slot_of_node(node).unwrap();
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false);
+        assert_eq!(app.rig_device[slot_of(&app, last)], Some(0));
+        let name_slot = slot_of(&app, last);
+        app.patch_names[name_slot] = Some("Wurli".into());
+
+        // Undo of a later job restores the twelfth unit's switches.
+        app.undo_job = None;
+        app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": true}));
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, true);
+        app.exec_tool("undo", &serde_json::json!({}));
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false, "undo restored slot 11");
+
+        // A unit in the middle goes: the state after it follows its unit.
+        let mut fewer = g.clone();
+        fewer.remove_node(mid);
+        app.build_rack(&fewer, &[]);
+        assert_eq!(app.rig_sources.len(), 11);
+        assert_eq!(app.rig_sources[slot_of(&app, last)].0, false);
+        assert_eq!(app.rig_device[slot_of(&app, last)], Some(0));
+        assert_eq!(app.patch_names[slot_of(&app, last)].as_deref(), Some("Wurli"));
+        assert_eq!(app.rig_sources[slot_of(&app, extra[5])], (true, true));
         for n in extra { app.send_rig_source(n); }
     }
 
@@ -21333,5 +21486,152 @@ mod settings_and_dropdown_tests {
             .expect("Count-in toggle").1.center();
         click_at(&mut app, &ctx, size, ci_toggle);
         assert!(app.count_in_enabled);
+    }
+}
+
+/// The app hosting real Surge XT voices on an offline engine (`EvalRig`).
+/// Skipped when Surge XT is not installed.
+#[cfg(test)]
+mod voice_host_tests {
+    use super::*;
+
+    fn rig() -> Option<EvalRig> {
+        let (assistant, _tx, _rx) = Assistant::with_test_worker();
+        match EvalRig::new(assistant, &(Vec::new(), Vec::new())) {
+            Ok(mut rig) => {
+                rig.settle();
+                Some(rig)
+            }
+            Err(e) => {
+                eprintln!("voice_host_tests skipped: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Every CLAP unit is played by a hosted voice, the engine says the
+    /// same, and nothing is hosted that no unit plays.
+    fn assert_voiced(rig: &mut EvalRig, units: usize, when: &str) {
+        rig.settle();
+        let app = &rig.app;
+        let published = app.graph_pub.as_ref().unwrap().lock().unwrap().voices.clone();
+        let slots = app.clap_rigs();
+        assert_eq!(slots.len(), units, "{when}: CLAP units");
+        for &(slot, node) in &slots {
+            let idx = app.clap_pool_idx(slot).unwrap_or_else(|| panic!("{when}: node {node} has no voice"));
+            let id = app.clap_voice_ids[idx];
+            assert!(published.contains(&(id, node)), "{when}: the engine plays node {node} with another voice than {id}: {published:?}");
+        }
+        assert_eq!(app._surge_main.len(), units, "{when}: hosted voices");
+        assert_eq!(published.len(), units, "{when}: voices in the engine");
+        assert!(app.clap_leaving.is_empty(), "{when}: voices still on their way out");
+    }
+
+    /// Surge's volume, the audible mark each voice gets.
+    fn volume_param(app: &mut DemoApp) -> ParamDesc {
+        app._surge_main[0].param_list().into_iter()
+            .find(|p| p.automatable && !p.hidden && !p.readonly && p.max > p.min && p.name.to_lowercase().contains("volume"))
+            .expect("Surge XT volume parameter")
+    }
+
+    fn mark(rig: &mut EvalRig, p: &ParamDesc, values: &[f64]) {
+        for (slot, _) in rig.app.clap_rigs() {
+            let idx = rig.app.clap_pool_idx(slot).unwrap();
+            rig.app.surge_controllers[idx].set_param(ClapId::new(p.id), values[slot]);
+        }
+        rig.settle();
+    }
+
+    /// The mark of every CLAP unit, in unit order.
+    fn marks(rig: &mut EvalRig, p: &ParamDesc) -> Vec<f64> {
+        rig.settle();
+        let slots = rig.app.clap_rigs();
+        slots.into_iter()
+            .map(|(slot, _)| {
+                let idx = rig.app.clap_pool_idx(slot).unwrap();
+                rig.app._surge_main[idx].param_value(p.id).unwrap()
+            })
+            .collect()
+    }
+
+    fn assert_marks(got: &[f64], want: &[f64], when: &str) {
+        assert_eq!(got.len(), want.len(), "{when}");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!((g - w).abs() < 1e-3, "{when}: unit {i} plays state {g}, its own is {w} (all: {got:?})");
+        }
+    }
+
+    #[test]
+    fn eight_clap_units_across_rigs_keep_their_voices_and_state() {
+        let Some(mut rig) = rig() else { return };
+        assert_voiced(&mut rig, 2, "the demo patch");
+        // A full voice table, so hosting more sends larger tables ahead.
+        rig.app.engine_voice_cap = rig.engine.shrink_voice_table();
+        assert_eq!(rig.app.engine_voice_cap, 2);
+        // Six more rigs: eight Surge units in seven rigs (the old pool had 4).
+        for _ in 0..6 {
+            rig.app.exec_tool("add_rig", &serde_json::json!({}));
+            rig.settle();
+        }
+        assert_eq!(rig.app.rig_count(), 7);
+        assert_voiced(&mut rig, 8, "after six added rigs");
+        assert!(rig.engine.voice_table_cap() >= 8, "the engine took the larger tables: {}", rig.engine.voice_table_cap());
+        assert_eq!(rig.app.engine_voice_cap, 8);
+
+        let p = volume_param(&mut rig.app);
+        let own: Vec<f64> = (0..8).map(|i| p.min + (p.max - p.min) * (0.15 + 0.1 * i as f64)).collect();
+        mark(&mut rig, &p, &own);
+        assert_marks(&marks(&mut rig, &p), &own, "marked");
+        let last = rig.app.clap_rigs()[7].1;
+        rig.app.exec_tool("set_rig_source", &serde_json::json!({"node": last, "keyboard": false}));
+
+        // Delete rig 3 (its Surge is unit 3): the others keep their state,
+        // its voice is freed.
+        rig.app.undo_job = None;
+        let out = rig.app.exec_tool("delete_rig", &serde_json::json!({"rig": 2, "confirm": true}));
+        assert_voiced(&mut rig, 7, &format!("after delete_rig ({out})"));
+        let mut without: Vec<f64> = own.clone();
+        without.remove(3);
+        assert_marks(&marks(&mut rig, &p), &without, "after deleting rig 3");
+        assert_eq!(rig.app.rig_sources[6], (false, true), "the last unit keeps its keyboard switch through the rig delete");
+
+        // Undo brings the rig back with the state its synth had.
+        let out = rig.app.exec_tool("undo", &serde_json::json!({}));
+        assert_voiced(&mut rig, 8, &format!("after undo ({out})"));
+        assert_marks(&marks(&mut rig, &p), &own, "after undo");
+        assert_eq!(rig.app.rig_sources[7], (false, true));
+
+        // Session round trip through a smaller rack.
+        let session = rig.app.capture_session("eight").unwrap();
+        rig.app.load_demo_patch();
+        assert_voiced(&mut rig, 2, "the demo patch again");
+        rig.app.apply_session(&session).unwrap();
+        assert_voiced(&mut rig, 8, "the session loaded back");
+        assert_marks(&marks(&mut rig, &p), &own, "after the session round trip");
+    }
+
+    /// The engine frees and binds voices on its own (remote AddNode /
+    /// RemoveNode): the app follows what the engine published, never its
+    /// own guess. Removing the first Surge left the app editing the freed
+    /// voice while the engine played the other one.
+    #[test]
+    fn the_app_follows_the_engines_binding_after_remote_edits() {
+        let Some(mut rig) = rig() else { return };
+        let p = volume_param(&mut rig.app);
+        let own = [p.min + (p.max - p.min) * 0.3, p.min + (p.max - p.min) * 0.8];
+        mark(&mut rig, &p, &own);
+        let (first, second) = (rig.app.clap_rigs()[0].1, rig.app.clap_rigs()[1].1);
+        let send = |rig: &mut EvalRig, cmd: Command| {
+            assert!(rig.app.bus.as_ref().unwrap().lock().unwrap().send(cmd));
+            rig.settle();
+        };
+        send(&mut rig, Command::RemoveNode(first));
+        assert_voiced(&mut rig, 1, "after a remote RemoveNode");
+        assert_eq!(rig.app.clap_rigs()[0].1, second);
+        assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
+
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
+        assert_voiced(&mut rig, 2, "after a remote AddNode");
+        assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
 }

@@ -19,7 +19,7 @@
 //! arc-length LUTs, cached galleys, fixed pulse arrays — no per-frame
 //! allocation storms. Pure snapshot-style simulation; never touches audio.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -884,6 +884,34 @@ const ENGINE_EDIT_TOOLS: &[&str] = &["add_node", "connect", "disconnect", "remov
 /// How long a tool batch waits for the engine to publish one edit.
 const ENGINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Outcome state of an in-run action chip rendered under the user's message.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolChipState {
+    Running,
+    Done,
+    NotApplied,
+    Failed,
+}
+
+/// One tool call chip rendered inside a chat turn run.
+#[derive(Clone, Debug)]
+struct ToolChip {
+    label: String,
+    state: ToolChipState,
+}
+
+/// Chips, collapse state, and final cost line associated with one user turn
+/// in `Assistant::history` (keyed by that `"user"` line's index).
+#[derive(Clone, Debug, Default)]
+struct TranscriptRun {
+    chips: Vec<ToolChip>,
+    expanded: bool,
+    cost_line: Option<String>,
+}
+
+/// Maximum tool chips shown in a finished or long run before `"+N more"`.
+const COLLAPSED_RUN_CHIPS: usize = 3;
+
 /// One model step's tool calls, run in call order. An engine edit is a
 /// barrier: the next call runs only after the engine published the edit and
 /// the rack adopted it, so every later call — and the model's next step —
@@ -892,6 +920,8 @@ struct ToolBatch {
     todo: VecDeque<ToolCall>,
     results: Vec<ToolOutput>,
     waiting: Option<Waiting>,
+    user_idx: usize,
+    chip_cursor: usize,
 }
 
 /// What a tool batch waits for before its next call runs. The wait spans
@@ -1868,6 +1898,11 @@ struct DemoApp {
     pending_confirm: Option<PendingConfirm>,
     /// The assistant's tool calls in flight (one model step).
     tool_batch: Option<ToolBatch>,
+    /// Per-turn tool chips and finished cost line, keyed by the `"user"`
+    /// message index in `assistant.history`.
+    transcript_runs: HashMap<usize, TranscriptRun>,
+    /// Index in `assistant.history` of the `"user"` turn currently running.
+    active_run_user_idx: Option<usize>,
     rack_shot: RackShot,
     /// The image attached to the chat message being written.
     chat_image: Option<Image>,
@@ -2156,6 +2191,8 @@ impl DemoApp {
             confirm_delete_rig: None,
             pending_confirm: None,
             tool_batch: None,
+            transcript_runs: HashMap::new(),
+            active_run_user_idx: None,
             rack_shot: RackShot::default(),
             chat_image: None,
             rename_rig_dialog: None,
@@ -3490,46 +3527,208 @@ impl DemoApp {
         self.session_msg = "Patch updated from MCP/CLI".into();
     }
 
+    fn classify_tool_result(result: &str) -> ToolChipState {
+        if result.contains("NOT applied") || result.contains("Confirm / Cancel") {
+            return ToolChipState::NotApplied;
+        }
+        let lower = result.trim_start().to_ascii_lowercase();
+        if lower.starts_with("error:")
+            || lower.starts_with("unknown ")
+            || lower.starts_with("failed")
+            || lower.starts_with("cannot ")
+            || lower.starts_with("invalid ")
+            || lower.starts_with("missing ")
+            || lower.starts_with("no ")
+            || lower.starts_with("not ")
+        {
+            ToolChipState::Failed
+        } else {
+            ToolChipState::Done
+        }
+    }
+
+    fn human_tool_label(name: &str, args: &serde_json::Value) -> String {
+        match name {
+            "set_split" => match args.get("point").and_then(|v| v.as_u64()) {
+                Some(p) => format!("Split keys → {}", note_name(p.min(127) as u8)),
+                None => "Unsplit keys".into(),
+            },
+            "add_node" => {
+                let what = args
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
+                    .or_else(|| args.get("kind").and_then(|v| v.as_str()))
+                    .unwrap_or("unit")
+                    .to_ascii_lowercase();
+                match args.get("rig").and_then(|v| v.as_u64()) {
+                    Some(r) => format!("Add {what} → rig {}", r + 1),
+                    None => format!("Add {what}"),
+                }
+            }
+            LOOK_TOOL => "Look at the rack".into(),
+            "get_graph" => "Read rack graph".into(),
+            "get_status" => "Check status".into(),
+            "get_rigs" => "List rigs".into(),
+            "measure_mix" => "Measure mix".into(),
+            "play_note" => {
+                let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
+                format!("Play {}", note_name(note))
+            }
+            "set_octave" => {
+                let oct = args.get("octave").and_then(|v| v.as_u64()).unwrap_or(4);
+                format!("Octave → C{oct}")
+            }
+            "flip_rack" => "Flip rack".into(),
+            "set_rig_source" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1);
+                format!("Rig {node} sources")
+            }
+            "set_rig_mix" => {
+                let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0);
+                format!("Mix rig {}", rig + 1)
+            }
+            "set_rig_device" => "Set MIDI input".into(),
+            "get_matrix" => "Read MIDI matrix".into(),
+            "set_matrix_cell" => {
+                if args.get("on").and_then(|v| v.as_bool()).unwrap_or(true) {
+                    "Enable MIDI route".into()
+                } else {
+                    "Mute MIDI route".into()
+                }
+            }
+            "set_matrix_rule" => "Set MIDI rule".into(),
+            "list_params" => "List parameters".into(),
+            "set_cc_map" => "Map MIDI CC".into(),
+            "clear_cc_map" => "Clear MIDI CC".into(),
+            "list_cc_maps" => "List MIDI CCs".into(),
+            "learn_cc" => "Learn MIDI CC".into(),
+            "list_sounds" => "Search patches".into(),
+            "load_sound" => format!("Load '{}'", args.get("query").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "add_rig" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => format!("Add rig · {n}"),
+                None => "Add rig".into(),
+            },
+            "delete_rig" => format!("Delete rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
+            "rename_rig" => format!("Rename rig → {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("rig")),
+            "select_rig" => format!("Switch to rig {}", args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) + 1),
+            "connect" => format!(
+                "Wire {} → {}",
+                args.get("from_node").and_then(|v| v.as_u64()).unwrap_or(0),
+                args.get("to_node").and_then(|v| v.as_u64()).unwrap_or(0)
+            ),
+            "disconnect" => format!("Unplug cable {}", args.get("id").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "remove_node" => format!("Remove unit {}", args.get("node").and_then(|v| v.as_u64()).unwrap_or(0)),
+            "load_template" => format!("Template · {}", args.get("name").and_then(|v| v.as_str()).unwrap_or("patch")),
+            "transport_play" => "Start transport".into(),
+            "transport_stop" => "Stop transport".into(),
+            "set_bpm" => format!("Tempo → {} BPM", args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0).round() as u32),
+            "set_count_in" => "Set count-in".into(),
+            "record_start" => "Start recording".into(),
+            "record_stop" => "Stop recording".into(),
+            "record_status" => "Recording status".into(),
+            "system_audio" => "System audio level".into(),
+            "play_file" => "Play audio file".into(),
+            "stop_file" => "Stop audio file".into(),
+            "set_player" => "File player level".into(),
+            "list_plugins" => "List plugins".into(),
+            "list_instruments" => "List instruments".into(),
+            "install_instrument" => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
+            "undo" => "Undo last edit".into(),
+            "redo" => "Redo edit".into(),
+            _ => name.replace('_', " "),
+        }
+    }
+
+    fn finish_chip(&mut self, user_idx: usize, chip_idx: usize, result: &str) {
+        if let Some(run) = self.transcript_runs.get_mut(&user_idx) {
+            if let Some(chip) = run.chips.get_mut(chip_idx) {
+                chip.state = Self::classify_tool_result(result);
+            }
+        }
+    }
+
+    fn finalize_active_run(&mut self) {
+        let Some(user_idx) = self.active_run_user_idx.take() else { return };
+        let cost = self.assistant.turn.summary().or_else(|| {
+            self.assistant
+                .turn
+                .wall
+                .map(|w| format!("0 steps · {:.1} s · {}", w.as_secs_f64(), self.assistant.model()))
+        });
+        let run = self.transcript_runs.entry(user_idx).or_default();
+        run.cost_line = cost;
+    }
+
     /// Take in the worker's events and run its tool calls. The worker sends
     /// one batch per model step and waits for all of its results.
     fn poll_assistant(&mut self) {
+        let was_busy = self.assistant.busy;
         if let Some(batch) = self.assistant.poll().pop() {
-            self.tool_batch = Some(ToolBatch { todo: batch.into(), results: Vec::new(), waiting: None });
+            let user_idx = self.active_run_user_idx.unwrap_or_else(|| {
+                self.assistant.history.iter().rposition(|l| l.role == "user").unwrap_or(0)
+            });
+            self.active_run_user_idx = Some(user_idx);
+            let run = self.transcript_runs.entry(user_idx).or_default();
+            let chip_start = run.chips.len();
+            for call in &batch {
+                run.chips.push(ToolChip {
+                    label: Self::human_tool_label(&call.name, &call.args),
+                    state: ToolChipState::Running,
+                });
+            }
+            self.tool_batch = Some(ToolBatch {
+                todo: batch.into(),
+                results: Vec::new(),
+                waiting: None,
+                user_idx,
+                chip_cursor: chip_start,
+            });
         }
-        let Some(mut batch) = self.tool_batch.take() else { return };
-        if let Some(waiting) = batch.waiting.take() {
-            let outcome = match &waiting {
-                Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
-                Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
-                    None if std::time::Instant::now() < *deadline => None,
-                    shot => Some(rack_shot_output(said, shot)),
-                },
-            };
-            match outcome {
-                Some(result) => batch.results.push(result),
-                None => {
-                    batch.waiting = Some(waiting);
-                    self.tool_batch = Some(batch);
-                    return;
+        if let Some(mut batch) = self.tool_batch.take() {
+            if let Some(waiting) = batch.waiting.take() {
+                let outcome = match &waiting {
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
+                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
+                        None if std::time::Instant::now() < *deadline => None,
+                        shot => Some(rack_shot_output(said, shot)),
+                    },
+                };
+                match outcome {
+                    Some(result) => {
+                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result.text);
+                        batch.chip_cursor += 1;
+                        batch.results.push(result);
+                    }
+                    None => {
+                        batch.waiting = Some(waiting);
+                        self.tool_batch = Some(batch);
+                        return;
+                    }
                 }
             }
+            while let Some(call) = batch.todo.pop_front() {
+                let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
+                let before = engine_edit.then(|| self.rack_ids());
+                let result = self.run_assistant_tool(&call.name, &call.args);
+                batch.waiting = match before {
+                    Some(before) => Some(Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT })),
+                    None if call.name == LOOK_TOOL => Some(Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT }),
+                    None => {
+                        self.finish_chip(batch.user_idx, batch.chip_cursor, &result);
+                        batch.chip_cursor += 1;
+                        batch.results.push(result.into());
+                        continue;
+                    }
+                };
+                self.tool_batch = Some(batch);
+                return;
+            }
+            self.assistant.send_tool_results(batch.results);
         }
-        while let Some(call) = batch.todo.pop_front() {
-            let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
-            let before = engine_edit.then(|| self.rack_ids());
-            let result = self.run_assistant_tool(&call.name, &call.args);
-            batch.waiting = match before {
-                Some(before) => Some(Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT })),
-                None if call.name == LOOK_TOOL => Some(Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT }),
-                None => {
-                    batch.results.push(result.into());
-                    continue;
-                }
-            };
-            self.tool_batch = Some(batch);
-            return;
+        if was_busy && !self.assistant.busy {
+            self.finalize_active_run();
         }
-        self.assistant.send_tool_results(batch.results);
     }
 
     /// Node ids and living cable ids of the rack.
@@ -3604,6 +3803,9 @@ impl DemoApp {
                 format!("[The user clicked Cancel: do not run {} ({}).] Acknowledge briefly.", p.tool, p.label),
             );
         }
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
     }
 
     fn sessions_dir() -> std::path::PathBuf {
@@ -6378,6 +6580,9 @@ impl DemoApp {
         self.undo_job = None; // a new request = a new undo step
         self.pending_confirm = None; // a typed answer replaces the buttons
         self.assistant.send_user_message(shown, UserMessage { text, image });
+        let user_idx = self.assistant.history.len().saturating_sub(1);
+        self.active_run_user_idx = Some(user_idx);
+        self.transcript_runs.entry(user_idx).or_default();
     }
 
     /// Attach an image to the chat message being written and show the chat.
@@ -8465,12 +8670,94 @@ impl DemoApp {
         job
     }
 
+    fn paint_busy_dots(ui: &mut egui::Ui, ui_time: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 14.0), egui::Sense::hover());
+        let p = ui.painter();
+        for i in 0..3 {
+            let wave = (ui_time * 5.0 - i as f32 * 0.95).sin() * 0.5 + 0.5;
+            let a = 0.25 + 0.75 * wave;
+            let x = rect.left() + 4.0 + i as f32 * 6.5;
+            p.circle_filled(Pos2::new(x, rect.center().y), 2.2 + 0.5 * wave, theme::alpha(theme::AGENT_COLOR, a));
+        }
+    }
+
+    fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32) {
+        let pulse = 0.45 + 0.45 * ((ui_time * 5.5).sin() * 0.5 + 0.5);
+        let (fill, border, glyph, glyph_color, txt_color, suffix) = match chip.state {
+            ToolChipState::Running => (
+                theme::alpha(theme::AGENT_COLOR, 0.14),
+                theme::alpha(theme::AGENT_COLOR, pulse),
+                "●",
+                theme::AGENT_COLOR,
+                theme::INK,
+                "",
+            ),
+            ToolChipState::Done => (
+                theme::DARK_PANEL_HI,
+                theme::alpha(theme::AGENT_COLOR, 0.50),
+                "✓",
+                theme::AGENT_COLOR,
+                theme::CREAM,
+                "",
+            ),
+            ToolChipState::NotApplied => (
+                theme::DARK_PANEL,
+                theme::CABLE_AMBER,
+                "–",
+                theme::CABLE_AMBER,
+                theme::CREAM_MID,
+                " · not applied",
+            ),
+            ToolChipState::Failed => (
+                theme::alpha(theme::CLIP_RED, 0.18),
+                theme::CLIP_RED,
+                "!",
+                theme::CLIP_BRIGHT,
+                theme::CLIP_BRIGHT,
+                "",
+            ),
+        };
+        let mut job = egui::text::LayoutJob::default();
+        job.append(glyph, 0.0, egui::TextFormat {
+            font_id: theme::medium_font(10.5),
+            color: glyph_color,
+            ..Default::default()
+        });
+        job.append(" ", 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        job.append(&chip.label, 0.0, egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: txt_color,
+            ..Default::default()
+        });
+        if !suffix.is_empty() {
+            job.append(suffix, 0.0, egui::TextFormat {
+                font_id: egui::FontId::proportional(10.5),
+                color: glyph_color,
+                ..Default::default()
+            });
+        }
+        // Rule 7: >= 8px horizontal and >= 4px vertical internal padding inside chip box.
+        egui::Frame::new()
+            .fill(fill)
+            .stroke(Stroke::new(1.0, border))
+            .corner_radius(2.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(job).selectable(false));
+            });
+    }
+
     /// Assistant dock occupant: a WIDE bottom panel — chat transcript +
     /// always-visible input on the left, live patch context & agent activity
     /// side column on the right when wide. Uses `exact_size` (rule 71) so the
     /// panel follows window resizes and never sticks at a tiny first-frame size.
     fn assistant_panel_ui(&mut self, root: &mut egui::Ui) {
         let panel_h = Self::assistant_dock_h(root.available_height(), self.rack_need_h());
+        let ui_time = self.ui_time;
         let mut starter_prompt: Option<String> = None;
         let mut submit_text: Option<String> = None;
         let mut clear_chat = false;
@@ -8501,7 +8788,15 @@ impl DemoApp {
                         }
                         if self.assistant.busy {
                             ui.add_space(8.0);
-                            ui.label(egui::RichText::new("● working").size(11.5).color(theme::AGENT_COLOR));
+                            Self::paint_busy_dots(ui, ui_time);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(self.assistant.phase_label())
+                                        .size(11.5)
+                                        .color(theme::AGENT_COLOR),
+                                )
+                                .truncate(),
+                            );
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the assistant (F12)").clicked() {
@@ -8558,6 +8853,7 @@ impl DemoApp {
                                  chat_input: &mut String,
                                  chat_image: &mut Option<Image>,
                                  assistant: &mut Assistant,
+                                 transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
                                  starter_prompt: &mut Option<String>,
                                  submit_text: &mut Option<String>,
@@ -8641,7 +8937,20 @@ impl DemoApp {
                                 });
                             }
                             let body_w = (ui.available_width() - 96.0).max(120.0);
-                            for line in &assistant.history {
+                            let mut current_run_idx: Option<usize> = None;
+                            for (idx, line) in assistant.history.iter().enumerate() {
+                                if line.role == "user" {
+                                    if let Some(prev_idx) = current_run_idx {
+                                        if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(78.0);
+                                                ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                            });
+                                            ui.add_space(4.0);
+                                        }
+                                    }
+                                    current_run_idx = Some(idx);
+                                }
                                 let (label, color, rule) = match line.role.as_str() {
                                     "user" => ("YOU", theme::INK_2, theme::HAIRLINE_DARK),
                                     "assistant" => ("ASSISTANT", theme::AGENT_COLOR, theme::AGENT_COLOR),
@@ -8666,10 +8975,51 @@ impl DemoApp {
                                     Vec2::new(2.0, (r.height() - 4.0).max(12.0)),
                                 );
                                 ui.painter().rect_filled(bar, 1.0, rule);
+                                if line.role == "user" {
+                                    if let Some(run) = transcript_runs.get_mut(&idx) {
+                                        if !run.chips.is_empty() {
+                                            ui.add_space(2.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.add_space(78.0);
+                                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                                                let total = run.chips.len();
+                                                let show_n = if !run.expanded && total > COLLAPSED_RUN_CHIPS {
+                                                    COLLAPSED_RUN_CHIPS
+                                                } else {
+                                                    total
+                                                };
+                                                for chip in &run.chips[..show_n] {
+                                                    Self::tool_chip_ui(ui, chip, ui_time);
+                                                }
+                                                if show_n < total {
+                                                    let more = total - show_n;
+                                                    if theme::chip_button(ui, &format!("+{more} more"), false).clicked() {
+                                                        run.expanded = true;
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
                                 ui.add_space(2.0);
                             }
+                            if !assistant.busy {
+                                if let Some(prev_idx) = current_run_idx {
+                                    if let Some(cost) = transcript_runs.get(&prev_idx).and_then(|r| r.cost_line.as_deref()) {
+                                        ui.horizontal(|ui| {
+                                            ui.add_space(78.0);
+                                            ui.label(egui::RichText::new(cost).size(10.5).color(theme::INK_2));
+                                        });
+                                        ui.add_space(4.0);
+                                    }
+                                }
+                            }
                             if assistant.busy {
-                                ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
+                                ui.horizontal(|ui| {
+                                    ui.add_space(78.0);
+                                    Self::paint_busy_dots(ui, ui_time);
+                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_COLOR));
+                                });
                             } else if let Some(label) = &confirm_label {
                                 // #32: the click answers the assistant's question.
                                 ui.horizontal(|ui| {
@@ -8740,6 +9090,7 @@ impl DemoApp {
                                     &mut self.chat_input,
                                     &mut self.chat_image,
                                     &mut self.assistant,
+                                    &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
                                     &mut starter_prompt,
                                     &mut submit_text,
@@ -8821,6 +9172,7 @@ impl DemoApp {
                         &mut self.chat_input,
                         &mut self.chat_image,
                         &mut self.assistant,
+                        &mut self.transcript_runs,
                         &mut self.assistant_input_h,
                         &mut starter_prompt,
                         &mut submit_text,
@@ -8835,6 +9187,8 @@ impl DemoApp {
         self.focus_chat_request = focus_chat;
         if clear_chat {
             self.assistant.history.clear();
+            self.transcript_runs.clear();
+            self.active_run_user_idx = None;
             self.pending_confirm = None;
         }
         if let Some(choice) = confirm_choice.get() {
@@ -17271,6 +17625,8 @@ mod ui_polish_agent_tests {
             todo: VecDeque::new(),
             results: Vec::new(),
             waiting: Some(Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }),
+            user_idx: 0,
+            chip_cursor: 0,
         });
         app.poll_assistant();
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
@@ -17941,6 +18297,122 @@ mod ui_polish_agent_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn step2_live_status_shows_phase_and_route() {
+        use crate::assistant::{FromWorker, RunPhase};
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Split keys at C4".into() });
+        app.assistant.busy = true;
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+
+        for (phase, expected) in [
+            (RunPhase::Deciding, "Jev · deciding"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
+            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+        ] {
+            app.assistant.phase = Some(phase);
+            let texts = run_frame(&mut app, &ctx, size, vec![]);
+            assert!(
+                texts.iter().any(|(t, _)| t == expected),
+                "expected phase '{expected}' in UI, got {texts:?}"
+            );
+            assert!(
+                texts.iter().all(|(t, _)| !t.contains("thinking…")),
+                "static thinking… text must be gone: {texts:?}"
+            );
+        }
+        let _ = FromWorker::Done;
+    }
+
+    #[test]
+    fn step2_action_chips_have_rule7_padding_states_collapse_and_cost() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let user_idx = app.assistant.history.len();
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Wire up a reverb on rig 2".into() });
+        app.assistant.history.push(ChatLine { role: "assistant".into(), text: "Added Reverb on rig 2.".into() });
+        app.transcript_runs.insert(
+            user_idx,
+            TranscriptRun {
+                chips: vec![
+                    ToolChip {
+                        label: DemoApp::human_tool_label("set_split", &serde_json::json!({"point": 60})),
+                        state: ToolChipState::Done,
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label("add_node", &serde_json::json!({"kind": "dsp", "dsp": "reverb", "rig": 1})),
+                        state: DemoApp::classify_tool_result("added — NOT applied: engine changed nothing"),
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label(LOOK_TOOL, &serde_json::json!({})),
+                        state: ToolChipState::Running,
+                    },
+                    ToolChip {
+                        label: DemoApp::human_tool_label("remove_node", &serde_json::json!({"node": 99})),
+                        state: ToolChipState::Failed,
+                    },
+                ],
+                expanded: false,
+                cost_line: Some("2 steps · 1.4 s · deepseek-chat".into()),
+            },
+        );
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(781.0, 950.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+
+        fn collect(shape: &egui::Shape, texts: &mut Vec<(String, Rect)>, rects: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(t) => texts.push((t.galley.text().to_owned(), t.visual_bounding_rect())),
+                egui::Shape::Rect(r) if r.fill != Color32::TRANSPARENT => rects.push(r.rect),
+                egui::Shape::Vec(v) => for s in v { collect(s, texts, rects) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            collect(&cs.shape, &mut texts, &mut rects);
+        }
+        assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing split chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Add reverb → rig 2") && t.contains("not applied")), "missing not-applied chip: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.contains("Look at the rack")), "missing running chip: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "4th chip collapsed initially");
+        let more_rect = texts.iter().find(|(t, _)| t == "+1 more").map(|(_, r)| *r).expect("+1 more collapse chip");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.4 s · deepseek-chat"), "missing cost line: {texts:?}");
+
+        // Rule 7 padding on visible chips: enclosing filled rect extends >= 7.5px H and >= 3.5px V around text.
+        for label in ["Split keys → C4", "Look at the rack", "+1 more"] {
+            let tr = texts.iter().find(|(t, _)| t.contains(label)).map(|(_, r)| *r).unwrap();
+            let boxed = rects.iter().any(|br| {
+                br.contains_rect(tr)
+                    && (tr.left() - br.left()) >= 7.5
+                    && (br.right() - tr.right()) >= 7.5
+                    && (tr.top() - br.top()) >= 3.5
+                    && (br.bottom() - tr.bottom()) >= 3.5
+            });
+            assert!(boxed, "chip '{label}' ({tr:?}) violates rule 7 padding against {rects:?}");
+        }
+
+        // Click "+1 more" -> expands to show Failed 4th chip.
+        click_at(&mut app, &ctx, size, more_rect.center());
+        let expanded_texts = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(expanded_texts.iter().any(|(t, _)| t.contains("Remove unit 99")), "expanded 4th chip missing: {expanded_texts:?}");
+        assert_eq!(DemoApp::classify_tool_result("unknown tool: foo"), ToolChipState::Failed);
+        assert_eq!(DemoApp::classify_tool_result("octave set to C4"), ToolChipState::Done);
     }
 }
 

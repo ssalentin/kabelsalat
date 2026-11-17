@@ -1072,7 +1072,9 @@ pub fn role_model_choices(role: Role, keys: llm::Keys, current: &str) -> Vec<Str
         Role::Decide => vec![llm::JEV.to_string()],
         Role::Act => {
             let mut m = picker_models(keys.openrouter, keys.deepseek, current);
-            for extra in [llm::JEV_ROUTER, llm::CLAUDE_OPUS, llm::PERCEIVE_MODEL] {
+            // Not the Jev router: `picker_models` already offers it where it is
+            // the default; beside DeepSeek it read as "turn Jev on" (rule 78).
+            for extra in [llm::CLAUDE_OPUS, llm::PERCEIVE_MODEL] {
                 if !m.iter().any(|x| x == extra) {
                     m.push(extra.to_string());
                 }
@@ -2942,7 +2944,8 @@ mod tests {
         let act_choices = role_model_choices(Role::Act, keys, llm::DEEPSEEK_CHAT);
         assert!(act_choices.iter().any(|m| m == llm::DEEPSEEK_CHAT));
         assert!(act_choices.iter().any(|m| m == "deepseek-reasoner"));
-        assert!(act_choices.iter().any(|m| m == llm::JEV_ROUTER));
+        assert!(!act_choices.iter().any(|m| m == llm::JEV_ROUTER), "no Jev router beside DeepSeek: {act_choices:?}");
+        assert!(role_model_choices(Role::Act, llm::Keys { openrouter: true, deepseek: false }, llm::JEV_ROUTER).iter().any(|m| m == llm::JEV_ROUTER));
         assert!(act_choices.iter().any(|m| m == llm::CLAUDE_OPUS));
         assert!(act_choices.iter().any(|m| m == llm::PERCEIVE_MODEL));
 

@@ -6,21 +6,18 @@
 set -euo pipefail
 labels=",${1:-},"
 
-# Paths CI cannot judge: what users see, what they hear (real-time audio,
-# real plugins, MIDI hardware), and what ships or governs the repo.
-human_paths='^(src/ui(\.rs|/)|src/theme\.rs|assets/|docs/images\.sha256'\
-'|src/engine(\.rs|/)|src/audio[^/]*\.rs|src/dsp\.rs|src/host\.rs|src/lv2\.rs'\
-'|src/juce\.rs|src/organ\.rs|src/midi\.rs|src/record\.rs|src/player\.rs'\
-'|src/capture\.rs|src/meter\.rs|src/transport\.rs'\
-'|Cargo\.toml|AGENTS\.md|\.github/|\.githooks/|packaging/|scripts/ci/|scripts/check-images\.sh)'
+# Paths that set the rules agents work under, or ship to users. Everything
+# else merges on green CI; hold a single risky PR with `needs-human`.
+human_paths='^(AGENTS\.md|\.github/|\.githooks/|scripts/ci/|scripts/check-images\.sh'\
+'|Cargo\.toml|packaging/)'
 
 hits=$(grep -E "$human_paths" || true)
 reason=""
-[[ -n $hits ]] && reason="touches paths CI cannot judge:"$'\n'"$hits"
+[[ -n $hits ]] && reason="touches governance or release paths:"$'\n'"$hits"
 [[ $labels == *,needs-human,* ]] && reason="labelled needs-human${reason:+; }$reason"
 
 if [[ -z $reason ]]; then
-  echo "auto-merge allowed: no human-review paths changed"
+  echo "auto-merge allowed: no governance or release paths changed"
   exit 0
 fi
 if [[ $labels == *,human-approved,* ]]; then

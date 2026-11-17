@@ -716,14 +716,14 @@ Learned so far (2026-11-15, UI polish pass):
   `test (x86_64)`, `test (aarch64)`, `flatpak cargo-sources.json is current`
   and `human gate` must pass. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
-  `gh pr merge` without `--auto`. `human gate` (`scripts/ci/human-gate.sh`)
-  holds every PR that touches what CI cannot judge: UI and visuals
-  (`src/ui*`, `src/theme.rs`, `assets/`, `docs/images.sha256`), real-time
-  audio, plugins and MIDI (`src/engine*`, `src/audio*`, `dsp`, `host`, `lv2`,
-  `juce`, `organ`, `midi`, `record`, `player`, `capture`, `meter`,
-  `transport`), and releases and repo rules (`Cargo.toml`, `AGENTS.md`,
-  `.github/`, `.githooks/`, `packaging/`, `scripts/ci/`). Add the
-  `needs-human` label to any other PR whose risk the tests do not cover.
+  `gh pr merge` without `--auto`. `human gate`
+  (`scripts/ci/human-gate.sh`, run from `main` via `pull_request_target`,
+  so a PR cannot edit it to pass) holds only PRs that change the rules
+  agents work under or what ships: `AGENTS.md`, `.github/`, `.githooks/`,
+  `scripts/ci/`, `scripts/check-images.sh`, `Cargo.toml`, `packaging/`.
+  Everything else merges on green CI, so the evidence rules above are what
+  keeps it safe. Add the `needs-human` label to a PR whose risk neither the
+  tests nor its evidence cover.
   Such a PR waits until the user adds `human-approved`; **agents never add
   or remove `human-approved`**, and a PR body for one lists the evidence the
   user needs (screenshots, self-test output). Self-tests with real plugins

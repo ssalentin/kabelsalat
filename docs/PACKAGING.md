@@ -56,7 +56,9 @@ adds `SHA256SUMS`, then creates the GitHub release, or uploads to it when the
 release already exists. Its notes (`scripts/ci/release-notes.sh <v> dist <tag>
 <repo>`) are the tag's CHANGELOG block plus a **Download** section that links
 each AppImage directly (x86_64 first), then the other packages and
-`SHA256SUMS`; a release without an AppImage fails.
+`SHA256SUMS`; a release without an AppImage fails. Each AppImage is also
+attached as `kabelsalat-<arch>.AppImage` (no version), so README's links to
+`releases/latest/download/kabelsalat-<arch>.AppImage` always fetch the newest.
 
 ### Packages for an existing tag
 

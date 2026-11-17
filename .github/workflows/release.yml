@@ -221,6 +221,13 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # Unversioned copies: README links releases/latest/download/<name>,
+      # which needs a file name that stays the same across releases.
+      - name: Stable AppImage names
+        run: |
+          for arch in x86_64 aarch64; do
+            cp "dist/kabelsalat-$VERSION-$arch.AppImage" "dist/kabelsalat-$arch.AppImage"
+          done
       - name: Checksums
         run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - name: Create or update the GitHub release

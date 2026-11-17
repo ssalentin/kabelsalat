@@ -20,7 +20,7 @@ dist=$2 tag=$3 repo=$4
 base="https://github.com/$repo/releases/download/$tag"
 link() { printf -- '- [%s](%s/%s)\n' "$1" "$base" "$1"; }
 shopt -s nullglob
-appimages=("$dist"/*-x86_64.AppImage "$dist"/*-aarch64.AppImage)
+appimages=("$dist"/kabelsalat-*-x86_64.AppImage "$dist"/kabelsalat-*-aarch64.AppImage)
 if [ ${#appimages[@]} -eq 0 ]; then
   echo "no AppImage in $dist" >&2
   exit 1

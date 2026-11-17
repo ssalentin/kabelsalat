@@ -7,6 +7,14 @@ releases may still change behaviour and session files.
 
 ## [Unreleased]
 
+### Changed
+- **Themed dropdowns (`theme::Dropdown`):** replaced all three `egui::ComboBox`
+  selectors (MIDI matrix CC parameter picker, assistant header chat-model
+  picker, mixer audio output) with a Hurricane-styled dropdown matching the
+  knob context menu (`DARK_PANEL`, `1px HAIRLINE` border, 4 px radius, soft
+  shadow, `LIVE_TEAL` selection mark, scrollable list, Esc-to-close, truncated
+  labels with full hover tooltips).
+
 ### Fixed
 - **Plugin knobs that drove the wrong thing or nothing:** every LV2 unit had
   a `GAIN` knob wired to the plugin's first control port, whatever that port
@@ -61,6 +69,13 @@ releases may still change behaviour and session files.
   full parameter list, and a control's name binds with
   `set_cc_map knob=<name>`. `kabelsalat main-controls-test` prints each
   installed instrument's main controls and moves one through the engine.
+- **Settings view (`,` / top bar `Settings`):** added a main-stage Settings view
+  for configuring per-role agent models (`agent_decide_model` with On/Off switch,
+  `agent_act_model`, `agent_perceive_model`) via themed dropdowns or custom model
+  IDs with effective route and key status, saving/removing DeepSeek and
+  OpenRouter API keys (masked, restarting the assistant worker immediately),
+  and editing preferences (`ui_reduce_motion`, count-in on/bars, audio output,
+  plus read-only detected UI scale).
 - **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in

@@ -1299,8 +1299,16 @@ fn text_toggle(ui: &mut egui::Ui, name: &str, on: bool) -> bool {
 use crate::control::VOICE_POOL;
 
 fn nav_button(ui: &mut egui::Ui, name: &str, active: bool) -> bool {
-    // Hover names the letter shortcut (M / N / C / B).
-    let key = match name { "Mixer" => Some("M"), "Matrix" => Some("N"), "Assistant" => Some("C"), "Keyboard" => Some("V"), "Plugins" => Some("B"), _ => None };
+    // Hover names the shortcut (M / N / C / V / B / ,).
+    let key = match name {
+        "Mixer" => Some("M"),
+        "Matrix" => Some("N"),
+        "Assistant" => Some("C"),
+        "Keyboard" => Some("V"),
+        "Plugins" => Some("B"),
+        "Settings" => Some(","),
+        _ => None,
+    };
     let r = theme::chip_button(ui, name, active);
     match key { Some(k) => r.on_hover_text(format!("{name} · key {k}")).clicked(), None => r.clicked() }
 }
@@ -1650,6 +1658,7 @@ enum StageView {
     Mixer,
     Sessions,
     Plugins,
+    Settings,
 }
 
 /// The bottom dock holds exactly one occupant at a time: no dock, the full-width
@@ -2070,8 +2079,16 @@ struct DemoApp {
     active_rig: usize,
     /// Smoothed per-rig activity for the overview strip (max unit LED).
     rig_levels: Vec<f32>,
-    /// Active main-stage view: Rack, Matrix, Mixer, Sessions, or Plugins.
+    /// Active main-stage view: Rack, Matrix, Mixer, Sessions, Plugins, or Settings.
     stage_view: StageView,
+    /// Whether any dropdown popup was open at the start of this frame.
+    popup_open_at_start: bool,
+    settings_decide_input: String,
+    settings_act_input: String,
+    settings_perceive_input: String,
+    settings_deepseek_key: String,
+    settings_openrouter_key: String,
+    settings_msg: String,
     /// Ctrl-drag of a unit: last rack-local cursor (drives the live layout
     /// preview) and the slot rect the dragged unit would land in.
     drag_cursor: Option<Vec2>,
@@ -2419,6 +2436,13 @@ impl DemoApp {
             active_rig: 0,
             rig_levels: Vec::new(),
             stage_view: StageView::Rack,
+            popup_open_at_start: false,
+            settings_decide_input: String::new(),
+            settings_act_input: String::new(),
+            settings_perceive_input: String::new(),
+            settings_deepseek_key: String::new(),
+            settings_openrouter_key: String::new(),
+            settings_msg: String::new(),
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
@@ -2934,6 +2958,7 @@ impl DemoApp {
                 (&["B"], "plugin browser (also F9)"),
                 (&["F11"], "MIDI matrix view"),
                 (&["F12"], "assistant"),
+                (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
             ]),
         ];
@@ -4249,6 +4274,9 @@ impl DemoApp {
         self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
         if self.stage_view != StageView::Sessions {
             self.confirm_delete_session = None;
+        }
+        if self.stage_view != StageView::Settings {
+            self.settings_msg.clear();
         }
         if self.stage_view == StageView::Plugins && !self.plugins_loaded {
             self.refresh_plugins();
@@ -6734,10 +6762,10 @@ impl DemoApp {
                 .find(|(id, _)| *id == self.rule_param_id)
                 .map(|(_, n)| n.as_str())
                 .unwrap_or("select param…");
-            egui::ComboBox::from_id_salt("rule_cc_param_pick")
+            theme::Dropdown::new("dd_rule_cc_param", selected_label)
                 .width((ui.available_width() - 4.0).max(160.0))
-                .selected_text(egui::RichText::new(selected_label).size(12.0).color(theme::INK))
-                .show_ui(ui, |ui| {
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
                     let mut shown = 0usize;
                     for (id, name) in choices {
                         let low = name.to_lowercase();
@@ -6745,14 +6773,16 @@ impl DemoApp {
                             continue;
                         }
                         if shown >= 80 {
-                            ui.label(egui::RichText::new("… refine filter").size(11.0).color(theme::INK_2));
+                            menu.note("… refine filter");
                             break;
                         }
                         shown += 1;
-                        ui.selectable_value(&mut self.rule_param_id, *id, egui::RichText::new(name).size(12.0).color(theme::INK));
+                        if menu.item(self.rule_param_id == *id, name) {
+                            self.rule_param_id = *id;
+                        }
                     }
                     if shown == 0 {
-                        ui.label(egui::RichText::new("no matching parameter").size(11.0).color(theme::INK_2));
+                        menu.note("no matching parameter");
                     }
                 });
         } else {
@@ -7825,8 +7855,11 @@ impl DemoApp {
                     // latter follows the bar's previous-frame width, so the mode
                     // flipped between frames and buttons jumped under the mouse.
                     let compact = ui.ctx().content_rect().width() < 1000.0;
+                    if compact {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                    }
                     let (mark, _) = ui.allocate_exact_size(egui::vec2(18.0, 22.0), egui::Sense::hover());
-                    ui.add_space(4.0);
+                    if !compact { ui.add_space(4.0); }
                     if compact {
                         theme::crossed_wires(ui.painter(), mark.center(), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                     } else if let Some(g) = self.topbar_word_g.clone() {
@@ -7842,25 +7875,29 @@ impl DemoApp {
                         let body_mid = r.top() + base - 20.0 * 0.36;
                         theme::crossed_wires(ui.painter(), Pos2::new(mark.center().x, body_mid), 16.0, theme::PAPER, theme::MarkStyle::Mono);
                     }
-                    ui.add_space(14.0);
-                    ui.add_space(6.0);
+                    if !compact {
+                        ui.add_space(20.0);
+                    }
                     if !self.editor_open && !self.editor_status.is_empty() {
                         ui.label(egui::RichText::new(&self.editor_status).size(12.0).color(theme::ACCENT_DEEP));
-                        ui.add_space(8.0);
+                        if !compact { ui.add_space(8.0); }
                     }
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); }
                     // Two explicit groups (user): the VIEW decides what the
                     // main stage shows — exactly one, Rack included — while
                     // the BOTTOM PANEL toggles what docks under it.
-                    if !compact { theme::section_label(ui, "View"); }
-                    ui.add_space(2.0);
+                    if !compact {
+                        theme::section_label(ui, "View");
+                        ui.add_space(2.0);
+                    }
                     let views = [
                         ("Rack", StageView::Rack),
                         ("Sessions", StageView::Sessions),
                         ("Plugins", StageView::Plugins),
                         ("Matrix", StageView::Matrix),
                         ("Mixer", StageView::Mixer),
+                        ("Settings", StageView::Settings),
                     ];
                     let mut pick = None;
                     let group = ui.scope(|ui| {
@@ -7874,11 +7911,15 @@ impl DemoApp {
                     if let Some(view) = pick {
                         if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
                     }
-                    ui.add_space(12.0);
+                    if !compact { ui.add_space(12.0); } else { ui.add_space(2.0); }
                     nav_separator(ui);
-                    ui.add_space(10.0);
-                    if !compact { theme::section_label(ui, "Bottom panel"); }
-                    ui.add_space(2.0);
+                    if !compact {
+                        ui.add_space(10.0);
+                        theme::section_label(ui, "Bottom panel");
+                        ui.add_space(2.0);
+                    } else {
+                        ui.add_space(2.0);
+                    }
                     let mut dock = None;
                     let group = ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
@@ -7897,7 +7938,7 @@ impl DemoApp {
                         let last = crate::bridge::LAST_REMOTE_MS.load(Relaxed);
                         let recent = last > 0 && crate::bridge::now_ms().saturating_sub(last) < 15_000;
                         if paused || recent {
-                            ui.add_space(10.0);
+                            if !compact { ui.add_space(10.0); } else { ui.add_space(2.0); }
                             let (label, tip) = match (paused, compact) {
                                 (true, false) => ("Agent paused", "external agents (MCP) may not change this rack — click to allow"),
                                 (true, true) => ("Paused", "external agents (MCP) may not change this rack — click to allow"),
@@ -7915,9 +7956,9 @@ impl DemoApp {
                     // Master recording (GitHub #6): a REC chip (tomato only
                     // while recording) + a sync-to-transport toggle + elapsed
                     // time while active. Start/stop go through the command bus.
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     nav_separator(ui);
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
                     let snap = self.recorder.as_ref().map(|r| r.snapshot());
                     let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
@@ -7929,7 +7970,7 @@ impl DemoApp {
                         ui.label(egui::RichText::new(err).size(11.0).color(theme::ACCENT_DEEP))
                             .on_hover_text("recording failed to start or write");
                     }
-                    ui.add_space(6.0);
+                    if !compact { ui.add_space(6.0); }
                     let sync = self.record_sync;
                     if theme::chip_button(ui, "SYNC", sync)
                         .on_hover_text("start/stop recording with the master transport (Space)")
@@ -9049,6 +9090,490 @@ impl DemoApp {
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
+    fn settings_role_input_mut(&mut self, role: crate::llm::Role) -> &mut String {
+        match role {
+            crate::llm::Role::Decide => &mut self.settings_decide_input,
+            crate::llm::Role::Act => &mut self.settings_act_input,
+            crate::llm::Role::Perceive => &mut self.settings_perceive_input,
+        }
+    }
+
+    fn settings_key_input_mut(&mut self, endpoint: crate::llm::Endpoint) -> &mut String {
+        match endpoint {
+            crate::llm::Endpoint::DeepSeek => &mut self.settings_deepseek_key,
+            crate::llm::Endpoint::OpenRouter => &mut self.settings_openrouter_key,
+        }
+    }
+
+    /// Main-stage view for agent models, API keys, and app preferences.
+    fn settings_stage(&mut self, ui: &mut egui::Ui) {
+        use crate::llm::{Endpoint, Role};
+
+        enum SettingsAction {
+            ToggleDecide,
+            SetModel(Role, String),
+            SaveKey(Endpoint, String),
+            RemoveKey(Endpoint),
+            ToggleReduceMotion,
+            SetCountIn(bool, u8),
+            SetAudioOutput(Option<String>),
+        }
+
+        let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let help = self.show_help;
+
+        let keys = self.assistant.keys();
+        let decide_on = self.assistant.decide_enabled();
+        let decide_route = self.assistant.route_for(Role::Decide);
+        let act_route = self.assistant.route_for(Role::Act);
+        let perceive_route = self.assistant.route_for(Role::Perceive);
+        let (outputs, out_current) = self
+            .audio_out
+            .lock()
+            .map(|s| (s.outputs.clone(), s.current.clone()))
+            .unwrap_or_default();
+        let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
+        let reduce_motion = self.reduce_motion;
+        let count_in_enabled = self.count_in_enabled;
+        let count_in_bars = self.count_in_bars;
+        let detected_scale = ui_scale_target();
+        let mut actions: Vec<SettingsAction> = Vec::new();
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.add_enabled_ui(!help, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
+                    if !self.settings_msg.is_empty() {
+                        ui.add_space(16.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let col = if self.settings_msg.contains("failed") {
+                                theme::CLIP_BRIGHT
+                            } else {
+                                theme::LIVE_TEAL
+                            };
+                            ui.add(egui::Label::new(egui::RichText::new(&self.settings_msg).size(12.5).color(col)).truncate());
+                        });
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("agent models · API keys · preferences · Tab / Esc: back to the rack")
+                        .size(13.0)
+                        .color(theme::INK_2),
+                );
+                ui.add_space(12.0);
+                Self::stage_hairline(ui);
+                ui.add_space(14.0);
+
+                let avail_w = ui.available_width().max(200.0);
+                let body_h = ui.available_height().max(80.0);
+                let two_col = avail_w >= 640.0;
+
+                let draw_models = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "Agent models");
+                    ui.add_space(8.0);
+                    for (idx, role) in Role::ALL.iter().copied().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(10.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(10.0);
+                        }
+                        let route = match role {
+                            Role::Decide => &decide_route,
+                            Role::Act => &act_route,
+                            Role::Perceive => &perceive_route,
+                        };
+                        let choices = crate::assistant::role_model_choices(role, keys, &route.model);
+                        let desc = match role {
+                            Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
+                            Role::Act => "Handles conversation, questions, and multi-step rack edits.",
+                            Role::Perceive => "Reads attached screenshots and images for turns that carry one.",
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(role.label()).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(role.model_field()).size(11.0).color(theme::INK_2));
+                            if role == Role::Decide {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if theme::chip_button(ui, if decide_on { "On" } else { "Off" }, decide_on)
+                                        .on_hover_text("enable or disable Jev decisions before the chat model")
+                                        .clicked()
+                                    {
+                                        actions.push(SettingsAction::ToggleDecide);
+                                    }
+                                });
+                            }
+                        });
+                        ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
+                        ui.add_space(6.0);
+
+                        // One row when the column fits dropdown + field + Apply,
+                        // else the dropdown gets its own row; every width comes
+                        // from the column so a row never widens it.
+                        let col_w = ui.available_width();
+                        let gap = ui.spacing().item_spacing.x;
+                        let one_row = col_w >= 460.0;
+                        let dd_w = if one_row { (col_w * 0.44).clamp(150.0, 240.0) } else { col_w.min(320.0) };
+                        let mut picked: Option<String> = None;
+                        let mut apply_other = false;
+                        let mut dropdown = |ui: &mut egui::Ui| {
+                            theme::Dropdown::new(("dd_settings_model", role.model_field()), &route.model)
+                                .width(dd_w)
+                                .popup_min_width(240.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    for m in &choices {
+                                        if menu.item(*m == route.model, m) {
+                                            picked = Some(m.clone());
+                                        }
+                                    }
+                                });
+                        };
+                        let mut other_id = |ui: &mut egui::Ui| {
+                            let field_w = ui.available_width()
+                                - theme::chip_button_width(ui, "Apply")
+                                - gap
+                                - RECESSED_INPUT_CHROME;
+                            let input = app.settings_role_input_mut(role);
+                            let edit = Self::recessed_input(ui, input, field_w.max(60.0), "other model id…");
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                apply_other = true;
+                            }
+                            if theme::chip_button(ui, "Apply", false).clicked() {
+                                apply_other = true;
+                            }
+                        };
+                        if one_row {
+                            ui.horizontal(|ui| {
+                                dropdown(ui);
+                                other_id(ui);
+                            });
+                        } else {
+                            dropdown(ui);
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| other_id(ui));
+                        }
+                        if let Some(m) = picked {
+                            actions.push(SettingsAction::SetModel(role, m));
+                        }
+                        if apply_other {
+                            let input = app.settings_role_input_mut(role);
+                            let custom = input.trim().to_string();
+                            if !custom.is_empty() {
+                                input.clear();
+                                actions.push(SettingsAction::SetModel(role, custom));
+                            }
+                        }
+
+                        ui.add_space(6.0);
+                        // One galley for the whole status line: it wraps inside
+                        // the column as a unit instead of as overlapping labels.
+                        let mut status = egui::text::LayoutJob::default();
+                        let mut part = |text: &str, color: Color32| {
+                            status.append(
+                                text,
+                                0.0,
+                                egui::TextFormat { font_id: FontId::proportional(11.5), color, ..Default::default() },
+                            );
+                        };
+                        if role == Role::Decide && !decide_on {
+                            part("Effective route: Off · chat model handles requests", theme::INK_2);
+                        } else {
+                            let spec = route.endpoint.spec();
+                            part(&format!("Route: {} · {}", spec.label, route.model), theme::CREAM_META);
+                            if keys.has(route.endpoint) {
+                                part(&format!("  ·  {} key set", spec.label), theme::LIVE_TEAL);
+                            } else {
+                                part(&format!("  ·  {} key not set", spec.label), theme::ACCENT_BRIGHT);
+                            }
+                            if role == Role::Decide && spec.decisions_url.is_none() {
+                                part("  ·  endpoint has no decisions API", theme::ACCENT_BRIGHT);
+                            }
+                        }
+                        ui.add(egui::Label::new(status).wrap());
+                    }
+                };
+
+                let draw_keys = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "API keys");
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("Stored locally (~/.config/kabelsalat/config.json, 0600). Saving restarts the assistant worker.")
+                            .size(11.5)
+                            .color(theme::INK_2),
+                    );
+                    ui.add_space(10.0);
+                    for (idx, endpoint) in [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().copied().enumerate() {
+                        if idx > 0 {
+                            ui.add_space(10.0);
+                        }
+                        let spec = endpoint.spec();
+                        let is_set = keys.has(endpoint);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(spec.label).font(theme::medium_font(14.0)).color(theme::INK));
+                            ui.add_space(6.0);
+                            let (status, col) = if is_set {
+                                ("set", theme::LIVE_TEAL)
+                            } else {
+                                ("not set", theme::CREAM_DIM)
+                            };
+                            ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new(spec.key_field).size(11.0).color(theme::INK_2));
+                        });
+                        ui.add_space(4.0);
+
+                        let field_w = (ui.available_width()
+                            - theme::primary_button_width(ui, "Save")
+                            - theme::chip_button_width(ui, "Remove")
+                            - ui.spacing().item_spacing.x * 2.0
+                            - RECESSED_INPUT_CHROME)
+                            .clamp(60.0, 320.0);
+                        let hint = match endpoint {
+                            Endpoint::DeepSeek => "sk-…",
+                            Endpoint::OpenRouter => "sk-or-…",
+                        };
+                        let mut do_save = false;
+                        let mut do_remove = false;
+                        ui.horizontal(|ui| {
+                            let buf = app.settings_key_input_mut(endpoint);
+                            let edit = egui::Frame::new()
+                                .fill(theme::PAPER_SINK)
+                                .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                                .corner_radius(2.0)
+                                .inner_margin(egui::Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(buf)
+                                            .id_salt(("settings_api_key", spec.key_field))
+                                            .password(true)
+                                            .frame(egui::Frame::NONE)
+                                            .desired_width(field_w)
+                                            .hint_text(hint),
+                                    )
+                                })
+                                .inner;
+                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                do_save = true;
+                            }
+                            if theme::primary_button(ui, "Save").clicked() {
+                                do_save = true;
+                            }
+                            ui.add_enabled_ui(is_set, |ui| {
+                                if theme::danger_button(ui, "Remove", false).clicked() {
+                                    do_remove = true;
+                                }
+                            });
+                        });
+                        if do_save {
+                            let buf = app.settings_key_input_mut(endpoint);
+                            let val = buf.trim().to_string();
+                            if !val.is_empty() {
+                                buf.clear();
+                                actions.push(SettingsAction::SaveKey(endpoint, val));
+                            }
+                        }
+                        if do_remove {
+                            app.settings_key_input_mut(endpoint).clear();
+                            actions.push(SettingsAction::RemoveKey(endpoint));
+                        }
+                    }
+                };
+
+                let draw_prefs = |ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>| {
+                    theme::section_label(ui, "Preferences");
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Reduce motion").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, if reduce_motion { "On" } else { "Off" }, reduce_motion).clicked() {
+                                actions.push(SettingsAction::ToggleReduceMotion);
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Snaps rack animations and disables pulsing indicators (ui_reduce_motion).").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
+                            theme::Dropdown::new("dd_settings_count_in_bars", bars_label)
+                                .width(92.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    for b in 1..=crate::transport::MAX_COUNT_IN_BARS {
+                                        let lbl = if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
+                                        if menu.item(count_in_bars == b, &lbl) {
+                                            actions.push(SettingsAction::SetCountIn(count_in_enabled, b));
+                                        }
+                                    }
+                                });
+                            ui.add_space(6.0);
+                            if theme::chip_button(ui, if count_in_enabled { "On" } else { "Off" }, count_in_enabled).clicked() {
+                                actions.push(SettingsAction::SetCountIn(!count_in_enabled, count_in_bars));
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Plays metronome clicks before master playback starts.").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    let label_of = |raw: &str| {
+                        outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string())
+                    };
+                    let selected_out = match &out_wanted {
+                        Some(w) => label_of(w),
+                        None => "System default".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Audio output").font(theme::medium_font(13.5)).color(theme::INK));
+                        let out_dd_w = (ui.available_width() - 100.0).clamp(130.0, 200.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            theme::Dropdown::new("dd_settings_audio_output", &selected_out)
+                                .width(out_dd_w)
+                                .popup_min_width(240.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    if menu.item(out_wanted.is_none(), "System default") {
+                                        actions.push(SettingsAction::SetAudioOutput(None));
+                                    }
+                                    for o in &outputs {
+                                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                                            actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                    ui.label(egui::RichText::new("Sound card kabelsalat plays to (same as Mixer).").size(11.5).color(theme::INK_2));
+                    if let Some(c) = &out_current {
+                        ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::INK_2));
+                    }
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("UI scale").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{detected_scale:.2}×"))
+                                    .font(theme::medium_font(13.5))
+                                    .color(theme::INK),
+                            );
+                        });
+                    });
+                    ui.label(egui::RichText::new("Detected from display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
+                };
+
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_scroll")
+                    .min_scrolled_height(body_h)
+                    .max_height(body_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if two_col {
+                            let left_w = ((avail_w - 25.0) * 0.52).clamp(300.0, 620.0);
+                            ui.horizontal_top(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(left_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        draw_models(ui, self, &mut actions);
+                                    },
+                                );
+                                ui.add_space(12.0);
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, body_h.max(420.0)), egui::Sense::hover());
+                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                ui.add_space(12.0);
+                                let right_w = ui.available_width();
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(right_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        draw_keys(ui, self, &mut actions);
+                                        ui.add_space(16.0);
+                                        Self::stage_hairline(ui);
+                                        ui.add_space(14.0);
+                                        draw_prefs(ui, &mut actions);
+                                    },
+                                );
+                            });
+                        } else {
+                            draw_models(ui, self, &mut actions);
+                            ui.add_space(16.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(14.0);
+                            draw_keys(ui, self, &mut actions);
+                            ui.add_space(16.0);
+                            Self::stage_hairline(ui);
+                            ui.add_space(14.0);
+                            draw_prefs(ui, &mut actions);
+                        }
+                    });
+            });
+        });
+
+        for act in actions {
+            match act {
+                SettingsAction::ToggleDecide => {
+                    let next = !self.assistant.decide_enabled();
+                    self.assistant.set_decide_enabled(next);
+                    self.settings_msg = if next {
+                        "Decisions model enabled".into()
+                    } else {
+                        "Decisions model turned off".into()
+                    };
+                }
+                SettingsAction::SetModel(role, m) => {
+                    self.settings_msg = self.assistant.set_role_model(role, &m);
+                }
+                SettingsAction::SaveKey(endpoint, key) => {
+                    let label = endpoint.spec().label;
+                    match self.assistant.save_api_key(endpoint, &key) {
+                        Ok(()) => self.settings_msg = format!("{label} key saved · worker restarted"),
+                        Err(e) => self.settings_msg = format!("Save {label} key failed: {e}"),
+                    }
+                }
+                SettingsAction::RemoveKey(endpoint) => {
+                    let label = endpoint.spec().label;
+                    match self.assistant.remove_api_key(endpoint) {
+                        Ok(()) => self.settings_msg = format!("{label} key removed"),
+                        Err(e) => self.settings_msg = format!("Remove {label} key failed: {e}"),
+                    }
+                }
+                SettingsAction::ToggleReduceMotion => {
+                    self.reduce_motion = !self.reduce_motion;
+                    let _ = crate::assistant::save_reduce_motion(self.reduce_motion);
+                    self.settings_msg = if self.reduce_motion {
+                        "Reduce motion enabled".into()
+                    } else {
+                        "Reduce motion disabled".into()
+                    };
+                }
+                SettingsAction::SetCountIn(enabled, bars) => {
+                    self.set_count_in(enabled, bars);
+                }
+                SettingsAction::SetAudioOutput(out) => {
+                    self.set_audio_output(out);
+                }
+            }
+        }
+
+        if self.show_help { self.draw_help(&painter, rect); }
+    }
+
     /// One bottom dock: exactly one occupant at a time (None / Keyboard /
     /// Assistant). The occupant owns the computer keyboard.
     fn dock_panel_ui(&mut self, root: &mut egui::Ui) {
@@ -9228,13 +9753,17 @@ impl DemoApp {
                             ui.add_space(6.0);
                             let cur = self.assistant.model();
                             let mut pick: Option<String> = None;
-                            egui::ComboBox::from_id_salt("assistant_model")
-                                .selected_text(egui::RichText::new(format!("chat: {cur}")).size(12.0).color(theme::CREAM))
-                                .show_ui(ui, |ui| {
+                            theme::Dropdown::new("dd_assistant_model", format!("chat: {cur}"))
+                                .text_size(12.0)
+                                .popup_min_width(220.0)
+                                .show_ui(ui, |menu| {
                                     for m in self.assistant.models.clone() {
-                                        if ui.selectable_label(m == cur, egui::RichText::new(&m).color(theme::CREAM)).clicked() { pick = Some(m); }
+                                        if menu.item(m == cur, &m) {
+                                            pick = Some(m);
+                                        }
                                     }
-                                }).response.on_hover_text(if self.assistant.decides_first() {
+                                })
+                                .on_hover_text(if self.assistant.decides_first() {
                                     "chat model for what Jev does not settle (questions, multi-step wiring) — switch any time, the conversation stays"
                                 } else {
                                     "chat model — switch any time, the conversation stays"
@@ -9314,11 +9843,8 @@ impl DemoApp {
                                 if *focus_chat { key_resp.request_focus(); *focus_chat = false; }
                                 if theme::primary_button(ui, "Save key").clicked() && !key_input.trim().is_empty() {
                                     let k = key_input.trim().to_string();
-                                    match crate::assistant::save_key(&k) {
-                                        Ok(()) => {
-                                            assistant.key_saved();
-                                            key_input.clear();
-                                        }
+                                    match assistant.save_api_key(crate::llm::Endpoint::DeepSeek, &k) {
+                                        Ok(()) => key_input.clear(),
                                         Err(e) => assistant.history.push(ChatLine {
                                             role: "error".into(),
                                             text: format!("could not save key: {e}"),
@@ -11106,10 +11632,13 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.toggle_stage(StageView::Mixer);
             }
+            if i.consume_key(Modifiers::NONE, Key::Comma) {
+                self.toggle_stage(StageView::Settings);
+            }
             if i.consume_key(Modifiers::NONE, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::F1) {
                 self.show_help = !self.show_help;
             }
-            if i.consume_key(Modifiers::NONE, Key::Escape) {
+            if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
@@ -11922,22 +12451,21 @@ impl DemoApp {
                                         Some(w) => label_of(w),
                                         None => "System default".to_string(),
                                     };
-                                    egui::ComboBox::from_id_salt("audio_output")
+                                    theme::Dropdown::new("dd_mixer_audio_output", &selected)
                                         .width(160.0)
-                                        .selected_text(egui::RichText::new(selected).size(11.5).color(theme::INK))
-                                        .show_ui(ui, |ui| {
-                                            if ui.selectable_label(out_wanted.is_none(),
-                                                egui::RichText::new("System default").color(theme::INK)).clicked() {
+                                        .popup_min_width(240.0)
+                                        .text_size(11.5)
+                                        .show_ui(ui, |menu| {
+                                            if menu.item(out_wanted.is_none(), "System default") {
                                                 out_pick = Some(None);
                                             }
                                             for o in &outputs {
-                                                if ui.selectable_label(out_wanted.as_deref() == Some(o.raw.as_str()),
-                                                    egui::RichText::new(&o.name).color(theme::INK)).clicked() {
+                                                if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
                                                     out_pick = Some(Some(o.raw.clone()));
                                                 }
                                             }
                                         })
-                                        .response.on_hover_text("the sound card kabelsalat plays to");
+                                        .on_hover_text("the sound card kabelsalat plays to");
                                     if let Some(c) = &out_current {
                                         ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
                                     }
@@ -13529,6 +14057,7 @@ impl DemoApp {
 
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.popup_open_at_start = egui::Popup::is_any_open(&ctx);
         // Subtitles first: a changed instrument name is laid out this frame.
         self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
@@ -13702,6 +14231,7 @@ impl DemoApp {
             StageView::Mixer => self.mixer_stage(ui),
             StageView::Sessions => self.sessions_stage(ui),
             StageView::Plugins => self.plugins_stage(ui),
+            StageView::Settings => self.settings_stage(ui),
         }
         self.knob_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
@@ -14733,6 +15263,10 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
 /// focused Hyprland monitor's scale (what every native app on this output
 /// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
 /// Computed once — the hyprctl query never runs on the frame path again.
+/// Width a recessed text field's frame adds around its text: 8px inner
+/// margin and a 1px stroke on each side.
+const RECESSED_INPUT_CHROME: f32 = 18.0;
+
 fn ui_scale_target() -> f32 {
     static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *SCALE.get_or_init(|| {
@@ -17839,12 +18373,12 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Rack"), "Rack is an explicit view: {texts:?}");
         let (v, d) = (app.view_group_rect, app.dock_group_rect);
         assert!(v.is_positive() && d.is_positive() && v.right() < d.left(), "two separate groups: {v:?} {d:?}");
-        // Views are exclusive: Mixer, Mixer again (stays), then Rack.
-        let mixer = v.right_center() - Vec2::new(12.0, 0.0);
-        click(&mut app, &ctx, mixer);
-        assert_eq!(app.stage_view, StageView::Mixer);
-        click(&mut app, &ctx, mixer);
-        assert_eq!(app.stage_view, StageView::Mixer, "the active view stays selected");
+        // Views are exclusive: Settings (rightmost), Settings again (stays), then Rack.
+        let settings = v.right_center() - Vec2::new(12.0, 0.0);
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.stage_view, StageView::Settings);
+        click(&mut app, &ctx, settings);
+        assert_eq!(app.stage_view, StageView::Settings, "the active view stays selected");
         let rack = app.view_group_rect.left_center() + Vec2::new(12.0, 0.0);
         click(&mut app, &ctx, rack);
         assert_eq!(app.stage_view, StageView::Rack, "Rack button returns to the rack");
@@ -20468,5 +21002,336 @@ Client 130 : \"kabelsalat-hw\" [User Legacy]\n  Port   0 : \"kabelsalat-hw   \" 
         assert_eq!(match_midi_device(&devices, "Launchkey:Launchkey MIDI 32:0"), Ok(None));
         // Something never seen → new.
         assert_eq!(match_midi_device(&devices, "Other:Other 40:0"), Ok(None));
+    }
+}
+
+#[cfg(test)]
+mod settings_and_dropdown_tests {
+    use super::*;
+
+    fn collect_shapes(
+        shape: &egui::Shape,
+        texts: &mut Vec<(String, Rect)>,
+        rects: &mut Vec<(Rect, Color32)>,
+    ) {
+        match shape {
+            egui::Shape::Text(t) => texts.push((
+                t.galley.text().to_owned(),
+                t.galley.rect.translate(t.pos.to_vec2()),
+            )),
+            egui::Shape::Rect(r) => rects.push((r.rect, r.fill)),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_shapes(s, texts, rects);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_frame(
+        app: &mut DemoApp,
+        ctx: &egui::Context,
+        size: Vec2,
+        events: Vec<egui::Event>,
+    ) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        // Past egui's area fade-in, which paints a new popup alpha-scaled.
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        let mut texts = Vec::new();
+        let mut rects = Vec::new();
+        for cs in &out.shapes {
+            collect_shapes(&cs.shape, &mut texts, &mut rects);
+        }
+        let (fg_areas, middle) = ctx.memory(|m| {
+            let fg: Vec<Rect> = m
+                .areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Foreground)
+                .filter_map(|l| m.area_rect(l.id))
+                .collect();
+            let mid: Vec<egui::LayerId> = m
+                .areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|l| l.order == egui::Order::Middle)
+                .collect();
+            (fg, mid)
+        });
+        let fg_rects: Vec<(Rect, Color32)> = rects
+            .into_iter()
+            .filter(|(r, _)| fg_areas.iter().any(|fa| fa.expand(2.0).contains_rect(*r)))
+            .collect();
+        (texts, fg_rects, middle)
+    }
+
+    fn key(k: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+        let ptr = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame(app, ctx, size, vec![ptr(true)]);
+        run_frame(app, ctx, size, vec![ptr(false)]);
+    }
+
+    fn warm(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        let mut res = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..3 {
+            res = run_frame(app, ctx, size, vec![]);
+        }
+        res
+    }
+
+    fn open_dropdown(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        click_at(app, ctx, size, pos);
+        run_frame(app, ctx, size, vec![])
+    }
+
+    /// Every text galley of the Settings sheet stays inside the sheet,
+    /// keeps its words on one line, and overlaps no other galley.
+    fn assert_settings_text_layout(app: &DemoApp, texts: &[(String, Rect)], size: Vec2) {
+        let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+        let sheet: Vec<&(String, Rect)> = texts
+            .iter()
+            .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0)
+            .collect();
+        assert!(sheet.iter().any(|(t, _)| t == "Settings"), "{size:?}: Settings title painted");
+        for (t, r) in &sheet {
+            assert!(
+                r.left() >= inner.left() - 1.0 && r.right() <= inner.right() + 1.0,
+                "{size:?}: {t:?} at {r:?} leaves the sheet {inner:?}",
+            );
+            if ["Apply", "Save", "Remove", "On", "Off"].contains(&t.as_str()) {
+                assert!(r.height() < 20.0, "{size:?}: button text {t:?} wrapped: {r:?}");
+            }
+        }
+        for (i, (a, ra)) in sheet.iter().enumerate() {
+            for (b, rb) in &sheet[i + 1..] {
+                let o = ra.intersect(*rb);
+                assert!(
+                    !(o.width() > 0.5 && o.height() > 0.5),
+                    "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_combobox_remains_and_all_three_dropdowns_use_themed_popup() {
+        let src = include_str!("ui.rs");
+        let combo = concat!("egui::", "ComboBox");
+        assert!(!src.contains(combo), "all ComboBoxes replaced with theme::Dropdown");
+        for old_id in ["\"rule_cc_param_pick\"", "\"assistant_model\"", "\"audio_output\""] {
+            let pattern = format!("from_id_salt({old_id})");
+            assert!(!src.contains(&pattern), "old ComboBox id {old_id} still present");
+        }
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let trigger = texts.iter().find(|(t, _)| t == "chat: deepseek-chat").expect("assistant model trigger").1.center();
+        let (texts, fg_rects, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL), "assistant dropdown uses DARK_PANEL: {fg_rects:?}");
+        assert!(!fg_rects.iter().any(|(_, f)| *f == Color32::BLACK), "no default black popup fill");
+        let reasoner = texts.iter().find(|(t, _)| t == "deepseek-reasoner").unwrap().1.center();
+        click_at(&mut app, &ctx, size, reasoner);
+        assert_eq!(app.assistant.model(), "deepseek-reasoner");
+        assert!(!egui::Popup::is_any_open(&ctx));
+
+        app.dock = DockView::None;
+        app.stage_view = StageView::Mixer;
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let out_pos = texts.iter().find(|(t, _)| t == "System default").expect("mixer audio output dropdown").1.center();
+        let (_, fg_rects, _) = open_dropdown(&mut app, &ctx, size, out_pos);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL));
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx), "Esc closes mixer dropdown");
+        assert_eq!(app.stage_view, StageView::Mixer, "first Esc does not exit Mixer while dropdown was open");
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack, "second Esc leaves Mixer");
+
+        app.stage_view = StageView::Matrix;
+        let master = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master)).unwrap();
+        app.rule_editor = Some((master, MatrixRow::Keys));
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let choices = app.node_param_choices(app.units[master].node_id);
+        let selected_name = choices.iter().find(|(id, _)| *id == app.rule_param_id).map(|(_, n)| n.as_str()).unwrap_or("select param…");
+        let trig = texts.iter().rev().find(|(t, _)| t == selected_name).expect("matrix param dropdown").1.center();
+        let (_, fg_rects, _) = open_dropdown(&mut app, &ctx, size, trig);
+        assert!(egui::Popup::is_any_open(&ctx));
+        assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL), "matrix param dropdown uses DARK_PANEL");
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx), "Esc closes matrix dropdown");
+        assert!(app.rule_editor.is_some(), "Esc closed only the dropdown, not the rule editor");
+    }
+
+    #[test]
+    fn settings_opens_via_nav_and_shortcut_and_esc_returns() {
+        let mut app = DemoApp::new_with_sink(None);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let nav_pos = texts.iter().find(|(t, r)| t == "Settings" && r.top() < 50.0).expect("Settings nav chip").1.center();
+        click_at(&mut app, &ctx, size, nav_pos);
+        assert_eq!(app.stage_view, StageView::Settings);
+        let (texts, _, middle) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(middle.is_empty(), "Settings renders in main stage, not a floating window: {middle:?}");
+        assert!(texts.iter().any(|(t, _)| t == "Settings"));
+
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert_eq!(app.stage_view, StageView::Rack);
+
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Settings);
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Rack);
+
+        run_frame(&mut app, &ctx, size, key(Key::Comma));
+        assert_eq!(app.stage_view, StageView::Settings);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let hint_pos = texts.iter().find(|(t, _)| t == "other model id…").expect("other model id input").1.center();
+        click_at(&mut app, &ctx, size, hint_pos);
+        let mut ev = key(Key::Comma);
+        ev.push(egui::Event::Text(",".into()));
+        run_frame(&mut app, &ctx, size, ev);
+        assert_eq!(app.stage_view, StageView::Settings, "typing comma keeps Settings open");
+        assert_eq!(app.settings_decide_input, ",");
+    }
+
+    #[test]
+    fn settings_api_keys_never_render_key_text_and_update_status() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let fake_ds = "sk-fake-deepseek-secret-9942";
+        let fake_or = "sk-or-fake-openrouter-secret-7731";
+        app.settings_deepseek_key = fake_ds.into();
+        app.settings_openrouter_key = fake_or.into();
+
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            for (t, _) in &texts {
+                assert!(!t.contains("9942") && !t.contains("deepseek-secret"), "painted text leaked key: {t}");
+                assert!(!t.contains("7731") && !t.contains("openrouter-secret"), "painted text leaked key: {t}");
+            }
+            if size.y >= 800.0 {
+                assert!(texts.iter().any(|(t, _)| t == "not set"));
+            }
+        }
+
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let mut save_btns: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Save").map(|(_, r)| *r).collect();
+        save_btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert_eq!(save_btns.len(), 2, "Save buttons for DeepSeek and OpenRouter");
+        click_at(&mut app, &ctx, size, save_btns[0].center());
+        click_at(&mut app, &ctx, size, save_btns[1].center());
+
+        assert!(app.assistant.keys().deepseek && app.assistant.keys().openrouter);
+        assert!(app.settings_deepseek_key.is_empty() && app.settings_openrouter_key.is_empty());
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        for (t, _) in &texts {
+            assert!(!t.contains("9942") && !t.contains("7731"), "key leaked after save: {t}");
+        }
+        assert!(texts.iter().any(|(t, _)| t == "set"));
+    }
+
+    #[test]
+    fn settings_models_and_prefs_reach_assistant_and_fit_narrow_windows() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            assert_settings_text_layout(&app, &texts, size);
+            assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
+            if size.y >= 800.0 {
+                assert!(texts.iter().any(|(t, _)| t == "Chat model"));
+                assert!(texts.iter().any(|(t, _)| t == "Vision model"));
+                assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
+            }
+            for (t, _) in &texts {
+                let low = t.to_lowercase();
+                assert!(!low.contains("faster") && !low.contains("speed") && !low.contains("0.2 s") && !low.contains("0.3 s"),
+                    "rule 78 violation in Settings text: {t}");
+            }
+        }
+
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::DEEPSEEK_CHAT).expect("Act model dropdown").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, act_dd);
+        let opus = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("OpenRouter choice in Act dropdown").1.center();
+        click_at(&mut app, &ctx, size, opus);
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, crate::llm::CLAUDE_OPUS);
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let vision_dd = texts.iter().find(|(t, _)| t == crate::llm::PERCEIVE_MODEL).expect("Perceive dropdown").1.center();
+        let _ = open_dropdown(&mut app, &ctx, size, vision_dd);
+        assert!(egui::Popup::is_any_open(&ctx));
+        run_frame(&mut app, &ctx, size, key(Key::Escape));
+        assert!(!egui::Popup::is_any_open(&ctx));
+        assert_eq!(app.stage_view, StageView::Settings, "first Esc closes dropdown, keeps Settings open");
+
+        app.settings_perceive_input = "openai/gpt-5.4".into();
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
+        applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert_eq!(applies.len(), 3);
+        click_at(&mut app, &ctx, size, applies[2].center());
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Perceive).model, "openai/gpt-5.4");
+
+        assert!(app.assistant.decide_enabled());
+        assert!(!app.reduce_motion);
+        assert!(!app.count_in_enabled);
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let decide_y = texts.iter().find(|(t, _)| t == "Decisions (Jev)").unwrap().1.center().y;
+        let decide_toggle = texts.iter()
+            .find(|(t, r)| t == "On" && (r.center().y - decide_y).abs() < 16.0)
+            .expect("Decisions On/Off toggle").1.center();
+        click_at(&mut app, &ctx, size, decide_toggle);
+        assert!(!app.assistant.decide_enabled());
+        assert!(!app.assistant.decides_first());
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let rm_y = texts.iter().find(|(t, _)| t == "Reduce motion").unwrap().1.center().y;
+        let rm_toggle = texts.iter()
+            .find(|(t, r)| t == "Off" && (r.center().y - rm_y).abs() < 16.0)
+            .expect("Reduce motion toggle").1.center();
+        click_at(&mut app, &ctx, size, rm_toggle);
+        assert!(app.reduce_motion);
+
+        let ci_y = texts.iter().find(|(t, _)| t == "Count-in").unwrap().1.center().y;
+        let ci_toggle = texts.iter()
+            .find(|(t, r)| t == "Off" && (r.center().y - ci_y).abs() < 16.0)
+            .expect("Count-in toggle").1.center();
+        click_at(&mut app, &ctx, size, ci_toggle);
+        assert!(app.count_in_enabled);
     }
 }

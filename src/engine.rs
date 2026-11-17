@@ -3672,6 +3672,33 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     println!("lv2-instrument-engine-test: {uri}: master peak silent={before:.4} held={held:.4} 4-5 s after release={after:.4}");
     anyhow::ensure!(held > 1e-3, "LV2 instrument {uri} is silent at the master while a key is held");
     anyhow::ensure!(after < held * 0.01, "LV2 instrument {uri} keeps sounding after note-off");
+    // A chord pressed and released within one block each: every note-off
+    // must reach the plugin (one event per block left a note hanging).
+    for n in [60u8, 64, 67] {
+        bus.send(Command::NoteOn { note: n, velocity: 0.9, source: SourceId::Keys });
+    }
+    let chord = peak_over(&mut engine, 47);
+    for n in [60u8, 64, 67] {
+        bus.send(Command::NoteOff { note: n, source: SourceId::Keys });
+    }
+    peak_over(&mut engine, 375);
+    let chord_after = peak_over(&mut engine, 94);
+    println!("lv2-instrument-engine-test: chord held={chord:.4} 4-5 s after one-block release={chord_after:.4}");
+    anyhow::ensure!(chord > 1e-3, "LV2 instrument {uri} is silent for a chord");
+    anyhow::ensure!(chord_after < chord * 0.01, "LV2 instrument {uri} leaves a chord note hanging after note-off");
+    // Legato: release 60 and press 62 in the same block, then release 62.
+    // With one event per block the note-off for 60 was lost (a hanging
+    // organ note, reported live with setBfree).
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    peak_over(&mut engine, 20);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    let legato = peak_over(&mut engine, 20);
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    peak_over(&mut engine, 375);
+    let legato_after = peak_over(&mut engine, 94);
+    println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
+    anyhow::ensure!(legato_after < legato * 0.01, "LV2 instrument {uri} leaves a legato note hanging (note-off and note-on in one block)");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
     Ok(())
 }

@@ -864,6 +864,19 @@ struct CcLearn {
 
 /// The knob context menu, keyed by what the knob drives — never unit/knob
 /// indices, which a rebuild can shift under an open menu (rule 10, #24).
+/// A destructive tool the assistant asked about: what to run on Confirm.
+#[derive(Clone, Debug)]
+struct PendingConfirm {
+    tool: String,
+    args: serde_json::Value,
+    /// Button text, e.g. "Delete rig 2 · Bass".
+    label: String,
+}
+
+/// Tools that change things the user cannot undo — they need confirm=true
+/// after asking (rule 23), and the in-app chat offers Confirm / Cancel.
+const CONFIRM_TOOLS: &[&str] = &["delete_rig", "install_instrument"];
+
 #[derive(Clone, Copy)]
 struct KnobMenu {
     node: u32,
@@ -1751,6 +1764,9 @@ struct DemoApp {
     master_meter: crate::meter::MeterSnapshot,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
+    /// A destructive assistant action waiting for the chat's Confirm /
+    /// Cancel buttons (#32).
+    pending_confirm: Option<PendingConfirm>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Rig names of the session being applied (load path names its rigs).
@@ -1827,6 +1843,8 @@ struct DemoApp {
     input_devices: std::sync::Arc<Mutex<Vec<crate::audio_in::InputDevice>>>,
     /// Outputs, our current sink and other apps' streams (scan thread).
     audio_out: std::sync::Arc<Mutex<crate::audio_out::OutputState>>,
+    /// Live levels of other apps' streams (mixer "System audio" meters).
+    stream_levels: crate::audio_out::StreamLevels,
     /// The output the user chose (None = follow PipeWire's default).
     wanted_output: std::sync::Arc<Mutex<Option<String>>>,
     /// Volume/mute changes for other apps' streams → scan thread.
@@ -2020,6 +2038,7 @@ impl DemoApp {
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
             confirm_delete_rig: None,
+            pending_confirm: None,
             rename_rig_dialog: None,
             session_rig_names: Vec::new(),
             load_as_rigs: None,
@@ -2061,6 +2080,7 @@ impl DemoApp {
             audio_in_tuners: std::collections::HashMap::new(),
             input_devices: std::sync::Arc::new(Mutex::new(Vec::new())),
             audio_out: std::sync::Arc::new(Mutex::new(Default::default())),
+            stream_levels: Default::default(),
             wanted_output: std::sync::Arc::new(Mutex::new(crate::assistant::load_config_str("audio_output"))),
             stream_cmds: None,
             stream_grace: Vec::new(),
@@ -2834,6 +2854,7 @@ impl DemoApp {
         self.stream_cmds = Some(tx);
         let state = self.audio_out.clone();
         let wanted = self.wanted_output.clone();
+        let mut meters = crate::audio_out::StreamMeters::new(self.stream_levels.clone());
         std::thread::Builder::new()
             .name("kabelsalat-audio-out".into())
             .spawn(move || loop {
@@ -2846,6 +2867,7 @@ impl DemoApp {
                 crate::audio_out::apply_stream_cmds(cmds);
                 let w = wanted.lock().ok().and_then(|w| w.clone());
                 let st = crate::audio_out::scan_and_apply(w.as_deref());
+                meters.sync(&st.streams);
                 if let Ok(mut s) = state.lock() { *s = st; }
             })
             .ok();
@@ -3337,7 +3359,7 @@ impl DemoApp {
                     .history
                     .push(ChatLine { role: "assistant".into(), text: t }),
                 FromWorker::ToolCall { id, name, args } => {
-                    let result = self.exec_tool_with_origin(&name, &args, AgentOrigin::Assistant);
+                    let result = self.run_assistant_tool(&name, &args);
                     self.assistant.send_tool_result(id, result);
                 }
                 FromWorker::Models(list) => {
@@ -3353,6 +3375,47 @@ impl DemoApp {
                         .push(ChatLine { role: "error".into(), text: e });
                 }
             }
+        }
+    }
+
+    /// Run one assistant tool call. A destructive tool called without
+    /// confirm=true is refused by `exec_tool` and parked as a Confirm /
+    /// Cancel prompt in the chat (#32); the model is told to ask and wait.
+    fn run_assistant_tool(&mut self, name: &str, args: &serde_json::Value) -> String {
+        let result = self.exec_tool_with_origin(name, args, AgentOrigin::Assistant);
+        let confirmed = args.get("confirm").and_then(|v| v.as_bool()) == Some(true);
+        if CONFIRM_TOOLS.contains(&name) && !confirmed && result.starts_with("not ") {
+            let label = match name {
+                "delete_rig" => {
+                    let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    format!("Delete rig {} · {}", rig + 1, self.rig_name(rig))
+                }
+                _ => format!("Install {}", args.get("id").and_then(|v| v.as_str()).unwrap_or("instrument")),
+            };
+            self.pending_confirm = Some(PendingConfirm { tool: name.to_string(), args: args.clone(), label });
+            return format!("{result}. The chat now shows Confirm / Cancel buttons for this: ask the user in one short sentence and wait — their click runs or cancels it (do not call it again with confirm=true unless they answer in text).");
+        }
+        result
+    }
+
+    /// The user clicked Confirm (true) or Cancel (false) on the pending
+    /// destructive action. Confirm runs it with confirm=true; either way the
+    /// model hears what happened.
+    fn resolve_confirm(&mut self, confirm: bool) {
+        let Some(p) = self.pending_confirm.take() else { return };
+        if confirm {
+            let mut args = p.args.clone();
+            if let Some(o) = args.as_object_mut() { o.insert("confirm".into(), serde_json::Value::Bool(true)); }
+            let result = self.exec_tool_with_origin(&p.tool, &args, AgentOrigin::Assistant);
+            self.assistant.send_user_display(
+                format!("Confirm · {}", p.label),
+                format!("[The user clicked Confirm. The app ran {} with confirm=true: {result}] Report the outcome briefly; do not call it again.", p.tool),
+            );
+        } else {
+            self.assistant.send_user_display(
+                format!("Cancel · {}", p.label),
+                format!("[The user clicked Cancel: do not run {} ({}).] Acknowledge briefly.", p.tool, p.label),
+            );
         }
     }
 
@@ -6045,6 +6108,7 @@ impl DemoApp {
         }
         let msg = format!("{}\n{}", self.chat_context(), t);
         self.undo_job = None; // a new request = a new undo step
+        self.pending_confirm = None; // a typed answer replaces the buttons
         self.assistant.send_user_display(t, msg);
     }
 
@@ -7684,6 +7748,7 @@ impl DemoApp {
         let mut clear_chat = false;
         let mut input_rect = Rect::NOTHING;
         let mut focus_chat = self.focus_chat_request;
+        let confirm_choice: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
         let resp = egui::Panel::bottom("dock")
             .default_size(max_h.min(260.0))
             .resizable(false)
@@ -7752,6 +7817,7 @@ impl DemoApp {
                 let side_w = if two_col { (avail_w * 0.30).clamp(260.0, 360.0) } else { 0.0 };
                 let main_w = if two_col { (avail_w - side_w - 25.0).max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
+                let confirm_label = self.pending_confirm.as_ref().map(|p| p.label.clone());
 
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
@@ -7867,6 +7933,19 @@ impl DemoApp {
                             }
                             if assistant.busy {
                                 ui.label(egui::RichText::new("thinking…").size(12.0).color(theme::AGENT_COLOR));
+                            } else if let Some(label) = &confirm_label {
+                                // #32: the click answers the assistant's question.
+                                ui.horizontal(|ui| {
+                                    ui.add_space(6.0);
+                                    if theme::primary_button(ui, &format!("Confirm · {label}")).clicked() {
+                                        confirm_choice.set(Some(true));
+                                    }
+                                    ui.add_space(6.0);
+                                    if theme::chip_button(ui, "Cancel", false).clicked() {
+                                        confirm_choice.set(Some(false));
+                                    }
+                                });
+                                ui.add_space(5.0);
                             }
                         });
                     ui.add_space(4.0);
@@ -8001,6 +8080,10 @@ impl DemoApp {
         self.focus_chat_request = focus_chat;
         if clear_chat {
             self.assistant.history.clear();
+            self.pending_confirm = None;
+        }
+        if let Some(choice) = confirm_choice.get() {
+            self.resolve_confirm(choice);
         }
         if let Some(p) = starter_prompt.or(submit_text) {
             self.submit_chat(p);
@@ -8039,6 +8122,16 @@ impl DemoApp {
         12 * (wi / 7) + WHITE_SEMI[wi % 7]
     }
 
+    /// Keyboard dock height: a share of the WINDOW height (rule 64), never
+    /// below the minimum playable size, and only what the rack can spare
+    /// (rule 22). Whole pixels, so a resize does not jitter the layout.
+    fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
+        const MIN_H: f32 = 140.0; // header + keys of at least 40 px
+        const MAX_H: f32 = 300.0;
+        let spare = (avail_h - rack_need_h).max(MIN_H);
+        (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
+    }
+
     /// Which semitone (above the keyboard's lowest C) a point lands on, black first.
     fn dock_key_hit(kb_rect: Rect, pos: Pos2) -> Option<usize> {
         for oct in 0..Self::dock_octaves(kb_rect) {
@@ -8055,8 +8148,7 @@ impl DemoApp {
     /// moved to the bottom dock. Plays through the same `fire_keys` path, lights
     /// the same `key_leds`, and the Keys unit stays unchanged in the rack.
     fn keyboard_panel_ui(&mut self, root: &mut egui::Ui) {
-        let spare = (root.available_height() - self.rack_need_h()).clamp(140.0, 340.0);
-        let h = spare.min(180.0);
+        let h = Self::keyboard_dock_h(root.ctx().content_rect().height(), root.available_height(), self.rack_need_h());
         let note_leds = self.note_leds;
         let split = self.keys_unit.and_then(|k| self.shown_split(k));
         let octave = self.octave;
@@ -8064,8 +8156,10 @@ impl DemoApp {
         let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
         let mut note: Option<usize> = None;
         let mut kb_rect = Rect::NOTHING;
+        // exact_size, not default_size: egui keeps a panel's first size, so
+        // the dock never followed a window resize (#23).
         let resp = egui::Panel::bottom("dock")
-            .default_size(h)
+            .exact_size(h)
             .resizable(false)
             .frame(
                 egui::Frame::new()
@@ -10025,7 +10119,9 @@ impl DemoApp {
                                                     let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
                                                     let shown = st.volume.min(1.0);
                                                     let mut v = Some(shown);
-                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, 0.0, fader_h);
+                                                    // What the app plays, dB-scaled (rule 62).
+                                                    let level = meter_db_pos(crate::audio_out::stream_level(&self.stream_levels, st.index));
+                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, level, fader_h);
                                                     ui.interact(fr, egui::Id::new(("app_stream_tip", st.index)), egui::Sense::hover())
                                                         .on_hover_text(format!("{} — {}", st.app, st.title));
                                                     if let Some(nv) = v {
@@ -13616,6 +13712,72 @@ mod rig_switch_tests {
         frame(&mut app, &ctx, vec![]);
     }
 
+    /// One frame; returns every painted text with its screen rect.
+    fn frame_texts(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        fn walk(s: &egui::Shape, acc: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => acc.push((t.galley.text().to_string(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for x in v { walk(x, acc) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for cs in &out.shapes { walk(&cs.shape, &mut texts); }
+        texts
+    }
+
+    fn click_text(app: &mut DemoApp, ctx: &egui::Context, label: &str) {
+        let texts = frame_texts(app, ctx, vec![]);
+        let pos = texts.iter().find(|(t, _)| t == label)
+            .unwrap_or_else(|| panic!("'{label}' not on screen: {:?}", texts.iter().map(|(t, _)| t).collect::<Vec<_>>()))
+            .1.center();
+        for ev in click(pos) { frame(app, ctx, ev); }
+    }
+
+    /// #32: a destructive assistant action waits for the chat's Confirm /
+    /// Cancel buttons; the click runs or cancels it and tells the model.
+    #[test]
+    fn assistant_destructive_action_waits_for_confirm_or_cancel_buttons() {
+        let (mut app, ctx) = two_rigs();
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        // The model asks to delete rig 2 without confirm: refused, parked.
+        let out = app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 1}));
+        assert!(out.contains("Confirm / Cancel buttons"), "{out}");
+        assert_eq!(app.rig_count(), 2, "nothing deleted yet");
+        // Cancel: nothing happens; the model hears it.
+        click_text(&mut app, &ctx, "Cancel");
+        assert!(app.pending_confirm.is_none());
+        assert_eq!(app.rig_count(), 2);
+        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("Cancel · Delete rig 2 · Rig B"));
+        // Ask again → Confirm deletes the rig.
+        app.assistant.busy = false;
+        app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 1}));
+        click_text(&mut app, &ctx, "Confirm · Delete rig 2 · Rig B");
+        assert_eq!(app.rig_count(), 1, "Confirm ran delete_rig with confirm=true");
+        assert!(app.pending_confirm.is_none());
+        // Buttons hide while the model is busy, and a typed answer replaces them.
+        app.assistant.busy = false;
+        app.run_assistant_tool("install_instrument", &serde_json::json!({"id": "setbfree"}));
+        app.assistant.busy = true;
+        assert!(!frame_texts(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Confirm · Install setbfree"), "hidden while busy");
+        app.assistant.busy = false;
+        assert!(frame_texts(&mut app, &ctx, vec![]).iter().any(|(t, _)| t == "Confirm · Install setbfree"), "shown when idle");
+        app.assistant.busy = false;
+        app.submit_chat("no thanks".into());
+        assert!(app.pending_confirm.is_none(), "typing answers instead of clicking");
+        // Confirmed calls and other tools never park a prompt.
+        app.run_assistant_tool("delete_rig", &serde_json::json!({"rig": 5, "confirm": true}));
+        app.run_assistant_tool("list_rigs", &serde_json::json!({}));
+        assert!(app.pending_confirm.is_none());
+    }
+
     #[test]
     fn deleting_a_rig_keeps_the_survivor_patch_knobs_and_mix() {
         let (mut app, ctx) = two_rigs();
@@ -15859,6 +16021,29 @@ mod ui_polish_agent_tests {
         }
         assert_eq!(app.chat_input, "cv", "letters reach the chat");
         assert_eq!(app.dock, DockView::Assistant, "typing does not swap the dock");
+    }
+
+    /// #23: the keyboard dock follows the window height both ways (it kept
+    /// its first height) and never drops below a playable size.
+    #[test]
+    fn keyboard_dock_follows_the_window_height() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let dock_h = |app: &mut DemoApp, size: Vec2| {
+            for _ in 0..3 { run_frame(app, &ctx, size, vec![]); }
+            (app.dock_rect.height(), app.dock_kb_rect)
+        };
+        let (h_small, kb_small) = dock_h(&mut app, Vec2::new(1600.0, 800.0));
+        let (h_big, kb_big) = dock_h(&mut app, Vec2::new(1600.0, 1400.0));
+        let (h_back, _) = dock_h(&mut app, Vec2::new(1600.0, 800.0));
+        assert!(h_big > h_small + 20.0, "grows with the window: {h_small} → {h_big}");
+        assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
+        assert!(kb_big.height() > kb_small.height());
+        let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
+        assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
+        assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
+        assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
     }
 
     #[test]

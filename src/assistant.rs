@@ -265,9 +265,12 @@ fn system_prompt() -> String {
      sound once wired.\n\
      - Rigs (you operate on ALL of them, not only the one in view): get_rigs lists every \
      rig; add_rig creates a new playable rig (Keys -> Surge -> Master); delete_rig removes \
-     one (ask the user first, then confirm=true); select_rig changes the view; add_node \
+     one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo. Wire only nodes of the \
      same rig. Every rig sounds at once.\n\
+     - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
+     the chat then shows Confirm / Cancel buttons. Ask the user in one short sentence and \
+     wait — their click runs or cancels it.\n\
      UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
      Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\

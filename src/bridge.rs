@@ -253,6 +253,16 @@ fn err_reply(msg: impl Into<String>) -> Value {
     json!({"ok": false, "error": msg.into()})
 }
 
+/// Longest a structural `cmd` waits for the engine's publication (#37).
+const STRUCTURAL_WAIT: Duration = Duration::from_millis(250);
+
+/// Commands that change the graph's nodes or cables (ids agents build on).
+fn is_structural(cmd: &Command) -> bool {
+    matches!(cmd,
+        Command::AddNode { .. } | Command::RemoveNode(..) | Command::Connect { .. }
+        | Command::Disconnect(..) | Command::LoadGraph { .. } | Command::LoadRigs { .. })
+}
+
 /// One request line → one reply value. Pure enough to unit-test; never panics
 /// on malformed input (every parse/lock failure becomes an error reply).
 #[cfg_attr(not(test), allow(dead_code))]
@@ -299,22 +309,37 @@ fn handle_line_with_pub(
             if cmd.is_rack_edit() && UI_ATTACHED.load(Ordering::Relaxed) {
                 let _ = ui_call_within(BEFORE_REMOTE_EDIT.into(), json!({}), Duration::from_millis(1000));
             }
-            let mut b = match bus.lock() {
-                Ok(b) => b,
-                Err(_) => return err_reply("command bus lock poisoned"),
+            // Structural edits answer only once the engine has published the
+            // result (#37): the agent's next call must see the new node/cable
+            // ids, or add_node → connect fails and auto ids collide.
+            let pub_rev = |p: &Arc<Mutex<GraphPub>>| p.lock().ok().map(|g| g.rev);
+            let wait_from = graph_pub.filter(|_| is_structural(&cmd)).and_then(|p| pub_rev(p).map(|r| (p, r)));
+            let sent = {
+                let mut b = match bus.lock() {
+                    Ok(b) => b,
+                    Err(_) => return err_reply("command bus lock poisoned"),
+                };
+                b.send(cmd.clone())
             };
-            if b.send(cmd.clone()) {
-                if UI_ATTACHED.load(Ordering::Relaxed) {
-                    if let Ok(mut q) = REMOTE_CMDS.lock() {
-                        if q.len() < 128 {
-                            q.push(cmd);
-                        }
+            if !sent {
+                return err_reply("command bus full — try again");
+            }
+            if UI_ATTACHED.load(Ordering::Relaxed) {
+                if let Ok(mut q) = REMOTE_CMDS.lock() {
+                    if q.len() < 128 {
+                        q.push(cmd);
                     }
                 }
-                json!({"ok": true})
-            } else {
-                err_reply("command bus full — try again")
             }
+            if let Some((p, rev0)) = wait_from {
+                // A rejected edit (duplicate cable, unknown id) never bumps
+                // the rev: cap the wait so it costs at most this long.
+                let deadline = std::time::Instant::now() + STRUCTURAL_WAIT;
+                while pub_rev(p) == Some(rev0) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            json!({"ok": true})
         }
         // UI-owned tools (synth patches live on the app's main thread):
         // queued for the app frame, answered within 5 s.
@@ -328,6 +353,19 @@ fn handle_line_with_pub(
         }
         Some("query") => match req.get("name").and_then(Value::as_str) {
             Some("get_graph") => {
+                // The engine's publication is authoritative; the UI's copy
+                // only catches up when a frame adopts it (#37). Before the
+                // engine's first publication, the UI copy is all there is.
+                let published = graph_pub
+                    .and_then(|p| p.lock().ok())
+                    .filter(|g| g.rev > 0)
+                    .map(|g| serde_json::to_value(&g.graph));
+                if let Some(v) = published {
+                    return match v {
+                        Ok(data) => json!({"ok": true, "data": data}),
+                        Err(e) => err_reply(format!("serializing graph: {e}")),
+                    };
+                }
                 let g = match graph.lock() {
                     Ok(g) => g,
                     Err(_) => return err_reply("graph lock poisoned"),
@@ -478,6 +516,63 @@ mod tests {
             Arc::new(AtomicU32::new(0.25f32.to_bits())),
             Arc::new(Mutex::new(RigSnapshot::default())),
         )
+    }
+
+    /// #37: an agent's add_node → connect → connect burst over the bridge.
+    /// The UI's graph copy (`graph`) never catches up here — the worst case
+    /// of the lag — so every id must come from the engine's publication.
+    #[test]
+    fn structural_burst_sees_its_own_nodes_and_cables() {
+        use crate::control::{name_bytes, DspKind, NodeKind, PortKind, PortRef};
+        use std::sync::atomic::AtomicBool;
+        let (bus, drain, graph, level, rigs) = fixtures();
+        let pub_ = Arc::new(Mutex::new(GraphPub::default()));
+        let mut engine = crate::engine::GraphEngine::new(Graph::demo_patch(), drain, 48000.0, vec![]);
+        engine.set_graph_pub(pub_.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let audio = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut buf = vec![0.0f32; 64 * 2];
+                while !stop.load(Ordering::Relaxed) {
+                    engine.render(&mut buf, 2);
+                    std::thread::sleep(Duration::from_millis(2)); // ~ an audio block
+                }
+            })
+        };
+        let call = |req: Value| handle_line_with_pub(&req.to_string(), &bus, &graph, &level, 48000.0, &rigs, Some(&pub_));
+        let get_graph = || -> Graph { serde_json::from_value(call(json!({"op": "query", "name": "get_graph"}))["data"].clone()).unwrap() };
+        // The engine's first publication (the UI's startup load does this).
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::LoadGraph { graph: Graph::demo_patch() }})), json!({"ok": true}));
+
+        // add_node, as MCP does it: ids from a fresh get_graph.
+        let mut g = get_graph();
+        let gain = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 }})), json!({"ok": true}));
+        assert!(get_graph().node(gain).is_some(), "the next call sees node {gain}");
+
+        // Three auto-id connects in a row get three distinct ids.
+        let ends = [(2, gain), (gain, 3), (5, gain)];
+        let mut ids = Vec::new();
+        for (from, to) in ends {
+            let g = get_graph();
+            let id = g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+            let cmd = Command::Connect { id, from: PortRef { node: from, port: 0 }, to: PortRef { node: to, port: 0 }, kind: PortKind::Audio };
+            assert_eq!(call(json!({"op": "cmd", "cmd": cmd})), json!({"ok": true}));
+            ids.push(id);
+        }
+        let g = get_graph();
+        let mut uniq = ids.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "distinct cable ids: {ids:?}");
+        for id in &ids {
+            assert!(g.edges.iter().any(|e| e.id == *id), "cable {id} exists: {:?}", g.edges);
+        }
+        // remove_node is visible on the very next call.
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::RemoveNode(gain)})), json!({"ok": true}));
+        assert!(get_graph().node(gain).is_none(), "removed node is gone at once");
+        stop.store(true, Ordering::Relaxed);
+        audio.join().unwrap();
     }
 
     #[test]

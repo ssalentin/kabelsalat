@@ -538,25 +538,39 @@ pub fn main_controls_for_uri(uri: &str) -> crate::main_controls::MainControls {
     }
 }
 
+type MainControlsCache = std::sync::Mutex<Vec<(String, Option<crate::main_controls::MainControls>)>>;
+static MAIN_CONTROLS: MainControlsCache = std::sync::Mutex::new(Vec::new());
+
 /// Main controls per plugin URI, resolved once on a worker thread. `None`
-/// while that thread runs: the caller asks again on a later frame.
+/// while that thread runs: the caller asks again on a later frame. Tests
+/// never read the machine's plugins here: they see only what
+/// [`set_main_controls_for_test`] stored.
 pub fn main_controls_cached(uri: &str) -> Option<crate::main_controls::MainControls> {
-    static CACHE: std::sync::Mutex<Vec<(String, Option<crate::main_controls::MainControls>)>> = std::sync::Mutex::new(Vec::new());
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, found)) = cache.iter().find(|(u, _)| u == uri) {
         return found.clone();
+    }
+    if cfg!(test) {
+        return None;
     }
     cache.push((uri.to_string(), None));
     drop(cache);
     let uri = uri.to_string();
     std::thread::spawn(move || {
         let found = main_controls_for_uri(&uri);
-        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.iter_mut().find(|(u, _)| *u == uri) {
             entry.1 = Some(found);
         }
     });
     None
+}
+
+#[cfg(test)]
+pub(crate) fn set_main_controls_for_test(uri: &str, found: crate::main_controls::MainControls) {
+    let mut cache = MAIN_CONTROLS.lock().unwrap_or_else(|e| e.into_inner());
+    cache.retain(|(u, _)| u != uri);
+    cache.push((uri.to_string(), Some(found)));
 }
 
 pub fn control_descs_for_uri(uri: &str) -> Vec<Lv2ControlDesc> {

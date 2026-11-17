@@ -543,7 +543,30 @@ struct Knob {
     /// A Surge parameter pinned from the synth editor: the knob drives the
     /// PLUGIN parameter (0..1 mapped onto min..max), sent only on change.
     clap: Option<ClapPin>,
+    /// Where the knob comes from: the unit's own table, or a plugin parameter.
+    source: KnobSource,
     label_g: Option<Arc<theme::TrackedLabel>>,
+}
+
+/// A knob's origin. Plugin knobs carry the parameter's full name, which
+/// agents and CC bindings may use instead of the short face label.
+#[derive(Clone, PartialEq)]
+enum KnobSource {
+    /// From `engine::knob_specs`.
+    BuiltIn,
+    /// One of the instrument's main controls (`main_controls::resolve`).
+    Main(String),
+    /// Pinned by hand from the synth editor.
+    Pinned(String),
+}
+
+impl KnobSource {
+    fn plugin_name(&self) -> Option<&str> {
+        match self {
+            KnobSource::BuiltIn => None,
+            KnobSource::Main(n) | KnobSource::Pinned(n) => Some(n),
+        }
+    }
 }
 
 impl Knob {
@@ -579,10 +602,29 @@ impl Knob {
 }
 
 #[derive(Clone, Copy)]
-struct ClapPin { id: u32, min: f64, max: f64, sent: f32 }
+struct ClapPin {
+    id: u32,
+    min: f64,
+    max: f64,
+    sent: f32,
+    /// Until this `ui_time` the plugin's value is not read back: a value on
+    /// its way to the audio thread would snap the knob to the old one.
+    hold_until: f32,
+}
 
-/// Most Surge parameters pinnable to one synth face (2 built-in + 4).
-const MAX_PINS: usize = 4;
+/// Most plugin parameters on one synth face (main controls and pins together).
+const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
+/// Longest knob label in characters; `fit_label` then fits it to the slot.
+const KNOB_LABEL_CHARS: usize = 9;
+/// Width a knob label may use: one knob slot minus a gap to its neighbour.
+const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
+/// How often plugin knobs follow their plugin (values and renamed controls).
+const MAIN_POLL_SECS: f32 = 0.1;
+/// Readback pause after the UI or a CC moved a plugin knob.
+const READBACK_HOLD_SECS: f32 = 0.3;
+/// The warm shift an instrument's audio cable carries (the former TONE
+/// knob's default × 0.20, §4.10).
+const INSTRUMENT_CABLE_WARMTH: f32 = 0.07;
 
 /// A jack on the back panel: direction, port index, x fraction of the unit.
 struct Jack {
@@ -618,6 +660,9 @@ struct Unit {
     ins: [PortKind; 3],
     outs: [PortKind; 3],
     knobs: Vec<Knob>,
+    /// Which plugin instance the main-control knobs were built from (a CLAP
+    /// voice id, 0 for an LV2 URI); None until that plugin is known.
+    main_from: Option<u64>,
     jacks: Vec<Jack>,
     led: f32,
     /// The node owns a start/stop transport (`NodeKind::supports_transport`:
@@ -643,6 +688,11 @@ struct Unit {
 }
 
 impl Unit {
+    /// Index of the knob with this face label. Knob positions shift with
+    /// the plugin knobs in front of them, labels do not.
+    fn knob_index(&self, label: &str) -> Option<usize> {
+        self.knobs.iter().position(|k| k.label == label)
+    }
     fn jack_local(&self, unit_rect: Rect, ji: usize) -> Vec2 {
         let j = &self.jacks[ji];
         Vec2::new(unit_rect.left() + unit_rect.width() * j.xf, unit_rect.top() + unit_rect.height() * 0.54)
@@ -672,6 +722,7 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         hidden: false,
         sent: None,
         clap: None,
+        source: KnobSource::BuiltIn,
         label_g: None,
     }
 }
@@ -690,7 +741,72 @@ fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         hidden: true,
         sent: None,
         clap: None,
+        source: KnobSource::BuiltIn,
         label_g: None,
+    }
+}
+
+/// Which plugin moves a main-control knob.
+#[derive(Clone, Copy)]
+enum MainTarget {
+    /// A CLAP parameter, sent through the voice controller.
+    Clap,
+    /// An LV2 control port, sent as the engine's `SetParam`.
+    Lv2,
+}
+
+/// A face knob for one main control at the plugin's current `value`.
+fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarget) -> Knob {
+    let norm = c.normalized(value);
+    Knob {
+        label: crate::main_controls::knob_label(&c.name, KNOB_LABEL_CHARS),
+        value: norm,
+        display_value: norm,
+        glide_from: norm,
+        glide_t: 1.0,
+        default: c.normalized(c.default),
+        param: matches!(target, MainTarget::Lv2).then_some(c.id),
+        hidden: false,
+        sent: Some(norm),
+        clap: matches!(target, MainTarget::Clap)
+            .then_some(ClapPin { id: c.id, min: c.min, max: c.max, sent: norm, hold_until: 0.0 }),
+        source: KnobSource::Main(c.name.clone()),
+        label_g: None,
+    }
+}
+
+/// Replace a unit's main-control knobs. They lead the knob row; with the
+/// hand-pinned ones a face holds at most `MAX_PINS` plugin knobs.
+fn set_main_knobs(
+    u: &mut Unit,
+    face: &[crate::main_controls::MainControl],
+    target: MainTarget,
+    mut value: impl FnMut(&crate::main_controls::MainControl) -> f64,
+) {
+    u.knobs.retain(|k| !matches!(k.source, KnobSource::Main(_)));
+    let pinned: Vec<u32> = u.knobs.iter().filter_map(|k| k.clap.map(|pin| pin.id)).collect();
+    let fresh: Vec<Knob> = face
+        .iter()
+        .filter(|c| !pinned.contains(&c.id))
+        .take(MAX_PINS.saturating_sub(pinned.len()))
+        .map(|c| main_knob(c, value(c), target))
+        .collect();
+    u.knobs.splice(0..0, fresh);
+}
+
+/// Move a unit's CLAP knobs to the values the plugin reports (a loaded
+/// patch, an agent's edit, a stepped parameter rounding the knob's value).
+fn follow_plugin_values(u: &mut Unit, main: &mut ClapVoiceMain, now: f32, reduce_motion: bool) {
+    for k in &mut u.knobs {
+        let Some(pin) = k.clap else { continue };
+        // An unsent change is the UI's own: publish_pins sends it this frame.
+        if now < pin.hold_until || (k.value - pin.sent).abs() > 1e-4 { continue; }
+        let Some(plain) = main.param_value(pin.id) else { continue };
+        let norm = (((plain - pin.min) / (pin.max - pin.min).max(1e-9)) as f32).clamp(0.0, 1.0);
+        if (norm - k.value).abs() > 2e-3 {
+            k.glide_to(norm, reduce_motion);
+            k.clap = Some(ClapPin { sent: norm, ..pin });
+        }
     }
 }
 
@@ -1330,6 +1446,7 @@ fn make_unit(node: &Node) -> Unit {
         ins: ins_arr,
         outs: outs_arr,
         knobs,
+        main_from: None,
         jacks: jacks.iter().map(|&(dir, port, xf, label)| Jack { dir, port, xf, label, label_g: None }).collect(),
         led: 0.0,
         transport: node.kind.supports_transport(),
@@ -2174,6 +2291,13 @@ struct DemoApp {
     editor_rig: usize,
     /// Cached parameter list for the open editor (refreshed on open/Refresh).
     editor_params: Vec<ParamDesc>,
+    /// `ui_time` of the last plugin poll for main-control knobs.
+    main_poll_at: f32,
+    /// LV2 main-control values waiting for their knobs, which appear only
+    /// once the plugin's controls are resolved: a loaded session's values
+    /// (sent to the engine) and the values carried over a rack rebuild (the
+    /// engine still holds them).
+    lv2_main_restore: Vec<(crate::session::ParamValue, bool)>,
     /// Search/filter text for the parameter list.
     editor_filter: String,
     /// Pending open/close request from a unit double-click (task-26).
@@ -2404,6 +2528,8 @@ impl DemoApp {
             editor_open: false,
             editor_rig: 0,
             editor_params: Vec::new(),
+            main_poll_at: 0.0,
+            lv2_main_restore: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
             lv2_editor_node: None,
@@ -2453,6 +2579,8 @@ impl DemoApp {
                     if u.lv2_inst {
                         u.sub = "lv2 synth".into();
                         u.sub_g = None;
+                        // An instrument's knobs are its main controls (sync_main_knobs).
+                        u.knobs.clear();
                     }
                 }
             }
@@ -2475,6 +2603,7 @@ impl DemoApp {
             }
         }
         self.next_id = max_id + 1;
+        self.lv2_main_restore = params.iter().map(|p| (*p, true)).collect();
         // Apply default params to the matching knobs.
         for p in params {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
@@ -2725,7 +2854,9 @@ impl DemoApp {
             }
             for k in &mut u.knobs {
                 if k.label_g.is_none() {
-                    k.label_g = Some(tracked(&k.label, 10.0, 0.14));
+                    // The slot is a fixed width, so the fit runs once per label.
+                    let (text, size) = fit_label(&k.label, 10.0, 8.0, KNOB_LABEL_W, |t, sz| tracked(t, sz, 0.14).size.x);
+                    k.label_g = Some(tracked(&text, size, 0.14));
                 }
             }
             for j in &mut u.jacks {
@@ -3705,7 +3836,9 @@ impl DemoApp {
                 }
             }
         }
+        let carried = self.lv2_main_values();
         self.build_rack(&adopted, &[]);
+        self.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
         for (nid, param, ki, disp, from, gt) in knob_glides {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
                 let pos = param.and_then(|p| u.knobs.iter().position(|k| k.param == Some(p))).unwrap_or(ki);
@@ -5103,7 +5236,15 @@ impl DemoApp {
                             .collect()
                     })
                     .unwrap_or_default();
-                serde_json::json!({"node": node, "total": total, "params": params, "knobs": knobs}).to_string()
+                let (main_controls, source) = self.main_controls_json(node);
+                serde_json::json!({
+                    "node": node,
+                    "main_controls_source": source,
+                    "main_controls": main_controls,
+                    "total": total,
+                    "params": params,
+                    "knobs": knobs,
+                }).to_string()
             }
             "learn_cc" => {
                 if args.get("cancel").and_then(|v| v.as_bool()) == Some(true) {
@@ -5798,7 +5939,9 @@ impl DemoApp {
                         c.value = val.clamp(c.min, hi);
                     }
                 }
+                self.mirror_lv2_editor_on_face(lv2_node);
             }
+            let moved = !ctrl_changes.is_empty();
             for (ci, val, norm) in ctrl_changes {
                 if let Some(c) = self.lv2_editor_controls.get_mut(ci) {
                     c.value = val;
@@ -5811,6 +5954,7 @@ impl DemoApp {
                     }
                 }
             }
+            if moved { self.mirror_lv2_editor_on_face(lv2_node); }
             return;
         }
         let rig = self.editor_rig;
@@ -6279,6 +6423,43 @@ impl DemoApp {
         }
     }
 
+    /// `list_params`' main controls for a node: page, name, id, the current
+    /// value and its text, the face knob that shows it (if one does), and
+    /// the rule that found them. Empty when the node has none.
+    fn main_controls_json(&mut self, node: u32) -> (Vec<serde_json::Value>, Option<&'static str>) {
+        let Some(unit) = self.units.iter().position(|u| u.node_id == node) else { return (Vec::new(), None) };
+        let Some(found) = self.unit_main_controls(unit) else { return (Vec::new(), None) };
+        let is_clap = matches!(self.units[unit].node_kind, UnitKind::Clap);
+        let pool_idx = self.rig_of_unit(unit).and_then(|slot| self.clap_pool_idx(slot));
+        let rows = found.controls.iter().map(|c| {
+            let knob = self.units[unit].knobs.iter().find(|k| k.cc_target().is_some_and(|(id, _)| id == c.id));
+            let (value, text) = match pool_idx.and_then(|i| self._surge_main.get_mut(i)).filter(|_| is_clap) {
+                Some(main) => {
+                    let v = main.param_value(c.id).unwrap_or(c.default);
+                    (v, main.param_text(c.id, v))
+                }
+                // An LV2 port is not read back: the face knob holds what was sent.
+                None => {
+                    let v = knob.map_or(c.default, |k| c.plain(k.value));
+                    (v, format!("{v:.3}"))
+                }
+            };
+            serde_json::json!({
+                "page": c.page,
+                "name": c.name,
+                "id": c.id,
+                "value": value,
+                "text": text,
+                "min": c.min,
+                "max": c.max,
+                "target": if is_clap { "plugin" } else { "knob" },
+                "knob": knob.map(|k| k.label.clone()),
+            })
+        }).collect::<Vec<_>>();
+        let source = (!rows.is_empty()).then_some(found.source.as_str());
+        (rows, source)
+    }
+
     fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
         match target.map(str::trim).map(str::to_lowercase).as_deref() {
             None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => {
@@ -6297,10 +6478,18 @@ impl DemoApp {
             .and_then(|n| crate::engine::find_knob_spec(&n.kind, knob))
             .map(|spec| spec.label);
         let q = canonical.unwrap_or(knob).trim().to_uppercase();
-        for k in &u.knobs {
-            if k.label.to_uppercase() == q {
-                return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
-            }
+        // A plugin knob answers to its face label and to the control's full name.
+        let named = |k: &&Knob| k.label.to_uppercase() == q || k.source.plugin_name().is_some_and(|n| n.to_uppercase() == q);
+        // The unit's own knob wins a shared name: "LEVEL" stays the rack's LEVEL.
+        let own = |k: &&Knob| k.source == KnobSource::BuiltIn;
+        if let Some(k) = u.knobs.iter().filter(own).chain(u.knobs.iter().filter(|k| !own(k))).find(named) {
+            return k.cc_target().ok_or_else(|| format!("knob '{}' on {} is local-only", k.label, u.name));
+        }
+        // Main controls past the face (the list holds more than fit) bind too.
+        let unit = self.units.iter().position(|u| u.node_id == node_id).unwrap_or(usize::MAX);
+        if let Some(c) = self.unit_main_controls(unit).and_then(|m| m.find(knob).cloned()) {
+            let target = if matches!(u.node_kind, UnitKind::Clap) { crate::matrix::CcTarget::PluginParam } else { crate::matrix::CcTarget::Knob };
+            return Ok((c.id, target));
         }
         Err(format!("no knob '{knob}' on node {node_id}"))
     }
@@ -6358,6 +6547,7 @@ impl DemoApp {
     /// engine saw it before the binding existed, so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
         let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
+        let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
@@ -6379,6 +6569,7 @@ impl DemoApp {
                             if let Some(pin) = k.clap.as_mut() {
                                 if pin.id == m.param {
                                     k.value = norm;
+                                    pin.hold_until = hold_until;
                                     if !resend { pin.sent = norm; }
                                 }
                             }
@@ -9786,9 +9977,97 @@ impl DemoApp {
     /// Connect commands (the engine rejects duplicates), knobs SetParam, and
     /// the shared graph mirror is rebuilt when the cable set changed. Runs
     /// once per frame after input, so a re-plug's Disconnect precedes it.
+    /// The main controls of a unit's instrument, if its plugin is known.
+    fn unit_main_controls(&self, unit: usize) -> Option<crate::main_controls::MainControls> {
+        let u = self.units.get(unit)?;
+        match u.node_kind {
+            UnitKind::Clap => {
+                let idx = self.clap_pool_idx(self.rig_of_unit(unit)?)?;
+                self._surge_main.get(idx).map(|m| m.main_controls().clone())
+            }
+            UnitKind::Dsp(_) if u.lv2_inst => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) => crate::lv2::main_controls_cached(uri.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Current values of the LV2 main-control knobs, as session params.
+    fn lv2_main_values(&self) -> Vec<crate::session::ParamValue> {
+        self.units.iter()
+            .filter(|u| u.lv2_inst)
+            .flat_map(|u| u.knobs.iter().filter_map(move |k| {
+                let param = k.param.filter(|_| matches!(k.source, KnobSource::Main(_)))?;
+                Some(crate::session::ParamValue { node: u.node_id, param, value: k.value as f64 })
+            }))
+            .collect()
+    }
+
+    /// Keep every instrument's main-control knobs in step with its plugin:
+    /// build them once the plugin is known, rebuild them when the plugin
+    /// renamed its controls, and follow the plugin's own values. Runs every
+    /// frame; a plugin is asked only every `MAIN_POLL_SECS`.
+    fn sync_main_knobs(&mut self) {
+        let poll = self.ui_time - self.main_poll_at >= MAIN_POLL_SECS;
+        if poll { self.main_poll_at = self.ui_time; }
+        let dragged = match self.drag { Drag::Knob { unit, .. } => Some(unit), _ => None };
+        let slots = self.clap_rigs();
+        for ui in 0..self.units.len() {
+            // A drag holds a knob index: the row must not change under it (rule 10).
+            if dragged == Some(ui) { continue; }
+            let node = self.units[ui].node_id;
+            match self.units[ui].node_kind {
+                UnitKind::Clap => {
+                    let Some(idx) = slots.iter().find(|(_, n)| *n == node).and_then(|(slot, _)| self.clap_pool_idx(*slot)) else { continue };
+                    let voice = self.clap_voice_ids.get(idx).copied();
+                    let Some(main) = self._surge_main.get_mut(idx) else { continue };
+                    let renamed = poll && main.poll_main_controls();
+                    let u = &mut self.units[ui];
+                    if renamed || u.main_from != voice {
+                        let face = main.main_controls().face().to_vec();
+                        set_main_knobs(u, &face, MainTarget::Clap, |c| main.param_value(c.id).unwrap_or(c.default));
+                        u.main_from = voice;
+                    } else if poll {
+                        follow_plugin_values(u, main, self.ui_time, self.reduce_motion);
+                    }
+                }
+                UnitKind::Dsp(_) if self.units[ui].lv2_inst && self.units[ui].main_from.is_none() => {
+                    let Some(found) = self.unit_main_controls(ui) else { continue };
+                    let u = &mut self.units[ui];
+                    set_main_knobs(u, found.face(), MainTarget::Lv2, |c| c.default);
+                    for k in &mut u.knobs {
+                        let saved = self.lv2_main_restore.iter().find(|(p, _)| p.node == node && Some(p.param) == k.param);
+                        if let Some((p, send)) = saved {
+                            k.set_immediate(p.value as f32);
+                            k.sent = if *send { None } else { Some(k.value) };
+                        }
+                    }
+                    u.main_from = Some(0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Show values the LV2 editor set (a preset, a slider) on the face knobs
+    /// of the same controls. The engine has them already: nothing is re-sent.
+    fn mirror_lv2_editor_on_face(&mut self, node: u32) {
+        let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) else { return };
+        for k in u.knobs.iter_mut().filter(|k| matches!(k.source, KnobSource::Main(_))) {
+            let Some(c) = k.param.and_then(|p| self.lv2_editor_controls.iter().find(|c| c.index as u32 == p)) else { continue };
+            let norm = ((c.value - c.min) / (c.max - c.min).max(1e-6)).clamp(0.0, 1.0);
+            if (norm - k.value).abs() > 1e-4 {
+                k.glide_to(norm, self.reduce_motion);
+                k.sent = Some(norm);
+            }
+        }
+    }
+
     /// Pinned Surge parameters: send changed knob values to the plugin.
     fn publish_pins(&mut self) {
         let slots = self.clap_rigs();
+        let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for u in self.units.iter_mut() {
             let Some(slot) = slots.iter().find(|(_, n)| *n == u.node_id).map(|(s, _)| *s) else { continue };
             let Some(idx) = self.clap_slot_map.get(slot).copied().flatten() else { continue };
@@ -9798,6 +10077,7 @@ impl DemoApp {
                     if (k.value - pin.sent).abs() > 1e-4 {
                         ctl.set_param(ClapId::new(pin.id), pin.min + k.value as f64 * (pin.max - pin.min));
                         pin.sent = k.value;
+                        pin.hold_until = hold_until;
                     }
                 }
             }
@@ -9812,16 +10092,20 @@ impl DemoApp {
             u.knobs.remove(i);
             return format!("unpinned {}", p.name);
         }
-        if u.knobs.iter().filter(|k| k.clap.is_some()).count() >= MAX_PINS {
-            return format!("at most {MAX_PINS} pinned knobs per synth");
+        let plugin_knobs = u.knobs.iter().filter(|k| k.clap.is_some()).count();
+        if plugin_knobs >= MAX_PINS {
+            return format!("at most {MAX_PINS} plugin knobs per synth: remove one first");
         }
         let span = (p.max - p.min).max(1e-9);
         let norm = (((p.value - p.min) / span) as f32).clamp(0.0, 1.0);
-        let label: String = p.name.to_uppercase().chars().take(9).collect();
-        u.knobs.push(Knob {
-            label, value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
+        // After the other plugin knobs, left of the unit's own.
+        u.knobs.insert(plugin_knobs, Knob {
+            label: crate::main_controls::knob_label(&p.name, KNOB_LABEL_CHARS),
+            value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, hidden: false, sent: Some(norm), clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm }), label_g: None,
+            param: None, hidden: false, sent: Some(norm),
+            clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
+            source: KnobSource::Pinned(p.name.clone()), label_g: None,
         });
         format!("pinned {} to the face", p.name)
     }
@@ -10634,13 +10918,32 @@ impl DemoApp {
         self.unit_rects[unit].bottom() - FACE_PAD_B - KNOB_LABEL_H - KNOB_LABEL_GAP - KNOB_R
     }
 
-    /// Right-to-left knob slot: pairs fill from the right (idx 0,1 = the
-    /// rightmost pair, pinned knobs add pairs to the LEFT); a pair with one
-    /// knob takes the slot next to its neighbours, never leaving a gap.
+    /// Knob slot counted from the right edge: the row reads left to right
+    /// in knob order and ends at the right padding (plugin knobs come first,
+    /// so they sit left of the unit's own knobs).
     fn knob_slot(n: usize, idx: usize) -> usize {
-        let pair = idx / 2;
-        let full = pair * 2 + 1 < n;
-        pair * 2 + if full { 1 - idx % 2 } else { 0 }
+        n.saturating_sub(idx + 1)
+    }
+
+    /// How many knobs fit a unit `width` wide with the leftmost label still
+    /// right of the face's left edge.
+    fn knobs_that_fit(width: f32) -> usize {
+        let leftmost = width - FACE_X - FACE_PAD_R - KNOB_SLOT_HALF - KNOB_LABEL_W / 2.0;
+        if leftmost < 0.0 { 1 } else { (leftmost / KNOB_PITCH) as usize + 1 }
+    }
+
+    /// Show as many plugin knobs as the unit is wide; the unit's own knobs
+    /// always stay, the last plugin knobs give way first.
+    fn fit_plugin_knobs(&mut self) {
+        for (u, r) in self.units.iter_mut().zip(&self.unit_rects) {
+            if !r.width().is_finite() || !u.knobs.iter().any(|k| k.source != KnobSource::BuiltIn) { continue; }
+            let own = u.knobs.iter().filter(|k| k.source == KnobSource::BuiltIn && !k.hidden).count();
+            let mut room = Self::knobs_that_fit(r.width()).saturating_sub(own);
+            for k in u.knobs.iter_mut().filter(|k| k.source != KnobSource::BuiltIn) {
+                k.hidden = room == 0;
+                room = room.saturating_sub(1);
+            }
+        }
     }
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
@@ -10662,8 +10965,7 @@ impl DemoApp {
         let end = if n == 0 {
             r.right() - FACE_PAD_R
         } else {
-            let slots = (0..n).map(|i| Self::knob_slot(n, i)).max().unwrap_or(0);
-            r.right() - FACE_PAD_R - (slots + 1) as f32 * KNOB_PITCH - 8.0
+            r.right() - FACE_PAD_R - n as f32 * KNOB_PITCH - 8.0
         };
         (start, (end - start).max(0.0))
     }
@@ -12715,13 +13017,12 @@ impl DemoApp {
         let mut col = c.color;
         if c.kind == PortKind::Audio && c.color == theme::AUDIO_CREAM {
             // Subtle flat warm shift toward the accent (§4.10), ONLY for the
-            // neutral cream jacket: TONE·0.20 + WARM·0.15. Colored jackets keep
+            // neutral cream jacket: a fixed instrument shift + WARM·0.15. Colored jackets keep
             // their hue so tomato stays scarce (selection-only) on the back.
             let mut t = 0.0;
             if let Some(su) = self.units.get(c.src) {
                 if matches!(su.node_kind, UnitKind::Clap) {
-                    let tone = su.knobs.first().map(|k| k.value).unwrap_or(0.35);
-                    t += tone * 0.20;
+                    t += INSTRUMENT_CABLE_WARMTH;
                 }
             }
             let warm = self.master_idx().map(|m| knob_val(&self.units[m], P_WARM, 0.15)).unwrap_or(0.15);
@@ -13381,7 +13682,9 @@ impl DemoApp {
         let dt = ctx.input(|i| i.stable_dt).clamp(1.0 / 240.0, 1.0 / 20.0);
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
+        self.sync_main_knobs();
         self.layout(rect);
+        self.fit_plugin_knobs();
         if !typing(&ctx) {
             self.handle_input(&ctx, rect);
         }
@@ -13459,9 +13762,13 @@ impl eframe::App for DemoApp {
 /// Exercises the real capture_session/apply_session paths (no GUI/audio needed).
 pub fn run_session_test() -> anyhow::Result<()> {
     let mut app = DemoApp::new_with_sink(None);
-    app.units[1].knobs[1].value = 0.42; // rig A level
-    app.units[3].knobs[0].value = 0.77; // master volume
-    app.units[5].knobs[1].value = 0.31; // rig B delay mix
+    let knob = |app: &DemoApp, unit: usize, label: &str| -> anyhow::Result<usize> {
+        app.units[unit].knob_index(label).ok_or_else(|| anyhow::anyhow!("unit {unit} has no {label} knob"))
+    };
+    let (level, volume, mix) = (knob(&app, 1, "LEVEL")?, knob(&app, 3, "VOLUME")?, knob(&app, 5, "MIX")?);
+    app.units[1].knobs[level].value = 0.42; // rig A level
+    app.units[3].knobs[volume].value = 0.77; // master volume
+    app.units[5].knobs[mix].value = 0.31; // rig B delay mix
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let dir = std::path::PathBuf::from(home).join(".cache").join("ksalat-session-selftest");
@@ -13473,15 +13780,16 @@ pub fn run_session_test() -> anyhow::Result<()> {
     let edges = session.graph.edges.len();
 
     // Wipe the knobs, then restore from disk.
-    app.units[1].knobs[1].value = 0.0;
-    app.units[3].knobs[0].value = 0.0;
-    app.units[5].knobs[1].value = 0.0;
+    app.units[1].knobs[level].value = 0.0;
+    app.units[3].knobs[volume].value = 0.0;
+    app.units[5].knobs[mix].value = 0.0;
     let loaded = crate::session::Session::load(&pkg)?;
     app.apply_session(&loaded)?;
 
-    anyhow::ensure!((app.units[1].knobs[1].value - 0.42).abs() < 1e-6, "rig A level not restored");
-    anyhow::ensure!((app.units[3].knobs[0].value - 0.77).abs() < 1e-6, "master volume not restored");
-    anyhow::ensure!((app.units[5].knobs[1].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
+    let (level, volume, mix) = (knob(&app, 1, "LEVEL")?, knob(&app, 3, "VOLUME")?, knob(&app, 5, "MIX")?);
+    anyhow::ensure!((app.units[1].knobs[level].value - 0.42).abs() < 1e-6, "rig A level not restored");
+    anyhow::ensure!((app.units[3].knobs[volume].value - 0.77).abs() < 1e-6, "master volume not restored");
+    anyhow::ensure!((app.units[5].knobs[mix].value - 0.31).abs() < 1e-6, "rig B delay mix not restored");
     anyhow::ensure!(loaded.graph.edges.len() == edges, "edge count changed across round-trip");
 
     // --- Keys split (a node property): point + the HIGH cable round-trip ---
@@ -15834,10 +16142,13 @@ mod rig_switch_tests {
         let before = app.units[surge].knobs.len();
         let msg = app.toggle_pin(0, &p);
         assert!(msg.starts_with("pinned"), "{msg}");
-        let k = app.units[surge].knobs.last().unwrap();
-        assert_eq!(k.label, "FILTER 1 ");
+        let k = &app.units[surge].knobs[0];
+        assert_eq!(k.label, "1 CUTOFF", "a readable label, left of the unit's own knobs");
+        assert_eq!(app.units[surge].knobs.last().unwrap().label, "LEVEL");
         assert!((k.value - 0.5).abs() < 1e-6, "65/130 of the range: {}", k.value);
         assert_eq!(app.units[surge].knobs.len(), before + 1);
+        assert_eq!(app.resolve_unit_knob(app.units[surge].node_id, "filter 1 cutoff").ok(),
+            Some((42, crate::matrix::CcTarget::PluginParam)), "the full name resolves like the label");
         app.publish_pins(); // no controllers headless: must not panic
         assert!(app.toggle_pin(0, &p).starts_with("unpinned"));
         assert_eq!(app.units[surge].knobs.len(), before);
@@ -17456,9 +17767,9 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         drain.drain(|_| {}); // clear initial SetParam/Connect burst
 
-        // Surge A is unit 1, LEVEL knob is index 1 (param = Some(P_LEVEL)).
+        // Surge A is unit 1; its LEVEL knob has param = Some(P_LEVEL).
         let surge_unit = 1usize;
-        let level_idx = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
 
         // 1. Right-click enters learning state and paints "LEARN".
@@ -17550,7 +17861,8 @@ mod split_bpm_tests {
     fn rack_knob_unbound_reset_from_the_learn_menu() {
         let (mut app, ctx) = demo();
         frame(&mut app, &ctx, vec![]);
-        let (surge_unit, level_idx) = (1usize, 1usize);
+        let surge_unit = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
         app.units[surge_unit].knobs[level_idx].value = 0.1;
         rclick(&mut app, &ctx, level_pos);
@@ -17571,7 +17883,8 @@ mod split_bpm_tests {
     fn knob_menu_follows_its_knob_by_id_not_index() {
         let (mut app, ctx) = demo();
         frame(&mut app, &ctx, vec![]);
-        let (surge_unit, level_idx) = (1usize, 1usize);
+        let surge_unit = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let node = app.units[surge_unit].node_id;
         let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO };
         assert_eq!(app.knob_menu_target(&menu), Some((surge_unit, level_idx)));
@@ -17589,7 +17902,7 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
 
         let surge_unit = 1usize;
-        let level_idx = 1usize;
+        let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let level_pos = app.xf.p(app.knob_center(surge_unit, level_idx));
 
         // Bind CC 74 on Hardware(2).
@@ -19420,7 +19733,7 @@ mod ui_polish_agent_tests {
 mod face_layout_tests {
     use super::*;
 
-    fn frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) {
+    pub(super) fn frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
         eframe::App::raw_input_hook(app, ctx, &mut raw);
@@ -19538,6 +19851,38 @@ mod face_layout_tests {
     }
 
     #[test]
+    fn instrument_faces_with_main_knobs_are_padded_and_clear() {
+        let mut app = DemoApp::new_with_sink(None);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        check(app, "clap main knobs");
+
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        check(app, "clap main knobs, two rigs");
+
+        let (app, _) = super::main_control_tests::lv2_synth_rack(&[]);
+        check(app, "lv2 instrument main knobs");
+    }
+
+    /// The audit above only sees what `items` lists: prove the main knobs
+    /// are in it, and that a wide unit shows all four.
+    #[test]
+    fn main_knobs_are_part_of_the_audited_face() {
+        let mut app = DemoApp::new_with_sink(None);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(2560.0, 1440.0)); }
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let names: Vec<String> = items(&app, surge).into_iter().map(|(n, _)| n).filter(|n| n.starts_with("knob")).collect();
+        assert_eq!(names, ["knob CUTOFF", "knob RESO", "knob OSC 1 VOL", "knob BAL", "knob LEVEL"]);
+        for k in &app.units[surge].knobs {
+            let w = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
+            assert!(w > 0.0 && w <= KNOB_LABEL_W, "{} is {w}px wide, a slot leaves {KNOB_LABEL_W}", k.label);
+        }
+    }
+
+    #[test]
     fn audio_in_face_is_padded_and_clear() {
         // A minimal rack: Keys + AudioIn (In 1, wired to Master) + Master. The
         // Keys/Master stay wide side anchors so the AudioIn unit is the lone
@@ -19570,6 +19915,258 @@ mod face_layout_tests {
             .collect();
         assert!(bottom_row.len() >= 3, "keys, a bottom stack and master share the bottom: {bottom_row:?}");
         assert!(bottom_row.iter().all(|y| (y - bottom_row[0]).abs() < 0.5), "one knob line: {bottom_row:?}");
+    }
+}
+
+#[cfg(test)]
+mod main_control_tests {
+    use super::*;
+    use super::face_layout_tests::frame_at;
+    use crate::control::command_bus;
+    use crate::main_controls::{MainControl, MainControls, MainSource};
+
+    fn control(id: u32, name: &str, page: &str) -> MainControl {
+        MainControl { id, name: name.into(), page: page.into(), min: 0.0, max: 2.0, default: 1.0 }
+    }
+
+    /// Six controls, like a plugin whose list is longer than a face.
+    pub(super) fn synth_controls() -> MainControls {
+        MainControls {
+            source: MainSource::RemoteControls,
+            controls: vec![
+                control(101, "M1: Cutoff", "Macros"),
+                control(102, "M2: Resonance", "Macros"),
+                control(103, "A Osc 1 Volume", "Scene A Mixer"),
+                control(104, "A Filter Balance", "Scene A Filters"),
+                control(105, "A Feedback", "Scene A Filters"),
+                control(106, "A Waveshaper Drive", "Scene A Filters"),
+            ],
+        }
+    }
+
+    pub(super) fn give_clap_units_main_knobs(app: &mut DemoApp) {
+        let found = synth_controls();
+        for u in app.units.iter_mut().filter(|u| matches!(u.node_kind, UnitKind::Clap)) {
+            set_main_knobs(u, found.face(), MainTarget::Clap, |c| c.default);
+        }
+    }
+
+    const LV2_SYNTH: &str = "urn:kabelsalat:test-synth";
+
+    /// Keys → an LV2 instrument → Master, with the instrument's controls
+    /// already resolved (the app resolves them on a worker thread).
+    pub(super) fn lv2_synth_rack(params: &[crate::session::ParamValue]) -> (DemoApp, usize) {
+        crate::lv2::set_main_controls_for_test(LV2_SYNTH, MainControls { source: MainSource::Fallback, ..synth_controls() });
+        let mut g = Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let synth = g.add_node(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(LV2_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&g, params);
+        let unit = app.units.iter().position(|u| u.node_id == synth).unwrap();
+        // build_rack classifies instruments from the installed plugins; this one is not installed.
+        app.units[unit].lv2_inst = true;
+        app.units[unit].knobs.clear();
+        (app, unit)
+    }
+
+    fn labels(app: &DemoApp, unit: usize) -> Vec<&str> {
+        app.units[unit].knobs.iter().map(|k| k.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_clap_face_shows_its_main_controls_left_of_level() {
+        let mut app = DemoApp::new_with_sink(None);
+        give_clap_units_main_knobs(&mut app);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        assert_eq!(labels(&app, surge), ["CUTOFF", "RESO", "OSC 1 VOL", "BAL", "LEVEL"]);
+        let k = &app.units[surge].knobs[0];
+        assert_eq!(k.cc_target(), Some((101, crate::matrix::CcTarget::PluginParam)), "bound to the plugin parameter");
+        assert!((k.value - 0.5).abs() < 1e-6, "the plugin's value 1.0 in 0..2");
+
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(2560.0, 1440.0));
+        let xs: Vec<f32> = (0..5).map(|i| app.knob_center(surge, i).x).collect();
+        assert!(xs.windows(2).all(|w| w[1] - w[0] == KNOB_PITCH), "one row, left to right: {xs:?}");
+    }
+
+    #[test]
+    fn a_narrow_unit_keeps_level_and_drops_the_last_main_knobs() {
+        assert_eq!(DemoApp::knobs_that_fit(200.0), 2);
+        assert_eq!(DemoApp::knobs_that_fit(268.0), 3);
+        assert_eq!(DemoApp::knobs_that_fit(420.0), 6);
+        let mut app = DemoApp::new_with_sink(None);
+        give_clap_units_main_knobs(&mut app);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        let shown: Vec<&str> = app.units[surge].knobs.iter().filter(|k| !k.hidden).map(|k| k.label.as_str()).collect();
+        assert_eq!(shown, ["CUTOFF", "LEVEL"]);
+        assert!(app.resolve_unit_knob(app.units[surge].node_id, "RESO").is_ok(), "a knob without room still binds");
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        assert!(app.units[surge].knobs.iter().all(|k| !k.hidden), "and comes back with the room");
+    }
+
+    #[test]
+    fn main_knobs_make_room_for_a_hand_pinned_one_and_never_repeat_it() {
+        let mut app = DemoApp::new_with_sink(None);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let pinned = crate::host::ParamDesc { id: 102, name: "M2: Resonance".into(), module: String::new(),
+            min: 0.0, max: 2.0, value: 2.0, default: 1.0, automatable: true, hidden: false, readonly: false };
+        assert!(app.toggle_pin(0, &pinned).starts_with("pinned"));
+        give_clap_units_main_knobs(&mut app);
+        assert_eq!(labels(&app, surge), ["CUTOFF", "OSC 1 VOL", "BAL", "RESO", "LEVEL"], "four plugin knobs, the pin kept once");
+        // A patch that renames its controls replaces the main knobs only.
+        let renamed = [control(201, "M1: Wobble", "Macros"), control(202, "Level", "Macros")];
+        set_main_knobs(&mut app.units[surge], &renamed, MainTarget::Clap, |c| c.default);
+        assert_eq!(labels(&app, surge), ["WOBBLE", "LEVEL", "RESO", "LEVEL"]);
+        assert_eq!(app.resolve_unit_knob(app.units[surge].node_id, "level"), Ok((P_LEVEL, crate::matrix::CcTarget::Knob)),
+            "the rack's own LEVEL keeps its name when a plugin control shares it");
+    }
+
+    #[test]
+    fn an_lv2_instrument_face_shows_main_controls_that_drive_its_ports() {
+        let (mut app, unit) = lv2_synth_rack(&[]);
+        let node = app.units[unit].node_id;
+        let ctx = egui::Context::default();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert_eq!(labels(&app, unit), ["CUTOFF", "RESO", "OSC 1 VOL", "BAL"], "no knob that drives nothing");
+        assert_eq!(app.units[unit].knobs[1].cc_target(), Some((102, crate::matrix::CcTarget::Knob)));
+        let mut sent = Vec::new();
+        drain.drain(|c| if let Command::SetParam { node: n, param, value } = c { if n == node { sent.push((param, value)); } });
+        assert!(sent.is_empty(), "a fresh knob shows the port's default: nothing to send, {sent:?}");
+
+        app.units[unit].knobs[1].set_immediate(0.25);
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        drain.drain(|c| if let Command::SetParam { node: n, param, value } = c { if n == node { sent.push((param, value)); } });
+        assert_eq!(sent, [(102, 0.25)], "turning the knob sets the plugin's control port");
+    }
+
+    #[test]
+    fn a_loaded_session_restores_lv2_main_knobs_and_a_rebuild_keeps_them() {
+        let saved = [crate::session::ParamValue { node: 1, param: 103, value: 0.8 }];
+        let (mut app, unit) = lv2_synth_rack(&saved);
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let k = &app.units[unit].knobs[2];
+        assert!((k.value - 0.8).abs() < 1e-6 && k.sent.is_none(), "restored and due to be sent");
+
+        app.units[unit].knobs[0].set_immediate(0.1);
+        let carried = app.lv2_main_values();
+        assert!(carried.contains(&crate::session::ParamValue { node: 1, param: 101, value: 0.1f32 as f64 }));
+        let graph = app.base_graph.clone();
+        app.build_rack(&graph, &[]);
+        app.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
+        app.units[unit].lv2_inst = true;
+        app.units[unit].knobs.clear();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let k = &app.units[unit].knobs[0];
+        assert!((k.value - 0.1).abs() < 1e-6, "the value survives the rebuild");
+        assert_eq!(k.sent, Some(k.value), "the engine still holds it: nothing is re-sent");
+    }
+
+    #[test]
+    fn list_params_puts_main_controls_first_and_their_names_bind() {
+        let (mut app, unit) = lv2_synth_rack(&[]);
+        let node = app.units[unit].node_id;
+        let ctx = egui::Context::default();
+        frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        app.units[unit].knobs[0].set_immediate(0.75);
+        let out: serde_json::Value = serde_json::from_str(&app.exec_tool("list_params", &serde_json::json!({"node": node}))).unwrap();
+        assert_eq!(out["main_controls_source"], "fallback");
+        let main = out["main_controls"].as_array().unwrap();
+        assert_eq!(main.len(), 6, "the whole list, not only the face: {out}");
+        assert_eq!(main[0]["name"], "M1: Cutoff");
+        assert_eq!(main[0]["page"], "Macros");
+        assert_eq!(main[0]["id"], 101);
+        assert_eq!(main[0]["knob"], "CUTOFF");
+        assert_eq!(main[0]["value"], 1.5, "0.75 of 0..2");
+        assert_eq!(main[0]["text"], "1.500");
+        assert_eq!(main[5]["knob"], serde_json::Value::Null, "listed, not on the face");
+
+        // The face label, the full name, and a control past the face all bind.
+        for (knob, id) in [("CUTOFF", 101), ("m1: cutoff", 101), ("A Waveshaper Drive", 106)] {
+            assert_eq!(app.resolve_unit_knob(node, knob), Ok((id, crate::matrix::CcTarget::Knob)), "{knob}");
+        }
+        let bound = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 21, "knob": "A Waveshaper Drive"}));
+        assert!(app.rule_edits.values().any(|e| e.cc_map.iter().any(|m| m.cc == 21 && m.param == 106)), "{bound}");
+        assert!(app.resolve_unit_knob(node, "GAIN").is_err(), "the old port-0 GAIN knob is gone");
+    }
+
+    /// The whole path on real Surge XT voices and the app's own frames:
+    /// knobs appear, a turned knob reaches the plugin, a loaded patch renames
+    /// them, and the agent reads the same list.
+    #[test]
+    fn real_surge_voices_get_main_knobs_that_drive_and_follow_the_plugin() {
+        let Ok(mut rig) = EvalRig::new(Assistant::new(), &(Vec::new(), Vec::new())) else { return };
+        rig.settle();
+        let surge = rig.app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let node = rig.app.units[surge].node_id;
+        assert_eq!(labels(&rig.app, surge), ["OSC 1 VOL", "OSC 2 VOL", "OSC 3 VOL", "NOISE VOL", "LEVEL"],
+            "the init patch names no macro: Surge's next page, the scene mixer");
+        let pin = rig.app.units[surge].knobs[0].clap.expect("a plugin knob");
+        assert!((rig.app.units[surge].knobs[0].value - 1.0).abs() < 1e-3, "read from the plugin: osc 1 is at full volume");
+
+        rig.app.units[surge].knobs[0].set_immediate(0.25);
+        rig.settle();
+        let read = rig.app._surge_main[0].param_value(pin.id).unwrap();
+        assert!((read - 0.25).abs() < 1e-3, "the knob moved Surge's parameter: {read}");
+
+        let out: serde_json::Value = serde_json::from_str(&rig.app.exec_tool("list_params", &serde_json::json!({"node": node}))).unwrap();
+        assert_eq!(out["main_controls_source"], "remote controls");
+        assert_eq!(out["main_controls"][0]["name"], "A Osc 1 Volume");
+        assert_eq!(out["main_controls"][0]["page"], "Scene A Mixer");
+        assert_eq!(out["main_controls"][0]["knob"], "OSC 1 VOL");
+        assert!((out["main_controls"][0]["value"].as_f64().unwrap() - 0.25).abs() < 1e-3, "{out}");
+        assert_eq!(out["main_controls"].as_array().unwrap().len(), 8);
+
+        let patches = crate::host::list_surge_patches();
+        let Some(patch) = crate::host::find_surge_patch(&patches, "bell pad") else { return };
+        let state = crate::host::fxp_to_state(&std::fs::read(&patch.path).unwrap()).unwrap();
+        rig.app._surge_main[0].load_state(&state).unwrap();
+        for _ in 0..600 {
+            rig.frame();
+            if rig.app.units[surge].knobs[0].label == "CUTOFF" { break; }
+        }
+        assert_eq!(labels(&rig.app, surge), ["CUTOFF", "SKEW H", "SHAPE", "SPEED", "LEVEL"], "the patch's named macros");
+        assert_eq!(rig.app.resolve_unit_knob(node, "M5: Vibrato Rate").map(|(_, t)| t), Ok(crate::matrix::CcTarget::PluginParam),
+            "a macro past the face binds by name");
+    }
+
+    #[test]
+    fn a_clap_knob_follows_the_value_the_plugin_reports() {
+        let Ok((mut voice, mut main)) = ClapVoice::new(48000.0) else { return };
+        let mut app = DemoApp::new_with_sink(None);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let face = main.main_controls().face().to_vec();
+        assert!(!face.is_empty(), "Surge XT has remote-control pages");
+        set_main_knobs(&mut app.units[surge], &face, MainTarget::Clap, |c| main.param_value(c.id).unwrap_or(c.default));
+        let c = &face[0];
+        let start = app.units[surge].knobs[0].value;
+        let target = if start < 0.5 { 0.9 } else { 0.1 };
+
+        // Something other than this knob moves the parameter (an agent, a patch).
+        voice.controller().set_param(ClapId::new(c.id), c.plain(target));
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..8 { voice.render(&mut buf, crate::transport::Transport::default()); }
+        follow_plugin_values(&mut app.units[surge], &mut main, 10.0, true);
+        let k = &app.units[surge].knobs[0];
+        assert!((k.value - target).abs() < 0.02, "{} followed {start} -> {target}: {}", c.name, k.value);
+        assert_eq!(k.clap.map(|p| p.sent), Some(k.value), "read back, so not sent again");
+
+        // A value the UI just sent is not overwritten by a stale readback.
+        let sent_at = 20.0;
+        let k = &mut app.units[surge].knobs[0];
+        k.set_immediate(start);
+        k.clap = k.clap.map(|p| ClapPin { sent: start, hold_until: sent_at + READBACK_HOLD_SECS, ..p });
+        follow_plugin_values(&mut app.units[surge], &mut main, sent_at + 0.1, true);
+        assert!((app.units[surge].knobs[0].value - start).abs() < 1e-6, "held while the change travels");
+        main.retire(voice);
     }
 }
 

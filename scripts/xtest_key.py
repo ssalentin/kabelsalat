@@ -62,7 +62,9 @@ def main():
         altgr = 108  # typical Mode_switch keycode; best effort
     sh = None
     if shift:
-        # Shift_L keycode: find via mapping (keysym 0xffe1 at level 0).
+        # Shift_L keycode: find via mapping (keysym 0xffe1 at level 0). Own
+        # `per`: the F-key override path never ran the first mapping lookup.
+        per = ctypes.c_int(0)
         syms2 = x11.XGetKeyboardMapping(d, first, last - first + 1, ctypes.byref(per))
         for kc2 in range(first, last + 1):
             if syms2[(kc2 - first) * per.value] == 0xFFE1:

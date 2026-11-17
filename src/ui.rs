@@ -1102,6 +1102,16 @@ struct KnobMenu {
     pos: Pos2,
 }
 
+/// One bit per note source for `notes_down`: the computer keyboard, each
+/// hardware device (indices past 29 share a bit), everything else.
+fn note_source_bit(src: SourceId) -> u32 {
+    match src {
+        SourceId::Keys => 1,
+        SourceId::Hardware(d) => 1 << (1 + d.min(29)),
+        _ => 1 << 31,
+    }
+}
+
 /// MIDI note name for editor readouts (60 = C4).
 fn note_name(n: u8) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -1828,6 +1838,9 @@ struct DemoApp {
     /// Per-MIDI-note LEDs for the multi-octave bottom keyboard (key_leds is
     /// per pitch class and would light every octave).
     note_leds: [f32; 128],
+    /// Notes held right now, one bit per source (`note_source_bit`): keys
+    /// stay lit until every source released them, not only for an LED blink.
+    notes_down: [u32; 128],
     meter: f32,
     /// Peak-hold for the master meter (slow release).
     meter_peak: f32,
@@ -2212,6 +2225,7 @@ impl DemoApp {
             hover: None,
             key_leds: [0.0; 13],
             note_leds: [0.0; 128],
+            notes_down: [0; 128],
             meter: 0.0,
             meter_peak: 0.0,
             show_help: false,
@@ -9716,9 +9730,13 @@ impl DemoApp {
         let amp = amp * (0.35 + vel * 0.65);
         // Light on note-on only: a note-off re-lighting the key restarted the
         // full decay tail AFTER release (user report: key color stays too long).
+        let bit = note_source_bit(self.current_source);
         if amp > 0.0 {
             self.key_leds[semitone % 12] = 1.0;
             self.note_leds[semitone.min(127)] = 1.0;
+            self.notes_down[semitone.min(127)] |= bit;
+        } else {
+            self.notes_down[semitone.min(127)] &= !bit;
         }
         if let Some(u) = self.units.get_mut(ki) { u.led = 1.0; }
         // A split keyboard sends each note out ONE jack (LOW below the point,
@@ -10345,6 +10363,14 @@ impl DemoApp {
         for &(_, semi) in &self.held_keys {
             self.key_leds[semi % 12] = 1.0;
             self.note_leds[semi.min(127)] = 1.0;
+        }
+        // Every held note stays lit (hardware keyboards, clicks, agents),
+        // like the laptop keys above.
+        for n in 0..128 {
+            if self.notes_down[n] != 0 {
+                self.key_leds[n % 12] = 1.0;
+                self.note_leds[n] = 1.0;
+            }
         }
         // Adopt hot-plug changes from the MIDI thread (one atomic load).
         let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
@@ -18650,6 +18676,35 @@ mod ui_polish_agent_tests {
         assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
+    }
+
+    /// User report: the software keyboard must show a note as long as it is
+    /// pressed. A hardware note only blinked (0.09 s LED tail) while held.
+    #[test]
+    fn held_notes_stay_lit_on_the_dock_until_released() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let ev = |note: u8, velocity: f32, dev: u32| (NoteEvent { note, velocity, source: SourceId::Hardware(dev), created: std::time::Instant::now() }, true);
+        run_frame(&mut app, &ctx, size, vec![]);
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.8, 0));
+        app.hw_queue.lock().unwrap().push_back(ev(64, 0.8, 1));
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < std::time::Duration::from_millis(600) {
+            run_frame(&mut app, &ctx, size, vec![]);
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        assert_eq!(app.note_leds[60], 1.0, "held 0.6 s and still fully lit");
+        // Device 1 releasing 60 does not darken device 0's held 60.
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.0, 1));
+        app.hw_queue.lock().unwrap().push_back(ev(64, 0.0, 1));
+        for _ in 0..30 { run_frame(&mut app, &ctx, size, vec![]); std::thread::sleep(std::time::Duration::from_millis(16)); }
+        assert_eq!(app.note_leds[60], 1.0, "another device still holds 60");
+        assert!(app.note_leds[64] < 0.02, "64 released: dark after its short tail ({})", app.note_leds[64]);
+        app.hw_queue.lock().unwrap().push_back(ev(60, 0.0, 0));
+        for _ in 0..30 { run_frame(&mut app, &ctx, size, vec![]); std::thread::sleep(std::time::Duration::from_millis(16)); }
+        assert!(app.note_leds[60] < 0.02, "60 released by its last holder ({})", app.note_leds[60]);
     }
 
     #[test]

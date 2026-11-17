@@ -389,6 +389,27 @@ Learned so far (2026-11-15, UI polish pass):
     binary copied into a scratch directory under `/tmp` filled the volume
     and every command lost its output. Keep binaries and eval output under
     `~/.cache/ksalat-*` and strip copies.
+80. **An engine barrier opens on the engine's answer, never on the rack's
+    own move:** `disconnect` unplugs its cable in the rack at once, so the
+    changed cable ids released the barrier before the engine had published.
+    The next `disconnect` of the step then ran while that publication was on
+    its way, `sync_from_engine` rebuilt the rack from it with the second
+    cable plugged in, and `publish_patch` re-connected it: every second
+    disconnect of a step reported `NOT applied`. `EngineEdit` keeps the
+    adopted `last_graph_rev` and reports "applied" only once it moved
+    (`every_disconnect_of_one_step_is_applied`).
+81. **Tell a model the base of an index it passes:** users say "rig 1",
+    tools take the 0-based `rig`. The chat model put a reverb into rig B
+    for "rig 1" in 2 of 22 runs; with the mapping stated in the system
+    prompt, 0 of 24 (`agent-eval --task reverb_and_tempo --runs 24`).
+82. **A turn with an image skips the decisions model:** measured with
+    `kabelsalat jev-test --image <file> <request>`. Jev reads a written note
+    (action `tempo` at p = 1.00) but its typed answers cannot return the
+    value the note states, and what it sees leaks into the other answers (a
+    mixer screenshot made it name rig 1 at p = 0.95 and a keys sound at
+    0.88 for a request that names neither). The seeing model
+    (`agent_perceive_model`) acts for that turn; re-measure before sending
+    images to Jev.
 
 ## Working on kabelsalat
 
@@ -417,10 +438,14 @@ Learned so far (2026-11-15, UI polish pass):
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`
   (`./target/debug/kabelsalat <name>`).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 14 scripted requests
+  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
   (headless app, offline engine, real Surge voices; it calls the configured
-  model APIs and costs a few cents) and `kabelsalat jev-test` shows Jev's
-  decisions. Surge logs to stdout: filter with
+  model APIs and costs a few cents; three requests carry an image, and
+  `look_at_rack` gets `docs/shots/mixer.png` in place of a window) and
+  `kabelsalat jev-test` shows Jev's decisions (`--image <file> <request>`
+  asks about one request without and with an image). A new shortcut row
+  needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
+  with
   `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
   `llm::fake::FakeTransport` (rule 37).
 - **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive

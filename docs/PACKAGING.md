@@ -52,9 +52,25 @@ than the runtime do not load, and host-side agents cannot attach. README and
 every release's notes point to the AppImage.
 
 Each job smoke-tests its package with `kabelsalat --version`. The release job
-adds `SHA256SUMS`, then creates the GitHub release with the tag's CHANGELOG
-block as notes (`scripts/ci/release-notes.sh`), or uploads to it when the
-release already exists.
+adds `SHA256SUMS`, then creates the GitHub release, or uploads to it when the
+release already exists. Its notes (`scripts/ci/release-notes.sh <v> dist <tag>
+<repo>`) are the tag's CHANGELOG block plus a **Download** section that links
+each AppImage directly (x86_64 first), then the other packages and
+`SHA256SUMS`; a release without an AppImage fails.
+
+### Packages for an existing tag
+
+A tag pushed before this workflow existed (v0.1.0) has a release without
+packages. Run **Release** from the Actions tab with `tag` set to it, or:
+
+```sh
+gh workflow run release.yml -R ssalentin/kabelsalat --ref main -f tag=v0.1.0
+```
+
+The tarball and AppImage jobs build the tag's source with this ref's packaging
+scripts and attach the files to that release, rewriting its notes with the
+download links. Flatpak and Arch are skipped: their manifests build from the
+current tree, not from the tag.
 
 ## Flatpak
 

@@ -97,11 +97,76 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
         DspKind::Gain => &[(0, "Gain")],
         DspKind::Filter => &[(0, "Cutoff"), (1, "Resonance")],
         DspKind::Eq3 => &[(0, "Low"), (1, "High")],
-        DspKind::Limiter => &[(0, "Threshold"), (1, "Ceiling")],
+        DspKind::Limiter => &[(0, "Ceiling"), (1, "Drive")],
         DspKind::Saturation => &[(0, "Drive"), (1, "Mix")],
         DspKind::Pan => &[(0, "Pan")],
         DspKind::Metronome => &[],
     }
+}
+
+/// System-audio capture gain (0..=1, the same value `SetSystemAudio` sets),
+/// as a SetParam on a SystemAudio node so its GAIN knob and CC bindings work.
+pub const P_SYSTEM_GAIN: ParamId = 66;
+
+/// One rack-unit knob: the label on the face (canonical for agents too),
+/// its default, the engine param it drives (None = local-only), and the long
+/// names agents may use instead of the label.
+pub struct KnobSpec {
+    pub label: &'static str,
+    pub default: f32,
+    pub param: Option<ParamId>,
+    /// Not drawn as a knob (the face renders it as a chip); still bindable.
+    pub hidden: bool,
+    pub aliases: &'static [&'static str],
+}
+
+const fn ks(label: &'static str, default: f32, param: Option<ParamId>, aliases: &'static [&'static str]) -> KnobSpec {
+    KnobSpec { label, default, param, hidden: false, aliases }
+}
+
+/// A `'static` knob table: `const` items are promoted, `const fn` calls are not.
+macro_rules! knobs {
+    ($($k:expr),* $(,)?) => {{
+        const K: &[KnobSpec] = &[$($k),*];
+        K
+    }};
+}
+
+/// The knobs a rack unit shows for a node kind — the ONE table both the UI
+/// (`make_unit`, `resolve_unit_knob`) and headless MCP resolve knob names
+/// against, so `knob="RESO"` means the same knob everywhere.
+pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
+    match kind {
+        NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
+        NodeKind::Clap { .. } => knobs!(ks("TONE", 0.35, None, &[]), ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
+        NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
+        NodeKind::Dsp(dk) => match dk {
+            DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
+            DspKind::Reverb => knobs!(ks("MIX", 0.35, Some(0), &[]), ks("SIZE", 0.5, Some(1), &[])),
+            DspKind::Gain => knobs!(ks("GAIN", 0.9, Some(0), &[])),
+            DspKind::Filter => knobs!(ks("CUTOFF", 0.45, Some(0), &[]), ks("RESO", 0.2, Some(1), &["RESONANCE"])),
+            DspKind::Eq3 => knobs!(ks("LOW", 0.5, Some(0), &[]), ks("HIGH", 0.5, Some(1), &[])),
+            DspKind::Limiter => knobs!(ks("CEIL", 0.8, Some(0), &["CEILING"]), ks("DRIVE", 0.2, Some(1), &[])),
+            DspKind::Saturation => knobs!(ks("DRIVE", 0.4, Some(0), &[]), ks("MIX", 0.5, Some(1), &[])),
+            DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
+            DspKind::Metronome => &[],
+        },
+        NodeKind::Lv2 { .. } => knobs!(ks("GAIN", 0.9, Some(0), &[])),
+        // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
+        NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
+        NodeKind::AudioIn { .. } => knobs!(
+            ks("GAIN", 0.5, Some(P_AUDIO_IN_GAIN), &[]),
+            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, aliases: &["MONITOR"] },
+        ),
+    }
+}
+
+/// Resolve a knob name (label or alias, any case) on a node kind.
+pub fn find_knob_spec(kind: &NodeKind, name: &str) -> Option<&'static KnobSpec> {
+    let q = name.trim();
+    knob_specs(kind)
+        .iter()
+        .find(|k| k.label.eq_ignore_ascii_case(q) || k.aliases.iter().any(|a| a.eq_ignore_ascii_case(q)))
 }
 
 struct VoiceSlot {
@@ -488,6 +553,8 @@ pub struct GraphPub {
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
+    /// System-audio capture gain, published with the mix (same `mix_rev`).
+    pub system_gain: f32,
     pub mix_rev: u64,
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
@@ -948,6 +1015,7 @@ impl GraphEngine {
                 g.graph = self.graph.clone();
                 g.rules = self.matrix.rules.clone();
                 g.mix = self.rig_mix;
+                g.system_gain = self.system_gain;
                 g.mix_rev = g.mix_rev.wrapping_add(1);
                 g.transport = tp;
                 g.transport_rev = g.transport_rev.wrapping_add(1);
@@ -1043,6 +1111,16 @@ impl GraphEngine {
         }
     }
 
+    /// One setter for the system-audio gain (SetSystemAudio and the GAIN knob
+    /// alike); the mixer publication carries it back to the UI (rule 33).
+    fn set_system_gain(&mut self, gain: f32) {
+        let g = gain.clamp(0.0, 1.0);
+        if g != self.system_gain {
+            self.system_gain = g;
+            self.mix_dirty = true;
+        }
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
@@ -1057,6 +1135,11 @@ impl GraphEngine {
                 return true;
             }
             false
+        } else if param == P_SYSTEM_GAIN
+            && self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::SystemAudio))
+        {
+            self.set_system_gain(v);
+            true
         } else if self.audio_in.iter().any(|s| s.node == node) {
             let Some(s) = self.audio_in.iter_mut().find(|s| s.node == node) else {
                 return false;
@@ -1558,9 +1641,7 @@ impl GraphEngine {
                     self.publish_graph();
                 }
             }
-            Command::SetSystemAudio { gain } => {
-                self.system_gain = gain.clamp(0.0, 1.0);
-            }
+            Command::SetSystemAudio { gain } => self.set_system_gain(gain),
             Command::SetAudioIn { node, device, channels } => {
                 // Structural: rewrite the node's device/channels, rebuild its
                 // slot, and publish so frontends adopt the selection.
@@ -1817,6 +1898,7 @@ impl GraphEngine {
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
+                    g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
                 },
@@ -2557,6 +2639,58 @@ mod tests {
         assert_eq!(p.rev, 1, "rule edit must bump the publication rev");
         let r = p.rules.iter().find(|r| r.source == SourceId::Keys && r.dest == 1).unwrap();
         assert_eq!(r.transpose, 7);
+    }
+
+    /// #21: the system-audio GAIN knob is a real SetParam (and so CC-bindable),
+    /// and the gain goes back to frontends like SetSystemAudio's does.
+    #[test]
+    fn system_audio_gain_knob_sets_and_publishes_the_capture_gain() {
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::demo_patch();
+        let sys = g.add_node(NodeKind::SystemAudio, name_bytes("SYSTEM AUDIO"));
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let mut buf = vec![0.0f32; 64 * 2];
+        bus.send(Command::SetParam { node: sys, param: super::P_SYSTEM_GAIN, value: 0.6 });
+        engine.render(&mut buf, 2);
+        assert!((engine.system_gain - 0.6).abs() < 1e-6);
+        assert!((pub_.lock().unwrap().system_gain - 0.6).abs() < 1e-6, "published for the knob mirror");
+        // The param id means nothing on another node kind.
+        bus.send(Command::SetParam { node: 1, param: super::P_SYSTEM_GAIN, value: 0.1 });
+        engine.render(&mut buf, 2);
+        assert!((engine.system_gain - 0.6).abs() < 1e-6);
+        // SetSystemAudio (tool path) publishes too.
+        bus.send(Command::SetSystemAudio { gain: 0.25 });
+        engine.render(&mut buf, 2);
+        assert!((pub_.lock().unwrap().system_gain - 0.25).abs() < 1e-6);
+        // A CC bound to the knob (CcTarget::Knob) reaches the same setter.
+        assert!(engine.apply_engine_param(sys, super::P_SYSTEM_GAIN, 1.0));
+        assert!((engine.system_gain - 1.0).abs() < 1e-6);
+    }
+
+    /// #19: one knob table — rack labels canonical, long names as aliases.
+    #[test]
+    fn knob_specs_resolve_rack_labels_and_aliases() {
+        use super::find_knob_spec;
+        use crate::control::DspKind;
+        let filter = NodeKind::Dsp(DspKind::Filter);
+        assert_eq!(find_knob_spec(&filter, "reso").and_then(|k| k.param), Some(1));
+        assert_eq!(find_knob_spec(&filter, "RESONANCE").map(|k| k.label), Some("RESO"));
+        let lim = NodeKind::Dsp(DspKind::Limiter);
+        // CEILING is the CEIL knob (param 0), never DRIVE (param 1).
+        assert_eq!(find_knob_spec(&lim, "CEILING").and_then(|k| k.param), Some(0));
+        assert_eq!(find_knob_spec(&lim, "DRIVE").and_then(|k| k.param), Some(1));
+        assert!(find_knob_spec(&lim, "THRESHOLD").is_none());
+        // Engine param names agree with the knob a param drives.
+        for dk in [DspKind::Delay, DspKind::Reverb, DspKind::Gain, DspKind::Filter, DspKind::Eq3,
+                   DspKind::Limiter, DspKind::Saturation, DspKind::Pan] {
+            let kind = NodeKind::Dsp(dk.clone());
+            for &(id, name) in super::dsp_param_choices(&dk) {
+                let spec = find_knob_spec(&kind, name).unwrap_or_else(|| panic!("{dk:?} '{name}' has no knob"));
+                assert_eq!(spec.param, Some(id), "{dk:?} '{name}'");
+            }
+        }
     }
 
     /// Two metronomes: M1 wired to the master (audible), M2 unwired. Returns

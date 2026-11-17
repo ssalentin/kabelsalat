@@ -8,6 +8,7 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Live agent run UI & rack animations:** docked assistant panel sizes cleanly to show >= 3 transcript turns at minimum window height, replaces static `"thinking…"` with an animated phase/route indicator (`Jev · deciding`, `DeepSeek · step N`, `Gemini · looking at the image`), renders tool action chips under user messages with rule-7 padding, outcome states (`Running`, `Done`, `NotApplied`, `Failed`), collapsing (`+N more`), and one-line run cost. Agent rack edits glide knobs visually (~200 ms, engine sound updated immediately), draw added cables in from source to destination, pulse touched unit highlights once and fade removed units/cables (all disabled when `ui_reduce_motion` is `true` in `config.json`), and fix faint zero-alpha `AGENT` badge boxes on untouched units. Extended `--demo-agent` (with `--demo-agent-anim` / `Shift+F12` replay) for full offline UI captures.
 - **Single-rig presets** (#34): save one rig (units, cables, knobs, plugin
   states, matrix routes, mix, name) as a named `.ksalat-rig` preset in
   `~/kabelsalat-rig-presets` and load it later as a new rig or replacing an

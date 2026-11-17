@@ -211,7 +211,10 @@ fn grid_coherence(onsets: &[f64], sample_rate: f64, hz: f64) -> f64 {
     (re * re + im * im).sqrt() / total
 }
 
-/// Rate (Hz) of the grid the onsets sit on: the lowest rate between 1 and
+/// Rate (Hz) of the grid the onsets sit on, between 1 and 20 Hz: the most
+/// coherent rate, stepped down to its lowest whole divisor that is about as
+/// coherent (onsets on a 4 Hz grid sit on 8 Hz too). Only divisors: "the
+/// lowest rate near the best" also caught harmonics of the 16-step pattern
 /// 20 Hz whose coherence is about as high as any (multiples match too).
 fn onset_grid_hz(onsets: &[f64], sample_rate: f64) -> f64 {
     const STEP_HZ: f64 = 0.005;
@@ -314,12 +317,26 @@ pub fn run_test() -> anyhow::Result<()> {
 
     // Tempo: 16th-note steps are 4 per beat at any tempo. The repeated 120
     // shows the run-to-run spread.
-    for bpm in [120.0f32, 60.0, 90.0, 120.0] {
+    for (run, bpm) in [120.0f32, 60.0, 90.0, 120.0].into_iter().enumerate() {
         bus.send(Command::SetBpm { bpm });
         bus.send(Command::TransportPlay);
-        let hz = onset_grid_hz(&hold_note(&mut engine, &mut bus, 14.0), SR);
+        let onsets = hold_note(&mut engine, &mut bus, 14.0);
+        let hz = onset_grid_hz(&onsets, SR);
         bus.send(Command::TransportStop);
         let steps = hz * 60.0 / bpm as f64;
+        // A rare failure read 1.24 steps per beat (#18) and has not recurred
+        // in 70+ runs: keep the evidence. `KABELSALAT_ONSET_DUMP=<dir>` saves
+        // every run for `grid_estimators_on_dumped_real_onsets`.
+        let dump_dir = std::env::var_os("KABELSALAT_ONSET_DUMP")
+            .map(std::path::PathBuf::from)
+            .or_else(|| ((steps - 4.0).abs() >= 0.04).then(std::env::temp_dir));
+        if let Some(dir) = dump_dir {
+            let bytes: Vec<u8> = onsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+            let path = dir.join(format!("{}-{bpm}-{run}.f64", std::process::id()));
+            if std::fs::write(&path, bytes).is_ok() {
+                println!("transport-test: onsets saved to {}", path.display());
+            }
+        }
         println!("transport-test: {bpm:>5.1} BPM → Surge's gates sit on a {hz:.3} Hz grid = {steps:.3} steps per beat");
         anyhow::ensure!(
             (steps - 4.0).abs() < 0.04,
@@ -417,6 +434,28 @@ pub fn run_test() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Real onsets dumped by `KABELSALAT_ONSET_DUMP=<dir> transport-test`:
+    /// the grid estimator against the step rate the file's BPM implies.
+    #[test]
+    #[ignore]
+    fn grid_estimators_on_dumped_real_onsets() {
+        let dir = std::env::var("KABELSALAT_ONSET_DUMP").expect("set KABELSALAT_ONSET_DUMP");
+        let (mut n, mut wrong) = (0, 0);
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            let bpm: f64 = p.file_name().unwrap().to_str().unwrap().split('-').nth(1).unwrap().parse().unwrap();
+            let bytes = std::fs::read(&p).unwrap();
+            let on: Vec<f64> = bytes.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+            let want = bpm * 4.0 / 60.0;
+            let got = onset_grid_hz(&on, SR);
+            n += 1;
+            if (got - want).abs() > 0.04 { wrong += 1; println!("wrong {}: {got} Hz, want {want}", p.display()); }
+        }
+        println!("dumps={n} wrong={wrong}");
+        assert_eq!(wrong, 0);
+    }
+
     use super::*;
 
     const SR: f64 = 48000.0;

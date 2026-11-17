@@ -573,6 +573,8 @@ pub struct GraphEngine {
     dsp: Vec<DspSlot>,
     lv2: Vec<Lv2Slot>,
     lv2_in: Vec<f32>,
+    /// Per-block scratch: which effects already ran (render step 2b).
+    fx_done: Vec<bool>,
     master_vol: f32,
     master_warm: f32,
     /// Master bus limiter (zero latency) in front of the warmth stage: many
@@ -721,6 +723,7 @@ impl GraphEngine {
             dsp,
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
+            fx_done: Vec::with_capacity(256),
             master_vol: 1.0,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
@@ -1078,6 +1081,38 @@ impl GraphEngine {
             };
             self.edge_levels.store(e.id, peak);
         }
+    }
+
+    /// The next effect to run: the first not-yet-run one whose wired effect
+    /// inputs have all run; in a feedback loop, the first not-yet-run one.
+    /// Allocation-free (linear scans over a handful of nodes).
+    fn next_effect(&self, n_dsp: usize, n_fx: usize) -> Option<usize> {
+        let node = |f: usize| if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
+        let mut first = None;
+        for f in 0..n_fx {
+            if self.fx_done[f] { continue; }
+            first.get_or_insert(f);
+            let waits = (0..n_fx).any(|g| {
+                g != f && !self.fx_done[g] && self.graph.has_route(node(g), node(f), PortKind::Audio)
+            });
+            if !waits { return Some(f); }
+        }
+        first
+    }
+
+    /// Sum every audio source wired into `dest` into `out` (stereo
+    /// interleaved). Allocation-free.
+    fn sum_audio_into(&self, dest: NodeId, out: &mut [f32]) {
+        out.fill(0.0);
+        let mut add = |src: NodeId, buf: &[f32]| {
+            if src != dest && self.graph.has_route(src, dest, PortKind::Audio) {
+                for (o, x) in out.iter_mut().zip(buf) { *o += *x; }
+            }
+        };
+        for v in &self.voices { if v.node != NodeId::MAX { add(v.node, &v.scratch); } }
+        for a in &self.audio_in { add(a.node, &a.buf); }
+        for d in &self.dsp { add(d.node, &d.buf); }
+        for l in &self.lv2 { add(l.node, &l.buf); }
     }
 
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
@@ -1930,31 +1965,6 @@ impl GraphEngine {
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
 
-        // 2. Each DSP node sums the instruments wired into it, then processes.
-        for d in &mut self.dsp {
-            if d.kind == DspKind::Metronome {
-                continue; // generated below from transport state, no inputs
-            }
-            for x in d.buf[..n2].iter_mut() {
-                *x = 0.0;
-            }
-            for v in &self.voices {
-                if self.graph.has_route(v.node, d.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        d.buf[i] += v.scratch[i];
-                    }
-                }
-            }
-            for a in &self.audio_in {
-                if self.graph.has_route(a.node, d.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        d.buf[i] += a.buf[i];
-                    }
-                }
-            }
-            d.proc.process(&mut d.buf[..n2], frames);
-        }
-
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
@@ -2018,27 +2028,32 @@ impl GraphEngine {
             }
         }
 
-        // 2b. LV2 effect nodes: sum wired instruments, process, hold output.
-        for slot in &mut self.lv2 {
-            for x in self.lv2_in[..n2].iter_mut() {
-                *x = 0.0;
+        // 2b. Effects — built-in DSP and LV2 alike — in signal-flow order,
+        // each summing EVERY audio source wired into it: instruments (CLAP and
+        // LV2), audio inputs, metronomes and other effects. Built-in effects
+        // used to hear only CLAP voices and audio inputs, and LV2 ran after
+        // them, so setBfree → Drive and Delay → Reverb were silent. A feedback
+        // loop reads the previous block's output of the effect not yet run.
+        let mut bus = std::mem::take(&mut self.lv2_in);
+        let n_dsp = self.dsp.len();
+        let n_fx = n_dsp + self.lv2.len();
+        self.fx_done.clear();
+        self.fx_done.extend((0..n_dsp).map(|i| self.dsp[i].kind == DspKind::Metronome));
+        self.fx_done.extend(std::iter::repeat(false).take(self.lv2.len()));
+        while let Some(f) = self.next_effect(n_dsp, n_fx) {
+            self.fx_done[f] = true;
+            let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
+            self.sum_audio_into(node, &mut bus[..n2]);
+            if f < n_dsp {
+                let d = &mut self.dsp[f];
+                d.buf[..n2].copy_from_slice(&bus[..n2]);
+                d.proc.process(&mut d.buf[..n2], frames);
+            } else {
+                let slot = &mut self.lv2[f - n_dsp];
+                slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
             }
-            for v in &self.voices {
-                if self.graph.has_route(v.node, slot.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        self.lv2_in[i] += v.scratch[i];
-                    }
-                }
-            }
-            for a in &self.audio_in {
-                if self.graph.has_route(a.node, slot.node, PortKind::Audio) {
-                    for i in 0..n2 {
-                        self.lv2_in[i] += a.buf[i];
-                    }
-                }
-            }
-            slot.plugin.process(&self.lv2_in[..n2], &mut slot.buf[..n2], frames);
         }
+        self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
         // Pull system-audio capture once per block (RT-safe ring pop).
@@ -2728,6 +2743,35 @@ mod tests {
             peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
         }
         peak
+    }
+
+    /// Effects hear every wired source, in signal-flow order whatever the
+    /// node order: Metronome → Gain A → Gain B → Master, with Gain B added
+    /// first. Built-in effects heard only CLAP voices and audio inputs, so
+    /// any chain of two effects (or LV2 → effect, like setBfree → Drive)
+    /// was silent at the master.
+    #[test]
+    fn effect_chains_reach_the_master_in_signal_order() {
+        use crate::control::DspKind;
+        let mut g = crate::control::Graph::default();
+        let gain_b = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN B"));
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+        let gain_a = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN A"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: gain_a, port: 0 }, PortKind::Audio);
+        g.connect_with_id(2, PortRef { node: gain_a, port: 0 }, PortRef { node: gain_b, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: gain_b, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        for n in [gain_a, gain_b] {
+            bus.send(Command::SetParam { node: n, param: 0, value: 0.9 });
+        }
+        bus.send(Command::SetNodePlaying { node: metro, playing: true });
+        let peak = peak_1s(&mut engine);
+        assert!(peak > 0.01, "the click passes two effects to the master: peak {peak}");
+        // A feedback loop (B → A) must not hang the render.
+        bus.send(Command::Connect { id: 4, from: PortRef { node: gain_b, port: 0 }, to: PortRef { node: gain_a, port: 0 }, kind: PortKind::Audio });
+        assert!(peak_1s(&mut engine).is_finite());
     }
 
     #[test]
@@ -3699,6 +3743,20 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     let legato_after = peak_over(&mut engine, 94);
     println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
     anyhow::ensure!(legato_after < legato * 0.01, "LV2 instrument {uri} leaves a legato note hanging (note-off and note-on in one block)");
+    // Through a built-in effect, like a live organ rig (setBfree → Drive →
+    // Master): the effect must hear the LV2 instrument.
+    let drive = master + 1;
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0 });
+    bus.send(Command::Disconnect(2));
+    bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
+    peak_over(&mut engine, 5);
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let through = peak_over(&mut engine, 47);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak_over(&mut engine, 100);
+    println!("lv2-instrument-engine-test: through a Saturation unit: master peak held={through:.4}");
+    anyhow::ensure!(through > 1e-3, "LV2 instrument {uri} → built-in effect → Master is silent");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
     Ok(())
 }

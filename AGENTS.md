@@ -345,6 +345,13 @@ Learned so far (2026-11-15, UI polish pass):
     the plugin's `rdf:type` decides; any other lv2core class means effect.
     The port guess (MIDI in + audio out) called 198 of 208 effects
     instruments; it is only the fallback for class-less plugins (#26).
+73. **Every effect hears every source wired into it, in signal order:**
+    built-in effects summed only CLAP voices and audio inputs, and LV2 ran
+    after them, so setBfree → Drive and any effect → effect chain were
+    silent at the master while the input cable still glowed. Render step
+    2b runs DSP and LV2 effects in one dependency order (`next_effect`)
+    and sums via `sum_audio_into`; add any new node type as a source there.
+    `lv2-instrument-engine-test` plays setBfree through a Saturation unit.
 
 ## Working on kabelsalat
 

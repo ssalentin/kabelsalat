@@ -74,6 +74,13 @@ reorder or collapse it; names and colours are saved with the session.
 
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
+### Navigate rigs, channels and plugins
+Press **Q** (or click **Navigator** in the top bar) to open the right-hand
+Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see
+every rig's channels in their mixer colours and unfold their plugin chains
+(**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
+and selects the unit in the rack or scrolls and flashes its strip in the mixer.
+
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be
 shaped: only some keys (keyboard splits), another MIDI channel, transposed, or

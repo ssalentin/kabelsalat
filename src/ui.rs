@@ -1330,7 +1330,7 @@ fn fit_stop_label(painter: &egui::Painter, name: &str, font: FontId, max_w: f32)
 /// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
 /// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
 /// Runs once per unit at galley-build time, never on the frame path.
-fn sentence_case(s: &str) -> String {
+pub(crate) fn sentence_case(s: &str) -> String {
     s.split_whitespace()
         .enumerate()
         .map(|(i, w)| {
@@ -1799,6 +1799,48 @@ enum DockView {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum NavFilter {
+    #[default]
+    Channels,
+    Plugins,
+    All,
+}
+
+impl NavFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Channels => "channels",
+            Self::Plugins => "plugins",
+            Self::All => "all",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "channels" => Some(Self::Channels),
+            "plugins" => Some(Self::Plugins),
+            "all" | "" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum NavRow {
+    Rig { rig: u8, name: String },
+    Channel { rig: u8, node: u32, label: String, color: Option<Color32> },
+    Plugin { rig: u8, node: u32, owner: u32, label: String, kind_label: &'static str },
+}
+
+/// How long a Navigator jump flashes its mixer strip.
+const NAV_FLASH_S: f32 = 1.4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavJumpTarget {
+    Node(u32),
+    Rig(u8),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum PluginCategory {
     #[default]
     All,
@@ -1944,6 +1986,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
+    "list_channels",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2182,6 +2225,7 @@ struct DemoApp {
     press: Option<(Hit, Pos2)>,
     pending: Option<Pending>,
     selected: Option<u32>,
+    selected_unit: Option<u32>,
     hover: Option<Hit>,
 
     key_leds: [f32; 13],
@@ -2447,6 +2491,16 @@ struct DemoApp {
     insert_pick: Option<Option<u32>>,
     /// Insert picker's filter text.
     insert_filter: String,
+    /// Navigator side panel (issue #108): hidden by default, never saved.
+    nav_open: bool,
+    nav_filter: NavFilter,
+    nav_folded: std::collections::HashSet<u32>,
+    nav_pan_target: Option<u32>,
+    mixer_scroll_target: Option<NavJumpTarget>,
+    mixer_flash: Option<(u32, f32)>,
+    nav_panel_rect: Rect,
+    nav_row_rects: Vec<(NavRow, Rect)>,
+    nav_chevron_rects: Vec<(u32, Rect)>,
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
     last_mix_rev: u64,
     /// Last adopted `GraphPub::meter_rev` (engine master-meter publication,
@@ -2693,6 +2747,7 @@ impl DemoApp {
             press: None,
             pending: None,
             selected: None,
+            selected_unit: None,
             hover: None,
             key_leds: [0.0; 13],
             note_leds: [0.0; 128],
@@ -2840,6 +2895,15 @@ impl DemoApp {
             strip_color_pick: None,
             insert_pick: None,
             insert_filter: String::new(),
+            nav_open: false,
+            nav_filter: NavFilter::Channels,
+            nav_folded: std::collections::HashSet::new(),
+            nav_pan_target: None,
+            mixer_scroll_target: None,
+            mixer_flash: None,
+            nav_panel_rect: Rect::NOTHING,
+            nav_row_rects: Vec::new(),
+            nav_chevron_rects: Vec::new(),
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
@@ -3017,12 +3081,18 @@ impl DemoApp {
         self.compute_groups();
         // Reset interaction state that referenced the old rack.
         self.selected = None;
+        self.selected_unit = None;
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
         self.knob_menu = None;
         self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
+        self.nav_pan_target = None;
+        self.mixer_scroll_target = None;
+        self.mixer_flash = None;
+        let live_nodes: std::collections::HashSet<u32> = self.units.iter().map(|u| u.node_id).collect();
+        self.nav_folded.retain(|id| live_nodes.contains(id));
         self.graph_sig.clear(); // force shared-graph re-mirror
         self.prewarm_sound_libraries();
         // No load_fade reset here: build_rack also serves sync adoptions
@@ -3143,6 +3213,7 @@ impl DemoApp {
         self.compute_groups();
         // Interaction state referenced the old view's geometry.
         self.selected = None;
+        self.selected_unit = None;
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
@@ -3338,13 +3409,11 @@ impl DemoApp {
                 (&["Ctrl", "drag"], "a unit to rearrange the rack"),
                 (&["click"], "a cable to select its path"),
                 (&["Del"], "remove the selected cable"),
-                (&["F9"], "plugin browser"),
+                (&["B", "F9"], "plugin browser"),
                 (&["M", "F10"], "mixer view (sources → rig bus → master)"),
-                (&["N"], "MIDI matrix view (also F11)"),
-                (&["C"], "chat with the assistant (also F12)"),
-                (&["B"], "plugin browser (also F9)"),
-                (&["F11"], "MIDI matrix view"),
-                (&["F12"], "assistant"),
+                (&["N", "F11"], "MIDI matrix view"),
+                (&["C", "F12"], "chat with the assistant"),
+                (&["Q"], "navigator side list (rigs, channels & plugins)"),
                 (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
             ]),
@@ -4443,6 +4512,7 @@ impl DemoApp {
             "get_graph" => "Read rack graph".into(),
             "get_status" => "Check status".into(),
             "get_rigs" => "List rigs".into(),
+            "list_channels" => "List channels".into(),
             "measure_mix" => "Measure mix".into(),
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
@@ -6561,6 +6631,13 @@ impl DemoApp {
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
+            "list_channels" => {
+                let raw = args.get("filter").and_then(|v| v.as_str()).unwrap_or("all");
+                let Some(filter) = NavFilter::parse(raw) else {
+                    return format!("list_channels: unknown filter '{raw}' (use channels | plugins | all)");
+                };
+                self.channels_json(filter).to_string()
+            }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
@@ -8349,6 +8426,391 @@ impl DemoApp {
         chain
     }
 
+    fn node_plugin_info(&self, unit: usize) -> Option<(String, &'static str)> {
+        let u = self.units.get(unit)?;
+        let kind = &self.base_graph.nodes.iter().find(|n| n.id == u.node_id)?.kind;
+        match kind {
+            NodeKind::Clap { plugin_id } => {
+                let label = self.plugin_display_name(&name_str(plugin_id))
+                    .unwrap_or_else(|| sentence_case(&u.name));
+                Some((label, "CLAP"))
+            }
+            NodeKind::Lv2 { .. } => Some((sentence_case(&u.name), "LV2")),
+            NodeKind::Dsp(_) | NodeKind::Arp | NodeKind::SystemAudio => Some((sentence_case(&u.name), "built-in")),
+            NodeKind::AudioIn { .. } | NodeKind::Keys | NodeKind::MasterOut => None,
+        }
+    }
+
+    fn channel_plugins(&self, unit: usize) -> Vec<(u32, String, &'static str)> {
+        let Some(u) = self.units.get(unit) else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some((label, kind_label)) = self.node_plugin_info(unit) {
+            out.push((u.node_id, label, kind_label));
+        }
+        for fx in self.strip_chain(unit).unwrap_or_default() {
+            if let (Some(fu), Some((label, kind_label))) = (self.units.get(fx), self.node_plugin_info(fx)) {
+                out.push((fu.node_id, label, kind_label));
+            }
+        }
+        out
+    }
+
+    /// Rigs, their source channels and each channel's plugin chain, as the
+    /// Navigator and `list_channels` show them (#108). Folds are the
+    /// panel's business, so the agent always sees every row.
+    fn nav_rows(&self, filter: NavFilter) -> Vec<NavRow> {
+        let mut out = Vec::new();
+        for r in 0..self.rig_count() {
+            let rig = r as u8;
+            let rig_name = self.rig_name(r);
+            let sources = self.rig_strip_sources(rig);
+            let mut rig_rows = Vec::new();
+            for unit in sources {
+                let u = &self.units[unit];
+                let node = u.node_id;
+                let label = sentence_case(&u.name);
+                let color = self.strip_row(node).color;
+                let plugins = match filter {
+                    NavFilter::Channels => Vec::new(),
+                    NavFilter::Plugins | NavFilter::All => self.channel_plugins(unit),
+                };
+                if filter == NavFilter::Plugins && plugins.is_empty() {
+                    continue;
+                }
+                rig_rows.push(NavRow::Channel { rig, node, label, color });
+                rig_rows.extend(plugins.into_iter().map(|(pnode, plabel, kind_label)| NavRow::Plugin {
+                    rig, node: pnode, owner: node, label: plabel, kind_label,
+                }));
+            }
+            if filter == NavFilter::Plugins && rig_rows.is_empty() {
+                continue;
+            }
+            out.push(NavRow::Rig { rig, name: rig_name });
+            out.extend(rig_rows);
+        }
+        out
+    }
+
+    fn pan_rack_to_unit(&mut self, node: u32) {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node) else { return };
+        if !self.visible(ui) { return; }
+        let Some(&r) = self.unit_rects.get(ui) else { return };
+        if !r.is_positive() || !r.min.is_finite() || !r.max.is_finite() { return; }
+        let ov = self.rack_overflow;
+        if ov.x <= 0.0 && ov.y <= 0.0 { return; }
+        let c = r.center();
+        let target = Vec2::new(self.rack_w * 0.5 - c.x, self.rack_h * 0.5 - c.y);
+        self.rack_pan = Vec2::new(
+            target.x.clamp(-ov.x * 0.5, ov.x * 0.5),
+            target.y.clamp(-ov.y * 0.5, ov.y * 0.5),
+        );
+    }
+
+    /// Switch to the row's rig, then select + pan to its unit (rack) or
+    /// scroll to + flash its strip (mixer). The pan waits for the next
+    /// layout: the rig switch regroups the rack.
+    fn nav_jump(&mut self, row: &NavRow) {
+        let (rig, unit, strip) = match *row {
+            NavRow::Rig { rig, .. } => {
+                let first = self.rig_strip_sources(rig).first().map(|&u| self.units[u].node_id);
+                (rig, None, first.map_or(NavJumpTarget::Rig(rig), NavJumpTarget::Node))
+            }
+            NavRow::Channel { rig, node, .. } => (rig, Some(node), NavJumpTarget::Node(node)),
+            NavRow::Plugin { rig, node, owner, .. } => (rig, Some(node), NavJumpTarget::Node(owner)),
+        };
+        self.set_active_rig(rig as usize);
+        self.selected_unit = unit;
+        self.nav_pan_target = unit;
+        if unit.is_none() { self.rack_pan = Vec2::ZERO; }
+        if self.stage_view == StageView::Mixer {
+            self.mixer_scroll_target = Some(strip);
+            if let NavJumpTarget::Node(n) = strip { self.mixer_flash = Some((n, self.ui_time + NAV_FLASH_S)); }
+        }
+    }
+
+    fn channels_json(&self, filter: NavFilter) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self.nav_rows(filter).into_iter().map(|row| match row {
+            NavRow::Rig { rig, name } => serde_json::json!({
+                "type": "rig",
+                "rig": rig,
+                "name": name,
+            }),
+            NavRow::Channel { rig, node, label, color } => serde_json::json!({
+                "type": "channel",
+                "rig": rig,
+                "node": node,
+                "label": label,
+                "color": color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())),
+            }),
+            NavRow::Plugin { rig, node, owner, label, kind_label } => serde_json::json!({
+                "type": "plugin",
+                "rig": rig,
+                "node": node,
+                "owner": owner,
+                "label": label,
+                "kind": kind_label,
+            }),
+        }).collect();
+        serde_json::json!({
+            "filter": filter.as_str(),
+            "active_rig": self.active_rig,
+            "rows": rows,
+        })
+    }
+
+    /// One line of `text` cut to `max_w` with an ellipsis (size kept).
+    fn ellipsized(painter: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
+        let measure = |t: &str, size: f32| painter.layout_no_wrap(t.to_owned(), FontId::new(size, font.family.clone()), color).size().x;
+        let (t, _) = fit_label(text, font.size, font.size, max_w, measure);
+        painter.layout_no_wrap(t, font, color)
+    }
+
+    fn navigator_panel_ui(&mut self, root: &mut egui::Ui) {
+        if !self.nav_open {
+            self.nav_panel_rect = Rect::NOTHING;
+            self.nav_row_rects.clear();
+            self.nav_chevron_rects.clear();
+            return;
+        }
+        let win_w = root.ctx().content_rect().width().max(320.0);
+        let nav_w = (win_w * 0.22).clamp(216.0, 268.0).round();
+        self.nav_row_rects.clear();
+        self.nav_chevron_rects.clear();
+        let mut close = false;
+        let mut jump: Option<NavRow> = None;
+        let mut toggle_fold: Option<u32> = None;
+        let resp = egui::Panel::right("navigator")
+            .exact_size(nav_w)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
+            )
+            .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let avail_w = ui.available_width().max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        theme::section_label(ui, "Navigator");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "×", false).on_hover_text("hide navigator (Q)").clicked() {
+                                close = true;
+                            }
+                        });
+                    },
+                );
+                ui.add_space(4.0);
+                // Segmented filter: CHANNELS | PLUGINS | ALL (tomato only for selected).
+                egui::Frame::new()
+                    .fill(theme::PAPER_SINK)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(2.0)
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        let inner_w = ui.available_width().max(120.0);
+                        let segs = [
+                            ("CHANNELS", NavFilter::Channels),
+                            ("PLUGINS", NavFilter::Plugins),
+                            ("ALL", NavFilter::All),
+                        ];
+                        let font = theme::medium_font(10.0);
+                        let natural: Vec<f32> = segs.iter()
+                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 14.0)
+                            .collect();
+                        let sum: f32 = natural.iter().sum();
+                        let extra = ((inner_w - sum).max(0.0)) / segs.len() as f32;
+                        let widths: Vec<f32> = natural.iter().map(|w| (w + extra).floor()).collect();
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for ((lbl, f), w) in segs.iter().zip(widths) {
+                                let on = self.nav_filter == *f;
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2((w - 1.5).max(28.0), 24.0), egui::Sense::click());
+                                let hov = resp.hovered();
+                                let fill = if on {
+                                    theme::ACCENT_DEEP
+                                } else if hov {
+                                    theme::DARK_PANEL_HI
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let txt = if on {
+                                    theme::ON_ACCENT
+                                } else if hov {
+                                    theme::CREAM
+                                } else {
+                                    theme::CREAM_MID
+                                };
+                                ui.painter().rect_filled(rect, 2.0, fill);
+                                let g = ui.painter().layout_no_wrap((*lbl).into(), font.clone(), txt);
+                                ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
+                                if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                if resp.clicked() { self.nav_filter = *f; }
+                            }
+                        });
+                    });
+                ui.add_space(4.0);
+                Self::stage_hairline(ui);
+                ui.add_space(4.0);
+                let rows = self.nav_rows(self.nav_filter);
+                let scroll_h = ui.available_height().max(1.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("navigator_scroll")
+                    .min_scrolled_height(scroll_h)
+                    .max_height(scroll_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let row_w = ui.available_width().max(100.0);
+                        for (i, row) in rows.iter().enumerate() {
+                            match row {
+                                NavRow::Rig { rig, name } => {
+                                    let active = *rig as usize == self.active_rig;
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, 24.0), egui::Sense::click());
+                                    let hov = resp.hovered();
+                                    if hov {
+                                        ui.painter().rect_filled(rect, 2.0, theme::DARK_PANEL_HI);
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if active {
+                                        let bar = Rect::from_min_size(Pos2::new(rect.left() + 2.0, rect.top() + 5.0), egui::vec2(2.0, rect.height() - 10.0));
+                                        ui.painter().rect_filled(bar, 1.0, theme::ACCENT);
+                                    }
+                                    let col = if active { theme::INK } else { theme::INK_2 };
+                                    let g = Self::ellipsized(
+                                        ui.painter(),
+                                        &format!("{} · {name}", rig + 1),
+                                        theme::medium_font(11.5),
+                                        col,
+                                        (rect.width() - 16.0).max(16.0),
+                                    );
+                                    ui.painter().galley(Pos2::new(rect.left() + 10.0, rect.center().y - g.size().y * 0.5), g, col);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if resp.clicked() { jump = Some(row.clone()); }
+                                }
+                                NavRow::Channel { rig, node, label, color } => {
+                                    let selected = *rig as usize == self.active_rig && self.selected_unit == Some(*node);
+                                    let has_plugins = matches!(rows.get(i + 1), Some(NavRow::Plugin { owner, .. }) if owner == node);
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 28.0), egui::Sense::hover());
+                                    let (chev_rect, body_rect) = if has_plugins {
+                                        let cr = Rect::from_min_size(Pos2::new(rect.left() + 4.0, rect.top()), egui::vec2(20.0, rect.height()));
+                                        let br = Rect::from_min_max(Pos2::new(cr.right(), rect.top()), rect.max);
+                                        (Some(cr), br)
+                                    } else {
+                                        (None, rect)
+                                    };
+                                    let chev_resp = chev_rect.map(|cr| ui.interact(cr, egui::Id::unique(("nav_chev", *node)), egui::Sense::click()));
+                                    let body_resp = ui.interact(body_rect, egui::Id::unique(("nav_chan", *node)), egui::Sense::click());
+                                    let chev_hov = chev_resp.as_ref().is_some_and(|r| r.hovered());
+                                    let row_hov = body_resp.hovered() || chev_hov;
+                                    if row_hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                    let fill = match color {
+                                        Some(c) => theme::alpha(*c, if row_hov { 0.28 } else { 0.17 }),
+                                        None => if row_hov { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06) } else { theme::DARK_PANEL_HI },
+                                    };
+                                    let border = if selected {
+                                        theme::ACCENT
+                                    } else if let Some(c) = color {
+                                        theme::alpha(*c, 0.55)
+                                    } else {
+                                        theme::HAIRLINE
+                                    };
+                                    ui.painter().rect_filled(rect, 4.0, fill);
+                                    ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                    if let Some(c) = color {
+                                        let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(3.0, rect.height() - 6.0));
+                                        ui.painter().rect_filled(spine, 1.5, *c);
+                                    } else if selected {
+                                        let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(3.0, rect.height() - 6.0));
+                                        ui.painter().rect_filled(spine, 1.5, theme::ACCENT);
+                                    }
+                                    if let Some(cr) = chev_rect {
+                                        let folded = self.nav_folded.contains(node);
+                                        let gcol = if chev_hov { theme::CREAM } else { theme::CREAM_MID };
+                                        // Painted, not a glyph: the UI font has no ▸/▾.
+                                        let c = cr.center();
+                                        let pts = if folded {
+                                            vec![c + Vec2::new(-2.0, -4.0), c + Vec2::new(3.0, 0.0), c + Vec2::new(-2.0, 4.0)]
+                                        } else {
+                                            vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(4.0, -2.0), c + Vec2::new(0.0, 3.0)]
+                                        };
+                                        ui.painter().add(egui::Shape::convex_polygon(pts, gcol, Stroke::NONE));
+                                        self.nav_chevron_rects.push((*node, cr));
+                                    }
+                                    let text_x = if has_plugins { rect.left() + 26.0 } else { rect.left() + 10.0 };
+                                    let max_w = (rect.right() - 8.0 - text_x).max(16.0);
+                                    let g = Self::ellipsized(ui.painter(), label, theme::medium_font(12.5), theme::CREAM, max_w);
+                                    ui.painter().galley(Pos2::new(text_x, rect.center().y - g.size().y * 0.5), g, theme::CREAM);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if chev_resp.as_ref().is_some_and(|r| r.clicked()) {
+                                        toggle_fold = Some(*node);
+                                    } else if body_resp.clicked() {
+                                        jump = Some(row.clone());
+                                    }
+                                }
+                                NavRow::Plugin { owner, .. } if self.nav_folded.contains(owner) => {}
+                                NavRow::Plugin { rig, node, owner, label, kind_label } => {
+                                    let selected = *rig as usize == self.active_rig && self.selected_unit == Some(*node);
+                                    let bypassed = self.strip_row(*node).bypass;
+                                    let (slot, _) = ui.allocate_exact_size(egui::vec2(row_w, 24.0), egui::Sense::hover());
+                                    let gx = slot.left() + 7.0;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(gx, slot.top() - 2.0), Pos2::new(gx, slot.bottom() + 2.0)],
+                                        Stroke::new(1.0, theme::HAIRLINE),
+                                    );
+                                    let rect = Rect::from_min_max(Pos2::new(slot.left() + 14.0, slot.top()), slot.max);
+                                    let resp = ui.interact(rect, egui::Id::unique(("nav_plug", *owner, *node)), egui::Sense::click());
+                                    let hov = resp.hovered();
+                                    if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                    let fill = if hov { theme::DARK_PANEL_HI } else { theme::PAPER_SINK };
+                                    let border = if selected { theme::ACCENT } else { theme::HAIRLINE };
+                                    ui.painter().rect_filled(rect, 3.0, fill);
+                                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                    let icon_c = Pos2::new(rect.left() + 11.0, rect.center().y);
+                                    let icon_col = if selected { theme::ACCENT } else if bypassed { theme::MUTED } else { theme::CREAM_MID };
+                                    match *kind_label {
+                                        "CLAP" => {
+                                            ui.painter().rect_filled(Rect::from_center_size(icon_c, egui::vec2(7.0, 7.0)), 1.5, icon_col);
+                                            ui.painter().circle_filled(icon_c, 1.3, theme::DARK_PANEL);
+                                        }
+                                        "LV2" => {
+                                            ui.painter().circle_stroke(icon_c, 3.2, Stroke::new(1.4, icon_col));
+                                        }
+                                        _ => {
+                                            ui.painter().rect_filled(Rect::from_center_size(icon_c, egui::vec2(5.5, 5.5)), 1.0, icon_col);
+                                        }
+                                    }
+                                    let kg = ui.painter().layout_no_wrap((*kind_label).into(), FontId::proportional(9.5), theme::CREAM_DIM);
+                                    let kx = rect.right() - 8.0 - kg.size().x;
+                                    ui.painter().galley(Pos2::new(kx, rect.center().y - kg.size().y * 0.5), kg, theme::CREAM_DIM);
+                                    let name_x = rect.left() + 20.0;
+                                    let name_col = if bypassed { theme::CREAM_DIM } else { theme::CREAM };
+                                    let max_w = (kx - 6.0 - name_x).max(16.0);
+                                    let ng = Self::ellipsized(ui.painter(), label, FontId::proportional(11.5), name_col, max_w);
+                                    ui.painter().galley(Pos2::new(name_x, rect.center().y - ng.size().y * 0.5), ng, name_col);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if resp.clicked() { jump = Some(row.clone()); }
+                                }
+                            }
+                        }
+                    });
+            });
+        self.nav_panel_rect = resp.response.rect;
+        if let Some(node) = toggle_fold {
+            if !self.nav_folded.remove(&node) {
+                self.nav_folded.insert(node);
+            }
+        }
+        if let Some(row) = jump {
+            self.nav_jump(&row);
+        }
+        if close {
+            self.nav_open = false;
+        }
+    }
+
     /// A source's live audio level for its strip meter (post-fader, rule 53):
     /// the published per-edge peak of its outgoing audio cables; without an
     /// engine the MIDI activity LED stands in (demo).
@@ -9380,6 +9842,11 @@ impl DemoApp {
                     ui.painter().rect_stroke(group.expand(3.0), 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
                     self.dock_group_rect = group;
                     if let Some(d) = dock { self.toggle_dock(d); }
+                    if !compact { ui.add_space(8.0); } else { ui.add_space(2.0); }
+                    // Compact: the short label keeps SYNC inside a 760 pt window.
+                    let nav = theme::chip_button(ui, if compact { "Nav" } else { "Navigator" }, self.nav_open)
+                        .on_hover_text("Navigator · key Q");
+                    if nav.clicked() { self.nav_open = !self.nav_open; }
                     // External agent (MCP --attach): visible while it acts,
                     // one click pauses it (Bravo item 7, without a per-start
                     // consent prompt — the user drives the app from outside).
@@ -13811,6 +14278,9 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::B) {
                 self.toggle_stage(StageView::Plugins);
             }
+            if i.consume_key(Modifiers::NONE, Key::Q) {
+                self.nav_open = !self.nav_open;
+            }
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.toggle_stage(StageView::Mixer);
             }
@@ -13829,7 +14299,7 @@ impl DemoApp {
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
                 else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
-                else { self.selected = None; }
+                else { self.selected = None; self.selected_unit = None; }
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
                 if let Some(sel) = self.selected {
@@ -14302,9 +14772,11 @@ impl DemoApp {
                             self.ping_unit(ui);
                         }
                     }
-                    Some(Hit::Background) | None => {
+                    // A release over a side panel (the Navigator's own row
+                    // click) must not clear the selection it just made.
+                    Some(Hit::Background) | None if rect.contains(s) => {
                         if self.pending.is_some() { self.pending = None; }
-                        else { self.selected = None; }
+                        else { self.selected = None; self.selected_unit = None; }
                     }
                     _ => {}
                 }
@@ -14335,7 +14807,6 @@ impl DemoApp {
             }
         };
         ctx.set_cursor_icon(icon);
-        let _ = rect;
     }
 
     // -- drawing ----------------------------------------------------------
@@ -14817,6 +15288,17 @@ impl DemoApp {
             }
         });
         let rect = strip.response.rect;
+        if self.mixer_scroll_target == Some(NavJumpTarget::Node(node)) {
+            ui.scroll_to_rect_animation(rect, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+            self.mixer_scroll_target = None;
+        }
+        if let Some((flash_node, exp)) = self.mixer_flash {
+            if flash_node == node && self.ui_time < exp {
+                let t = ((exp - self.ui_time) / NAV_FLASH_S).clamp(0.0, 1.0);
+                ui.painter().rect_filled(rect.expand(3.0), 4.0, theme::alpha(theme::ACCENT, 0.14 * t));
+                ui.painter().rect_stroke(rect.expand(3.0), 4.0, Stroke::new(2.0, theme::alpha(theme::ACCENT, t)), egui::StrokeKind::Inside);
+            }
+        }
         // The colour spine (#77): a 3px stripe down the strip's left edge.
         if let Some(c) = row.color {
             let spine = Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
@@ -14835,7 +15317,7 @@ impl DemoApp {
         let mut m = self.rig_mix[rig.min(7)];
         let mut vol = m.vol;
         let old = (m.vol, m.pan, m.mute, m.solo);
-        ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+        let bus_resp = ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.set_width(STRIP_W);
             ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
             theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.12, theme::INK_2);
@@ -14870,6 +15352,10 @@ impl DemoApp {
                 if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; }
             });
         });
+        if self.mixer_scroll_target == Some(NavJumpTarget::Rig(rig as u8)) {
+            ui.scroll_to_rect_animation(bus_resp.response.rect, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+            self.mixer_scroll_target = None;
+        }
         let changed = (m.vol, m.pan, m.mute, m.solo) != old || vol != old.0;
         if changed {
             m.vol = vol;
@@ -15448,6 +15934,7 @@ impl DemoApp {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let unit_selected = self.selected_unit == Some(u.node_id);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
@@ -15456,7 +15943,7 @@ impl DemoApp {
             // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
-            if dragging {
+            if dragging || unit_selected {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
                 let sw = 1.8 + 1.4 * pulse;
@@ -15473,7 +15960,7 @@ impl DemoApp {
             // touched by an agent. Activity is the LED's job alone — the
             // strip no longer flashes with it (one signal, not two).
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
-            let strip_col = if dragging {
+            let strip_col = if dragging || unit_selected {
                 theme::ACCENT
             } else if agent_t > 0.01 {
                 mix(BORDER, theme::AGENT_COLOR, agent_t)
@@ -16663,13 +17150,14 @@ impl DemoApp {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let unit_selected = self.selected_unit == Some(u.node_id);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
-            if dragging {
+            if dragging || unit_selected {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
                 let sw = 1.8 + 1.4 * pulse;
@@ -16681,7 +17169,7 @@ impl DemoApp {
                 let rule = mix(BORDER, theme::ACCENT, ht);
                 painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
-            let active = u.led > 0.05 || dragging;
+            let active = u.led > 0.05 || dragging || unit_selected;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             let strip_col = if active {
                 theme::ACCENT
@@ -17402,6 +17890,7 @@ impl DemoApp {
         }
         self.load_fade < 1.0
             || self.tap_flash_t > 0.0
+            || self.mixer_flash.is_some_and(|(_, exp)| self.ui_time < exp)
             || !self.fading_units.is_empty()
             || !self.fading_cables.is_empty()
             || self.units.iter().any(|u| u.knobs.iter().any(|k| k.glide_t < 1.0))
@@ -17466,6 +17955,7 @@ impl DemoApp {
         self.rig_inputs_panel(ui);
         self.rig_overview_panel(ui);
         self.dock_panel_ui(ui);
+        self.navigator_panel_ui(ui);
 
         // Native rig editor (task-26): handle open/close requests from unit
         // double-clicks. No X11 — the editor is a plain egui window drawn below.
@@ -17568,6 +18058,14 @@ impl DemoApp {
         self.sync_main_knobs();
         self.sync_aeolus_faces();
         self.layout(rect);
+        if let Some(node) = self.nav_pan_target.take() {
+            let old_pan = self.rack_pan;
+            self.pan_rack_to_unit(node);
+            self.xf.center += self.rack_pan - old_pan;
+        }
+        if self.mixer_flash.is_some_and(|(_, exp)| self.ui_time >= exp) {
+            self.mixer_flash = None;
+        }
         self.fit_plugin_knobs();
         if !typing(&ctx) {
             self.handle_input(&ctx, rect);
@@ -26693,4 +27191,340 @@ mod arp_tests {
         assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(want));
     }
 
+}
+
+/// Navigator side panel (issue #108): data projection, rig switching + rack/mixer
+/// jump, layout floor at 760x520, and `list_channels` agent parity.
+#[cfg(test)]
+mod navigator_tests {
+    use super::*;
+    use crate::control::{name_bytes, PortRef};
+
+    fn run_frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        out.shapes
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+        let ptr = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame_at(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame_at(app, ctx, size, vec![ptr(true)]);
+        run_frame_at(app, ctx, size, vec![ptr(false)]);
+    }
+
+    fn key_ev(key: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// Two rigs with linear inserts (and optional bare Audio In on Rig A).
+    fn two_rigs_with_inserts(with_audio_in: bool) -> (DemoApp, [u32; 2]) {
+        let mut rig_a = Graph::default();
+        rig_a.reserve(8, 8);
+        let ka = rig_a.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let sa = rig_a.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let da = rig_a.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let va = rig_a.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let ma = rig_a.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        rig_a.connect_with_id(1, PortRef { node: ka, port: 0 }, PortRef { node: sa, port: 0 }, CPortKind::Midi);
+        rig_a.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: da, port: 0 }, CPortKind::Audio);
+        rig_a.connect_with_id(3, PortRef { node: da, port: 0 }, PortRef { node: va, port: 0 }, CPortKind::Audio);
+        rig_a.connect_with_id(4, PortRef { node: va, port: 0 }, PortRef { node: ma, port: 0 }, CPortKind::Audio);
+        if with_audio_in {
+            let ain = rig_a.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("AUDIO IN"));
+            rig_a.connect_with_id(5, PortRef { node: ain, port: 0 }, PortRef { node: ma, port: 0 }, CPortKind::Audio);
+        }
+
+        let mut rig_b = Graph::default();
+        rig_b.reserve(8, 8);
+        let kb = rig_b.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let sb = rig_b.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let sat = rig_b.add_node(NodeKind::Dsp(DspKind::Saturation), name_bytes("SATURATION"));
+        let mb = rig_b.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        rig_b.connect_with_id(1, PortRef { node: kb, port: 0 }, PortRef { node: sb, port: 0 }, CPortKind::Midi);
+        rig_b.connect_with_id(2, PortRef { node: sb, port: 0 }, PortRef { node: sat, port: 0 }, CPortKind::Audio);
+        rig_b.connect_with_id(3, PortRef { node: sat, port: 0 }, PortRef { node: mb, port: 0 }, CPortKind::Audio);
+
+        let rigs = vec![
+            crate::control::Rig::new("Lead", rig_a, None),
+            crate::control::Rig::new("Bass", rig_b, None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&merged, &[]);
+        app.session_rig_names = vec!["Lead".into(), "Bass".into()];
+        if let Ok(mut s) = app.rig_snapshot.lock() {
+            s.rigs = vec![
+                crate::control::RigMeta { name: "Lead".into(), midi_device: None },
+                crate::control::RigMeta { name: "Bass".into(), midi_device: None },
+            ];
+            s.active = 0;
+        }
+        let claps: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        assert_eq!(claps.len(), 2);
+        app.apply_strip_name(claps[0], "Hammond").unwrap();
+        app.apply_strip_name(claps[1], "Sub bass").unwrap();
+        app.with_strip_row(claps[0], |row| row.color = Some(theme::CABLE_AMBER));
+        app.with_strip_row(claps[1], |row| row.color = Some(theme::CABLE_ROSE));
+        (app, [claps[0], claps[1]])
+    }
+
+    #[test]
+    fn nav_rows_for_two_rigs_with_inserts_under_each_filter() {
+        let (mut app, [na, nb]) = two_rigs_with_inserts(true);
+
+        // Channels: both rigs, all channels including Audio in (no plugins).
+        let ch = app.nav_rows(NavFilter::Channels);
+        assert_eq!(ch, vec![
+            NavRow::Rig { rig: 0, name: "Lead".into() },
+            NavRow::Channel { rig: 0, node: na, label: "Hammond".into(), color: Some(theme::CABLE_AMBER) },
+            NavRow::Channel { rig: 0, node: 5, label: "Audio in".into(), color: None },
+            NavRow::Rig { rig: 1, name: "Bass".into() },
+            NavRow::Channel { rig: 1, node: nb, label: "Sub bass".into(), color: Some(theme::CABLE_ROSE) },
+        ]);
+
+        // Plugins: skips Audio in (0 plugins), unfolds Hammond & Sub bass.
+        let pl = app.nav_rows(NavFilter::Plugins);
+        assert!(!pl.iter().any(|r| matches!(r, NavRow::Channel { label, .. } if label == "Audio in")), "Plugins skips plugin-less channels: {pl:?}");
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Surge XT" && *kind_label == "CLAP")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Delay" && *kind_label == "built-in")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Reverb" && *kind_label == "built-in")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 1, owner, label, kind_label, .. } if *owner == nb && label == "Saturation" && *kind_label == "built-in")));
+
+        // All: keeps Audio in AND unfolds plugins.
+        let all = app.nav_rows(NavFilter::All);
+        assert!(all.iter().any(|r| matches!(r, NavRow::Channel { label, .. } if label == "Audio in")));
+        assert!(all.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, .. } if *owner == na)));
+        assert!(all.iter().any(|r| matches!(r, NavRow::Plugin { rig: 1, owner, .. } if *owner == nb)));
+
+        // A fold is the panel's: the agent still gets every row.
+        app.nav_folded.insert(na);
+        assert_eq!(app.nav_rows(NavFilter::Plugins), pl);
+
+        assert!(tool_is_read_only("list_channels"));
+        let json: serde_json::Value = serde_json::from_str(&app.exec_tool("list_channels", &serde_json::json!({"filter": "plugins"}))).unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), app.nav_rows(NavFilter::Plugins).len());
+    }
+
+    #[test]
+    fn clicking_channel_row_of_rig_b_switches_rig_and_selects_unit() {
+        let (mut app, [na, nb]) = two_rigs_with_inserts(false);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+
+        assert!(!app.nav_open, "Navigator is hidden by default");
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+
+        // Toggle open via Q shortcut.
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Q));
+        assert!(app.nav_open, "Q opens Navigator");
+        run_frame_at(&mut app, &ctx, size, vec![]);
+
+        // Click Rig B's channel row.
+        let rig_b_pos = app.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { rig: 1, node, .. } if *node == nb).then(|| rect.center()))
+            .expect("Rig B channel row in Navigator");
+        click_at(&mut app, &ctx, size, rig_b_pos);
+        assert_eq!(app.active_rig, 1, "clicking Rig B channel switches to Rig B");
+        assert_eq!(app.selected_unit, Some(nb), "clicking channel selects its unit");
+        assert_eq!(app.rig_snapshot.lock().unwrap().active, 1, "rig_snapshot stayed in sync");
+
+        // Switch to Plugins filter via UI click, fold Rig B via its chevron.
+        let plugins_pos = Pos2::new(app.nav_panel_rect.center().x, app.nav_panel_rect.top() + 50.0);
+        click_at(&mut app, &ctx, size, plugins_pos);
+        assert_eq!(app.nav_filter, NavFilter::Plugins);
+        let chev = app.nav_chevron_rects.iter().find_map(|&(n, r)| (n == nb).then(|| r.center())).expect("Rig B chevron");
+        assert!(app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Plugin { owner, .. } if *owner == nb)));
+        click_at(&mut app, &ctx, size, chev);
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        assert!(app.nav_folded.contains(&nb), "chevron folds channel");
+        assert!(!app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Plugin { owner, .. } if *owner == nb)),
+            "a folded channel draws no plugin rows");
+        assert!(app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Channel { node, .. } if *node == nb)));
+        assert_eq!(app.selected_unit, Some(nb), "folding chevron does not clear selection");
+
+        // Rack shortcuts keep working while Navigator is open (rule 12).
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Num1));
+        assert_eq!(app.active_rig, 0);
+        let _ = na;
+
+        // Esc clears selection when in Rack view.
+        app.selected_unit = Some(na);
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Escape));
+        assert_eq!(app.selected_unit, None);
+    }
+
+    #[test]
+    fn clicking_in_mixer_view_scrolls_and_flashes_strip() {
+        // Build 1 rig with 6 sources so strips overflow horizontally at 760x520.
+        let mut g = Graph::default();
+        g.reserve(20, 20);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut eid = 1;
+        let mut srcs = Vec::new();
+        for i in 0..6 {
+            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(&format!("CH {}", i + 1)));
+            g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); eid += 1;
+            g.connect_with_id(eid, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); eid += 1;
+            srcs.push(s);
+        }
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&g, &[]);
+        app.stage_view = StageView::Mixer;
+        app.nav_open = true;
+        app.nav_filter = NavFilter::Channels;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(760.0, 520.0);
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+
+        let target = *srcs.last().unwrap();
+        let before = app.mixer_strip_rects.iter().find(|(_, n, _)| *n == target).unwrap().2;
+        assert!(before.left() > app.stage_rect.right(), "last strip starts offscreen right ({before:?} vs {:?})", app.stage_rect);
+
+        let nav_pos = app.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { node, .. } if *node == target).then(|| rect.center()))
+            .expect("target row in Navigator");
+        click_at(&mut app, &ctx, size, nav_pos);
+        // egui applies a scroll_to_rect on the pass after the request.
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        let shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+        let after = app.mixer_strip_rects.iter().find(|(_, n, _)| *n == target).unwrap().2;
+        assert!(after.center().x <= app.stage_rect.right(), "target strip scrolled into view ({after:?} vs {:?})", app.stage_rect);
+        assert!(app.mixer_flash.is_some_and(|(n, exp)| n == target && exp > app.ui_time), "strip flash armed");
+        let ring = after.expand(3.0);
+        fn is_flash(s: &egui::Shape, ring: Rect) -> bool {
+            match s {
+                egui::Shape::Rect(r) => r.rect == ring && r.stroke.width == 2.0 && r.stroke.color.a() > 0,
+                egui::Shape::Vec(v) => v.iter().any(|c| is_flash(c, ring)),
+                _ => false,
+            }
+        }
+        assert!(shapes.iter().any(|cs| is_flash(&cs.shape, ring)), "flash ring painted around the strip");
+    }
+
+    #[test]
+    fn opening_navigator_keeps_rack_floors_and_nothing_clips_at_760x520() {
+        fn collect_text(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for c in v { collect_text(c, out); },
+                _ => {}
+            }
+        }
+        // At 760x520 the rack overflows beside the panel and pans (rule 22);
+        // a jump pans the clicked unit into the clip.
+        let (mut small, _) = two_rigs_with_inserts(true);
+        small.nav_open = true;
+        let ctx1 = egui::Context::default();
+        let size = Vec2::new(760.0, 520.0);
+        for _ in 0..3 { run_frame_at(&mut small, &ctx1, size, vec![]); }
+        assert!(small.rack_overflow.x > 0.0, "the rack pans rather than squishes at 760x520");
+        let audio_in = small.units.iter().position(|u| u.name == "AUDIO IN").unwrap();
+        let clip = small.rack_clip.expect("an overflowing rack is clipped");
+        let off_center = |app: &DemoApp| app.xf.rect(app.unit_rects[audio_in]).center().x - clip.center().x;
+        assert!(off_center(&small).abs() > 4.0, "Audio in starts off centre");
+        let row = small.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { label, .. } if label == "Audio in").then(|| rect.center()))
+            .expect("Audio in row");
+        click_at(&mut small, &ctx1, size, row);
+        run_frame_at(&mut small, &ctx1, size, vec![]);
+        assert_eq!(small.selected_unit, Some(small.units[audio_in].node_id));
+        let half = small.rack_overflow.x / 2.0;
+        assert!(off_center(&small).abs() < 1.0 || (small.rack_pan.x.abs() - half).abs() < 0.5,
+            "the jump centres Audio in as far as the pan allows (off {}, pan {:?})", off_center(&small), small.rack_pan);
+        assert!(small.rack_pan.x != 0.0, "the jump panned the rack");
+
+        // Multi-stack rigs keep FACE_MIN_W / MIN_UNIT_H floors and pan cleanly (rule 22).
+        let (mut app, [na, _nb]) = two_rigs_with_inserts(true);
+        // Long insert name to verify ellipsis truncation never overflows.
+        let delay_node = app.units.iter().find(|u| u.name == "DELAY").unwrap().node_id;
+        app.apply_strip_name(delay_node, "Very Long Custom Tape Delay Effect").unwrap();
+        app.nav_open = true;
+        app.selected_unit = Some(na);
+
+        let ctx = egui::Context::default();
+        for (w, h) in [(760.0, 520.0), (781.0, 950.0), (1600.0, 1000.0)] {
+            let size = Vec2::new(w, h);
+            for filter in [NavFilter::Channels, NavFilter::Plugins, NavFilter::All] {
+                app.nav_filter = filter;
+                app.stage_view = StageView::Rack;
+                let mut shapes = Vec::new();
+                for _ in 0..3 { shapes = run_frame_at(&mut app, &ctx, size, vec![]); }
+                for (ui, u) in app.units.iter().enumerate() {
+                    if !app.visible(ui) { continue; }
+                    let r = app.unit_rects[ui];
+                    assert!(r.width() >= FACE_MIN_W - 0.5, "{w}x{h} {filter:?} unit {} shrunk below FACE_MIN_W: {r:?}", u.name);
+                    assert!(r.height() >= MIN_UNIT_H - 0.5, "{w}x{h} {filter:?} unit {} shrunk below MIN_UNIT_H: {r:?}", u.name);
+                }
+                // Every row inside the Navigator stays within the panel's width.
+                for (_, rect) in &app.nav_row_rects {
+                    assert!(rect.left() >= app.nav_panel_rect.left() && rect.right() <= app.nav_panel_rect.right() + 0.5,
+                        "{w}x{h} {filter:?}: row {rect:?} escapes panel {:?}", app.nav_panel_rect);
+                }
+                assert!(app.nav_panel_rect.right() <= w + 0.5 && app.nav_panel_rect.left() >= 0.0);
+                // Navigator text stays in the panel; nothing else shows over it.
+                let panel = app.nav_panel_rect;
+                // An empty clip (a face under the panel) draws nothing.
+                for cs in shapes.iter().filter(|cs| cs.clip_rect.is_positive()) {
+                    let mut texts = Vec::new();
+                    collect_text(&cs.shape, &mut texts);
+                    let in_panel = panel.expand(0.5).contains_rect(cs.clip_rect);
+                    for (t, tr) in texts {
+                        let visible = tr.intersect(cs.clip_rect);
+                        if in_panel {
+                            assert!(tr.left() >= panel.left() - 0.5 && tr.right() <= panel.right() + 0.5,
+                                "{w}x{h} {filter:?}: Navigator text {t:?} {tr:?} escapes panel {panel:?}");
+                        } else if visible.is_positive() {
+                            assert!(!visible.intersects(panel.shrink(0.5)),
+                                "{w}x{h} {filter:?}: {t:?} {visible:?} shows over the Navigator {panel:?}");
+                        }
+                    }
+                }
+            }
+        }
+        app.show_help = true;
+        let shapes = run_frame_at(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]);
+        let mut texts = Vec::new();
+        for cs in &shapes { collect_text(&cs.shape, &mut texts); }
+        assert!(texts.iter().any(|(t, _)| t == "Q"), "help overlay documents Q");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat navigator_shots -- --ignored"]
+    fn navigator_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh app per image: `shot` builds a new egui context (and font
+        // atlas) each time, and the rack keeps galleys from the last one.
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            for mixer in [false, true] {
+                let (mut app, [na, nb]) = two_rigs_with_inserts(true);
+                app.nav_open = true;
+                app.nav_filter = NavFilter::Plugins;
+                let jump = if mixer {
+                    app.stage_view = StageView::Mixer;
+                    NavRow::Channel { rig: 1, node: nb, label: "Sub bass".into(), color: Some(theme::CABLE_ROSE) }
+                } else {
+                    NavRow::Channel { rig: 0, node: na, label: "Hammond".into(), color: Some(theme::CABLE_AMBER) }
+                };
+                app.nav_jump(&jump);
+                let name = if mixer { "mixer" } else { "rack" };
+                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-nav-{w}x{h}.png")));
+            }
+        }
+    }
 }

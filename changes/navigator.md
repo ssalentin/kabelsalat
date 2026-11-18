@@ -1,0 +1,2 @@
+### Added
+- **Navigator (#108):** press **Q** or click **Navigator** in the top bar for a side list of every rig, its channels in their strip colours and each channel's plugins (instrument, then inserts, marked CLAP, LV2 or built-in). **CHANNELS / PLUGINS / ALL** filter the list and the chevron folds a channel. Clicking an entry switches to its rig and selects the unit in the rack (panning to it), or scrolls to and flashes its strip in the mixer. Agents read the same list with `list_channels`.

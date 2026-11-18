@@ -982,13 +982,11 @@ impl RuleEdit {
             && self.cc_map.is_empty()
             && !self.cc_only
     }
-    fn set_cc(&mut self, cc: u8, param: u32, target: crate::matrix::CcTarget) {
-        let cc = cc & 0x7F;
-        if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
-            m.param = param;
-            m.target = target;
-        } else {
-            self.cc_map.push(crate::matrix::CcMapping { cc, param, target });
+    fn set_cc(&mut self, m: crate::matrix::CcMapping) {
+        let m = crate::matrix::CcMapping { cc: m.cc & 0x7F, ..m };
+        match self.cc_map.iter_mut().find(|x| x.cc == m.cc) {
+            Some(x) => *x = m,
+            None => self.cc_map.push(m),
         }
     }
     fn unmap_cc(&mut self, cc: u8) {
@@ -1246,7 +1244,22 @@ fn note_name(n: u8) -> String {
     format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
 }
 
-/// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
+/// One matrix click on an instrument's sources: keyboard is a switch,
+/// hardware a radio group (all devices, one device, or off).
+fn toggled_sources(src: (bool, bool), dev: Option<u32>, row: MatrixRow, on: bool) -> ((bool, bool), Option<u32>) {
+    let (mut src, mut dev) = (src, dev);
+    match row {
+        MatrixRow::Keys => src.0 = on,
+        MatrixRow::HwAll => { src.1 = on; if on { dev = None; } }
+        MatrixRow::HwDev(d) => {
+            if on { src.1 = true; dev = Some(d); }
+            else if dev == Some(d) { src.1 = false; }
+        }
+    }
+    (src, dev)
+}
+
+/// Effective cell state for an instrument column: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
 /// `src` = the rig's (keyboard, hardware) source pair.
 fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
@@ -1673,6 +1686,30 @@ enum Hit {
     Background,
 }
 
+/// Which saved session a two-step confirm in the Sessions view is armed for.
+#[derive(Clone, Debug, PartialEq)]
+enum SessionConfirm {
+    Delete(String),
+    Overwrite(String),
+}
+
+/// Where autosave writes while no saved session is open.
+const AUTOSAVE_NAME: &str = "Autosave";
+/// Seconds between autosave checks.
+const AUTOSAVE_INTERVAL: f32 = 20.0;
+/// Seconds after a load before autosave records what was loaded.
+const AUTOSAVE_SETTLE: f32 = 2.0;
+
+/// Autosave of the open session (`session_autosave` in config.json).
+struct Autosave {
+    enabled: bool,
+    due: f32,
+    /// What is on disk under the open session's name, or what was loaded.
+    /// None: the next check records the rack without writing, so a fresh
+    /// start or a template never replaces a saved session unchanged.
+    saved: Option<crate::session::Session>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum StageView {
     #[default]
@@ -2046,8 +2083,12 @@ struct DemoApp {
     show_help: bool,
     show_stats: bool,
     session_name: String,
+    /// The saved session the rack came from or was last saved as; autosave
+    /// writes there (`AUTOSAVE_NAME` while None).
+    open_session: Option<String>,
+    autosave: Autosave,
     session_msg: String,
-    confirm_delete_session: Option<String>,
+    confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
@@ -2080,6 +2121,10 @@ struct DemoApp {
     /// Test-only override of the bundle-probe roots (None = real home + system
     /// dirs), so catalog "installed" assertions never depend on this machine.
     catalog_roots: Option<Vec<std::path::PathBuf>>,
+    /// GitHub stars per catalog repo, fetched once per run on a background
+    /// thread when the Install tab first shows; empty offline.
+    catalog_stars: std::collections::HashMap<&'static str, u32>,
+    catalog_stars_rx: Option<std::sync::mpsc::Receiver<(&'static str, u32)>>,
     fps: f32,
     stats_timer: f32,
     stats_line: String,
@@ -2316,6 +2361,15 @@ struct DemoApp {
     /// Hardware device selection per CLAP unit (None = any). A slot table
     /// like `rig_sources`.
     rig_device: Vec<Option<u32>>,
+    /// Instrument profiles, built-in and the user's (`instruments::load_all`).
+    instrument_profiles: Vec<crate::instruments::Profile>,
+    /// The profile picked per hardware device, keyed by `midi_port_key`: a
+    /// profile id, or "" for none. A device without an entry is matched by
+    /// its port name. Stored in config.json as `instrument_devices`.
+    device_instruments: std::collections::BTreeMap<String, String>,
+    /// The CC bindings profiles put into the matrix, so a profile change
+    /// takes back exactly those.
+    instrument_bound: Vec<(SourceId, u32, crate::instruments::Binding)>,
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -2468,8 +2522,14 @@ impl DemoApp {
             show_help: false,
             show_stats: false,
             session_name: String::new(),
+            open_session: None,
+            autosave: Autosave {
+                enabled: crate::assistant::load_session_autosave(),
+                due: AUTOSAVE_SETTLE,
+                saved: None,
+            },
             session_msg: String::new(),
-            confirm_delete_session: None,
+            confirm_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
@@ -2489,6 +2549,8 @@ impl DemoApp {
             plugin_msg: String::new(),
             install: None,
             catalog_roots: None,
+            catalog_stars: std::collections::HashMap::new(),
+            catalog_stars_rx: None,
             fps: 60.0,
             stats_timer: 0.0,
             stats_line: String::new(),
@@ -2616,6 +2678,15 @@ impl DemoApp {
             last_midi: None,
             info_in_hint: false,
             rig_device: Vec::new(),
+            instrument_profiles: {
+                let (profiles, errors) = crate::instruments::load_all();
+                for e in errors { eprintln!("instrument profile: {e}"); }
+                profiles
+            },
+            device_instruments: crate::assistant::load_config_value("instrument_devices")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            instrument_bound: Vec::new(),
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
@@ -4433,7 +4504,7 @@ impl DemoApp {
     fn toggle_stage(&mut self, view: StageView) {
         self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
         if self.stage_view != StageView::Sessions {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
         }
         if self.stage_view != StageView::Settings {
             self.settings_msg.clear();
@@ -4657,7 +4728,7 @@ impl DemoApp {
                     });
                 }
                 for m in &r.edit.cc_map {
-                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param), target: m.target });
+                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param), target: m.target, scale: m.scale });
                 }
             }
             self.rule_edits.insert((r.source, r.dest), r.edit);
@@ -4872,6 +4943,8 @@ impl DemoApp {
     /// Load a starter template (playable pre-wired rack + default knobs).
     fn load_template(&mut self, t: Template) {
         let s = t.session();
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = format!("Loaded template '{}'", t.title()),
             Err(e) => self.session_msg = format!("Template failed: {e}"),
@@ -4881,6 +4954,8 @@ impl DemoApp {
     /// Reload the default two-stack demo patch.
     fn load_demo_patch(&mut self) {
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = "Loaded demo patch".into(),
             Err(e) => self.session_msg = format!("Demo failed: {e}"),
@@ -4892,6 +4967,8 @@ impl DemoApp {
     /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
     /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
     fn load_multi_rig_demo(&mut self) {
+        self.open_session = None;
+        self.autosave_rebase();
         fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
             let mut g = Graph::default();
             g.reserve(8, 8);
@@ -5071,26 +5148,16 @@ impl DemoApp {
             }
             "save_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                match self.capture_session(name) {
-                    Ok(s) => {
-                        let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                        match path.and_then(|p| s.save(&p).map(|_| p)) {
-                            Ok(p) => format!("saved session '{}' to {}", name, p.display()),
-                            Err(e) => format!("save failed: {e}"),
-                        }
-                    }
-                    Err(e) => format!("capture failed: {e}"),
+                match self.save_session_as(&Self::sessions_dir(), name) {
+                    Ok(p) => format!("saved session '{}' to {}", name, p.display()),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "load_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                match path.and_then(|p| crate::session::Session::load(&p)) {
-                    Ok(s) => match self.apply_session(&s) {
-                        Ok(_) => format!("loaded session '{}' — knobs + plugin state restored", name),
-                        Err(e) => format!("apply failed: {e}"),
-                    },
-                    Err(e) => format!("load failed: {e}"),
+                match self.open_saved_session(&Self::sessions_dir(), name) {
+                    Ok(()) => format!("loaded session '{}' — knobs + plugin state restored", name),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "list_sessions" => {
@@ -6401,39 +6468,73 @@ impl DemoApp {
         }
     }
 
-    /// Toggle one matrix cell live. CLAP columns map to the engine's source
-    /// filters + device binding (SetRigSource/SetRigDevice); LV2 instrument
-    /// columns are gated by the MIDI cable alone. Turning a cell ON also
+    /// Toggle one matrix cell live. Every instrument column has the same
+    /// rows: the keyboard switch and a radio group of hardware (all / one
+    /// device / off). CLAP columns store them as the voice's source filter
+    /// (SetRigSource/SetRigDevice); LV2 instrument columns as the enabled
+    /// flag of each (source, node) matrix rule. Turning a cell ON also
     /// hot-wires the MIDI cable if it was unplugged.
     fn matrix_toggle(&mut self, inst: usize, row: MatrixRow, on: bool) {
-        let is_clap = matches!(self.units.get(inst).map(|u| &u.node_kind), Some(UnitKind::Clap));
+        let Some(unit) = self.units.get(inst) else { return };
+        let (is_clap, node) = (matches!(unit.node_kind, UnitKind::Clap), unit.node_id);
         if !is_clap {
-            // LV2 instrument: the cable IS the route.
             if on { self.ensure_midi_cable(inst); }
-            else if let Some(ci) = self.midi_cable_to(inst) { self.unplug_cable(ci, true); }
+            let (src, dev) = self.lv2_sources(node);
+            let (src, dev) = toggled_sources(src, dev, row, on);
+            self.set_lv2_sources(node, src, dev);
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
         if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
-        let node = self.units[inst].node_id;
-        {
-            let s = &mut self.rig_sources[rig];
-            let d = &mut self.rig_device[rig];
-            match row {
-                MatrixRow::Keys => s.0 = on,
-                MatrixRow::HwAll => { s.1 = on; if on { *d = None; } }
-                MatrixRow::HwDev(dev) => {
-                    if on { s.1 = true; *d = Some(dev); }
-                    else if *d == Some(dev) { s.1 = false; }
-                }
-            }
-        }
+        let (src, dev) = toggled_sources(self.rig_sources[rig], self.rig_device[rig], row, on);
+        self.rig_sources[rig] = src;
+        self.rig_device[rig] = dev;
         self.send_rig_source(node);
         if matches!(row, MatrixRow::HwAll | MatrixRow::HwDev(_)) {
-            let device = self.rig_device[rig];
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: dev });
+            }
+        }
+    }
+
+    /// Whether one matrix cell routes (what the grid draws).
+    fn matrix_cell_on(&self, inst: usize, row: MatrixRow) -> bool {
+        let Some(u) = self.units.get(inst) else { return false };
+        let (src, dev) = if matches!(u.node_kind, UnitKind::Clap) {
+            let rig = self.rig_of_unit(inst).unwrap_or(0);
+            (self.rig_sources.get(rig).copied().unwrap_or((true, true)), self.rig_device.get(rig).copied().flatten())
+        } else {
+            self.lv2_sources(u.node_id)
+        };
+        clap_cell(src, dev, self.midi_cable_to(inst).is_some(), row)
+    }
+
+    /// An LV2 instrument's sources as the CLAP filter shape, read from its
+    /// matrix rules (a missing rule routes): keyboard, any hardware, and
+    /// the one device when not every hardware rule is on.
+    fn lv2_sources(&self, node: u32) -> ((bool, bool), Option<u32>) {
+        let routes = |src: SourceId| self.rule_edits.get(&(src, node)).is_none_or(|e| e.enabled);
+        let hw: Vec<u32> = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| routes(SourceId::Hardware(d))).collect();
+        let dev = (hw.len() < crate::engine::MAX_HW_DEVICES as usize).then(|| hw.first().copied()).flatten();
+        ((routes(SourceId::Keys), !hw.is_empty()), dev)
+    }
+
+    /// Write an LV2 instrument's sources as the enabled flags of its matrix
+    /// rules; a rule's shape (transpose, range, …) is kept.
+    fn set_lv2_sources(&mut self, node: u32, src: (bool, bool), dev: Option<u32>) {
+        let wanted = std::iter::once((SourceId::Keys, src.0)).chain((0..crate::engine::MAX_HW_DEVICES)
+            .map(|d| (SourceId::Hardware(d), src.1 && dev.is_none_or(|b| b == d))));
+        for (source, enabled) in wanted {
+            let mut edit = self.rule_edits.get(&(source, node)).cloned().unwrap_or_default();
+            if edit.enabled == enabled { continue; }
+            edit.enabled = enabled;
+            edit.cc_only = false;
+            let cmd = edit.to_command(source, node);
+            if edit.is_default() { self.rule_edits.remove(&(source, node)); }
+            else { self.rule_edits.insert((source, node), edit); }
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(cmd);
             }
         }
     }
@@ -6477,6 +6578,37 @@ impl DemoApp {
             });
         }
         rows
+    }
+
+    /// A device's instrument-profile picker, and what the profile drives.
+    /// Returns the picked profile id ("" = none).
+    fn instrument_dropdown(&self, ui: &mut egui::Ui, d: u32) -> Option<String> {
+        const NONE: &str = "No profile";
+        let current = self.device_profile(d);
+        let mut pick = None;
+        theme::Dropdown::new(("dd_instrument", d), current.map_or(NONE.to_string(), |p| p.title()))
+            .width(178.0)
+            .text_size(12.0)
+            .show_ui(ui, |menu| {
+                if menu.item(current.is_none(), NONE) { pick = Some(String::new()); }
+                for p in &self.instrument_profiles {
+                    if menu.item(current.is_some_and(|c| c.id == p.id), &p.title()) { pick = Some(p.id.clone()); }
+                }
+            })
+            .on_hover_text("The instrument on this port: its knobs, drawbars and switches drive the rack");
+        if current.is_some() {
+            let src = SourceId::Hardware(d);
+            let mut dests: Vec<u32> = self.instrument_bound.iter().filter(|(s, _, _)| *s == src).map(|(_, n, _)| *n).collect();
+            let count = dests.len();
+            dests.dedup();
+            let names: Vec<String> = dests.iter()
+                .filter_map(|n| self.units.iter().find(|u| u.node_id == *n))
+                .map(|u| sentence_case(&u.name))
+                .collect();
+            let text = if names.is_empty() { "nothing in the rack to drive".to_string() } else { format!("{count} controls → {}", names.join(", ")) };
+            ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::INK_2)).wrap_mode(egui::TextWrapMode::Extend));
+        }
+        pick
     }
 
     /// A matrix row header: activity LED, a kind badge (KEYS, ANY HW, HW),
@@ -6581,6 +6713,7 @@ impl DemoApp {
         }
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
         let mut edit_requests: Vec<(usize, MatrixRow)> = Vec::new();
+        let mut profile_picks: Vec<(u32, String)> = Vec::new();
         let rows = self.matrix_rows();
         // Header cells never wrap ("Surge A" split across lines): Extend
         // labels + a min column width keep names and status on fixed rows.
@@ -6632,19 +6765,17 @@ impl DemoApp {
                     });
                     ui.end_row();
                 }
-                Self::matrix_source_head(ui, src);
+                match src.row {
+                    MatrixRow::HwDev(d) if !src.continues => {
+                        ui.horizontal(|ui| {
+                            Self::matrix_source_head(ui, src);
+                            if let Some(id) = self.instrument_dropdown(ui, d) { profile_picks.push((d, id)); }
+                        });
+                    }
+                    _ => Self::matrix_source_head(ui, src),
+                }
                 for &s in &sinks {
-                    let u = &self.units[s];
-                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
-                    let gate = self.midi_cable_to(s).is_some();
-                    let on = if is_clap {
-                        let rig = self.rig_of_unit(s).unwrap_or(0);
-                        let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
-                        let dev = self.rig_device.get(rig).copied().flatten();
-                        clap_cell(src, dev, gate, *row)
-                    } else {
-                        gate // LV2: the cable is the route (all sources)
-                    };
+                    let on = self.matrix_cell_on(s, *row);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
@@ -6696,6 +6827,7 @@ impl DemoApp {
                 .size(11.0).color(theme::INK_2));
         }
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
+        for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
     }
 
@@ -6891,7 +7023,6 @@ impl DemoApp {
     /// (no feedback loop). `resend` is for the CC that completed a learn: the
     /// engine saw it before the binding existed, so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
-        let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
         let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
@@ -6900,6 +7031,7 @@ impl DemoApp {
             }
             for m in &edit.cc_map {
                 if m.cc != cc { continue; }
+                let norm = m.scale.norm(val) as f32;
                 for u in &mut self.units {
                     if u.node_id != *dest { continue; }
                     // On non-CLAP units plugin and knob params are the same
@@ -6926,7 +7058,88 @@ impl DemoApp {
         }
     }
 
+    /// The profile of hardware device `d`: the one picked for it, else the
+    /// first whose maker and model its port name carries.
+    fn device_profile(&self, d: u32) -> Option<&crate::instruments::Profile> {
+        let raw = self.hw_devices.get(d as usize)?;
+        match self.device_instruments.get(midi_port_key(raw)) {
+            Some(id) => self.instrument_profiles.iter().find(|p| &p.id == id),
+            None => self.instrument_profiles.iter().find(|p| p.matches_port(raw)),
+        }
+    }
+
+    fn pick_device_profile(&mut self, d: u32, id: &str) {
+        let Some(raw) = self.hw_devices.get(d as usize) else { return };
+        self.device_instruments.insert(midi_port_key(raw).to_string(), id.to_string());
+        if let Ok(v) = serde_json::to_value(&self.device_instruments) {
+            if let Err(e) = crate::assistant::save_config_value("instrument_devices", v) {
+                eprintln!("instrument profile: config not saved: {e}");
+            }
+        }
+    }
+
+    /// Every CC binding the devices' profiles ask for: one per device, node
+    /// the device plays, and controller.
+    fn wanted_instrument_bindings(&self) -> Vec<(SourceId, u32, crate::instruments::Binding)> {
+        let mut wanted = Vec::new();
+        let published = self.graph_pub.as_ref().and_then(|p| p.lock().ok());
+        let plays = |src: SourceId, dest: u32| {
+            published.as_ref().map_or(true, |g| g.rules.iter().any(|r| r.source == src && r.dest == dest && !r.cc_only))
+        };
+        for d in 0..self.hw_devices.len() as u32 {
+            let Some(profile) = self.device_profile(d) else { continue };
+            let src = SourceId::Hardware(d);
+            for u in &self.units {
+                let Some(node) = self.base_graph.node(u.node_id) else { continue };
+                let bindings = profile.bindings(&node.kind);
+                if bindings.is_empty() || !plays(src, u.node_id) { continue; }
+                wanted.extend(bindings.into_iter().map(|b| (src, u.node_id, b)));
+            }
+        }
+        wanted
+    }
+
+    /// Bring the matrix in line with the devices' profiles: bind what is
+    /// missing (after a load, a new organ, a device plugged in) and take back
+    /// what a profile bound and no longer wants, unless the user rebound that
+    /// controller by hand since. A profile owns its controllers on the nodes
+    /// it drives: pick "No profile" to learn them by hand. Sends nothing
+    /// when all is in place.
+    fn sync_instrument_maps(&mut self) {
+        if self.instrument_bound.is_empty() && self.hw_devices.is_empty() { return; }
+        let wanted = self.wanted_instrument_bindings();
+        let bound = |app: &Self, src: SourceId, dest: u32, b: &crate::instruments::Binding| {
+            app.rule_edits.get(&(src, dest)).and_then(|e| e.cc_map.iter().find(|m| m.cc == b.cc)).is_some_and(|m| {
+                (m.param, m.target, m.scale) == (b.param, b.target, b.scale)
+            })
+        };
+        let stale: Vec<_> = self.instrument_bound.iter().filter(|x| !wanted.contains(x)).copied().collect();
+        for (src, dest, b) in stale {
+            if bound(self, src, dest, &b) {
+                self.set_cc_scaled(src, dest, b.cc, None, b.target, b.scale);
+            }
+        }
+        for &(src, dest, b) in &wanted {
+            if !bound(self, src, dest, &b) {
+                self.set_cc_scaled(src, dest, b.cc, Some(b.param), b.target, b.scale);
+            }
+        }
+        self.instrument_bound = wanted;
+    }
+
     fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>, target: crate::matrix::CcTarget) {
+        self.set_cc_scaled(source, dest, cc, param, target, crate::matrix::CcScale::IDENTITY);
+    }
+
+    fn set_cc_scaled(
+        &mut self,
+        source: SourceId,
+        dest: u32,
+        cc: u8,
+        param: Option<u32>,
+        target: crate::matrix::CcTarget,
+        scale: crate::matrix::CcScale,
+    ) {
         let cc = cc & 0x7F;
         let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_else(|| {
             // Mirror what the engine will do: binding on a pair without a rule
@@ -6938,7 +7151,7 @@ impl DemoApp {
             RuleEdit { cc_only: !routed, ..RuleEdit::default() }
         });
         match param {
-            Some(p) => e.set_cc(cc, p, target),
+            Some(param) => e.set_cc(crate::matrix::CcMapping { cc, param, target, scale }),
             None => e.unmap_cc(cc),
         }
         if e.is_default() {
@@ -6947,7 +7160,7 @@ impl DemoApp {
             self.rule_edits.insert((source, dest), e);
         }
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param, target });
+            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param, target, scale });
         }
     }
 
@@ -8397,18 +8610,79 @@ impl DemoApp {
         } else {
             self.session_name.trim().to_string()
         };
-        match self.capture_session(&name) {
-            Ok(s) => {
-                let path = crate::session::Session::package_path(dir, &name);
-                match path.and_then(|p| s.save(&p).map(|_| p)) {
-                    Ok(_) => {
-                        self.confirm_delete_session = None;
-                        self.session_msg = format!("Saved '{name}'");
+        self.confirm_session = None;
+        self.session_msg = match self.save_session_as(dir, &name) {
+            Ok(_) => format!("Saved '{name}'"),
+            Err(e) => e,
+        };
+    }
+
+    /// Save the rack as `name`, replacing a saved session of that name; it
+    /// becomes the open session, which autosave keeps writing.
+    fn save_session_as(&mut self, dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+        let s = self.capture_session(name).map_err(|e| format!("Capture failed: {e}"))?;
+        let path = crate::session::Session::package_path(dir, name)
+            .and_then(|p| s.save(&p).map(|_| p))
+            .map_err(|e| format!("Save failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave.saved = Some(s);
+        Ok(path)
+    }
+
+    /// Load the saved session `name`; it becomes the open session.
+    fn open_saved_session(&mut self, dir: &std::path::Path, name: &str) -> Result<(), String> {
+        let s = crate::session::Session::package_path(dir, name)
+            .and_then(|p| crate::session::Session::load(&p))
+            .map_err(|e| format!("Load failed: {e}"))?;
+        self.apply_session(&s).map_err(|e| format!("Apply failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave_rebase();
+        Ok(())
+    }
+
+    /// The rack now holds something autosave has not seen (a load, a
+    /// template): record it once it settled, before writing anything.
+    fn autosave_rebase(&mut self) {
+        self.autosave.saved = None;
+        self.autosave.due = AUTOSAVE_SETTLE;
+    }
+
+    fn autosave_target(&self) -> String {
+        self.open_session.clone().unwrap_or_else(|| AUTOSAVE_NAME.to_string())
+    }
+
+    /// Counts down to the next autosave check; true when one is due.
+    fn autosave_due(&mut self, dt: f32) -> bool {
+        if !self.autosave.enabled {
+            return false;
+        }
+        self.autosave.due -= dt;
+        if self.autosave.due > 0.0 {
+            return false;
+        }
+        self.autosave.due = AUTOSAVE_INTERVAL;
+        true
+    }
+
+    /// Write the open session if the rack changed since it was saved or
+    /// loaded. Plugin state is read here, so this runs on the UI thread.
+    fn autosave_now(&mut self, dir: &std::path::Path) {
+        let name = self.autosave_target();
+        let Ok(s) = self.capture_session(&name) else { return };
+        match &self.autosave.saved {
+            None => self.autosave.saved = Some(s),
+            Some(prev) if prev.same_content(&s) => {}
+            Some(_) => {
+                match crate::session::Session::package_path(dir, &name).and_then(|p| s.save(&p)) {
+                    Ok(()) => {
+                        self.session_msg = format!("Autosaved '{name}'");
+                        self.autosave.saved = Some(s);
                     }
-                    Err(e) => self.session_msg = format!("Save failed: {e}"),
+                    Err(e) => self.session_msg = format!("Autosave failed: {e}"),
                 }
             }
-            Err(e) => self.session_msg = format!("Capture failed: {e}"),
         }
     }
 
@@ -8462,6 +8736,13 @@ impl DemoApp {
 
                 let mut load_session: Option<String> = None;
                 let mut delete_session: Option<String> = None;
+                let mut overwrite_session: Option<String> = None;
+                let open_session = self.open_session.clone();
+                let autosave_line = if self.autosave.enabled {
+                    format!("Autosave on: changes go to '{}' every {} s.", self.autosave_target(), AUTOSAVE_INTERVAL as u32)
+                } else {
+                    "Autosave off (Settings).".to_string()
+                };
                 let mut do_save = false;
                 let mut load_tpl: Option<Template> = None;
                 let mut load_demo = false;
@@ -8484,6 +8765,8 @@ impl DemoApp {
                     if theme::primary_button(ui, "Save current patch").clicked() {
                         *do_save = true;
                     }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&autosave_line).size(11.5).color(theme::INK_2));
                     ui.add_space(16.0);
                     Self::stage_hairline(ui);
                     ui.add_space(14.0);
@@ -8542,8 +8825,9 @@ impl DemoApp {
 
                 let draw_right = |ui: &mut egui::Ui,
                                   names: &[String],
-                                  confirm_delete: &mut Option<String>,
+                                  confirm: &mut Option<SessionConfirm>,
                                   load_session: &mut Option<String>,
+                                  overwrite_session: &mut Option<String>,
                                   delete_session: &mut Option<String>,
                                   list_h: f32| {
                     theme::section_label(ui, &format!("Saved sessions ({})", names.len()));
@@ -8575,31 +8859,56 @@ impl DemoApp {
                                             .color(theme::INK_2),
                                     );
                                     ui.add_space(8.0);
+                                    let is_open = open_session.as_deref() == Some(name.as_str());
                                     ui.label(
                                         egui::RichText::new(name)
                                             .font(theme::medium_font(14.5))
-                                            .color(theme::INK),
+                                            .color(if is_open { theme::LIVE_TEAL } else { theme::INK }),
                                     );
+                                    if is_open {
+                                        ui.label(egui::RichText::new("open").size(11.5).color(theme::INK_2));
+                                    }
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let confirming = confirm_delete.as_deref() == Some(name.as_str());
-                                        if confirming {
-                                            if theme::chip_button(ui, "Cancel", false).clicked() {
-                                                *confirm_delete = None;
+                                        match confirm.as_ref() {
+                                            Some(SessionConfirm::Delete(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm delete", true).clicked() {
+                                                    *delete_session = Some(name.clone());
+                                                }
                                             }
-                                            ui.add_space(6.0);
-                                            if theme::danger_button(ui, "Confirm delete", true).clicked() {
-                                                *delete_session = Some(name.clone());
+                                            Some(SessionConfirm::Overwrite(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm overwrite", true)
+                                                    .on_hover_text(format!("replace '{name}' with the current patch"))
+                                                    .clicked()
+                                                {
+                                                    *overwrite_session = Some(name.clone());
+                                                }
                                             }
-                                        } else {
-                                            if theme::danger_button(ui, "Delete", false)
-                                                .on_hover_text(format!("delete '{name}' from disk"))
-                                                .clicked()
-                                            {
-                                                *confirm_delete = Some(name.clone());
-                                            }
-                                            ui.add_space(6.0);
-                                            if theme::primary_button(ui, "Load").clicked() {
-                                                *load_session = Some(name.clone());
+                                            _ => {
+                                                if theme::danger_button(ui, "Delete", false)
+                                                    .on_hover_text(format!("delete '{name}' from disk"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Delete(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::chip_button(ui, "Overwrite", false)
+                                                    .on_hover_text(format!("save the current patch over '{name}'"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Overwrite(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::primary_button(ui, "Load").clicked() {
+                                                    *load_session = Some(name.clone());
+                                                }
                                             }
                                         }
                                     });
@@ -8636,6 +8945,7 @@ impl DemoApp {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                         ui.add_space(12.0);
+                        let right_w = ui.available_width().min(right_w);
                         ui.allocate_ui_with_layout(
                             egui::vec2(right_w, h),
                             egui::Layout::top_down(egui::Align::Min),
@@ -8644,8 +8954,9 @@ impl DemoApp {
                                 draw_right(
                                     ui,
                                     &names,
-                                    &mut self.confirm_delete_session,
+                                    &mut self.confirm_session,
                                     &mut load_session,
+                                    &mut overwrite_session,
                                     &mut delete_session,
                                     list_h,
                                 );
@@ -8673,8 +8984,9 @@ impl DemoApp {
                             draw_right(
                                 ui,
                                 &names,
-                                &mut self.confirm_delete_session,
+                                &mut self.confirm_session,
                                 &mut load_session,
+                                &mut overwrite_session,
                                 &mut delete_session,
                                 200.0,
                             );
@@ -8694,18 +9006,25 @@ impl DemoApp {
                     self.load_multi_rig_demo();
                 }
                 if let Some(name) = load_session {
-                    self.confirm_delete_session = None;
-                    let path = crate::session::Session::package_path(dir, &name);
-                    match path.and_then(|p| crate::session::Session::load(&p)) {
-                        Ok(s) => match self.apply_session(&s) {
-                            Ok(_) => self.session_msg = format!("Loaded '{name}'"),
-                            Err(e) => self.session_msg = format!("Apply failed: {e}"),
-                        },
-                        Err(e) => self.session_msg = format!("Load failed: {e}"),
-                    }
+                    self.confirm_session = None;
+                    self.session_msg = match self.open_saved_session(dir, &name) {
+                        Ok(()) => format!("Loaded '{name}'"),
+                        Err(e) => e,
+                    };
+                }
+                if let Some(name) = overwrite_session {
+                    self.confirm_session = None;
+                    self.session_msg = match self.save_session_as(dir, &name) {
+                        Ok(_) => format!("Overwrote '{name}'"),
+                        Err(e) => e,
+                    };
                 }
                 if let Some(name) = delete_session {
-                    self.confirm_delete_session = None;
+                    self.confirm_session = None;
+                    if self.open_session.as_deref() == Some(name.as_str()) {
+                        self.open_session = None;
+                        self.autosave_rebase();
+                    }
                     match Self::delete_saved_session(dir, &name) {
                         Ok(()) => self.session_msg = format!("Deleted '{name}'"),
                         Err(e) => self.session_msg = format!("Delete failed: {e}"),
@@ -8999,6 +9318,35 @@ impl DemoApp {
             });
     }
 
+    /// Starts the star fetch on first call, then adopts what has arrived.
+    /// Tests never reach the network (rule 37).
+    fn poll_catalog_stars(&mut self, ctx: &egui::Context) {
+        if self.catalog_stars_rx.is_none() && !cfg!(test) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name("catalog-stars".into())
+                .spawn(move || {
+                    let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else {
+                        return;
+                    };
+                    for e in crate::catalog::CATALOG {
+                        if let Some(n) = crate::catalog::fetch_stars(&client, e.repo) {
+                            if tx.send((e.repo, n)).is_err() {
+                                return;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                })
+                .ok();
+            self.catalog_stars_rx = Some(rx);
+        }
+        if let Some(rx) = &self.catalog_stars_rx {
+            self.catalog_stars.extend(rx.try_iter());
+        }
+    }
+
     /// A taller [`plugin_card`] for catalog entries: name, one-line
     /// description, repo link and an Install button / Installed badge.
     fn catalog_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
@@ -9120,6 +9468,7 @@ impl DemoApp {
                         let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
 
                         if self.plugin_category == PluginCategory::Install {
+                            self.poll_catalog_stars(ui.ctx());
                             let roots_raw = self.catalog_root_paths();
                             let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
                             let scan = self.catalog_scan();
@@ -9212,9 +9561,14 @@ impl DemoApp {
                                                 || format!("No Linux build for {}", std::env::consts::ARCH),
                                                 |r| r.summary(),
                                             );
+                                            let stars = self
+                                                .catalog_stars
+                                                .get(e.repo)
+                                                .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
+                                                .unwrap_or_default();
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format!("License {} · {how}", e.license))
+                                                    egui::RichText::new(format!("{stars}License {} · {how}", e.license))
                                                         .size(11.5)
                                                         .color(theme::CREAM_DIM),
                                                 )
@@ -9483,6 +9837,7 @@ impl DemoApp {
             SaveKey(Endpoint, String),
             RemoveKey(Endpoint),
             ToggleReduceMotion,
+            ToggleAutosave,
             SetCountIn(bool, u8),
             SetAudioOutput(Option<String>),
         }
@@ -9507,6 +9862,7 @@ impl DemoApp {
             .unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         let reduce_motion = self.reduce_motion;
+        let autosave_on = self.autosave.enabled;
         let count_in_enabled = self.count_in_enabled;
         let count_in_bars = self.count_in_bars;
         let detected_scale = ui_scale_target();
@@ -9773,6 +10129,19 @@ impl DemoApp {
                     ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Autosave sessions").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, if autosave_on { "On" } else { "Off" }, autosave_on).clicked() {
+                                actions.push(SettingsAction::ToggleAutosave);
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Saves changes to the open session every 20 s and on quit; unsaved patches go to 'Autosave' (session_autosave).").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
@@ -9929,6 +10298,16 @@ impl DemoApp {
                         "Reduce motion enabled".into()
                     } else {
                         "Reduce motion disabled".into()
+                    };
+                }
+                SettingsAction::ToggleAutosave => {
+                    self.autosave.enabled = !self.autosave.enabled;
+                    self.autosave_rebase();
+                    let saved = crate::assistant::save_session_autosave(self.autosave.enabled);
+                    self.settings_msg = match (saved, self.autosave.enabled) {
+                        (Err(e), _) => format!("Saving the autosave setting failed: {e}"),
+                        (Ok(()), true) => "Autosave enabled".into(),
+                        (Ok(()), false) => "Autosave disabled".into(),
                     };
                 }
                 SettingsAction::SetCountIn(enabled, bars) => {
@@ -11591,6 +11970,9 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        if self.autosave_due(dt) {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Audio In tuner: drain each open capture's tuner ring and run YIN.
         if !self.audio_in_tuners.is_empty() {
             self.pump_audio_in_tuners();
@@ -12122,7 +12504,7 @@ impl DemoApp {
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
-                else if self.confirm_delete_session.is_some() { self.confirm_delete_session = None; }
+                else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
                 else { self.selected = None; }
             }
@@ -13013,7 +13395,7 @@ impl DemoApp {
     /// Tab: in any non-rack stage view it returns to the rack; otherwise it flips the rack.
     fn on_tab(&mut self) {
         if self.stage_view != StageView::Rack {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
             self.stage_view = StageView::Rack;
         } else {
             self.start_flip();
@@ -14149,7 +14531,7 @@ impl DemoApp {
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
-            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 1.0) * 0.85)
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.75) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
@@ -14725,6 +15107,7 @@ impl DemoApp {
         self.serve_rack_shots();
         self.rack_shot.request(&ctx);
         self.sync_from_engine();
+        self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
         if self.plugin_scan.is_some() || self.install.as_ref().is_some_and(|i| i.running) {
@@ -14849,6 +15232,9 @@ impl eframe::App for DemoApp {
     }
 
     fn on_exit(&mut self) {
+        if self.autosave.enabled {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Native editor holds no plugin GUI; just drop its cached state.
         self.editor_open = false;
         self.editor_params.clear();
@@ -17097,7 +17483,7 @@ mod rig_switch_tests {
         let learned = rules.iter().find(|r| r.source == dev && r.dest == 1).expect("learned rule restored");
         assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
         assert_eq!(learned.param_for_cc(7), Some(43));
-        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }));
+        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::IDENTITY }));
         assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
     }
 
@@ -18596,6 +18982,13 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("License GPL-3.0-or-later · ")), "Floe's card names its licence: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains('★')), "no stars without a fetched count: {texts:?}");
+        app.catalog_stars.insert("pantherb/setBfree", 235);
+        app.catalog_stars.insert("surge-synthesizer/surge", 3870);
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.starts_with("★ 235 · License ")), "setBfree's card shows its stars: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("★ 3.9k · License ")), "Surge's card shows its stars: {texts:?}");
+        assert_eq!(texts.iter().filter(|t| t.contains('★')).count(), 2, "only fetched repos show stars: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("Plays sample libraries")), "cards show the about text: {texts:?}");
         let sources = texts.iter().filter(|t| *t == "Source code").count();
         assert_eq!(sources, crate::catalog::CATALOG.len(), "every card has a Source code button");
@@ -18994,7 +19387,7 @@ mod split_bpm_tests {
         app.graph_pub = Some(pub_);
         app.sync_from_engine();
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("remote cc_map mirrored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42, target: crate::matrix::CcTarget::PluginParam }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42, target: crate::matrix::CcTarget::PluginParam, scale: crate::matrix::CcScale::IDENTITY }]);
         assert_eq!(e.cell_code(), "1 CC");
     }
 
@@ -19010,10 +19403,10 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.cc_learn.is_none(), "MIDI-learn disarms after binding");
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("learned binding stored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam, scale: crate::matrix::CcScale::IDENTITY }]);
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
-        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123), target: crate::matrix::CcTarget::PluginParam })));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123), target: crate::matrix::CcTarget::PluginParam, .. })));
     }
 
     #[test]
@@ -19225,6 +19618,7 @@ mod split_bpm_tests {
                 cc: 74,
                 param: Some(P_LEVEL),
                 target: crate::matrix::CcTarget::Knob,
+                ..
             }
         )), "sent MatrixCcMap with CcTarget::Knob: {cmds:?}");
         // The binding CC itself counts: the engine saw it before the mapping
@@ -19415,7 +19809,7 @@ mod split_bpm_tests {
         app.stage_view = StageView::Rack;
         app.edit_rigs(None);
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("knob binding survived + Rig");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::IDENTITY }]);
 
         // Clear via knob name.
         app.exec_tool("clear_cc_map", &serde_json::json!({"node": 1, "source": "hw:0", "knob": "LEVEL"}));
@@ -19751,14 +20145,159 @@ mod stage_views_tests {
         assert!(texts.iter().any(|t| t == "Stage Jam"), "saved session rendered: {texts:?}");
         assert!(texts.iter().any(|t| t == "Delete"), "delete action rendered");
 
-        app.confirm_delete_session = Some("Stage Jam".into());
+        app.confirm_session = Some(SessionConfirm::Delete("Stage Jam".into()));
         run_frame(&mut app, &ctx, Vec2::new(1280.0, 800.0), key(Key::Escape));
-        assert!(app.confirm_delete_session.is_none());
+        assert!(app.confirm_session.is_none());
         assert_eq!(app.stage_view, StageView::Sessions, "first Esc cancels delete confirm");
 
         DemoApp::delete_saved_session(&dir, "Stage Jam").unwrap();
         assert!(DemoApp::list_saved_sessions(&dir).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ksalat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn on_disk(dir: &std::path::Path, name: &str) -> crate::session::Session {
+        crate::session::Session::load(&crate::session::Session::package_path(dir, name).unwrap()).unwrap()
+    }
+
+    fn turn_a_knob(app: &mut DemoApp) {
+        let k = app.units.iter_mut().flat_map(|u| u.knobs.iter_mut()).find(|k| k.param.is_some()).unwrap();
+        k.value = if k.value > 0.5 { 0.2 } else { 0.8 };
+    }
+
+    #[test]
+    fn autosave_writes_the_open_session_only_after_a_change() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-change");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let saved = on_disk(&dir, "Jam");
+
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Saved 'Jam'", "an unchanged rack is not written again");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Autosaved 'Jam'");
+        let after = on_disk(&dir, "Jam");
+        assert!(!after.same_content(&saved), "the change reached the open session");
+        assert!(after.same_content(&app.capture_session("Jam").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "no second session appears");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_never_writes_a_template_over_the_session_that_was_open() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-template");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let jam = on_disk(&dir, "Jam");
+
+        app.load_template(Template::LeadReverb);
+        assert_eq!(app.open_session, None);
+        app.autosave_now(&dir);
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "the first check after a load only records it");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, format!("Autosaved '{AUTOSAVE_NAME}'"));
+        assert!(on_disk(&dir, "Jam").same_content(&jam), "the session that was open is untouched");
+        assert!(on_disk(&dir, AUTOSAVE_NAME).same_content(&app.capture_session(AUTOSAVE_NAME).unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_session_becomes_the_autosave_target() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-load");
+        app.session_name = "Song".into();
+        app.save_current_session(&dir);
+        app.load_template(Template::AmbientPad);
+
+        app.open_saved_session(&dir, "Song").unwrap();
+        assert_eq!(app.open_session.as_deref(), Some("Song"));
+        assert_eq!(app.session_name, "Song", "the name field shows the open session");
+        assert!(app.autosave_target() == "Song");
+
+        app.autosave.enabled = true;
+        assert!(!app.autosave_due(AUTOSAVE_SETTLE / 2.0));
+        assert!(app.autosave_due(AUTOSAVE_SETTLE), "the first check comes once the load settled");
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL - 1.0));
+        assert!(app.autosave_due(1.0));
+        app.autosave.enabled = false;
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL * 2.0), "off means no checks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stage_frame(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(shape: &Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                Shape::Vec(v) => for s in v { walk(s, out) },
+                _ => {}
+            }
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| app.sessions_stage_in(ui, dir));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn click_text(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, label: &str) {
+        let texts = stage_frame(app, ctx, dir, vec![]);
+        let pos = texts.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("'{label}' not drawn: {texts:?}")).1.center();
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        stage_frame(app, ctx, dir, vec![egui::Event::PointerMoved(pos)]);
+        stage_frame(app, ctx, dir, vec![b(true)]);
+        stage_frame(app, ctx, dir, vec![b(false)]);
+    }
+
+    #[test]
+    fn overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("overwrite");
+        app.session_name = "Take one".into();
+        app.save_current_session(&dir);
+        let first = on_disk(&dir, "Take one");
+        app.load_template(Template::DrumsBass);
+        turn_a_knob(&mut app);
+        let ctx = egui::Context::default();
+
+        click_text(&mut app, &ctx, &dir, "Overwrite");
+        assert_eq!(app.confirm_session, Some(SessionConfirm::Overwrite("Take one".into())));
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Confirm overwrite"), "{texts:?}");
+        assert!(on_disk(&dir, "Take one").same_content(&first), "nothing is written before the confirm");
+
+        click_text(&mut app, &ctx, &dir, "Confirm overwrite");
+        assert_eq!(app.session_msg, "Overwrote 'Take one'");
+        assert_eq!(app.confirm_session, None);
+        assert_eq!(app.open_session.as_deref(), Some("Take one"));
+        let now = on_disk(&dir, "Take one");
+        assert!(!now.same_content(&first));
+        assert!(now.same_content(&app.capture_session("Take one").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Take one".to_string()]);
+
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "open"), "the open session is marked");
+        let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+        for (label, r) in texts.iter().filter(|(t, _)| ["Load", "Overwrite", "Delete"].contains(&t.as_str())) {
+            assert!(r.right() + 8.0 <= inner.right() + 0.5, "'{label}' at {r:?} leaves the sheet ({inner:?})");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -20108,8 +20647,108 @@ mod ui_polish_agent_tests {
         (app, drain)
     }
 
+    /// User 2026-11-17: one click in an organ's matrix column selected
+    /// every cell of it, because all its rows showed the MIDI cable.
+    #[test]
+    fn an_lv2_column_toggles_one_cell_like_a_clap_column() {
+        let (mut app, drain) = app_of_instruments();
+        app.hw_devices = vec!["FM-1 24:0".into(), "MIDIMATE 28:0".into()];
+        let organ = app.units.iter().position(|u| u.rig == 1 && u.name == "ORGAN").expect("organ");
+        let node = app.units[organ].node_id;
+        let rows = [MatrixRow::Keys, MatrixRow::HwAll, MatrixRow::HwDev(0), MatrixRow::HwDev(1)];
+        let cells = |app: &DemoApp| rows.map(|r| app.matrix_cell_on(organ, r));
+        assert_eq!(cells(&app), [true, true, false, false], "keyboard and all hardware by default");
+
+        app.matrix_toggle(organ, MatrixRow::Keys, false);
+        assert_eq!(cells(&app), [false, true, false, false], "only the keyboard cell went off");
+        app.matrix_toggle(organ, MatrixRow::HwDev(1), true);
+        assert_eq!(cells(&app), [false, false, false, true], "one device replaces all hardware");
+        app.matrix_toggle(organ, MatrixRow::Keys, true);
+        assert_eq!(cells(&app), [true, false, false, true], "the keyboard is independent of hardware");
+        assert!(app.midi_cable_to(organ).is_some(), "the cable stays plugged");
+
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.render(&mut vec![0.0f32; 64 * 2], 2);
+        let rules = pub_.lock().unwrap().rules.clone();
+        let muted: Vec<SourceId> = rules.iter().filter(|r| r.dest == node && !r.enabled).map(|r| r.source).collect();
+        let others = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| d != 1).map(SourceId::Hardware);
+        assert_eq!(muted, others.collect::<Vec<_>>(), "the engine mutes every source but the keyboard and device 1");
+    }
+
     fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
         app.units.iter().find(|u| u.rig == rig && u.name == name).map(|u| u.node_id).expect("that unit")
+    }
+
+    /// A Nord Electro 2 behind a MIDI interface: the port name does not say
+    /// what is plugged in, so the user picks the profile. Its drawbars,
+    /// rotary, percussion and drive then drive the organ face, a session
+    /// load that drops the bindings gets them back, and "No profile" takes
+    /// back exactly what the profile bound.
+    #[test]
+    fn a_picked_nord_electro_2_profile_binds_the_organ_and_unbinds_cleanly() {
+        let rigs = vec![instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")])];
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        *app.hw_midi.devices.lock().unwrap() = vec![
+            ("U6MIDI Pro:U6MIDI Pro MIDI 1 32:0".into(), true),
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into(), true),
+        ];
+        app.hw_midi.rev.fetch_add(1, Ordering::Release);
+        let organ = node_named(&app, 0, "ORGAN");
+        let nord = SourceId::Hardware(1);
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert!(app.device_profile(1).is_none(), "an interface's name says nothing about the instrument");
+        while drain.pop().is_some() {}
+
+        app.pick_device_profile(1, "nord-electro-2");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        let bound: Vec<u8> = sent.iter().filter_map(|c| match c {
+            Command::MatrixCcMap { source, dest, cc, param: Some(_), target: crate::matrix::CcTarget::Knob, .. }
+                if *source == nord && *dest == organ => Some(*cc),
+            _ => None,
+        }).collect();
+        let mut bound = bound;
+        bound.sort();
+        assert_eq!(bound, [16, 17, 18, 19, 20, 21, 22, 23, 24, 82, 87, 111], "nine drawbars, rotary, percussion, overdrive");
+        assert!(!sent.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), .. })), "the other port keeps its CCs");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut resent = Vec::new();
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { .. }) { resent.push(c); });
+        assert!(resent.is_empty(), "nothing is resent once the bindings are in place: {resent:?}");
+
+        // The Nord moves: 8' drawbar to position 6, rotary fast, percussion on.
+        let u = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let knob = |app: &DemoApp, param| app.units[u].knobs.iter().find(|k| k.param == Some(param)).unwrap().display_value;
+        for (cc, v) in [(18u8, 86u8), (82, 127), (87, 100)] {
+            app.hw_cc_queue.lock().unwrap().push_back((nord, 0, cc, v));
+        }
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert_eq!(crate::organ::drawbar_position(knob(&app, crate::organ::drawbar_param(2))), 6);
+        assert_eq!(crate::organ::step_name(crate::organ::P_LESLIE, knob(&app, crate::organ::P_LESLIE)), Some("FAST"));
+        assert_eq!(crate::organ::step_name(crate::organ::P_PERC, knob(&app, crate::organ::P_PERC)), Some("ON"));
+
+        // A load without the bindings: the next frame binds them again.
+        app.rule_edits.clear();
+        while drain.pop().is_some() {}
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut again = 0;
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { param: Some(_), .. }) { again += 1; });
+        assert_eq!(again, 12);
+
+        // A hand-made binding on the profile's controller survives the unpick.
+        app.set_cc_binding(nord, organ, 111, Some(crate::organ::P_REVERB), crate::matrix::CcTarget::Knob);
+        app.pick_device_profile(1, "");
+        while drain.pop().is_some() {}
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let cc_map: Vec<(u8, u32)> = app.rule_edits.get(&(nord, organ)).map_or(vec![], |e| e.cc_map.iter().map(|m| (m.cc, m.param)).collect());
+        assert_eq!(cc_map, vec![(111, crate::organ::P_REVERB)], "the profile's bindings are gone, the hand-made one stays");
     }
 
     /// setBfree's face: drawbars and four CC knobs, all ordinary knob

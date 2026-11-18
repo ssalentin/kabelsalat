@@ -863,8 +863,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_cc_map",
-            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Omit param/knob to unbind that CC.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source","cc"]}
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). Omit param/knob to unbind that CC.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",

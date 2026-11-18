@@ -798,6 +798,32 @@ Learned so far (2026-11-15, UI polish pass):
     0-based index, so "move to slot 1" landed second. Convert once, at the
     edit (`to.clamp(1, len) - 1`), and send the shown number from the UI.
 
+141. **Input-ring discards are whole stereo frames, and a backlog is cut at
+    once:** `DropOne` popped ONE sample of an interleaved ring (swapping L and
+    R from then on) and trimmed a startup backlog one sample per block, so
+    monitoring ran 330-570 ms late. `Drift::catch_up` cuts everything above
+    the target in whole frames; `monitor-latency-test` measures the loop
+    itself (about 19 ms median, 10 ms best, once it recirculates).
+142. **A UI frame runs a heavy estimator once, never per chunk:** the tuner's
+    YIN (millions of multiply-adds) ran for each 512-sample chunk of a
+    one-second backlog, so loading the Guitar rig froze the window until the
+    compositor offered to terminate it; `pump_audio_in_tuners` also called
+    `process(&[])`, which always answered "no pitch". `Tuner::push` is cheap,
+    `estimate_if_due` runs at most every 50 ms
+    (`a_backlog_costs_one_estimate_not_one_per_chunk`). The tuner's feed is
+    one L+R-mixed sample per frame, never the interleaved stream.
+143. **Shift variants of a key are asked before the plain key:** egui matches
+    `Modifiers::NONE` logically, so Shift+F5 was consumed as F5 (Lead +
+    Reverb) and the Guitar rig never loaded
+    (`shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead`).
+144. **A self-test of LV2 units follows the app's load path:** `LoadGraph` on
+    an engine with `spawn_lv2_loader`, wait until every LV2 slot attached
+    (rule 46), then feed. Building the engine with the graph instantiated
+    the plugins inside the constructor and aborted with heap corruption in
+    about one run in four; the measurement also raced the attach. Judge
+    "transformed" by the share of power outside the fundamental
+    (`non_fundamental_share`), not a single Goertzel bin of a decaying tone.
+
 128. **Dock controls are painted from the theme, never stock `egui::Slider`:**
     the VEL slider's rail has the panel's own fill on the dark dock, so only a
     tiny handle showed. Use a `PAPER_SINK` track + `CREAM` fill like the strip's

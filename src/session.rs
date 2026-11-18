@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::control::{
-    name_bytes, name_str, DspKind, EdgeId, Graph, NodeId, NodeKind, ParamId, PortKind, PortRef, Rig,
+    name_bytes, name_str, AudioInChannel, DspKind, EdgeId, Graph, Lv2Uri, NodeId, NodeKind,
+    ParamId, PortKind, PortRef, Rig,
 };
 // Param ids are per-node; these mirror the engine's current knob table
 // (task-10 generalizes it — the session stores opaque (node, param, value)
@@ -1125,20 +1126,33 @@ pub enum Template {
     DrumsBass,
     /// Slow pad into long delay and big reverb — instant atmosphere.
     AmbientPad,
+    /// GarageBand's guitar story (issue #92): a live input through stomps
+    /// into an amp and cabinet. Audio In picks the input device on its face
+    /// (default = PipeWire's default source) and carries the tuner.
+    GuitarRig,
 }
 
 impl Template {
-    pub const ALL: [Template; 3] = [
+    pub const ALL: [Template; 4] = [
         Template::LeadReverb,
         Template::DrumsBass,
         Template::AmbientPad,
+        Template::GuitarRig,
     ];
+
+    /// A template whose instrument is a live input, not the keyboard: the
+    /// validity test asks for Audio In → effects → Master instead of
+    /// Keys → synth → Master.
+    pub fn is_guitar(self) -> bool {
+        matches!(self, Template::GuitarRig)
+    }
 
     pub fn title(self) -> &'static str {
         match self {
             Template::LeadReverb => "Lead + Reverb",
             Template::DrumsBass => "Drums + Bass",
             Template::AmbientPad => "Ambient Pad",
+            Template::GuitarRig => "Guitar Rig",
         }
     }
 
@@ -1236,6 +1250,53 @@ impl Template {
                     (verb, 0, 0.6), // reverb mix (param table: task-7)
                     (master, P_VOL, 0.75),
                     (master, P_WARM, 0.05),
+                ]);
+            }
+            // Audio In → screamer → delay → reverb (stomps) → amp → cabinet →
+            // Master. The guitarix LV2s come with the catalog's Guitarix card;
+            // until it is installed the three units say so on their faces and
+            // the rest of the rig (Audio In, Delay, Reverb) already works.
+            Template::GuitarRig => {
+                let ain = g.add_node(
+                    NodeKind::AudioIn { device: None, channels: AudioInChannel::MonoL },
+                    name_bytes("AUDIO IN"),
+                );
+                let scream = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::SCREAM) },
+                    name_bytes("SCREAM"),
+                );
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+                let amp = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::AMP) },
+                    name_bytes("AMP"),
+                );
+                let cab = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::CABINET) },
+                    name_bytes("CABINET"),
+                );
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+                link(&mut g, ain, scream, 0, PortKind::Audio);
+                link(&mut g, scream, delay, 0, PortKind::Audio);
+                link(&mut g, delay, verb, 0, PortKind::Audio);
+                link(&mut g, verb, amp, 0, PortKind::Audio);
+                link(&mut g, amp, cab, 0, PortKind::Audio);
+                link(&mut g, cab, master, 0, PortKind::Audio);
+                defaults.extend([
+                    // The amp's tube stage driven to its crunch (guitar.rs:
+                    // Drive is the one control that turns the modelled clean
+                    // channel into an amp — the plugin's default 0.25 is
+                    // nearly clean).
+                    (amp, crate::guitar::AMP_DRIVE_CTRL as ParamId, 1.0),
+                    (amp, crate::guitar::AMP_PREGAIN_CTRL as ParamId, 0.8),
+                    // The screamer at full drive pushes the amp into its
+                    // crunch (its one control, port 0).
+                    (scream, 0, 1.0),
+                    (delay, P_TIME, 0.42), // ~1/8th at 96 BPM
+                    (delay, P_MIX, 0.35),
+                    (verb, 0, 0.3), // reverb mix (param table: task-7)
+                    (master, P_VOL, 0.75),
+                    (master, P_WARM, 0.1),
                 ]);
             }
         }
@@ -1513,17 +1574,27 @@ mod tests {
             ids.sort_unstable();
             assert!(ids.windows(2).all(|w| w[0] != w[1]));
 
-            // Playable shape: keys → at least one Clap synth → audio → master.
+            // Playable shape: every template makes sound into a master —
+            // keyboard templates Keys → Clap synth → master (MIDI + audio),
+            // the guitar rig Audio In → effects → master (audio only).
             let keys: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id).collect();
+            let inputs: Vec<NodeId> = g.nodes.iter()
+                .filter(|n| matches!(n.kind, NodeKind::AudioIn { .. })).map(|n| n.id).collect();
             let synths: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::Clap { .. })).map(|n| n.id).collect();
             let masters: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
-            assert!(!keys.is_empty() && !synths.is_empty() && !masters.is_empty());
-            assert!(synths.iter().any(|&syn| keys.iter().any(|&k| g.has_route(k, syn, PortKind::Midi))));
+            assert!(!masters.is_empty());
+            if t.is_guitar() {
+                assert!(!inputs.is_empty(), "{}: no Audio In", t.title());
+            } else {
+                assert!(!keys.is_empty() && !synths.is_empty(), "{}: no keys/synth", t.title());
+                assert!(synths.iter().any(|&syn| keys.iter().any(|&k| g.has_route(k, syn, PortKind::Midi))));
+            }
 
-            // Audio reachability: some synth reaches some master over audio edges.
+            // Audio reachability: the template's sound source reaches a
+            // master over audio edges.
             let reaches_master = |syn: NodeId| -> bool {
                 let mut seen = vec![syn];
                 let mut stack = vec![syn];
@@ -1540,7 +1611,8 @@ mod tests {
                 }
                 false
             };
-            assert!(synths.iter().any(|&syn| reaches_master(syn)), "{}: no audio path to master", t.title());
+            let sources: Vec<NodeId> = if t.is_guitar() { inputs } else { synths };
+            assert!(sources.iter().any(|&syn| reaches_master(syn)), "{}: no audio path to master", t.title());
 
             // Default knobs reference real nodes and are finite.
             for p in s.params() {

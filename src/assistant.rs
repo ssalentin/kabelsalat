@@ -967,8 +967,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"load_template",
-            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | demo | multi_rig (two independent rigs, switch view with 1-9).",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","demo","multi_rig"]}},"required":["name"]}
+            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; the player plugs a guitar or mic into the Audio In unit, whose face also carries the tuner) | demo | multi_rig (two independent rigs, switch view with 1-9).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","guitar_rig","demo","multi_rig"]}},"required":["name"]}
         }},
         {"type":"function","function":{
             "name":"add_node",
@@ -1626,6 +1626,14 @@ const SHORTCUTS: &[Shortcut] = &[
     Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.",
         plan: |f, done| once(done, || Some(call("select_rig", json!({ "rig": f.rig? }))), say_result) },
     Shortcut { key: "metronome", means: "Add a metronome (a click), or start the metronome.", plan: metronome },
+    Shortcut { key: "guitar_rig", means: "Load the Guitar rig template: a live Audio In unit (guitar, mic or interface — its face carries the tuner) run through overdrive, delay and reverb into a guitar amp and cabinet, replacing the current patch. Only a request that asks for a GUITAR rig (it may name its stomps or the input); 'a new rig with a sound' is not this.",
+        plan: |_, done| once(done, || Some(call("load_template", json!({ "name": "guitar_rig" }))), |r| {
+            if r.starts_with("Loaded template 'Guitar Rig'") {
+                "Guitar rig loaded: Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master. Pick the input device on the Audio In unit's face (its tuner is there); the Delay unit's TIME and MIX are on its face.".to_string()
+            } else {
+                say_result(r)
+            }
+        }) },
     Shortcut { key: "play", means: "Start the transport (play), with no word about a metronome.",
         plan: |_, done| once(done, || Some(call("transport_play", json!({}))), say_result) },
     Shortcut { key: "stop", means: "Stop the transport.",
@@ -1731,6 +1739,7 @@ const JEV_SAMPLES: &[&str] = &[
     "Make rig 2 a bit quieter.", "make rig B a bit louder", "turn rig 1 down by 6 dB", "Pan rig 1 to the left.",
     "pan rig 2 right", "Pan rig 1 hard left and rig 2 hard right.", "Mute rig 1.", "unmute rig 1", "solo the second rig",
     "Delete rig 2.", "show rig 2", "undo that", "Why is there no sound?",
+    "Build me a guitar rig.", "Give me a guitar rig with a warm delay.",
 ];
 
 /// What a decision leads to, for the test printout.

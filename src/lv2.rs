@@ -2368,6 +2368,98 @@ mod tests {
         retire(again);
     }
 
+    #[test]
+    fn guitarix_amps_process_from_the_first_block() {
+        // Guitarix's amps declare an `lv2:enabled` port named BYPASS with
+        // default 1 (bypassed). The host must enable such a plugin on
+        // instantiation: a unit the player adds starts processing (the
+        // Guitar rig would pass audio untouched otherwise). Probes the real
+        // plugin when the Guitarix card is installed, skips in CI.
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut amp) = Lv2Plugin::load(crate::guitar::AMP, 48000.0, 512) else { return };
+
+        fn harmonics_over_fundamental(amp: &mut Lv2Plugin, bypass: Option<f32>) -> f32 {
+            let block = 512usize;
+            let mut inp = vec![0.0f32; block * 2];
+            let mut out = vec![0.0f32; block * 2];
+            let mut l = Vec::new();
+            for b in 0..(48000 / block) {
+                for i in 0..block {
+                    let s = (2.0 * std::f32::consts::PI * 220.0 * ((b * block + i) as f32 / 48000.0)).sin() * 0.45;
+                    inp[i * 2] = s;
+                    inp[i * 2 + 1] = s;
+                }
+                amp.process(&inp, &mut out, block);
+                if b > 20 {
+                    l.extend(out.iter().step_by(2).copied());
+                }
+            }
+            let g = |x: &[f32], f: f32| {
+                let k = 2.0 * std::f32::consts::PI * f / 48000.0;
+                let (mut s1, mut s2) = (0.0f32, 0.0f32);
+                for &v in x {
+                    let s0 = v + 2.0 * k.cos() * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                (s1 * s1 + s2 * s2 - 2.0 * k.cos() * s1 * s2) / (x.len().max(1) as f32).powi(2)
+            };
+            let f0 = g(&l, 220.0);
+            if f0 <= 1e-12 {
+                return 0.0;
+            }
+            (g(&l, 440.0) + g(&l, 660.0) + g(&l, 880.0)) / f0
+        }
+
+        let by_desc = amp.control_descs().into_iter().find(|d| d.symbol == "BYPASS");
+        let Some(desc) = by_desc else {
+            // No enabled port: the amp crunches as it declares.
+            let plain = harmonics_over_fundamental(&mut amp, None);
+            assert!(plain > 0.02, "the amp transforms its input (harmonics {plain:.4})");
+            retire(amp);
+            return;
+        };
+        // The amp as the bundle ships it: enabled (per the LV2 `enabled`
+        // designation, 1 = processing) but nearly clean at its defaults.
+        let as_shipped = harmonics_over_fundamental(&mut amp, None);
+        println!("guitarix amp as the bundle ships it (BYPASS={}): harmonics {as_shipped:.4}", desc.value);
+        assert!(as_shipped > 0.0, "the enabled port must not mute the amp: {as_shipped:.4}");
+        // The Guitar rig drives its amp: "Drive" (the tube stage's gain)
+        // is the one control that turns the modelled clean channel into a
+        // crunch — the template sets it to its maximum.
+        let ctl = |p: &Lv2Plugin, sym: &str| p.control_descs().into_iter().find(|d| d.symbol == sym).expect(sym);
+        let (drive, pregain, distortion, highgain) = (
+            ctl(&amp, "Drive"), ctl(&amp, "PreGain"), ctl(&amp, "Distortion"), ctl(&amp, "HIGHGAIN"),
+        );
+        assert_eq!(drive.index, crate::guitar::AMP_DRIVE_CTRL, "the template's Drive ordinal follows the plugin's port order");
+        for (sym, idx, v) in [
+            ("Drive", drive.index, 1.0),
+            ("Distortion", distortion.index, 0.8),
+            ("HIGHGAIN", highgain.index, 1.0),
+            ("PreGain", pregain.index, 0.8),
+        ] {
+            amp.set_control_normalized(idx, v);
+            println!("guitarix amp with {sym}={v}: harmonics {:.4}", harmonics_over_fundamental(&mut amp, None));
+        }
+        // The template's amp: everything at the plugin's declared defaults
+        // (normalized: PreGain 0 dB = 0.5, Distortion 20 = ~0.19) except Drive.
+        for (idx, v) in [
+            (drive.index, 1.0),
+            (pregain.index, 0.5),
+            (distortion.index, (20.0f32 - 1.0) / 99.0),
+            (highgain.index, 0.0),
+        ] {
+            amp.set_control_normalized(idx, v);
+        }
+        let driven = harmonics_over_fundamental(&mut amp, None);
+        println!("guitarix amp at the template's setting (Drive max, rest default): harmonics {driven:.4}");
+        assert!(
+            driven > as_shipped * 2.0 + 0.02,
+            "the rig's amp setting must transform the input: as-shipped {as_shipped:.4} vs driven {driven:.4}"
+        );
+        retire(amp);
+    }
+
     // -- LV2 worker plumbing -------------------------------------------------
 
     #[derive(Default)]

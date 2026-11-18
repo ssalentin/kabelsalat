@@ -52,6 +52,18 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded.
 
+### Play your guitar
+Plug a guitar (or a microphone) into your audio interface and press **⇧F5**: the
+Guitar rig loads **Audio In → Scream → Delay → Reverb → Amp → Cabinet →
+Master**. The Audio In unit picks any input by name, has a gain knob, a live
+level meter, a **MON** switch for monitoring through the rig, and a built-in
+**tuner** (note and cents) on its face. The stomps, amp and cabinet are the
+Guitarix LV2 plugins from the Plugins browser (install the *Guitarix* card).
+Monitoring goes through the same low-latency path as everything else; a missing
+input says so instead of falling back to the laptop microphone.
+
+<p align="center"><img src="docs/shots/guitar-rig.png" width="85%" alt="The Guitar rig: Audio In with level meter and tuner, Scream, Delay, Reverb, Amp and Cabinet in one stack beside Master out"/></p>
+
 ### Mix
 Every source gets its own channel strip: a fader in dB with a 0 dB detent
 (double-click for exact unity), a held peak and a clip light, plus pan, mute

@@ -1939,7 +1939,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
-    "save_rig", "load_rig", "list_rig_presets",
+    "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
@@ -6477,6 +6477,10 @@ impl DemoApp {
                     "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); Some("Loaded template 'Lead + Reverb'".to_string()) }
                     "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); Some("Loaded template 'Drums + Bass'".to_string()) }
                     "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); Some("Loaded template 'Ambient Pad'".to_string()) }
+                    "guitar_rig" | "guitar" => {
+                        self.load_template(Template::GuitarRig);
+                        Some("Loaded template 'Guitar Rig' — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too".to_string())
+                    }
                     "demo" => { self.load_demo_patch(); Some("Loaded the demo patch".to_string()) }
                     "multi_rig" | "rigs" => { self.load_multi_rig_demo(); Some("Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".to_string()) }
                     _ => None,
@@ -6487,7 +6491,7 @@ impl DemoApp {
                         self.agent_activity.record(origin, format!("Template: {name}"), nodes, now);
                         msg
                     }
-                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
+                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)"),
                 }
             }
             "add_node" => {
@@ -9688,6 +9692,7 @@ impl DemoApp {
                             Template::LeadReverb => ("Keys → Surge → Reverb", "F5"),
                             Template::DrumsBass => ("Dual Surge layers", "F6"),
                             Template::AmbientPad => ("Surge → Delay → Reverb", "F7"),
+                            Template::GuitarRig => ("Live input → stomps → amp", "⇧F5"),
                         };
                         if template_row(ui, t.title(), &format!("{desc} · {key_hint}"), "load a playable pre-wired rack") {
                             *load_tpl = Some(*t);
@@ -13777,6 +13782,11 @@ impl DemoApp {
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
+            // The guitar rig replaces the keyboard patch (no Keys unit), so it
+            // sits on Shift+F5, next to its keyboard sibling. Asked BEFORE
+            // plain F5: egui matches `NONE` logically, so a Shift+F5 press
+            // would otherwise be consumed as F5 and load Lead + Reverb.
+            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
             if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
@@ -16206,10 +16216,12 @@ impl DemoApp {
                 }
                 if n == 0 { break; }
                 any = true;
-                tuner.process(&chunk[..n]);
+                tuner.push(&chunk[..n]);
             }
             if any {
-                *pitch = tuner.process(&[]);
+                if let Some(p) = tuner.estimate_if_due() {
+                    *pitch = p;
+                }
             }
         }
     }
@@ -18151,6 +18163,27 @@ const EVAL_TASKS: &[EvalTask] = &[
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
     },
+    EvalTask {
+        name: "guitar_rig", start: EvalStart::OneRig, prompt: "Build me a guitar rig.",
+        check: |app, _, _| {
+            // The Guitar rig template's shape (issue #92): a live input through
+            // stomps into the amp and cabinet, all the way to the master.
+            let g = eval_graph(app);
+            let ain = eval_node(&g, 0, "audio in", |k| matches!(k, NodeKind::AudioIn { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, ain, master), || "the Audio In does not reach the master".into())?;
+            let amp = eval_node(&g, 0, "amp", |k| matches!(k, NodeKind::Lv2 { uri } if crate::guitar::is_amp_uri(uri.as_str())))?;
+            let cab = eval_node(&g, 0, "cabinet", |k| matches!(k, NodeKind::Lv2 { uri } if uri.as_str() == crate::guitar::CABINET))?;
+            eval_ensure(eval_audio_path(&g, ain, amp) && eval_audio_path(&g, amp, cab) && eval_audio_path(&g, cab, master),
+                || "the amp and cabinet are not chained between the input and the master".into())?;
+            for (kind, what) in [(DspKind::Delay, "delay"), (DspKind::Reverb, "reverb")] {
+                let fx = eval_one_dsp(&g, 0, &kind)?;
+                eval_ensure(eval_audio_path(&g, ain, fx) && eval_audio_path(&g, fx, master),
+                    || format!("the {what} is not in the input's chain"))?;
+            }
+            Ok(())
+        }
+    },
 ];
 
 /// A headless app on an offline engine: no window, no audio device, no
@@ -19992,6 +20025,23 @@ mod rig_switch_tests {
             assert!(!vis.is_empty(), "rig {rig} has cables");
             for c in vis { assert!(finite(c), "rig {rig} cable {} rope {:?}", c.id, &c.pts[..c.n]); }
         }
+    }
+
+    #[test]
+    fn shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead() {
+        // egui matches `Modifiers::NONE` logically, so a Shift+F5 press that
+        // is asked for after F5 loads Lead + Reverb instead of the guitar rig.
+        let ctx = egui::Context::default();
+        let names = |app: &DemoApp| -> Vec<String> { app.units.iter().map(|u| u.name.clone()).collect() };
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let shifted = |down: bool| egui::Event::Key {
+            key: Key::F5, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::SHIFT,
+        };
+        frame(&mut app, &ctx, vec![shifted(true), shifted(false)]);
+        assert!(names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "Shift+F5 → guitar rig: {:?}", names(&app));
+        frame(&mut app, &ctx, key(Key::F5));
+        assert!(!names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "plain F5 → lead: {:?}", names(&app));
     }
 
     #[test]

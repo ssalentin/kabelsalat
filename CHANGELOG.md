@@ -24,6 +24,9 @@ releases may still change behaviour and session files.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code
   and the project's website. `list_instruments` reports the same fields.
+- **GitHub stars on catalog cards:** each card shows its project's star count
+  (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
+  opens. Without internet access, or when GitHub refuses, cards show no stars.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).

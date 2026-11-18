@@ -68,6 +68,10 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **MIDI matrix, LV2 instrument columns:** a click in a setBfree (or any LV2
+  instrument) column lit or cleared every cell of it, because all its rows
+  showed the MIDI cable. Each cell now routes its own source, with the same
+  keyboard switch and hardware radio group as a Surge column.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

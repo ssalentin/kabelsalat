@@ -509,6 +509,88 @@ struct SetRigMixArgs {
     solo: Option<bool>,
 }
 
+/// Arguments for `set_strip_mix` (#73).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripMixArgs {
+    /// Source node id (get_graph).
+    node: NodeId,
+    /// Pan -1 (L) .. 1 (R) (omit to keep).
+    pan: Option<f32>,
+    /// Mute (omit to keep).
+    mute: Option<bool>,
+    /// Solo — within the node's rig (omit to keep).
+    solo: Option<bool>,
+}
+
+/// Arguments for `set_node_bypass` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetNodeBypassArgs {
+    /// FX node id (get_graph).
+    node: NodeId,
+    /// True = bypass (default), false = enable.
+    bypass: Option<bool>,
+}
+
+/// Arguments for `add_insert` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AddInsertArgs {
+    /// The strip's source node id; omit for a MASTER insert.
+    source: Option<NodeId>,
+    /// "dsp" (with dsp=…) or "lv2" (with uri=…).
+    kind: String,
+    /// Built-in effect: gain, pan, eq3, filter, limiter, saturation, delay, reverb.
+    dsp: Option<String>,
+    /// LV2 effect URI (list_plugins).
+    uri: Option<String>,
+    /// Optional display name for the new unit.
+    name: Option<String>,
+}
+
+/// Arguments for `remove_insert` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoveInsertArgs {
+    /// The effect node id to remove.
+    fx: NodeId,
+    /// Its strip's source node id; omit for a master insert.
+    source: Option<NodeId>,
+}
+
+/// Arguments for `rename_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameStripArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// New name (≤ 24 characters).
+    name: String,
+}
+
+/// Arguments for `set_strip_color` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripColorArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan), or none.
+    color: String,
+}
+
+/// Arguments for `move_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveStripArgs {
+    /// Source node id (get_graph).
+    node: NodeId,
+    /// 1-based slot within its rig.
+    to: u64,
+}
+
+/// Arguments for `collapse_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CollapseStripArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// True = collapse (default), false = expand.
+    collapsed: Option<bool>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -1890,6 +1972,116 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"rig": args.rig, "name": name}))
+    }
+
+    /// Per-source strip mix (#73).
+    #[tool(name = "set_strip_mix", description = "Per-SOURCE mixer (#73): pan -1..1, mute, solo on one instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Applied by the engine at the node's output; resets on graph loads. In the running app (mcp --attach) the Mixer view shows it live.")]
+    fn set_strip_mix(&self, Parameters(args): Parameters<SetStripMixArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_strip_mix", json!({
+                "node": args.node, "pan": args.pan, "mute": args.mute, "solo": args.solo,
+            }));
+        }
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetStripMix { node: args.node, pan: args.pan, mute: args.mute, solo: args.solo }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "pan": args.pan, "mute": args.mute, "solo": args.solo}))
+    }
+
+    /// Bypass one effect node (#74).
+    #[tool(name = "set_node_bypass", description = "Bypass one effect node (#74): a bypassed FX passes its input through unchanged (its knobs are kept). True = bypass, false = enable. Resets on graph loads.")]
+    fn set_node_bypass(&self, Parameters(args): Parameters<SetNodeBypassArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_node_bypass", json!({"node": args.node, "bypass": args.bypass}));
+        }
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        let bypass = args.bypass.unwrap_or(true);
+        if let Err(e) = send_cmd(&mut st, Command::SetStripBypass { node: args.node, bypass }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "bypass": bypass}))
+    }
+
+    /// Add an insert to a strip's chain (#74).
+    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
+    fn add_insert(&self, Parameters(args): Parameters<AddInsertArgs>) -> Result<CallToolResult, McpError> {
+        let mut a = json!({"kind": args.kind});
+        if let Some(s) = args.source { a["source"] = json!(s); }
+        if let Some(d) = &args.dsp { a["dsp"] = json!(d); }
+        if let Some(u) = &args.uri { a["uri"] = json!(u); }
+        if let Some(n) = &args.name { a["name"] = json!(n); }
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("add_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");
+        }
+        Self::ui_bridge_tool("add_insert", a)
+    }
+
+    /// Remove an insert from a strip's chain (#74).
+    #[tool(name = "remove_insert", description = "Remove one effect from a strip's insert chain (#74); the chain closes up (source -> next). fx = the effect's node id; source = its strip's source node id, omitted for a master insert. Needs the running app (kabelsalat mcp --attach).")]
+    fn remove_insert(&self, Parameters(args): Parameters<RemoveInsertArgs>) -> Result<CallToolResult, McpError> {
+        let mut a = json!({"fx": args.fx});
+        if let Some(s) = args.source { a["source"] = json!(s); }
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("remove_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");
+        }
+        Self::ui_bridge_tool("remove_insert", a)
+    }
+
+    /// Rename one strip (#77).
+    #[tool(name = "rename_strip", description = "Rename one strip (#77): the name is the node's name, so the rack face, the mixer and saved sessions all show it. Up to 24 characters. In headless mcp the engine's graph is renamed (get_graph shows it).")]
+    fn rename_strip(&self, Parameters(args): Parameters<RenameStripArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("rename_strip", json!({"node": args.node, "name": args.name}));
+        }
+        let name: String = args.name.trim().chars().take(24).collect();
+        if name.is_empty() { return tool_err("a strip name cannot be empty"); }
+        let mut st = self.state.lock().unwrap();
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::RenameNode { node: args.node, name: name_bytes(&name) }) {
+            return tool_err(e);
+        }
+        if let Some(n) = st.graph.nodes.iter_mut().find(|n| n.id == args.node) {
+            n.name = name_bytes(&name);
+        }
+        ok_json(json!({"node": args.node, "name": name}))
+    }
+
+    /// Set a strip's colour (#77).
+    #[tool(name = "set_strip_color", description = "Give a mixer strip a colour (#77): 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan) or none to clear. Saved with the session. Needs the running app (kabelsalat mcp --attach).")]
+    fn set_strip_color(&self, Parameters(args): Parameters<SetStripColorArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("set_strip_color needs the running app (kabelsalat mcp --attach): the colour is session state the app owns");
+        }
+        Self::ui_bridge_tool("set_strip_color", json!({"node": args.node, "color": args.color}))
+    }
+
+    /// Move a strip in the display order (#77).
+    #[tool(name = "move_strip", description = "Move one source strip to slot `to` (1-based) within its rig's display order in the mixer (#77). Display only — the sound is unchanged. Needs the running app (kabelsalat mcp --attach).")]
+    fn move_strip(&self, Parameters(args): Parameters<MoveStripArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("move_strip needs the running app (kabelsalat mcp --attach): the order is session state the app owns");
+        }
+        Self::ui_bridge_tool("move_strip", json!({"node": args.node, "to": args.to}))
+    }
+
+    /// Collapse a strip (#77).
+    #[tool(name = "collapse_strip", description = "Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand. Needs the running app (kabelsalat mcp --attach).")]
+    fn collapse_strip(&self, Parameters(args): Parameters<CollapseStripArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("collapse_strip needs the running app (kabelsalat mcp --attach): the collapse flag is session state the app owns");
+        }
+        Self::ui_bridge_tool("collapse_strip", json!({"node": args.node, "collapsed": args.collapsed}))
     }
 
     /// Delete one rig.

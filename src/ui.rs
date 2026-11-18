@@ -1005,6 +1005,9 @@ fn remap_session(
     }
     let order: Vec<u32> = s.strip_order().iter().filter_map(|n| remap(*n)).collect();
     if !order.is_empty() { ns.set_strip_order(order); }
+    for (&old, label) in s.strip_knobs() {
+        if let Some(node) = remap(old) { ns.set_strip_knob(node, label.clone()); }
+    }
     ns
 }
 
@@ -1944,6 +1947,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
+    "get_strip_knobs", "set_strip_knob",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2422,6 +2426,9 @@ struct DemoApp {
     /// the entries whose node is in that rig, in this order; unlisted nodes
     /// follow in unit order.
     strip_order: Vec<u32>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id (knob
+    /// label or parameter name/id). Unlisted nodes use their default.
+    strip_knobs: std::collections::BTreeMap<u32, String>,
     /// Grace deadlines per node so echoes of direct UI strip edits never
     /// overwrite the mirror from the engine's own publication.
     ui_strip_grace: std::collections::HashMap<u32, f32>,
@@ -2436,6 +2443,10 @@ struct DemoApp {
     /// Last frame's meter rects in the mixer stage: (key, rect incl. the
     /// clip light on top) — the clip-clear click and the tests.
     mixer_meter_rects: Vec<(u32, Rect)>,
+    /// Last frame's quick-knob rects in the mixer stage: (node_id, rect).
+    mixer_quick_knob_rects: Vec<(u32, Rect)>,
+    /// Active drag on a mixer quick knob: (node_id, knob_idx, unquantized value).
+    mixer_knob_drag: Option<(u32, usize, f32)>,
     /// The strip being dragged to reorder (#77): (node, rig).
     mixer_strip_drag: Option<(u32, u8)>,
     /// Strip rename popup (#77): the node being renamed + its edit buffer.
@@ -2830,11 +2841,14 @@ impl DemoApp {
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             strips: Vec::new(),
             strip_order: Vec::new(),
+            strip_knobs: std::collections::BTreeMap::new(),
             ui_strip_grace: std::collections::HashMap::new(),
             mixer_peaks: std::collections::HashMap::new(),
             mixer_strip_rects: Vec::new(),
             mixer_strip_rects_prev: Vec::new(),
             mixer_meter_rects: Vec::new(),
+            mixer_quick_knob_rects: Vec::new(),
+            mixer_knob_drag: None,
             mixer_strip_drag: None,
             strip_rename: None,
             strip_color_pick: None,
@@ -4363,6 +4377,7 @@ impl DemoApp {
         let rules = std::mem::take(&mut self.rule_edits);
         self.build_rack(&adopted, &[]);
         self.rule_edits = rules;
+        self.strip_knobs.retain(|n, _| self.units.iter().any(|u| u.node_id == *n));
         self.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
         for (nid, param, ki, disp, from, gt) in knob_glides {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
@@ -4492,6 +4507,11 @@ impl DemoApp {
             }
             "move_strip" => "Reorder strip".into(),
             "collapse_strip" => "Collapse strip".into(),
+            "get_strip_knobs" => "Read strip knobs".into(),
+            "set_strip_knob" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Quick knob → {}", self.unit_display_name(node))
+            }
             "set_rig_device" => match args.get("rig").and_then(|v| v.as_u64()) {
                 Some(r) => format!("Set {} MIDI input", self.rig_name(r as usize)),
                 None => "Set MIDI input".into(),
@@ -5030,6 +5050,11 @@ impl DemoApp {
             .filter(|n| self.units.iter().any(|u| u.node_id == **n))
             .copied().collect();
         if !order.is_empty() { s.set_strip_order(order); }
+        for (&node, label) in &self.strip_knobs {
+            if s.graph.node(node).is_some() {
+                s.set_strip_knob(node, label.clone());
+            }
+        }
         Ok(s)
     }
 
@@ -5203,9 +5228,10 @@ impl DemoApp {
         self.load_graph_into_engine(&s.graph);
         self.voice_hold_rev = Some(self.last_graph_rev);
         // The editor referenced the old voice mapping; close it.
-        self.editor_open = false;
+        if std::mem::take(&mut self.editor_open) {
+            self.editor_status = "editor closed (rack reloaded)".into();
+        }
         self.editor_params.clear();
-        self.editor_status = "editor closed (rack reloaded)".into();
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
         self.reset_rig_inputs();
@@ -5241,6 +5267,8 @@ impl DemoApp {
         // state, re-sent because the load dropped the engine's table.
         self.strips = s.strips().iter().map(StripUiRow::from_saved).collect();
         self.strip_order = s.strip_order().to_vec();
+        self.strip_knobs = s.strip_knobs().clone();
+        self.mixer_knob_drag = None;
         self.send_all_strip_state();
         Ok(())
     }
@@ -5363,6 +5391,10 @@ impl DemoApp {
         let rigs = vec![mk_rig("Rig A", true), mk_rig("Rig B", false)];
         let merged = crate::control::merge_rigs(&rigs);
         self.build_rack(&merged, &[]);
+        self.strips.clear();
+        self.strip_order.clear();
+        self.strip_knobs.clear();
+        self.mixer_knob_drag = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
         if let Some(bus) = &self.bus {
@@ -6328,6 +6360,78 @@ impl DemoApp {
                 self.with_strip_row(node, |row| row.collapsed = next);
                 self.agent_activity.touch_node(node, now);
                 format!("{} (node {node}): {}", self.unit_display_name(node), if next { "collapsed (mini strip)" } else { "expanded" })
+            }
+            "get_strip_knobs" => {
+                // #107: effective quick knob + choices per mixer strip/insert node.
+                let filter_node = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if let Some(n) = filter_node {
+                    if !self.units.iter().any(|u| u.node_id == n) {
+                        return format!("no unit with node id {n} (see get_graph)");
+                    }
+                }
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for (ui_idx, u) in self.units.iter().enumerate() {
+                    if filter_node.is_some_and(|n| n != u.node_id) { continue; }
+                    if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Arp) { continue; }
+                    let qk = self.quick_knob(ui_idx);
+                    let knob = qk.map(|i| u.knobs[i].label.clone());
+                    let param_name = qk.map(|i| {
+                        u.knobs[i].source.plugin_name()
+                            .unwrap_or(u.knobs[i].label.as_str())
+                            .to_string()
+                    });
+                    let value = qk.map(|i| u.knobs[i].value);
+                    let choices: Vec<String> = u.knobs.iter()
+                        .filter(|k| is_rack_knob(k))
+                        .map(|k| k.label.clone())
+                        .collect();
+                    entries.push(serde_json::json!({
+                        "node": u.node_id,
+                        "name": sentence_case(&u.name),
+                        "rig": u.rig,
+                        "knob": knob,
+                        "param_name": param_name,
+                        "value": value,
+                        "custom": self.strip_knobs.contains_key(&u.node_id),
+                        "choices": choices,
+                    }));
+                }
+                serde_json::json!({ "strips": entries }).to_string()
+            }
+            "set_strip_knob" => {
+                // #107: assign (or reset with "") one node's mixer quick knob.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let knob_arg = args.get("knob").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(ui_idx) = self.units.iter().position(|u| u.node_id == node) else {
+                    return format!("no unit with node id {node} (see get_graph)");
+                };
+                if knob_arg.trim().is_empty() {
+                    self.strip_knobs.remove(&node);
+                    let def = self.quick_knob(ui_idx)
+                        .map(|i| self.units[ui_idx].knobs[i].label.clone())
+                        .unwrap_or_else(|| "none".into());
+                    self.agent_activity.touch_node(node, now);
+                    self.agent_activity.record(origin, format!("Quick knob {} → default ({def})", self.unit_display_name(node)), vec![node], now);
+                    return format!("{} (node {node}): quick knob reset to default ({def}) — saved with the session", self.unit_display_name(node));
+                }
+                let kind = self.base_graph.node(node).map(|n| &n.kind);
+                let Some(ki) = resolve_unit_quick_knob_choice(&self.units[ui_idx], kind, knob_arg) else {
+                    let avail: Vec<&str> = self.units[ui_idx].knobs.iter()
+                        .filter(|k| is_rack_knob(k))
+                        .map(|k| k.label.as_str())
+                        .collect();
+                    if avail.is_empty() {
+                        return format!("{} (node {node}) has no knobs", self.unit_display_name(node));
+                    }
+                    return format!("no knob '{knob_arg}' on {} (node {node}) — available: {}", self.unit_display_name(node), avail.join(", "));
+                };
+                let k = &self.units[ui_idx].knobs[ki];
+                let store = k.source.plugin_name().unwrap_or(&k.label).to_string();
+                let label = k.label.clone();
+                self.strip_knobs.insert(node, store);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Quick knob {} → {label}", self.unit_display_name(node)), vec![node], now);
+                format!("{} (node {node}): quick knob set to {label} — saved with the session", self.unit_display_name(node))
             }
             "list_plugins" => {
                 if !self.plugin_lists_ready() {
@@ -8917,6 +9021,9 @@ impl DemoApp {
             }
             for st in src_sess.plugin_states() {
                 combined.set_plugin_state(st.node, &st.plugin_id, st.data.clone());
+            }
+            for (&node, label) in src_sess.strip_knobs() {
+                combined.set_strip_knob(node, label.clone());
             }
         }
         let mut rules: Vec<SavedRule> = Vec::new();
@@ -14484,14 +14591,46 @@ impl DemoApp {
             .collect()
     }
 
-    /// Set a unit knob from the mixer and publish it (same path as the rack).
+    /// Effective quick knob index of `unit` (#107), resolving any explicit
+    /// `strip_knobs` assignment by label/name/id first, else the default.
+    fn quick_knob(&self, unit: usize) -> Option<usize> {
+        let u = self.units.get(unit)?;
+        let explicit = self.strip_knobs.get(&u.node_id).map(String::as_str);
+        let kind = self.base_graph.node(u.node_id).map(|n| &n.kind);
+        quick_knob(u, explicit, kind)
+    }
+
+    /// Set a unit knob from the mixer and publish it (same path as the rack:
+    /// `SetParam` for engine/LV2 knobs, `ClapController::set_param` for CLAP
+    /// main/pinned knobs).
     fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
-        let Some(u) = self.units.get_mut(unit) else { return };
-        let Some(k) = u.knobs.get_mut(knob) else { return };
-        k.set_immediate(v);
-        if let (Some(p), Some(bus)) = (k.param, &self.bus) {
-            if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
-                k.sent = Some(k.value);
+        let (node_id, param, val, clap_pin) = {
+            let Some(u) = self.units.get_mut(unit) else { return };
+            let Some(k) = u.knobs.get_mut(knob) else { return };
+            k.set_immediate(v);
+            (u.node_id, k.param, k.value, k.clap)
+        };
+        if let (Some(p), Some(bus)) = (param, &self.bus) {
+            if bus.lock().unwrap().send(Command::SetParam { node: node_id, param: p, value: val as f64 }) {
+                if let Some(k) = self.units.get_mut(unit).and_then(|u| u.knobs.get_mut(knob)) {
+                    k.sent = Some(val);
+                }
+            }
+        }
+        if let Some(pin) = clap_pin {
+            let slots = self.clap_rigs();
+            let hold_until = self.ui_time + READBACK_HOLD_SECS;
+            if let Some(ctl) = slots.iter().find(|(_, n)| *n == node_id)
+                .and_then(|(slot, _)| self.clap_slot_map.get(*slot).copied().flatten())
+                .and_then(|idx| self.surge_controllers.get(idx))
+            {
+                ctl.set_param(ClapId::new(pin.id), pin.min + val as f64 * (pin.max - pin.min));
+                if let Some(k) = self.units.get_mut(unit).and_then(|u| u.knobs.get_mut(knob)) {
+                    if let Some(p) = k.clap.as_mut() {
+                        p.sent = val;
+                        p.hold_until = hold_until;
+                    }
+                }
             }
         }
     }
@@ -14499,8 +14638,9 @@ impl DemoApp {
     /// Mixer stage: every source → its rig bus → Master out, as channel
     /// strips (#72–77): dB faders with a unity detent, peak hold + clip light,
     /// per-source mute/solo/pan, insert slots (a view of the cable chain),
-    /// strip names, colours, drag order and collapse. A main-stage view like
-    /// the matrix (rule 8) — Tab / Esc return to the rack.
+    /// quick parameter knobs (#107), strip names, colours, drag order and
+    /// collapse. A main-stage view like the matrix (rule 8) — Tab / Esc
+    /// return to the rack.
     fn mixer_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
@@ -14514,6 +14654,7 @@ impl DemoApp {
         self.mixer_fader_rects.clear();
         self.mixer_strip_rects_prev = std::mem::take(&mut self.mixer_strip_rects);
         self.mixer_meter_rects.clear();
+        self.mixer_quick_knob_rects.clear();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
         let app_streams = self.app_streams_shown();
@@ -14535,16 +14676,16 @@ impl DemoApp {
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(14.0);
-                // Strip height: name + sub + meta + inserts + fader + readout
-                // + bus controls. A short sheet keeps a usable fader and
-                // scrolls the rest.
+                // Strip height: name + meta + source slot + inserts + fader +
+                // readout + bus controls. A short sheet keeps a usable fader
+                // and scrolls the rest.
                 let view_h = ui.available_height().max(1.0);
-                // Insert rows (29 px each) of the tallest strip count too.
                 let max_inserts = (0..n).flat_map(|r| self.rig_strip_sources(r as u8))
                     .filter(|&u| !self.strip_row(self.units[u].node_id).collapsed)
                     .map(|u| self.strip_chain(u).map_or(0, |c| c.len()))
-                    .max().unwrap_or(0);
-                let overhead = 250.0 + 29.0 * max_inserts as f32;
+                    .max().unwrap_or(0)
+                    .max(self.master_chain().len());
+                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32;
                 let fader_h = (view_h - overhead).clamp(64.0, 480.0);
                 let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
@@ -14553,16 +14694,22 @@ impl DemoApp {
                         // Center the strips in the sheet while they fit (a left-
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
-                        let strips: usize = (0..n).map(|r| self.rig_strip_sources(r as u8).len() + 1).sum();
-                        let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
-                        let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
+                        let sources_w: f32 = (0..n).map(|r| {
+                            let s_w: f32 = self.rig_strip_sources(r as u8).iter().map(|&u| {
+                                let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                w + gap
+                            }).sum();
+                            s_w + STRIP_W + gap
+                        }).sum();
+                        let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 15.0 + gap };
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + sys + 152.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad);
                                 for rig in 0..n {
                                     if rig > 0 {
-                                        let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                        let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                                     }
                                     ui.vertical(|ui| {
@@ -14571,7 +14718,10 @@ impl DemoApp {
                                         // filter/tab while every rig is shown (vision review).
                                         // The rig in the rack view gets an "IN VIEW" tag.
                                         let sources = self.rig_strip_sources(rig as u8);
-                                        let group_w = (sources.len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
+                                        let group_w: f32 = sources.iter().map(|&u| {
+                                            let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                            w + ui.spacing().item_spacing.x
+                                        }).sum::<f32>() + STRIP_W;
                                         // Heading truly centered over ITS strips; the "shown in
                                         // rack" tag sits on a subline reserved for every rig, so
                                         // headings stay centered and strips stay aligned.
@@ -14604,7 +14754,7 @@ impl DemoApp {
                                 // (YouTube in the browser, …) gets a strip —
                                 // its PipeWire stream volume and mute.
                                 if !app_streams.is_empty() {
-                                    let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                     ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                                     ui.vertical(|ui| {
                                         let gap = ui.spacing().item_spacing.x;
@@ -14648,7 +14798,7 @@ impl DemoApp {
                                 }
                                 // Master out sits right after the last rig bus
                                 // (the sum they feed) — not pinned far away.
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
                                 self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
                             });
@@ -14696,13 +14846,16 @@ impl DemoApp {
         let collapsed = row.collapsed;
         let w = if collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
         let level = self.strip_audio_level(unit);
-        let mut gain = knob.map(|k| self.units[unit].knobs[k].value);
+        let mut gain: Option<f32> = None;
+        let source_patch = self.clap_rigs().into_iter()
+            .find(|(_, nid)| *nid == node)
+            .and_then(|(slot, _)| self.patch_names.get(slot).and_then(|p| p.clone()));
         let strip = ui.allocate_ui_with_layout(egui::vec2(w, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.set_width(w);
             // Name: click renames, drag reorders (#77). A coloured strip
             // names itself in its colour; the spine under it is drawn once
             // the column rect is known (below).
-            let shown = truncate_chars(&name, if collapsed { 6 } else { 11 });
+            let shown = truncate_chars(&name, if collapsed { 6 } else { 13 });
             // Keyed by node, not by position: a live reorder moves the strip
             // under the pointer, and a positional id would hand the drag to
             // whichever strip now sits in the old slot (it ping-ponged).
@@ -14750,10 +14903,9 @@ impl DemoApp {
                     self.with_strip_row(node, |r| r.collapsed = false);
                 }
             } else {
-                theme::tracked_label(ui, &sub.to_uppercase(), 9.0, 0.12, theme::INK_2);
-                ui.add_space(3.0);
                 // Meta row: colour dot + collapse chevron.
                 ui.horizontal(|ui| {
+                    ui.add_space(((w - 42.0) * 0.5).max(4.0));
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let (dr, dresp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::click());
                     if let Some(c) = row.color {
@@ -14767,7 +14919,24 @@ impl DemoApp {
                         self.with_strip_row(node, |r| r.collapsed = true);
                     }
                 });
-                // Insert slots (#74): a view of the cable chain.
+                // Source slot (#107): quick knob + instrument/patch plate aligned
+                // in the same column grid as the insert slots below it.
+                let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
+                let (cap_rect, knob_rect, plate_rect) = strip_slot_rects(sr);
+                self.strip_quick_knob_ui(ui, cap_rect, knob_rect, unit, false);
+                ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
+                let plate_label = source_patch.as_deref()
+                    .map(|p| truncate_chars(p, 11))
+                    .unwrap_or_else(|| truncate_chars(&sentence_case(&sub), 11));
+                ui.painter().text(Pos2::new(plate_rect.left() + 8.0, plate_rect.center().y),
+                    egui::Align2::LEFT_CENTER, &plate_label, egui::FontId::proportional(11.0), theme::CREAM);
+                let tip = match &source_patch {
+                    Some(p) => format!("{} · {p}", sentence_case(&sub)),
+                    None => sentence_case(&sub),
+                };
+                ui.interact(plate_rect, egui::Id::new(("strip_src_plate", node)), egui::Sense::hover())
+                    .on_hover_text(tip);
+                // Insert slots (#74/#107): a view of the cable chain.
                 let chain = self.strip_chain(unit);
                 self.insert_rows_ui(ui, Some(node), chain.as_deref(), edits);
                 // The dB fader (#72) drives the unit's own level knob.
@@ -14789,7 +14958,7 @@ impl DemoApp {
                     .on_hover_text("this source's level · double-click the fader: 0 dB");
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(10.0);
+                    ui.add_space(((w - 92.0) * 0.5).max(4.0));
                     theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
                     let mut p = row.pan;
                     let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
@@ -14803,7 +14972,7 @@ impl DemoApp {
                 ui.add_space(3.0);
                 let mut ms = row;
                 ui.horizontal(|ui| {
-                    ui.add_space(20.0);
+                    ui.add_space(((w - 46.0) * 0.5).max(4.0));
                     ui.spacing_mut().item_spacing.x = 4.0;
                     if strip_ms_button(ui, &mut ms, 'M').on_hover_text("mute this source").clicked() {
                         self.with_strip_row(node, |r| r.mute = ms.mute);
@@ -14846,7 +15015,7 @@ impl DemoApp {
                 .on_hover_text("this rig's level · double-click the fader: 0 dB");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(((STRIP_W - 92.0) * 0.5).max(4.0));
                 theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
                 let mut p = m.pan;
                 let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
@@ -14856,7 +15025,7 @@ impl DemoApp {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.add_space(18.0);
+                ui.add_space(((STRIP_W - 56.0) * 0.5).max(4.0));
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
                         .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
@@ -14901,7 +15070,7 @@ impl DemoApp {
             .and_then(|mi| self.units[mi].knob_index("VOLUME").map(|k| (mi, k)));
         let mut gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value);
         ui.vertical(|ui| {
-            ui.set_width(170.0);
+            ui.set_width(152.0);
             theme::section_label(ui, "Master out");
             // Output device (#31): which sound card kabelsalat plays to.
             let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
@@ -14911,7 +15080,7 @@ impl DemoApp {
                 None => "System default".to_string(),
             };
             theme::Dropdown::new("dd_mixer_audio_output", &selected)
-                .width(160.0)
+                .width(144.0)
                 .popup_min_width(240.0)
                 .text_size(11.5)
                 .show_ui(ui, |menu| {
@@ -15099,9 +15268,100 @@ impl DemoApp {
         resp.on_hover_text("peak hold · red = clipped (click the light to clear)");
     }
 
-    /// Insert slots (#74): a view of the strip's cable chain. A linear chain
-    /// lists its FX (bypass dot, drag to reorder, × to remove) plus an
-    /// "+ insert" picker; custom wiring says so instead of guessing.
+    /// One mixer quick knob (#107) inside a source or insert slot: quantized
+    /// uppercase caption in `cap_rect`, dial painted via `paint_knob_dial` in
+    /// `knob_rect`, drag/double-click updates the underlying rack knob, and
+    /// right-click opens a `theme::Dropdown` listing the unit's knobs.
+    fn strip_quick_knob_ui(&mut self, ui: &mut egui::Ui, cap_rect: Rect, knob_rect: Rect, unit: usize, dimmed: bool) {
+        let Some(ki) = self.quick_knob(unit) else { return };
+        let (node_id, label, full_name, val, default) = {
+            let u = &self.units[unit];
+            let k = &u.knobs[ki];
+            (u.node_id, k.label.clone(), k.source.plugin_name().map(str::to_string), k.value, k.default)
+        };
+        let caption = label.to_uppercase();
+        let cap_col = if dimmed { theme::CREAM_DIM } else { theme::CREAM_MID };
+        let cap_g = fit_quick_knob_caption(ui.painter(), &caption, cap_rect.width(), cap_col);
+        ui.painter().galley(Pos2::new(cap_rect.left(), cap_rect.center().y - cap_g.size().y * 0.5), cap_g, cap_col);
+
+        let resp = ui.interact(knob_rect, egui::Id::new(("strip_quick_knob", node_id)), egui::Sense::click_and_drag());
+        self.mixer_quick_knob_rects.push((node_id, knob_rect));
+
+        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical); }
+        if resp.drag_started() {
+            self.mixer_knob_drag = Some((node_id, ki, val));
+        }
+        if resp.dragged() {
+            let dy = resp.drag_delta().y;
+            let mut accum = match self.mixer_knob_drag {
+                Some((n, idx, cur)) if n == node_id && idx == ki => cur,
+                _ => val,
+            };
+            accum = (accum - dy * 0.006).clamp(0.0, 1.0);
+            self.mixer_knob_drag = Some((node_id, ki, accum));
+            self.set_unit_knob(unit, ki, accum);
+        }
+        if resp.drag_stopped() && self.mixer_knob_drag.is_some_and(|(n, _, _)| n == node_id) {
+            self.mixer_knob_drag = None;
+        }
+        if resp.double_clicked() {
+            self.mixer_knob_drag = None;
+            self.set_unit_knob(unit, ki, default);
+        }
+
+        let disp = self.units[unit].knobs[ki].display_value;
+        let hovered = resp.hovered();
+        let dragging = resp.dragged();
+        let ring = if hovered || dragging { TEXT } else if dimmed { theme::MUTED } else { BORDER };
+        let accent = if dimmed { theme::CREAM_DIM } else { theme::ACCENT };
+        paint_knob_dial(
+            ui.painter(),
+            |l| l.to_pos2(),
+            knob_rect.center().to_vec2(),
+            Vec2::splat(QUICK_KNOB_R),
+            disp,
+            hovered,
+            dragging,
+            ring,
+            accent,
+            2.5,
+            1.4,
+        );
+
+        let choices: Vec<(usize, String, String)> = self.units[unit].knobs.iter().enumerate()
+            .filter(|(_, k)| is_rack_knob(k))
+            .map(|(i, k)| {
+                let store = k.source.plugin_name().unwrap_or(&k.label).to_string();
+                let item_label = match k.source.plugin_name() {
+                    Some(full) if !full.eq_ignore_ascii_case(&k.label) => format!("{} · {}", k.label, full),
+                    _ => k.label.clone(),
+                };
+                (i, store, item_label)
+            })
+            .collect();
+        let mut picked: Option<String> = None;
+        theme::Dropdown::new(("strip_quick_dd", node_id), &label)
+            .popup_min_width(190.0)
+            .text_size(11.5)
+            .show_context_menu(&resp, |menu| {
+                for &(i, ref store, ref item_label) in &choices {
+                    if menu.item(i == ki, item_label) {
+                        picked = Some(store.clone());
+                    }
+                }
+            });
+        if let Some(choice) = picked {
+            self.strip_knobs.insert(node_id, choice);
+        }
+        let tip_name = full_name.as_deref().unwrap_or(&label);
+        let cur_v = self.units[unit].knobs[ki].value;
+        resp.on_hover_text(format!("{tip_name}: {cur_v:.2} · drag to adjust · double-click: reset · right-click: assign knob"));
+    }
+
+    /// Insert slots (#74/#107): a view of the strip's cable chain. A linear
+    /// chain lists its FX (quick knob, bypass dot, drag to reorder, × to
+    /// remove) plus an "+ insert" picker; custom wiring says so instead of
+    /// guessing.
     fn insert_rows_ui(&mut self, ui: &mut egui::Ui, source: Option<u32>, chain: Option<&[usize]>, edits: &mut Vec<PendingInsertEdit>) {
         let Some(chain) = chain else {
             theme::tracked_label(ui, "CUSTOM WIRING", 9.0, 0.12, theme::MUTED)
@@ -15109,18 +15369,23 @@ impl DemoApp {
             return;
         };
         let w = ui.available_width();
+        let stride = SLOT_H + ui.spacing().item_spacing.y;
         for (slot, &fx) in chain.iter().enumerate() {
             let (node, name) = {
                 let u = &self.units[fx];
                 (u.node_id, sentence_case(&u.name))
             };
             let row = self.strip_row(node);
-            let (rr, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::click_and_drag());
+            let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
+            let (cap_rect, knob_rect, plate_rect) = strip_slot_rects(sr);
+            self.strip_quick_knob_ui(ui, cap_rect, knob_rect, fx, row.bypass);
+
+            let resp = ui.interact(plate_rect, egui::Id::new(("insert_slot", node)), egui::Sense::click_and_drag());
             let fill = if row.bypass { theme::MUTED } else { theme::DARK_PANEL_HI };
-            ui.painter().rect_filled(rr.shrink2(egui::vec2(1.0, 1.0)), 2.0, fill);
+            ui.painter().rect_filled(plate_rect, 2.0, fill);
             // Bypass dot (#74): a click toggles pass-through.
-            let dot = Rect::from_min_size(Pos2::new(rr.left() + 5.0, rr.center().y - 4.0), egui::vec2(8.0, 8.0));
-            let dresp = ui.interact(dot, egui::Id::unique(("insert_bypass", node)), egui::Sense::click());
+            let dot = Rect::from_min_size(Pos2::new(plate_rect.left() + 5.0, plate_rect.center().y - 4.0), egui::vec2(8.0, 8.0));
+            let dresp = ui.interact(dot, egui::Id::new(("insert_bypass", node)), egui::Sense::click());
             let dot_col = if row.bypass { theme::MUTED } else { theme::LIVE_TEAL };
             if row.bypass {
                 ui.painter().circle_stroke(dot.center(), 3.5, Stroke::new(1.6, dot_col));
@@ -15133,27 +15398,25 @@ impl DemoApp {
             }
             dresp.on_hover_text(if row.bypass { "bypassed — click to enable" } else { "click to bypass (the effect passes its input through)" });
             // Name.
-            let label = format!("{} {}", slot + 1, truncate_chars(&name, 9));
-            ui.painter().text(Pos2::new(rr.left() + 18.0, rr.center().y), egui::Align2::LEFT_CENTER,
-                &label, egui::FontId::proportional(11.5), if row.bypass { theme::CREAM_DIM } else { theme::CREAM });
+            let label = format!("{} {}", slot + 1, truncate_chars(&name, 8));
+            ui.painter().text(Pos2::new(plate_rect.left() + 17.0, plate_rect.center().y), egui::Align2::LEFT_CENTER,
+                &label, egui::FontId::proportional(11.0), if row.bypass { theme::CREAM_DIM } else { theme::CREAM });
             // Drag reorders (one edit when the drag ends — the rack reloads).
             if resp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grab);
             }
             if resp.drag_stopped() {
-                // Slot target from the pointer's vertical offset among
-                // the chain's rows (each row 20 px, stacked top-down).
                 if let Some(p) = resp.interact_pointer_pos() {
-                    let top = rr.top() - slot as f32 * 20.0;
-                    let to = ((p.y - top) / 20.0).floor().clamp(0.0, chain.len() as f32 - 1.0) as usize + 1;
+                    let top = sr.top() - slot as f32 * stride;
+                    let to = ((p.y - top) / stride).floor().clamp(0.0, chain.len() as f32 - 1.0) as usize + 1;
                     if to != slot + 1 {
                         edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Move { fx: node, to } });
                     }
                 }
             }
             // Remove (shown on hover).
-            let x = Rect::from_min_size(Pos2::new(rr.right() - 18.0, rr.center().y - 8.0), egui::vec2(16.0, 16.0));
-            let xresp = ui.interact(x, egui::Id::unique(("insert_remove", node)), egui::Sense::click());
+            let x = Rect::from_min_size(Pos2::new(plate_rect.right() - 17.0, plate_rect.center().y - 8.0), egui::vec2(16.0, 16.0));
+            let xresp = ui.interact(x, egui::Id::new(("insert_remove", node)), egui::Sense::click());
             let row_hovered = resp.hovered() || xresp.hovered();
             if row_hovered {
                 ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
@@ -16392,13 +16655,22 @@ impl DemoApp {
         let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
         let learn_col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
 
-        // Unfilled disc (§4.6): 1.5px hairline ring, cream on hover, MIDI pulse when learning.
-        self.ell(painter, c, r, Color32::TRANSPARENT,
-            Stroke::new(1.5, if is_learning { learn_col } else if hovered || dragging { TEXT } else { BORDER }));
-
-        // Flat value arc: hairline track + solid accent arc + flat end dot
-        // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.display_value, theme::ACCENT);
+        let border_col = if is_learning { learn_col } else if hovered || dragging { TEXT } else { BORDER };
+        let rx = r * xf.sx;
+        let ry = r * xf.sy;
+        paint_knob_dial(
+            painter,
+            |l| xf.p(l),
+            c,
+            Vec2::new(rx, ry),
+            k.display_value,
+            hovered,
+            dragging,
+            border_col,
+            theme::ACCENT,
+            4.5,
+            2.2,
+        );
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -16406,18 +16678,6 @@ impl DemoApp {
                 Stroke::new(2.2, alpha(learn_col, 0.70 + 0.30 * pulse)));
         }
 
-        // Active/dragging knob: the CTA inset-keyline motif as focus state.
-        if dragging {
-            let disc = Rect::from_center_size(c.to_pos2(), Vec2::splat(2.0 * r));
-            theme::inset_keyline(painter, xf.rect(disc), r, theme::ACCENT, 2.0, 2.5);
-        }
-
-        // Pointer: center → 0.62r needle, 2px cream.
-        let a0 = 135.0f32.to_radians();
-        let sweep = 270.0f32.to_radians();
-        let ang = a0 + sweep * k.display_value;
-        let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
-        painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
         self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + KNOB_LABEL_GAP), &k.label_g, SUBTEXT);
 
@@ -17169,9 +17429,154 @@ fn parse_pan(s: &str) -> Option<f64> {
 }
 
 /// Mixer channel-strip width (sources and rig buses share it).
-const STRIP_W: f32 = 116.0;
+const STRIP_W: f32 = 122.0;
 /// Width of a strip collapsed to its mini form (#77).
 const STRIP_COLLAPSED_W: f32 = 46.0;
+/// Quick-knob geometry inside a strip slot (#107).
+const QUICK_KNOB_R: f32 = 7.0;
+const QUICK_KNOB_COL_W: f32 = 24.0;
+const SLOT_PAD_X: f32 = 3.0;
+const SLOT_GAP: f32 = 4.0;
+const SLOT_CAPTION_H: f32 = 11.0;
+const SLOT_BODY_H: f32 = 24.0;
+const SLOT_H: f32 = SLOT_CAPTION_H + 1.0 + SLOT_BODY_H;
+
+/// Shared knob dial painter (rack face + mixer quick knobs): disc ring, flat
+/// value arc, active inset keyline, and pointer needle.
+#[allow(clippy::too_many_arguments)]
+fn paint_knob_dial(
+    painter: &egui::Painter,
+    map: impl Fn(Vec2) -> Pos2,
+    center: Vec2,
+    radii: Vec2,
+    value: f32,
+    hovered: bool,
+    dragging: bool,
+    border_col: Color32,
+    accent: Color32,
+    arc_gap: f32,
+    dot_r: f32,
+) {
+    let sc = map(center);
+    let r = radii.x.min(radii.y);
+    let ring = Stroke::new(if r < 12.0 { 1.2 } else { 1.5 }, border_col);
+    if (radii.x - radii.y).abs() < 0.05 {
+        painter.circle_stroke(sc, radii.x, ring);
+    } else {
+        painter.add(egui::Shape::ellipse_stroke(sc, radii, ring));
+    }
+    let track_w = if r < 12.0 { 1.5 } else { 2.0 };
+    let arc_w = if r < 12.0 { 1.8 } else { 2.4 };
+    theme::value_arc_sized(painter, &map, center, r, arc_gap, dot_r, track_w, arc_w, value, accent);
+    if dragging {
+        let disc = Rect::from_center_size(sc, Vec2::splat(2.0 * r));
+        theme::inset_keyline(painter, disc, r, accent, if r < 12.0 { 1.5 } else { 2.0 }, if r < 12.0 { 1.8 } else { 2.5 });
+    }
+    let a0 = 135.0f32.to_radians();
+    let sweep = 270.0f32.to_radians();
+    let ang = a0 + sweep * value;
+    let tip = map(center + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
+    let _ = hovered;
+    painter.line_segment([sc, tip], Stroke::new(if r < 12.0 { 1.6 } else { 2.0 }, TEXT));
+}
+
+/// Grid rects of one mixer plugin slot: (caption row, quick-knob box, plate box).
+fn strip_slot_rects(sr: Rect) -> (Rect, Rect, Rect) {
+    let inner_w = (sr.width() - 2.0 * SLOT_PAD_X).max(40.0);
+    let cap_rect = Rect::from_min_size(Pos2::new(sr.left() + SLOT_PAD_X, sr.top()), egui::vec2(inner_w, SLOT_CAPTION_H));
+    let body_rect = Rect::from_min_size(Pos2::new(sr.left() + SLOT_PAD_X, sr.top() + SLOT_CAPTION_H + 1.0), egui::vec2(inner_w, SLOT_BODY_H));
+    let knob_rect = Rect::from_min_size(body_rect.min, egui::vec2(QUICK_KNOB_COL_W, SLOT_BODY_H));
+    let plate_rect = Rect::from_min_max(
+        Pos2::new(knob_rect.right() + SLOT_GAP, body_rect.top() + 1.0),
+        Pos2::new(body_rect.right(), body_rect.bottom() - 1.0),
+    );
+    (cap_rect, knob_rect, plate_rect)
+}
+
+/// Lay out a quick-knob caption in uppercase at a 0.5 px quantized font size
+/// (rule 17), fitting inside `max_w` with ellipsis fallback.
+fn fit_quick_knob_caption(painter: &egui::Painter, text: &str, max_w: f32, color: Color32) -> Arc<Galley> {
+    for size in [8.5f32, 8.0, 7.5] {
+        let g = painter.layout_no_wrap(text.to_string(), theme::medium_font(size), color);
+        if g.size().x <= max_w {
+            return g;
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t = format!("{}\u{2026}", chars[..n].iter().collect::<String>());
+        let g = painter.layout_no_wrap(t, theme::medium_font(7.5), color);
+        if g.size().x <= max_w {
+            return g;
+        }
+    }
+    painter.layout_no_wrap(text.to_string(), theme::medium_font(7.5), color)
+}
+
+/// Knobs eligible for mixer quick-knob assignment (#107): built-in hidden
+/// knobs (AudioIn MON, setBfree drawbars) stay on their chips/faders, while
+/// plugin main/pinned knobs stay available even when `fit_plugin_knobs` hides
+/// them on a narrow rack face.
+fn is_rack_knob(k: &Knob) -> bool {
+    !k.hidden || k.source != KnobSource::BuiltIn
+}
+
+/// Resolve an explicit quick-knob choice (label, full plugin parameter name,
+/// `knob_specs` alias, or numeric parameter id) on `u`.
+fn resolve_unit_quick_knob_choice(u: &Unit, kind: Option<&NodeKind>, choice: &str) -> Option<usize> {
+    let q = choice.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let q_up = q.to_uppercase();
+    if let Some(i) = u.knobs.iter().position(|k| {
+        is_rack_knob(k) && k.source.plugin_name().is_some_and(|n| n.eq_ignore_ascii_case(q))
+    }) {
+        return Some(i);
+    }
+    if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && k.label.to_uppercase() == q_up) {
+        return Some(i);
+    }
+    if let Some(spec) = kind.and_then(|nk| crate::engine::find_knob_spec(nk, q)) {
+        if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && k.source == KnobSource::BuiltIn && k.label == spec.label) {
+            return Some(i);
+        }
+    }
+    if let Ok(pid) = q.parse::<u32>() {
+        if let Some(i) = u.knobs.iter().position(|k| {
+            is_rack_knob(k) && (k.clap.map(|c| c.id) == Some(pid) || k.param == Some(pid))
+        }) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Effective quick knob of `u` (#107): explicit user choice if that knob
+/// still exists, else the default:
+/// - plugin unit: first main control (`KnobSource::Main`), else first rack knob;
+/// - effect / other unit: `MIX` / dry-wet knob from `knob_specs` if it has one,
+///   else first rack knob;
+/// - `None` when the unit has no rack knobs.
+fn quick_knob(u: &Unit, explicit: Option<&str>, kind: Option<&NodeKind>) -> Option<usize> {
+    if let Some(choice) = explicit.and_then(|c| resolve_unit_quick_knob_choice(u, kind, c)) {
+        return Some(choice);
+    }
+    let is_plugin = matches!(u.node_kind, UnitKind::Clap)
+        || matches!(kind, Some(NodeKind::Lv2 { .. }))
+        || u.knobs.iter().any(|k| is_rack_knob(k) && matches!(k.source, KnobSource::Main(_)));
+    if is_plugin {
+        if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && matches!(k.source, KnobSource::Main(_))) {
+            return Some(i);
+        }
+    } else if let Some(i) = u.knobs.iter().position(|k| {
+        is_rack_knob(k) && k.source == KnobSource::BuiltIn
+            && matches!(k.label.as_str(), "MIX" | "DRY/WET" | "WET")
+    }) {
+        return Some(i);
+    }
+    u.knobs.iter().position(is_rack_knob)
+}
 
 /// ---- dB faders (#72) ----------------------------------------------------
 
@@ -17720,6 +18125,7 @@ pub fn run_session_test() -> anyhow::Result<()> {
             r.color = Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E));
             r.collapsed = true;
         });
+        app.strip_knobs.insert(node, "LEVEL".into());
         let saved = app.capture_session("strips")?;
         saved.save(&crate::session::Session::package_path(&dir, "selftest-strips")?)?;
         app.load_demo_patch();
@@ -17730,7 +18136,8 @@ pub fn run_session_test() -> anyhow::Result<()> {
         anyhow::ensure!(row.mute && (row.pan + 0.35).abs() < 1e-6, "strip pan/mute not restored: {row:?}");
         anyhow::ensure!(row.color == Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E)), "strip colour not restored");
         anyhow::ensure!(row.collapsed, "strip collapse not restored");
-        println!("  mixer strips: name, colour, mute/pan, collapse round-trip — OK");
+        anyhow::ensure!(app.strip_knobs.get(&node).map(String::as_str) == Some("LEVEL"), "strip quick knob not restored");
+        println!("  mixer strips: name, colour, mute/pan, collapse, quick knob round-trip — OK");
     }
 
     // --- Starter templates: each must rebuild a correct, playable rack ---
@@ -26102,6 +26509,311 @@ mod mixer_parity_tests {
         assert!(app.units.iter().any(|u| u.node_id == node_id), "the FX node stays");
         assert!(app.strip_chain(surge).is_some(), "the chain view is unchanged");
         let _ = source;
+    }
+
+    // ---- #107: assignable quick knob per plugin in mixer strips -----------
+
+    fn run_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(time);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()));
+                }
+                egui::Shape::Vec(v) => for x in v { collect(x, out); }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes { collect(&cs.shape, &mut texts); }
+        texts
+    }
+
+    #[test]
+    fn quick_knob_defaults_and_explicit_resolution() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let filt = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("FILTER"));
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRO"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: verb, port: 0 }, PortRef { node: filt, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(5, PortRef { node: filt, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(6, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("qk", g)).unwrap();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+
+        let unit_of = |app: &DemoApp, nid: u32| app.units.iter().position(|u| u.node_id == nid).unwrap();
+        let label_of = |app: &DemoApp, nid: u32| {
+            let ui = unit_of(app, nid);
+            app.quick_knob(ui).map(|ki| app.units[ui].knobs[ki].label.clone())
+        };
+
+        assert_eq!(label_of(&app, surge).as_deref(), Some("CUTOFF"), "plugin unit defaults to its first main control");
+        assert_eq!(label_of(&app, verb).as_deref(), Some("MIX"), "reverb defaults to MIX");
+        assert_eq!(label_of(&app, delay).as_deref(), Some("MIX"), "delay defaults to MIX even though TIME is first");
+        assert_eq!(label_of(&app, filt).as_deref(), Some("CUTOFF"), "effect without MIX defaults to its first knob");
+        assert_eq!(label_of(&app, metro), None, "knob-less unit resolves to None");
+
+        // Explicit choice wins, even when narrow rack faces hide main knobs.
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        app.strip_knobs.insert(surge, "OSC 1 VOL".into());
+        assert_eq!(label_of(&app, surge).as_deref(), Some("OSC 1 VOL"));
+        app.strip_knobs.insert(verb, "SIZE".into());
+        assert_eq!(label_of(&app, verb).as_deref(), Some("SIZE"));
+        // Stale/missing choice falls back to the default.
+        app.strip_knobs.insert(verb, "NONEXISTENT".into());
+        assert_eq!(label_of(&app, verb).as_deref(), Some("MIX"));
+    }
+
+    #[test]
+    fn dragging_and_double_clicking_a_strip_quick_knob_drives_the_rack_and_engine() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        open_mixer(&mut app, &ctx);
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+
+        let verb_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap();
+        let verb_node = app.units[verb_ui].node_id;
+        let mix_ki = app.units[verb_ui].knob_index("MIX").unwrap();
+        let start_val = app.units[verb_ui].knobs[mix_ki].display_value;
+        let kr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == verb_node).expect("reverb quick knob").1;
+
+        for ev in drag(kr.center(), Pos2::new(kr.center().x, kr.center().y - 35.0), 6) {
+            frame(&mut app, &ctx, ev);
+        }
+        let after_val = app.units[verb_ui].knobs[mix_ki].display_value;
+        assert!(after_val > start_val + 0.1, "dragging quick knob moves rack knob display_value ({start_val} -> {after_val})");
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node, param: 0, value } if *node == verb_node && (*value - after_val as f64).abs() < 1e-4)),
+            "engine received SetParam for reverb MIX ({cmds:?})"
+        );
+
+        // Double-click resets to the rack knob's default.
+        let mut t = 10.0;
+        let size = Vec2::new(1600.0, 1000.0);
+        let c = kr.center();
+        for ev in [
+            vec![egui::Event::PointerMoved(c)],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        ] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, ev);
+        }
+        let def = app.units[verb_ui].knobs[mix_ki].default;
+        assert!((app.units[verb_ui].knobs[mix_ki].display_value - def).abs() < 1e-5,
+            "double-click resets quick knob to default {def}, got {}", app.units[verb_ui].knobs[mix_ki].display_value);
+
+        // Dragging Surge's quick knob moves its first main control display_value.
+        let surge_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let surge_node = app.units[surge_ui].node_id;
+        let sr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == surge_node).expect("surge quick knob").1;
+        let s_before = app.units[surge_ui].knobs[0].display_value;
+        for ev in drag(sr.center(), Pos2::new(sr.center().x, sr.center().y - 30.0), 6) {
+            frame(&mut app, &ctx, ev);
+        }
+        assert!(app.units[surge_ui].knobs[0].display_value > s_before + 0.1, "source quick knob drives first main control");
+    }
+
+    #[test]
+    fn right_click_pick_persists_across_session_round_trip_and_rig_add() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        app.stage_view = StageView::Mixer;
+        let size = Vec2::new(1600.0, 1000.0);
+        for i in 0..3 { run_at(&mut app, &ctx, size, i as f64, vec![]); }
+
+        let verb_node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        let kr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == verb_node).expect("reverb quick knob").1;
+
+        // Right-click opens theme::Dropdown listing the unit's knobs (rule 101: advance time).
+        run_at(&mut app, &ctx, size, 4.0, vec![egui::Event::PointerMoved(kr.center())]);
+        run_at(&mut app, &ctx, size, 4.1, vec![egui::Event::PointerButton {
+            pos: kr.center(), button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        run_at(&mut app, &ctx, size, 4.2, vec![egui::Event::PointerButton {
+            pos: kr.center(), button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        let texts = run_at(&mut app, &ctx, size, 5.0, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx), "right-click opened quick-knob dropdown");
+        let size_pos = texts.iter().find(|(t, _)| t == "SIZE").expect("SIZE choice in dropdown").1.center();
+
+        // Click "SIZE" in the dropdown.
+        run_at(&mut app, &ctx, size, 5.1, vec![egui::Event::PointerMoved(size_pos)]);
+        run_at(&mut app, &ctx, size, 5.2, vec![egui::Event::PointerButton {
+            pos: size_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        run_at(&mut app, &ctx, size, 5.3, vec![egui::Event::PointerButton {
+            pos: size_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(app.strip_knobs.get(&verb_node).map(String::as_str), Some("SIZE"), "right-click pick stored choice");
+
+        // Session round-trip.
+        let saved = app.capture_session("quick-round-trip").unwrap();
+        app.load_demo_patch();
+        assert!(!app.strip_knobs.contains_key(&verb_node), "fresh patch has no override");
+        app.apply_session(&saved).unwrap();
+        assert_eq!(app.strip_knobs.get(&verb_node).map(String::as_str), Some("SIZE"), "session round-trip restored quick knob");
+
+        // Rig add + node-id renumbering (rule 44/106): add a second rig, put an
+        // explicit choice on Rig B's surge, then grow Rig A so Rig B's node ids shift.
+        app.edit_rigs(None);
+        let rig_b_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let rig_a_surge = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.strip_knobs.insert(rig_b_surge, "LEVEL".into());
+        app.strip_insert_edit(rig_a_surge, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Gain),
+            name: "GAIN".into(),
+        }).unwrap();
+        let new_rig_b_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        assert_ne!(new_rig_b_surge, rig_b_surge, "growing Rig A renumbered Rig B's node ids");
+        assert_eq!(app.strip_knobs.get(&new_rig_b_surge).map(String::as_str), Some("LEVEL"),
+            "quick knob followed Rig B's surge to its new node id {new_rig_b_surge}: {:?}", app.strip_knobs);
+        let new_verb = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        assert_eq!(app.strip_knobs.get(&new_verb).map(String::as_str), Some("SIZE"),
+            "Rig A's reverb choice survived rig edits too");
+    }
+
+    #[test]
+    fn strip_quick_knob_tools_read_and_update_assignments() {
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let verb = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        let surge = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+
+        let list: serde_json::Value = serde_json::from_str(&app.exec_tool("get_strip_knobs", &serde_json::json!({}))).unwrap();
+        let strips = list["strips"].as_array().unwrap();
+        let v_entry = strips.iter().find(|s| s["node"] == verb).expect("reverb reported");
+        assert_eq!(v_entry["knob"], "MIX");
+        assert_eq!(v_entry["custom"], false);
+        let s_entry = strips.iter().find(|s| s["node"] == surge).expect("surge reported");
+        assert_eq!(s_entry["knob"], "CUTOFF");
+
+        let set_out = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "SIZE" }));
+        assert!(set_out.contains("SIZE"), "{set_out}");
+        let one: serde_json::Value = serde_json::from_str(&app.exec_tool("get_strip_knobs", &serde_json::json!({ "node": verb }))).unwrap();
+        assert_eq!(one["strips"][0]["knob"], "SIZE");
+        assert_eq!(one["strips"][0]["custom"], true);
+
+        // Empty string resets back to default.
+        let reset_out = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "" }));
+        assert!(reset_out.contains("default"), "{reset_out}");
+        assert!(!app.strip_knobs.contains_key(&verb));
+
+        let bad_knob = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "BOGUS" }));
+        assert!(bad_knob.contains("no knob 'BOGUS'"), "{bad_knob}");
+        let bad_node = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": 999, "knob": "MIX" }));
+        assert!(bad_node.contains("no unit with node id 999"), "{bad_node}");
+
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        for name in ["get_strip_knobs", "set_strip_knob"] {
+            assert!(names.contains(&name), "assistant::tools missing {name}");
+            assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
+        }
+        assert!(tool_is_read_only("get_strip_knobs"));
+        assert!(!tool_is_read_only("set_strip_knob"));
+    }
+
+    #[test]
+    fn mixer_with_inserts_and_quick_knobs_fits_narrow_windows() {
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let (mut app, ctx) = app_with(Rack::Linear);
+            super::main_control_tests::give_clap_units_main_knobs(&mut app);
+            app.stage_view = StageView::Mixer;
+            let size = Vec2::new(w, h);
+            let mut texts = Vec::new();
+            for i in 0..4 {
+                texts = run_at(&mut app, &ctx, size, i as f64, vec![]);
+            }
+            assert_eq!(app.mixer_quick_knob_rects.len(), 3, "{w}x{h}: source + 2 inserts draw quick knobs");
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            for (text, rect) in &texts {
+                assert!(screen.expand(0.5).contains_rect(*rect), "{w}x{h}: '{text}' leaves window: {rect:?}");
+            }
+            for i in 0..texts.len() {
+                for j in i + 1..texts.len() {
+                    let o = texts[i].1.intersect(texts[j].1);
+                    assert!(!(o.width() > 1.0 && o.height() > 1.0),
+                        "{w}x{h}: '{}' {:?} overlaps '{}' {:?}", texts[i].0, texts[i].1, texts[j].0, texts[j].1);
+                }
+            }
+        }
+    }
+
+    /// Mixer with Surge source + Reverb & Delay inserts + quick knobs at the
+    /// three target window sizes (`KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_quick_knob_shots -- --ignored`).
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_quick_knob_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(24, 24);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for s in [a, b, c] {
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+        }
+        g.connect_with_id(edge, PortRef { node: a, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("quick knob shots", g)).unwrap();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.apply_strip_name(na, "Bass wurli").unwrap();
+        app.apply_strip_name(nb, "Pad").unwrap();
+        for (n, hex) in [(na, "amber"), (nb, "rose")] {
+            let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": n, "color": hex }));
+            assert!(out.contains('#'), "{out}");
+        }
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": na, "pan": -0.35 }));
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nb, "mute": true }));
+        app.exec_tool("collapse_strip", &serde_json::json!({ "node": nc }));
+        app.exec_tool("set_strip_knob", &serde_json::json!({ "node": nb, "knob": "OSC 1 VOL" }));
+        for (i, u) in app.units.iter_mut().enumerate() {
+            if let Some(k) = u.knob_index("LEVEL") { u.knobs[k].set_immediate([0.8, 0.55, 0.9, 0.4][i % 4]); }
+            if let Some(k) = u.knob_index("CUTOFF") { u.knobs[k].set_immediate(0.65); }
+            if let Some(k) = u.knob_index("MIX") { u.knobs[k].set_immediate(0.45); }
+        }
+        app.stage_view = StageView::Mixer;
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
     }
 }
 

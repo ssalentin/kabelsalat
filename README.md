@@ -69,8 +69,11 @@ Every source gets its own channel strip: a fader in dB with a 0 dB detent
 (double-click for exact unity), a held peak and a clip light, plus pan, mute
 and solo. Each strip lists the effects on its cable chain as insert slots —
 add, bypass, reorder or remove them — and the master has inserts that run on
-the whole mix before the limiter. Rename a strip, give it a colour, drag it to
-reorder or collapse it; names and colours are saved with the session.
+the whole mix before the limiter. Every source and insert slot has a quick
+parameter knob beside it (defaulting to the plugin's first main control or an
+effect's mix; right-click to reassign, double-click to reset). Rename a strip,
+give it a colour, drag it to reorder or collapse it; names, colours and quick
+knob assignments are saved with the session.
 
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 

@@ -175,6 +175,15 @@ pub fn open_capture(device: Option<&str>, rate: u32, buffer: u32) -> Option<Inpu
     std::thread::Builder::new()
         .name("kabelsalat-audio-in".into())
         .spawn(move || {
+            // This thread feeds the engine's ring: at normal priority a busy
+            // desktop delays it past the ring's fill and the input stutters
+            // (rule 29). One promotion with the sample rate, never a buffer
+            // (rule 38).
+            let _rt = if std::env::var_os("KABELSALAT_NO_RT").is_none() {
+                audio_thread_priority::promote_current_thread_to_real_time(rate, rate).ok()
+            } else {
+                None
+            };
             let mut bytes = [0u8; 4096];
             let mut carry: Vec<u8> = Vec::with_capacity(8);
             loop {
@@ -347,6 +356,22 @@ impl Drift {
         Self { low: target.saturating_sub(block / 2), high: target.saturating_add(block / 2) }
     }
 
+    /// Samples to discard at once when the ring holds a backlog (a capture
+    /// that started before its consumer, a stalled render): everything above
+    /// the target fill, in whole stereo frames. 0 while the backlog is within
+    /// what `DropOne` trims one frame per block. One click now beats hearing
+    /// every note hundreds of milliseconds late (the first monitor-latency
+    /// measurement: 361 ms median).
+    pub fn catch_up(&self, available: usize) -> usize {
+        let block = self.high - self.low;
+        let target = self.low + block / 2;
+        if available > target + 2 * block {
+            (available - target) & !1
+        } else {
+            0
+        }
+    }
+
     pub fn action(&self, available: usize) -> DriftAction {
         if available > self.high {
             DriftAction::DropOne
@@ -420,12 +445,340 @@ impl LatencyMeter {
     }
 }
 
+/// Seed the device-label table with a source the running test needs to open
+/// even though the periodic scan does not list it — the latency self-test
+/// captures the monitor of a null sink it just created. This is not a UI
+/// choice (monitors stay hidden from the picker, rule 60): it names a device
+/// that is verifiably live right now.
+pub fn remember_source(raw: &str, label: &str) {
+    if let Ok(mut l) = LABELS.lock() {
+        if !l.iter().any(|(r, _)| r == raw) {
+            l.push((raw.to_string(), label.to_string()));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Self-test: open the default input, loop it to the output, measure latency.
+// Self-test: the REAL monitoring path, measured by recirculation
 // ---------------------------------------------------------------------------
 
-/// `kabelsalat audio-in-test`: a software loopback that measures the real
-/// input→output round trip (via cpal stream timestamps) and the ring drift.
+/// One line of shell output.
+fn sh(args: &[&str]) -> Option<String> {
+    std::process::Command::new(args[0]).args(&args[1..]).output().ok().filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// Normalized cross-correlation of `marker` against `rec` at every offset
+/// (coefficient in −1..=1, amplitude-invariant), then the offsets of the
+/// local maxima above `threshold × best`, at least `min_gap` apart.
+fn marker_arrivals(rec: &[f32], marker: &[f32], threshold: f32, min_gap: usize) -> Vec<usize> {
+    let m = marker.len();
+    if rec.len() <= m + 1 {
+        return Vec::new();
+    }
+    let m_norm = marker.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if m_norm < 1e-9 {
+        return Vec::new();
+    }
+    let mut vals = vec![0.0f32; rec.len() - m];
+    for (off, v) in vals.iter_mut().enumerate() {
+        let (mut dot, mut energy) = (0.0f32, 0.0f32);
+        for i in 0..m {
+            let s = rec[off + i];
+            dot += s * marker[i];
+            energy += s * s;
+        }
+        *v = if energy > 1e-12 { dot / (energy.sqrt() * m_norm) } else { 0.0 };
+    }
+    let best = vals.iter().cloned().fold(0.0f32, f32::max);
+    let cut = best * threshold;
+    let mut arrivals = Vec::new();
+    let mut last = usize::MAX;
+    for i in 1..vals.len() - 1 {
+        if vals[i] >= cut && vals[i] >= vals[i - 1] && vals[i] >= vals[i + 1] {
+            if last == usize::MAX || i - last >= min_gap {
+                arrivals.push(i);
+                last = i;
+            }
+        }
+    }
+    arrivals
+}
+
+/// `kabelsalat monitor-latency-test` (issue #28): measure the REAL
+/// input→output round trip of live monitoring — the same path a singer or
+/// guitarist hears — by recirculation, not by stream timestamps:
+///
+/// 1. a null sink + its monitor stand in for the interface (nothing is
+///    audible: our output stream is moved onto the null sink);
+/// 2. one short tone burst is injected into the null sink (pw-play);
+/// 3. it travels monitor → pw-record (the app's real capture path) → engine
+///    ring → MON (post-gain into the master) → our cpal output → back into
+///    the null sink — and comes around again;
+/// 4. the interval between successive arrivals in our own played output IS
+///    the round trip: every constant of the loop (both stream latencies,
+///    the ring fill, the engine block) is inside it, and the injection's
+///    own latency cancels in the difference.
+///
+/// cpal's stream timestamps on the ALSA host misreport the output side on
+/// this machine (185 ms "playback − callback" while the graph runs one
+/// quantum — audio-in-test prints it); this measurement reads the audio
+/// itself. Skips cleanly with no PipeWire (CI).
+fn monitor_latency_attempt() -> anyhow::Result<Option<Measure>> {
+    use crate::control::{command_bus, name_bytes, AudioInChannel, Command, Graph, NodeKind};
+    use crate::engine::{GraphEngine, P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR};
+
+    let host = crate::ui::preferred_host();
+    let Some(out_dev) = host.default_output_device() else {
+        println!("monitor-latency-test: SKIP — no output device");
+        return Ok(None);
+    };
+    let out_cfg = out_dev.default_output_config()?;
+    let (rate, ch) = (out_cfg.sample_rate().max(1), out_cfg.channels().max(1) as usize);
+    let buffer = crate::bridge::BUFFER_FRAMES;
+    for tool in ["pactl", "pw-play", "pw-record"] {
+        if std::process::Command::new(tool).output().is_err() {
+            println!("monitor-latency-test: SKIP — {tool} not available (no PipeWire)");
+            return Ok(None);
+        }
+    }
+
+    // 1. The loopback: a null sink (and its monitor), unique to this run.
+    let pid = std::process::id();
+    let sink = format!("ksalat-lat-{pid}");
+    let module = sh(&["pactl", "load-module", "module-null-sink", &format!("sink_name={sink}")])
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let module = match module {
+        Some(m) => m,
+        None => {
+            println!("monitor-latency-test: SKIP — cannot create a null sink (no PipeWire pulse compat)");
+            return Ok(None);
+        }
+    };
+    let monitor = format!("{sink}.monitor");
+    let teardown = |msg: Option<String>, module: u32| -> anyhow::Result<Option<Measure>> {
+        let _ = sh(&["pactl", "unload-module", &module.to_string()]);
+        match msg {
+            Some(m) => Err(anyhow::anyhow!(m)),
+            None => Ok(None),
+        }
+    };
+    anyhow::ensure!(
+        sh(&["pactl", "list", "short", "sinks"]).map_or(false, |s| s.contains(&sink)),
+        "the null sink did not appear"
+    );
+
+    // 2. The app's real capture path on the monitor (a source the picker
+    //    would never list; seeded for this process only, rule 60).
+    remember_source(&monitor, "Latency loopback");
+    let Some(cap) = open_capture(Some(&monitor), rate, buffer) else {
+        return teardown(Some("pw-record could not open the loopback monitor".into()), module);
+    };
+
+    // 3. The engine exactly as the app runs it: Audio In → MON → Master,
+    //    driven by the real cpal output stream.
+    let mut g = Graph::default();
+    let ain = g.add_node(
+        NodeKind::AudioIn { device: Some(monitor.clone()), channels: AudioInChannel::MonoL },
+        name_bytes("AUDIO IN"),
+    );
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, rate as f64, vec![]);
+    let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+    engine.set_audio_in_channel(side_rx);
+    let _ = side_tx.push((ain, cap.engine_rx));
+    // Half input gain keeps the MON feedback loop decaying (~4 dB per pass
+    // with the master at 0.75) instead of running away to the limiter.
+    bus.send(Command::SetParam { node: ain, param: P_AUDIO_IN_GAIN, value: 0.5 });
+    bus.send(Command::SetParam { node: ain, param: P_AUDIO_IN_MONITOR, value: 1.0 });
+    bus.send(Command::SetParam { node: master, param: crate::engine::P_VOL, value: 0.75 });
+    bus.send(Command::SetParam { node: master, param: crate::engine::P_WARM, value: 0.1 });
+
+    // 4. The output stream, moved onto the null sink: the loop closes in
+    //    software, nothing is audible.
+    let mut config: cpal::StreamConfig = out_cfg.into();
+    config.buffer_size = cpal::BufferSize::Fixed(buffer);
+    config.sample_rate = rate;
+    let (mut rec_tx, mut rec_rx) = rtrb::RingBuffer::<f32>::new((rate as usize) * ch * 8);
+    let stats = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+    let stats_cb = stats.clone();
+    let mut rt_tried = false;
+    let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
+    let sample_rate = rate as f64;
+    let stream = out_dev.build_output_stream(
+        config,
+        move |data: &mut [f32], _| {
+            if !rt_tried {
+                rt_tried = true;
+                if std::env::var_os("KABELSALAT_NO_RT").is_none() {
+                    // Rule 38: sample_rate, never one buffer.
+                    match audio_thread_priority::promote_current_thread_to_real_time(sample_rate as u32, sample_rate as u32) {
+                        Ok(h) => _rt_handle = Some(h),
+                        Err(e) => eprintln!("monitor-latency-test: no realtime ({e})"),
+                    }
+                }
+            }
+            engine.render(data, ch);
+            if let Some((d, s)) = engine.audio_in_status(ain) {
+                stats_cb[0].store(d, Ordering::Relaxed);
+                stats_cb[1].store(s, Ordering::Relaxed);
+            }
+            for s in data.iter() {
+                if rec_tx.push(*s).is_err() {
+                    break; // recording full: keep rendering
+                }
+            }
+        },
+        |e| eprintln!("monitor-latency-test: stream error: {e}"),
+        None,
+    )?;
+    stream.play()?;
+    // Move our playback onto the null sink so the loop closes in software
+    // (nothing is audible: the null sink has no hardware behind it).
+    let moved = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let inputs = sh(&["pactl", "-f", "json", "list", "sink-inputs"]).unwrap_or_default();
+            let clients = sh(&["pactl", "-f", "json", "list", "clients"]).unwrap_or_default();
+            if let Some((input, _)) = crate::audio_out::find_our_stream(&inputs, &clients, pid) {
+                if sh(&["pactl", "move-sink-input", &input.to_string(), &sink]).is_some() {
+                    break true;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    if !moved {
+        stream.pause()?;
+        drop(stream);
+        drop(cap.stream);
+        return teardown(Some("could not move our output onto the null sink".into()), module);
+    }
+
+    // 5. One burst into the null sink, then let it recirculate.
+    let burst_len = (rate as usize) / 160; // ~6 ms
+    let mut burst = Vec::with_capacity(burst_len);
+    for i in 0..burst_len {
+        let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / burst_len as f32).cos(); // Hann
+        burst.push((2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin() * 0.4 * w);
+    }
+    let dir = crate::catalog::home_dir().join(".cache").join("ksalat-monitor-latency");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let raw = dir.join("burst.raw");
+    let mut bytes = Vec::with_capacity(burst_len * 8);
+    for s in &burst {
+        bytes.extend_from_slice(&s.to_le_bytes());
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(&raw, &bytes)?;
+    let inject = std::process::Command::new("pw-play")
+        .args(["--target", &sink])
+        .args(["--rate", &rate.to_string()])
+        .args(["--channels", "2"])
+        .args(["--format", "f32"])
+        .args(["--latency", &format!("{buffer}/{rate}")])
+        .arg(&raw)
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    if let Ok(mut child) = inject {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // 6. What we played, off the recording ring.
+    stream.pause()?;
+    drop(stream);
+    drop(cap.stream); // end pw-record (the rest of `cap` drops with the scope)
+    let mut played = Vec::with_capacity((rate as usize) * ch * 6);
+    while let Ok(s) = rec_rx.pop() {
+        played.push(s);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    teardown(None, module)?;
+    let l: Vec<f32> = played.iter().step_by(2).copied().collect();
+
+    // 7. The arrivals and their intervals.
+    let arrivals = marker_arrivals(&l, &burst, 0.55, (rate as usize) / 100);
+    let (dropped, starved) = (stats[0].load(Ordering::Relaxed), stats[1].load(Ordering::Relaxed));
+    anyhow::ensure!(arrivals.len() >= 2,
+        "only {} arrival(s) of the burst found in 4 s — the monitoring loop never closed (ring: {dropped} dropped, {starved} starved)",
+        arrivals.len());
+    let mut intervals: Vec<f32> = arrivals.windows(2).map(|w| (w[1] - w[0]) as f32 / rate as f32 * 1000.0).collect();
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = intervals[intervals.len() / 2];
+    Ok(Some(Measure {
+        median,
+        min: intervals[0],
+        max: intervals[intervals.len() - 1],
+        passes: intervals.len(),
+        dropped,
+        starved,
+        rate,
+        buffer,
+    }))
+}
+
+/// One attempt's result: the median interval of the recirculating burst.
+struct Measure {
+    median: f32,
+    min: f32,
+    max: f32,
+    passes: usize,
+    dropped: u64,
+    starved: u64,
+    rate: u32,
+    buffer: u32,
+}
+
+pub fn run_monitor_latency_test() -> anyhow::Result<()> {
+    // The loop runs through other processes (pw-record, pw-play, the
+    // PipeWire graph) at normal priority: on a loaded desktop one pass can be
+    // starved and the burst lost. A measurement counts when the loop
+    // recirculated at least 16 times; up to three tries, each printed.
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match monitor_latency_attempt() {
+            Ok(None) => {
+                println!("monitor-latency-test: SKIP — no PipeWire loopback on this machine");
+                return Ok(());
+            }
+            Ok(Some(m)) if m.passes >= 16 => {
+                println!(
+                    "monitor-latency-test: input→output round trip {:.2} ms (median of {} passes, {} Hz, {}-frame buffer, attempt {attempt})",
+                    m.median, m.passes, m.rate, m.buffer
+                );
+                println!(
+                    "  passes min/median/max: {:.2} / {:.2} / {:.2} ms · ring: {} dropped, {} starved",
+                    m.min, m.median, m.max, m.dropped, m.starved
+                );
+                anyhow::ensure!(m.median < 40.0, "monitoring round trip {:.1} ms is far over the ~15 ms target", m.median);
+                println!("monitor-latency-test: OK — MON carries the input to the master at {:.2} ms round trip", m.median);
+                return Ok(());
+            }
+            Ok(Some(m)) => {
+                println!("monitor-latency-test: attempt {attempt}: loop recirculated only {} time(s) (starved: {}) — retrying", m.passes, m.starved);
+                last_err = Some(anyhow::anyhow!("the loop recirculated only {} time(s)", m.passes));
+            }
+            Err(e) => {
+                println!("monitor-latency-test: attempt {attempt}: {e} — retrying");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no measurement")))
+}
+
+/// `kabelsalat audio-in-test`: a software loopback over the raw cpal streams
+/// (the layer under the app's capture: stream latencies from cpal's own
+/// timestamps, ring drift). On this machine's ALSA host the "playback −
+/// callback" number is not the graph's real output latency — trust
+/// `monitor-latency-test`, which measures the audio itself by recirculation.
 /// Skips cleanly when there is no input device (not an error — a headless
 /// machine).
 pub fn run_test() -> anyhow::Result<()> {
@@ -462,9 +815,16 @@ pub fn run_test() -> anyhow::Result<()> {
     let in_stream = dev.build_input_stream(
         in_config,
         move |data: &[f32], info: &cpal::InputCallbackInfo| {
-            // Downmix device channels to mono and push into the ring.
+            // Downmix device channels to mono and push STEREO-interleaved (the
+            // same layout the render side consumes — the app's engine ring is
+            // stereo; the loop here used to push one sample per frame while
+            // the output popped two, so the ring starved on every block and
+            // the "loopback" was silent the whole run).
             for frame in data.chunks(nch) {
                 let s = frame.iter().copied().sum::<f32>() / nch as f32;
+                if ib_prod.push(s).is_err() {
+                    meter2.dropped.fetch_add(1, Ordering::Relaxed);
+                }
                 if ib_prod.push(s).is_err() {
                     meter2.dropped.fetch_add(1, Ordering::Relaxed);
                 }
@@ -486,6 +846,8 @@ pub fn run_test() -> anyhow::Result<()> {
     let out_stream = out_dev.build_output_stream(
         out_config,
         move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // The ring is stereo-interleaved (the producer pushes L,R per
+            // frame): pop one value per output sample.
             for s in data.iter_mut() {
                 let v = match ib_cons.pop() {
                     Ok(v) => v.clamp(-1.0, 1.0),
@@ -616,6 +978,20 @@ mod tests {
     }
 
     #[test]
+    fn a_backlog_is_cut_to_the_target_in_whole_frames() {
+        let d = Drift::new(512);
+        let target = 512 * 2;
+        assert_eq!(d.catch_up(target), 0, "on target: nothing to cut");
+        assert_eq!(d.catch_up(target + 512), 0, "a small overshoot is DropOne's job");
+        // One second of stereo backlog (a capture that began before its
+        // consumer): everything above the target goes at once.
+        let cut = d.catch_up(96_000);
+        assert_eq!(96_000 - cut, target, "the ring is left at the target fill");
+        assert_eq!(cut % 2, 0, "whole stereo frames: an odd cut would swap L and R");
+        assert_eq!(d.catch_up(target + 4001) % 2, 0);
+    }
+
+    #[test]
     fn drift_band_scales_with_block() {
         let big = Drift::new(512);
         let small = Drift::new(256);
@@ -628,6 +1004,33 @@ mod tests {
         assert_eq!(pretty_device_name("alsa_input.usb-MOTU_M2_M2MC0123-00.analog-stereo"), "MOTU M2");
         assert_eq!(pretty_device_name("alsa_input.usb-Focusrite_Scarlett_2i2_USB_ABCD-00.analog-stereo"), "Focusrite Scarlett");
         assert_eq!(pretty_device_name(""), "");
+    }
+
+    #[test]
+    fn marker_arrivals_reads_the_passes_of_a_recirculated_burst() {
+        // A burst in a silent recording at 0, 720 and 1440 samples (two
+        // passes of 720): the interval between arrivals is the round trip.
+        let sr = 48_000.0;
+        let mut burst = Vec::new();
+        for i in 0..300 {
+            let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / 300.0).cos();
+            burst.push((2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sr).sin() * 0.3 * w);
+        }
+        let mut rec = vec![0.0f32; 4000];
+        for at in [100usize, 820, 1540] {
+            for (i, s) in burst.iter().enumerate() {
+                rec[at + i] += s;
+            }
+        }
+        let found = marker_arrivals(&rec, &burst, 0.55, 480);
+        assert_eq!(found.len(), 3, "each pass is found: {found:?}");
+        // The correlation peak sits at a fixed offset from the true start
+        // (a windowed sinusoid is not a matched filter) — what the interval
+        // measures is unaffected, and the interval IS the round trip.
+        let ms = |a: usize, b: usize| (b - a) as f32 / sr * 1000.0;
+        assert!((ms(found[0], found[1]) - 15.0).abs() < 0.01, "720 samples = 15 ms, got {:.3}", ms(found[0], found[1]));
+        assert!((ms(found[1], found[2]) - 15.0).abs() < 0.01, "got {:.3}", ms(found[1], found[2]));
+        assert!(marker_arrivals(&rec, &vec![0.0f32; 300], 0.55, 480).is_empty(), "a silent marker finds nothing");
     }
 
     #[test]

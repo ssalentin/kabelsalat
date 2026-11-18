@@ -176,6 +176,25 @@ struct InstallInstrumentArgs {
     confirm: bool,
 }
 
+/// Arguments for `load_template`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadTemplateArgs {
+    /// Template name: lead_reverb | drums_bass | ambient_pad | guitar_rig | demo | multi_rig.
+    name: String,
+}
+
+/// Resolve a template name (same aliases the app's tool takes).
+fn template_by_name(name: &str) -> Option<crate::session::Template> {
+    use crate::session::Template;
+    Some(match name.to_lowercase().as_str() {
+        "lead_reverb" | "lead" => Template::LeadReverb,
+        "drums_bass" | "drums" => Template::DrumsBass,
+        "ambient_pad" | "ambient" | "pad" => Template::AmbientPad,
+        "guitar_rig" | "guitar" => Template::GuitarRig,
+        _ => return None,
+    })
+}
+
 /// Arguments for `remove_node`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemoveNodeArgs {
@@ -1966,6 +1985,43 @@ impl McpServer {
             .map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
         if let Ok(mut s) = st.rigs.lock() { s.rigs = metas.clone(); s.active = target; }
         ok_json(json!({"loaded": preset.name, "rig": target, "rigs": metas, "active": target}))
+    }
+
+    /// Load a starter template, replacing the patch.
+    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face; the three guitarix units need the Guitarix card installed) | demo | multi_rig (the two demo patches exist in the running app only).")]
+    fn load_template(&self, Parameters(args): Parameters<LoadTemplateArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("load_template", json!({"name": args.name}));
+        }
+        let name = args.name.to_lowercase();
+        if matches!(name.as_str(), "demo" | "multi_rig" | "rigs") {
+            return tool_err("demo and multi_rig are demo patches of the running app; headless templates are lead_reverb, drums_bass, ambient_pad, guitar_rig");
+        }
+        let Some(t) = template_by_name(&name) else {
+            return tool_err(format!(
+                "unknown template '{}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)",
+                args.name
+            ));
+        };
+        let s = t.session();
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::LoadGraph { graph: s.graph.clone() }) {
+            return tool_err(e);
+        }
+        for p in s.params() {
+            let _ = send_cmd(&mut st, Command::SetParam { node: p.node, param: p.param, value: p.value });
+        }
+        st.graph = s.graph.clone();
+        // A single-graph load leaves no rig list (the app's multi-rig path
+        // owns rig names; LoadGraph resets the engine's list too).
+        if let Ok(mut r) = st.rigs.lock() { r.rigs.clear(); r.active = 0; }
+        let mut result = json!({
+            "loaded": t.title(),
+            "nodes": s.graph.nodes.iter().map(|n| json!({"id": n.id, "name": name_str(&n.name), "rig": n.rig})).collect::<Vec<_>>(),
+            "edges": s.graph.edges.len(),
+        });
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
     }
 
     /// List saved single-rig presets.

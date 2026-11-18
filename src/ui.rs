@@ -1843,7 +1843,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
-    "save_rig", "load_rig", "list_rig_presets",
+    "save_rig", "load_rig", "list_rig_presets", "load_template",
     "list_instruments", "install_instrument", "play_file", "stop_file",
 ];
 
@@ -5795,6 +5795,10 @@ impl DemoApp {
                     "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); Some("Loaded template 'Lead + Reverb'".to_string()) }
                     "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); Some("Loaded template 'Drums + Bass'".to_string()) }
                     "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); Some("Loaded template 'Ambient Pad'".to_string()) }
+                    "guitar_rig" | "guitar" => {
+                        self.load_template(Template::GuitarRig);
+                        Some("Loaded template 'Guitar Rig' — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too".to_string())
+                    }
                     "demo" => { self.load_demo_patch(); Some("Loaded the demo patch".to_string()) }
                     "multi_rig" | "rigs" => { self.load_multi_rig_demo(); Some("Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".to_string()) }
                     _ => None,
@@ -5805,7 +5809,7 @@ impl DemoApp {
                         self.agent_activity.record(origin, format!("Template: {name}"), nodes, now);
                         msg
                     }
-                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
+                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)"),
                 }
             }
             "add_node" => {
@@ -8824,6 +8828,7 @@ impl DemoApp {
                             Template::LeadReverb => ("Keys → Surge → Reverb", "F5"),
                             Template::DrumsBass => ("Dual Surge layers", "F6"),
                             Template::AmbientPad => ("Surge → Delay → Reverb", "F7"),
+                            Template::GuitarRig => ("Live input → stomps → amp", "⇧F5"),
                         };
                         if template_row(ui, t.title(), &format!("{desc} · {key_hint}"), "load a playable pre-wired rack") {
                             *load_tpl = Some(*t);
@@ -12540,6 +12545,9 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
             if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
+            // The guitar rig replaces the keyboard patch (no Keys unit), so it
+            // sits on Shift+F5, next to its keyboard sibling.
+            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
             if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
             // Plugin browser (task-18).
             if i.consume_key(Modifiers::NONE, Key::F9) {
@@ -15847,6 +15855,27 @@ const EVAL_TASKS: &[EvalTask] = &[
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
+    },
+    EvalTask {
+        name: "guitar_rig", start: EvalStart::OneRig, prompt: "Build me a guitar rig.",
+        check: |app, _, _| {
+            // The Guitar rig template's shape (issue #92): a live input through
+            // stomps into the amp and cabinet, all the way to the master.
+            let g = eval_graph(app);
+            let ain = eval_node(&g, 0, "audio in", |k| matches!(k, NodeKind::AudioIn { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, ain, master), || "the Audio In does not reach the master".into())?;
+            let amp = eval_node(&g, 0, "amp", |k| matches!(k, NodeKind::Lv2 { uri } if crate::guitar::is_amp_uri(uri.as_str())))?;
+            let cab = eval_node(&g, 0, "cabinet", |k| matches!(k, NodeKind::Lv2 { uri } if uri.as_str() == crate::guitar::CABINET))?;
+            eval_ensure(eval_audio_path(&g, ain, amp) && eval_audio_path(&g, amp, cab) && eval_audio_path(&g, cab, master),
+                || "the amp and cabinet are not chained between the input and the master".into())?;
+            for (kind, what) in [(DspKind::Delay, "delay"), (DspKind::Reverb, "reverb")] {
+                let fx = eval_one_dsp(&g, 0, &kind)?;
+                eval_ensure(eval_audio_path(&g, ain, fx) && eval_audio_path(&g, fx, master),
+                    || format!("the {what} is not in the input's chain"))?;
+            }
+            Ok(())
+        }
     },
 ];
 

@@ -718,6 +718,9 @@ pub struct GraphEngine {
     /// instance was live (it loads on its own thread, rule 46); replayed by
     /// `attach_lv2`. Fixed size: no allocation on the audio thread.
     organ_pending: [Option<OrganPending>; 8],
+    /// Control values that arrived before ANY still-loading LV2 instance
+    /// was live (`Lv2Pending`); replayed by `attach_lv2` (rule 113).
+    lv2_pending: [Option<Lv2Pending>; 8],
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -866,6 +869,7 @@ impl GraphEngine {
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             organ_pending: [None; 8],
+            lv2_pending: [None; 8],
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -960,6 +964,15 @@ impl GraphEngine {
                     if let Some((msgs, n)) = crate::organ::ccs(crate::organ::P_BASE + k as ParamId, p.values[k]) {
                         for &(cc, val) in &msgs[..n] { s.plugin.control_change(cc, val); }
                     }
+                }
+            }
+        }
+        // Control values any still-loading LV2 node was sent (rule 113).
+        if let Some(i) = self.lv2_pending.iter().position(|p| p.is_some_and(|p| p.node == node)) {
+            let p = self.lv2_pending[i].take().unwrap();
+            if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                for &(ordinal, v) in p.pairs.iter().take(p.count) {
+                    s.plugin.set_control_normalized(ordinal as usize, v);
                 }
             }
         }
@@ -1461,6 +1474,33 @@ impl GraphEngine {
         }
     }
 
+    /// Park a control value for an LV2 instance that is still loading
+    /// (`attach_lv2` replays it). Most recent value per ordinal wins; the
+    /// table is small and fixed — a template load parks one value per knob.
+    fn park_lv2(&mut self, node: NodeId, ordinal: u16, value: f32) {
+        let mut slot = None;
+        for (i, p) in self.lv2_pending.iter().enumerate() {
+            if p.as_ref().is_some_and(|p| p.node == node) {
+                slot = Some(i);
+                break;
+            }
+        }
+        if slot.is_none() {
+            slot = self.lv2_pending.iter().position(|p| p.is_none());
+        }
+        let Some(i) = slot else {
+            eprintln!("lv2 pending table full: value for node {node} dropped");
+            return;
+        };
+        let p = self.lv2_pending[i].get_or_insert(Lv2Pending { node, pairs: [(0, 0.0); 8], count: 0 });
+        if let Some(existing) = p.pairs.iter_mut().take(p.count).find(|(o, _)| *o == ordinal) {
+            existing.1 = value;
+        } else if p.count < p.pairs.len() {
+            p.pairs[p.count] = (ordinal, value);
+            p.count += 1;
+        }
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
@@ -1486,6 +1526,12 @@ impl GraphEngine {
                 p.values[k] = v;
                 p.set |= 1 << k;
             }
+            true
+        } else if self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
+            // Any other LV2 node still loading on the loader thread: park
+            // the value, never drop it (rule 113; the template's amp Drive
+            // is one of these between LoadGraph and attach).
+            self.park_lv2(node, param.min(0xFFFF) as u16, v);
             true
         } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
@@ -1726,6 +1772,7 @@ impl GraphEngine {
                 self.rig_meta.clear();
                 // Values parked for the old graph's organs (ids are reused).
                 self.organ_pending = [None; 8];
+                self.lv2_pending = [None; 8];
                 for i in 0..self.graph.nodes.len() {
                     if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
                         let id = self.graph.nodes[i].id;
@@ -2221,8 +2268,19 @@ impl GraphEngine {
                 s.buf[i * 2] = ol * g;
                 s.buf[i * 2 + 1] = or * g;
             }
+            // A backlog (capture ahead of its consumer) is cut to the target
+            // fill in one go; the ring holds interleaved stereo, so every
+            // discard is a whole frame (one sample would swap L and R).
+            let backlog = s.drift.catch_up(consumer.slots());
+            if backlog > 0 {
+                for _ in 0..backlog {
+                    let _ = consumer.pop();
+                }
+                s.dropped += (backlog / 2) as u64;
+            }
             match s.drift.action(consumer.slots()) {
                 DriftAction::DropOne => {
+                    let _ = consumer.pop();
                     let _ = consumer.pop();
                     s.dropped += 1;
                 }
@@ -2570,6 +2628,20 @@ struct OrganPending {
     node: NodeId,
     values: [f32; crate::organ::PARAMS],
     set: u16,
+}
+
+/// Control-port values waiting for an LV2 instance that is still loading on
+/// the loader thread (rule 46): parked here by `apply_engine_param` and
+/// replayed by `attach_lv2` — the general case of `organ_pending` (rule 113:
+/// a value sent before the instance is live is parked, never dropped; the
+/// Guitar rig's template Drive otherwise never reached the amp). Fixed size,
+/// no allocation (audio thread).
+#[derive(Clone, Copy)]
+struct Lv2Pending {
+    node: NodeId,
+    /// (control ordinal, normalized value), most recent per ordinal.
+    pairs: [(u16, f32); 8],
+    count: usize,
 }
 
 /// Zero-latency peak limiter for the master bus: holds the summed signal
@@ -3768,6 +3840,41 @@ mod tests {
     }
 
     #[test]
+    fn lv2_values_sent_while_the_instance_loads_are_parked_and_replayed() {
+        use crate::control::{command_bus, name_bytes, Graph, Lv2Uri, NodeKind};
+        // Rule 113 for every LV2 node, not only the organ: a SetParam that
+        // arrives while the instance is still on the loader thread is parked
+        // and replayed at attach — the Guitar rig template's amp Drive is
+        // one between LoadGraph and attach. Probes the real plugin when the
+        // Guitarix card is installed, skips in CI.
+        let uri = crate::guitar::AMP;
+        let (mut bus, drain) = command_bus();
+        let mut g = Graph::default();
+        let amp = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes("AMP"));
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        if engine.lv2.is_empty() {
+            return; // the plugin is not installed (CI): nothing to park for
+        }
+        let Some(slot) = engine.lv2.pop() else { return };
+        let mut buf = vec![0.0f32; 256 * 2];
+        bus.send(Command::SetParam { node: amp, param: crate::guitar::AMP_DRIVE_CTRL as super::ParamId, value: 1.0 });
+        engine.render(&mut buf, 2); // drains the command: parks (no live slot)
+        assert!(
+            engine.lv2_pending.iter().any(|p| p.is_some_and(|p| p.node == amp)),
+            "the value sent while loading is parked, not dropped"
+        );
+        engine.attach_lv2(slot);
+        let live = engine.lv2.iter().find(|s| s.node == amp).unwrap();
+        let desc = live.plugin.control_descs()[crate::guitar::AMP_DRIVE_CTRL].clone();
+        assert!(
+            (desc.value - desc.max).abs() < 1e-6,
+            "the parked Drive was replayed at attach: {} (max {})",
+            desc.value, desc.max
+        );
+        engine.lv2_pending = [None; 8];
+    }
+
+    #[test]
     fn audio_in_routes_and_meters() {
         use crate::control::{command_bus, name_bytes, AudioInChannel, Command, NodeKind, PortKind, PortRef};
         use super::{P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR};
@@ -4417,6 +4524,154 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     println!("lv2-instrument-engine-test: through a Saturation unit: master peak held={through:.4}");
     anyhow::ensure!(through > 1e-3, "LV2 instrument {uri} → built-in effect → Master is silent");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
+    Ok(())
+}
+
+/// Goertzel magnitude² of `freq` in `x` (single-bin DFT power, normalized by
+/// the window length): the guitar rig's "audibly transformed" check without
+/// an FFT dependency.
+fn goertzel(x: &[f32], freq: f32, sr: f32) -> f32 {
+    let k = 2.0 * std::f32::consts::PI * freq / sr;
+    let coeff = 2.0 * k.cos();
+    let (mut s1, mut s2) = (0.0f32, 0.0f32);
+    for &v in x {
+        let s0 = v + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (x.len().max(1) as f32).powi(2)
+}
+
+/// Share of the signal's power that is not the `freq` sine (least-squares
+/// fit of one sine+cosine over `x`): ~0 for a clean tone, grows with
+/// distortion. Robust to a slowly decaying envelope, unlike a single
+/// Goertzel bin.
+fn non_fundamental_share(x: &[f32], freq: f32, sr: f32) -> f32 {
+    let k = 2.0 * std::f32::consts::PI * freq / sr;
+    let (mut ss, mut cc, mut sc, mut xs, mut xc, mut xx) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    for (i, &v) in x.iter().enumerate() {
+        let (s, c) = ((k * i as f32).sin() as f64, (k * i as f32).cos() as f64);
+        let v = v as f64;
+        ss += s * s; cc += c * c; sc += s * c;
+        xs += v * s; xc += v * c; xx += v * v;
+    }
+    let det = ss * cc - sc * sc;
+    if det.abs() < 1e-9 || xx < 1e-12 {
+        return 0.0;
+    }
+    let a = (xs * cc - xc * sc) / det;
+    let b = (xc * ss - xs * sc) / det;
+    let fit = a * xs + b * xc;
+    ((xx - fit).max(0.0) / xx) as f32
+}
+
+/// `guitar-rig-test` (issue #92): the Guitar rig template end to end — a
+/// synthetic plucked-string input into the Audio In ring, through the
+/// template's stomps, amp and cabinet, audibly transformed at the Master.
+/// Skips cleanly when the Guitarix card is not installed.
+pub fn guitar_rig_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, Command, NodeKind};
+    let sr = 48000.0f32;
+    if crate::lv2::Lv2Plugin::load(crate::guitar::AMP, sr as f64, 512).is_err() {
+        println!("guitar-rig-test: SKIP — the Guitarix card is not installed (catalog card 'guitarix')");
+        return Ok(());
+    }
+    let session = crate::session::Template::GuitarRig.session();
+    let ain = session.graph.nodes.iter()
+        .find(|n| matches!(n.kind, NodeKind::AudioIn { .. }))
+        .map(|n| n.id)
+        .ok_or_else(|| anyhow::anyhow!("the Guitar rig template has no Audio In"))?;
+    let (mut bus, drain) = command_bus();
+    // The app's path (rule 46): the loader thread instantiates the LV2 units
+    // after a LoadGraph; the rig's values follow, and nothing is fed until
+    // every unit is live (an unattached unit would pass nothing and make the
+    // measurement a race).
+    let mut engine = GraphEngine::new(crate::control::Graph::default(), drain, sr as f64, vec![]);
+    engine.spawn_lv2_loader();
+    bus.send(Command::LoadGraph { graph: session.graph.clone() });
+    for p in session.params() {
+        bus.send(Command::SetParam { node: p.node, param: p.param, value: p.value });
+    }
+    let want = session.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Lv2 { .. })).count();
+    let t0 = std::time::Instant::now();
+    let mut warm = vec![0.0f32; crate::bridge::BUFFER_FRAMES as usize * 2];
+    while engine.lv2.len() < want {
+        anyhow::ensure!(t0.elapsed().as_secs() < 15, "the guitarix units did not load ({}/{want})", engine.lv2.len());
+        engine.render(&mut warm, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for _ in 0..8 { engine.render(&mut warm, 2); }
+    // Side channel + data ring, exactly as the app's capture path hands them
+    // to the engine (the unit tests do the same).
+    let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+    engine.set_audio_in_channel(side_rx);
+    let ring = sr as usize * 2; // one second of stereo input
+    let (mut data_tx, data_rx) = rtrb::RingBuffer::<f32>::new(ring);
+    let _ = side_tx.push((ain, data_rx));
+
+    // The "string": a 220 Hz tone with a slow pluck envelope (the tube stage
+    // needs level to crunch, so the decay is gentle), then a 40 ms fade so
+    // the input ends at silence (a starved ring repeats its last sample —
+    // never leave it holding a nonzero constant).
+    let steady_secs = 1.0f32;
+    let n = (sr * steady_secs) as usize;
+    let mut input = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / sr;
+        let env = (-t * 0.8).exp();
+        let s = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.45 * env;
+        input.push(s);
+        input.push(s);
+    }
+    let fade = (0.04 * sr) as usize;
+    for i in 0..fade {
+        let g = 1.0 - i as f32 / fade as f32;
+        input[i * 2] *= g;
+        input[i * 2 + 1] *= g;
+    }
+    // Render in 256-frame blocks, feeding the ring as the engine drains it.
+    let block = crate::bridge::BUFFER_FRAMES as usize;
+    let mut buf = vec![0.0f32; block * 2];
+    let mut master: Vec<f32> = Vec::with_capacity(n * 2);
+    let mut fed = 0usize;
+    engine.render(&mut buf, 2); // attach the consumer, settle the chain
+    while master.len() < n * 2 {
+        while fed < input.len() && data_tx.push(input[fed]).is_ok() {
+            fed += 1;
+        }
+        engine.render(&mut buf, 2);
+        master.extend_from_slice(&buf);
+    }
+    let steady = &master[..n * 2];
+    let l: Vec<f32> = steady.iter().step_by(2).copied().collect();
+    let peak = l.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    // The middle of the steady phase, clear of the pluck envelope's start.
+    let mid = &l[(n / 4)..(3 * n / 4)];
+    // 100 ms of the middle: short enough that the pluck decay is flat.
+    let win = &mid[mid.len() / 2..mid.len() / 2 + (sr as usize / 10)];
+    let ratio = non_fundamental_share(win, 220.0, sr);
+    let rms = (mid.iter().map(|s| (s * s) as f64).sum::<f64>() / mid.len() as f64).sqrt() as f32;
+
+    // The tail: input silent, the delay/reverb part of the chain still sounds.
+    // The first 100 ms are the played note's own decay; the peak after that
+    // is the echoes and the reverb.
+    let mut tail_peak = 0.0f32;
+    for blk in 0..(sr as usize * 12 / 10 / block) {
+        engine.render(&mut buf, 2);
+        if blk * block >= sr as usize / 10 {
+            tail_peak = buf.iter().fold(tail_peak, |m, s| m.max(s.abs()));
+        }
+    }
+    let (dropped, starved) = engine.audio_in_status(ain).unwrap_or((0, 0));
+    println!(
+        "guitar-rig-test: Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master\n  \
+         steady peak {peak:.4} RMS {rms:.4} · non-fundamental power {ratio:.4} · \
+         tail peak after silence {tail_peak:.4} · ring {dropped} dropped {starved} starved"
+    );
+    anyhow::ensure!(peak > 1e-3, "the rig is silent at the master (peak {peak:.4})");
+    anyhow::ensure!(ratio > 0.02, "the rig is transparent (non-fundamental power {ratio:.4}): the amp did not transform the input");
+    anyhow::ensure!(tail_peak > 1e-4, "no delay/reverb tail after the input stopped (peak {tail_peak:.4})");
+    println!("guitar-rig-test: OK — the input is audible and audibly transformed on the way to Master");
     Ok(())
 }
 

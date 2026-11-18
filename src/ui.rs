@@ -28198,6 +28198,48 @@ mod mixer_parity_tests {
     }
 
     #[test]
+    fn an_effect_picked_in_the_insert_picker_lands_in_the_strip_chain() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        open_mixer(&mut app, &ctx);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let before = app.strip_chain(surge).unwrap().len();
+        let mut time = 0.0;
+        let mut step = |app: &mut DemoApp, events: Vec<egui::Event>| -> Vec<(String, Rect)> {
+            time += 0.5; // past every fade-in (rule 101)
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+            raw.time = Some(time);
+            raw.events = events;
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            let mut texts = Vec::new();
+            fn collect(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+                match s {
+                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                    egui::Shape::Vec(v) => for x in v { collect(x, out); },
+                    _ => {}
+                }
+            }
+            for cs in &out.shapes { collect(&cs.shape, &mut texts); }
+            texts
+        };
+        let texts = step(&mut app, vec![]);
+        let plus = texts.iter().find(|(t, _)| t == "+ insert").expect("a '+ insert' chip").1.center();
+        for ev in click(plus) { step(&mut app, ev); }
+        assert!(app.insert_pick.is_some(), "'+ insert' opens the picker");
+        step(&mut app, vec![]); // an Area's first frame is a sizing pass
+        let texts = step(&mut app, vec![]);
+        let sat = texts.iter().find(|(t, _)| t == "Saturation").expect("the picker lists Saturation").1.center();
+        for ev in click(sat) { step(&mut app, ev); }
+        step(&mut app, vec![]);
+        let chain = app.strip_chain(surge).unwrap();
+        assert_eq!(chain.len(), before + 1, "the picked effect joined the chain");
+        assert!(chain.iter().any(|&u| matches!(app.units[u].node_kind, UnitKind::Dsp(DspKind::Saturation))),
+            "the new insert is a Saturation: {:?}", chain.iter().map(|&u| &app.units[u].name).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn the_insert_picker_is_a_view_not_a_second_model() {
         // #74's design line: the slots ARE the cables. A bypassed insert
         // keeps its node and its cables.

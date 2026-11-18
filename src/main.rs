@@ -107,6 +107,7 @@ fn main() -> anyhow::Result<()> {
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
         "midifx-test" => engine::midifx_test(),
         "lv2-async-test" => engine::lv2_async_test(),
+        "wind-test" => engine::wind_test(std::env::args().nth(2).as_deref()),
         "sound-library-test" => engine::sound_library_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "vital-test" => vital::run_test(&std::env::args_os().skip(2).map(Into::into).collect::<Vec<_>>()),
         "vital-import" => {

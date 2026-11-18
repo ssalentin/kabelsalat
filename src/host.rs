@@ -583,11 +583,10 @@ impl ClapVoice {
         self.push_rt(VoiceCmd::Midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]));
     }
 
-    /// Queue a raw MIDI 1.0 pitch bend on the audio thread without locking
-    /// or allocating. `value` is the signed 14-bit bend (0 = center).
-    pub fn send_pitch_bend_rt(&mut self, channel: u8, value: i16) {
-        let v = (value.clamp(-8192, 8191) + 8192) as u16;
-        self.push_rt(VoiceCmd::Midi([0xE0 | (channel & 0x0F), (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]));
+    /// Queue one raw MIDI 1.0 channel message on the audio thread without
+    /// locking or allocating (a 2-byte message leaves the third byte 0).
+    pub fn send_midi_rt(&mut self, msg: [u8; 3]) {
+        self.push_rt(VoiceCmd::Midi(msg));
     }
 
     /// Queue a MIDI programme change on the audio thread without locking or allocating.

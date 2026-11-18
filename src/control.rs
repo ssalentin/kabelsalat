@@ -955,6 +955,16 @@ pub enum Command {
         channel: u8,
         value: i16,
     },
+    /// Incoming aftertouch routed through the matrix like
+    /// [`Command::PitchBend`]: channel pressure (0xD0) when `note` is
+    /// `None`, poly pressure (0xA0) on that played key otherwise. Wind
+    /// controllers send breath this way.
+    Pressure {
+        source: SourceId,
+        channel: u8,
+        note: Option<u8>,
+        value: u8,
+    },
     /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
     /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
     MatrixCcMap {

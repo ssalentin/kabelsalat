@@ -402,6 +402,22 @@ fn rescan_hw_midi(
     }
 }
 
+/// A hardware pitch bend or aftertouch as the engine command it becomes.
+/// Wind controllers send breath as channel pressure, which is 2 bytes on
+/// the wire.
+fn hw_expression(dev: u32, msg: &[u8]) -> Option<Command> {
+    let (source, channel) = (SourceId::Hardware(dev), *msg.first()? & 0x0F);
+    match msg.first()? & 0xF0 {
+        0xD0 => Some(Command::Pressure { source, channel, note: None, value: *msg.get(1)? & 0x7F }),
+        0xA0 => Some(Command::Pressure { source, channel, note: Some(*msg.get(1)? & 0x7F), value: *msg.get(2)? & 0x7F }),
+        0xE0 => {
+            let value = ((*msg.get(2)? as i16 & 0x7F) << 7 | (*msg.get(1)? as i16 & 0x7F)) - 8192;
+            Some(Command::PitchBend { source, channel, value })
+        }
+        _ => None,
+    }
+}
+
 /// Open one hardware input. Events sound from the MIDI thread (rule 31) and
 /// queue for the UI animation.
 fn connect_hw_input(
@@ -417,6 +433,10 @@ fn connect_hw_input(
         port,
         "kabelsalat-hw",
         move |_stamp, msg: &[u8], _| {
+            if let Some(cmd) = hw_expression(dev, msg) {
+                let _ = direct.send_now(cmd, std::time::Instant::now());
+                return;
+            }
             if msg.len() >= 3 {
                 let st = msg[0] & 0xF0;
                 if st == 0x90 || st == 0x80 {
@@ -441,13 +461,6 @@ fn connect_hw_input(
                             cq.pop_front();
                         }
                     }
-                } else if st == 0xE0 {
-                    // Pitch bend from a wheel/wind controller: to the engine
-                    // like a CC (the pitch-bend half of #68). The UI animates
-                    // nothing here, so no queue.
-                    let ch = msg[0] & 0x0F;
-                    let val = ((msg[2] as i16) << 7 | msg[1] as i16) - 8192;
-                    let _ = direct.send_bend(SourceId::Hardware(dev), ch, val, std::time::Instant::now());
                 }
             }
         },
@@ -501,16 +514,11 @@ impl HwDirect {
         ok
     }
 
-    /// Send one hardware pitch bend straight to the engine from the midir
-    /// thread, like [`Self::send_cc`].
-    fn send_bend(&self, source: SourceId, channel: u8, value: i16, created: std::time::Instant) -> bool {
+    /// Send one hardware channel message (pitch bend, aftertouch) straight
+    /// to the engine from the midir thread, like [`Self::send_cc`].
+    fn send_now(&self, cmd: Command, created: std::time::Instant) -> bool {
         let Ok(guard) = self.bus.lock() else { return false };
         let Some(bus) = guard.as_ref() else { return false };
-        let cmd = Command::PitchBend {
-            source,
-            channel: channel & 0x0F,
-            value: value.clamp(-8192, 8191),
-        };
         let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
         crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
         ok
@@ -26018,6 +26026,16 @@ mod ui_polish_agent_tests {
     /// modulation (holds its value), sustain (CC 64 toggle) — and the VEL
     /// slider drives the Keys unit's VEL knob (found by label, rule 92;
     /// assert the DRAWN value, rule 109).
+    #[test]
+    fn a_wind_controllers_breath_and_bend_become_engine_commands() {
+        let hw = SourceId::Hardware(2);
+        assert!(matches!(super::hw_expression(2, &[0xD3, 100]), Some(Command::Pressure { source, channel: 3, note: None, value: 100 }) if source == hw), "channel pressure is 2 bytes");
+        assert!(matches!(super::hw_expression(2, &[0xA0, 60, 70]), Some(Command::Pressure { note: Some(60), value: 70, .. })));
+        assert!(matches!(super::hw_expression(2, &[0xE0, 0x7F, 0x5F]), Some(Command::PitchBend { value: 4095, .. })));
+        assert!(super::hw_expression(2, &[0xA0, 60]).is_none(), "a truncated message is dropped");
+        assert!(super::hw_expression(2, &[0x90, 60, 100]).is_none(), "notes take their own path");
+    }
+
     #[test]
     fn kb_strip_sends_the_standard_midi_signals() {
         let mut app = DemoApp::new_with_sink(None);

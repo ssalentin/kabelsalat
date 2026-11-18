@@ -1511,18 +1511,19 @@ impl Lv2Plugin {
         self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
     }
 
-    /// Queue a MIDI pitch bend (channel 1, signed 14-bit, 0 = center) for
-    /// the next run().
-    pub fn pitch_bend(&mut self, value: i16) {
-        let v = (value.clamp(-8192, 8191) + 8192) as u16;
-        self.queue_midi([0xE0, (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]);
-    }
-
     /// Queue a channel-pressure (aftertouch) message: how wind patches read
     /// breath (allocation-free).
     pub fn channel_pressure(&mut self, value: u8) {
-        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &[0xD0, value & 0x7F]) {
-            self.last_event = Some([0xD0, value & 0x7F, 0]);
+        self.midi(&[0xD0, value & 0x7F]);
+    }
+
+    /// Queue one channel message as it goes on the wire, 2 or 3 bytes
+    /// (allocation-free).
+    pub fn midi(&mut self, msg: &[u8]) {
+        if self.atom_in.is_some() && msg.len() <= 3 && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, msg) {
+            let mut last = [0; 3];
+            last[..msg.len()].copy_from_slice(msg);
+            self.last_event = Some(last);
         }
     }
 

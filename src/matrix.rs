@@ -102,6 +102,13 @@ impl MidiMsg {
         self.status | (self.channel & 0x0F)
     }
 
+    /// The message as it goes on the wire: program change and channel
+    /// pressure are 2 bytes, every other channel message 3.
+    pub fn wire(&self) -> ([u8; 3], usize) {
+        let len = if matches!(self.status, PROGRAM_CHANGE | CHANNEL_AFTERTOUCH) { 2 } else { 3 };
+        ([self.status_byte(), self.data[0], if len == 3 { self.data[1] } else { 0 }], len)
+    }
+
     /// A sounding note-on (velocity > 0). Velocity-0 note-ons are note-offs.
     pub fn is_note_on(&self) -> bool {
         self.status == NOTE_ON && self.data[1] > 0
@@ -475,7 +482,17 @@ impl Rule {
                 }
                 Some(ev)
             }
-            // Pitch bend, program change, aftertouch: channel filter only.
+            // Poly pressure presses one played key: it follows that key's
+            // split and transpose, or it would bend a note it never reached.
+            POLY_AFTERTOUCH => {
+                if !self.in_key_range(ev.data[0]) {
+                    return None;
+                }
+                let mut out = ev;
+                out.data[0] = transpose_note(ev.data[0], self.transpose);
+                Some(out)
+            }
+            // Pitch bend, program change, channel pressure: channel filter only.
             _ => Some(ev),
         }
     }
@@ -863,6 +880,17 @@ mod tests {
         assert_eq!(m.route(SourceId::Keys, pc), vec![(SURGE_A, pc)]);
         assert_eq!(m.route(SourceId::Keys, cat), vec![(SURGE_A, cat)]);
         assert_eq!(m.route(SourceId::Keys, pat), vec![(SURGE_A, pat)]);
+    }
+
+    #[test]
+    fn poly_pressure_follows_the_split_and_transpose_of_its_key() {
+        let mut m = Matrix::new();
+        m.add_rule(Rule::new(SourceId::Keys, SURGE_A).key_range(0, 59).transpose(12));
+        m.add_rule(Rule::new(SourceId::Keys, SURGE_B).key_range(60, 127));
+        assert_eq!(m.route(SourceId::Keys, MidiMsg::poly_aftertouch(0, 48, 90)), vec![(SURGE_A, MidiMsg::poly_aftertouch(0, 60, 90))]);
+        assert_eq!(m.route(SourceId::Keys, MidiMsg::poly_aftertouch(0, 64, 90)), vec![(SURGE_B, MidiMsg::poly_aftertouch(0, 64, 90))]);
+        let breath = MidiMsg::channel_aftertouch(0, 90);
+        assert_eq!(m.route(SourceId::Keys, breath), vec![(SURGE_A, breath), (SURGE_B, breath)], "channel pressure reaches every zone");
     }
 
     #[test]

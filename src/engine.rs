@@ -2233,6 +2233,42 @@ impl GraphEngine {
         self.arp = arps;
     }
 
+    /// A pitch bend or aftertouch is a channel message like a CC: routed
+    /// through the matrix and passed on to the instruments, which bend or
+    /// press what they play; no binding applies to it.
+    fn pass_to_instruments(&mut self, source: SourceId, msg: MidiMsg) {
+        self.matrix.route_into(source, msg, &mut self.route_out);
+        for i in 0..self.route_out.len() {
+            let (dest, m) = self.route_out[i];
+            let has_midi = self.has_midi_cable(dest);
+            let (wire, len) = m.wire();
+            if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                if !has_midi || !source_accepted(s, source) {
+                    continue;
+                }
+                s.voice.send_midi_rt(wire);
+                #[cfg(test)]
+                self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+            } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
+                // A Clap node whose voice is not hosted yet: nothing to
+                // reach (same shape as the CC path; logged under test).
+                #[cfg(test)]
+                if has_midi {
+                    self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                }
+            } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                if s.plugin.is_instrument() && has_midi {
+                    // LV2 instruments hear everything on channel 1.
+                    let mut wire = wire;
+                    wire[0] &= 0xF0;
+                    s.plugin.midi(&wire[..len]);
+                    #[cfg(test)]
+                    self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                }
+            }
+        }
+    }
+
     fn has_midi_cable(&self, dest: NodeId) -> bool {
         self.graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == dest)
     }
@@ -3544,36 +3580,14 @@ impl GraphEngine {
                 }
             }
             Command::PitchBend { source, channel, value } => {
-                // A bend is a channel message like CC: routed through the
-                // matrix, passed through to the instruments (plugins bend
-                // what they play); no binding applies to it.
-                let msg = MidiMsg::pitch_bend(channel, value);
-                self.matrix.route_into(source, msg, &mut self.route_out);
-                for i in 0..self.route_out.len() {
-                    let (dest, m) = self.route_out[i];
-                    let has_midi = self.has_midi_cable(dest);
-                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
-                        if !has_midi || !source_accepted(s, source) {
-                            continue;
-                        }
-                        s.voice.send_pitch_bend_rt(m.channel, m.pitch_bend_value());
-                        #[cfg(test)]
-                        self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
-                    } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
-                        // A Clap node whose voice is not hosted yet: nothing to
-                        // bend (same shape as the CC path; logged under test).
-                        #[cfg(test)]
-                        if has_midi {
-                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
-                        }
-                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
-                        if s.plugin.is_instrument() && has_midi {
-                            s.plugin.pitch_bend(m.pitch_bend_value());
-                            #[cfg(test)]
-                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
-                        }
-                    }
-                }
+                self.pass_to_instruments(source, MidiMsg::pitch_bend(channel, value));
+            }
+            Command::Pressure { source, channel, note, value } => {
+                let msg = match note {
+                    None => MidiMsg::channel_aftertouch(channel, value),
+                    Some(n) => MidiMsg::poly_aftertouch(channel, n, value),
+                };
+                self.pass_to_instruments(source, msg);
             }
             Command::MatrixCcMap { source, dest, cc, param, target, scale } => {
                 let changed = match param {
@@ -6134,6 +6148,20 @@ mod tests {
         assert_eq!(engine.cc_passthrough_log, vec![(1, 1, 127), (4, 1, 127), (1, 64, 127), (4, 64, 127)], "mod and sustain reach every rig the keys feed");
     }
 
+    #[test]
+    fn breath_as_aftertouch_reaches_the_rigs_the_keys_feed() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: 100 });
+        bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: Some(60), value: 70 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 100, 0), (4, 100, 0), (1, 60, 70), (4, 60, 70)], "channel and poly pressure reach both rigs");
+    }
+
     /// GitHub #97, the audible half: a full pitch bend (+2 st at Surge's
     /// default range) raises the rendered pitch — counted as zero crossings
     /// of the master output, like `organ-test` counts drawbar brightness.
@@ -6671,11 +6699,26 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
         matches!(engine.lv2_last_note(inst), Some(e) if e[0] == 0xE0 && (((e[2] as i16) << 7) | e[1] as i16) - 8192 == 2010),
         "pitch bend did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
     );
+    // Breath from a wind controller: channel pressure (2 bytes on the wire)
+    // and poly pressure reach the LV2 instrument as they were sent.
+    bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: 99 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        engine.lv2_last_note(inst) == Some([0xD0, 99, 0]),
+        "channel pressure did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: Some(60), value: 33 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        engine.lv2_last_note(inst) == Some([0xA0, 60, 33]),
+        "poly pressure did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: 0 });
     // Leave the plugin centered and the pedal up for what follows.
     bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 0 });
     bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
     peak_over(&mut engine, 2);
-    println!("lv2-instrument-engine-test: strip signals (mod, sustain, bend) delivered");
+    println!("lv2-instrument-engine-test: strip signals (mod, sustain, bend) and breath (channel and poly pressure) delivered");
     // Through a built-in effect, like a live organ rig (setBfree → Drive →
     // Master): the effect must hear the LV2 instrument.
     let drive = master + 1;
@@ -7118,6 +7161,71 @@ pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
     anyhow::ensure!(tested > 0, "no catalog instrument is installed");
     anyhow::ensure!(failed.is_empty(), "sound-library-test: {} of {tested} instrument(s) failed: {}", failed.len(), failed.join(", "));
     println!("sound-library-test: OK — {tested} instrument(s): library listed, searched, one sound loaded through the engine and heard");
+    Ok(())
+}
+
+/// `wind-test [query]`: a Vital wind patch (default: the first match for
+/// "woody") played through the engine the way a wind controller plays it.
+/// Note 60 sounds for 2 s without breath, then with a breath swell sent as
+/// channel pressure ([`Command::Pressure`], what the hardware input sends);
+/// a wind patch is nearly silent without breath and opens with it.
+pub fn wind_test(query: Option<&str>) -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
+    use crate::sounds::{Instrument, Libraries, Lookup, Target};
+    let query = query.unwrap_or("woody");
+    let (sr, block) = (48000.0, 256usize);
+    let instrument = Instrument::Lv2(crate::vital::URI.to_string());
+    anyhow::ensure!(crate::lv2::discover().iter().any(|p| p.uri == crate::vital::URI), "Vitalium is not installed");
+    let Lookup::Ready(library) = Libraries::blocking(crate::sounds::scan).get(&instrument) else {
+        anyhow::bail!("Vitalium's library did not read")
+    };
+    let label = crate::sounds::search(&library.sounds, query, 1).labels.into_iter().next()
+        .ok_or_else(|| anyhow::anyhow!("no Vital patch matches '{query}' ({} in the library); import a wind bank with `kabelsalat vital-import`", library.sounds.len()))?;
+    let sound = crate::sounds::find(&library.sounds, &label).ok_or_else(|| anyhow::anyhow!("'{label}' vanished"))?;
+
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let node = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, name_bytes("VITALIUM"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node, port: 1 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    engine.spawn_lv2_loader();
+    bus.send(Command::LoadGraph { graph: g });
+    let mut buf = vec![0.0f32; block * 2];
+    let start = std::time::Instant::now();
+    while !engine.lv2.iter().any(|s| s.node == node) {
+        anyhow::ensure!(start.elapsed() < std::time::Duration::from_secs(10), "Vitalium never attached");
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    crate::sounds::load(sound, Target { node, clap: None, bus: Some(&mut bus) }).map_err(|e| anyhow::anyhow!("loading '{label}': {e}"))?;
+    for _ in 0..40 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let blocks = (2.0 * sr) as usize / block;
+    let mut play = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, breath: &dyn Fn(f32) -> u8| -> f64 {
+        let mut sum = 0.0f64;
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: SourceId::Keys });
+        for b in 0..blocks {
+            bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: breath(b as f32 / blocks as f32) });
+            engine.render(&mut buf, 2);
+            sum += buf.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+        }
+        bus.send(Command::Pressure { source: SourceId::Keys, channel: 0, note: None, value: 0 });
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        for _ in 0..80 { engine.render(&mut buf, 2); }
+        (sum / (blocks * block * 2) as f64).sqrt()
+    };
+    let still = play(&mut engine, &mut bus, &|_| 0);
+    let blown = play(&mut engine, &mut bus, &|t| ((t * std::f32::consts::PI).sin() * 127.0).round() as u8);
+    println!("wind-test: '{label}' through the engine · note 60 for 2 s: rms {still:.4} without breath, {blown:.4} with a breath swell (channel pressure)");
+    anyhow::ensure!(blown > 1e-3, "'{label}' is silent with breath (rms {blown:.5})");
+    anyhow::ensure!(blown > still * 4.0, "breath does not open '{label}': rms {still:.4} without, {blown:.4} with");
+    println!("wind-test: OK — breath reaches Vitalium as channel pressure and opens the wind patch");
     Ok(())
 }
 

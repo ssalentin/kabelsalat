@@ -1,0 +1,36 @@
+name: README check
+
+# A PR labelled `enhancement` is a new feature and must update README.md in
+# the same change (AGENTS.md rule 132): the README is the shop window, and
+# the plugin-editor windows (#71) merged without a line in "What you can
+# do". Fails such a PR without a README change; when it changes UI code
+# without touching a screenshot under docs/shots/, only warns on the file —
+# whether users can see the difference is the author's call. Label events
+# re-run it, so (un)labelling re-checks at once. Like ci.yml it runs from
+# the PR's own head (pull_request), not from main.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+concurrency:
+  group: readme-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: readme-check
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: New features ship their README entry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' \
+            | scripts/ci/readme-check.sh "$LABELS"

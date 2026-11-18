@@ -639,6 +639,12 @@ fn system_prompt() -> String {
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
+     - Hear: listen records the next seconds of the master and a listening model scores \
+     it 0-10 on the words you pass as attributes (take them from the user's request: \
+     \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
+     It hears only what plays during the recording: call play_note for the notes first, \
+     in the same step. Use it to check a sound you made against what the user asked for, \
+     change one thing, then listen again to compare; stop after 3 rounds.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -667,6 +673,11 @@ fn system_prompt() -> String {
      one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     - Mixing (the Mixer view, F10): every source strip has set_strip_mix (pan/mute/solo at \
+     the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
+     rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
+     before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
+     shape the strip itself; faders are dB with double-click at 0 dB. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -724,6 +735,15 @@ pub(crate) fn tools() -> Value {
             "name":"measure_mix",
             "description":"Read the master-bus loudness/profile meter (Bravo measure loop): momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation + a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness measurement now (this resets the integration, not the signal).",
             "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
+        }},
+        {"type":"function","function":{
+            "name":"listen",
+            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note first in the same step. Takes about seconds + 3 s.",
+            "parameters":{"type":"object","properties":{
+                "attributes":{"type":"string","description":"Comma-separated words from the user's request the sound should match, e.g. \"8-bit, heroic\""},
+                "seconds":{"type":"number","description":"How long to record, 0.5-8 (default 4)"},
+                "question":{"type":"string","description":"Anything else to ask about the sound"}
+            }}
         }},
         {"type":"function","function":{
             "name":"play_note",
@@ -834,6 +854,46 @@ pub(crate) fn tools() -> Value {
             "name":"set_rig_mix",
             "description":"Per-rig mixer: rig index (0-based), vol 0..1, pan -1..1, mute, solo (solo mutes other rigs). Omitted fields keep their value. Example: rig 1 mute true.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"vol":{"type":"number"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["rig"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_mix",
+            "description":"Per-SOURCE mixer (#73): pan -1..1, mute, solo on ONE instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Example: node 1 pan -0.5 mute false.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_node_bypass",
+            "description":"Bypass one effect node (#74): a bypassed FX passes its input through unchanged, its knobs are kept. True = bypass, false = enable.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"FX node id (get_graph)"},"bypass":{"type":"boolean","description":"Default true"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"add_insert",
+            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_insert",
+            "description":"Remove one effect from a strip's insert chain (#74); the chain closes up (source → next). Pass fx = the effect's node id; source = its strip's source node id, omitted for a master insert.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"fx":{"type":"integer","description":"The effect node id to remove"}},"required":["fx"]}
+        }},
+        {"type":"function","function":{
+            "name":"rename_strip",
+            "description":"Rename one strip (#77): the name is the node's name, so the rack face, the mixer and saved sessions all show it. Up to 24 characters.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"name":{"type":"string"}},"required":["node","name"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_color",
+            "description":"Give a mixer strip a colour (#77): 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan), or none to clear. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"color":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"move_strip",
+            "description":"Move one source strip to slot `to` (1-based) within its rig's display order in the mixer (#77). Display only — the sound is unchanged.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"to":{"type":"integer","description":"1-based slot in its rig"}},"required":["node","to"]}
+        }},
+        {"type":"function","function":{
+            "name":"collapse_strip",
+            "description":"Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"list_plugins",

@@ -31,6 +31,11 @@ USB MIDI keyboard — devices are found while the app runs, just plug them in.
 Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
 ambient pad with one key.
 
+The on-screen keyboard carries the controls a real keyboard has: a pitch-bend
+wheel that springs back to centre, a modulation wheel, a sustain pedal and a
+velocity slider. They reach every rig the keys feed, and hardware pitch bend,
+modulation and sustain reach your instruments the same way.
+
 <p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The rack with the full-width software keyboard opened at the bottom"/></p>
 
 ### Patch with real cables
@@ -48,10 +53,14 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 it has loaded.
 
 ### Mix
-The mixer gives every rig volume, pan, mute and solo, with meters that show
-what you actually hear.
+Every source gets its own channel strip: a fader in dB with a 0 dB detent
+(double-click for exact unity), a held peak and a clip light, plus pan, mute
+and solo. Each strip lists the effects on its cable chain as insert slots —
+add, bypass, reorder or remove them — and the master has inserts that run on
+the whole mix before the limiter. Rename a strip, give it a colour, drag it to
+reorder or collapse it; names and colours are saved with the session.
 
-<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: per-rig faders, pan, mute and solo, and the master meter"/></p>
+<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be

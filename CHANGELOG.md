@@ -120,6 +120,10 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **A MIDI device turned off for an LV2 instrument stays off:** with two rigs
+  on two keyboards, the keyboard of the CLAP rig also played an LV2
+  instrument such as setBfree, when its cells were set while the plugin was
+  still loading (session load, new rig) (#123).
 - **Small and tiled windows:** the rack fits windows down to the 760 px
   minimum instead of panning with Keys and Master cut off; a short, wide
   window lays each instrument chain out in one row; the Mixer, Matrix,

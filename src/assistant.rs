@@ -637,6 +637,7 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
      get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
@@ -679,7 +680,8 @@ fn system_prompt() -> String {
      the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
      rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
      before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
-     shape the strip itself; faders are dB with double-click at 0 dB. \
+     shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
+     quick knob; faders are dB with double-click at 0 dB. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -918,6 +920,21 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
         }},
         {"type":"function","function":{
+            "name":"get_strip_knobs",
+            "description":"List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), whether it is custom-assigned, and available knob choices. Filter optionally with node.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Optional node id to inspect one unit"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_knob",
+            "description":"Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id (from get_strip_knobs or list_params), or empty string \"\" to reset to default. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"knob":{"type":"string","description":"Knob label/name, or empty string for default"}},"required":["node","knob"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_channels",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
+        }},
+        {"type":"function","function":{
             "name":"list_plugins",
             "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
             "parameters":{"type":"object","properties":{}}
@@ -984,8 +1001,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
-            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|midi_fx|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). kind midi_fx = a MIDI effect in the rig's MIDI chain (list_midi_fx): uri = an LV2 MIDI plugin (transpose, filter, …), no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"semis":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_midi_fx",
+            "description":"List the MIDI effects add_node(kind=midi_fx) can host: the built-in transposer and the installed LV2 MIDI plugins (uri). Installed CLAP note effects are listed but cannot be hosted yet.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"list_audio_outputs",

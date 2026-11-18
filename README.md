@@ -52,6 +52,17 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded.
 
+### Put MIDI effects in front of an instrument
+A **MIDI strip** sits between your keys and the instrument and changes the notes
+on the way: the built-in **MIDI transpose**, or any installed LV2 MIDI plugin
+(note transposers, filters, arpeggiators — pick one in **Plugins** and press
+*Add MIDI strip*). The strip shows the plugin's own main controls, they can be
+learned from a hardware knob like any other, and a note released while you turn
+a knob never hangs. The assistant can add strips too (`list_midi_fx`, `add_node`
+with kind `midi_fx`).
+
+<p align="center"><img src="docs/shots/midi-strip.png" width="85%" alt="The rack with a Transpose MIDI strip between Keys and the two Surge synths"/></p>
+
 ### Play your guitar
 Plug a guitar (or a microphone) into your audio interface and press **⇧F5**: the
 Guitar rig loads **Audio In → Scream → Delay → Reverb → Amp → Cabinet →
@@ -69,10 +80,20 @@ Every source gets its own channel strip: a fader in dB with a 0 dB detent
 (double-click for exact unity), a held peak and a clip light, plus pan, mute
 and solo. Each strip lists the effects on its cable chain as insert slots —
 add, bypass, reorder or remove them — and the master has inserts that run on
-the whole mix before the limiter. Rename a strip, give it a colour, drag it to
-reorder or collapse it; names and colours are saved with the session.
+the whole mix before the limiter. Every source and insert slot has a quick
+parameter knob beside it (defaulting to the plugin's first main control or an
+effect's mix; right-click to reassign, double-click to reset). Rename a strip,
+give it a colour, drag it to reorder or collapse it; names, colours and quick
+knob assignments are saved with the session.
 
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
+
+### Navigate rigs, channels and plugins
+Press **Q** (or click **Navigator** in the top bar) to open the right-hand
+Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see
+every rig's channels in their mixer colours and unfold their plugin chains
+(**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
+and selects the unit in the rack or scrolls and flashes its strip in the mixer.
 
 ### Keep an eye on the engine
 Beside your rigs, **DSP** shows how much of each audio buffer the engine needs

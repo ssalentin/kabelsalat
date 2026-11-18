@@ -168,6 +168,10 @@ pub enum SourceId {
     Keys,
     /// File player (P2) — one id per player node.
     FilePlayer(u32),
+    /// A MIDI-FX unit's OUTPUT — one id per MidiFx node (AUM MIDI strips:
+    /// the strip's processed MIDI is a matrix source routable to any rig
+    /// input). The id is the node id, not an ALSA port.
+    MidiFx(u32),
 }
 
 /// Which parameter space a CC binding drives on the destination node.

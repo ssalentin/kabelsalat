@@ -886,14 +886,27 @@ Learned so far (2026-11-15, UI polish pass):
     pattern position apart (`a_press_mid_bar_starts_the_pattern_on_its_first_note`).
     In the held-notes check, judge arps by "the last release silences
     everything", never per key: chords of two held keys can share a pitch.
-145. **An integer moving average keeps what its division drops:**
+145. **A hosted MIDI effect's knob move releases what is held through it:**
+    Carla's MIDI Transpose maps a note-off with the CURRENT semitones, so
+    moving the knob between a key's note-on (+7 → 67) and note-off (−5 → 55)
+    left the instrument's 67 sounding. `apply_midi_fx_param` calls
+    `release_all` when a hosted plugin's value really changes
+    (`kabelsalat midifx-test` runs the real plugin through the engine).
+146. **An exhaustive search stores hashes, never state text, and splits
+    its alphabet:** the held-notes search kept each state's JSON (6.7 GB at
+    800 k states), the OOM killer ended the session's shells again and
+    again, and the full product of routing × MIDI-FX edits has no reachable
+    fixpoint. States are hashes, the halves run as separate scenarios
+    (`Scenario::{Routing, Arp, RoutingWithStrip, Fx}`, 30–100 k states each),
+    and a long run goes in `systemd-run --user -p MemoryMax=3G`.
+147. **An integer moving average keeps what its division drops:**
     `RENDER_AVG_US` did `avg - avg/64 + us/64` in whole microseconds, and
     both divisions dropped up to 63 µs: a 50 µs render read 0 and a steady
     300 µs one read 256, so the DSP load of a light rack read 0 %. Average in
     nanoseconds with `engine_info::ema_ns` (a signed step, rounded towards
     the sample), and test a new average on a constant input from below and
     from above (`the_average_converges_on_small_and_large_times`).
-146. **A headless shot starts from an app that never ran a frame:**
+148. **A headless shot starts from an app that never ran a frame:**
     `offline_shots::shot` makes a new egui context and font atlas, but the
     app keeps galleys (wordmark, knob captions, hints) laid out in the
     atlas of the context it ran in before. `engine_info_shots` and
@@ -938,7 +951,7 @@ Learned so far (2026-11-15, UI polish pass):
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
   `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
   (calls the listening model; prints rankings and latency),

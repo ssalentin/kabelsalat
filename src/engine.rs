@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{
-    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind,
-    ParamId, PortKind, RigSnapshot,
+    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
+    NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
@@ -108,6 +108,14 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
 /// as a SetParam on a SystemAudio node so its GAIN knob and CC bindings work.
 pub const P_SYSTEM_GAIN: ParamId = 66;
 
+/// A built-in MIDI-FX unit's TRANSPOSE knob, in semitones −24..=24 mapped to
+/// 0..1 (`SetParam` on the MidiFx node). CLAP/LV2 MIDI-FX units have no
+/// built-in knobs — their knobs are the plugin's main controls (rule 89).
+pub const P_MIDIFX_SEMI: ParamId = 67;
+
+/// A built-in transposer's knob value in semitones (TRANSPOSE is ±24).
+pub const MIDIFX_SEMI_MAX: i8 = 24;
+
 /// The arp unit's knobs (issue #90): mode, rate, octaves, gate, swing and
 /// the chord shape of chord mode. Normalized 0..1 like every rack knob; the
 /// stepped ones quantize in `arp::ArpState::set_param` (and on the face).
@@ -193,6 +201,12 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Lv2 { .. } => &[],
         // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
         NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
+        // A hosted MIDI-FX unit's own knobs are the plugin's main controls
+        // (rule 89); the BUILTIN transposer's face shows SEMIS.
+        NodeKind::MidiFx { plugin } => match plugin {
+            MidiFxPlugin::Builtin { .. } => knobs!(ks("SEMIS", 0.5, Some(P_MIDIFX_SEMI), &["TRANSPOSE", "SEMI", "SEMITONES"])),
+            _ => &[],
+        },
         // The arp's six knobs (issue #90). MODE/RATE/OCT/CHORD are stepped —
         // the face snaps the needle, and `ArpState::set_param` quantizes.
         NodeKind::Arp => knobs!(
@@ -382,6 +396,73 @@ struct Lv2Slot {
     node: NodeId,
     plugin: crate::lv2::Lv2Plugin,
     buf: Vec<f32>,
+}
+
+/// Input events a MIDI-FX unit may hold between blocks (a full queue drops,
+/// never allocates).
+const FX_QUEUE_CAP: usize = 256;
+/// Output events one unit may emit per block (one shared engine scratch
+/// buffer; a full one drops).
+const FX_OUT_CAP: usize = 256;
+
+/// A hosted MIDI-FX node: the unit the matrix routes events through (AUM
+/// MIDI strips). The input queue is filled by `apply` at block boundaries
+/// and drained by `pump_midi_fx` on the audio thread — allocation-free
+/// both sides. Without a live processor (still loading, load failed, or a
+/// built-in unit) events pass through unprocessed: the rack stays playable
+/// and note-offs always flow (rule 41).
+struct MidiFxSlot {
+    node: NodeId,
+    /// The hosted plugin. `None` = pass-through.
+    proc: Option<MidiFxProc>,
+    /// The unit's raw-MIDI input queue (preallocated, cleared per pump).
+    in_q: Vec<MidiMsg>,
+    /// BUILT-IN transposer: the TRANSPOSE knob's semitones (CLAP/LV2 units
+    /// ignore this and process with their own plugin).
+    semis: i8,
+    /// `release_all` recursion guard (a wired FX1 → FX2 → FX1 loop).
+    releasing: bool,
+    /// Knob values sent before the plugin is live (rule 113): fixed capacity,
+    /// replayed by `attach_midi_fx_lv2`, never grown on the audio thread.
+    pending: Vec<(ParamId, f32)>,
+}
+
+enum MidiFxProc {
+    /// The loaded LV2 plugin, in the loader's own slot (so its retirement
+    /// goes back through `retire_lv2`, never a free on the audio thread).
+    Lv2(Lv2Slot),
+}
+
+/// Knob values one unit may hold while its plugin loads.
+const FX_PENDING_CAP: usize = 16;
+
+impl MidiFxSlot {
+    fn new(node: NodeId, semis: i8) -> Self {
+        Self {
+            node,
+            proc: None,
+            in_q: Vec::with_capacity(FX_QUEUE_CAP),
+            semis,
+            releasing: false,
+            pending: Vec::with_capacity(FX_PENDING_CAP),
+        }
+    }
+
+    /// Queue one event (allocation-free; a full queue drops the event).
+    fn queue(&mut self, msg: MidiMsg) {
+        if self.in_q.len() < FX_QUEUE_CAP {
+            self.in_q.push(msg);
+        }
+    }
+}
+
+/// Build the slot for a node (rare structural op — allocating here is fine).
+fn midi_fx_slot(n: &crate::control::Node) -> MidiFxSlot {
+    let semis = match &n.kind {
+        NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis } } => *semis,
+        _ => 0,
+    };
+    MidiFxSlot::new(n.id, semis)
 }
 
 /// One `AudioIn` node's render-side state. The ring `consumer` is filled by the
@@ -990,6 +1071,14 @@ pub struct GraphEngine {
     // notes by graph wiring (keys_gate).
     matrix: Matrix,
     route_out: Vec<(NodeId, MidiMsg)>,
+    // Hosted MIDI-FX units (AUM MIDI strips): the event path source →
+    // MIDI-FX → rig input. `apply` queues into the slots at block
+    // boundaries; `pump_midi_fx` (render) processes + routes their output.
+    midi_fx: Vec<MidiFxSlot>,
+    /// Scratch: raw MIDI bytes queued into one CLAP MIDI-FX per pump.
+    fx_in: Vec<[u8; 3]>,
+    /// Scratch: output events one MIDI-FX emitted, before routing.
+    fx_out: Vec<crate::lv2::FxOutEvent>,
     /// Test-only delivery log: (dest, note, on) for every gated note event
     /// (incl. split-change releases), so routing is observable without voices.
     #[cfg(test)]
@@ -1137,6 +1226,12 @@ impl GraphEngine {
             }
         }
         let route_cap = matrix.rules.len().max(64);
+        let midi_fx = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
+            .map(midi_fx_slot)
+            .collect();
         Self {
             graph,
             drain,
@@ -1163,6 +1258,9 @@ impl GraphEngine {
             node_timer: crate::engine_info::NodeTimer::new(),
             matrix,
             route_out: Vec::with_capacity(route_cap),
+            midi_fx,
+            fx_in: Vec::with_capacity(FX_QUEUE_CAP),
+            fx_out: Vec::with_capacity(FX_OUT_CAP),
             #[cfg(test)]
             note_log: Vec::new(),
             #[cfg(test)]
@@ -1244,6 +1342,10 @@ impl GraphEngine {
     /// default MIDI routes (only its rig's device when the rig has one).
     fn attach_lv2(&mut self, slot: Lv2Slot) {
         let node = slot.node;
+        if self.is_midi_fx(node) {
+            self.attach_midi_fx_lv2(slot);
+            return;
+        }
         let inst = slot.plugin.is_instrument();
         self.lv2.push(slot);
         // The face's organ values sent while the instance was loading.
@@ -1268,6 +1370,11 @@ impl GraphEngine {
             }
         }
         if inst {
+            // Units wired to this instrument route to it from now on.
+            for k in 0..self.midi_fx.len() {
+                let fx = self.midi_fx[k].node;
+                self.route_midi_fx_outputs(fx);
+            }
             let device = self.graph.node(node)
                 .and_then(|n| self.rig_meta.get(n.rig as usize))
                 .and_then(|m| m.midi_device);
@@ -1334,7 +1441,7 @@ impl GraphEngine {
             match msg {
                 Lv2Response::Loaded { node, gen, slot } => {
                     let wanted = gen == self.lv2_gen
-                        && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }))
+                        && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. } | NodeKind::MidiFx { .. }))
                         && !self.lv2.iter().any(|s| s.node == node)
                         && self.lv2.len() < self.lv2.capacity();
                     if wanted {
@@ -2022,6 +2129,296 @@ impl GraphEngine {
         self.graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == dest)
     }
 
+    /// Does a MIDI cable carry THIS unit's output to `dest`? The output leg
+    /// of a MIDI-FX chain is gated by its own cable, exactly like a Keys
+    /// node's leg is (`keys_route`).
+    fn fx_cable(&self, fx: NodeId, dest: NodeId) -> bool {
+        self.graph
+            .edges
+            .iter()
+            .any(|e| e.kind == PortKind::Midi && e.from.node == fx && e.to.node == dest)
+    }
+
+    /// Is `node` a hosted MIDI-FX unit?
+    fn is_midi_fx(&self, node: NodeId) -> bool {
+        matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::MidiFx { .. }))
+    }
+
+    /// Default matrix rules for one MIDI-FX node (rule 105: routes belong to
+    /// the node): the rig's input sources feed the unit (`device`: only that
+    /// hardware device, else the keyboard and every device), and its output
+    /// cables become rules. Both legs also need their cable (`keys_route`
+    /// gates the input, `fx_cable` the output). Idempotent.
+    fn route_midi_fx(&mut self, fx: NodeId, device: Option<u32>) {
+        let connect = |src: SourceId, m: &mut Matrix| {
+            if !m.rules.iter().any(|r| r.source == src && r.dest == fx) {
+                m.connect(src, fx);
+            }
+        };
+        match device {
+            Some(dev) => connect(SourceId::Hardware(dev), &mut self.matrix),
+            None => {
+                connect(SourceId::Keys, &mut self.matrix);
+                for dev in 0..MAX_HW_DEVICES {
+                    connect(SourceId::Hardware(dev), &mut self.matrix);
+                }
+            }
+        }
+        self.route_midi_fx_outputs(fx);
+    }
+
+    /// Wire + route a freshly added MIDI-FX node like an instrument is
+    /// (rule 19: playable out of the box). Wiring inserts the unit into its
+    /// rig's chain: the instruments' direct Keys cables are replaced, so
+    /// everything held on them is released first (rule 41).
+    fn setup_midi_fx(&mut self, id: NodeId, wire: bool) {
+        if wire {
+            let rig = self.graph.node(id).map_or(0, |n| n.rig);
+            for inst in self.graph.midi_sinks(rig) {
+                self.release_all(inst);
+            }
+            self.graph.wire_midi_fx(id);
+        }
+        let device = self
+            .graph
+            .node(id)
+            .and_then(|n| self.rig_meta.get(n.rig as usize))
+            .and_then(|m| m.midi_device);
+        self.route_midi_fx(id, device);
+    }
+
+    /// May an event that came from `origin` enter `fx`? The per-rig source
+    /// switches gate the chain behind the unit: it accepts when some
+    /// instrument it feeds accepts that source (a unit feeding only chained
+    /// units or LV2 instruments always accepts). Note-offs never ask —
+    /// a stray release is harmless, a dropped one hangs a note (rule 41).
+    fn fx_accepts(&self, fx: NodeId, origin: SourceId) -> bool {
+        let mut fed = false;
+        for r in self.matrix.rules.iter() {
+            if r.source != SourceId::MidiFx(fx) || !r.enabled {
+                continue;
+            }
+            fed = true;
+            match self.voices.iter().find(|v| v.node == r.dest) {
+                Some(v) if source_accepted(v, origin) => return true,
+                Some(_) => {}
+                None => return true,
+            }
+        }
+        !fed
+    }
+
+    /// Release every MIDI-FX unit upstream of `node` (an instrument whose
+    /// source switch or device filter is about to change): the filter that
+    /// used to pass a held key's note-on would drop its note-off (rule 41).
+    fn release_upstream(&mut self, node: NodeId) {
+        let mut i = 0;
+        while let Some(r) = self.matrix.rules.get(i) {
+            i += 1;
+            if r.dest == node {
+                if let SourceId::MidiFx(fx) = r.source {
+                    self.release_all(fx);
+                }
+            }
+        }
+    }
+
+    /// Set a MIDI-FX unit's knob: the built-in transposer's semitones, or a
+    /// plugin control. Before the plugin is live the value is parked. A
+    /// transposer's semitones change the pitch a held note's release takes,
+    /// so the unit releases first.
+    fn apply_midi_fx_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
+        let Some(i) = self.midi_fx.iter().position(|s| s.node == node) else { return false };
+        let v = v.clamp(0.0, 1.0);
+        if param == P_MIDIFX_SEMI && matches!(self.midi_fx[i].proc, None) {
+            let semis = ((v * 2.0 - 1.0) * MIDIFX_SEMI_MAX as f32).round() as i8;
+            if semis != self.midi_fx[i].semis {
+                self.release_all(node);
+                self.midi_fx[i].semis = semis;
+            }
+            return true;
+        }
+        // A hosted plugin's knob may change what its note-offs mean (the
+        // transposition a held note leaves with): when the value really
+        // moves, everything held through the unit is released first
+        // (rule 41; found by `midifx-test`: a note-off at the new pitch left
+        // the old one sounding).
+        let moves = matches!(&self.midi_fx[i].proc, Some(MidiFxProc::Lv2(s))
+            if s.plugin.control_normalized(param as usize).is_some_and(|cur| (cur - v).abs() > 1e-4));
+        if moves {
+            self.release_all(node);
+        }
+        let slot = &mut self.midi_fx[i];
+        match &mut slot.proc {
+            Some(MidiFxProc::Lv2(s)) => s.plugin.set_control_normalized(param as usize, v),
+            _ => match slot.pending.iter_mut().find(|(p, _)| *p == param) {
+                Some(e) => e.1 = v,
+                None => {
+                    if slot.pending.len() < slot.pending.capacity() {
+                        slot.pending.push((param, v));
+                    }
+                }
+            },
+        }
+        true
+    }
+
+    /// A loaded MIDI-only LV2 plugin takes its node's place in the event
+    /// path. The note-off path of everything held changes with it, so the
+    /// unit releases (rule 41); parked knob values replay (rule 113).
+    fn attach_midi_fx_lv2(&mut self, slot: Lv2Slot) {
+        let node = slot.node;
+        if !slot.plugin.is_midi_fx() || !self.midi_fx.iter().any(|s| s.node == node) {
+            eprintln!("midi-fx node {node}: {} is not a MIDI unit", slot.plugin.uri());
+            self.retire_lv2(slot);
+            return;
+        }
+        self.release_all(node);
+        let Some(i) = self.midi_fx.iter().position(|s| s.node == node) else { return };
+        let mut slot = slot;
+        for k in 0..self.midi_fx[i].pending.len() {
+            let (param, v) = self.midi_fx[i].pending[k];
+            slot.plugin.set_control_normalized(param as usize, v);
+        }
+        self.midi_fx[i].pending.clear();
+        if let Some(MidiFxProc::Lv2(old)) = self.midi_fx[i].proc.replace(MidiFxProc::Lv2(slot)) {
+            self.retire_lv2(old);
+        }
+    }
+
+    /// Run every MIDI-FX unit for one block: the events queued by `apply`
+    /// go in, the plugin's output is routed on through the matrix
+    /// (`SourceId::MidiFx(node)`), gated by the unit's own output cables.
+    /// A unit without a live plugin passes events through (transposed when
+    /// it is the built-in one). Allocation-free: every buffer is preallocated
+    /// and bounded.
+    fn pump_midi_fx(&mut self, frames: usize) {
+        use crate::lv2::FxOutEvent;
+        for i in 0..self.midi_fx.len() {
+            let node = self.midi_fx[i].node;
+            self.fx_in.clear();
+            self.fx_out.clear();
+            {
+                let slot = &mut self.midi_fx[i];
+                for m in slot.in_q.drain(..) {
+                    if self.fx_in.len() < self.fx_in.capacity() {
+                        self.fx_in.push([m.status | m.channel, m.data[0], m.data[1]]);
+                    }
+                }
+            }
+            let slot = &mut self.midi_fx[i];
+            match &mut slot.proc {
+                Some(MidiFxProc::Lv2(s)) => {
+                    for &ev in self.fx_in.iter() {
+                        s.plugin.send_midi(ev);
+                    }
+                    s.plugin.process(&[], &mut [], frames);
+                    s.plugin.read_midi_out(&mut self.fx_out);
+                }
+                None => {
+                    let semis = slot.semis as i16;
+                    for &d in self.fx_in.iter() {
+                        if self.fx_out.len() >= self.fx_out.capacity() {
+                            break;
+                        }
+                        let status = d[0] & 0xF0;
+                        let ch = d[0] & 0x0F;
+                        let is_note = matches!(status, 0x80 | 0x90);
+                        let note = if is_note {
+                            match shifted(d[1], semis) {
+                                Some(n) => n,
+                                None => continue,
+                            }
+                        } else {
+                            d[1]
+                        };
+                        self.fx_out.push(match status {
+                            0x90 if d[2] > 0 => FxOutEvent::NoteOn { channel: ch, note, velocity: d[2] },
+                            0x80 | 0x90 => FxOutEvent::NoteOff { channel: ch, note },
+                            _ => FxOutEvent::Midi(d),
+                        });
+                    }
+                }
+            }
+            for j in 0..self.fx_out.len() {
+                let ev = self.fx_out[j];
+                self.deliver_fx_event(node, ev);
+            }
+        }
+    }
+
+    /// Route one event a MIDI-FX unit emitted to everything its output
+    /// cables reach (rule transforms apply, like any matrix route).
+    fn deliver_fx_event(&mut self, fx: NodeId, ev: crate::lv2::FxOutEvent) {
+        use crate::lv2::FxOutEvent;
+        let msg = match ev {
+            FxOutEvent::NoteOn { channel, note, velocity } => MidiMsg::note_on(channel, note, velocity),
+            FxOutEvent::NoteOff { channel, note } => MidiMsg::note_off(channel, note, 0),
+            FxOutEvent::Midi(d) => MidiMsg::new(d[0] & 0xF0, d[0] & 0x0F, d[1], d[2]),
+        };
+        self.matrix.route_into(SourceId::MidiFx(fx), msg, &mut self.route_out);
+        for k in 0..self.route_out.len() {
+            let (dest, m) = self.route_out[k];
+            if !self.fx_cable(fx, dest) {
+                continue;
+            }
+            let is_on = m.status == 0x90 && m.data[1] > 0;
+            let is_off = m.status == 0x80 || (m.status == 0x90 && m.data[1] == 0);
+            if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                if dest != fx {
+                    self.midi_fx[j].queue(m);
+                }
+                continue;
+            }
+            if is_on || is_off {
+                #[cfg(test)]
+                self.note_log.push((dest, m.data[0], is_on));
+                let note = m.data[0];
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                    if is_on {
+                        s.voice.note_on(note as u16, m.data[1] as f64 / 127.0);
+                    } else {
+                        s.voice.note_off(note as u16);
+                    }
+                }
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                    if s.plugin.is_instrument() {
+                        if is_on {
+                            s.plugin.note_on(note, m.data[1]);
+                        } else {
+                            s.plugin.note_off(note);
+                        }
+                    }
+                }
+            } else if m.status == 0xB0 {
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                    s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                }
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                    if s.plugin.is_instrument() {
+                        s.plugin.control_change(m.data[0], m.data[1]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Matrix rules for the output cables of a MIDI-FX unit: one rule per
+    /// MIDI cable leaving it (idempotent). Called when a cable is added and
+    /// when an LV2 instrument attaches (its rules come with the load).
+    fn route_midi_fx_outputs(&mut self, fx: NodeId) {
+        for i in 0..self.graph.edges.len() {
+            let e = &self.graph.edges[i];
+            if e.kind == PortKind::Midi && e.from.node == fx {
+                let dest = e.to.node;
+                if !self.matrix.rules.iter().any(|r| r.source == SourceId::MidiFx(fx) && r.dest == dest) {
+                    self.matrix.connect(SourceId::MidiFx(fx), dest);
+                }
+            }
+        }
+        self.fit_route_out();
+    }
+
     fn apply_dsp_or_master_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
         match param {
             P_VOL => {
@@ -2085,7 +2482,9 @@ impl GraphEngine {
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
         let v = value as f32;
-        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+        if self.midi_fx.iter().any(|s| s.node == node) {
+            self.apply_midi_fx_param(node, param, v)
+        } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
             // setBfree's face controls are MIDI CCs (organ.rs); every other
             // LV2 knob maps param index → nth control port (normalized).
             match crate::organ::ccs(param, v) {
@@ -2207,6 +2606,11 @@ impl GraphEngine {
     /// off path is the arp's own cable, which the edit may be about to move
     /// (rule 41). Rare op, allocation-free (fixed 8-deep fan-out). Checked
     /// by `held_notes` (verify-held-notes).
+    ///
+    /// A MIDI-FX dest releases BOTH sides of the unit (rule 41): the events
+    /// still in its input queue are dropped (they never reached the plugin),
+    /// all-notes-off is queued into the plugin itself, and every instrument
+    /// the unit feeds is released (its own notes can be sounding there).
     fn release_all(&mut self, dest: NodeId) {
         if self.arp.iter().any(|a| a.node == dest) {
             let mut fed = [0u32; 8];
@@ -2241,6 +2645,35 @@ impl GraphEngine {
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
             for n in 0..128u8 { s.plugin.note_off(n); }
         }
+        if self.is_midi_fx(dest) {
+            let Some(fx) = self.midi_fx.iter_mut().find(|s| s.node == dest) else { return };
+            // Cycle guard: a user-wired FX1 → FX2 → FX1 loop must not recurse
+            // forever; the second entry only requeues all-notes-off.
+            if !fx.releasing {
+                fx.releasing = true;
+                // Own queue: never-delivered events die here.
+                fx.in_q.clear();
+                // All-notes-off INTO the plugin: the queue is capped, and
+                // 128 events fit (FX_QUEUE_CAP = 256), so this never drops.
+                for note in 0..128u8 {
+                    fx.queue(MidiMsg::note_off(0, note, 0));
+                }
+                // Downstream: every instrument the unit feeds, by rule
+                // index (allocation-free), enabled or not — a just-disabled
+                // rule may have been the path a note took.
+                let mut i = 0;
+                while let Some(r) = self.matrix.rules.get(i) {
+                    i += 1;
+                    if r.source == SourceId::MidiFx(dest) {
+                        let inst = r.dest;
+                        self.release_all(inst);
+                    }
+                }
+                if let Some(fx) = self.midi_fx.iter_mut().find(|s| s.node == dest) {
+                    fx.releasing = false;
+                }
+            }
+        }
         #[cfg(test)]
         self.note_log.push((dest, 255, false)); // 255 = all-notes-off marker
     }
@@ -2266,6 +2699,13 @@ impl GraphEngine {
             let dest = e.to.node;
             #[cfg(test)]
             self.note_log.push((dest, note, on));
+            // An arp wired into a MIDI strip (arp → unit → synth): the unit
+            // takes the note into its queue like one from the keys.
+            if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                let v7 = (vel.clamp(0.0, 1.0) * 127.0) as u8;
+                self.midi_fx[j].queue(if on { MidiMsg::note_on(0, note, v7) } else { MidiMsg::note_off(0, note, 0) });
+                continue;
+            }
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                 if on {
                     s.voice.note_on(note as u16, vel as f64);
@@ -2304,7 +2744,7 @@ impl GraphEngine {
             Command::AddNode { kind, name, rig, wire } => {
                 let id = self.graph.add_node(kind.clone(), name);
                 self.graph.set_rig(id, rig);
-                if wire {
+                if wire && !matches!(kind, NodeKind::MidiFx { .. }) {
                     if matches!(kind, NodeKind::Arp) {
                         // The arp takes over the rig's Keys→synth MIDI cables:
                         // every note held on those synths loses its off path
@@ -2342,6 +2782,15 @@ impl GraphEngine {
                         }
                     }
                     NodeKind::Lv2 { uri } => self.request_lv2(id, *uri),
+                    NodeKind::MidiFx { plugin } => {
+                        if let Some(n) = self.graph.node(id) {
+                            self.midi_fx.push(midi_fx_slot(n));
+                        }
+                        if let MidiFxPlugin::Lv2 { uri } = plugin {
+                            self.request_lv2(id, *uri);
+                        }
+                        self.setup_midi_fx(id, wire);
+                    }
                     NodeKind::AudioIn { device, channels } => {
                         self.audio_in.push(AudioInSlot::new(id, *channels, device.clone()));
                     }
@@ -2371,7 +2820,21 @@ impl GraphEngine {
                 // An idle voice keeps a held note and replays it when rebound.
                 // (An Arp node cascades: its generated notes die with it.)
                 self.release_all(id);
+                let rig_of_fx = self.graph.node(id).filter(|n| matches!(n.kind, NodeKind::MidiFx { .. })).map(|n| n.rig);
                 self.graph.remove_node(id);
+                if let Some(i) = self.midi_fx.iter().position(|s| s.node == id) {
+                    let slot = self.midi_fx.remove(i);
+                    if let Some(MidiFxProc::Lv2(s)) = slot.proc {
+                        self.retire_lv2(s);
+                    }
+                    // Notes of the removed unit are released; its rules go
+                    // with it, and the rig's instruments get their direct
+                    // cables back so the rack stays playable.
+                    self.matrix.rules.retain(|r| r.dest != id && r.source != SourceId::MidiFx(id));
+                    if let Some(rig) = rig_of_fx {
+                        self.graph.heal_midi_after_fx(rig);
+                    }
+                }
                 self.dsp.retain(|s| s.node != id);
                 self.audio_in.retain(|s| s.node != id);
                 self.arp.retain(|s| s.node != id);
@@ -2397,17 +2860,21 @@ impl GraphEngine {
                     return;
                 }
                 if self.graph.connect_with_id(id, from, to, kind) {
+                    if kind == PortKind::Midi && self.is_midi_fx(from.node) {
+                        self.route_midi_fx_outputs(from.node);
+                    }
                     self.publish_graph();
                 }
             }
             Command::Disconnect(id) => {
                 // keys_gate drops a note-off whose Keys cable is gone; an
-                // arp-generated note's off path is the arp's own cable.
+                // arp-generated note's off path is the arp's own cable and a
+                // MIDI-FX unit's output cable is a note-off path of its own.
                 let fed = self.graph.edges.iter().find(|e| {
                     e.id == id
                         && e.kind == PortKind::Midi
                         && self.graph.node(e.from.node).map_or(false, |n| {
-                            matches!(n.kind, NodeKind::Keys | NodeKind::Arp)
+                            matches!(n.kind, NodeKind::Keys | NodeKind::Arp | NodeKind::MidiFx { .. })
                         })
                 });
                 if let Some(dest) = fed.map(|e| e.to.node) {
@@ -2479,6 +2946,18 @@ impl GraphEngine {
                     })
                     .collect();
                 self.audio_in = build_audio_in_slots(&self.graph);
+                while let Some(slot) = self.midi_fx.pop() {
+                    if let Some(MidiFxProc::Lv2(s)) = slot.proc {
+                        self.retire_lv2(s);
+                    }
+                }
+                self.midi_fx = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
+                    .map(midi_fx_slot)
+                    .collect();
                 // Arp nodes of the new graph start fresh (the loop above
                 // released every old node — an old arp cascaded to what it
                 // fed, and the slots themselves die with the old graph).
@@ -2524,15 +3003,21 @@ impl GraphEngine {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
                 }
+                let fx_ids: Vec<NodeId> = self.midi_fx.iter().map(|s| s.node).collect();
+                for fx in fx_ids {
+                    self.route_midi_fx(fx, None);
+                }
                 self.fit_route_out();
                 self.rig_meta.clear();
                 // Values parked for the old graph's organs (ids are reused).
                 self.organ_pending = [None; 8];
                 self.lv2_pending = [None; 8];
                 for i in 0..self.graph.nodes.len() {
-                    if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
-                        let id = self.graph.nodes[i].id;
-                        self.request_lv2(id, uri);
+                    let id = self.graph.nodes[i].id;
+                    match self.graph.nodes[i].kind {
+                        NodeKind::Lv2 { uri } => self.request_lv2(id, uri),
+                        NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri } } => self.request_lv2(id, uri),
+                        _ => {}
                     }
                 }
                 self.active_rig = 0;
@@ -2585,6 +3070,18 @@ impl GraphEngine {
                         for id in insts {
                             self.matrix.connect(SourceId::Hardware(dev), id);
                         }
+                        // The rig's MIDI-FX units: only that device feeds
+                        // them, and their output rules came out with the rest.
+                        let fxs: Vec<NodeId> = self
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|n| n.rig == tag && matches!(n.kind, NodeKind::MidiFx { .. }))
+                            .map(|n| n.id)
+                            .collect();
+                        for fx in fxs {
+                            self.route_midi_fx(fx, Some(dev));
+                        }
                     }
                     // Keep the voice-level source filter consistent with the
                     // matrix (a second gate on top of the cable + matrix).
@@ -2625,6 +3122,12 @@ impl GraphEngine {
                     }
                     #[cfg(test)]
                     self.note_log.push((dest, out, true));
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        if self.fx_accepts(dest, source) {
+                            self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+                        }
+                        continue;
+                    }
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_on(out as u16, velocity as f64);
@@ -2656,6 +3159,10 @@ impl GraphEngine {
                     }
                     #[cfg(test)]
                     self.note_log.push((dest, out, false));
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+                        continue;
+                    }
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_off(out as u16);
@@ -2671,6 +3178,7 @@ impl GraphEngine {
             Command::SetRigSource { node, keyboard, hardware } => {
                 // source_accepted would drop the note-off of a source turned off.
                 self.release_all(node);
+                self.release_upstream(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.src_keys = keyboard;
                     s.src_hw = hardware;
@@ -2688,6 +3196,7 @@ impl GraphEngine {
             }
             Command::SetRigDevice { node, device } => {
                 self.release_all(node);
+                self.release_upstream(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.rig_device = device;
                 }
@@ -2860,6 +3369,20 @@ impl GraphEngine {
                         if self.apply_engine_param(dest, pid, norm) || is_clap_node {
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
+                        }
+                        continue;
+                    }
+                    // A MIDI-FX unit takes the CC into its plugin (needs its cable).
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        match mapping {
+                            // A learned knob (PluginParam target) moves the unit's control.
+                            Some(b) => {
+                                self.apply_midi_fx_param(dest, b.param, norm as f32);
+                                #[cfg(test)]
+                                self.cc_log.push((dest, b.param, norm));
+                            }
+                            None if self.has_midi_cable(dest) => self.midi_fx[j].queue(m),
+                            None => {}
                         }
                         continue;
                     }
@@ -3276,6 +3799,10 @@ impl GraphEngine {
         }
         self.drain_voice_msgs();
         self.publish_voices();
+        // MIDI-FX units run before the instruments render, so the notes they
+        // emit sound in the same block the events arrived in.
+        let fx_frames = data.len() / ch;
+        self.pump_midi_fx(fx_frames);
         // Attach freshly-opened input captures (UI opened a device for a node):
         // a (node, ring consumer) pair, swapped in place of any stale consumer.
         while let Some(rx) = self.audio_in_rx.as_mut() {
@@ -5750,6 +6277,94 @@ pub fn organ_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `midifx-test`: the REAL Carla "MIDI Transpose" LV2 plugin as a MIDI strip
+/// (issue #86). Scripted events → matrix → MIDI-FX unit → rig instrument:
+/// the instrument must receive the transposed pitch, a knob value sent while
+/// the plugin still loads must apply (rule 113), and a key released after the
+/// knob moved must leave nothing sounding (rule 41).
+pub fn midifx_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, MidiFxPlugin, NodeKind, PortKind, PortRef};
+    use crate::matrix::SourceId;
+    const TRANSPOSE: &str = "http://kxstudio.sf.net/carla/plugins/miditranspose";
+    const OSC: &str = "urn:distrho:vitalium";
+    let sr = 48000.0;
+    anyhow::ensure!(crate::lv2::Lv2Plugin::load(TRANSPOSE, sr, 512).is_ok_and(|p| p.is_midi_fx()), "Carla MIDI Transpose is not installed");
+    anyhow::ensure!(crate::lv2::Lv2Plugin::load(OSC, sr, 512).is_ok_and(|p| p.is_instrument()), "Vitalium is not installed");
+    let semis_ctl = crate::lv2::control_descs_for_uri(TRANSPOSE)
+        .into_iter()
+        .find(|c| c.symbol == "semitones")
+        .ok_or_else(|| anyhow::anyhow!("the plugin has no 'semitones' control"))?;
+    let norm = |semis: f32| ((semis - semis_ctl.min) / (semis_ctl.max - semis_ctl.min)) as f64;
+
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri: Lv2Uri::new(TRANSPOSE) } }, name_bytes("MIDI TRANSPOSE"));
+    let inst = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(OSC) }, name_bytes("OSC"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: fx, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+    g.connect_with_id(3, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    engine.spawn_lv2_loader();
+    let mut buf = vec![0.0f32; 512 * 2];
+    bus.send(Command::LoadGraph { graph: g });
+    // +7 semitones, sent before the plugin is live.
+    bus.send(Command::SetParam { node: fx, param: semis_ctl.index as u32, value: norm(7.0) });
+    let t0 = std::time::Instant::now();
+    let live = |e: &GraphEngine| e.midi_fx.iter().any(|s| s.node == fx && s.proc.is_some()) && e.lv2.iter().any(|s| s.node == inst);
+    while !live(&engine) && t0.elapsed().as_secs() < 15 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    anyhow::ensure!(live(&engine), "the MIDI unit and the instrument did not load within 15 s");
+
+    let mut peak = |engine: &mut GraphEngine, blocks: usize| {
+        let mut p = 0.0f32;
+        for _ in 0..blocks {
+            engine.render(&mut buf, 2);
+            p = buf.iter().fold(p, |m, s| m.max(s.abs()));
+        }
+        p
+    };
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let held = peak(&mut engine, 20);
+    let ev = engine.lv2_last_note(inst);
+    println!("midifx-test: C4 through MIDI Transpose (+7, set while loading) reached the instrument as {ev:?}; master peak {held:.4}");
+    anyhow::ensure!(matches!(ev, Some([0x90, 67, _])), "expected note-on 67 at the instrument, got {ev:?}");
+    anyhow::ensure!(held > 1e-3, "the instrument is silent behind the MIDI unit");
+    // Move the knob while the key is held, then release the key.
+    bus.send(Command::SetParam { node: fx, param: semis_ctl.index as u32, value: norm(-5.0) });
+    peak(&mut engine, 5);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let after = peak(&mut engine, 94);
+    println!("midifx-test: knob moved to -5 while C4 was held, key released: master peak afterwards {after:.5} (held {held:.4})");
+    anyhow::ensure!(after < held * 0.01, "a note stayed on after release: the unit lost a note-off when its knob moved");
+    // The new setting applies to the next note.
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    peak(&mut engine, 5);
+    let ev = engine.lv2_last_note(inst);
+    println!("midifx-test: next C4 at -5 reached the instrument as {ev:?}");
+    anyhow::ensure!(matches!(ev, Some([0x90, 55, _])), "expected note-on 55 after the knob moved, got {ev:?}");
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let tail = peak(&mut engine, 94);
+    anyhow::ensure!(tail < held * 0.01, "second note stayed on after release");
+    // Removing the unit while a key is held must release it, not strand it.
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    peak(&mut engine, 5);
+    bus.send(Command::RemoveNode(fx));
+    peak(&mut engine, 5);
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let removed = peak(&mut engine, 94);
+    anyhow::ensure!(removed < held * 0.01, "removing the MIDI unit under a held key left the note sounding");
+    println!("midifx-test: OK — Carla MIDI Transpose transposes through the matrix, takes knob values sent while loading, and leaves no held note after a knob move or removal");
+    Ok(())
+}
+
 pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
     use crate::matrix::SourceId;
@@ -7330,4 +7945,48 @@ pub fn meter_test() -> anyhow::Result<()> {
         snap.true_peak_db, snap.band_db, snap.low_end_corr
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod midifx_cc_tests {
+    use super::*;
+    use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef};
+    use crate::matrix::{CcTarget, SourceId};
+
+    /// Keys → built-in transposer → Master (no instrument: only the unit's knob is observed).
+    fn engine_with_strip() -> (GraphEngine, crate::control::CommandBus, u32) {
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis: 0 } }, name_bytes("TRANSPOSE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+        let _ = master;
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        (engine, bus, fx)
+    }
+
+    fn semis(e: &GraphEngine, fx: u32) -> i8 {
+        e.midi_fx.iter().find(|s| s.node == fx).expect("unit").semis
+    }
+
+    #[test]
+    fn a_learned_cc_moves_a_midi_strips_knob() {
+        for target in [CcTarget::Knob, CcTarget::PluginParam] {
+            let (mut engine, mut bus, fx) = engine_with_strip();
+            let mut buf = vec![0.0f32; 64 * 2];
+            let dev = SourceId::Hardware(0);
+            bus.send(Command::MatrixCcMap { source: dev, dest: fx, cc: 20, param: Some(P_MIDIFX_SEMI), target, scale: Default::default() });
+            bus.send(Command::Cc { source: dev, channel: 0, cc: 20, value: 127 });
+            engine.render(&mut buf, 2);
+            assert_eq!(semis(&engine, fx), MIDIFX_SEMI_MAX, "{target:?}: full CC = top of the range");
+            bus.send(Command::Cc { source: dev, channel: 0, cc: 20, value: 0 });
+            engine.render(&mut buf, 2);
+            assert_eq!(semis(&engine, fx), -MIDIFX_SEMI_MAX, "{target:?}: zero CC = bottom");
+        }
+    }
 }

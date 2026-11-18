@@ -46,7 +46,7 @@ mod transport;
 mod ui;
 mod vital;
 
-const MODES: &str = "app, preview, audio-test, audio-in-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, arp-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
+const MODES: &str = "app, preview, audio-test, audio-in-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -102,6 +102,7 @@ fn main() -> anyhow::Result<()> {
         "lv2-instrument-test" => lv2::instrument_test(),
         "organ-test" => engine::organ_test(),
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
+        "midifx-test" => engine::midifx_test(),
         "lv2-async-test" => engine::lv2_async_test(),
         "sound-library-test" => engine::sound_library_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "vital-test" => vital::run_test(&std::env::args_os().skip(2).map(Into::into).collect::<Vec<_>>()),

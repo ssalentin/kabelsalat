@@ -716,6 +716,8 @@ impl Default for GraphPub {
             voices_rev: 0,
             transport: TransportPub::default(),
             transport_rev: 0,
+            player: PlayerPub::default(),
+            player_rev: 0,
             meter: MeterSnapshot::default(),
             meter_rev: 0,
         }

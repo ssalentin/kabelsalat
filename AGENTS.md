@@ -998,6 +998,11 @@ Learned so far (2026-11-15, UI polish pass):
     (`instruments_first`), and `add_node` with an uninstalled LV2 URI names
     the installed instruments
     (`the_agent_finds_an_lv2_instrument_behind_hundreds_of_effects`).
+155. **Before a push, run every test module of each file you changed:** a
+    new refusal in headless `add_node` was checked with three hand-picked
+    tests and pushed; CI then failed on an `mcp::tests` test that adds a
+    made-up LV2 URI (`cargo test --bin kabelsalat -- mcp::` would have
+    shown it). Filter by module path, not by test name.
 
 ## Working on kabelsalat
 

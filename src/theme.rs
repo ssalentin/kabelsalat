@@ -390,9 +390,12 @@ pub fn value_arc_sized(
 }
 
 /// Meter color, stepped — not a gradient (§4.8): cream → tomato → clip red.
-pub fn meter_color(t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.6 { CREAM } else if t < 0.95 { ACCENT } else { CLIP_RED }
+/// `pos` is a position on the meters' −60…0 dBFS scale. Tomato starts at
+/// −6 dBFS and red at the master's −1 dBFS ceiling: the stops were linear
+/// fractions, so on the dB scale everything above −24 dBFS read hot.
+pub fn meter_color(pos: f32) -> Color32 {
+    let db = pos.clamp(0.0, 1.0) * 60.0 - 60.0;
+    if db < -6.0 { CREAM } else if db < -1.0 { ACCENT } else { CLIP_RED }
 }
 
 // ---------------------------------------------------------------------------

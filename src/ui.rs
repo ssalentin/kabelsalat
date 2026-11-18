@@ -28163,6 +28163,25 @@ mod mixer_parity_tests {
         }
     }
 
+    /// Every meter at a healthy −12 dBFS, rack and mixer, as PNGs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat healthy_meter_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn healthy_meter_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let level = 10f32.powf(-12.0 / 20.0);
+        for view in [StageView::Rack, StageView::Mixer] {
+            app.stage_view = view;
+            app.meter = level;
+            app.meter_peak = level;
+            app.rig_levels = vec![level; 8];
+            for u in app.units.iter_mut() { u.led = level; }
+            super::offline_shots::shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join(format!("{view:?}-minus12dbfs.png").to_lowercase()));
+        }
+    }
+
     #[test]
     fn dragging_a_strip_name_reorders_it_live() {
         let (mut app, ctx) = two_source_app();

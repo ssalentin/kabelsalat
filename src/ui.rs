@@ -1263,7 +1263,22 @@ fn note_name(n: u8) -> String {
     format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
 }
 
-/// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
+/// One matrix click on an instrument's sources: keyboard is a switch,
+/// hardware a radio group (all devices, one device, or off).
+fn toggled_sources(src: (bool, bool), dev: Option<u32>, row: MatrixRow, on: bool) -> ((bool, bool), Option<u32>) {
+    let (mut src, mut dev) = (src, dev);
+    match row {
+        MatrixRow::Keys => src.0 = on,
+        MatrixRow::HwAll => { src.1 = on; if on { dev = None; } }
+        MatrixRow::HwDev(d) => {
+            if on { src.1 = true; dev = Some(d); }
+            else if dev == Some(d) { src.1 = false; }
+        }
+    }
+    (src, dev)
+}
+
+/// Effective cell state for an instrument column: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
 /// `src` = the rig's (keyboard, hardware) source pair.
 fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
@@ -6442,39 +6457,73 @@ impl DemoApp {
         }
     }
 
-    /// Toggle one matrix cell live. CLAP columns map to the engine's source
-    /// filters + device binding (SetRigSource/SetRigDevice); LV2 instrument
-    /// columns are gated by the MIDI cable alone. Turning a cell ON also
+    /// Toggle one matrix cell live. Every instrument column has the same
+    /// rows: the keyboard switch and a radio group of hardware (all / one
+    /// device / off). CLAP columns store them as the voice's source filter
+    /// (SetRigSource/SetRigDevice); LV2 instrument columns as the enabled
+    /// flag of each (source, node) matrix rule. Turning a cell ON also
     /// hot-wires the MIDI cable if it was unplugged.
     fn matrix_toggle(&mut self, inst: usize, row: MatrixRow, on: bool) {
-        let is_clap = matches!(self.units.get(inst).map(|u| &u.node_kind), Some(UnitKind::Clap));
+        let Some(unit) = self.units.get(inst) else { return };
+        let (is_clap, node) = (matches!(unit.node_kind, UnitKind::Clap), unit.node_id);
         if !is_clap {
-            // LV2 instrument: the cable IS the route.
             if on { self.ensure_midi_cable(inst); }
-            else if let Some(ci) = self.midi_cable_to(inst) { self.unplug_cable(ci, true); }
+            let (src, dev) = self.lv2_sources(node);
+            let (src, dev) = toggled_sources(src, dev, row, on);
+            self.set_lv2_sources(node, src, dev);
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
         if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
-        let node = self.units[inst].node_id;
-        {
-            let s = &mut self.rig_sources[rig];
-            let d = &mut self.rig_device[rig];
-            match row {
-                MatrixRow::Keys => s.0 = on,
-                MatrixRow::HwAll => { s.1 = on; if on { *d = None; } }
-                MatrixRow::HwDev(dev) => {
-                    if on { s.1 = true; *d = Some(dev); }
-                    else if *d == Some(dev) { s.1 = false; }
-                }
-            }
-        }
+        let (src, dev) = toggled_sources(self.rig_sources[rig], self.rig_device[rig], row, on);
+        self.rig_sources[rig] = src;
+        self.rig_device[rig] = dev;
         self.send_rig_source(node);
         if matches!(row, MatrixRow::HwAll | MatrixRow::HwDev(_)) {
-            let device = self.rig_device[rig];
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: dev });
+            }
+        }
+    }
+
+    /// Whether one matrix cell routes (what the grid draws).
+    fn matrix_cell_on(&self, inst: usize, row: MatrixRow) -> bool {
+        let Some(u) = self.units.get(inst) else { return false };
+        let (src, dev) = if matches!(u.node_kind, UnitKind::Clap) {
+            let rig = self.rig_of_unit(inst).unwrap_or(0);
+            (self.rig_sources.get(rig).copied().unwrap_or((true, true)), self.rig_device.get(rig).copied().flatten())
+        } else {
+            self.lv2_sources(u.node_id)
+        };
+        clap_cell(src, dev, self.midi_cable_to(inst).is_some(), row)
+    }
+
+    /// An LV2 instrument's sources as the CLAP filter shape, read from its
+    /// matrix rules (a missing rule routes): keyboard, any hardware, and
+    /// the one device when not every hardware rule is on.
+    fn lv2_sources(&self, node: u32) -> ((bool, bool), Option<u32>) {
+        let routes = |src: SourceId| self.rule_edits.get(&(src, node)).is_none_or(|e| e.enabled);
+        let hw: Vec<u32> = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| routes(SourceId::Hardware(d))).collect();
+        let dev = (hw.len() < crate::engine::MAX_HW_DEVICES as usize).then(|| hw.first().copied()).flatten();
+        ((routes(SourceId::Keys), !hw.is_empty()), dev)
+    }
+
+    /// Write an LV2 instrument's sources as the enabled flags of its matrix
+    /// rules; a rule's shape (transpose, range, …) is kept.
+    fn set_lv2_sources(&mut self, node: u32, src: (bool, bool), dev: Option<u32>) {
+        let wanted = std::iter::once((SourceId::Keys, src.0)).chain((0..crate::engine::MAX_HW_DEVICES)
+            .map(|d| (SourceId::Hardware(d), src.1 && dev.is_none_or(|b| b == d))));
+        for (source, enabled) in wanted {
+            let mut edit = self.rule_edits.get(&(source, node)).cloned().unwrap_or_default();
+            if edit.enabled == enabled { continue; }
+            edit.enabled = enabled;
+            edit.cc_only = false;
+            let cmd = edit.to_command(source, node);
+            if edit.is_default() { self.rule_edits.remove(&(source, node)); }
+            else { self.rule_edits.insert((source, node), edit); }
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(cmd);
             }
         }
     }
@@ -6715,17 +6764,7 @@ impl DemoApp {
                     _ => Self::matrix_source_head(ui, src),
                 }
                 for &s in &sinks {
-                    let u = &self.units[s];
-                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
-                    let gate = self.midi_cable_to(s).is_some();
-                    let on = if is_clap {
-                        let rig = self.rig_of_unit(s).unwrap_or(0);
-                        let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
-                        let dev = self.rig_device.get(rig).copied().flatten();
-                        clap_cell(src, dev, gate, *row)
-                    } else {
-                        gate // LV2: the cable is the route (all sources)
-                    };
+                    let on = self.matrix_cell_on(s, *row);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
@@ -20678,6 +20717,36 @@ mod ui_polish_agent_tests {
         let (bus, drain) = command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         (app, drain)
+    }
+
+    /// User 2026-11-17: one click in an organ's matrix column selected
+    /// every cell of it, because all its rows showed the MIDI cable.
+    #[test]
+    fn an_lv2_column_toggles_one_cell_like_a_clap_column() {
+        let (mut app, drain) = app_of_instruments();
+        app.hw_devices = vec!["FM-1 24:0".into(), "MIDIMATE 28:0".into()];
+        let organ = app.units.iter().position(|u| u.rig == 1 && u.name == "ORGAN").expect("organ");
+        let node = app.units[organ].node_id;
+        let rows = [MatrixRow::Keys, MatrixRow::HwAll, MatrixRow::HwDev(0), MatrixRow::HwDev(1)];
+        let cells = |app: &DemoApp| rows.map(|r| app.matrix_cell_on(organ, r));
+        assert_eq!(cells(&app), [true, true, false, false], "keyboard and all hardware by default");
+
+        app.matrix_toggle(organ, MatrixRow::Keys, false);
+        assert_eq!(cells(&app), [false, true, false, false], "only the keyboard cell went off");
+        app.matrix_toggle(organ, MatrixRow::HwDev(1), true);
+        assert_eq!(cells(&app), [false, false, false, true], "one device replaces all hardware");
+        app.matrix_toggle(organ, MatrixRow::Keys, true);
+        assert_eq!(cells(&app), [true, false, false, true], "the keyboard is independent of hardware");
+        assert!(app.midi_cable_to(organ).is_some(), "the cable stays plugged");
+
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.render(&mut vec![0.0f32; 64 * 2], 2);
+        let rules = pub_.lock().unwrap().rules.clone();
+        let muted: Vec<SourceId> = rules.iter().filter(|r| r.dest == node && !r.enabled).map(|r| r.source).collect();
+        let others = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| d != 1).map(SourceId::Hardware);
+        assert_eq!(muted, others.collect::<Vec<_>>(), "the engine mutes every source but the keyboard and device 1");
     }
 
     fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {

@@ -37,6 +37,12 @@ releases may still change behaviour and session files.
 - **GitHub stars on catalog cards:** each card shows its project's star count
   (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
   opens. Without internet access, or when GitHub refuses, cards show no stars.
+- **Sessions save themselves (#51):** with *Autosave sessions* on (Settings,
+  on by default) the open session is written every 20 s when it changed, and
+  on quit; a patch that was never saved goes to `Autosave`. Loading a session
+  or saving one makes it the open session; a starter template never replaces
+  it. Each saved session has an **Overwrite** action (with a confirm) that
+  saves the current patch over it, and the open session is marked in the list.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).

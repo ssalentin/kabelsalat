@@ -650,13 +650,28 @@ Learned so far (2026-11-15, UI polish pass):
     release prevents waveform tracking), `P_VOL` defaults to `0.75`
     (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
     red only above `0.95` (−3 dBFS).
-117. **An instrument starts playable:** Aeolus starts with every stop off,
+118. **Delete build output you no longer need:** parallel sessions left a
+    dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
+    copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
+    held in RAM) reached 98 %, swap filled, and a build killed the session.
+    When your PR is merged or your work is abandoned, `rm -rf` your own
+    `CARGO_TARGET_DIR` and the binaries you copied. Before a long build,
+    check `df -h /tmp ~` and `free -h`. You may delete another session's
+    target dir only when no process uses it (`pgrep -fa <dir>` is empty)
+    and its branch is merged.
+119. **A column sized beside another takes what is left in the row:** the
+    Sessions list was sized `avail - left - 25`, but the row's item spacing
+    sat between the columns too, so the Delete button ran 6 pt past the
+    sheet. Size the last column from `ui.available_width()` at the point you
+    allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
+    checks the row buttons stay inside the sheet).
+120. **An instrument starts playable:** Aeolus starts with every stop off,
     so the catalog install built, loaded and scanned it, and middle C peaked
     at 0.000. Play a note on a fresh instance of every new catalog
     instrument (`catalog-install-test <id>`); one that starts silent gets a
     starting state (`aeolus::initial_state`, applied where every CLAP voice
     is instantiated) and its sounds as a `Source` (rule 93).
-118. **Test a face element in the rack the app opens with:** the Aeolus
+121. **Test a face element in the rack the app opens with:** the Aeolus
     stop panel passed its layout tests on a lone, tall unit, yet in the
     real app (two instruments stacked over their delays, units 250 px
     tall) it found no room and was not drawn at all. A face test asserts

@@ -26400,8 +26400,6 @@ mod mixer_parity_tests {
         g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
         g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.apply_session(&crate::session::Session::new("mixer shots", g)).unwrap();
-        let ctx = egui::Context::default();
-        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
         let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
         let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
         app.strip_insert_edit(na, StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Reverb), name: "REVERB".into() }).unwrap();
@@ -26830,6 +26828,44 @@ mod engine_info_tests {
     }
 
 
+    /// The readout and panel repaint changing numbers four times a second
+    /// for as long as the app runs. egui clears a font atlas past 80 % and
+    /// the app keeps galleys across frames (wordmark, knob captions), so a
+    /// growing glyph set would garble them (rule 17).
+    #[test]
+    fn changing_engine_numbers_never_grow_the_font_atlas() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let chip = app.dsp_chip_rect.center();
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |m: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % m };
+        let mut timer = NodeTimer::new();
+        let mut cycle = |app: &mut DemoApp, frames: usize| {
+            for _ in 0..frames {
+                let pct = next(10_000) as f64 / 100.0;
+                set_counters(app, EngineCounters {
+                    render_max_us: next(20_000) as u32, render_late: next(500) as u32, xruns: next(300) as u32,
+                    midi_latency_us: next(5_000) as u32, ..counters(pct)
+                });
+                timer.begin_block();
+                for u in &app.units { timer.record(u.node_id, Duration::from_nanos(next(3_000_000))); }
+                timer.end_block();
+                app.node_times = Some(timer.handle());
+                run_frame(app, &ctx, SIZE, vec![]);
+            }
+        };
+        let atlas = || ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.font_image_size()));
+        cycle(&mut app, 100);
+        let warm = atlas();
+        cycle(&mut app, 1_000);
+        let after = atlas();
+        eprintln!("font atlas after 100 frames {warm:?}, after 1100 frames {after:?}");
+        assert!(app.engine_info_open, "the panel stayed open");
+        assert_eq!(after, warm, "1000 more frames of new numbers added glyphs to the atlas");
+        assert!(after.0 < 0.5, "far from egui's 80 % clear: {}", after.0);
+    }
+
     /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat engine_info_shots -- --ignored`
     #[test]
     #[ignore = "writes PNGs"]
@@ -26842,20 +26878,23 @@ mod engine_info_tests {
             ("critical", EngineCounters { render_max_us: 6120, render_late: 231, xruns: 3, midi_latency_us: 420, ..counters(94.0) }),
         ] {
             for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
-                let (mut app, _ctx) = app_at(c, Vec2::new(w, h));
-                let share = c.render_avg_ns as f64 / 1000.0 / app.units.len() as f64;
-                let mut timer = NodeTimer::new();
-                timer.begin_block();
-                for (i, u) in app.units.iter().enumerate() {
-                    if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { continue; }
-                    let us = share * [1.9, 0.12, 1.4, 0.08][i % 4];
-                    timer.record(u.node_id, Duration::from_nanos((us * 1000.0) as u64));
+                for panel in [false, true] {
+                    let mut app = DemoApp::new_with_sink(None);
+                    app.test_counters = Some(c);
+                    let share = c.render_avg_ns as f64 / 1000.0 / app.units.len() as f64;
+                    let mut timer = NodeTimer::new();
+                    timer.begin_block();
+                    for (i, u) in app.units.iter().enumerate() {
+                        if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { continue; }
+                        let us = share * [1.9, 0.12, 1.4, 0.08][i % 4];
+                        timer.record(u.node_id, Duration::from_nanos((us * 1000.0) as u64));
+                    }
+                    timer.end_block();
+                    app.node_times = Some(timer.handle());
+                    app.engine_info_open = panel;
+                    let name = if panel { "panel" } else { "bar" };
+                    super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-{state}-{w}x{h}.png")));
                 }
-                timer.end_block();
-                app.node_times = Some(timer.handle());
-                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("bar-{state}-{w}x{h}.png")));
-                app.engine_info_open = true;
-                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("panel-{state}-{w}x{h}.png")));
             }
         }
     }
@@ -27262,6 +27301,8 @@ mod offline_shots {
     }
 
     /// Run frames of `app` at `size` points and write the last one as a PNG.
+    /// `app` must not have run a frame before: it keeps galleys laid out in
+    /// that frame's font atlas, and this fresh context draws them as glyph soup.
     pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
         let ctx = egui::Context::default();
         let mut tex = Textures::default();

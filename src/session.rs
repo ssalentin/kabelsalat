@@ -1065,7 +1065,7 @@ impl Template {
                 defaults.extend([
                     (lead, P_LEVEL, 0.85),
                     (verb, 0, 0.35), // reverb mix (param table: task-7)
-                    (master, P_VOL, 1.0),
+                    (master, P_VOL, 0.75),
                     (master, P_WARM, 0.1),
                 ]);
             }
@@ -1088,7 +1088,7 @@ impl Template {
                     (bass, P_LEVEL, 0.8),
                     (drum_gain, 0, 0.9),   // gain (param table: task-7)
                     (bass_filter, 0, 0.45), // cutoff (param table: task-7)
-                    (master, P_VOL, 1.0),
+                    (master, P_VOL, 0.75),
                     (master, P_WARM, 0.1),
                 ]);
             }

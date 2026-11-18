@@ -53,6 +53,16 @@ agents are in [AGENTS.md](../AGENTS.md).
   delay, reverb, metronome).
 - `matrix.rs` — MIDI routing: sources × destinations, per-cell rules (channel,
   transpose, key/velocity range), splits, CC maps; allocation-free `route_into`.
+  A CC binding carries a `CcScale`: a stepped control (a switch, an LED
+  drawbar) lands on the target's own steps.
+- `instruments.rs` — instrument profiles: what every controller of a hardware
+  instrument means. A profile is a [MIDI Guide](https://midi.guide) CSV
+  (`instruments/*.csv`, compiled in, plus `~/.config/kabelsalat/instruments/`)
+  with one more column, `role` (`drawbar.upper.3`, `rotary.speed`, …).
+  `target` is the one table of which rack parameter a role drives. The app
+  gives each hardware port a profile (picked in the matrix, or matched by the
+  port name) and keeps the matrix CC bindings in line with it
+  (`DemoApp::sync_instrument_maps`).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
@@ -76,6 +86,20 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `session.rs` — sessions (multi-rig), templates.
 
 ## 0. Decision log
+
+- **2026-11-17** — **Instrument profiles, not per-knob learn** (user: map a whole
+  Nord Electro 2, drawbars included). Other hosts do this with a per-device
+  definition: Logic's Vintage B3 ships controller presets per organ (one is
+  the Nord Electro 2's), Bitwig and Ableton load a controller script per port,
+  Mixxx keeps XML mappings matched by device name, and Cakewalk/REAPER read
+  instrument definition files that name every CC. kabelsalat reads the open
+  MIDI Guide CSV format (one file per device, the community dataset) and adds a
+  `role` column, because the dataset names controls freely ("Drawbar 1" on a
+  Stage 3, "16' upper drawbar" in the Electro 2 manual) and names alone cannot
+  say what a control does. The profile binds through ordinary matrix CC
+  bindings, so sessions, the mixer mirror and agents see nothing new. A DIN
+  instrument sits behind a USB interface whose port name hides it, so the
+  user picks the profile per port; a USB instrument is matched by its name.
 
 - **2026-11-14** — Original plan was a GarageBand-style DAW; pivoted after the user
   clarified the real need: an [AUM](https://kymatica.com/apps/aum)-like live host —

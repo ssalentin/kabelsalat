@@ -91,10 +91,20 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
+  The player decodes on its own thread; the engine owns its clock and reads the
+  file at the song position (loop, tempo sync as varispeed, Number of Beats,
+  Beat Offset, start at the next bar), so a synced loop cannot drift.
 - `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono
   check, 4-band summary; allocation-free, published via `GraphPub.meter`.
+- `listen.rs` — the audio judge behind the agent's `listen` tool (#35): an
+  armed master tap (pushes only while a listen records), the clip sent as mono
+  16 kHz WAV with the meter's numbers to an audio-capable OpenRouter model
+  (`agent_listen_model`, default Gemini 3.8 Flash, `reasoning: low`), which
+  answers in text (0-10 per attribute plus what it heard). The acting model
+  and Jev read that text, never the audio (rule 82). `listen-test` checks the
+  model ranks known reference clips (real Surge patches) the right way round.
 - `ui.rs` / `theme.rs` — eframe/egui app: rack with physics cables and flip,
   rigs strip, mixer, matrix, sessions, plugin browser, native plugin editors,
   bottom dock (keyboard or assistant); `theme.rs` is the single palette source

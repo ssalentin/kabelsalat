@@ -750,6 +750,26 @@ pub enum Command {
         mute: Option<bool>,
         solo: Option<bool>,
     },
+    /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
+    /// audio-in / generator node, applied to the node's own output (post its
+    /// LEVEL knob — the strip fader) before anything downstream hears it, so
+    /// its FX chain and the rig bus follow. Solo scope is WITHIN the node's
+    /// rig: a soloed source silences only the other sources of that rig; rig
+    /// buses keep their own global solo (`SetRigMix`). Omitted fields keep
+    /// their value; resets on graph loads.
+    SetStripMix {
+        node: NodeId,
+        pan: Option<f32>,
+        mute: Option<bool>,
+        solo: Option<bool>,
+    },
+    /// Bypass one effect node (#74): a bypassed FX passes its input through
+    /// unchanged (its knob values are kept). Resets on graph loads.
+    SetStripBypass { node: NodeId, bypass: bool },
+    /// Rename one node (#77): the name its rack unit and mixer strip show.
+    /// Metadata only — routing and sound are untouched; the engine publishes
+    /// the graph (node names live in it).
+    RenameNode { node: NodeId, name: Name },
     /// Replace the whole graph (template load). The engine rebuilds DSP, remaps
     /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
     /// matrix. Rare structural op: allocates (bends RT discipline by design).
@@ -801,6 +821,14 @@ pub enum Command {
         cc: u8,
         value: u8,
     },
+    /// Incoming MIDI pitch bend (0xE0) routed through the matrix like
+    /// [`Command::Cc`]: `value` is the signed 14-bit bend (-8192..=8191,
+    /// 0 = center). Instruments bend what they play; nothing is edited.
+    PitchBend {
+        source: SourceId,
+        channel: u8,
+        value: i16,
+    },
     /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
     /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
     MatrixCcMap {
@@ -829,6 +857,23 @@ pub enum Command {
     /// Mix the file player (backing track) into the master at `gain` (0..1).
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
+    /// Configure the file player's playback settings (AUM FilePlayer, issue
+    /// #84): `loop_on` restarts the file seamlessly, `sync` follows the
+    /// transport tempo (varispeed), `beats` is the loop's length in beats
+    /// (0 = derive the tempo from `bpm` instead), `offset` shifts the start
+    /// point in beats (±), `bpm` is the file's original tempo. Omitted
+    /// fields keep their current value; settings apply to the loaded file.
+    SetPlayerCfg {
+        loop_on: Option<bool>,
+        sync: Option<bool>,
+        beats: Option<f32>,
+        offset: Option<f32>,
+        bpm: Option<f32>,
+    },
+    /// File-player play-enable (AUM's circular toggle): with sync on and the
+    /// master transport rolling (or counting in), sounding starts at the
+    /// next bar boundary; otherwise it starts now. `on: false` stops.
+    SetPlayerEnable { on: bool },
     /// Master transport: start EVERY transport-capable node (sets
     /// `Node::playing` on all of them) and run the song clock hosted CLAP
     /// plugins follow, from beat 0. Per-node SetNodePlaying overrides
@@ -895,6 +940,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
+            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
             | Command::SetKeysScale { .. })

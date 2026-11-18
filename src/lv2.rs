@@ -1396,6 +1396,13 @@ impl Lv2Plugin {
         self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
     }
 
+    /// Queue a MIDI pitch bend (channel 1, signed 14-bit, 0 = center) for
+    /// the next run().
+    pub fn pitch_bend(&mut self, value: i16) {
+        let v = (value.clamp(-8192, 8191) + 8192) as u16;
+        self.queue_midi([0xE0, (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]);
+    }
+
     /// Queue a channel-pressure (aftertouch) message: how wind patches read
     /// breath (allocation-free).
     pub fn channel_pressure(&mut self, value: u8) {

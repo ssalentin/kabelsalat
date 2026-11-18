@@ -978,13 +978,11 @@ impl RuleEdit {
             && self.cc_map.is_empty()
             && !self.cc_only
     }
-    fn set_cc(&mut self, cc: u8, param: u32, target: crate::matrix::CcTarget) {
-        let cc = cc & 0x7F;
-        if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
-            m.param = param;
-            m.target = target;
-        } else {
-            self.cc_map.push(crate::matrix::CcMapping { cc, param, target });
+    fn set_cc(&mut self, m: crate::matrix::CcMapping) {
+        let m = crate::matrix::CcMapping { cc: m.cc & 0x7F, ..m };
+        match self.cc_map.iter_mut().find(|x| x.cc == m.cc) {
+            Some(x) => *x = m,
+            None => self.cc_map.push(m),
         }
     }
     fn unmap_cc(&mut self, cc: u8) {
@@ -2047,6 +2045,10 @@ struct DemoApp {
     /// Test-only override of the bundle-probe roots (None = real home + system
     /// dirs), so catalog "installed" assertions never depend on this machine.
     catalog_roots: Option<Vec<std::path::PathBuf>>,
+    /// GitHub stars per catalog repo, fetched once per run on a background
+    /// thread when the Install tab first shows; empty offline.
+    catalog_stars: std::collections::HashMap<&'static str, u32>,
+    catalog_stars_rx: Option<std::sync::mpsc::Receiver<(&'static str, u32)>>,
     fps: f32,
     stats_timer: f32,
     stats_line: String,
@@ -2277,6 +2279,15 @@ struct DemoApp {
     /// Hardware device selection per CLAP unit (None = any). A slot table
     /// like `rig_sources`.
     rig_device: Vec<Option<u32>>,
+    /// Instrument profiles, built-in and the user's (`instruments::load_all`).
+    instrument_profiles: Vec<crate::instruments::Profile>,
+    /// The profile picked per hardware device, keyed by `midi_port_key`: a
+    /// profile id, or "" for none. A device without an entry is matched by
+    /// its port name. Stored in config.json as `instrument_devices`.
+    device_instruments: std::collections::BTreeMap<String, String>,
+    /// The CC bindings profiles put into the matrix, so a profile change
+    /// takes back exactly those.
+    instrument_bound: Vec<(SourceId, u32, crate::instruments::Binding)>,
     surge_status: String,
     // !Send: CLAP main-thread objects; DemoApp never leaves the UI thread.
     _surge_main: Vec<ClapVoiceMain>,
@@ -2454,6 +2465,8 @@ impl DemoApp {
             plugin_msg: String::new(),
             install: None,
             catalog_roots: None,
+            catalog_stars: std::collections::HashMap::new(),
+            catalog_stars_rx: None,
             fps: 60.0,
             stats_timer: 0.0,
             stats_line: String::new(),
@@ -2578,6 +2591,15 @@ impl DemoApp {
             last_midi: None,
             info_in_hint: false,
             rig_device: Vec::new(),
+            instrument_profiles: {
+                let (profiles, errors) = crate::instruments::load_all();
+                for e in errors { eprintln!("instrument profile: {e}"); }
+                profiles
+            },
+            device_instruments: crate::assistant::load_config_value("instrument_devices")
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            instrument_bound: Vec::new(),
             surge_status: "no synth loaded".into(),
             _surge_main: Vec::new(),
             surge_controllers: Vec::new(),
@@ -4587,7 +4609,7 @@ impl DemoApp {
                     });
                 }
                 for m in &r.edit.cc_map {
-                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param), target: m.target });
+                    let _ = b.send(Command::MatrixCcMap { source: r.source, dest: r.dest, cc: m.cc, param: Some(m.param), target: m.target, scale: m.scale });
                 }
             }
             self.rule_edits.insert((r.source, r.dest), r.edit);
@@ -6479,6 +6501,37 @@ impl DemoApp {
         rows
     }
 
+    /// A device's instrument-profile picker, and what the profile drives.
+    /// Returns the picked profile id ("" = none).
+    fn instrument_dropdown(&self, ui: &mut egui::Ui, d: u32) -> Option<String> {
+        const NONE: &str = "No profile";
+        let current = self.device_profile(d);
+        let mut pick = None;
+        theme::Dropdown::new(("dd_instrument", d), current.map_or(NONE.to_string(), |p| p.title()))
+            .width(178.0)
+            .text_size(12.0)
+            .show_ui(ui, |menu| {
+                if menu.item(current.is_none(), NONE) { pick = Some(String::new()); }
+                for p in &self.instrument_profiles {
+                    if menu.item(current.is_some_and(|c| c.id == p.id), &p.title()) { pick = Some(p.id.clone()); }
+                }
+            })
+            .on_hover_text("The instrument on this port: its knobs, drawbars and switches drive the rack");
+        if current.is_some() {
+            let src = SourceId::Hardware(d);
+            let mut dests: Vec<u32> = self.instrument_bound.iter().filter(|(s, _, _)| *s == src).map(|(_, n, _)| *n).collect();
+            let count = dests.len();
+            dests.dedup();
+            let names: Vec<String> = dests.iter()
+                .filter_map(|n| self.units.iter().find(|u| u.node_id == *n))
+                .map(|u| sentence_case(&u.name))
+                .collect();
+            let text = if names.is_empty() { "nothing in the rack to drive".to_string() } else { format!("{count} controls → {}", names.join(", ")) };
+            ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::INK_2)).wrap_mode(egui::TextWrapMode::Extend));
+        }
+        pick
+    }
+
     /// A matrix row header: activity LED, a kind badge (KEYS, ANY HW, HW),
     /// the source's name, its port chip and an UNPLUGGED chip. Further ports
     /// of one device hang off the first by an elbow instead of a badge.
@@ -6581,6 +6634,7 @@ impl DemoApp {
         }
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
         let mut edit_requests: Vec<(usize, MatrixRow)> = Vec::new();
+        let mut profile_picks: Vec<(u32, String)> = Vec::new();
         let rows = self.matrix_rows();
         // Header cells never wrap ("Surge A" split across lines): Extend
         // labels + a min column width keep names and status on fixed rows.
@@ -6632,7 +6686,15 @@ impl DemoApp {
                     });
                     ui.end_row();
                 }
-                Self::matrix_source_head(ui, src);
+                match src.row {
+                    MatrixRow::HwDev(d) if !src.continues => {
+                        ui.horizontal(|ui| {
+                            Self::matrix_source_head(ui, src);
+                            if let Some(id) = self.instrument_dropdown(ui, d) { profile_picks.push((d, id)); }
+                        });
+                    }
+                    _ => Self::matrix_source_head(ui, src),
+                }
                 for &s in &sinks {
                     let u = &self.units[s];
                     let is_clap = matches!(u.node_kind, UnitKind::Clap);
@@ -6696,6 +6758,7 @@ impl DemoApp {
                 .size(11.0).color(theme::INK_2));
         }
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
+        for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
     }
 
@@ -6891,7 +6954,6 @@ impl DemoApp {
     /// (no feedback loop). `resend` is for the CC that completed a learn: the
     /// engine saw it before the binding existed, so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
-        let norm = (val as f32 / 127.0).clamp(0.0, 1.0);
         let hold_until = self.ui_time + READBACK_HOLD_SECS;
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
@@ -6900,6 +6962,7 @@ impl DemoApp {
             }
             for m in &edit.cc_map {
                 if m.cc != cc { continue; }
+                let norm = m.scale.norm(val) as f32;
                 for u in &mut self.units {
                     if u.node_id != *dest { continue; }
                     // On non-CLAP units plugin and knob params are the same
@@ -6926,7 +6989,88 @@ impl DemoApp {
         }
     }
 
+    /// The profile of hardware device `d`: the one picked for it, else the
+    /// first whose maker and model its port name carries.
+    fn device_profile(&self, d: u32) -> Option<&crate::instruments::Profile> {
+        let raw = self.hw_devices.get(d as usize)?;
+        match self.device_instruments.get(midi_port_key(raw)) {
+            Some(id) => self.instrument_profiles.iter().find(|p| &p.id == id),
+            None => self.instrument_profiles.iter().find(|p| p.matches_port(raw)),
+        }
+    }
+
+    fn pick_device_profile(&mut self, d: u32, id: &str) {
+        let Some(raw) = self.hw_devices.get(d as usize) else { return };
+        self.device_instruments.insert(midi_port_key(raw).to_string(), id.to_string());
+        if let Ok(v) = serde_json::to_value(&self.device_instruments) {
+            if let Err(e) = crate::assistant::save_config_value("instrument_devices", v) {
+                eprintln!("instrument profile: config not saved: {e}");
+            }
+        }
+    }
+
+    /// Every CC binding the devices' profiles ask for: one per device, node
+    /// the device plays, and controller.
+    fn wanted_instrument_bindings(&self) -> Vec<(SourceId, u32, crate::instruments::Binding)> {
+        let mut wanted = Vec::new();
+        let published = self.graph_pub.as_ref().and_then(|p| p.lock().ok());
+        let plays = |src: SourceId, dest: u32| {
+            published.as_ref().map_or(true, |g| g.rules.iter().any(|r| r.source == src && r.dest == dest && !r.cc_only))
+        };
+        for d in 0..self.hw_devices.len() as u32 {
+            let Some(profile) = self.device_profile(d) else { continue };
+            let src = SourceId::Hardware(d);
+            for u in &self.units {
+                let Some(node) = self.base_graph.node(u.node_id) else { continue };
+                let bindings = profile.bindings(&node.kind);
+                if bindings.is_empty() || !plays(src, u.node_id) { continue; }
+                wanted.extend(bindings.into_iter().map(|b| (src, u.node_id, b)));
+            }
+        }
+        wanted
+    }
+
+    /// Bring the matrix in line with the devices' profiles: bind what is
+    /// missing (after a load, a new organ, a device plugged in) and take back
+    /// what a profile bound and no longer wants, unless the user rebound that
+    /// controller by hand since. A profile owns its controllers on the nodes
+    /// it drives: pick "No profile" to learn them by hand. Sends nothing
+    /// when all is in place.
+    fn sync_instrument_maps(&mut self) {
+        if self.instrument_bound.is_empty() && self.hw_devices.is_empty() { return; }
+        let wanted = self.wanted_instrument_bindings();
+        let bound = |app: &Self, src: SourceId, dest: u32, b: &crate::instruments::Binding| {
+            app.rule_edits.get(&(src, dest)).and_then(|e| e.cc_map.iter().find(|m| m.cc == b.cc)).is_some_and(|m| {
+                (m.param, m.target, m.scale) == (b.param, b.target, b.scale)
+            })
+        };
+        let stale: Vec<_> = self.instrument_bound.iter().filter(|x| !wanted.contains(x)).copied().collect();
+        for (src, dest, b) in stale {
+            if bound(self, src, dest, &b) {
+                self.set_cc_scaled(src, dest, b.cc, None, b.target, b.scale);
+            }
+        }
+        for &(src, dest, b) in &wanted {
+            if !bound(self, src, dest, &b) {
+                self.set_cc_scaled(src, dest, b.cc, Some(b.param), b.target, b.scale);
+            }
+        }
+        self.instrument_bound = wanted;
+    }
+
     fn set_cc_binding(&mut self, source: SourceId, dest: u32, cc: u8, param: Option<u32>, target: crate::matrix::CcTarget) {
+        self.set_cc_scaled(source, dest, cc, param, target, crate::matrix::CcScale::IDENTITY);
+    }
+
+    fn set_cc_scaled(
+        &mut self,
+        source: SourceId,
+        dest: u32,
+        cc: u8,
+        param: Option<u32>,
+        target: crate::matrix::CcTarget,
+        scale: crate::matrix::CcScale,
+    ) {
         let cc = cc & 0x7F;
         let mut e = self.rule_edits.get(&(source, dest)).cloned().unwrap_or_else(|| {
             // Mirror what the engine will do: binding on a pair without a rule
@@ -6938,7 +7082,7 @@ impl DemoApp {
             RuleEdit { cc_only: !routed, ..RuleEdit::default() }
         });
         match param {
-            Some(p) => e.set_cc(cc, p, target),
+            Some(param) => e.set_cc(crate::matrix::CcMapping { cc, param, target, scale }),
             None => e.unmap_cc(cc),
         }
         if e.is_default() {
@@ -6947,7 +7091,7 @@ impl DemoApp {
             self.rule_edits.insert((source, dest), e);
         }
         if let Some(bus) = &self.bus {
-            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param, target });
+            let _ = bus.lock().unwrap().send(Command::MatrixCcMap { source, dest, cc, param, target, scale });
         }
     }
 
@@ -9016,6 +9160,35 @@ impl DemoApp {
             });
     }
 
+    /// Starts the star fetch on first call, then adopts what has arrived.
+    /// Tests never reach the network (rule 37).
+    fn poll_catalog_stars(&mut self, ctx: &egui::Context) {
+        if self.catalog_stars_rx.is_none() && !cfg!(test) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::Builder::new()
+                .name("catalog-stars".into())
+                .spawn(move || {
+                    let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else {
+                        return;
+                    };
+                    for e in crate::catalog::CATALOG {
+                        if let Some(n) = crate::catalog::fetch_stars(&client, e.repo) {
+                            if tx.send((e.repo, n)).is_err() {
+                                return;
+                            }
+                            ctx.request_repaint();
+                        }
+                    }
+                })
+                .ok();
+            self.catalog_stars_rx = Some(rx);
+        }
+        if let Some(rx) = &self.catalog_stars_rx {
+            self.catalog_stars.extend(rx.try_iter());
+        }
+    }
+
     /// A taller [`plugin_card`] for catalog entries: name, one-line
     /// description, repo link and an Install button / Installed badge.
     fn catalog_card(ui: &mut egui::Ui, width: f32, body: impl FnOnce(&mut egui::Ui, f32)) {
@@ -9136,6 +9309,7 @@ impl DemoApp {
                         let card_w = ((avail_w - gap * (cols as f32 - 1.0)) / cols as f32).max(200.0);
 
                         if self.plugin_category == PluginCategory::Install {
+                            self.poll_catalog_stars(ui.ctx());
                             let roots_raw = self.catalog_root_paths();
                             let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
                             let scan = self.catalog_scan();
@@ -9228,9 +9402,14 @@ impl DemoApp {
                                                 || format!("No Linux build for {}", std::env::consts::ARCH),
                                                 |r| r.summary(),
                                             );
+                                            let stars = self
+                                                .catalog_stars
+                                                .get(e.repo)
+                                                .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
+                                                .unwrap_or_default();
                                             ui.add(
                                                 egui::Label::new(
-                                                    egui::RichText::new(format!("License {} · {how}", e.license))
+                                                    egui::RichText::new(format!("{stars}License {} · {how}", e.license))
                                                         .size(11.5)
                                                         .color(theme::CREAM_DIM),
                                                 )
@@ -14701,6 +14880,7 @@ impl DemoApp {
         self.serve_rack_shots();
         self.rack_shot.request(&ctx);
         self.sync_from_engine();
+        self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
         if self.plugin_scan.is_some() || self.install.as_ref().is_some_and(|i| i.running) {
@@ -17054,7 +17234,7 @@ mod rig_switch_tests {
         let learned = rules.iter().find(|r| r.source == dev && r.dest == 1).expect("learned rule restored");
         assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
         assert_eq!(learned.param_for_cc(7), Some(43));
-        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }));
+        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::IDENTITY }));
         assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
     }
 
@@ -18553,6 +18733,13 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("License GPL-3.0-or-later · ")), "Floe's card names its licence: {texts:?}");
+        assert!(!texts.iter().any(|t| t.contains('★')), "no stars without a fetched count: {texts:?}");
+        app.catalog_stars.insert("pantherb/setBfree", 235);
+        app.catalog_stars.insert("surge-synthesizer/surge", 3870);
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t.starts_with("★ 235 · License ")), "setBfree's card shows its stars: {texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("★ 3.9k · License ")), "Surge's card shows its stars: {texts:?}");
+        assert_eq!(texts.iter().filter(|t| t.contains('★')).count(), 2, "only fetched repos show stars: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("Plays sample libraries")), "cards show the about text: {texts:?}");
         let sources = texts.iter().filter(|t| *t == "Source code").count();
         assert_eq!(sources, crate::catalog::CATALOG.len(), "every card has a Source code button");
@@ -18980,7 +19167,7 @@ mod split_bpm_tests {
         app.graph_pub = Some(pub_);
         app.sync_from_engine();
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("remote cc_map mirrored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42, target: crate::matrix::CcTarget::PluginParam }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 42, target: crate::matrix::CcTarget::PluginParam, scale: crate::matrix::CcScale::IDENTITY }]);
         assert_eq!(e.cell_code(), "1 CC");
     }
 
@@ -18996,10 +19183,10 @@ mod split_bpm_tests {
         frame(&mut app, &ctx, vec![]);
         assert!(app.cc_learn.is_none(), "MIDI-learn disarms after binding");
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("learned binding stored");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: 123, target: crate::matrix::CcTarget::PluginParam, scale: crate::matrix::CcScale::IDENTITY }]);
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
-        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123), target: crate::matrix::CcTarget::PluginParam })));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(123), target: crate::matrix::CcTarget::PluginParam, .. })));
     }
 
     #[test]
@@ -19211,6 +19398,7 @@ mod split_bpm_tests {
                 cc: 74,
                 param: Some(P_LEVEL),
                 target: crate::matrix::CcTarget::Knob,
+                ..
             }
         )), "sent MatrixCcMap with CcTarget::Knob: {cmds:?}");
         // The binding CC itself counts: the engine saw it before the mapping
@@ -19401,7 +19589,7 @@ mod split_bpm_tests {
         app.stage_view = StageView::Rack;
         app.edit_rigs(None);
         let e = app.rule_edits.get(&(SourceId::Hardware(0), 1)).expect("knob binding survived + Rig");
-        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: P_LEVEL, target: crate::matrix::CcTarget::Knob }]);
+        assert_eq!(e.cc_map, vec![crate::matrix::CcMapping { cc: 74, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::IDENTITY }]);
 
         // Clear via knob name.
         app.exec_tool("clear_cc_map", &serde_json::json!({"node": 1, "source": "hw:0", "knob": "LEVEL"}));
@@ -20184,6 +20372,76 @@ mod ui_polish_agent_tests {
 
     fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
         app.units.iter().find(|u| u.rig == rig && u.name == name).map(|u| u.node_id).expect("that unit")
+    }
+
+    /// A Nord Electro 2 behind a MIDI interface: the port name does not say
+    /// what is plugged in, so the user picks the profile. Its drawbars,
+    /// rotary, percussion and drive then drive the organ face, a session
+    /// load that drops the bindings gets them back, and "No profile" takes
+    /// back exactly what the profile bound.
+    #[test]
+    fn a_picked_nord_electro_2_profile_binds_the_organ_and_unbinds_cleanly() {
+        let rigs = vec![instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")])];
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        *app.hw_midi.devices.lock().unwrap() = vec![
+            ("U6MIDI Pro:U6MIDI Pro MIDI 1 32:0".into(), true),
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into(), true),
+        ];
+        app.hw_midi.rev.fetch_add(1, Ordering::Release);
+        let organ = node_named(&app, 0, "ORGAN");
+        let nord = SourceId::Hardware(1);
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert!(app.device_profile(1).is_none(), "an interface's name says nothing about the instrument");
+        while drain.pop().is_some() {}
+
+        app.pick_device_profile(1, "nord-electro-2");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut sent = Vec::new();
+        drain.drain(|c| sent.push(c));
+        let bound: Vec<u8> = sent.iter().filter_map(|c| match c {
+            Command::MatrixCcMap { source, dest, cc, param: Some(_), target: crate::matrix::CcTarget::Knob, .. }
+                if *source == nord && *dest == organ => Some(*cc),
+            _ => None,
+        }).collect();
+        let mut bound = bound;
+        bound.sort();
+        assert_eq!(bound, [16, 17, 18, 19, 20, 21, 22, 23, 24, 82, 87, 111], "nine drawbars, rotary, percussion, overdrive");
+        assert!(!sent.iter().any(|c| matches!(c, Command::MatrixCcMap { source: SourceId::Hardware(0), .. })), "the other port keeps its CCs");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut resent = Vec::new();
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { .. }) { resent.push(c); });
+        assert!(resent.is_empty(), "nothing is resent once the bindings are in place: {resent:?}");
+
+        // The Nord moves: 8' drawbar to position 6, rotary fast, percussion on.
+        let u = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let knob = |app: &DemoApp, param| app.units[u].knobs.iter().find(|k| k.param == Some(param)).unwrap().display_value;
+        for (cc, v) in [(18u8, 86u8), (82, 127), (87, 100)] {
+            app.hw_cc_queue.lock().unwrap().push_back((nord, 0, cc, v));
+        }
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert_eq!(crate::organ::drawbar_position(knob(&app, crate::organ::drawbar_param(2))), 6);
+        assert_eq!(crate::organ::step_name(crate::organ::P_LESLIE, knob(&app, crate::organ::P_LESLIE)), Some("FAST"));
+        assert_eq!(crate::organ::step_name(crate::organ::P_PERC, knob(&app, crate::organ::P_PERC)), Some("ON"));
+
+        // A load without the bindings: the next frame binds them again.
+        app.rule_edits.clear();
+        while drain.pop().is_some() {}
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut again = 0;
+        drain.drain(|c| if matches!(c, Command::MatrixCcMap { param: Some(_), .. }) { again += 1; });
+        assert_eq!(again, 12);
+
+        // A hand-made binding on the profile's controller survives the unpick.
+        app.set_cc_binding(nord, organ, 111, Some(crate::organ::P_REVERB), crate::matrix::CcTarget::Knob);
+        app.pick_device_profile(1, "");
+        while drain.pop().is_some() {}
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let cc_map: Vec<(u8, u32)> = app.rule_edits.get(&(nord, organ)).map_or(vec![], |e| e.cc_map.iter().map(|m| (m.cc, m.param)).collect());
+        assert_eq!(cc_map, vec![(111, crate::organ::P_REVERB)], "the profile's bindings are gone, the hand-made one stays");
     }
 
     /// setBfree's face: drawbars and four CC knobs, all ordinary knob

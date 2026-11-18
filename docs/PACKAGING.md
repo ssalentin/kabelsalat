@@ -157,7 +157,9 @@ output out of `/tmp` (AGENTS.md rule 79).
 2. Bump `version` in `Cargo.toml` (and `Cargo.lock`, by building once).
 3. Add `<release version="X.Y.Z" date="...">` at the top of `<releases>` in
    `packaging/flatpak/io.github.ssalentin.kabelsalat.metainfo.xml`.
-4. Commit on `main`, tag `vX.Y.Z`, push the tag.
+4. Commit on a `release-X.Y.Z` branch and open a PR (`main` is protected;
+   the PR touches `Cargo.toml`, so it waits for `human-approved`). Once it
+   is merged, tag the merge commit on `main` `vX.Y.Z` and push the tag.
 
 The release workflow checks that the tag matches `Cargo.toml`, that the
 CHANGELOG has notes for it and that the metainfo lists it, then builds every

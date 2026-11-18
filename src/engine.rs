@@ -1955,7 +1955,7 @@ impl GraphEngine {
                         .graph
                         .node(dest)
                         .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
-                    let norm = m.data[1] as f64 / 127.0;
+                    let norm = mapping.map_or(m.data[1] as f64 / 127.0, |b| b.scale.norm(m.data[1]));
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
                         if self.apply_engine_param(dest, pid, norm) || is_clap_node {
                             #[cfg(test)]
@@ -2003,7 +2003,7 @@ impl GraphEngine {
                     }
                 }
             }
-            Command::MatrixCcMap { source, dest, cc, param, target } => {
+            Command::MatrixCcMap { source, dest, cc, param, target, scale } => {
                 let changed = match param {
                     Some(p) => match self
                         .matrix
@@ -2011,12 +2011,12 @@ impl GraphEngine {
                         .iter_mut()
                         .find(|r| r.source == source && r.dest == dest)
                     {
-                        Some(r) => r.set_cc_target(cc, p, target),
+                        Some(r) => r.set_cc_mapping(CcMapping { cc, param: p, target, scale }),
                         None => {
                             // Learning a knob must not also wire the keys.
                             let mut r = Rule::new(source, dest);
                             r.cc_only = true;
-                            r.set_cc_target(cc, p, target);
+                            r.set_cc_mapping(CcMapping { cc, param: p, target, scale });
                             self.matrix.add_rule(r);
                             true
                         }
@@ -3843,7 +3843,7 @@ mod tests {
         engine.render(&mut buf, 2);
         // Device 20 is beyond the pre-routed hardware range: no rule to Surge A.
         let dev = SourceId::Hardware(20);
-        bus.send(Command::MatrixCcMap { source: dev, dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam });
+        bus.send(Command::MatrixCcMap { source: dev, dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam, scale: Default::default() });
         engine.render(&mut buf, 2);
         engine.note_log.clear();
         engine.cc_log.clear();
@@ -3857,6 +3857,30 @@ mod tests {
         bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: dev });
         engine.render(&mut buf, 2);
         assert!(engine.note_log.iter().any(|&(d, n, on)| d == 1 && n == 62 && on), "{:?}", engine.note_log);
+    }
+
+    /// A stepped binding (an instrument's switch) reaches the organ as the
+    /// organ's own step, through the engine's CC path.
+    #[test]
+    fn a_scaled_cc_binding_lands_on_the_organ_step() {
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let organ = g.add_node(NodeKind::Lv2 { uri: crate::control::Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let nord = SourceId::Hardware(5);
+        bus.send(Command::MatrixCcMap {
+            source: nord, dest: organ, cc: 82, param: Some(crate::organ::P_LESLIE),
+            target: CcTarget::Knob, scale: crate::matrix::CcScale::stepped(2, 64, 127),
+        });
+        engine.cc_log.clear();
+        bus.send(Command::Cc { source: nord, channel: 0, cc: 82, value: 10 });
+        bus.send(Command::Cc { source: nord, channel: 0, cc: 82, value: 100 });
+        engine.render(&mut buf, 2);
+        let steps: Vec<_> = engine.cc_log.iter().map(|&(_, p, v)| (p, crate::organ::step_name(p, v as f32))).collect();
+        assert_eq!(steps, vec![(crate::organ::P_LESLIE, Some("SLOW")), (crate::organ::P_LESLIE, Some("FAST"))]);
     }
 
     #[test]
@@ -3887,6 +3911,7 @@ mod tests {
             cc: 74,
             param: Some(42),
             target: CcTarget::PluginParam,
+            scale: Default::default(),
         });
         engine.render(&mut buf, 2);
         let rev_after = pub_.lock().unwrap().rev;
@@ -3895,7 +3920,7 @@ mod tests {
         assert_eq!(r.param_for_cc(74), Some(42));
 
         // Duplicate MatrixCcMap does not bump rev.
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(42), target: CcTarget::PluginParam, scale: Default::default() });
         engine.render(&mut buf, 2);
         assert_eq!(pub_.lock().unwrap().rev, rev_after);
 
@@ -3910,8 +3935,8 @@ mod tests {
         assert_eq!(engine.cc_passthrough_log, vec![(4, 74, 127), (4, 1, 90)]);
 
         // 4. Replace CC 74 -> param 99, and bind CC 7 -> Filter cutoff (param 0).
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(99), target: CcTarget::PluginParam });
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: filter, cc: 7, param: Some(0), target: CcTarget::PluginParam });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: Some(99), target: CcTarget::PluginParam, scale: Default::default() });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: filter, cc: 7, param: Some(0), target: CcTarget::PluginParam, scale: Default::default() });
         engine.cc_log.clear();
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 0 });
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 7, value: 64 });
@@ -3922,7 +3947,7 @@ mod tests {
         assert!((engine.cc_log[1].2 - 64.0 / 127.0).abs() < 1e-6);
 
         // 5. Remove CC 74 -> node 1 returns to empty-map transparency.
-        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: None, target: CcTarget::PluginParam });
+        bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: 1, cc: 74, param: None, target: CcTarget::PluginParam, scale: Default::default() });
         engine.cc_log.clear();
         engine.cc_passthrough_log.clear();
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 1, value: 55 });
@@ -3955,6 +3980,7 @@ mod tests {
             cc: 74,
             param: Some(cutoff.id),
             target: CcTarget::PluginParam,
+            scale: Default::default(),
         });
         let mut buf = vec![0.0f32; 256 * 2];
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 74, value: 127 });
@@ -3993,6 +4019,7 @@ mod tests {
             cc: 12,
             param: Some(super::P_MIX),
             target: CcTarget::Knob,
+            scale: Default::default(),
         });
         bus_cc.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 12, value: val });
         bus_sp.send(Command::SetParam { node: delay_sp, param: super::P_MIX, value: norm });
@@ -4026,6 +4053,7 @@ mod tests {
             cc: 7,
             param: Some(super::P_LEVEL),
             target: CcTarget::Knob,
+            scale: Default::default(),
         });
         bus.send(Command::Cc { source: SourceId::Hardware(3), channel: 0, cc: 7, value: 0 });
         let mut buf = vec![0.0f32; 128 * 2];
@@ -4247,7 +4275,31 @@ pub fn organ_test() -> anyhow::Result<()> {
     // 1' sounds 4 octaves above 16': 16x the fundamental. Ask for 6x, so the
     // Leslie's movement and the percussion cannot fake it.
     anyhow::ensure!(high > 6.0 * low, "the drawbars did not change the registration ({high:.0} vs {low:.0} crossings/s): the CCs (or the ones sent while loading) did not arrive");
-    println!("organ-test: OK — drawbar CCs reach setBfree, also those sent while it loaded");
+
+    // A Nord Electro 2 on a MIDI interface plays the same registrations with
+    // its own drawbar CCs, through the profile's bindings.
+    let nord = SourceId::Hardware(3);
+    let profile = crate::instruments::builtin().into_iter().find(|p| p.id == "nord-electro-2").expect("built-in profile");
+    let organ_kind = NodeKind::Lv2 { uri: Lv2Uri::new(B_SYNTH) };
+    for b in profile.bindings(&organ_kind) {
+        bus.send(Command::MatrixCcMap { source: nord, dest: organ, cc: b.cc, param: Some(b.param), target: b.target, scale: b.scale });
+    }
+    let nord_bars = |bus: &mut crate::control::CommandBus, bars: [u8; DRAWBARS]| {
+        for (i, b) in bars.iter().enumerate() {
+            // The Electro's LED drawbars send the start of each position's section.
+            let value = (*b as u32 * 128).div_ceil(9) as u8;
+            bus.send(Command::Cc { source: nord, channel: 0, cc: 16 + i as u8, value });
+        }
+    };
+    nord_bars(&mut bus, [0, 0, 0, 0, 0, 0, 0, 0, 8]);
+    for _ in 0..10 { engine.render(&mut buf, 2); }
+    let (nord_high, _) = measure(&mut engine, &mut bus, 48);
+    nord_bars(&mut bus, [8, 0, 0, 0, 0, 0, 0, 0, 0]);
+    for _ in 0..10 { engine.render(&mut buf, 2); }
+    let (nord_low, _) = measure(&mut engine, &mut bus, 48);
+    println!("organ-test: Nord Electro 2 drawbars: 1' only {nord_high:.0}/s; 16' only {nord_low:.0}/s");
+    anyhow::ensure!(nord_high > 6.0 * nord_low, "the Nord Electro 2 drawbar CCs did not change the registration ({nord_high:.0} vs {nord_low:.0} crossings/s)");
+    println!("organ-test: OK — drawbar CCs reach setBfree, also those sent while it loaded, and a Nord Electro 2 pulls them");
     Ok(())
 }
 
@@ -5070,6 +5122,7 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         cc: 74,
         param: Some(cutoff.id),
         target: CcTarget::PluginParam,
+        scale: Default::default(),
     });
     bus.send(Command::MatrixCcMap {
         source: SourceId::Hardware(0),
@@ -5077,6 +5130,7 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         cc: 7,
         param: Some(gain_p.id),
         target: CcTarget::PluginParam,
+        scale: Default::default(),
     });
     let mut buf = vec![0.0f32; 256 * 2];
     let mut render_note = |engine: &mut GraphEngine, cc: u8, val: u8| -> Vec<f32> {
@@ -5209,7 +5263,7 @@ fn clap_main_controls_check(name: &str, plugin_id: &str) -> anyhow::Result<()> {
     settle(&mut engine);
     let by_knob = main.param_value(c.id).unwrap_or(f64::NAN);
     // What a MIDI-learned knob does: a hardware CC through the matrix.
-    bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: inst, cc: 20, param: Some(c.id), target: CcTarget::PluginParam });
+    bus.send(Command::MatrixCcMap { source: SourceId::Hardware(0), dest: inst, cc: 20, param: Some(c.id), target: CcTarget::PluginParam, scale: Default::default() });
     bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc: 20, value: 127 });
     settle(&mut engine);
     let by_cc = main.param_value(c.id).unwrap_or(f64::NAN);

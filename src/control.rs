@@ -710,6 +710,8 @@ pub enum Command {
         param: Option<ParamId>,
         #[serde(default)]
         target: crate::matrix::CcTarget,
+        #[serde(default)]
+        scale: crate::matrix::CcScale,
     },
     /// Mix system-audio capture (e.g. YouTube) into the master at `gain` (0..1).
     /// 0 mutes it. The capture source is started at app startup.
@@ -908,9 +910,9 @@ mod tests {
             Command::SetCountIn { enabled: true, bars: 2 },
             Command::SetCountIn { enabled: false, bars: 1 },
             Command::Cc { source: SourceId::Hardware(1), channel: 2, cc: 74, value: 99 },
-            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam },
-            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob },
-            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None, target: crate::matrix::CcTarget::PluginParam },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: Some(42), target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 7, param: Some(0), target: crate::matrix::CcTarget::Knob, scale: Default::default() },
+            Command::MatrixCcMap { source: SourceId::Hardware(1), dest: 1, cc: 74, param: None, target: crate::matrix::CcTarget::PluginParam, scale: Default::default() },
             Command::RecordStart,
             Command::RecordStop,
             Command::SetRecordSync { on: true },

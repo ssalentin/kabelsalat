@@ -666,7 +666,9 @@ fn system_prompt() -> String {
      transport_stop are the master and start/stop ALL of them. The master is also the \
      song clock CLAP plugins follow: play runs it from beat 0, stop halts it. \
      set_count_in(enabled, bars) enables/configures a count-in bar of clicks before \
-     the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome).\n\
+     the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome). \
+     get_midi_clock/set_midi_clock control the MIDI Clock Send: kabelsalat as the master \
+     beat clock (24 per beat, Start/Stop) for external hardware and apps.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
@@ -998,6 +1000,16 @@ pub(crate) fn tools() -> Value {
             "name":"set_count_in",
             "description":"Enable/disable master transport count-in or set its length in bars (1..=4). When enabled, master play plays N bars of metronome clicks before the song clock and plugins start at beat 0.",
             "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"bars":{"type":"integer"}}}
+        }},
+        {"type":"function","function":{
+            "name":"get_midi_clock",
+            "description":"Read the MIDI Clock Send: whether kabelsalat sends MIDI beat clock (24 per beat) plus Start/Stop to external gear and apps, the sync offset, latency mode, song position pointer, every MIDI out port (live, wired) and the virtual port apps can subscribe to.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_midi_clock",
+            "description":"Configure the MIDI Clock Send (kabelsalat is the master clock). enabled: send clock/Start/Stop with the transport. offset_ms: shift the clock against the audio (negative = earlier; a pre-roll is added automatically at play). latency_mode: none (align to the audio output) | output (also include the sound device's output latency, for gear mixed outside kabelsalat) | input (align to the audio input, for gear fed back into kabelsalat). song_position: send Song Position Pointer + Continue when resuming. output + output_enabled: wire the clock to (or unplug it from) one MIDI out port, named as in get_midi_clock (a part of the name is enough). Starts with the next transport start.",
+            "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"offset_ms":{"type":"number"},"latency_mode":{"type":"string","enum":["none","output","input"]},"song_position":{"type":"boolean"},"output":{"type":"string"},"output_enabled":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"load_template",

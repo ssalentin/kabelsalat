@@ -964,6 +964,16 @@ Learned so far (2026-11-15, UI polish pass):
     failed on 124770 of 124800 samples. `record-test` rebuilds the master
     from the stems of the same take (`master_chain_from_silence`) instead.
 
+151. **A `while let Some(..)` over a source that is always `Some` needs a
+    bound, and a test count that is short is a hang:** the clock's pre-roll
+    loop asked `next_grid_k` for the next tick and that answered `Some` for
+    every later tick, so two `clocksend` tests grew a `Vec` until the runner
+    killed them (CI exit 143 after 24 to 47 s of silence, and the local
+    session with it). Bound every such loop by its lookahead window, and when
+    a filtered run shows fewer `ok` lines than `N passed` would, or no
+    `test result:` line, the missing tests hang: find them before pushing
+    (`test result: ok. 17 passed` for `clocksend`).
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

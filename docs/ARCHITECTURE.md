@@ -93,6 +93,20 @@ agents are in [AGENTS.md](../AGENTS.md).
   port name) and keeps the matrix CC bindings in line with it
   (`DemoApp::sync_instrument_maps`).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
+- `clocksend.rs` / `alsaseq.rs` — MIDI Clock Send (#85): kabelsalat as the master
+  beat clock. The engine publishes its song position and a monotonic stamp every
+  audio block (`ClockPos`); the clock thread derives the 24-ppqn grid from that
+  and hands each tick to an ALSA sequencer queue with an absolute time (lookahead
+  200 ms), so the kernel delivers it, not a sleep loop and never a UI frame.
+  `alsaseq` is a thin binding to `/dev/snd/seq` (no libasound); a queue's stamps
+  count from its own start, so it calibrates that epoch once. Start goes out
+  when the song starts from the beginning; Continue (after an optional Song
+  Position Pointer) when one starts from a position. A negative net offset (sync
+  offset plus the latency mode: none, output, input) pre-rolls the engine's
+  start. Wiring is a row in the matrix view (one cell per MIDI out port, by name,
+  rule 58); settings and wiring are app preferences in config.json, not session
+  content, so loads and undo never touch them. Check:
+  `kabelsalat clock-test` (virtual ports only).
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
   The player decodes on its own thread; the engine owns its clock and reads the
@@ -440,7 +454,8 @@ source-only. **No box64/emulation for live audio** — native ARM plugins only.
 | VST3 hosting | later (study Maolan) |
 | Plugin GUIs: own windows first (X11/XWayland), embed later | P0 / later |
 | Scenes/setlist for live | P4 |
-| Ableton Link, MIDI clock, OSC | later |
+| MIDI clock send (24 ppqn, Start/Stop, SPP, offset + latency modes) | done (#85) |
+| Ableton Link, MIDI clock receive, OSC | later |
 
 **Non-goals:** timeline/arranger, piano roll, notation, video, x86 bridging, VST2, AU.
 Fixed limits for RT safety: 64 nodes, 8 inserts/channel, stereo buses (multichannel later).

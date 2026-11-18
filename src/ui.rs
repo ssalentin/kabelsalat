@@ -2093,6 +2093,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "get_engine_info", "reset_engine_peaks",
     "get_strip_knobs", "set_strip_knob",
     "list_channels",
+    "get_midi_clock", "set_midi_clock",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2110,7 +2111,7 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks")
+    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_midi_clock")
 }
 
 /// File-player settings carried by play_file/set_player args (AUM
@@ -2780,6 +2781,10 @@ struct DemoApp {
     graph_pub: Option<Arc<Mutex<crate::engine::GraphPub>>>,
     /// Last engine graph revision the UI has seen/adopted.
     last_graph_rev: u64,
+    /// MIDI clock send (#85): settings + wiring shared with the clock
+    /// thread. The real app swaps in `clocksend::global()`; tests keep
+    /// their own, so none of them touches another's or the user's.
+    clock: Arc<crate::clocksend::ClockControl>,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
     /// Retired player buffers the engine handed back: dropped here (UI
@@ -3122,6 +3127,7 @@ impl DemoApp {
             shared_graph: Arc::new(Mutex::new(Graph::demo_patch())),
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             graph_pub: None,
+            clock: crate::clocksend::ClockControl::new(),
             last_graph_rev: 0,
             player_ctrl: None,
             player_retire_rx: None,
@@ -4785,6 +4791,8 @@ impl DemoApp {
             "transport_stop" => "Stop transport".into(),
             "set_bpm" => format!("Tempo → {} BPM", args.get("bpm").and_then(|v| v.as_f64()).unwrap_or(120.0).round() as u32),
             "set_count_in" => "Set count-in".into(),
+            "get_midi_clock" => "MIDI clock status".into(),
+            "set_midi_clock" => "Set MIDI clock".into(),
             "record_start" => "Start recording".into(),
             "record_stop" => "Stop recording".into(),
             "record_status" => "Recording status".into(),
@@ -6850,6 +6858,14 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("Count-in {enabled} ({bars}b)"), nodes, now);
                 serde_json::json!({"enabled": self.count_in_enabled, "bars": self.count_in_bars}).to_string()
             }
+            "get_midi_clock" => self.midi_clock_json().to_string(),
+            "set_midi_clock" => match self.set_midi_clock(args) {
+                Ok(json) => {
+                    self.agent_activity.record(origin, "MIDI clock", Vec::new(), now);
+                    json
+                }
+                Err(e) => format!("error: {e}"),
+            },
             "load_template" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("demo").to_lowercase();
                 let res = match name.as_str() {
@@ -7889,6 +7905,8 @@ impl DemoApp {
         let sinks = self.matrix_sinks();
         if sinks.is_empty() {
             ui.label(egui::RichText::new("no instruments in the patch — add a rig first").size(12.0).color(theme::INK_2));
+            ui.add_space(18.0);
+            self.midi_clock_ui(ui);
             return;
         }
         let mut toggles: Vec<(usize, MatrixRow, bool)> = Vec::new();
@@ -8006,9 +8024,138 @@ impl DemoApp {
             ui.label(egui::RichText::new("Hardware rows are a radio group per rig: one device, all devices, or off.")
                 .size(11.0).color(theme::INK_2));
         }
+        ui.add_space(18.0);
+        self.midi_clock_ui(ui);
         for (s, row, on) in toggles { self.matrix_toggle(s, row, on); }
         for (d, id) in profile_picks { self.pick_device_profile(d, &id); }
         if let Some(cell) = edit_requests.last() { self.rule_editor = Some(*cell); }
+    }
+
+    /// MIDI Clock Send (#85), the matrix view's last block: the master
+    /// beat clock's settings and one cell per MIDI out port it is wired to
+    /// (the same cell look as the routes above). All state is the clock's
+    /// (`self.clock`); each edit goes through `set_midi_clock` like the
+    /// agent's, so what the UI and the tools show cannot differ.
+    fn midi_clock_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::clocksend::CompMode;
+        let cfg = self.clock.config();
+        let wired = self.clock.wired_keys();
+        let outs = self.clock.outs_snapshot();
+        let stats = self.clock.stats_snapshot();
+        let mut edits: Vec<serde_json::Value> = Vec::new();
+
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "MIDI Clock Send");
+            ui.label(egui::RichText::new("kabelsalat is the master: 24 clocks per beat + Start/Stop to hardware and apps")
+                .size(11.0).color(theme::INK_2));
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if theme::chip_button(ui, if cfg.enabled { "CLOCK ON" } else { "CLOCK OFF" }, cfg.enabled)
+                .on_hover_text("send MIDI clock with the transport (from the next Play)").clicked() {
+                edits.push(serde_json::json!({"enabled": !cfg.enabled}));
+            }
+            if theme::chip_button(ui, "SONG POS", cfg.spp)
+                .on_hover_text("send Song Position Pointer + Continue when resuming mid-song").clicked() {
+                edits.push(serde_json::json!({"song_position": !cfg.spp}));
+            }
+            ui.add_space(8.0);
+            for (mode, label, tip) in [
+                (CompMode::None, "NONE", "align to our audio output, ignoring the device's latency"),
+                (CompMode::Output, "OUTPUT", "also include the sound device's output latency (gear mixed outside kabelsalat)"),
+                (CompMode::Input, "INPUT", "align to the audio input (gear fed back into kabelsalat)"),
+            ] {
+                if theme::chip_button(ui, label, cfg.comp == mode).on_hover_text(tip).clicked() {
+                    edits.push(serde_json::json!({"latency_mode": mode.as_str()}));
+                }
+            }
+            ui.add_space(8.0);
+            for (label, delta) in [("−10", -10.0f32), ("−1", -1.0)] {
+                if theme::chip_button(ui, label, false).on_hover_text("sync offset, ms (negative = clock earlier)").clicked() {
+                    edits.push(serde_json::json!({"offset_ms": cfg.offset_ms + delta}));
+                }
+            }
+            if theme::chip_button(ui, &format!("{:+.0} ms", cfg.offset_ms), cfg.offset_ms != 0.0)
+                .on_hover_text("sync offset (click to reset to 0)").clicked() {
+                edits.push(serde_json::json!({"offset_ms": 0.0}));
+            }
+            for (label, delta) in [("+1", 1.0f32), ("+10", 10.0)] {
+                if theme::chip_button(ui, label, false).on_hover_text("sync offset, ms (positive = clock later)").clicked() {
+                    edits.push(serde_json::json!({"offset_ms": cfg.offset_ms + delta}));
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        // One row: the clock → every MIDI out port (plus wired ports that
+        // are unplugged right now, so a re-plug finds its wiring again).
+        let mut ports: Vec<(String, bool)> = outs.iter().map(|o| (o.key.clone(), o.live)).collect();
+        for k in wired.iter().filter(|k| !outs.iter().any(|o| &o.key == *k)) {
+            ports.push((k.clone(), false));
+        }
+        egui::Grid::new("midi_clock_grid").num_columns(ports.len() + 2).spacing([20.0, 8.0])
+            .min_col_width(120.0).show(ui, |ui| {
+            ui.label("");
+            ui.vertical(|ui| {
+                ui.add(egui::Label::new(egui::RichText::new("MIDI Clock").font(theme::medium_font(13.0)).color(theme::INK))
+                    .wrap_mode(egui::TextWrapMode::Extend));
+                ui.add(egui::Label::new(egui::RichText::new("virtual port").size(11.0).color(theme::LIVE_TEAL))
+                    .wrap_mode(egui::TextWrapMode::Extend));
+            });
+            for (key, live) in &ports {
+                let short = key.rsplit_once(':').map_or(key.as_str(), |(_, p)| p).to_string();
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(short).font(theme::medium_font(13.0)).color(theme::INK))
+                        .wrap_mode(egui::TextWrapMode::Extend));
+                    ui.add(egui::Label::new(egui::RichText::new(if *live { "MIDI OUT ✓" } else { "unplugged" }).size(11.0)
+                        .color(if *live { theme::LIVE_TEAL } else { theme::INK_2 })).wrap_mode(egui::TextWrapMode::Extend));
+                });
+            }
+            ui.end_row();
+            theme::section_label(ui, "Clock");
+            // The virtual port is always there: apps subscribe to it
+            // (aconnect), nothing to wire.
+            let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::hover());
+            let cell = rect.shrink(3.0);
+            ui.painter().rect_filled(cell, 2.0, theme::LIVE_TEAL);
+            ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, "CLK", theme::medium_font(12.5), theme::DARK_PANEL);
+            resp.on_hover_text("always available: other apps connect to \"kabelsalat: MIDI Clock\" (e.g. with aconnect)");
+            for (key, _) in &ports {
+                let on = wired.contains(key);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
+                let cell = rect.shrink(3.0);
+                if on {
+                    ui.painter().rect_filled(cell, 2.0, theme::LIVE_TEAL);
+                    ui.painter().text(cell.center(), egui::Align2::CENTER_CENTER, "CLK", theme::medium_font(12.5), theme::DARK_PANEL);
+                } else {
+                    ui.painter().rect_stroke(cell, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                }
+                if resp.hovered() {
+                    ui.painter().rect_stroke(rect.shrink(1.0), 3.0, Stroke::new(1.0, theme::ACCENT), egui::StrokeKind::Inside);
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.on_hover_text("click: send the clock to this port on/off").clicked() {
+                    edits.push(serde_json::json!({"output": key, "output_enabled": !on}));
+                }
+            }
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        let status = if stats.alsa == "unavailable" {
+            "ALSA sequencer unavailable: the clock cannot be sent".to_string()
+        } else if !stats.last_error.is_empty() {
+            format!("clock: {}", stats.last_error)
+        } else {
+            format!("{} clocks sent · net offset {:+.1} ms", stats.ticks, self.clock.net_offset_ms())
+        };
+        ui.add(egui::Label::new(egui::RichText::new(status).size(11.0).color(theme::INK_2)).wrap_mode(egui::TextWrapMode::Extend));
+
+        for e in edits {
+            if let Err(err) = self.set_midi_clock(&e) {
+                self.plugin_msg = format!("MIDI clock: {err}");
+            }
+        }
     }
 
     fn parse_rule_source(&self, source: &str) -> Result<SourceId, String> {
@@ -13763,7 +13910,10 @@ impl DemoApp {
     /// transport-capable node and publishes; faces follow via
     /// `sync_from_engine`. Headless (no GraphPub) applies the flags locally.
     fn master_transport(&mut self, playing: bool) {
-        if let Some(bus) = &self.bus {
+        // MIDI clock send with a negative offset: the clock thread sends the
+        // engine's TransportPlay after the pre-roll; Stop cancels a pending one.
+        let preroll = if playing { self.clock_preroll_play() } else { self.clock.cancel_preroll(); false };
+        if let (Some(bus), false) = (&self.bus, preroll) {
             let cmd = if playing { Command::TransportPlay } else { Command::TransportStop };
             let _ = bus.lock().unwrap().send(cmd);
         }
@@ -14223,6 +14373,119 @@ impl DemoApp {
         if let Some(bpm) = self.tap_tempo.tap(now_secs) {
             self.set_bpm(bpm);
         }
+    }
+
+    // -- MIDI clock send (#85) -------------------------------------------
+
+    /// Tests: a fixed MIDI out port table (they never scan the machine).
+    #[cfg(test)]
+    fn seed_clock_ports(&self, ports: &[(&str, bool)]) {
+        let mut outs = self.clock.outs.lock().unwrap();
+        outs.clear();
+        for (i, (key, live)) in ports.iter().enumerate() {
+            outs.push(crate::clocksend::ClockOutPort {
+                key: key.to_string(),
+                raw: format!("{key} 24:{i}"),
+                addr: (24, i as u8),
+                live: *live,
+                wired: false,
+            });
+        }
+    }
+
+    /// Keep the clock's settings and wiring across restarts (config.json;
+    /// a no-op in tests, rule 37).
+    fn save_midi_clock(&self) {
+        if let Ok(v) = serde_json::to_value(self.clock.saved()) {
+            let _ = crate::assistant::save_config_value("midi_clock", v);
+        }
+    }
+
+    /// The clock as `get_midi_clock` reports it: settings, every MIDI out
+    /// port (wired or not), the always-present virtual port and counters.
+    fn midi_clock_json(&self) -> serde_json::Value {
+        let cfg = self.clock.config();
+        let wired = self.clock.wired_keys();
+        let outs = self.clock.outs_snapshot();
+        let stats = self.clock.stats_snapshot();
+        let mut ports: Vec<serde_json::Value> = outs.iter()
+            .map(|o| serde_json::json!({"name": o.key, "live": o.live, "wired": wired.contains(&o.key)}))
+            .collect();
+        for k in wired.iter().filter(|k| !outs.iter().any(|o| &o.key == *k)) {
+            ports.push(serde_json::json!({"name": k, "live": false, "wired": true}));
+        }
+        serde_json::json!({
+            "enabled": cfg.enabled,
+            "song_position": cfg.spp,
+            "offset_ms": cfg.offset_ms,
+            "latency_mode": cfg.comp.as_str(),
+            "net_offset_ms": self.clock.net_offset_ms(),
+            "virtual_port": "kabelsalat: MIDI Clock",
+            "outputs": ports,
+            "ticks_sent": stats.ticks,
+            "starts_sent": stats.starts,
+            "alsa": if stats.alsa.is_empty() { "ok" } else { stats.alsa },
+            "last_error": stats.last_error,
+        })
+    }
+
+    /// Resolve a port the user or agent named: exact key first, then a
+    /// unique case-insensitive part of it.
+    fn clock_port_key(&self, name: &str) -> Result<String, String> {
+        let mut keys: Vec<String> = self.clock.outs_snapshot().into_iter().map(|o| o.key).collect();
+        for k in self.clock.wired_keys() {
+            if !keys.contains(&k) { keys.push(k); }
+        }
+        if let Some(k) = keys.iter().find(|k| k.as_str() == name) { return Ok(k.clone()); }
+        let want = name.to_lowercase();
+        let hits: Vec<&String> = keys.iter().filter(|k| k.to_lowercase().contains(&want)).collect();
+        match hits.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => Err(format!("no MIDI out port '{name}' (ports: {})", keys.join(", "))),
+            many => Err(format!("'{name}' matches {} ports; be more specific ({})", many.len(),
+                many.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "))),
+        }
+    }
+
+    /// Apply `set_midi_clock` arguments (the agent tools; the UI chips call
+    /// the narrower helpers below).
+    fn set_midi_clock(&mut self, args: &serde_json::Value) -> Result<String, String> {
+        let mut cfg = self.clock.config();
+        if let Some(b) = args.get("enabled").and_then(|v| v.as_bool()) { cfg.enabled = b; }
+        if let Some(b) = args.get("song_position").and_then(|v| v.as_bool()) { cfg.spp = b; }
+        if let Some(v) = args.get("offset_ms").filter(|v| !v.is_null()) {
+            let ms = v.as_f64().filter(|m| m.is_finite()).ok_or("offset_ms must be a number")?;
+            cfg.offset_ms = ms as f32;
+        }
+        if let Some(m) = args.get("latency_mode").and_then(|v| v.as_str()) {
+            cfg.comp = crate::clocksend::CompMode::parse(m)
+                .ok_or_else(|| format!("latency_mode '{m}' is not none | output | input"))?;
+        }
+        let wiring = match args.get("output").and_then(|v| v.as_str()) {
+            Some(name) => Some((self.clock_port_key(name)?, args.get("output_enabled").and_then(|v| v.as_bool()).unwrap_or(true))),
+            None => None,
+        };
+        self.clock.set_config(cfg);
+        if let Some((key, on)) = wiring { self.clock.set_wired(&key, on); }
+        self.save_midi_clock();
+        Ok(self.midi_clock_json().to_string())
+    }
+
+    /// A negative net offset needs a pre-roll (AUM: done automatically when
+    /// the transport is stopped): the clock starts counting now and the
+    /// engine start waits |offset|, so the first ticks are still on time.
+    /// True when the clock took over starting the engine.
+    fn clock_preroll_play(&mut self) -> bool {
+        let cfg = self.clock.config();
+        if !cfg.enabled || self.clock.armed() { return false; }
+        let net_ns = (self.clock.net_offset_ms() as f64 * 1e6).round() as i64;
+        if net_ns >= 0 { return false; }
+        let count_in_secs = if self.count_in_enabled {
+            self.count_in_bars as f64 * crate::transport::BEATS_PER_BAR as f64 * 60.0 / self.bpm.max(1.0) as f64
+        } else { 0.0 };
+        let armed = crate::clocksend::arm_preroll(crate::alsaseq::mono_ns(), net_ns, count_in_secs, self.bpm as f64);
+        self.clock.request_arm(armed);
+        true
     }
 
     /// Update count-in configuration, persist it, and notify the engine.
@@ -20141,6 +20404,7 @@ struct BuiltAudio {
     node_times: Arc<crate::engine_info::NodeTimes>,
     audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
     audio_in_levels: Arc<AudioInLevels>,
+    clock_pos: Arc<crate::clocksend::ClockPos>,
 }
 
 fn build_audio() -> anyhow::Result<BuiltAudio> {
@@ -20189,6 +20453,11 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // structural changes; the UI adopts it when it diverges from its mirror.
     let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch(), rules: Vec::new(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
+    // MIDI clock send (#85): the engine publishes its song position every
+    // block; the clock thread schedules ticks from it (never per UI frame).
+    let clock_pos = crate::clocksend::ClockPos::new();
+    engine.set_clock_pos(clock_pos.clone());
+    let clock_pos_cb = clock_pos.clone();
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
     if let Some(source) = crate::capture::SystemCapture::default_monitor() {
@@ -20230,7 +20499,13 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
     let stream = device.build_output_stream(
         config,
-        move |data: &mut [f32], _| {
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // Device output latency for the clock's "Output" compensation.
+            let ts = info.timestamp();
+            let d = ts.playback.duration_since(ts.callback);
+            if !d.is_zero() {
+                clock_pos_cb.publish_out_latency(d.as_nanos() as u64);
+            }
             // One-time realtime promotion via rtkit (first callback only; the
             // D-Bus round trip happens once, never in the steady state).
             // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
@@ -20280,6 +20555,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         node_times,
         audio_in_tx,
         audio_in_levels,
+        clock_pos,
     })
 }
 
@@ -20438,8 +20714,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             node_times,
                             audio_in_tx,
                             audio_in_levels,
+                            clock_pos,
                         } = ba;
                         let bus = Arc::new(Mutex::new(bus));
+                        // MIDI clock send: attach the engine and start the
+                        // thread (it owns the ALSA sequencer client).
+                        let clock = crate::clocksend::global();
+                        clock.set_engine(clock_pos, bus.clone());
+                        crate::clocksend::spawn_clock_thread(clock);
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
                         // socket is unavailable the app just runs without it.
@@ -20523,6 +20805,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.node_times = Some(node_times);
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
+                    app.clock = crate::clocksend::global();
                     app.player_ctrl = Some(player_ctrl);
                     app.player_retire_rx = Some(player_retire_rx);
                     app.recorder = Some(recorder);
@@ -20911,6 +21194,74 @@ mod matrix_ui_tests {
         app.exec_tool("set_rig_source", &serde_json::json!({"node": node, "keys": false, "laptop": true, "hardware": false}));
         assert_eq!(app.rig_sources[1], (true, false));
         assert!(matches!(drain.pop(), Some(Command::SetRigSource { keyboard: true, hardware: false, .. })));
+    }
+
+    #[test]
+    fn midi_clock_tools_set_and_read_the_clock() {
+        let mut app = demo_app();
+        app.seed_clock_ports(&[("MIDIMATE eX:MIDIMATE eX MIDI 1", true), ("MIDIMATE eX:MIDIMATE eX MIDI 2", true), ("M2:M2 MIDI 1", true)]);
+        let get = |app: &mut DemoApp| -> serde_json::Value { serde_json::from_str(&app.exec_tool("get_midi_clock", &serde_json::json!({}))).unwrap() };
+        let wired_names = |v: &serde_json::Value| -> Vec<String> {
+            v["outputs"].as_array().unwrap().iter()
+                .filter(|o| o["wired"] == true).map(|o| o["name"].as_str().unwrap().to_string()).collect()
+        };
+        let before = get(&mut app);
+        assert_eq!(before["enabled"], false, "off by default");
+        assert_eq!(before["latency_mode"], "none");
+        assert_eq!(before["virtual_port"], "kabelsalat: MIDI Clock");
+
+        let out = app.exec_tool("set_midi_clock", &serde_json::json!({
+            "enabled": true, "offset_ms": -12.5, "latency_mode": "output", "song_position": true, "output": "m2",
+        }));
+        assert!(!out.starts_with("error"), "{out}");
+        let now = get(&mut app);
+        assert_eq!(now["enabled"], true);
+        assert_eq!(now["offset_ms"], -12.5);
+        assert_eq!(now["latency_mode"], "output");
+        assert_eq!(now["song_position"], true);
+        assert_eq!(wired_names(&now), vec!["M2:M2 MIDI 1".to_string()], "a part of the name finds the port");
+
+        // Unplugging one port leaves the rest alone.
+        app.exec_tool("set_midi_clock", &serde_json::json!({"output": "MIDIMATE eX:MIDIMATE eX MIDI 2"}));
+        app.exec_tool("set_midi_clock", &serde_json::json!({"output": "m2", "output_enabled": false}));
+        assert_eq!(wired_names(&get(&mut app)), vec!["MIDIMATE eX:MIDIMATE eX MIDI 2".to_string()]);
+
+        // Off-schema input is answered, never defaulted (rule 77).
+        assert!(app.exec_tool("set_midi_clock", &serde_json::json!({"latency_mode": "loud"})).starts_with("error"));
+        assert!(app.exec_tool("set_midi_clock", &serde_json::json!({"offset_ms": "soon"})).starts_with("error"));
+        assert!(app.exec_tool("set_midi_clock", &serde_json::json!({"output": "nothing"})).starts_with("error"));
+        let ambiguous = app.exec_tool("set_midi_clock", &serde_json::json!({"output": "midimate"}));
+        assert!(ambiguous.starts_with("error") && ambiguous.contains("matches 2 ports"), "{ambiguous}");
+        // A refused call changed nothing; a huge offset is clamped; a null one (MCP) is ignored.
+        assert_eq!(get(&mut app)["latency_mode"], "output");
+        app.exec_tool("set_midi_clock", &serde_json::json!({"offset_ms": 1.0e9}));
+        assert_eq!(get(&mut app)["offset_ms"], crate::clocksend::MAX_OFFSET_MS as f64);
+        app.exec_tool("set_midi_clock", &serde_json::json!({"offset_ms": null, "enabled": false}));
+        assert_eq!(get(&mut app)["offset_ms"], crate::clocksend::MAX_OFFSET_MS as f64);
+        assert_eq!(get(&mut app)["enabled"], false);
+    }
+
+    /// A negative net offset needs a pre-roll: Play hands the start to the
+    /// clock (it counts first), and a clock that is off or not early plays at once.
+    #[test]
+    fn a_negative_offset_arms_a_preroll_at_play() {
+        let mut app = demo_app();
+        app.bpm = 120.0;
+        assert!(!app.clock_preroll_play(), "off: play is the engine's own");
+        app.exec_tool("set_midi_clock", &serde_json::json!({"enabled": true, "offset_ms": 40.0}));
+        app.clock.publish_net_offset_ns(40_000_000);
+        assert!(!app.clock_preroll_play(), "a late clock needs no pre-roll");
+        app.exec_tool("set_midi_clock", &serde_json::json!({"offset_ms": -120.0}));
+        app.clock.publish_net_offset_ns(-120_000_000);
+        assert!(app.clock_preroll_play(), "an early clock takes over the start");
+        // The maths the thread then follows: the engine start waits |offset|,
+        // tick 0 is now.
+        let a = crate::clocksend::arm_preroll(1_000_000_000, -120_000_000, 0.0, 120.0);
+        assert_eq!(a.play_at_ns, 1_120_000_000);
+        assert_eq!(a.tick0_ns, 1_000_000_000);
+        // A 2 s count-in swallows a 120 ms pre-roll.
+        let a = crate::clocksend::arm_preroll(1_000_000_000, -120_000_000, 2.0, 120.0);
+        assert_eq!(a.play_at_ns, 1_000_000_000, "the count-in is the pre-roll");
     }
 
     #[test]
@@ -23523,6 +23874,29 @@ mod split_bpm_tests {
         assert_eq!(u.sub, "Surge XT · Wurli");
         // Tracked captions paint one glyph per shape: join them.
         assert!(texts.concat().contains("SURGE XT · WURLI"), "subtitle repainted: {texts:?}");
+    }
+
+    /// Rule 59/65 for a setting `apply_session` never touches: loading a
+    /// template and undoing an agent job leave the clock exactly as it was
+    /// (checked with non-default values).
+    #[test]
+    fn midi_clock_is_untouched_by_loads_and_undo() {
+        let (mut app, ctx) = demo();
+        app.seed_clock_ports(&[("M2:M2 MIDI 1", true)]);
+        app.exec_tool("set_midi_clock", &serde_json::json!({
+            "enabled": true, "offset_ms": 7.0, "latency_mode": "input", "song_position": true, "output": "M2",
+        }));
+        let saved = app.clock.saved();
+        assert_ne!(saved, crate::clocksend::ClockSaved::default());
+        app.submit_chat("add a rig".into());
+        app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
+        frame(&mut app, &ctx, vec![]);
+        app.exec_tool("load_template", &serde_json::json!({"name": "drums_bass"}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.clock.saved(), saved, "a template load reset the clock");
+        app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.clock.saved(), saved, "an undo reset the clock");
     }
 
     #[test]
@@ -28900,13 +29274,18 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 10] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
             ("mixer", &|a| a.stage_view = StageView::Mixer),
             ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
             ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("matrix with clock ports", &|a| {
+                a.stage_view = StageView::Matrix;
+                a.seed_clock_ports(&[("MIDIMATE eX:MIDIMATE eX MIDI 1", true), ("M2:M2 MIDI 1", true), ("Roland UM-ONE:Roland UM-ONE MIDI 1", false)]);
+                a.clock.set_wired("MIDIMATE eX:MIDIMATE eX MIDI 1", true);
+            }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("settings", &|a| a.stage_view = StageView::Settings),
@@ -29057,7 +29436,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 10] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -29068,6 +29447,12 @@ mod offline_shots {
                 a.set_record_arm(Some(1), true);
             }),
             ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("matrix-clock", &|a| {
+                a.stage_view = StageView::Matrix;
+                a.seed_clock_ports(&[("MIDIMATE eX:MIDIMATE eX MIDI 1", true), ("Midi Through:Midi Through Port-0", true)]);
+                a.clock.set_config(crate::clocksend::ClockConfig { enabled: true, spp: true, offset_ms: -12.0, comp: crate::clocksend::CompMode::Output });
+                a.clock.set_wired("MIDIMATE eX:MIDIMATE eX MIDI 1", true);
+            }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("settings", &|a| a.stage_view = StageView::Settings),
             ("sessions", &|a| a.stage_view = StageView::Sessions),

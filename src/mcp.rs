@@ -449,6 +449,24 @@ struct SetCountInArgs {
     bars: Option<u8>,
 }
 
+/// Arguments for `set_midi_clock`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetMidiClockArgs {
+    /// Send MIDI beat clock and Start/Stop with the transport.
+    enabled: Option<bool>,
+    /// Sync offset in ms (positive = clock later than the audio, negative =
+    /// earlier; a pre-roll is added automatically at play).
+    offset_ms: Option<f64>,
+    /// none | output | input — what the clock aligns to (see the tool text).
+    latency_mode: Option<String>,
+    /// Send Song Position Pointer + Continue when resuming.
+    song_position: Option<bool>,
+    /// A MIDI out port, by (part of) the name `get_midi_clock` lists.
+    output: Option<String>,
+    /// Wire (default) or unplug that port.
+    output_enabled: Option<bool>,
+}
+
 /// Arguments for `set_record_sync`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RecordSyncArgs {
@@ -1701,6 +1719,19 @@ impl McpServer {
             _ => serde_json::json!({}),
         }).unwrap_or(serde_json::json!({}));
         ok_json(summary)
+    }
+
+    #[tool(name = "get_midi_clock", description = "Read the MIDI Clock Send (kabelsalat as the master MIDI beat clock, 24 per beat, plus Start/Stop): enabled, offset_ms, latency_mode (none|output|input), song_position, every MIDI out port (live/wired) and the virtual port apps can subscribe to. Needs the running app (kabelsalat mcp --attach).")]
+    fn get_midi_clock(&self) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("get_midi_clock", json!({}))
+    }
+
+    #[tool(name = "set_midi_clock", description = "Configure the MIDI Clock Send: enabled; offset_ms (negative = earlier, a pre-roll is added at play); latency_mode none (align to the audio output) | output (include the sound device's output latency, for gear mixed externally) | input (align to the audio input, for gear fed back into kabelsalat); song_position (SPP + Continue when resuming); output + output_enabled (wire the clock to one MIDI out port, by part of its name from get_midi_clock). Starts with the next transport start. Needs the running app.")]
+    fn set_midi_clock(&self, Parameters(args): Parameters<SetMidiClockArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_midi_clock", json!({
+            "enabled": args.enabled, "offset_ms": args.offset_ms, "latency_mode": args.latency_mode,
+            "song_position": args.song_position, "output": args.output, "output_enabled": args.output_enabled,
+        }))
     }
 
     #[tool(name = "list_audio_outputs", description = "List the sound cards kabelsalat can play to (PipeWire sinks), the one it plays to now and the user's choice. Needs the running app (kabelsalat mcp --attach).")]

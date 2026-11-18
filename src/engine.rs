@@ -1060,6 +1060,8 @@ pub struct GraphEngine {
     count_in_buf: Vec<f32>,
     last_count_in_beat: u8,
     transport_dirty: bool,
+    /// MIDI clock send (#85): the song position, published every block.
+    clock_pos: Option<Arc<crate::clocksend::ClockPos>>,
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
@@ -1261,6 +1263,7 @@ impl GraphEngine {
             count_in_buf: vec![0.0; 8192 * 2],
             last_count_in_beat: 0,
             transport_dirty: false,
+            clock_pos: None,
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
             node_timer: crate::engine_info::NodeTimer::new(),
@@ -2038,6 +2041,12 @@ impl GraphEngine {
 
     /// Attach the shared graph publication (main-thread setup, before the
     /// engine moves to the audio thread).
+    /// Attach the MIDI clock sender's position publication (main-thread
+    /// setup, like `set_graph_pub`).
+    pub fn set_clock_pos(&mut self, p: Arc<crate::clocksend::ClockPos>) {
+        self.clock_pos = Some(p);
+    }
+
     pub fn set_graph_pub(&mut self, p: Arc<Mutex<GraphPub>>) {
         // Room for the voice list now, so publishing it never allocates on
         // the audio thread (the host reserves again when it sends `Grow`).
@@ -3772,6 +3781,9 @@ impl GraphEngine {
                 self.last_count_in_beat = 0;
                 self.transport.set_playing(true);
                 self.count_in_slot.set_playing(false);
+                if let Some(cp) = &self.clock_pos {
+                    cp.publish_start(0.0);
+                }
             }
             let changed = self.graph.set_all_playing(true);
             for d in &mut self.dsp {
@@ -4020,6 +4032,22 @@ impl GraphEngine {
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
         let (sr, bpm) = (self.sample_rate, self.transport.bpm);
+        // MIDI clock send: the song position as of THIS block's first frame,
+        // stamped with the monotonic clock (one vDSO read, no allocation).
+        let block_wall_ns = match &self.clock_pos {
+            Some(cp) => {
+                let wall = crate::alsaseq::mono_ns();
+                cp.publish_block(
+                    self.transport.beats,
+                    bpm,
+                    self.master_clock == MasterClock::Playing,
+                    self.master_clock.is_counting_in(),
+                    wall,
+                );
+                wall
+            }
+            None => 0,
+        };
         let beat_inc = Transport::beats_per_frame(bpm, sr);
         // Song position of THIS block's first frame — the file player and
         // the metronome both count beats from it with the same factor
@@ -4084,6 +4112,12 @@ impl GraphEngine {
                     self.last_count_in_beat = 0;
                     self.transport.set_playing(true);
                     self.count_in_slot.set_playing(false);
+                    if let Some(cp) = &self.clock_pos {
+                        // Beat 0 starts with the NEXT block: anchor it there.
+                        let next_wall = block_wall_ns + (frames as f64 / sr * 1e9) as u64;
+                        cp.publish_block(0.0, bpm, true, false, next_wall);
+                        cp.publish_start(0.0);
+                    }
                     for d in &mut self.dsp {
                         if self.graph.node(d.node).map_or(false, |n| n.kind.supports_transport())
                             && d.transport.playing

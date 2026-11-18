@@ -1030,6 +1030,13 @@ Learned so far (2026-11-15, UI polish pass):
     (`MidiMsg::wire`), never padded to 3 bytes
     (`a_wind_controllers_breath_and_bend_become_engine_commands`,
     `kabelsalat wind-test`).
+157. **A knob's whole travel stays inside what the control is for:** the
+    Delay's TIME mapped 0..1 onto 1 ms..2 s, so the face default 0.4 meant
+    21 ms with feedback, a resonant comb that sounded distorted on every new
+    delay. TIME now spans `DELAY_MIN_S`..`DELAY_MAX_S` (50 ms..2 s). When a
+    DSP param range changes, check the knob default and every template value
+    against it in physical units
+    (`the_delay_time_knob_always_gives_an_echo_never_a_comb`).
 
 ## Working on kabelsalat
 

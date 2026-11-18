@@ -10,20 +10,20 @@
 //!   on the *caller* side, so call them from non-RT threads (UI). For cross-thread
 //!   use grab a `VoiceController` before moving the voice.
 //! - `ClapVoiceMain` stays on the creating (main) thread: state save/restore,
-//!   params, embedded GUI, deactivation (CLAP [main-thread] rules).
+//!   params, deactivation (CLAP [main-thread] rules). Plugin editors are
+//!   native egui (parameter lists), never the plugin's own window.
 //!
 //! `run_test` is a demo built entirely on this API: discover ~/.clap, enumerate
 //! params, play an audible arpeggio through the default cpal output,
-//! save/restore state, and EMBED the plugin GUI into a host-owned X11 window
-//! (XWayland) — no detached plugin windows.
+//! save/restore state.
 //!
 //! Architecture (matches docs/ARCHITECTURE.md §7):
-//! - main thread: plugin instance lifecycle, params/state/GUI (CLAP [main-thread])
+//! - main thread: plugin instance lifecycle, params/state (CLAP [main-thread])
 //! - audio thread: owns `ClapVoice` (the `StartedPluginAudioProcessor`), renders
 //!   blocks (CLAP [audio-thread])
 //! - cpal callback: drains a lock-free `rtrb` ring into the device buffer
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -34,9 +34,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use clack_extensions::audio_ports::{AudioPortInfoBuffer, PluginAudioPorts};
-use clack_extensions::gui::{
-    GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window as ClapWindow,
-};
+use clack_extensions::gui::{GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui, Window as ClapWindow};
+use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
+use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_extensions::latency::{HostLatency, HostLatencyImpl, PluginLatency};
 use clack_extensions::log::{HostLog, HostLogImpl, LogSeverity};
 use clack_extensions::params::{
@@ -54,21 +54,14 @@ use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 
 use crate::main_controls::{self, Candidate, MainControls, RemotePage};
+use crate::plugin_window::PluginWindow;
 use crate::transport::{Transport, BEATS_PER_BAR};
-
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{
-    AtomEnum, ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
-    EventMask, PropMode, WindowClass,
-};
-use x11rb::rust_connection::RustConnection;
-use x11rb::wrapper::ConnectionExt as _;
 
 /// Frames per processing block. Small enough for live latency, big enough for Surge.
 const BLOCK: usize = 256;
 /// Upper bound on output ports (Surge XT: main + Scene A + Scene B = 3).
 const MAX_OUT_PORTS: usize = 8;
-/// How long the arpeggio + GUI demo runs.
+/// How long the arpeggio demo runs.
 const DEMO_SECONDS: u64 = 9;
 
 // ---------------------------------------------------------------------------
@@ -80,21 +73,20 @@ struct HostShared {
     // Plugin extensions, queried during initialization.
     params: OnceLock<Option<PluginParams>>,
     state: OnceLock<Option<PluginState>>,
-    gui: OnceLock<Option<PluginGui>>,
     latency: OnceLock<Option<PluginLatency>>,
     audio_ports: OnceLock<Option<PluginAudioPorts>>,
     remote_controls: OnceLock<Option<PluginRemoteControls>>,
+    gui: OnceLock<Option<PluginGui>>,
+    timer: OnceLock<Option<PluginTimer>>,
+    posix_fd: OnceLock<Option<PluginPosixFd>>,
     // Plugin -> host requests (lock-free flags).
     callback_requested: AtomicBool,
     restart_requested: AtomicBool,
     process_requested: AtomicBool,
     flush_requested: AtomicBool,
-    // GUI requests. clack-extensions dispatches ALL HostGuiImpl callbacks to
-    // the *shared* handler (they may arrive off the main thread), so this
-    // state must be Send + Sync.
-    resize_request: Mutex<Option<GuiSize>>,
-    show_request: AtomicBool,
-    hide_request: AtomicBool,
+    // Editor requests. clack dispatches every HostGuiImpl callback to the
+    // shared handler (they may come from any thread).
+    gui_resize: Mutex<Option<GuiSize>>,
     gui_closed: AtomicBool,
 }
 
@@ -102,10 +94,12 @@ impl<'a> SharedHandler<'a> for HostShared {
     fn initializing(&self, instance: InitializingPluginHandle<'a>) {
         let _ = self.params.set(instance.get_extension());
         let _ = self.state.set(instance.get_extension());
-        let _ = self.gui.set(instance.get_extension());
         let _ = self.latency.set(instance.get_extension());
         let _ = self.audio_ports.set(instance.get_extension());
         let _ = self.remote_controls.set(instance.get_extension());
+        let _ = self.gui.set(instance.get_extension());
+        let _ = self.timer.set(instance.get_extension());
+        let _ = self.posix_fd.set(instance.get_extension());
     }
     fn request_restart(&self) {
         self.restart_requested.store(true, Ordering::SeqCst);
@@ -134,15 +128,13 @@ impl HostParamsImplShared for HostShared {
 impl HostGuiImpl for HostShared {
     fn resize_hints_changed(&self) {}
     fn request_resize(&self, new_size: GuiSize) -> Result<(), HostError> {
-        *self.resize_request.lock().unwrap() = Some(new_size);
+        *self.gui_resize.lock().unwrap() = Some(new_size);
         Ok(())
     }
     fn request_show(&self) -> Result<(), HostError> {
-        self.show_request.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn request_hide(&self) -> Result<(), HostError> {
-        self.hide_request.store(true, Ordering::SeqCst);
         Ok(())
     }
     fn closed(&self, _was_destroyed: bool) {
@@ -150,10 +142,24 @@ impl HostGuiImpl for HostShared {
     }
 }
 
+/// A timer the plugin registered (`timer-support`); the UI frame fires it.
+struct PluginTimerSlot {
+    id: u32,
+    period: Duration,
+    due: Instant,
+}
+
+/// Host shortest timer period: the UI frame drives timers, so faster ones
+/// could not be honoured anyway.
+const MIN_TIMER_PERIOD: Duration = Duration::from_millis(15);
+
 struct HostMainThread {
     state_dirty: Cell<bool>,
     latency_changed: Cell<bool>,
     params_rescan: Cell<bool>,
+    timers: RefCell<Vec<PluginTimerSlot>>,
+    next_timer_id: Cell<u32>,
+    fds: RefCell<Vec<(i32, FdFlags)>>,
 }
 
 impl HostMainThread {
@@ -162,7 +168,55 @@ impl HostMainThread {
             state_dirty: Cell::new(false),
             latency_changed: Cell::new(false),
             params_rescan: Cell::new(false),
+            timers: RefCell::new(Vec::new()),
+            next_timer_id: Cell::new(1),
+            fds: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Ids of timers that are due, rescheduled for their next tick.
+    fn take_due_timers(&self, now: Instant) -> Vec<u32> {
+        let mut due = Vec::new();
+        for t in self.timers.borrow_mut().iter_mut() {
+            if now >= t.due {
+                due.push(t.id);
+                t.due = now + t.period;
+            }
+        }
+        due
+    }
+}
+
+impl HostTimerImpl for HostMainThread {
+    fn register_timer(&self, period_ms: u32) -> Result<TimerId, HostError> {
+        let id = self.next_timer_id.get();
+        self.next_timer_id.set(id.wrapping_add(1).max(1));
+        let period = Duration::from_millis(period_ms as u64).max(MIN_TIMER_PERIOD);
+        self.timers.borrow_mut().push(PluginTimerSlot { id, period, due: Instant::now() + period });
+        Ok(TimerId(id))
+    }
+    fn unregister_timer(&self, timer_id: TimerId) -> Result<(), HostError> {
+        self.timers.borrow_mut().retain(|t| t.id != timer_id.0);
+        Ok(())
+    }
+}
+
+impl HostPosixFdImpl for HostMainThread {
+    fn register_fd(&self, fd: i32, flags: FdFlags) -> Result<(), HostError> {
+        let mut fds = self.fds.borrow_mut();
+        fds.retain(|(f, _)| *f != fd);
+        fds.push((fd, flags));
+        Ok(())
+    }
+    fn modify_fd(&self, fd: i32, flags: FdFlags) -> Result<(), HostError> {
+        if let Some(e) = self.fds.borrow_mut().iter_mut().find(|(f, _)| *f == fd) {
+            e.1 = flags;
+        }
+        Ok(())
+    }
+    fn unregister_fd(&self, fd: i32) -> Result<(), HostError> {
+        self.fds.borrow_mut().retain(|(f, _)| *f != fd);
+        Ok(())
     }
 }
 
@@ -200,7 +254,9 @@ impl HostHandlers for TestHost {
             .register::<HostParams>()
             .register::<HostState>()
             .register::<HostLatency>()
-            .register::<HostGui>();
+            .register::<HostGui>()
+            .register::<HostTimer>()
+            .register::<HostPosixFd>();
     }
 }
 
@@ -208,10 +264,12 @@ impl HostHandlers for TestHost {
 struct Exts {
     params: Option<PluginParams>,
     state: Option<PluginState>,
-    gui: Option<PluginGui>,
     latency: Option<PluginLatency>,
     audio_ports: Option<PluginAudioPorts>,
     remote_controls: Option<PluginRemoteControls>,
+    gui: Option<PluginGui>,
+    timer: Option<PluginTimer>,
+    posix_fd: Option<PluginPosixFd>,
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +386,20 @@ impl ClapVoice {
         plugin_id: CString,
         sample_rate: f64,
     ) -> Result<(ClapVoice, ClapVoiceMain)> {
-        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id_str = plugin_id.to_string_lossy().into_owned();
+        // A parked instance of a never-free plugin is reused instead of
+        // instantiating a new one next to it (#52, rule 56 class). The fresh
+        // `entry` we just loaded is dropped: dlopen is refcounted, and the
+        // parked instance keeps its own.
+        if let Some(parked) = take_parked_clap(&id_str) {
+            println!("reusing parked instance: {}", parked.plugin_id);
+            let ParkedClap { plugin_id, instance, exts, _entry } = parked;
+            let (voice, mut main) = Self::build_voice(instance, exts, _entry, plugin_id.clone(), sample_rate)?;
+            if let Some(init) = init_state(&plugin_id) {
+                let _ = main.load_state(&init); // fresh-instance state
+            }
+            return Ok((voice, main));
+        }
         let host_info = HostInfo::new(
             "kabelsalat",
             "kabelsalat",
@@ -349,24 +419,41 @@ impl ClapVoice {
         let exts = plugin.access_shared_handler(|h| Exts {
             params: h.params.get().copied().flatten(),
             state: h.state.get().copied().flatten(),
-            gui: h.gui.get().copied().flatten(),
             latency: h.latency.get().copied().flatten(),
             audio_ports: h.audio_ports.get().copied().flatten(),
             remote_controls: h.remote_controls.get().copied().flatten(),
+            gui: h.gui.get().copied().flatten(),
+            timer: h.timer.get().copied().flatten(),
+            posix_fd: h.posix_fd.get().copied().flatten(),
         });
         println!(
-            "extensions: params={} state={} gui={} latency={} audio-ports={} remote-controls={}",
+            "extensions: params={} state={} latency={} audio-ports={} remote-controls={}",
             exts.params.is_some(),
             exts.state.is_some(),
-            exts.gui.is_some(),
             exts.latency.is_some(),
             exts.audio_ports.is_some(),
             exts.remote_controls.is_some()
         );
 
+        let (voice, mut main) = Self::build_voice(plugin, exts, entry, id_str.clone(), sample_rate)?;
+        if clap_never_free(&id_str) {
+            remember_init_state(&id_str, &mut main);
+        }
+        Ok((voice, main))
+    }
+
+    /// Activate `plugin`, start processing and build both halves of the
+    /// voice. Shared by fresh instantiation and parked reuse.
+    fn build_voice(
+        mut plugin: PluginInstance<TestHost>,
+        exts: Exts,
+        entry: PluginEntry,
+        id_str: String,
+        sample_rate: f64,
+    ) -> Result<(ClapVoice, ClapVoiceMain)> {
+        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (in_count, in_ch, out_chs, main_out) =
             inspect_audio_ports(&mut plugin, exts.audio_ports)?;
-
         let audio_config = PluginAudioConfiguration {
             sample_rate,
             min_frames_count: 1,
@@ -399,7 +486,7 @@ impl ClapVoice {
         let n_out = out_chs.len();
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            plugin_id: id_str,
+            plugin_id: id_str.clone(),
             processor,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
@@ -426,14 +513,19 @@ impl ClapVoice {
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
         };
+        let main_id = id_str;
         let mut main = ClapVoiceMain {
             instance: plugin,
             exts,
             main_controls: MainControls::default(),
             main_controls_rechecks: 0,
+            editor: None,
             _entry: entry,
         };
         main.refresh_main_controls();
+        if let Some(state) = crate::aeolus::initial_state(&main_id) {
+            main.load_state(&state).with_context(|| format!("starting {main_id} with a registration"))?;
+        }
         Ok((voice, main))
     }
 
@@ -489,6 +581,12 @@ impl ClapVoice {
     /// Queue a raw MIDI 1.0 CC event on the audio thread without locking or allocating.
     pub fn send_cc_rt(&mut self, channel: u8, cc: u8, value: u8) {
         self.push_rt(VoiceCmd::Midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]));
+    }
+
+    /// Queue one raw MIDI 1.0 channel message on the audio thread without
+    /// locking or allocating (a 2-byte message leaves the third byte 0).
+    pub fn send_midi_rt(&mut self, msg: [u8; 3]) {
+        self.push_rt(VoiceCmd::Midi(msg));
     }
 
     /// Queue a MIDI programme change on the audio thread without locking or allocating.
@@ -694,13 +792,201 @@ mod transport_event_tests {
     }
 }
 
+fn x11_embedded() -> GuiConfiguration<'static> {
+    GuiConfiguration { api_type: GuiApiType::X11, is_floating: false }
+}
+
+/// The registered descriptors that are ready now (never blocks).
+fn ready_fds(fds: &[(i32, FdFlags)]) -> Vec<(i32, FdFlags)> {
+    let mut polls: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&(fd, flags)| {
+            let mut events = 0;
+            if flags.contains(FdFlags::READ) {
+                events |= libc::POLLIN;
+            }
+            if flags.contains(FdFlags::WRITE) {
+                events |= libc::POLLOUT;
+            }
+            libc::pollfd { fd, events, revents: 0 }
+        })
+        .collect();
+    if polls.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: `polls` is a valid, exclusively borrowed array of its length.
+    if unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 0) } <= 0 {
+        return Vec::new();
+    }
+    polls
+        .iter()
+        .filter(|p| p.revents != 0)
+        .map(|p| {
+            let mut flags = FdFlags::empty();
+            if p.revents & libc::POLLIN != 0 {
+                flags |= FdFlags::READ;
+            }
+            if p.revents & libc::POLLOUT != 0 {
+                flags |= FdFlags::WRITE;
+            }
+            if p.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                flags |= FdFlags::ERROR;
+            }
+            (p.fd, flags)
+        })
+        .collect()
+}
+
+/// `kabelsalat editor-test [plugin-id...]`: open every installed CLAP
+/// plugin's own editor (or the named ones), run its main-thread callbacks for
+/// a while, and check that the editor attached to the host window. Hold each
+/// open longer with `KABELSALAT_EDITOR_HOLD=<seconds>` (for screenshots).
+pub fn run_editor_test(ids: &[String]) -> Result<()> {
+    let ids: Vec<String> = if ids.is_empty() {
+        let mut all: Vec<String> = list_clap_plugins().into_iter().map(|p| p.id).collect();
+        all.sort();
+        all.dedup();
+        all
+    } else {
+        ids.to_vec()
+    };
+    let hold = std::env::var("KABELSALAT_EDITOR_HOLD").ok().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0);
+    let mut failed = Vec::new();
+    for id in &ids {
+        let (voice, mut main) = match ClapVoice::new_plugin(48_000.0, id) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("editor-test {id}: SKIP (does not load: {e:#})");
+                continue;
+            }
+        };
+        if !main.has_editor() {
+            println!("editor-test {id}: no X11 editor");
+            main.retire(voice);
+            continue;
+        }
+        let result = main.open_editor(&format!("{id} · kabelsalat editor-test")).and_then(|()| {
+            let until = Instant::now() + Duration::from_secs_f64(hold);
+            while Instant::now() < until && main.editor_open() {
+                main.pump();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            match main.editor_children() {
+                Some(n) if n > 0 => Ok(n),
+                Some(_) => Err(anyhow!("the plugin attached no window to the editor window")),
+                None => Err(anyhow!("the editor closed by itself")),
+            }
+        });
+        main.close_editor();
+        let reopened = result.is_ok() && main.open_editor("reopen").is_ok() && {
+            for _ in 0..10 {
+                main.pump();
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            main.editor_children().is_some_and(|n| n > 0)
+        };
+        main.close_editor();
+        match (result, reopened) {
+            (Ok(n), true) => println!("editor-test {id}: PASS ({n} child window, closes and reopens)"),
+            (Ok(_), false) => {
+                println!("editor-test {id}: FAIL (did not reopen after close)");
+                failed.push(id.clone());
+            }
+            (Err(e), _) => {
+                println!("editor-test {id}: FAIL ({e:#})");
+                failed.push(id.clone());
+            }
+        }
+        main.retire(voice);
+    }
+    if failed.is_empty() {
+        println!("=== editor-test PASS ===");
+        Ok(())
+    } else {
+        bail!("editor-test FAIL: {}", failed.join(", "))
+    }
+}
+
 /// Main-control polls that look again after a state load (about a second
 /// at the UI's poll rate): the state lands on the audio thread a few blocks
 /// later.
 const MAIN_CONTROLS_RECHECKS: u8 = 10;
 
+/// CLAP plugins whose instances must never be destroyed (#52): Dexed's
+/// destructor segfaults while other plugin instances render (same class as
+/// the LV2 `NEVER_FREE` list, rule 56). Retired instances are deactivated
+/// and parked instead of destroyed; `ClapVoice::new_plugin` reuses them.
+const CLAP_NEVER_FREE: &[&str] = &["com.digital-suburban.dexed"];
+
+fn clap_never_free(plugin_id: &str) -> bool {
+    CLAP_NEVER_FREE.iter().any(|id| plugin_id.contains(id))
+}
+
+/// A deactivated instance of a `CLAP_NEVER_FREE` plugin, kept for reuse.
+/// Instances stay on the thread that created them (the plugin main thread):
+/// the pool is thread-local, so an instance never crosses a thread.
+struct ParkedClap {
+    plugin_id: String,
+    instance: PluginInstance<TestHost>,
+    exts: Exts,
+    _entry: PluginEntry,
+}
+
+thread_local! {
+    /// Parked instances are never dropped — not even at exit.
+    static CLAP_PARKED: std::cell::RefCell<Vec<ParkedClap>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Post-activation state of each never-free plugin's *first* fresh
+/// instantiation: what a new instance starts with. Reloaded when a parked
+/// instance is reused, so the player never hears the previous unit's patch.
+static INIT_STATE: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+
+fn remember_init_state(plugin_id: &str, main: &mut ClapVoiceMain) {
+    let mut store = INIT_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if store.iter().any(|(id, _)| id == plugin_id) {
+        return; // keep the first capture: this one may already be customized
+    }
+    if let Ok(state) = main.save_state() {
+        store.push((plugin_id.to_string(), state));
+    }
+}
+
+fn init_state(plugin_id: &str) -> Option<Vec<u8>> {
+    INIT_STATE
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(id, _)| id == plugin_id)
+        .map(|(_, s)| s.clone())
+}
+
+/// Take a parked instance of `plugin_id`, if this thread parked one.
+fn take_parked_clap(plugin_id: &str) -> Option<ParkedClap> {
+    if !clap_never_free(plugin_id) {
+        return None;
+    }
+    CLAP_PARKED.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let i = pool.iter().position(|p| p.plugin_id == plugin_id)?;
+        Some(pool.swap_remove(i))
+    })
+}
+
+/// How many instances of `plugin_id` this thread has parked (tests).
+pub fn parked_clap_count(plugin_id: &str) -> usize {
+    CLAP_PARKED.with(|pool| {
+        pool.borrow()
+            .iter()
+            .filter(|p| p.plugin_id.contains(plugin_id))
+            .count()
+    })
+}
+
+
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
-/// `!Send`), state save/restore, GUI access and deactivation. Must stay on the
+/// `!Send`), state save/restore and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
 pub struct ClapVoiceMain {
     instance: PluginInstance<TestHost>,
@@ -710,18 +996,137 @@ pub struct ClapVoiceMain {
     main_controls: MainControls,
     /// Polls left that re-read the main controls after a state load.
     main_controls_rechecks: u8,
+    /// The plugin's own editor, while it is open.
+    editor: Option<ClapEditor>,
     _entry: PluginEntry,
 }
 
+/// An open plugin editor: the plugin's GUI embedded in a host toplevel.
+/// The window must outlive the GUI, so `close_editor` destroys the GUI first.
+struct ClapEditor {
+    gui: PluginGui,
+    window: PluginWindow,
+    resizable: bool,
+}
+
+impl Drop for ClapVoiceMain {
+    fn drop(&mut self) {
+        self.close_editor();
+    }
+}
+
 impl ClapVoiceMain {
-    /// Direct access for params inspection / embedded GUI (main thread only).
-    pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
-        &mut self.instance
+    /// Whether the plugin has its own editor kabelsalat can open.
+    pub fn has_editor(&mut self) -> bool {
+        let Some(gui) = self.exts.gui else { return false };
+        gui.is_api_supported(&self.instance.plugin_handle(), x11_embedded())
     }
 
-    /// The plugin's GUI extension, if any (for embedded-editor setup).
-    pub fn gui(&self) -> Option<PluginGui> {
-        self.exts.gui
+    pub fn editor_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Open the plugin's own editor in a window titled `title`. A second call
+    /// while it is open does nothing.
+    pub fn open_editor(&mut self, title: &str) -> Result<()> {
+        if self.editor.is_some() {
+            return Ok(());
+        }
+        let gui = self.exts.gui.ok_or_else(|| anyhow!("this plugin has no editor of its own"))?;
+        let cfg = x11_embedded();
+        if !gui.is_api_supported(&self.instance.plugin_handle(), cfg) {
+            bail!("this plugin's editor does not run on X11");
+        }
+        self.instance.access_shared_handler(|h| {
+            h.gui_closed.store(false, Ordering::SeqCst);
+            h.gui_resize.lock().unwrap().take();
+        });
+        gui.create(&self.instance.plugin_handle(), cfg).map_err(|e| anyhow!("the plugin could not create its editor: {e:?}"))?;
+        let handle = self.instance.plugin_handle();
+        let size = gui.get_size(&handle).unwrap_or(GuiSize { width: 800, height: 600 });
+        let resizable = gui.can_resize(&handle);
+        let window = match PluginWindow::open(title, size.width, size.height, resizable) {
+            Ok(w) => w,
+            Err(e) => {
+                gui.destroy(&handle);
+                return Err(e);
+            }
+        };
+        // SAFETY: the window lives in `self.editor` and `close_editor`
+        // destroys the GUI before dropping it.
+        let parented = unsafe { gui.set_parent(&handle, ClapWindow::from_x11_handle(window.id() as _)) };
+        if let Err(e) = parented {
+            gui.destroy(&handle);
+            bail!("the plugin could not attach its editor: {e:?}");
+        }
+        // Odin 2 answers false here yet shows its editor; whether it attached
+        // is what `editor-test` checks, not this answer.
+        let _ = gui.show(&handle);
+        self.editor = Some(ClapEditor { gui, window, resizable });
+        Ok(())
+    }
+
+    pub fn close_editor(&mut self) {
+        if let Some(ed) = self.editor.take() {
+            let handle = self.instance.plugin_handle();
+            let _ = ed.gui.hide(&handle);
+            ed.gui.destroy(&handle);
+            drop(ed.window);
+        }
+    }
+
+    /// While the editor is open, run the plugin's main-thread callbacks: due
+    /// timers, ready file descriptors, the window's events and resize
+    /// requests. Call it every UI frame; JUCE editors (Surge) paint only from
+    /// these. Without an editor nothing runs: JUCE's timers drive its one
+    /// process-wide message loop, and firing them from several threads (one
+    /// per test) deadlocked the unit suite.
+    pub fn pump(&mut self) {
+        if self.editor.is_none() {
+            return;
+        }
+        let due = self.instance.access_handler(|h| h.take_due_timers(Instant::now()));
+        if let Some(timer) = self.exts.timer {
+            for id in due {
+                timer.on_timer(&mut self.instance.plugin_handle(), TimerId(id));
+            }
+        }
+        if let Some(posix_fd) = self.exts.posix_fd {
+            let fds = self.instance.access_handler(|h| h.fds.borrow().clone());
+            for (fd, flags) in ready_fds(&fds) {
+                posix_fd.on_fd(&mut self.instance.plugin_handle(), fd, flags);
+            }
+        }
+        self.pump_editor();
+    }
+
+    /// Windows the plugin attached inside its editor window, while it is open.
+    pub fn editor_children(&self) -> Option<usize> {
+        self.editor.as_ref().and_then(|ed| ed.window.child_count().ok())
+    }
+
+    fn pump_editor(&mut self) {
+        let plugin_closed = self.instance.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst));
+        let requested = self.instance.access_shared_handler(|h| h.gui_resize.lock().unwrap().take());
+        let Some(ed) = self.editor.as_mut() else { return };
+        let events = ed.window.poll();
+        if plugin_closed || events.close_requested {
+            self.close_editor();
+            return;
+        }
+        let handle = self.instance.plugin_handle();
+        if let Some(size) = requested {
+            let _ = ed.window.resize(size.width, size.height, ed.resizable);
+            let _ = ed.gui.set_size(&handle, size);
+        } else if let Some((w, h)) = events.resized.filter(|_| ed.resizable) {
+            let size = ed.gui.adjust_size(&handle, GuiSize { width: w, height: h }).unwrap_or(GuiSize { width: w, height: h });
+            let _ = ed.gui.set_size(&handle, size);
+        }
+    }
+
+    /// Direct access for params inspection (main thread only).
+    pub fn instance_mut(&mut self) -> &mut PluginInstance<TestHost> {
+        &mut self.instance
     }
 
     /// Plugin-reported latency in samples (meaningful once active).
@@ -753,10 +1158,48 @@ impl ClapVoiceMain {
         self.instance.deactivate(stopped);
     }
 
-    /// Stop `voice` and deactivate both halves (main thread only).
+    /// Stop `voice` and retire both halves (main thread only).
+    /// `CLAP_NEVER_FREE` plugins are deactivated and parked for reuse —
+    /// never destroyed: their destructor is unsafe while other plugin
+    /// instances render (#52).
     pub fn retire(self, voice: ClapVoice) {
+        let plugin_id = voice.plugin_id.clone();
         let stopped = voice.stop();
-        self.deactivate(stopped);
+        if clap_never_free(&plugin_id) {
+            self.park(stopped, plugin_id);
+        } else {
+            self.deactivate(stopped);
+        }
+    }
+
+    /// Deactivate a never-free instance and park it for the next
+    /// `new_plugin` of the same id. If the pool cannot take it, leak it —
+    /// never destroy (rule 56 class).
+    fn park(self, stopped: StoppedPluginAudioProcessor<TestHost>, plugin_id: String) {
+        // `Drop` closes the editor and frees the instance; a parked plugin
+        // is never freed, so take the fields out by hand.
+        let mut me = std::mem::ManuallyDrop::new(self);
+        me.close_editor();
+        me.instance.deactivate(stopped);
+        // SAFETY: `me` is never used or dropped again, and each field is read
+        // exactly once (the editor is closed, so there is nothing else to free).
+        let (instance, exts, entry, controls) = unsafe {
+            (
+                std::ptr::read(&me.instance),
+                std::ptr::read(&me.exts),
+                std::ptr::read(&me._entry),
+                std::ptr::read(&me.main_controls),
+            )
+        };
+        drop(controls);
+        let parked = ParkedClap { plugin_id, instance, exts, _entry: entry };
+        CLAP_PARKED.with(|pool| {
+            if let Ok(mut pool) = pool.try_borrow_mut() {
+                pool.push(parked);
+            } else {
+                std::mem::forget(parked); // poisoned pool: leak rather than free
+            }
+        });
     }
 
     /// Enumerate all plugin parameters for the native (egui) editor. Main thread
@@ -986,13 +1429,10 @@ pub fn run_test() -> Result<()> {
         )?
     };
     stream.play()?;
-    println!("playing arpeggio (A3 C4 E4 A4 C5 ...) for {DEMO_SECONDS}s — GUI embedded below");
+    println!("playing arpeggio (A3 C4 E4 A4 C5 ...) for {DEMO_SECONDS}s");
 
-    // 8. Embedded GUI (X11/XWayland). No detached-window fallback by design.
-    ensure_display();
-    let gui_ext = main.gui();
-    let gui_report = run_embedded_gui(main.instance_mut(), gui_ext, Duration::from_secs(DEMO_SECONDS));
-    println!("GUI: {gui_report}");
+    // 8. Let the arpeggio play.
+    std::thread::sleep(Duration::from_secs(DEMO_SECONDS));
 
     // 9. State round-trip, part 2 — while processing is still running, like a
     //    real host restoring a session during playback. Surge applies loaded
@@ -1075,7 +1515,6 @@ pub fn run_test() -> Result<()> {
     // 11. Deactivate on the main thread, then drop everything.
     main.deactivate(stopped);
     println!("=== host-test PASS: Surge XT loads, plays, state round-trips ===");
-    println!("GUI result: {gui_report}");
     Ok(())
 }
 
@@ -1188,6 +1627,13 @@ pub struct ClapPluginInfo {
     pub name: String,
     pub vendor: String,
     pub features: Vec<String>,
+}
+
+/// Is a scanned CLAP plugin a MIDI effect — one that declares the
+/// `note-effect` feature (what an arpeggiator or chord tool declares)?
+/// Such plugins are listed; hosting them is not implemented yet.
+pub fn is_note_effect(p: &ClapPluginInfo) -> bool {
+    p.features.iter().any(|f| f == "note-effect")
 }
 
 /// Enumerate all CLAP plugins in ~/.clap (id, name, vendor, features).
@@ -2244,693 +2690,6 @@ fn voice_render_loop(
     Ok(errors)
 }
 
-// ---------------------------------------------------------------------------
-// Embedded GUI (X11 / XWayland) — host-owned parent window, no floating fallback
-// ---------------------------------------------------------------------------
-
-/// The tool shells may lack DISPLAY even though XWayland is running; find the
-/// socket and point DISPLAY at it (no-op when already set).
-fn ensure_display() {
-    if std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false) {
-        return;
-    }
-    if let Ok(entries) = std::fs::read_dir("/tmp/.X11-unix") {
-        for e in entries.flatten() {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if let Some(num) = name.strip_prefix('X') {
-                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-                    std::env::set_var("DISPLAY", format!(":{num}"));
-                    println!("DISPLAY was unset; using :{num} (XWayland socket)");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-struct ParentWindow {
-    conn: RustConnection,
-    win: u32,
-}
-
-impl ParentWindow {
-    fn new(title: &str, width: u32, height: u32) -> Result<Self> {
-        let (conn, screen_num) = x11rb::connect(None).context("connecting to X server (DISPLAY)")?;
-        let screen = &conn.setup().roots[screen_num];
-        let win = conn.generate_id()?;
-        conn.create_window(
-            screen.root_depth,
-            win,
-            screen.root,
-            40,
-            40,
-            width.min(u16::MAX as u32) as u16,
-            height.min(u16::MAX as u32) as u16,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .background_pixel(0x0020_2020)
-                .event_mask(
-                    EventMask::EXPOSURE
-                        | EventMask::STRUCTURE_NOTIFY
-                        | EventMask::SUBSTRUCTURE_NOTIFY, // observe the plugin reparenting into us
-                ),
-        )?;
-        conn.change_property8(
-            PropMode::REPLACE,
-            win,
-            AtomEnum::WM_NAME,
-            AtomEnum::STRING,
-            title.as_bytes(),
-        )?;
-        conn.map_window(win)?;
-        conn.flush()?;
-        Ok(Self { conn, win })
-    }
-
-    fn resize(&self, width: u32, height: u32) -> Result<()> {
-        self.conn.configure_window(
-            self.win,
-            &ConfigureWindowAux::new()
-                .width(width.min(u16::MAX as u32))
-                .height(height.min(u16::MAX as u32)),
-        )?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
-    /// Drain pending X events; flags reparent/create of children into us.
-    fn pump(&self, reparented: &mut bool, created: &mut bool) -> Result<()> {
-        while let Some(event) = self.conn.poll_for_event()? {
-            match event {
-                x11rb::protocol::Event::ReparentNotify(ev) => {
-                    if ev.parent == self.win {
-                        *reparented = true;
-                        println!(
-                            "X11: plugin window {} reparented into host window {} (embedding confirmed)",
-                            ev.window, self.win
-                        );
-                    }
-                }
-                x11rb::protocol::Event::CreateNotify(ev) => {
-                    if ev.parent == self.win {
-                        *created = true;
-                        println!(
-                            "X11: plugin window {} created directly inside host window {}",
-                            ev.window, self.win
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    /// Enumerate child windows with their WM_CLASS — hard evidence that the
-    /// plugin editor lives inside our host window.
-    fn describe_children(&self) -> Result<Vec<(u32, String)>> {
-        let tree = self.conn.query_tree(self.win)?.reply()?;
-        let mut out = Vec::new();
-        for &child in &tree.children {
-            let reply = self
-                .conn
-                .get_property(false, child, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)?
-                .reply()?;
-            let class = String::from_utf8_lossy(&reply.value).replace('\0', " ");
-            out.push((child, class.trim().to_string()));
-        }
-        Ok(out)
-    }
-}
-
-impl Drop for ParentWindow {
-    fn drop(&mut self) {
-        let _ = self.conn.destroy_window(self.win);
-        let _ = self.conn.flush();
-    }
-}
-
-fn run_embedded_gui(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: Option<PluginGui>,
-    duration: Duration,
-) -> String {
-    let Some(gui) = gui else {
-        return "FAILED: plugin exposes no GUI extension".into();
-    };
-    match embed_gui(plugin, &gui, duration) {
-        Ok(summary) => summary,
-        Err(e) => format!("FAILED: {e:#}"),
-    }
-}
-
-fn embed_gui(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: &PluginGui,
-    duration: Duration,
-) -> Result<String> {
-    let cfg = GuiConfiguration {
-        api_type: GuiApiType::X11,
-        is_floating: false, // embedded, per requirement — never floating
-    };
-    if let Some(pref) = gui.get_preferred_api(&plugin.plugin_handle()) {
-        println!(
-            "GUI preferred api: {} (floating={})",
-            pref.api_type.0.to_string_lossy(),
-            pref.is_floating
-        );
-    }
-    if !gui.is_api_supported(&plugin.plugin_handle(), cfg) {
-        bail!("step=is_api_supported: Surge rejected x11 embedded configuration");
-    }
-    gui.create(&plugin.plugin_handle(), cfg)
-        .context("step=create(x11, embedded)")?;
-
-    // From here on the GUI exists; make sure we destroy it on every exit path.
-    // The host parent window must outlive gui.destroy(): destroying the X11
-    // parent first would tear down the plugin's reparented child window.
-    let size = gui
-        .get_size(&plugin.plugin_handle())
-        .unwrap_or(GuiSize { width: 900, height: 600 });
-    println!("GUI initial size: {}x{}", size.width, size.height);
-    let parent = ParentWindow::new("kabelsalat P0 — Surge XT (embedded)", size.width, size.height)
-        .context("step=create host X11 parent window");
-    let result = match &parent {
-        Ok(parent) => embed_gui_inner(plugin, gui, duration, parent),
-        Err(e) => Err(anyhow!("{e:#}")),
-    };
-    let _ = gui.hide(&plugin.plugin_handle());
-    gui.destroy(&plugin.plugin_handle());
-    drop(parent); // destroys the X11 window only after the plugin GUI is gone
-    result
-}
-
-fn embed_gui_inner(
-    plugin: &mut PluginInstance<TestHost>,
-    gui: &PluginGui,
-    duration: Duration,
-    parent: &ParentWindow,
-) -> Result<String> {
-    let can_resize = gui.can_resize(&plugin.plugin_handle());
-    println!("GUI can_resize: {can_resize}");
-
-    // CLAP X11 embedding: hand the plugin our window handle; the plugin
-    // reparents its editor into it (XReparentWindow on the plugin side).
-    // SAFETY: `parent` outlives the GUI (destroyed before ParentWindow::drop).
-    unsafe {
-        gui.set_parent(&plugin.plugin_handle(), ClapWindow::from_x11_handle(parent.win as _))
-            .context("step=set_parent(x11)")?;
-    }
-    gui.show(&plugin.plugin_handle()).context("step=show")?;
-    println!("GUI embedded; running event loop for {}s", duration.as_secs());
-
-    let deadline = Instant::now() + duration;
-    let mut reparented = false;
-    let mut created = false;
-    let mut resizes = 0u32;
-    let mut children_seen = false;
-    let mut next_inspect = Instant::now() + Duration::from_secs(1);
-    while Instant::now() < deadline {
-        parent.pump(&mut reparented, &mut created)?;
-        if !children_seen && Instant::now() >= next_inspect {
-            let children = parent.describe_children()?;
-            if !children.is_empty() {
-                children_seen = true;
-                println!("X11: host window {} children: {children:?}", parent.win);
-            }
-            next_inspect = Instant::now() + Duration::from_secs(1);
-        }
-
-        // Plugin-initiated resize: adjust the host window, then confirm.
-        if let Some(req) = plugin.access_shared_handler(|h| h.resize_request.lock().unwrap().take()) {
-            let adjusted = gui.adjust_size(&plugin.plugin_handle(), req).unwrap_or(req);
-            parent.resize(adjusted.width, adjusted.height)?;
-            let _ = gui.set_size(&plugin.plugin_handle(), adjusted);
-            resizes += 1;
-        }
-        if plugin.access_shared_handler(|h| h.show_request.swap(false, Ordering::SeqCst)) {
-            let _ = gui.show(&plugin.plugin_handle());
-        }
-        if plugin.access_shared_handler(|h| h.hide_request.swap(false, Ordering::SeqCst)) {
-            let _ = gui.hide(&plugin.plugin_handle());
-        }
-        if plugin.access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst)) {
-            bail!("step=event-loop: plugin reported GUI closed unexpectedly");
-        }
-        if plugin.access_shared_handler(|h| h.callback_requested.swap(false, Ordering::SeqCst)) {
-            plugin.call_on_main_thread_callback();
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    let final_size = gui.get_size(&plugin.plugin_handle());
-    let evidence = if reparented || created || children_seen {
-        "child window confirmed in host window"
-    } else {
-        "WARNING: no child window observed"
-    };
-    Ok(format!(
-        "EMBEDDED OK (x11/XWayland, {evidence}; reparented={reparented}, created={created}, resize requests={resizes}, final size={final_size:?})"
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// EmbeddedEditor — plugin GUI inside the app's MAIN window (P1, task-15)
-// ---------------------------------------------------------------------------
-//
-// Same CLAP sequence as the P0 spike (create → set_parent → show → resize
-// pump), but the parent is the egui main window itself (X11 id obtained from
-// eframe via raw-window-handle), not a host-owned top-level. The editor is an
-// X11 CHILD of the main window, positioned by the UI into a reserved region
-// (physical pixels). One dedicated x11rb connection per editor discovers and
-// configures the child; CLAP gui requests are drained from HostShared.
-//
-// The parent window is NOT owned here — never destroy it. Teardown order is
-// gui.hide() → gui.destroy() (the plugin destroys its child itself); the X
-// connection may go away at any time afterwards.
-
-/// A rectangle in the main window's X11 coordinate space (physical pixels).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EditorRect {
-    pub x: i16,
-    pub y: i16,
-    pub w: u16,
-    pub h: u16,
-}
-
-/// Result of [`EmbeddedEditor::pump`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum EditorStatus {
-    Ok,
-    /// The plugin closed/destroyed its own GUI; the UI should drop the editor.
-    Closed,
-}
-
-pub struct EmbeddedEditor {
-    conn: RustConnection,
-    /// Main app window (borrowed, NOT owned).
-    parent: u32,
-    gui: PluginGui,
-    /// The plugin's editor window inside `parent`, once discovered.
-    child: Option<u32>,
-    /// Main-window children present before set_parent (discovery baseline).
-    baseline: Vec<u32>,
-    /// Plugin-side editor size (what Surge draws, physical px).
-    size: GuiSize,
-    /// Last region requested by the UI + when it last changed (debounce).
-    last_rect: Option<EditorRect>,
-    rect_changed: Instant,
-    /// Last geometry actually applied to the child (avoid configure spam).
-    last_geom: Option<(i16, i16, u16, u16)>,
-    mapped: bool,
-    /// Plugin reported closed/destroyed — skip hide/destroy on teardown.
-    gui_gone: bool,
-    next_evidence: Instant,
-}
-
-impl EmbeddedEditor {
-    /// Create the plugin GUI and embed it into `parent` (the main window's
-    /// X11 id), fitted to `rect`. Call on the main thread. On success the
-    /// editor is shown and (usually) already positioned; [`Self::pump`] keeps
-    /// it in sync afterwards.
-    pub fn open(main: &mut ClapVoiceMain, parent: u32, rect: EditorRect) -> Result<Self> {
-        ensure_display();
-        let gui = main
-            .gui()
-            .ok_or_else(|| anyhow!("plugin exposes no GUI extension"))?;
-        let cfg = GuiConfiguration {
-            api_type: GuiApiType::X11,
-            is_floating: false, // embedded into the main window — never floating
-        };
-        if !gui.is_api_supported(&main.instance_mut().plugin_handle(), cfg) {
-            bail!("Surge rejected x11 embedded GUI configuration");
-        }
-        gui.create(&main.instance_mut().plugin_handle(), cfg)
-            .context("step=create(x11, embedded)")?;
-        // GUI exists from here on: destroy it on every error path.
-        let result = Self::open_inner(main, gui, parent, rect);
-        if result.is_err() {
-            let _ = gui.hide(&main.instance_mut().plugin_handle());
-            gui.destroy(&main.instance_mut().plugin_handle());
-        }
-        result
-    }
-
-    fn open_inner(
-        main: &mut ClapVoiceMain,
-        gui: PluginGui,
-        parent: u32,
-        rect: EditorRect,
-    ) -> Result<Self> {
-        let (conn, _screen) = x11rb::connect(None).context("connecting to X server (DISPLAY)")?;
-        let baseline = conn
-            .query_tree(parent)
-            .context("query_tree(main window)")?
-            .reply()
-            .context("query_tree reply")?
-            .children;
-
-        // CLAP X11 embedding: hand Surge the MAIN window's id. Surge creates
-        // its editor directly as a child of it (P0: CreateNotify, no reparent).
-        // SAFETY: the main window outlives the GUI (eframe owns it; the editor
-        // is destroyed on toggle-off / app exit before the window goes away).
-        unsafe {
-            gui.set_parent(
-                &main.instance_mut().plugin_handle(),
-                ClapWindow::from_x11_handle(parent as _),
-            )
-            .context("step=set_parent(main window)")?;
-        }
-        gui.show(&main.instance_mut().plugin_handle())
-            .context("step=show")?;
-
-        let mut ed = Self {
-            conn,
-            parent,
-            gui,
-            child: None,
-            baseline,
-            size: GuiSize { width: 900, height: 600 },
-            last_rect: None,
-            rect_changed: Instant::now(),
-            last_geom: None,
-            mapped: true,
-            gui_gone: false,
-            next_evidence: Instant::now(),
-        };
-
-        // Discover the child synchronously (Surge creates it during
-        // set_parent/show) so it can be positioned before the first frame.
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while ed.child.is_none() && Instant::now() < deadline {
-            ed.discover_child();
-            if ed.child.is_none() {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        if ed.child.is_none() {
-            eprintln!("editor: no child window yet after 600 ms — will keep looking in pump()");
-        }
-        ed.fit_and_place(main, rect, true);
-        ed.log_evidence("open");
-        Ok(ed)
-    }
-
-    /// The plugin's editor X11 window, once discovered (for UI status).
-    pub fn child(&self) -> Option<u32> {
-        self.child
-    }
-
-    /// Per-frame maintenance: drain X events + CLAP gui requests, keep the
-    /// child fitted to `rect` (physical px in the main window). Main thread.
-    pub fn pump(&mut self, main: &mut ClapVoiceMain, rect: EditorRect) -> EditorStatus {
-        if self.gui_gone {
-            return EditorStatus::Closed;
-        }
-        // 1. X events on our dedicated connection (child StructureNotify).
-        loop {
-            match self.conn.poll_for_event() {
-                Ok(Some(event)) => match event {
-                    x11rb::protocol::Event::CreateNotify(ev) if ev.parent == self.parent => {
-                        if self.child.is_none() {
-                            self.adopt_child(ev.window);
-                        }
-                    }
-                    x11rb::protocol::Event::ReparentNotify(ev) if ev.parent == self.parent => {
-                        if self.child.is_none() {
-                            self.adopt_child(ev.window);
-                        }
-                    }
-                    x11rb::protocol::Event::DestroyNotify(ev) if Some(ev.window) == self.child => {
-                        eprintln!("editor: child window {} destroyed by plugin", ev.window);
-                        self.child = None;
-                        self.gui_gone = true;
-                        return EditorStatus::Closed;
-                    }
-                    _ => {}
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("editor: X event poll failed: {e}");
-                    break;
-                }
-            }
-        }
-        // 2. Child not seen yet? Poll the tree (covers missed events).
-        if self.child.is_none() {
-            self.discover_child();
-        }
-        // 3. CLAP gui requests (dispatched to the shared handler by clack).
-        let req = main
-            .instance_mut()
-            .access_shared_handler(|h| h.resize_request.lock().unwrap().take());
-        if let Some(req) = req {
-            let target = self.adjusted_fit(main, clamp_size(req, rect), rect);
-            let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
-            self.size = self
-                .gui
-                .get_size(&main.instance_mut().plugin_handle())
-                .unwrap_or(target);
-            self.last_geom = None; // force reconfigure
-            eprintln!("editor: request_resize {req:?} -> {target:?}");
-        }
-        if main.instance_mut().access_shared_handler(|h| h.show_request.swap(false, Ordering::SeqCst)) {
-            let _ = self.gui.show(&main.instance_mut().plugin_handle());
-            self.set_mapped(true);
-        }
-        if main.instance_mut().access_shared_handler(|h| h.hide_request.swap(false, Ordering::SeqCst)) {
-            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
-            self.set_mapped(false);
-        }
-        if main.instance_mut().access_shared_handler(|h| h.gui_closed.swap(false, Ordering::SeqCst)) {
-            self.gui_gone = true;
-            return EditorStatus::Closed;
-        }
-        if main.instance_mut().access_shared_handler(|h| h.callback_requested.swap(false, Ordering::SeqCst)) {
-            main.instance_mut().call_on_main_thread_callback();
-        }
-        // 4. Keep the child fitted + centered in the reserved region.
-        self.fit_and_place(main, rect, false);
-        // 5. Periodic hard evidence: the main window's child list.
-        if Instant::now() >= self.next_evidence {
-            self.log_evidence("pump");
-            self.next_evidence = Instant::now() + Duration::from_secs(5);
-        }
-        EditorStatus::Ok
-    }
-
-    /// Hide + destroy the plugin GUI (the plugin destroys its X11 child).
-    /// Consumes the editor; the X connection is dropped afterwards.
-    pub fn close(mut self, main: &mut ClapVoiceMain) {
-        if !self.gui_gone {
-            let _ = self.gui.hide(&main.instance_mut().plugin_handle());
-            self.gui.destroy(&main.instance_mut().plugin_handle());
-        }
-        self.child = None;
-        eprintln!("editor: closed (gui destroyed, main window {} untouched)", self.parent);
-    }
-
-    // -- internals ----------------------------------------------------------
-
-    /// Find a new child of the main window (vs. the pre-embed baseline) and
-    /// adopt it as the editor. Prefer Surge's WM_CLASS; else the largest new
-    /// window. Selects StructureNotify on the child to observe its lifecycle.
-    fn discover_child(&mut self) {
-        let Ok(reply) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
-            return;
-        };
-        let Ok(tree) = reply else { return };
-        let mut best: Option<(u32, u32)> = None; // (window, area)
-        for &child in &tree.children {
-            if self.baseline.contains(&child) {
-                continue;
-            }
-            let class = self.window_class(child);
-            let area = self
-                .conn
-                .get_geometry(child)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|g| g.width as u32 * g.height as u32)
-                .unwrap_or(0);
-            if class.to_lowercase().contains("surge") {
-                self.adopt_child(child);
-                return;
-            }
-            if best.map_or(true, |(_, a)| area > a) {
-                best = Some((child, area));
-            }
-        }
-        if let Some((child, _)) = best {
-            self.adopt_child(child);
-        }
-    }
-
-    fn adopt_child(&mut self, child: u32) {
-        self.child = Some(child);
-        self.baseline.push(child); // never re-adopt
-        // Observe the child's own lifecycle (destroy/configure). This does not
-        // touch the main window's event mask (winit owns that).
-        let _ = self.conn.change_window_attributes(
-            child,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
-        );
-        let _ = self.conn.flush();
-        eprintln!(
-            "editor: X11 child {} (WM_CLASS {:?}) lives INSIDE main window {} — embedded",
-            child,
-            self.window_class(child),
-            self.parent
-        );
-    }
-
-    fn window_class(&self, win: u32) -> String {
-        self.conn
-            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| String::from_utf8_lossy(&r.value).replace('\0', " ").trim().to_string())
-            .unwrap_or_default()
-    }
-
-    fn set_mapped(&mut self, mapped: bool) {
-        if self.mapped == mapped {
-            return;
-        }
-        self.mapped = mapped;
-        if let Some(child) = self.child {
-            let _ = if mapped {
-                self.conn.map_window(child)
-            } else {
-                self.conn.unmap_window(child)
-            };
-            let _ = self.conn.flush();
-        }
-    }
-
-    /// Fit the editor to the region (debounced while the region is actively
-    /// resizing) and center the child in it. `force` skips the debounce.
-    fn fit_and_place(&mut self, main: &mut ClapVoiceMain, rect: EditorRect, force: bool) {
-        if rect.w < 16 || rect.h < 16 {
-            return;
-        }
-        let region_changed = self.last_rect != Some(rect);
-        if region_changed {
-            if force {
-                self.rect_changed = Instant::now() - Duration::from_secs(1);
-            } else if self.last_rect.is_none() {
-                self.rect_changed = Instant::now();
-            }
-            self.last_rect = Some(rect);
-        }
-        // Re-fit the plugin size only once the region settles (150 ms), so
-        // live window resizes don't re-zoom Surge every frame.
-        let settled = self.rect_changed.elapsed() >= Duration::from_millis(150);
-        if (region_changed && settled) || force {
-            let desired = GuiSize { width: rect.w as u32, height: rect.h as u32 };
-            let target = self.adjusted_fit(main, desired, rect);
-            if target != self.size || force {
-                let _ = self.gui.set_size(&main.instance_mut().plugin_handle(), target);
-                self.size = self
-                    .gui
-                    .get_size(&main.instance_mut().plugin_handle())
-                    .unwrap_or(target);
-            }
-            self.last_geom = None;
-        }
-        // Center the child in the region; never exceed it (X children are
-        // only clipped by the main window, not by our reserved region).
-        let Some(child) = self.child else { return };
-        let cw = self.size.width.min(rect.w as u32) as u16;
-        let ch = self.size.height.min(rect.h as u32) as u16;
-        let cx = rect.x + ((rect.w.saturating_sub(cw)) / 2) as i16;
-        let cy = rect.y + ((rect.h.saturating_sub(ch)) / 2) as i16;
-        let geom = (cx, cy, cw, ch);
-        if self.last_geom != Some(geom) {
-            let _ = self.conn.configure_window(
-                child,
-                &ConfigureWindowAux::new()
-                    .x(cx as i32)
-                    .y(cy as i32)
-                    .width(cw as u32)
-                    .height(ch as u32),
-            );
-            let _ = self.conn.flush();
-            self.last_geom = Some(geom);
-        }
-        if !self.mapped {
-            self.set_mapped(true);
-        }
-    }
-
-    /// CLAP-correct size fitting: `set_size` must receive a size approved by
-    /// `adjust_size` (Surge snaps to its zoom steps and may round UP). Shrink
-    /// the request proportionally and re-adjust until it fits the region.
-    fn adjusted_fit(&self, main: &mut ClapVoiceMain, desired: GuiSize, rect: EditorRect) -> GuiSize {
-        let mut want = desired;
-        let mut last = desired;
-        for _ in 0..8 {
-            let adj = self
-                .gui
-                .adjust_size(&main.instance_mut().plugin_handle(), want)
-                .unwrap_or(want);
-            last = adj;
-            if adj.width <= rect.w as u32 && adj.height <= rect.h as u32 {
-                return adj;
-            }
-            let s = (rect.w as f64 / adj.width as f64).min(rect.h as f64 / adj.height as f64);
-            want = GuiSize {
-                width: ((want.width as f64 * s) as u32).max(1),
-                height: ((want.height as f64 * s) as u32).max(1),
-            };
-        }
-        last // zoom granularity may leave a few px overflow; centered anyway
-    }
-
-    /// Hard evidence: enumerate the main window's children with WM_CLASS and
-    /// geometry (x11rb query_tree — the xwininfo -tree equivalent).
-    fn log_evidence(&self, when: &str) {
-        let Ok(tree) = self.conn.query_tree(self.parent).map(|c| c.reply()) else {
-            return;
-        };
-        let Ok(tree) = tree else { return };
-        let mut lines = Vec::new();
-        for &child in &tree.children {
-            let geom = self
-                .conn
-                .get_geometry(child)
-                .ok()
-                .and_then(|c| c.reply().ok())
-                .map(|g| format!("{}x{}+{}+{}", g.width, g.height, g.x, g.y))
-                .unwrap_or_else(|| "?".into());
-            lines.push(format!(
-                "    child {} WM_CLASS {:?} geom {}{}",
-                child,
-                self.window_class(child),
-                geom,
-                if Some(child) == self.child { "  <-- Surge editor" } else { "" }
-            ));
-        }
-        eprintln!(
-            "editor evidence [{when}]: main window {} has {} child window(s):\n{}",
-            self.parent,
-            tree.children.len(),
-            lines.join("\n")
-        );
-    }
-}
-
-/// Clamp a plugin size to the reserved region (never cover the rack).
-fn clamp_size(size: GuiSize, rect: EditorRect) -> GuiSize {
-    GuiSize {
-        width: size.width.min(rect.w as u32).max(1),
-        height: size.height.min(rect.h as u32).max(1),
-    }
-}
-
 #[cfg(test)]
 mod patch_search_tests {
     use super::*;
@@ -2989,6 +2748,64 @@ mod patch_search_tests {
             }
         }
         assert!(peak > 1e-4, "Dexed should render non-zero audio after patch load (peak={peak})");
+        main.retire(voice);
+    }
+
+    /// Retiring a Dexed instance parks it instead of destroying it (#52:
+    /// its destructor segfaults while other instances render), and a later
+    /// `new_plugin` reuses the parked instance — reset to fresh state.
+    #[test]
+    fn dexed_is_parked_and_reused_not_destroyed() {
+        let plugins = list_clap_plugins();
+        let Some(dexed) = plugins.iter().find(|p| p.id == "com.digital-suburban.dexed") else {
+            return; // skip cleanly on machines without dexed-clap
+        };
+        let before = parked_clap_count(&dexed.id);
+        let (voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate");
+        assert_eq!(parked_clap_count(&dexed.id), before, "a live instance is not parked");
+        // Customize the instance so we can prove the reuse resets its state.
+        let patches = discover_dexed_patches();
+        let stock = main.save_state().expect("stock state");
+        if let Some(target) = patches.iter().find(|p| p.program != 0) {
+            load_dexed_voice(&mut main, &target.syx_path, target.program).expect("load_dexed_voice");
+        }
+        let custom = main.save_state().expect("customized state");
+        main.retire(voice);
+        assert_eq!(parked_clap_count(&dexed.id), before + 1, "retire parks a never-free instance");
+
+        let (mut voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate again");
+        assert_eq!(parked_clap_count(&dexed.id), before, "the second instance reused the parked one");
+        // The reset lands on the audio thread a few blocks later (longer on a
+        // loaded machine): render until the customized patch is gone, bounded.
+        // Not compared byte for byte with a fresh instance: Dexed's fresh state
+        // also depends on what other instances in the process did.
+        if custom != stock {
+            let mut buf = vec![0.0f32; 256 * 2];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reused = loop {
+                for _ in 0..8 {
+                    voice.render(&mut buf, Transport::default());
+                }
+                let state = main.save_state().expect("reused state");
+                if state != custom || Instant::now() > deadline {
+                    break state;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_ne!(reused, custom, "a reused instance must not keep the previous unit's patch");
+        }
+        voice.note_on(60, 0.8);
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            voice.render(&mut buf, Transport::default());
+            for &s in &buf {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(peak > 1e-4, "reused Dexed should render non-zero audio (peak={peak})");
         main.retire(voice);
     }
 }
@@ -3192,24 +3009,27 @@ mod clap_scan_tests {
         let cache_file = tmp.0.join("cache").join("clap-scan.json");
         let spawn_log = tmp.0.join("spawns.log");
         let hang = sh_cmd(&r#"printf '%s\n' "$1" >> '__LOG__'; sleep 10"#.replace("__LOG__", &spawn_log.display().to_string()));
-        let list = |cmd: &ScannerCommand| {
+        // Only the hanging scanner needs the short timeout; the "fixed" one
+        // gets a generous timeout so a loaded machine's shell spawn cannot
+        // flake the third assertion (issue #64).
+        let list = |cmd: &ScannerCommand, timeout: Duration| {
             let start = Instant::now();
-            let out = list_clap_plugins_with(&[bad.clone()], cmd, Some(&cache_file), Duration::from_millis(150), 1);
+            let out = list_clap_plugins_with(&[bad.clone()], cmd, Some(&cache_file), timeout, 1);
             (out, start.elapsed())
         };
         let spawns = || std::fs::read_to_string(&spawn_log).map_or(0, |s| s.lines().count());
 
-        let (first, _) = list(&hang);
+        let (first, _) = list(&hang, Duration::from_millis(150));
         assert!(first.is_empty());
         assert_eq!(spawns(), 1);
-        let (second, took) = list(&hang);
+        let (second, took) = list(&hang, Duration::from_millis(150));
         assert!(second.is_empty());
         assert_eq!(spawns(), 1, "a cached failure must not spawn the scanner again");
         assert!(took < Duration::from_millis(100), "cached failure still paid the timeout: {took:?}");
 
         std::fs::write(&bad, b"v2-fixed").unwrap();
         let fixed = sh_cmd(r#"printf '[{"id":"id.fixed","name":"F","vendor":"V","features":[]}]\n'"#);
-        let (third, _) = list(&fixed);
+        let (third, _) = list(&fixed, Duration::from_secs(30));
         assert_eq!(third.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["id.fixed"]);
     }
 

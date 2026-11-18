@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 
 use crate::control::{DspKind, Edge, Graph, NodeId, NodeKind, PortKind};
 use crate::llm::{self, Endpoint, LlmError, Role, Route, Transport};
-use crate::vision::Image;
 
 pub fn config_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -151,6 +150,21 @@ pub fn save_reduce_motion(reduce: bool) -> std::io::Result<()> {
     save_reduce_motion_to(&config_path(), reduce)
 }
 
+/// Persisted `session_autosave` flag in config.json (default on; off in
+/// tests, which never write the user's sessions, rule 37).
+pub fn load_session_autosave() -> bool {
+    if cfg!(test) { return false; }
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("session_autosave").and_then(Value::as_bool))
+        .unwrap_or(true)
+}
+
+pub fn save_session_autosave(on: bool) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_config_values_to(&config_path(), &[("session_autosave", json!(on))])
+}
+
 #[derive(Clone)]
 pub struct ChatLine {
     pub role: String,
@@ -164,38 +178,17 @@ pub struct ToolCall {
     pub args: Value,
 }
 
-/// What the user sent: their words, and an image when they attached one.
-#[derive(Clone, Debug, PartialEq)]
-pub struct UserMessage {
-    pub text: String,
-    pub image: Option<Image>,
-}
-
-/// What a tool call gave back: its result line, and a picture when the tool
-/// shows something (look_at_rack).
-#[derive(Clone, Debug, PartialEq)]
-pub struct ToolOutput {
-    pub text: String,
-    pub image: Option<Image>,
-}
-
-impl From<String> for ToolOutput {
-    fn from(text: String) -> Self {
-        Self { text, image: None }
-    }
-}
-
 pub enum ToWorker {
-    User(UserMessage),
+    User(String),
     /// One result per call of the last `FromWorker::ToolCalls`, in call order.
-    ToolResults(Vec<ToolOutput>),
+    ToolResults(Vec<String>),
 }
 
 /// Live phase of an in-flight assistant turn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunPhase {
     Deciding,
-    Thinking { step: usize, model: String, seeing: bool },
+    Thinking { step: usize, model: String },
 }
 
 impl RunPhase {
@@ -219,14 +212,7 @@ impl RunPhase {
     pub fn label(&self) -> String {
         match self {
             RunPhase::Deciding => "Jev · deciding".to_string(),
-            RunPhase::Thinking { step, model, seeing } => {
-                let route = Self::route_name(model);
-                if *seeing && *step <= 1 {
-                    format!("{route} · looking at the image")
-                } else {
-                    format!("{route} · step {step}")
-                }
-            }
+            RunPhase::Thinking { step, model } => format!("{} · step {step}", Self::route_name(model)),
         }
     }
 }
@@ -295,7 +281,6 @@ type SharedOptRoute = std::sync::Arc<std::sync::Mutex<Option<Route>>>;
 struct Routes {
     act: SharedRoute,
     decide: SharedOptRoute,
-    perceive: SharedRoute,
 }
 
 pub struct Assistant {
@@ -353,7 +338,6 @@ impl Assistant {
             routes: Routes {
                 act: std::sync::Arc::new(std::sync::Mutex::new(route)),
                 decide: std::sync::Arc::new(std::sync::Mutex::new(decide_active)),
-                perceive: std::sync::Arc::new(std::sync::Mutex::new(Route::configured(Role::Perceive))),
             },
             keys_present,
             decide_enabled,
@@ -494,12 +478,6 @@ impl Assistant {
                 .lock()
                 .map(|r| r.clone())
                 .unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT)),
-            Role::Perceive => self
-                .routes
-                .perceive
-                .lock()
-                .map(|r| r.clone())
-                .unwrap_or_else(|_| Route::for_model(llm::PERCEIVE_MODEL)),
         }
     }
 
@@ -542,20 +520,6 @@ impl Assistant {
                     format!("decisions model switched to {m}")
                 }
             }
-            Role::Perceive => {
-                let route = Route::for_model(m);
-                let spec = route.endpoint.spec();
-                let missing_key = !self.keys_present.has(route.endpoint) && !cfg!(test);
-                if let Ok(mut cur) = self.routes.perceive.lock() {
-                    *cur = route;
-                }
-                let _ = save_config_field(Role::Perceive.model_field(), m);
-                if missing_key {
-                    format!("vision model switched to {m}, but config.json has no {} key yet ({})", spec.label, spec.key_field)
-                } else {
-                    format!("vision model switched to {m}")
-                }
-            }
         }
     }
 
@@ -583,19 +547,12 @@ impl Assistant {
     /// Show `shown` in the transcript but send `sent` (e.g. with a state
     /// header) to the model.
     pub fn send_user_display(&mut self, shown: String, sent: String) {
-        self.send_user_message(shown, UserMessage { text: sent, image: None });
-    }
-
-    /// The same for a message that may carry an image.
-    pub fn send_user_message(&mut self, shown: String, sent: UserMessage) {
         self.history.push(ChatLine { role: "user".into(), text: shown });
         self.busy = true;
-        self.phase = Some(if sent.image.is_some() {
-            RunPhase::Thinking { step: 1, model: self.route_for(Role::Perceive).model, seeing: true }
-        } else if self.decides_first() {
+        self.phase = Some(if self.decides_first() {
             RunPhase::Deciding
         } else {
-            RunPhase::Thinking { step: 1, model: self.model(), seeing: false }
+            RunPhase::Thinking { step: 1, model: self.model() }
         });
         self.turn = TurnStats { started: Some(std::time::Instant::now()), ..TurnStats::default() };
         if let Some(tx) = &self.tx {
@@ -608,7 +565,7 @@ impl Assistant {
     }
 
     /// Answer a batch from `poll`: one result per call, in call order.
-    pub fn send_tool_results(&mut self, results: Vec<ToolOutput>) {
+    pub fn send_tool_results(&mut self, results: Vec<String>) {
         if let Some(tx) = &self.tx {
             let _ = tx.send(ToWorker::ToolResults(results));
         }
@@ -680,11 +637,17 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
-     verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
-     - See: look_at_rack gives you a screenshot of the app window as the user sees it \
-     right now (layout, what is selected, how something looks). The user can also \
-     attach an image to a message; an image is visible only during its own turn.\n\
+     verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
+     get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
+     \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima).\n\
+     - Hear: listen records the next seconds of the master and a listening model scores \
+     it 0-10 on the words you pass as attributes (take them from the user's request: \
+     \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
+     It hears only what plays during the recording: call play_note for the notes first, \
+     in the same step. Use it to check a sound you made against what the user asked for, \
+     change one thing, then listen again to compare; stop after 3 rounds.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -692,7 +655,7 @@ fn system_prompt() -> String {
      from_port 0/1 — there is no automatic rig split; low_octave/high_octave shift a zone by \
      octaves. The keys below a split are low already and many bass sounds are pitched down: \
      when you put a bass on the LOW zone, set low_octave 1 unless the user asked for a deep \
-     bass, and tell the user; if they say it is too deep or too high, step it), flip_rack.\n\
+     bass, and tell the user; if they say it is too deep or too high, step it), set_scale (keys play only one scale: out-of-scale keys snap to the nearest in-scale note), flip_rack. For arpeggios or one-key chords: add_node kind arp into the rig (it sits between the rig's Keys and its synth, already wired), then set_arp (mode up/down/up-down/chord/random, rate 1/4..1/32 synced to the tempo, octaves, gate, swing, chord shape).\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
@@ -703,7 +666,9 @@ fn system_prompt() -> String {
      transport_stop are the master and start/stop ALL of them. The master is also the \
      song clock CLAP plugins follow: play runs it from beat 0, stop halts it. \
      set_count_in(enabled, bars) enables/configures a count-in bar of clicks before \
-     the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome).\n\
+     the song clock starts (and the user can tap tempo with Shift+T or TAP on a metronome). \
+     get_midi_clock/set_midi_clock control the MIDI Clock Send: kabelsalat as the master \
+     beat clock (24 per beat, Start/Stop) for external hardware and apps.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
@@ -713,6 +678,12 @@ fn system_prompt() -> String {
      one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     - Mixing (the Mixer view, F10): every source strip has set_strip_mix (pan/mute/solo at \
+     the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
+     rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
+     before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
+     shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
+     quick knob; faders are dB with double-click at 0 dB. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -749,8 +720,7 @@ fn system_prompt() -> String {
      node=<the instrument's node id>.\n\
      Be concise and practical. When something is broken, diagnose step by step starting \
      with get_status. Notes: loading a template or adding a plugin rebuilds the current \
-     patch; only Surge XT is loadable as a CLAP instrument so far (other CLAP and LV2 \
-     instruments are coming soon); system-audio capture of the output monitor can feed \
+     patch; system-audio capture of the output monitor can feed \
      back if kabelsalat plays to the same output."
         .into()
 }
@@ -768,14 +738,28 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
-            "name":"look_at_rack",
-            "description":"See the app: a screenshot of the whole kabelsalat window as the user sees it right now (rack side in view, units, cables, mixer, open panels). Use it for questions about how something looks, what is selected or where something is; get_graph is the faster source for nodes and cables.",
+            "name":"get_engine_info",
+            "description":"The engine's load and audio session (the DSP readout beside the rigs and its Engine Info panel): dsp_percent (average render time as a share of one buffer; above 70 is high, above 90 dropouts are likely), render_avg_us, render_max_us, late_blocks (buffers that took over 80 % of their time), xruns, sample_rate, buffer_frames, buffer_ms (the output latency the buffer adds), inputs (channels of the Audio In units), outputs, midi_input_latency_ms (null until a hardware MIDI event was measured), and nodes: every instrument and effect with avg_us, max_us and percent of the buffer, most expensive first. Use it to find which unit costs CPU. The sound card's own latency and the audio-input latency are not measured and not included.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"reset_engine_peaks",
+            "description":"Start the engine's peak counters again from now: render_max_us, late_blocks, xruns and every unit's max_us (the Engine Info panel's Reset peaks button). Averages are not touched.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"measure_mix",
             "description":"Read the master-bus loudness/profile meter (Bravo measure loop): momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation + a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness measurement now (this resets the integration, not the signal).",
             "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
+        }},
+        {"type":"function","function":{
+            "name":"listen",
+            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note first in the same step. Takes about seconds + 3 s.",
+            "parameters":{"type":"object","properties":{
+                "attributes":{"type":"string","description":"Comma-separated words from the user's request the sound should match, e.g. \"8-bit, heroic\""},
+                "seconds":{"type":"number","description":"How long to record, 0.5-8 (default 4)"},
+                "question":{"type":"string","description":"Anything else to ask about the sound"}
+            }}
         }},
         {"type":"function","function":{
             "name":"play_note",
@@ -803,6 +787,16 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit with no octaves = unsplit"},"low_octave":{"type":"integer","description":"octave shift of the LOW zone, -3..3"},"high_octave":{"type":"integer","description":"octave shift of the HIGH zone, -3..3"}}}
         }},
         {"type":"function","function":{
+            "name":"set_scale",
+            "description":"Make a Keys node's keyboard play only one scale (a property of the Keys node): out-of-scale keys snap to the nearest in-scale note, so every key sounds right (GarageBand's scale-limited keys). key: C, C#, D … B (default C); scale: major | minor | dorian | mixolydian | harmonic minor | maj penta | min penta | blues (default major); off true switches snapping off. Example: {key:'A', scale:'min penta'}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"key":{"type":"string"},"scale":{"type":"string"},"off":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_arp",
+            "description":"Set an Arp unit's settings by name. Add the unit first with add_node {kind:'arp'} (it is inserted between the rig's Keys and its synth(s); held keys then arpeggiate). mode: up | down | up-down | chord | random ('chord' = each held key sounds a whole chord, shape from chord); rate: 1/4 | 1/8 | 1/8T | 1/16 | 1/16T | 1/32, synced to the tempo; octaves 1-4; gate 0.05-1 (how much of each step a note sounds); swing 0-1; chord: maj | min | sus2 | sus4 | 7 | maj7 | min7 | power. Give any subset. Example: {node:7, mode:'up-down', rate:'1/16', octaves:2}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"arp node id (get_graph, kind arp)"},"mode":{"type":"string"},"rate":{"type":"string"},"octaves":{"type":"integer"},"gate":{"type":"number"},"swing":{"type":"number"},"chord":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
             "name":"save_session",
             "description":"Save the current patch, knob values, and Surge plugin state as a named session package (.ksalat) in ~/kabelsalat-sessions.",
             "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Session name (no slashes)"}},"required":["name"]}
@@ -824,18 +818,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"play_file",
-            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
-            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"}},"required":["path"]}
+            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). AUM FilePlayer options: loop, sync (follow the tempo), beats (loop length), offset, bpm (file tempo).",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}},"required":["path"]}
         }},
         {"type":"function","function":{
             "name":"stop_file",
-            "description":"Stop the backing-track file player.",
+            "description":"Stop the backing-track file player (the file and its settings stay; play_file restarts it).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_player",
-            "description":"Set the file-player mix gain (0..1, 0 mutes) without changing what's playing.",
-            "parameters":{"type":"object","properties":{"gain":{"type":"number"}},"required":["gain"]}
+            "description":"Change the file player without restarting it: mix gain (0..1, 0 mutes) and/or the AUM FilePlayer options loop, sync, beats, offset, bpm. Give at least one.",
+            "parameters":{"type":"object","properties":{"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_device",
@@ -869,8 +863,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_cc_map",
-            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Omit param/knob to unbind that CC.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source","cc"]}
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). Omit param/knob to unbind that CC.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",
@@ -886,6 +880,61 @@ pub(crate) fn tools() -> Value {
             "name":"set_rig_mix",
             "description":"Per-rig mixer: rig index (0-based), vol 0..1, pan -1..1, mute, solo (solo mutes other rigs). Omitted fields keep their value. Example: rig 1 mute true.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"vol":{"type":"number"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["rig"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_mix",
+            "description":"Per-SOURCE mixer (#73): pan -1..1, mute, solo on ONE instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Example: node 1 pan -0.5 mute false.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_node_bypass",
+            "description":"Bypass one effect node (#74): a bypassed FX passes its input through unchanged, its knobs are kept. True = bypass, false = enable.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"FX node id (get_graph)"},"bypass":{"type":"boolean","description":"Default true"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"add_insert",
+            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_insert",
+            "description":"Remove one effect from a strip's insert chain (#74); the chain closes up (source → next). Pass fx = the effect's node id; source = its strip's source node id, omitted for a master insert.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"fx":{"type":"integer","description":"The effect node id to remove"}},"required":["fx"]}
+        }},
+        {"type":"function","function":{
+            "name":"rename_strip",
+            "description":"Rename one strip (#77): the name is the node's name, so the rack face, the mixer and saved sessions all show it. Up to 24 characters.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"name":{"type":"string"}},"required":["node","name"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_color",
+            "description":"Give a mixer strip a colour (#77): 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan), or none to clear. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"color":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"move_strip",
+            "description":"Move one source strip to slot `to` (1-based) within its rig's display order in the mixer (#77). Display only — the sound is unchanged.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"to":{"type":"integer","description":"1-based slot in its rig"}},"required":["node","to"]}
+        }},
+        {"type":"function","function":{
+            "name":"collapse_strip",
+            "description":"Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_strip_knobs",
+            "description":"List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), whether it is custom-assigned, and available knob choices. Filter optionally with node.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Optional node id to inspect one unit"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_knob",
+            "description":"Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id (from get_strip_knobs or list_params), or empty string \"\" to reset to default. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"knob":{"type":"string","description":"Knob label/name, or empty string for default"}},"required":["node","knob"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_channels",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugins",
@@ -914,18 +963,23 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"record_start",
-            "description":"Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/. Idempotent: a second start while recording is a no-op.",
+            "description":"Start recording armed targets (master mix and/or armed rig stems) to a new timestamped take folder under ~/Music/kabelsalat/. Bar-quantized when the transport rolls. Idempotent.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"record_stop",
-            "description":"Stop recording: the writer drains the ring and finalizes the WAV header. Idempotent: a stop while idle is a no-op.",
+            "description":"Stop recording: the writer drains the rings and finalizes all WAV headers. Bar-quantized when the transport rolls (a second stop stops immediately). Idempotent.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"record_status",
-            "description":"Get recording status: recording (bool), path (the last/take WAV), seconds (elapsed), dropped_frames (ring overruns), finalized.",
+            "description":"Get recording status: recording (bool), pending (bool, waiting for bar/beat 0), path, folder, seconds, dropped_frames, finalized, stems (per-rig WAV status), armed_master, armed_rigs.",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_record_arm",
+            "description":"Arm or disarm a recording target: target='master' (or omit target and rig) for the master mix, or rig=<0-based index> for a rig's post-fader stem. Armed targets record simultaneously into the same take folder.",
+            "parameters":{"type":"object","properties":{"target":{"type":"string","enum":["master","rig"],"description":"'master' or 'rig' (defaults to 'rig' when rig is given, else 'master')"},"rig":{"type":"integer","description":"0-based rig index when target is 'rig'"},"armed":{"type":"boolean","description":"true to arm, false to disarm (defaults to true)"}},"required":["armed"]}
         }},
         {"type":"function","function":{
             "name":"set_record_sync",
@@ -948,14 +1002,29 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"bars":{"type":"integer"}}}
         }},
         {"type":"function","function":{
+            "name":"get_midi_clock",
+            "description":"Read the MIDI Clock Send: whether kabelsalat sends MIDI beat clock (24 per beat) plus Start/Stop to external gear and apps, the sync offset, latency mode, song position pointer, every MIDI out port (live, wired) and the virtual port apps can subscribe to.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_midi_clock",
+            "description":"Configure the MIDI Clock Send (kabelsalat is the master clock). enabled: send clock/Start/Stop with the transport. offset_ms: shift the clock against the audio (negative = earlier; a pre-roll is added automatically at play). latency_mode: none (align to the audio output) | output (also include the sound device's output latency, for gear mixed outside kabelsalat) | input (align to the audio input, for gear fed back into kabelsalat). song_position: send Song Position Pointer + Continue when resuming. output + output_enabled: wire the clock to (or unplug it from) one MIDI out port, named as in get_midi_clock (a part of the name is enough). Starts with the next transport start.",
+            "parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"offset_ms":{"type":"number"},"latency_mode":{"type":"string","enum":["none","output","input"]},"song_position":{"type":"boolean"},"output":{"type":"string"},"output_enabled":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
             "name":"load_template",
-            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | demo | multi_rig (two independent rigs, switch view with 1-9).",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","demo","multi_rig"]}},"required":["name"]}
+            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; the player plugs a guitar or mic into the Audio In unit, whose face also carries the tuner) | demo | multi_rig (two independent rigs, switch view with 1-9).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","guitar_rig","demo","multi_rig"]}},"required":["name"]}
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). Added dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
-            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|midi_fx|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). kind midi_fx = a MIDI effect in the rig's MIDI chain (list_midi_fx): uri = an LV2 MIDI plugin (transpose, filter, …), no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"semis":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_midi_fx",
+            "description":"List the MIDI effects add_node(kind=midi_fx) can host: the built-in transposer and the installed LV2 MIDI plugins (uri). Installed CLAP note effects are listed but cannot be hosted yet.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"list_audio_outputs",
@@ -1091,18 +1160,13 @@ pub fn role_model_choices(role: Role, keys: llm::Keys, current: &str) -> Vec<Str
             let mut m = picker_models(keys.openrouter, keys.deepseek, current);
             // Not the Jev router: `picker_models` already offers it where it is
             // the default; beside DeepSeek it read as "turn Jev on" (rule 78).
-            for extra in [llm::CLAUDE_OPUS, llm::PERCEIVE_MODEL] {
+            for extra in [llm::CLAUDE_OPUS, llm::GEMINI_FLASH] {
                 if !m.iter().any(|x| x == extra) {
                     m.push(extra.to_string());
                 }
             }
             m
         }
-        Role::Perceive => vec![
-            llm::PERCEIVE_MODEL.to_string(),
-            llm::GEMINI_FLASH_25.to_string(),
-            llm::CLAUDE_OPUS.to_string(),
-        ],
     };
     let cur = current.trim();
     if !cur.is_empty() && !cur.eq_ignore_ascii_case("off") && !list.iter().any(|x| x == cur) {
@@ -1613,6 +1677,14 @@ const SHORTCUTS: &[Shortcut] = &[
     Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.",
         plan: |f, done| once(done, || Some(call("select_rig", json!({ "rig": f.rig? }))), say_result) },
     Shortcut { key: "metronome", means: "Add a metronome (a click), or start the metronome.", plan: metronome },
+    Shortcut { key: "guitar_rig", means: "Load the Guitar rig template: a live Audio In unit (guitar, mic or interface — its face carries the tuner) run through overdrive, delay and reverb into a guitar amp and cabinet, replacing the current patch. Only a request that asks for a GUITAR rig (it may name its stomps or the input); 'a new rig with a sound' is not this.",
+        plan: |_, done| once(done, || Some(call("load_template", json!({ "name": "guitar_rig" }))), |r| {
+            if r.starts_with("Loaded template 'Guitar Rig'") {
+                "Guitar rig loaded: Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master. Pick the input device on the Audio In unit's face (its tuner is there); the Delay unit's TIME and MIX are on its face.".to_string()
+            } else {
+                say_result(r)
+            }
+        }) },
     Shortcut { key: "play", means: "Start the transport (play), with no word about a metronome.",
         plan: |_, done| once(done, || Some(call("transport_play", json!({}))), say_result) },
     Shortcut { key: "stop", means: "Stop the transport.",
@@ -1718,6 +1790,7 @@ const JEV_SAMPLES: &[&str] = &[
     "Make rig 2 a bit quieter.", "make rig B a bit louder", "turn rig 1 down by 6 dB", "Pan rig 1 to the left.",
     "pan rig 2 right", "Pan rig 1 hard left and rig 2 hard right.", "Mute rig 1.", "unmute rig 1", "solo the second rig",
     "Delete rig 2.", "show rig 2", "undo that", "Why is there no sound?",
+    "Build me a guitar rig.", "Give me a guitar rig with a warm delay.",
 ];
 
 /// What a decision leads to, for the test printout.
@@ -1729,36 +1802,23 @@ fn settled_as(d: &llm::Decisions, user: &str) -> String {
     }
 }
 
-/// `kabelsalat jev-test [--image <file> <request>]`: ask the configured
-/// decisions model about sample requests and print what it decides, how
-/// sure it is and how long it took. With `--image`, ask about one request
-/// twice, without and with the image, to compare what the image adds.
+/// `kabelsalat jev-test`: ask the configured decisions model about sample
+/// requests and print what it decides, how sure it is and how long it took.
 pub fn run_jev_test() -> anyhow::Result<()> {
     let route = Route::configured(Role::Decide);
     let key = route.endpoint.key().ok_or_else(|| anyhow::anyhow!("no {} key in config.json", route.endpoint.spec().label))?;
     let mut client = llm::Client::new(llm::HttpTransport::new().map_err(anyhow::Error::msg)?);
     let context = "[context: rig in view = 1 · Rig A (index 0), units: Keys (node 0), Surge (node 1), Delay (node 3), Master (node 2) · all rigs: 1 · Rig A, 2 · Rig B, 3 · YANES, 4 · Organ]";
-    let mut ask = |request: &str, image: Option<&Image>| -> anyhow::Result<String> {
+    let mut ask = |request: &str| -> anyhow::Result<String> {
         let user = format!("{context}\n{request}");
-        let d = client.decide(&route, &key, &user, image, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let d = client.decide(&route, &key, &user, decision_questions()).map_err(|e| anyhow::anyhow!("{e}"))?;
         let show = |q: &str| d.choice(q).map_or("refused".to_string(), |(c, p)| format!("{c} {p:.2}"));
         Ok(format!("  {:>5} ms  action {:<18} rig {:<10} effect {:<15} sound {:<11} {:<48} {request}  [{}]",
             d.ms, show("action"), show("rig"), show(EFFECT.key), show(SOUND.key), settled_as(&d, &user), d.model))
     };
-    let args: Vec<String> = std::env::args().skip(2).collect();
     println!("jev-test: {} on {}", route.model, route.endpoint.spec().label);
-    if let Some(at) = args.iter().position(|a| a == "--image") {
-        let (Some(path), Some(request)) = (args.get(at + 1), args.get(at + 2)) else { anyhow::bail!("usage: jev-test --image <file> <request>") };
-        let image = Image::from_file(path, &std::fs::read(path)?).map_err(anyhow::Error::msg)?;
-        println!("image: {}, {} KB", image.describe(), image.bytes.len() / 1000);
-        for _ in 0..3 {
-            println!("text only{}", ask(request, None)?);
-            println!("with image{}", ask(request, Some(&image))?);
-        }
-        return Ok(());
-    }
     for request in JEV_SAMPLES {
-        println!("{}", ask(request, None)?);
+        println!("{}", ask(request)?);
     }
     Ok(())
 }
@@ -1770,10 +1830,6 @@ const CONTEXT_BUDGET: usize = 60_000;
 /// at the time of the call; the model asks again when it needs fresh data.
 const OLD_RESULT_CHARS: usize = 300;
 
-/// What one image counts against the budget: its base64 text is megabytes
-/// of characters, but a model reads it as about a thousand tokens.
-const IMAGE_CHARS: usize = 4_000;
-
 /// The conversation as whole turns: a user message followed by the model's
 /// messages and their tool results. Trimming drops whole turns from the
 /// front, so a tool result can never lose the call it answers.
@@ -1783,26 +1839,19 @@ struct Conversation {
 }
 
 impl Conversation {
-    /// A new user message. Tool results of earlier turns are shortened and
-    /// their images dropped: an image is sent only during its own turn.
-    fn start_turn(&mut self, user: &UserMessage) {
+    /// A new user message. Tool results of earlier turns are shortened.
+    fn start_turn(&mut self, user: &str) {
         for turn in &mut self.turns {
             for msg in turn.iter_mut() {
                 shorten_tool_result(msg);
-                drop_image(msg);
             }
         }
-        self.turns.push_back(vec![user_message(&user.text, user.image.as_ref())]);
+        self.turns.push_back(vec![json!({ "role": "user", "content": user })]);
     }
 
     /// Append a message to the current turn.
     fn push(&mut self, msg: Value) {
         if let Some(turn) = self.turns.back_mut() { turn.push(msg); }
-    }
-
-    /// Does the current turn carry an image (attached, or shown by a tool)?
-    fn has_image(&self) -> bool {
-        self.turns.back().is_some_and(|turn| turn.iter().any(|m| m["content"].is_array()))
     }
 
     fn chars(&self) -> usize {
@@ -1832,30 +1881,8 @@ impl Conversation {
     }
 }
 
-/// A user message: plain text, or text and the image as content parts. The
-/// text names the image, so the note stays when the image is dropped.
-fn user_message(text: &str, image: Option<&Image>) -> Value {
-    match image {
-        None => json!({ "role": "user", "content": text }),
-        Some(image) => json!({ "role": "user", "content": [
-            { "type": "text", "text": format!("{text}\n[image: {}]", image.describe()) },
-            image.chat_part(),
-        ]}),
-    }
-}
-
 fn message_chars(msg: &Value) -> usize {
-    match msg["content"].as_array() {
-        None => msg.to_string().len(),
-        Some(parts) => parts.iter().map(|p| p["text"].as_str().map_or(IMAGE_CHARS, str::len)).sum(),
-    }
-}
-
-/// Replace a message's image by one line that says it was there.
-fn drop_image(msg: &mut Value) {
-    let Some(parts) = msg["content"].as_array() else { return };
-    let text: Vec<&str> = parts.iter().filter_map(|p| p["text"].as_str()).collect();
-    msg["content"] = json!(format!("{} — no longer attached: an image is sent only during its own turn", text.join("\n")));
+    msg.to_string().len()
 }
 
 fn shorten_tool_result(msg: &mut Value) {
@@ -1877,15 +1904,14 @@ enum TurnEnd {
     Answered,
     Failed(String),
     /// The user wrote again while tool calls were out: that message is next.
-    Interrupted(UserMessage),
+    Interrupted(String),
     /// The app is gone.
     Closed,
 }
 
 /// The agent loop: one turn per user message. A decisions model (Jev) is
 /// asked first and settles a simple request with a plan of tool calls;
-/// everything else goes to a chat model (the acting model, or the seeing
-/// model while the turn carries an image), whose tool calls travel to the
+/// everything else goes to the acting chat model, whose tool calls travel to the
 /// app as ONE batch per model step and come back as one batch of results.
 fn worker<T: Transport>(
     mut client: llm::Client<T>,
@@ -1897,7 +1923,7 @@ fn worker<T: Transport>(
     let system = system_prompt();
     let tools = tools();
     let mut convo = Conversation::default();
-    let mut next_user: Option<UserMessage> = None;
+    let mut next_user: Option<String> = None;
     loop {
         let user = match next_user.take() {
             Some(message) => message,
@@ -1925,7 +1951,7 @@ fn worker<T: Transport>(
 
 /// Send one batch of tool calls to the app and take its results (one per
 /// call, in call order). Err = the turn ends here.
-fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWorker>) -> Result<Vec<ToolOutput>, TurnEnd> {
+fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWorker>) -> Result<Vec<String>, TurnEnd> {
     let _ = tx.send(FromWorker::ToolCalls(batch));
     match rx.recv_timeout(TOOL_TIMEOUT) {
         Ok(ToWorker::ToolResults(ran)) => Ok(ran),
@@ -1940,19 +1966,12 @@ fn run_batch(batch: Vec<ToolCall>, rx: &Receiver<ToWorker>, tx: &Sender<FromWork
 const NOT_RUN: &str = "no result: the call did not run";
 
 /// Record one batch in the conversation the way a chat model's step looks:
-/// the assistant's tool calls, each call's result, then every image a tool
-/// showed (a tool message carries text only). A call without a result gets
-/// `NOT_RUN`: an unanswered call makes the next request invalid.
-fn record_batch(convo: &mut Conversation, calls: &[(Value, &str)], results: Vec<Option<ToolOutput>>) {
-    let mut shown: Vec<Value> = Vec::new();
-    for ((id, name), result) in calls.iter().zip(results) {
-        let out = result.unwrap_or_else(|| NOT_RUN.to_string().into());
-        convo.push(json!({ "role": "tool", "tool_call_id": id, "content": out.text }));
-        if let Some(image) = &out.image {
-            shown.push(user_message(&format!("[what {name} shows]"), Some(image)));
-        }
+/// the assistant's tool calls, then each call's result. A call without a
+/// result gets `NOT_RUN`: an unanswered call makes the next request invalid.
+fn record_batch(convo: &mut Conversation, ids: &[Value], results: Vec<Option<String>>) {
+    for (id, result) in ids.iter().zip(results) {
+        convo.push(json!({ "role": "tool", "tool_call_id": id, "content": result.unwrap_or_else(|| NOT_RUN.to_string()) }));
     }
-    for message in shown { convo.push(message); }
 }
 
 /// Ask Jev about the request. When it is sure of a shortcut, run that
@@ -1963,20 +1982,16 @@ fn decide_turn<T: Transport>(
     client: &mut llm::Client<T>,
     jev: &Route,
     key_for: fn(Endpoint) -> Option<String>,
-    user: &UserMessage,
+    user: &str,
     convo: &mut Conversation,
     rx: &Receiver<ToWorker>,
     tx: &Sender<FromWorker>,
 ) -> Option<TurnEnd> {
-    // An image turn goes straight to the seeing model. Measured with
-    // `jev-test --image`: Jev reads a note in an image, but cannot return a
-    // value it states, and what it sees leaks into the rig and slot answers.
-    if user.image.is_some() { return None; }
     let key = key_for(jev.endpoint)?;
     let _ = tx.send(FromWorker::Phase(RunPhase::Deciding));
-    let decision = client.decide(jev, &key, &user.text, None, decision_questions()).ok()?;
+    let decision = client.decide(jev, &key, user, decision_questions()).ok()?;
     let _ = tx.send(FromWorker::Step(StepStat { ms: decision.ms, model: decision.model.clone(), attempts: decision.attempts, rejected: 0 }));
-    let (shortcut, facts, mut step) = settle(&decision, &user.text)?;
+    let (shortcut, facts, mut step) = settle(&decision, user)?;
     let mut done: Vec<String> = Vec::new();
     for round in 0..MAX_PLAN_BATCHES {
         let calls = match step {
@@ -1991,8 +2006,8 @@ fn decide_turn<T: Transport>(
         // later chat step knows what was done. DeepSeek's thinking models
         // answer 400 to a tool call they did not issue themselves unless
         // it carries `reasoning_content` (empty will do).
-        let ids: Vec<(Value, &str)> = calls.iter().enumerate().map(|(i, c)| (json!(format!("jev-{round}-{i}")), c.name.as_str())).collect();
-        convo.push(json!({ "role": "assistant", "content": null, "reasoning_content": "", "tool_calls": calls.iter().zip(&ids).map(|(c, (id, _))| json!({
+        let ids: Vec<Value> = (0..calls.len()).map(|i| json!(format!("jev-{round}-{i}"))).collect();
+        convo.push(json!({ "role": "assistant", "content": null, "reasoning_content": "", "tool_calls": calls.iter().zip(&ids).map(|(c, id)| json!({
             "id": id, "type": "function", "function": { "name": c.name, "arguments": c.args.to_string() },
         })).collect::<Vec<_>>() }));
         let (ran, stopped) = match run_batch(calls.clone(), rx, tx) {
@@ -2000,8 +2015,8 @@ fn decide_turn<T: Transport>(
             Err(end) => (Vec::new(), Some(end)),
         };
         let mut ran = ran.into_iter();
-        let results: Vec<Option<ToolOutput>> = calls.iter().map(|_| ran.next()).collect();
-        done.extend(results.iter().map(|r| r.as_ref().map_or(NOT_RUN.to_string(), |out| out.text.clone())));
+        let results: Vec<Option<String>> = calls.iter().map(|_| ran.next()).collect();
+        done.extend(results.iter().map(|r| r.clone().unwrap_or_else(|| NOT_RUN.to_string())));
         record_batch(convo, &ids, results);
         if stopped.is_some() { return stopped; }
         step = (shortcut.plan)(&facts, &done)?;
@@ -2022,23 +2037,14 @@ fn run_turn<T: Transport>(
 ) -> TurnEnd {
     for step_idx in 0..MAX_STEPS {
         convo.fit(CONTEXT_BUDGET);
-        // The acting model may not see images: from the step an image
-        // enters the turn, the seeing model acts.
-        let sees = convo.has_image();
-        let route = if sees {
-            routes.perceive.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::PERCEIVE_MODEL))
-        } else {
-            routes.act.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT))
-        };
+        let route = routes.act.lock().map(|r| r.clone()).unwrap_or_else(|_| Route::for_model(llm::DEEPSEEK_CHAT));
         let spec = route.endpoint.spec();
         let Some(key) = key_for(route.endpoint) else {
-            let need = if sees { format!("an image needs {} ({})", route.model, spec.label) } else { format!("no {} API key", spec.label) };
-            return TurnEnd::Failed(format!("{need}: add {} to {}", spec.key_field, config_path().display()));
+            return TurnEnd::Failed(format!("no {} API key: add {} to {}", spec.label, spec.key_field, config_path().display()));
         };
         let _ = tx.send(FromWorker::Phase(RunPhase::Thinking {
             step: step_idx + 1,
             model: route.model.clone(),
-            seeing: sees,
         }));
         let body = json!({ "messages": convo.request(system), "tools": tools, "tool_choice": "auto" });
         let done = match client.chat(&route, &key, body) {
@@ -2061,16 +2067,16 @@ fn run_turn<T: Transport>(
 
         // Each call is answered either here (it does not fit its tool) or
         // by the app (it ran).
-        let mut results: Vec<Option<ToolOutput>> = Vec::with_capacity(calls.len());
+        let mut results: Vec<Option<String>> = Vec::with_capacity(calls.len());
         let mut batch: Vec<ToolCall> = Vec::new();
-        let mut ids: Vec<(Value, &str)> = Vec::with_capacity(calls.len());
+        let mut ids: Vec<Value> = Vec::with_capacity(calls.len());
         for call in &calls {
             let name = call.pointer("/function/name").and_then(|n| n.as_str()).unwrap_or("");
             let raw = call.pointer("/function/arguments").and_then(|a| a.as_str()).unwrap_or("");
-            ids.push((call.get("id").cloned().unwrap_or(Value::Null), name));
+            ids.push(call.get("id").cloned().unwrap_or(Value::Null));
             match parse_tool_call(tools, name, raw) {
                 Ok(args) => { batch.push(ToolCall { name: name.to_string(), args }); results.push(None); }
-                Err(why) => results.push(Some(why.into())),
+                Err(why) => results.push(Some(why)),
             }
         }
         let _ = tx.send(step(calls.len() - batch.len()));
@@ -2171,9 +2177,6 @@ mod tests {
         drive_with(replies, inbox, Some(Route::for_model(llm::JEV)), |_| Some("test-key".to_string()))
     }
 
-    /// The model that acts while a turn carries an image.
-    const SEEING: &str = "google/gemini-3.8-flash";
-
     fn drive_with(replies: Vec<Result<Reply, String>>, inbox: Vec<ToWorker>, decide: Option<Route>, key_for: fn(Endpoint) -> Option<String>) -> (Vec<FromWorker>, Vec<Value>) {
         let probe = FakeTransport::new(replies);
         let (tx_in, rx_in) = channel();
@@ -2183,23 +2186,14 @@ mod tests {
         let routes = Routes {
             act: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(llm::JEV_ROUTER))),
             decide: std::sync::Arc::new(std::sync::Mutex::new(decide)),
-            perceive: std::sync::Arc::new(std::sync::Mutex::new(Route::for_model(SEEING))),
         };
         worker(llm::Client::new(probe.clone()), routes, key_for, rx_in, tx_out);
         (rx_out.try_iter().collect(), probe.requests().into_iter().map(|(_, _, body)| body).collect())
     }
 
-    fn user(text: &str) -> ToWorker { ToWorker::User(UserMessage { text: text.to_string(), image: None }) }
+    fn user(text: &str) -> ToWorker { ToWorker::User(text.to_string()) }
 
-    fn results(r: &[&str]) -> ToWorker { ToWorker::ToolResults(r.iter().map(|s| s.to_string().into()).collect()) }
-
-    fn image(name: &str) -> Image {
-        Image { name: name.into(), format: crate::vision::Format::Png, bytes: vec![1, 2, 3].into(), size: Some([640, 400]) }
-    }
-
-    fn user_with_image(text: &str) -> ToWorker {
-        ToWorker::User(UserMessage { text: text.to_string(), image: Some(image("note.png")) })
-    }
+    fn results(r: &[&str]) -> ToWorker { ToWorker::ToolResults(r.iter().map(|s| s.to_string()).collect()) }
 
     fn messages(request: &Value) -> &Vec<Value> { request["messages"].as_array().unwrap() }
 
@@ -2318,10 +2312,6 @@ mod tests {
         }
     }
 
-    fn says(text: &str) -> UserMessage {
-        UserMessage { text: text.to_string(), image: None }
-    }
-
     fn tool_step(id: &str, result: &str) -> Vec<Value> {
         vec![
             json!({"role": "assistant", "content": null, "tool_calls": [{"id": id, "type": "function", "function": {"name": "get_graph", "arguments": "{}"}}]}),
@@ -2332,12 +2322,12 @@ mod tests {
     #[test]
     fn old_turns_keep_a_short_form_of_their_tool_results() {
         let mut c = Conversation::default();
-        c.start_turn(&says("first"));
+        c.start_turn("first");
         for m in tool_step("c1", &"g".repeat(5_000)) { c.push(m); }
         c.push(json!({"role": "assistant", "content": "done"}));
         let result = |msgs: &[Value]| msgs.iter().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
         assert_eq!(result(&c.request("sys")).len(), 5_000, "the current turn keeps its results whole");
-        c.start_turn(&says("second"));
+        c.start_turn("second");
         let msgs = c.request("sys");
         assert_no_orphans(&msgs);
         let old = result(&msgs);
@@ -2349,7 +2339,7 @@ mod tests {
     fn over_budget_the_oldest_turns_go_whole_and_the_current_turn_stays() {
         let mut c = Conversation::default();
         for i in 0..6 {
-            c.start_turn(&says(&format!("request {i}")));
+            c.start_turn(&format!("request {i}"));
             for m in tool_step(&format!("c{i}"), "ok") { c.push(m); }
             c.push(json!({"role": "assistant", "content": "x".repeat(900)}));
         }
@@ -2366,7 +2356,7 @@ mod tests {
     #[test]
     fn a_turn_too_big_on_its_own_shortens_its_earlier_results_not_the_latest() {
         let mut c = Conversation::default();
-        c.start_turn(&says("build it"));
+        c.start_turn("build it");
         for i in 0..3 {
             for m in tool_step(&format!("c{i}"), &format!("{i}").repeat(4_000)) { c.push(m); }
         }
@@ -2438,12 +2428,8 @@ mod tests {
     fn run_phase_labels_name_route_and_action() {
         assert_eq!(RunPhase::Deciding.label(), "Jev · deciding");
         assert_eq!(
-            RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }.label(),
+            RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }.label(),
             "DeepSeek · step 2"
-        );
-        assert_eq!(
-            RunPhase::Thinking { step: 1, model: "google/gemini-3.8-flash".into(), seeing: true }.label(),
-            "Gemini · looking at the image"
         );
     }
 
@@ -2873,74 +2859,6 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_with_an_image_goes_to_the_seeing_model_and_skips_the_decision() {
-        let (events, requests) = drive_with_jev(vec![text(SEEING, "The note says 90.")], vec![user_with_image("What does the note say?")]);
-        assert_eq!(said(&events), vec!["The note says 90."]);
-        assert_eq!(requests.len(), 1, "no decisions request");
-        assert_eq!(requests[0]["model"], SEEING);
-        let sent = messages(&requests[0]).last().unwrap();
-        assert_eq!(sent["role"], "user");
-        assert_eq!(sent["content"], json!([
-            {"type": "text", "text": "What does the note say?\n[image: note.png (640×400 px)]"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AQID"}},
-        ]));
-    }
-
-    #[test]
-    fn an_image_is_sent_only_during_its_own_turn() {
-        let (_, requests) = drive(
-            vec![text(SEEING, "It says 90."), text("m", "Yes.")],
-            vec![user_with_image("What does the note say?"), user("Thanks. Still there?")],
-        );
-        assert_eq!(requests[1]["model"], llm::JEV_ROUTER, "a text turn is back on the acting model");
-        let msgs = messages(&requests[1]);
-        assert!(!requests[1].to_string().contains("image_url"), "no image in the next turn's request");
-        let old = msgs.iter().find(|m| m["role"] == "user").unwrap()["content"].as_str().expect("the old message is plain text again");
-        assert!(old.starts_with("What does the note say?\n[image: note.png (640×400 px)] — no longer attached"), "{old}");
-        assert!(msgs.iter().any(|m| m["content"] == "It says 90."), "what was seen stays as the answer");
-    }
-
-    #[test]
-    fn an_image_a_tool_shows_follows_the_tool_results_and_moves_the_turn_to_the_seeing_model() {
-        let shot = ToolOutput { text: "screenshot of the kabelsalat window: window (640×400 px)".into(), image: Some(image("window")) };
-        let (events, requests) = drive(
-            vec![calls(&[("c1", "look_at_rack", "{}"), ("c2", "get_status", "{}")]), text(SEEING, "The mixer is open.")],
-            vec![user("What is on screen?"), ToWorker::ToolResults(vec![shot, "{}".to_string().into()])],
-        );
-        assert_eq!(said(&events), vec!["The mixer is open."]);
-        assert_eq!(requests[0]["model"], llm::JEV_ROUTER, "the acting model asks to look");
-        assert_eq!(requests[1]["model"], SEEING, "the seeing model reads the screenshot");
-        let msgs = messages(&requests[1]);
-        assert_no_orphans(&msgs[1..]);
-        let roles: Vec<&str> = msgs[1..].iter().map(|m| m["role"].as_str().unwrap()).collect();
-        assert_eq!(roles, vec!["user", "assistant", "tool", "tool", "user"], "the image comes after every tool result");
-        assert_eq!(msgs[3]["content"], "screenshot of the kabelsalat window: window (640×400 px)");
-        assert_eq!(msgs[5]["content"][0]["text"], "[what look_at_rack shows]\n[image: window (640×400 px)]");
-        assert_eq!(msgs[5]["content"][1]["type"], "image_url");
-    }
-
-    #[test]
-    fn an_image_counts_as_a_page_of_text_not_as_its_megabytes() {
-        let mut c = Conversation::default();
-        c.start_turn(&says("earlier"));
-        c.push(json!({"role": "assistant", "content": "ok"}));
-        let big = Image { bytes: vec![7; 300_000].into(), ..image("big.png") };
-        c.start_turn(&UserMessage { text: "look".into(), image: Some(big) });
-        assert!(c.request("sys").last().unwrap().to_string().len() > CONTEXT_BUDGET, "the base64 alone is past the budget");
-        c.fit(CONTEXT_BUDGET);
-        assert_eq!(c.turns.len(), 2, "the earlier turn stays");
-        assert!(c.has_image());
-        assert!(c.chars() < 2 * IMAGE_CHARS);
-    }
-
-    #[test]
-    fn an_image_without_a_key_for_the_seeing_model_is_named_and_nothing_is_sent() {
-        let (events, requests) = drive_with(vec![], vec![user_with_image("what is this?")], None, |_| None);
-        assert!(requests.is_empty());
-        assert!(matches!(&events[..], [FromWorker::Error(e), FromWorker::Done] if e.contains("an image needs google/gemini-3.8-flash") && e.contains("openrouter_api_key")), "{events:?}");
-    }
-
-    #[test]
     fn remove_config_field_removes_only_target_and_preserves_mode() {
         let dir = std::env::temp_dir().join(format!("ksalat-rm-field-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2964,14 +2882,11 @@ mod tests {
         assert!(!act_choices.iter().any(|m| m == llm::JEV_ROUTER), "no Jev router beside DeepSeek: {act_choices:?}");
         assert!(role_model_choices(Role::Act, llm::Keys { openrouter: true, deepseek: false }, llm::JEV_ROUTER).iter().any(|m| m == llm::JEV_ROUTER));
         assert!(act_choices.iter().any(|m| m == llm::CLAUDE_OPUS));
-        assert!(act_choices.iter().any(|m| m == llm::PERCEIVE_MODEL));
+        assert!(act_choices.iter().any(|m| m == llm::GEMINI_FLASH));
 
         let mut a = Assistant::new();
         a.set_role_model(Role::Act, llm::CLAUDE_OPUS);
         assert_eq!(a.route_for(Role::Act), Route { endpoint: Endpoint::OpenRouter, model: llm::CLAUDE_OPUS.into() });
-
-        a.set_role_model(Role::Perceive, llm::GEMINI_FLASH_25);
-        assert_eq!(a.route_for(Role::Perceive), Route { endpoint: Endpoint::OpenRouter, model: llm::GEMINI_FLASH_25.into() });
 
         a.set_decide_enabled(false);
         assert!(!a.decide_enabled());

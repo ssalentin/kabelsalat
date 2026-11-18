@@ -1,6 +1,7 @@
 /target
 /dist
 /.flatpak-builder
+/packaging/flatpak/cargo-sources.json
 
 # Stray screenshots and scratch images never belong at the root (rule 108)
 /*.png

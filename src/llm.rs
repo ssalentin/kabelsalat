@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::vision::Image;
-
 /// An OpenAI-compatible chat-completions service.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Endpoint {
@@ -61,20 +59,16 @@ pub enum Role {
     /// Act: a chat model reads the request and calls tools, for everything
     /// the decision alone does not settle.
     Act,
-    /// See: a multimodal chat model that acts in place of the acting model
-    /// for a turn that carries an image.
-    Perceive,
 }
 
 impl Role {
-    pub const ALL: [Role; 3] = [Role::Decide, Role::Act, Role::Perceive];
+    pub const ALL: [Role; 2] = [Role::Decide, Role::Act];
 
     /// The config.json field that overrides this role's model.
     pub fn model_field(self) -> &'static str {
         match self {
             Role::Decide => "agent_decide_model",
             Role::Act => "agent_act_model",
-            Role::Perceive => "agent_perceive_model",
         }
     }
 
@@ -82,7 +76,6 @@ impl Role {
         match self {
             Role::Decide => "Decisions (Jev)",
             Role::Act => "Chat model",
-            Role::Perceive => "Vision model",
         }
     }
 }
@@ -100,9 +93,8 @@ pub const JEV: &str = "~typesafe/jev-latest";
 /// have only an OpenRouter key.
 pub const JEV_ROUTER: &str = "typesafe/jev-router";
 pub const DEEPSEEK_CHAT: &str = "deepseek-chat";
-pub const PERCEIVE_MODEL: &str = "google/gemini-3.8-flash";
+pub const GEMINI_FLASH: &str = "google/gemini-3.8-flash";
 pub const CLAUDE_OPUS: &str = "anthropic/claude-opus-5.5";
-pub const GEMINI_FLASH_25: &str = "google/gemini-2.5-flash";
 
 impl Route {
     /// The endpoint follows the id's shape: OpenRouter ids are
@@ -124,7 +116,6 @@ impl Route {
             Role::Decide => Route::for_model(JEV),
             Role::Act if keys.openrouter && !keys.deepseek => Route::for_model(JEV_ROUTER),
             Role::Act => Route::for_model(DEEPSEEK_CHAT),
-            Role::Perceive => Route::for_model(PERCEIVE_MODEL),
         }
     }
 
@@ -367,18 +358,12 @@ impl<T: Transport> Client<T> {
     }
 
     /// Ask a decisions model typed `questions` (noul, choice, score) about
-    /// `request`, and about `image` when one is attached: one request, one
-    /// probability-backed answer per question.
-    pub fn decide(&mut self, route: &Route, key: &str, request: &str, image: Option<&Image>, questions: Value) -> Result<Decisions, LlmError> {
+    /// `request`: one request, one probability-backed answer per question.
+    pub fn decide(&mut self, route: &Route, key: &str, request: &str, questions: Value) -> Result<Decisions, LlmError> {
         let spec = route.endpoint.spec();
         let url = spec.decisions_url
             .ok_or_else(|| LlmError::Request(format!("{} has no decisions endpoint (model {})", spec.label, route.model)))?;
-        let mut body = serde_json::json!({ "model": route.model, "state": request, "questions": questions });
-        if let Some(image) = image {
-            // Jev reads an asset where the state names its key.
-            body["state"] = serde_json::json!({ "request": request, "image": IMAGE_ASSET });
-            body["assets"] = serde_json::json!({ IMAGE_ASSET: image.decision_asset() });
-        }
+        let body = serde_json::json!({ "model": route.model, "state": request, "questions": questions });
         let started = std::time::Instant::now();
         let (answer, attempts) = self.post(spec.label, url, key, &body)?;
         let answers = answer.get("answers").and_then(|a| a.as_object())
@@ -387,9 +372,6 @@ impl<T: Transport> Client<T> {
         Ok(Decisions { answers, model: model_of(&answer), ms: started.elapsed().as_millis() as u64, attempts })
     }
 }
-
-/// The key a decisions request's image goes under in `assets`.
-const IMAGE_ASSET: &str = "attached_image";
 
 fn model_of(answer: &Value) -> String {
     answer.get("model").and_then(|m| m.as_str()).unwrap_or("").to_string()
@@ -472,7 +454,6 @@ mod tests {
         assert_eq!(Route::resolve(Role::Act, None, BOTH), Route { endpoint: Endpoint::DeepSeek, model: DEEPSEEK_CHAT.into() });
         assert_eq!(Route::resolve(Role::Act, None, ONLY_OPENROUTER), Route { endpoint: Endpoint::OpenRouter, model: JEV_ROUTER.into() });
         assert_eq!(Route::resolve(Role::Act, None, NONE).endpoint, Endpoint::DeepSeek, "the key box asks for a DeepSeek key");
-        assert_eq!(Route::resolve(Role::Perceive, None, BOTH), Route { endpoint: Endpoint::OpenRouter, model: "google/gemini-3.8-flash".into() });
     }
 
     #[test]
@@ -485,7 +466,7 @@ mod tests {
             "id":"gen-dec-1","model":"typesafe/jev-1.13-20260917","provider":"TypeSafe","usage":{"cost":0.00002,"input_tokens":476,"output_tokens":70}}"#;
         let probe = FakeTransport::new(vec![status(503, "{}"), status(200, body)]);
         let out = Client::new(probe.clone())
-            .decide(&Route::for_model(JEV), "k", "My checkout page is blank.", None, json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
+            .decide(&Route::for_model(JEV), "k", "My checkout page is blank.", json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
             .unwrap();
         assert_eq!(out.answers["is_bug"], Answer::Noul(0.96));
         assert_eq!(out.choice("team"), Some(("payments", 0.84)));
@@ -499,19 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_about_an_image_sends_it_once_as_an_asset_the_state_names() {
-        let probe = FakeTransport::new(vec![status(200, r#"{"answers":{},"model":"m"}"#)]);
-        let image = Image { name: "note.png".into(), format: crate::vision::Format::Png, bytes: vec![1, 2, 3].into(), size: Some([4, 2]) };
-        Client::new(probe.clone()).decide(&Route::for_model(JEV), "k", "Do what the note says.", Some(&image), json!({})).unwrap();
-        let (_, _, sent) = &probe.requests()[0];
-        assert_eq!(sent["state"], json!({"request": "Do what the note says.", "image": "attached_image"}));
-        assert_eq!(sent["assets"], json!({"attached_image": {"type": "image", "format": "png", "data_base64": "AQID"}}));
-    }
-
-    #[test]
     fn a_decision_needs_an_endpoint_that_has_decisions() {
         let probe = FakeTransport::new(vec![]);
-        let out = Client::new(probe.clone()).decide(&Route::for_model(DEEPSEEK_CHAT), "k", "x", None, json!({}));
+        let out = Client::new(probe.clone()).decide(&Route::for_model(DEEPSEEK_CHAT), "k", "x", json!({}));
         assert!(matches!(out, Err(LlmError::Request(m)) if m.contains("no decisions endpoint")));
         assert!(probe.requests().is_empty());
     }
@@ -519,7 +490,7 @@ mod tests {
     #[test]
     fn a_configured_model_overrides_the_default_and_picks_its_endpoint() {
         assert_eq!(Route::resolve(Role::Act, Some("deepseek-reasoner"), ONLY_OPENROUTER).endpoint, Endpoint::DeepSeek);
-        let r = Route::resolve(Role::Perceive, Some("anthropic/claude-opus-5.5"), NONE);
+        let r = Route::resolve(Role::Act, Some("anthropic/claude-opus-5.5"), NONE);
         assert_eq!((r.endpoint, r.model.as_str()), (Endpoint::OpenRouter, "anthropic/claude-opus-5.5"));
     }
 

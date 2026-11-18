@@ -8,6 +8,43 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Controller range on a MIDI-mapped knob:** right-click a bound knob and
+  set MIN / MAX under *Controller range*. The controller's whole travel then
+  spans only that stretch, so an expression pedal on organ drive can be held
+  below 60 % and still use its full sweep. The knob shows the reachable
+  stretch in blue between two ticks, *Full range* lifts the limit, and the
+  range is saved with the session. Agents set it with `set_cc_map`
+  `min`/`max`, and `list_cc_maps` reports it.
+- **MIDI strip on the software keyboard:** the keyboard dock now carries a
+  pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
+  its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's
+  VEL knob), like GarageBand's. They go out as the Keys source, so every rig
+  the keys feed responds, and they light the Keys unit's MIDI cables. Pitch
+  bend from a hardware controller now reaches the instruments too, and CC 1 /
+  CC 64 reach LV2 instruments as they already reached CLAP ones (#97).
+- **The assistant can listen (#35).** A new `listen` tool records a few
+  seconds of the master and sends them to an audio-capable model on
+  OpenRouter (Gemini 3.8 Flash by default; `agent_listen_model` in
+  config.json picks another). The model scores the sound 0-10 on the words
+  of your request ("8-bit", "heroic", "warm") and says what it heard and how
+  to move toward them. The agent plays notes, listens, changes one thing and
+  listens again. A listen takes the recording plus about 3 s. It needs an
+  OpenRouter key; without one the agent is pointed at `measure_mix`. MCP
+  agents get the same `listen` tool, headless and attached.
+  `kabelsalat listen-test` checks that the model ranks known reference clips
+  the right way round and prints its latency.
+- **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
+  Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
+  editor pane, in a window of its own, and closes from the same button or the
+  window's close button. kabelsalat now runs the plugin's timers and file
+  descriptor callbacks, which these editors paint from.
+  `kabelsalat editor-test` opens, checks and closes every installed editor.
+- **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
+  `.vital` patches, wavetables and modulation included. Its sound list in the
+  editor and the assistant's `list_sounds` / `load_sound` show every patch in
+  Vitalium's folder. Drop a `.vitalbank` or `.vital` file on the window to add
+  it (or run `kabelsalat vital-import <file>`). A loaded patch is kept in saved
+  sessions, through rig edits and through undo.
 - **Instrument profiles: map a whole hardware instrument at once.** Pick the
   instrument for a hardware port in the MIDI matrix (a port whose name names
   the instrument is matched by itself) and its knobs, drawbars and switches
@@ -21,12 +58,28 @@ releases may still change behaviour and session files.
   search and load them. Floe installs from its release on x86_64; it publishes
   no aarch64 Linux build, and its card says so there. Release downloads are
   checked against a pinned SHA-256.
+- **Aeolus in the instrument catalog:** a pipe organ with additive pipe
+  models, several divisions of stops and a convolution reverb. It installs
+  from its v0.3.0 release on x86_64 and builds from source on aarch64.
+  Aeolus starts with every stop off, so kabelsalat starts it with a
+  principal chorus drawn, and `list_sounds` / `load_sound` offer 12
+  registrations (principals, flutes, celeste, reeds, full organ). The
+  Aeolus unit has a stop panel like a console's stop jamb: Manual III, II,
+  I and Pedal down the left, and each stop of the shown division with an
+  indicator light; a click draws it or pushes it in. The panel reads the stops
+  back from the plugin, so it follows sound and session loads.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code
   and the project's website. `list_instruments` reports the same fields.
 - **GitHub stars on catalog cards:** each card shows its project's star count
   (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
   opens. Without internet access, or when GitHub refuses, cards show no stars.
+- **Sessions save themselves (#51):** with *Autosave sessions* on (Settings,
+  on by default) the open session is written every 20 s when it changed, and
+  on quit; a patch that was never saved goes to `Autosave`. Loading a session
+  or saving one makes it the open session; a starter template never replaces
+  it. Each saved session has an **Overwrite** action (with a confirm) that
+  saves the current patch over it, and the open session is marked in the list.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).
@@ -42,7 +95,19 @@ releases may still change behaviour and session files.
   the low keys it is played on; the assistant sets the LOW zone an octave up
   when it puts a bass there. Saved with the session.
 
+### Removed
+- **Image input for the assistant:** dropping or pasting an image into the
+  chat, the `look_at_rack` screenshot tool (in-app and MCP), the vision model
+  role (`agent_perceive_model` in Settings and config.json) and
+  `jev-test --image` are gone. The agent works from text and the rack's own
+  data. Dropped `.vital` / `.vitalbank` files are still imported.
+
 ### Changed
+- **Native Wayland:** the app no longer forces XWayland and needs no X
+  server. It renders at the compositor's fractional scale (sharp at 1.6x),
+  opens maximized as it asks to, and text input goes through the Wayland
+  input method instead of fcitx's X bridge. The Flatpak drops its X11
+  socket. `KABELSALAT_UI_SCALE` still overrides the scale.
 - **MIDI matrix sources read like devices:** hardware rows show the device name
   ("ESI MIDIMATE eX") instead of ALSA's "client:port 24:0" string, with a port
   chip only when a device has several ports and further ports joined to the
@@ -65,6 +130,43 @@ releases may still change behaviour and session files.
 - **The Load rig preset dialog has a clean layout.** "Load into" lists the new
   rig and every rig to replace as one row each with a radio mark; long rig
   names no longer wrap letter by letter into tall columns.
+- **Effects can be inserted from the mixer again:** "+ insert" opened its
+  effect picker and closed it in the same click, and a picked effect was
+  dropped. The picker now stays open and the chosen effect joins the
+  strip's or the master's insert chain. Clicking a strip's name opens a
+  rename dialog that stays open until Rename or Cancel (it vanished after
+  one frame).
+- **The assistant can add Vitalium (and any LV2 instrument):** the plugin
+  list it reads stopped after the first 30 of about 300 LV2 plugins, and
+  Vitalium was not among them, so it guessed addresses that do not exist and
+  no Vitalium patch could be loaded. Instruments now come first in that
+  list, and a wrong address is refused with the right ones.
+- **A MIDI device turned off for an LV2 instrument stays off:** with two rigs
+  on two keyboards, the keyboard of the CLAP rig also played an LV2
+  instrument such as setBfree, when its cells were set while the plugin was
+  still loading (session load, new rig) (#123).
+- **Meters no longer read hot at normal levels:** the meters' colour zones
+  were left on the old linear scale, so anything above −24 dBFS showed
+  tomato and anything above −3 dBFS red. Tomato now starts at −6 dBFS and
+  red only at the master's −1 dBFS ceiling.
+- **Small and tiled windows:** the rack fits windows down to the 760 px
+  minimum instead of panning with Keys and Master cut off; a short, wide
+  window lays each instrument chain out in one row; the Mixer, Matrix,
+  Plugins and Settings sheets give their margins to content, scroll instead
+  of painting into the keyboard or assistant dock, and the master meter no
+  longer stacks its dB marks. The rig strip hint is shown only where it fits.
+- **UI scale on a second monitor:** the scale follows the monitor the window
+  is on (it kept the laptop's 1.6x on a 1.0x external screen).
+- **An instrument the assistant adds plays at once:** `add_node` wires a
+  CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
+  rig's synth: the rig's Keys into it and it into the rig's Master. A
+  setBfree added to a rig was left with only its MIDI cable and stayed
+  silent. The assistant also no longer believes LV2 instruments are
+  "coming soon".
+- **MIDI matrix, LV2 instrument columns:** a click in a setBfree (or any LV2
+  instrument) column lit or cleared every cell of it, because all its rows
+  showed the MIDI cable. Each cell now routes its own source, with the same
+  keyboard switch and hardware radio group as a Surge column.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

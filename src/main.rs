@@ -5,18 +5,28 @@
 //! can develop and verify them in parallel; integration happens in `main` once
 //! the spikes pass their go/no-go checks.
 
+/// Release version and the commit it was built from, e.g. "0.1.0 (abc1234)".
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("KABELSALAT_COMMIT"), ")");
+
+mod aeolus;
+mod alsaseq;
 mod assistant;
+mod arp;
 mod audio;
 mod audio_in;
 mod audio_out;
 mod bridge;
 mod capture;
 mod catalog;
+mod clocksend;
 mod control;
 mod dsp;
 mod engine;
+mod engine_info;
+mod guitar;
 mod host;
 mod juce;
+mod listen;
 mod llm;
 mod lv2;
 mod main_controls;
@@ -27,6 +37,7 @@ mod instruments;
 mod meter;
 mod midi;
 mod player;
+mod plugin_window;
 mod preview;
 mod record;
 mod rope;
@@ -35,9 +46,9 @@ mod sounds;
 mod theme;
 mod transport;
 mod ui;
-mod vision;
+mod vital;
 
-const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, catalog-install-test [id...]";
+const MODES: &str = "app, preview, audio-test, audio-in-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -47,6 +58,7 @@ fn main() -> anyhow::Result<()> {
         "audio-test" => audio::run_test(),
         "midi-test" => midi::run_test(),
         "host-test" => host::run_test(),
+        "editor-test" => host::run_editor_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "preset-test" => host::run_preset_test(),
         "ui-demo" => ui::run_demo(),
         "mcp" => {
@@ -76,8 +88,10 @@ fn main() -> anyhow::Result<()> {
         "clap-scan-test" => host::run_clap_scan_test(),
         "catalog-install-test" => catalog::install_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-test" => ui::run_session_test(),
+        "session-load-bench" => ui::run_session_load_bench(&std::env::args().skip(2).collect::<Vec<_>>()),
         "agent-eval" => ui::run_agent_eval(),
         "jev-test" => assistant::run_jev_test(),
+        "listen-test" => listen::run_test(),
         "capture-test" => capture::run_test(),
         "player-test" => player::run_test(),
         "lv2-test" => lv2::run_test(),
@@ -86,14 +100,29 @@ fn main() -> anyhow::Result<()> {
         "lv2-engine-test" => engine::lv2_engine_test(),
         "metro-test" => engine::metro_test(),
         "transport-test" => transport::run_test(),
+        "clock-test" => clocksend::run_clock_test(),
         "edge-level-test" => engine::edge_level_test(),
         "lv2-instrument-test" => lv2::instrument_test(),
         "organ-test" => engine::organ_test(),
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
+        "midifx-test" => engine::midifx_test(),
         "lv2-async-test" => engine::lv2_async_test(),
-        "sound-library-test" => engine::sound_library_test(),
+        "wind-test" => engine::wind_test(std::env::args().nth(2).as_deref()),
+        "sound-library-test" => engine::sound_library_test(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "vital-test" => vital::run_test(&std::env::args_os().skip(2).map(Into::into).collect::<Vec<_>>()),
+        "vital-import" => {
+            let files: Vec<std::path::PathBuf> = std::env::args_os().skip(2).map(Into::into).collect();
+            anyhow::ensure!(!files.is_empty(), "usage: kabelsalat vital-import <file.vitalbank|file.vital>...");
+            let data = vital::data_dir();
+            for f in &files {
+                println!("{}: {}", f.display(), vital::import(f, &data).map_err(|e| anyhow::anyhow!(e))?);
+            }
+            println!("into {}", data.display());
+            Ok(())
+        }
         "add-node-test" => engine::add_node_test(),
         "many-voices-test" => engine::many_voices_test(),
+        "arp-test" => engine::arp_test(),
         "mono-master-test" => engine::mono_master_test(),
         "multi-rig-test" => engine::multi_rig_test(),
         "rig-mix-test" => engine::rig_mix_test(),
@@ -103,8 +132,10 @@ fn main() -> anyhow::Result<()> {
         "meter-test" => engine::meter_test(),
         "record-test" => record::run_test(),
         "audio-in-test" => audio_in::run_test(),
+        "monitor-latency-test" => audio_in::run_monitor_latency_test(),
+        "guitar-rig-test" => engine::guitar_rig_test(),
         "--version" | "-V" => {
-            println!("kabelsalat {}", env!("CARGO_PKG_VERSION"));
+            println!("kabelsalat {VERSION}");
             Ok(())
         }
         "--help" | "-h" | "help" => {

@@ -344,9 +344,26 @@ pub fn value_arc(
     value: f32,
     accent: Color32,
 ) {
+    value_arc_sized(painter, map, center, r, 4.5, 2.2, 2.0, 2.4, value, accent);
+}
+
+/// Scaled variant of [`value_arc`] for smaller knobs (e.g. mixer quick knobs).
+#[allow(clippy::too_many_arguments)]
+pub fn value_arc_sized(
+    painter: &egui::Painter,
+    map: impl Fn(Vec2) -> Pos2,
+    center: Vec2,
+    r: f32,
+    arc_gap: f32,
+    dot_r: f32,
+    track_w: f32,
+    arc_w: f32,
+    value: f32,
+    accent: Color32,
+) {
     let a0 = 135.0f32.to_radians();
     let sweep = 270.0f32.to_radians();
-    let arc_r = r + 4.5;
+    let arc_r = r + arc_gap;
     let segs = 20;
     let v = value.clamp(0.0, 1.0);
     let mut prev_track: Option<Pos2> = None;
@@ -356,12 +373,12 @@ pub fn value_arc(
         let ang = a0 + sweep * f;
         let p = map(center + Vec2::new(ang.cos(), ang.sin()) * arc_r);
         if let Some(pp) = prev_track {
-            painter.line_segment([pp, p], Stroke::new(2.0, alpha(HAIRLINE_DARK, 0.35)));
+            painter.line_segment([pp, p], Stroke::new(track_w, alpha(HAIRLINE_DARK, 0.35)));
         }
         prev_track = Some(p);
         if f <= v {
             if let Some(pp) = prev_val {
-                painter.line_segment([pp, p], Stroke::new(2.4, accent));
+                painter.line_segment([pp, p], Stroke::new(arc_w, accent));
             }
             prev_val = Some(p);
         }
@@ -369,13 +386,16 @@ pub fn value_arc(
     // Flat indicator dot at the value angle.
     let ang = a0 + sweep * v;
     let dot = map(center + Vec2::new(ang.cos(), ang.sin()) * arc_r);
-    painter.circle_filled(dot, 2.2, accent);
+    painter.circle_filled(dot, dot_r, accent);
 }
 
 /// Meter color, stepped — not a gradient (§4.8): cream → tomato → clip red.
-pub fn meter_color(t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.6 { CREAM } else if t < 0.9 { ACCENT } else { CLIP_RED }
+/// `pos` is a position on the meters' −60…0 dBFS scale. Tomato starts at
+/// −6 dBFS and red at the master's −1 dBFS ceiling: the stops were linear
+/// fractions, so on the dB scale everything above −24 dBFS read hot.
+pub fn meter_color(pos: f32) -> Color32 {
+    let db = pos.clamp(0.0, 1.0) * 60.0 - 60.0;
+    if db < -6.0 { CREAM } else if db < -1.0 { ACCENT } else { CLIP_RED }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +423,11 @@ pub fn layout_tracked(fonts: &mut egui::epaint::FontsView<'_>, text: &str, font:
     for ch in text.chars() {
         let g = fonts.layout_delayed_color(ch.to_string(), font.clone(), f32::INFINITY);
         h = h.max(g.size().y);
+        let gw = g.size().x;
         chars.push((g, x));
-        let w = fonts.glyph_width(&font, ch);
+        // The laid-out glyph is the fallback: glyph_width answered 0 for
+        // every letter in a busy test run, stacking the wordmark on one spot.
+        let w = Some(fonts.glyph_width(&font, ch)).filter(|w| *w > 0.0).unwrap_or(gw);
         let adv = if tracking_em < 0.0 { (w + tracking).max(w * 0.9) } else { w + tracking };
         x += adv;
     }
@@ -960,27 +983,60 @@ impl Dropdown {
         }
 
         let popup_w = self.popup_min_width.unwrap_or(0.0).max(rect.width()).clamp(140.0, 380.0);
-        egui::Popup::menu(&resp)
-            .id(popup_id)
-            .width(popup_w)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-            .frame(dropdown_popup_frame())
-            .show(|ui| {
-                let inner_w = (popup_w - 12.0).max(120.0);
-                ui.set_min_width(inner_w);
-                ui.set_max_width(368.0);
-                egui::ScrollArea::vertical()
-                    .max_height(self.max_popup_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        let mut menu = DropdownMenu { ui, text_size: self.text_size };
-                        add_contents(&mut menu);
-                    });
-            });
+        show_dropdown_popup(
+            egui::Popup::menu(&resp),
+            popup_id,
+            popup_w,
+            self.max_popup_height,
+            self.text_size,
+            add_contents,
+        );
 
         resp
     }
+
+    /// Open a context menu (right-click on `anchor`) using the same Hurricane
+    /// dropdown frame, scroll list and `DropdownMenu` rows.
+    pub fn show_context_menu(self, anchor: &egui::Response, add_contents: impl FnOnce(&mut DropdownMenu<'_>)) {
+        let popup_id = anchor.id.with("context_menu");
+        let popup_w = self.popup_min_width.unwrap_or(180.0).clamp(140.0, 380.0);
+        show_dropdown_popup(
+            egui::Popup::context_menu(anchor),
+            popup_id,
+            popup_w,
+            self.max_popup_height,
+            self.text_size,
+            add_contents,
+        );
+    }
+}
+
+fn show_dropdown_popup<'a>(
+    popup: egui::Popup<'a>,
+    popup_id: egui::Id,
+    popup_w: f32,
+    max_height: f32,
+    text_size: f32,
+    add_contents: impl FnOnce(&mut DropdownMenu<'_>),
+) {
+    popup
+        .id(popup_id)
+        .width(popup_w)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+        .frame(dropdown_popup_frame())
+        .show(|ui| {
+            let inner_w = (popup_w - 12.0).max(120.0);
+            ui.set_min_width(inner_w);
+            ui.set_max_width(368.0);
+            egui::ScrollArea::vertical()
+                .max_height(max_height)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let mut menu = DropdownMenu { ui, text_size };
+                    add_contents(&mut menu);
+                });
+        });
 }
 
 #[cfg(test)]

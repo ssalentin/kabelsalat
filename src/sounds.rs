@@ -51,12 +51,17 @@ pub enum Load {
     /// A binary JUCE `ValueTree` patch (Odin 2's `.odin`), loaded as the
     /// plugin's CLAP state (`juce::value_tree_to_state`).
     ValueTreePatch(PathBuf),
+    /// A Vital patch (`.vital`), restored as Vitalium's state on the
+    /// engine's LV2 loader thread.
+    VitalPatch(PathBuf),
     /// An installed `pset:Preset`, applied by the engine's LV2 loader thread.
     Lv2Preset(String),
     /// A MIDI programme change, sent to the instrument by the engine.
     MidiProgram(u8),
     /// One value of the plugin's own preset parameter.
     ParamValue { param: u32, value: f64 },
+    /// An Aeolus registration, written as the plugin's CLAP state.
+    AeolusRegistration(&'static crate::aeolus::Registration),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,9 +100,14 @@ pub enum Source {
     /// `.odin` patches in Odin 2's soundbank folder. The factory ones are
     /// compiled into the plugin, so the catalog install copies them there.
     OdinSoundbanks,
+    /// Registrations of Aeolus's built-in organ, kabelsalat's own table
+    /// (`aeolus::REGISTRATIONS`): the plugin has no presets.
+    AeolusRegistrations,
     /// `pset:Preset` files in the LV2 bundles, plus the programmes the
     /// plugin names in its MIDNAM document.
     Lv2Bundles,
+    /// `.vital` patches in Vitalium's data folder, then its LV2 presets.
+    VitalPatches,
     /// A stepped parameter of the plugin's own ("Preset"), read from the
     /// live plugin on the main thread: `preset_param_library`.
     PresetParameter,
@@ -115,7 +125,9 @@ impl Instrument {
             Instrument::Clap(id) if id == SURGE_ID => Source::SurgePatches,
             Instrument::Clap(id) if id == DEXED_ID => Source::DexedCartridges,
             Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
+            Instrument::Clap(id) if id == crate::aeolus::AEOLUS_ID => Source::AeolusRegistrations,
             Instrument::Clap(_) => Source::PresetParameter,
+            Instrument::Lv2(uri) if uri == crate::vital::URI => Source::VitalPatches,
             Instrument::Lv2(_) => Source::Lv2Bundles,
         }
     }
@@ -128,7 +140,9 @@ pub fn scan(instrument: &Instrument) -> Library {
         Source::SurgePatches => surge_library(),
         Source::DexedCartridges => dexed_library(),
         Source::OdinSoundbanks => odin_library(&odin_soundbanks_dir()),
+        Source::AeolusRegistrations => aeolus_library(),
         Source::Lv2Bundles => lv2_library(instrument.id()),
+        Source::VitalPatches => vital_library(&crate::vital::data_dir()),
         // Nothing on disk: the plugin is asked.
         Source::PresetParameter => Library::default(),
     }
@@ -183,6 +197,16 @@ fn odin_library(soundbanks: &std::path::Path) -> Library {
     Library { kind: "Odin 2 patches".into(), sounds, params: Vec::new() }
 }
 
+fn aeolus_library() -> Library {
+    let sounds = crate::aeolus::REGISTRATIONS.iter().map(|r| Sound {
+        category: r.category.into(),
+        name: r.name.into(),
+        preferred: false,
+        load: Load::AeolusRegistration(r),
+    }).collect();
+    Library { kind: "Aeolus organ registrations".into(), sounds, params: Vec::new() }
+}
+
 /// An LV2 instrument's installed presets plus the MIDI programmes it names.
 fn lv2_library(uri: &str) -> Library {
     let presets = crate::lv2::discover_presets(uri);
@@ -202,6 +226,12 @@ fn lv2_library(uri: &str) -> Library {
         Vec::new()
     };
     Library { kind: kind.into(), sounds, params }
+}
+
+fn vital_library(data: &std::path::Path) -> Library {
+    let mut sounds = crate::vital::patches(data);
+    sounds.extend(lv2_library(crate::vital::URI).sounds);
+    Library { kind: "Vital patches".into(), sounds, params: Vec::new() }
 }
 
 /// Parameter names that select a whole sound.
@@ -335,9 +365,14 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             let state = crate::juce::value_tree_to_state(&data).map_err(|e| format!("{}: {e}", path.display()))?;
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
+        Load::AeolusRegistration(reg) => plugin()?.0.load_state(&crate::aeolus::state(reg)).map_err(|e| e.to_string()),
         Load::ParamValue { param, value } => {
             plugin()?.1.set_param(clack_host::prelude::ClapId::new(*param), *value);
             Ok(())
+        }
+        Load::VitalPatch(path) => {
+            let state = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
+            send(Command::LoadLv2State { node, state })
         }
         Load::Lv2Preset(uri) => send(Command::LoadLv2Preset { node, preset_uri: uri.clone() }),
         Load::MidiProgram(program) => send(Command::ProgramChange { node, program: *program }),
@@ -520,6 +555,11 @@ impl Libraries {
             self.found.lock().unwrap_or_else(|e| e.into_inner()).remove(instrument);
         }
         Lookup::Scanning
+    }
+
+    /// Read an instrument's library again on its next use (files were added).
+    pub fn forget(&self, instrument: &Instrument) {
+        self.found.lock().unwrap_or_else(|e| e.into_inner()).remove(instrument);
     }
 
     /// Keep a library that was read from the live plugin.

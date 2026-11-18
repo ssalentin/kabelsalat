@@ -102,6 +102,13 @@ impl MidiMsg {
         self.status | (self.channel & 0x0F)
     }
 
+    /// The message as it goes on the wire: program change and channel
+    /// pressure are 2 bytes, every other channel message 3.
+    pub fn wire(&self) -> ([u8; 3], usize) {
+        let len = if matches!(self.status, PROGRAM_CHANGE | CHANNEL_AFTERTOUCH) { 2 } else { 3 };
+        ([self.status_byte(), self.data[0], if len == 3 { self.data[1] } else { 0 }], len)
+    }
+
     /// A sounding note-on (velocity > 0). Velocity-0 note-ons are note-offs.
     pub fn is_note_on(&self) -> bool {
         self.status == NOTE_ON && self.data[1] > 0
@@ -168,6 +175,10 @@ pub enum SourceId {
     Keys,
     /// File player (P2) — one id per player node.
     FilePlayer(u32),
+    /// A MIDI-FX unit's OUTPUT — one id per MidiFx node (AUM MIDI strips:
+    /// the strip's processed MIDI is a matrix source routable to any rig
+    /// input). The id is the node id, not an ALSA port.
+    MidiFx(u32),
 }
 
 /// Which parameter space a CC binding drives on the destination node.
@@ -220,6 +231,41 @@ impl CcScale {
 
     pub fn is_identity(&self) -> bool {
         *self == Self::IDENTITY
+    }
+
+    /// A continuous binding whose full controller travel covers `lo..=hi`
+    /// of the parameter (normalized 0..=1), e.g. a pedal that only reaches
+    /// 60 % drive.
+    pub fn range(lo: f32, hi: f32) -> Self {
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 127.0).round() as u8;
+        let (lo, hi) = (q(lo), q(hi));
+        CcScale { steps: 0, lo: lo.min(hi), hi: lo.max(hi) }
+    }
+
+    /// Switch and step bindings (instrument profiles) keep their sections;
+    /// only continuous ones have a range a player edits.
+    pub fn is_continuous(&self) -> bool {
+        self.steps < 2
+    }
+
+    /// The normalized (0..=1) ends of the parameter range.
+    pub fn bounds(&self) -> (f32, f32) {
+        (self.lo.min(127) as f32 / 127.0, self.hi.min(127) as f32 / 127.0)
+    }
+
+    /// How agent tools report the scale: `[min, max]` (0..1, two decimals)
+    /// for a limited continuous range, null for the full range, the steps
+    /// for a stepped binding.
+    pub fn range_json(&self) -> serde_json::Value {
+        if !self.is_continuous() {
+            return serde_json::json!({"steps": self.steps, "lo": self.lo, "hi": self.hi});
+        }
+        if self.is_identity() {
+            return serde_json::Value::Null;
+        }
+        let (lo, hi) = self.bounds();
+        let r2 = |v: f32| (v as f64 * 100.0).round() / 100.0;
+        serde_json::json!([r2(lo), r2(hi)])
     }
 
     /// The normalized (0..=1) parameter value of a controller value.
@@ -436,7 +482,17 @@ impl Rule {
                 }
                 Some(ev)
             }
-            // Pitch bend, program change, aftertouch: channel filter only.
+            // Poly pressure presses one played key: it follows that key's
+            // split and transpose, or it would bend a note it never reached.
+            POLY_AFTERTOUCH => {
+                if !self.in_key_range(ev.data[0]) {
+                    return None;
+                }
+                let mut out = ev;
+                out.data[0] = transpose_note(ev.data[0], self.transpose);
+                Some(out)
+            }
+            // Pitch bend, program change, channel pressure: channel filter only.
             _ => Some(ev),
         }
     }
@@ -479,10 +535,16 @@ impl Matrix {
         id
     }
 
-    /// Convenience: add a transparent rule (omni, full ranges) and return
-    /// its id for further editing via [`Matrix::rule_mut`].
+    /// Route `source` to `dest`: add a transparent rule (omni, full ranges),
+    /// or keep the one already there, shape and enabled flag included. An
+    /// LV2 instrument connects when its instance attaches, after the user's
+    /// edits to its cells may have arrived; a second rule would route a
+    /// source the user turned off. Returns the rule's id.
     pub fn connect(&mut self, source: SourceId, dest: NodeId) -> RuleId {
-        self.add_rule(Rule::new(source, dest))
+        match self.rules.iter().find(|r| r.source == source && r.dest == dest) {
+            Some(r) => r.id,
+            None => self.add_rule(Rule::new(source, dest)),
+        }
     }
 
     pub fn rule(&self, id: RuleId) -> Option<&Rule> {
@@ -543,6 +605,19 @@ mod tests {
 
     fn dests(out: &[(NodeId, MidiMsg)]) -> Vec<NodeId> {
         out.iter().map(|(d, _)| *d).collect()
+    }
+
+    #[test]
+    fn a_ranged_pedal_spans_only_its_range() {
+        let s = CcScale::range(0.1, 0.6);
+        assert!(s.is_continuous());
+        assert!((s.norm(0) - 13.0 / 127.0).abs() < 1e-9, "heel down sits on the lower bound");
+        assert!((s.norm(127) - 76.0 / 127.0).abs() < 1e-9, "toe down stops at the upper bound");
+        let mid = s.norm(64);
+        assert!(mid > s.norm(0) && mid < s.norm(127), "travel in between is spread over the range");
+        assert_eq!(CcScale::range(0.8, 0.2), CcScale::range(0.2, 0.8), "bounds are ordered");
+        assert_eq!(CcScale::range(0.0, 1.0), CcScale::IDENTITY, "the full range is the plain binding");
+        assert!(!CcScale::stepped(2, 64, 127).is_continuous());
     }
 
     // --- SPLITS -----------------------------------------------------------
@@ -805,6 +880,17 @@ mod tests {
         assert_eq!(m.route(SourceId::Keys, pc), vec![(SURGE_A, pc)]);
         assert_eq!(m.route(SourceId::Keys, cat), vec![(SURGE_A, cat)]);
         assert_eq!(m.route(SourceId::Keys, pat), vec![(SURGE_A, pat)]);
+    }
+
+    #[test]
+    fn poly_pressure_follows_the_split_and_transpose_of_its_key() {
+        let mut m = Matrix::new();
+        m.add_rule(Rule::new(SourceId::Keys, SURGE_A).key_range(0, 59).transpose(12));
+        m.add_rule(Rule::new(SourceId::Keys, SURGE_B).key_range(60, 127));
+        assert_eq!(m.route(SourceId::Keys, MidiMsg::poly_aftertouch(0, 48, 90)), vec![(SURGE_A, MidiMsg::poly_aftertouch(0, 60, 90))]);
+        assert_eq!(m.route(SourceId::Keys, MidiMsg::poly_aftertouch(0, 64, 90)), vec![(SURGE_B, MidiMsg::poly_aftertouch(0, 64, 90))]);
+        let breath = MidiMsg::channel_aftertouch(0, 90);
+        assert_eq!(m.route(SourceId::Keys, breath), vec![(SURGE_A, breath), (SURGE_B, breath)], "channel pressure reaches every zone");
     }
 
     #[test]

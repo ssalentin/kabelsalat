@@ -1522,7 +1522,7 @@ impl McpServer {
             },
             None => args.param,
         };
-        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target }) {
+        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target, scale: Default::default() }) {
             return tool_err(e);
         }
         let entry = st.cc_maps.entry((source, args.node)).or_default();
@@ -1532,7 +1532,7 @@ impl McpServer {
                     m.param = p;
                     m.target = target;
                 } else {
-                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p, target });
+                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p, target, scale: crate::matrix::CcScale::IDENTITY });
                 }
             }
             None => entry.retain(|m| m.cc != args.cc),
@@ -1607,7 +1607,7 @@ impl McpServer {
                 .unwrap_or_default(),
         };
         for cc in ccs {
-            if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc, param: None, target: crate::matrix::CcTarget::PluginParam }) {
+            if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc, param: None, target: crate::matrix::CcTarget::PluginParam, scale: Default::default() }) {
                 return tool_err(e);
             }
             if let Some(v) = st.cc_maps.get_mut(&(source, args.node)) {

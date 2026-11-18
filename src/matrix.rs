@@ -191,15 +191,62 @@ impl CcTarget {
     }
 }
 
+/// How a controller value becomes the parameter value. Instruments send
+/// switches and stepped controls (an LED drawbar, a slow/fast button) as
+/// `steps` equal sections of 0..=127; each section lands on one value spread
+/// evenly from `lo` to `hi` (7-bit units, so 64 is the middle of a knob).
+/// `steps` 0 is continuous: `lo..=hi` scaled linearly. The default is the
+/// identity, which MIDI learn uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CcScale {
+    pub steps: u8,
+    pub lo: u8,
+    pub hi: u8,
+}
+
+impl Default for CcScale {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl CcScale {
+    pub const IDENTITY: CcScale = CcScale { steps: 0, lo: 0, hi: 127 };
+
+    /// `steps` sections of the controller range onto `lo..=hi`.
+    pub const fn stepped(steps: u8, lo: u8, hi: u8) -> Self {
+        CcScale { steps, lo, hi }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    /// The normalized (0..=1) parameter value of a controller value.
+    pub fn norm(&self, value: u8) -> f64 {
+        let v = (value & 0x7F) as f64;
+        let (lo, hi) = (self.lo.min(127) as f64, self.hi.min(127) as f64);
+        let t = if self.steps >= 2 {
+            let section = ((value & 0x7F) as u32 * self.steps as u32 / 128).min(self.steps as u32 - 1);
+            section as f64 / (self.steps - 1) as f64
+        } else {
+            v / 127.0
+        };
+        (lo + (hi - lo) * t) / 127.0
+    }
+}
+
 /// CC binding: controller number → parameter on the rule's destination node.
 /// MIDI-learn fills these; the matrix routes the CC and the destination applies
-/// the binding according to `target`.
+/// the binding according to `target`, with the value shaped by `scale`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CcMapping {
     pub cc: u8,
     pub param: ParamId,
     #[serde(default)]
     pub target: CcTarget,
+    #[serde(default, skip_serializing_if = "CcScale::is_identity")]
+    pub scale: CcScale,
 }
 
 /// One routing rule: source → destination plus per-rule transforms.
@@ -298,17 +345,22 @@ impl Rule {
 
     /// Add or replace a CC binding in place with an explicit target. Returns true if the map changed.
     pub fn set_cc_target(&mut self, cc: u8, param: ParamId, target: CcTarget) -> bool {
-        let cc = cc & 0x7F;
-        if let Some(m) = self.cc_map.iter_mut().find(|m| m.cc == cc) {
-            if m.param == param && m.target == target {
-                return false;
+        self.set_cc_mapping(CcMapping { cc, param, target, scale: CcScale::IDENTITY })
+    }
+
+    /// Add or replace the binding of `m.cc` in place. Returns true if the map changed.
+    pub fn set_cc_mapping(&mut self, m: CcMapping) -> bool {
+        let m = CcMapping { cc: m.cc & 0x7F, ..m };
+        match self.cc_map.iter_mut().find(|x| x.cc == m.cc) {
+            Some(x) if *x == m => false,
+            Some(x) => {
+                *x = m;
+                true
             }
-            m.param = param;
-            m.target = target;
-            true
-        } else {
-            self.cc_map.push(CcMapping { cc, param, target });
-            true
+            None => {
+                self.cc_map.push(m);
+                true
+            }
         }
     }
 
@@ -1021,14 +1073,14 @@ mod tests {
 
         // Legacy CcMapping saved without `target` defaults to PluginParam.
         let legacy_map: CcMapping = serde_json::from_str(r#"{"cc":74,"param":42}"#).unwrap();
-        assert_eq!(legacy_map, CcMapping { cc: 74, param: 42, target: CcTarget::PluginParam });
+        assert_eq!(legacy_map, CcMapping { cc: 74, param: 42, target: CcTarget::PluginParam, scale: CcScale::IDENTITY });
 
         // Knob target round-trips and replacing target marks the rule dirty.
         let mut r3 = Rule::new(SourceId::Hardware(0), SURGE_A);
         assert!(r3.set_cc_target(7, 0, CcTarget::PluginParam));
         assert!(!r3.set_cc_target(7, 0, CcTarget::PluginParam));
         assert!(r3.set_cc_target(7, 0, CcTarget::Knob));
-        assert_eq!(r3.mapping_for_cc(7), Some(CcMapping { cc: 7, param: 0, target: CcTarget::Knob }));
+        assert_eq!(r3.mapping_for_cc(7), Some(CcMapping { cc: 7, param: 0, target: CcTarget::Knob, scale: CcScale::IDENTITY }));
         let back3: Rule = serde_json::from_str(&serde_json::to_string(&r3).unwrap()).unwrap();
         assert_eq!(back3.cc_map, r3.cc_map);
     }

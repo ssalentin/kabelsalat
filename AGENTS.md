@@ -1014,6 +1014,14 @@ Learned so far (2026-11-15, UI polish pass):
     tests and pushed; CI then failed on an `mcp::tests` test that adds a
     made-up LV2 URI (`cargo test --bin kabelsalat -- mcp::` would have
     shown it). Filter by module path, not by test name.
+156. **One binding has one identity, whatever its spelling:** off a CLAP
+    unit, CC target `plugin` and `knob` with the same param reach the same
+    engine param, but the knob tag and the knob menu matched the target
+    strictly. The assistant's `set_cc_map {param: 0}` (target plugin) on a
+    Filter drove CUTOFF without a `CC 11` tag, unlike MIDI learn (target
+    knob). Every "is this knob bound?" question goes through
+    `DemoApp::binds_knob`
+    (`an_agent_param_binding_on_a_built_in_unit_shows_like_a_learned_one`).
 156. **Decode a MIDI message by its type before its length:** the hardware
     input dropped everything shorter than 3 bytes before looking at the
     status, so channel aftertouch (2 bytes: how wind controllers send breath)

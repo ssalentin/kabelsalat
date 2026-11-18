@@ -8358,6 +8358,14 @@ impl DemoApp {
         }
     }
 
+    /// Whether `m` drives the knob `(param, target)` of `node_id`. Off a CLAP
+    /// unit, plugin and knob targets reach the same engine param
+    /// (`apply_engine_param`), so the agent's `param: 0` is the learned CUTOFF.
+    fn binds_knob(&self, node_id: u32, m: &crate::matrix::CcMapping, param: u32, target: crate::matrix::CcTarget) -> bool {
+        let is_clap = self.units.iter().any(|u| u.node_id == node_id && matches!(u.node_kind, UnitKind::Clap));
+        m.param == param && (m.target == target || !is_clap)
+    }
+
     /// Active CC binding for a rack knob (if any): `(source, cc)`.
     fn knob_cc_binding(&self, node_id: u32, param: u32, target: crate::matrix::CcTarget) -> Option<(SourceId, u8)> {
         self.knob_cc_mapping(node_id, param, target).map(|(src, m)| (src, m.cc))
@@ -8368,7 +8376,7 @@ impl DemoApp {
         for (&(src, dest), edit) in &self.rule_edits {
             if dest != node_id { continue; }
             for m in &edit.cc_map {
-                if m.param == param && m.target == target {
+                if self.binds_knob(node_id, m, param, target) {
                     if best.map_or(true, |(bs, bm)| (Self::source_sort_key(bs), bm.cc) > (Self::source_sort_key(src), m.cc)) {
                         best = Some((src, *m));
                     }
@@ -8384,7 +8392,7 @@ impl DemoApp {
             .filter(|(&(_, dest), _)| dest == node_id)
             .flat_map(|(&(src, _), edit)| {
                 edit.cc_map.iter()
-                    .filter(move |m| m.param == param && m.target == target)
+                    .filter(|m| self.binds_knob(node_id, m, param, target))
                     .map(move |m| (src, m.cc))
             })
             .collect();
@@ -24315,6 +24323,46 @@ mod split_bpm_tests {
 
     /// #20: an unbound knob can be reset from the menu — right-click arms
     /// learn, right-click again opens Reset / Cancel learn.
+    /// The assistant bound CC 11 to a filter's cutoff as `param: 0` (target
+    /// "plugin"); MIDI learn stores the same binding as target "knob". On a
+    /// built-in unit both drive the same engine param, so the face shows the
+    /// tag and the knob menu clears it either way.
+    #[test]
+    fn an_agent_param_binding_on_a_built_in_unit_shows_like_a_learned_one() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let filt = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("FILTER"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: filt, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: filt, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("cc", g)).unwrap();
+        let ctx = egui::Context::default();
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(!texts.iter().any(|t| t == "CC 11"), "nothing bound yet: {texts:?}");
+
+        let r = app.exec_tool("set_cc_map", &serde_json::json!({"node": filt, "source": "keys", "cc": 11, "param": 0}));
+        assert!(r.contains("\"target\":\"plugin\""), "the agent's spelling is kept: {r}");
+        if let Ok(dir) = std::env::var("KABELSALAT_SHOTS") {
+            app.set_cc_binding(SourceId::Hardware(0), filt, 74, Some(1), crate::matrix::CcTarget::Knob);
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &std::path::Path::new(&dir).join("agent-cc-filter.png"));
+        }
+        let unit = app.units.iter().position(|u| u.node_id == filt).unwrap();
+        let cutoff = app.units[unit].knob_index("CUTOFF").unwrap();
+        let (param, target) = app.units[unit].knobs[cutoff].cc_target().unwrap();
+        assert_eq!(app.knob_cc_binding(filt, param, target), Some((SourceId::Keys, 11)));
+        let texts = frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|t| t == "CC 11"), "CC 11 tag painted on CUTOFF: {texts:?}");
+
+        app.clear_knob_bindings(filt, param, target);
+        assert!(app.rule_edits.get(&(SourceId::Keys, filt)).map_or(true, |e| e.cc_map.is_empty()),
+            "the knob menu's clear removes the agent's binding");
+
+    }
+
     #[test]
     fn rack_knob_unbound_reset_from_the_learn_menu() {
         let (mut app, ctx) = demo();

@@ -411,14 +411,13 @@ Learned so far (2026-11-15, UI polish pass):
     tools take the 0-based `rig`. The chat model put a reverb into rig B
     for "rig 1" in 2 of 22 runs; with the mapping stated in the system
     prompt, 0 of 24 (`agent-eval --task reverb_and_tempo --runs 24`).
-82. **A turn with an image skips the decisions model:** measured with
-    `kabelsalat jev-test --image <file> <request>`. Jev reads a written note
-    (action `tempo` at p = 1.00) but its typed answers cannot return the
-    value the note states, and what it sees leaks into the other answers (a
+82. **Jev decides from text, never from media:** with an image attached
+    (measured before image input was removed), Jev read a written note
+    (action `tempo` at p = 1.00) but its typed answers could not return the
+    value the note stated, and what it saw leaked into the other answers (a
     mixer screenshot made it name rig 1 at p = 0.95 and a keys sound at
-    0.88 for a request that names neither). The seeing model
-    (`agent_perceive_model`) acts for that turn; re-measure before sending
-    images to Jev.
+    0.88 for a request that named neither). A model that perceives
+    (hears, sees) writes what it found as text; Jev decides from that text.
 83. **Assistant dock uses `exact_size`, a 176 px floor, and a clipped single-row header:**
     `default_size` froze the panel at its first-frame height and `150` px left
     one transcript line clipped by the header (`bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950`).
@@ -430,8 +429,8 @@ Learned so far (2026-11-15, UI polish pass):
     `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
 86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
     duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
-87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`, and attachment thumbnails drop their `TextureHandle` on clear:**
-    align `Confirm`/`Cancel` and the attachment chip to the message text column (`78.0` px), load the ~32 px thumbnail once per `Image::bytes` Arc (`sync_chat_thumb`), and clear `chat_thumb` on removal/submit so egui frees the texture (`agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle`).
+87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`:**
+    align `Confirm`/`Cancel` to the message text column (`78.0` px) (`agent_panel_defect6_confirm_aligns_with_the_transcript_column`).
 88. **A key shows lit for as long as it is held, from every source:** only
     laptop keys counted as held, so a note held on the FM-1 (or any hardware
     keyboard) blinked for one 0.09 s LED tail and the key went dark while it
@@ -782,13 +781,11 @@ Learned so far (2026-11-15, UI polish pass):
   `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
+  [--task <name>] [--no-jev]` runs the in-app agent over 25 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree
   for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
-  model APIs and costs a few cents; three requests carry an image, and
-  `look_at_rack` gets `docs/shots/mixer.png` in place of a window) and
-  `kabelsalat jev-test` shows Jev's decisions (`--image <file> <request>`
-  asks about one request without and with an image). A new shortcut row
+  model APIs and costs a few cents) and `kabelsalat jev-test` shows Jev's
+  decisions. A new shortcut row
   needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
   with
   `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on

@@ -186,6 +186,7 @@ pub fn open_capture(device: Option<&str>, rate: u32, buffer: u32) -> Option<Inpu
             };
             let mut bytes = [0u8; 4096];
             let mut carry: Vec<u8> = Vec::with_capacity(8);
+            let mut left: Option<f32> = None;
             loop {
                 let n = match out.read(&mut bytes) { Ok(0) | Err(_) => break, Ok(n) => n };
                 carry.extend_from_slice(&bytes[..n]);
@@ -193,7 +194,13 @@ pub fn open_capture(device: Option<&str>, rate: u32, buffer: u32) -> Option<Inpu
                 for c in carry[..whole].chunks_exact(4) {
                     let s = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
                     let _ = engine_p.push(s);
-                    let _ = tuner_p.push(s);
+                    // The tuner takes ONE sample per stereo frame (L+R mix):
+                    // the interleaved stream fed straight in reads an octave
+                    // low and smears the period.
+                    match left.take() {
+                        None => left = Some(s),
+                        Some(l) => { let _ = tuner_p.push((l + s) * 0.5); }
+                    }
                 }
                 carry.drain(..whole);
             }
@@ -223,31 +230,56 @@ pub struct Tuner {
     /// samples/period) with margin.
     window: usize,
     sr: f32,
+    /// Samples pushed since the last estimate (`estimate_if_due`).
+    fresh: usize,
 }
 
 impl Tuner {
     pub fn new(sample_rate: u32) -> Self {
         // 4096 samples @48k = 85 ms, ~3.5 periods of E2 and ~1.4 of a low B0.
         let window = 4096usize.max((sample_rate as usize / 12) * 4); // ≥ 4 periods @ ~12 Hz floor
-        Self { buffer: vec![0.0; window], window, sr: sample_rate as f32 }
+        Self { buffer: vec![0.0; window], window, sr: sample_rate as f32, fresh: 0 }
     }
 
-    /// Feed a slice of (mono) samples; returns the current pitch estimate.
-    /// Call whenever new samples are available; the detector keeps its own
-    /// rolling window so callers just pump.
-    pub fn process(&mut self, input: &[f32]) -> Option<Pitch> {
-        if input.is_empty() {
-            return None;
-        }
+    /// Append (mono) samples to the rolling window without estimating:
+    /// cheap, so a backlog can be drained in any number of chunks.
+    pub fn push(&mut self, input: &[f32]) {
         let w = self.window;
-        // Shift old samples out, append new (rolling window).
         let n = input.len();
+        if n == 0 {
+            return;
+        }
         if n >= w {
             self.buffer.copy_from_slice(&input[n - w..]);
         } else {
             self.buffer.copy_within(n.., 0);
             self.buffer[w - n..].copy_from_slice(input);
         }
+        self.fresh = self.fresh.saturating_add(n);
+    }
+
+    /// The pitch of the window now, or `Some(None)` for "no confident
+    /// pitch" — but only once 50 ms of new samples arrived since the last
+    /// estimate (`None` = not due). The YIN difference function costs
+    /// millions of multiply-adds, so a UI frame calls this, never `detect`
+    /// per chunk: estimating per 512-sample chunk of a one-second backlog
+    /// froze the window until the compositor offered to terminate the app.
+    pub fn estimate_if_due(&mut self) -> Option<Option<Pitch>> {
+        if self.fresh < (self.sr as usize / 20).max(1) {
+            return None;
+        }
+        self.fresh = 0;
+        Some(self.detect())
+    }
+
+    /// Feed a slice of (mono) samples and estimate at once (tests, tools
+    /// that pump one block at a time).
+    pub fn process(&mut self, input: &[f32]) -> Option<Pitch> {
+        if input.is_empty() {
+            return None;
+        }
+        self.push(input);
+        self.fresh = 0;
         self.detect()
     }
 
@@ -975,6 +1007,29 @@ mod tests {
         assert_eq!(d.action(target + 1000), DriftAction::DropOne, "fast input → drop");
         assert_eq!(d.action(0), DriftAction::InsertOne, "starved → hold last");
         assert_eq!(d.action(2), DriftAction::InsertOne, "near-empty → hold last");
+    }
+
+    #[test]
+    fn a_backlog_costs_one_estimate_not_one_per_chunk() {
+        // A one-second backlog drained in 512-sample chunks used to run YIN
+        // 187 times in one UI frame (a frozen window). Pushing is cheap; the
+        // estimate runs once, and not again until 50 ms of new audio.
+        let sr = 48_000u32;
+        let mut t = Tuner::new(sr);
+        let tone: Vec<f32> = (0..sr as usize)
+            .map(|i| (2.0 * std::f32::consts::PI * 220.0 * i as f32 / sr as f32).sin() * 0.5)
+            .collect();
+        for chunk in tone.chunks(512) {
+            t.push(chunk);
+        }
+        let first = t.estimate_if_due().expect("a backlog is due").expect("a clean sine has a pitch");
+        assert_eq!(first.note, 57, "220 Hz is A3: {first:?}");
+        assert!(first.cents.abs() < 5.0, "{first:?}");
+        assert!(t.estimate_if_due().is_none(), "nothing new: not due again");
+        t.push(&tone[..sr as usize / 40]); // 25 ms
+        assert!(t.estimate_if_due().is_none(), "25 ms is below the 50 ms cadence");
+        t.push(&tone[..sr as usize / 40]);
+        assert!(t.estimate_if_due().is_some(), "50 ms of new audio is due");
     }
 
     #[test]

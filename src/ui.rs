@@ -1129,6 +1129,8 @@ enum Waiting {
     /// list_sounds / load_sound on an instrument whose library is still
     /// being scanned: the call runs once the scan is done.
     SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
+    /// listen: recording the master and asking the listening model.
+    Listen(std::sync::mpsc::Receiver<String>),
 }
 
 /// The tools that read an instrument's sound library.
@@ -1855,7 +1857,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo")
+        || matches!(name, "record_status" | "measure_mix" | "listen" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -2259,6 +2261,9 @@ struct DemoApp {
     last_meter_rev: u64,
     /// Mirrored master-bus meter snapshot (read by `measure_mix`, `get_status`).
     master_meter: crate::meter::MeterSnapshot,
+    /// A `listen` call in flight: its thread records the master and asks the
+    /// listening model, and the tool batch waits for this answer.
+    listening: Option<std::sync::mpsc::Receiver<String>>,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
     /// A destructive assistant action waiting for the chat's Confirm /
@@ -2618,6 +2623,7 @@ impl DemoApp {
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
+            listening: None,
             confirm_delete_rig: None,
             pending_confirm: None,
             tool_batch: None,
@@ -4305,6 +4311,11 @@ impl DemoApp {
                         let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
                         (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args))
                     }
+                    Waiting::Listen(answer) => match answer.try_recv() {
+                        Ok(text) => Some(text),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("listen: the listening thread ended without an answer".into()),
+                    },
                 };
                 match outcome {
                     Some(result) => {
@@ -4329,6 +4340,11 @@ impl DemoApp {
                 let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
                 let before = engine_edit.then(|| self.rack_ids());
                 let result = self.run_assistant_tool(&call.name, &call.args);
+                if let Some(answer) = self.listening.take().filter(|_| call.name == "listen") {
+                    batch.waiting = Some((Waiting::Listen(answer), chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
                 batch.waiting = match before {
                     Some(before) => Some((
                         Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
@@ -5056,6 +5072,20 @@ impl DemoApp {
                 })).collect::<Vec<_>>(),
             })
             .to_string(),
+            "listen" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let args = args.clone();
+                let spawned = std::thread::Builder::new().name("listen".into()).spawn(move || {
+                    let _ = tx.send(crate::listen::listen(&args));
+                });
+                match spawned {
+                    Ok(_) => {
+                        self.listening = Some(rx);
+                        "listening".into()
+                    }
+                    Err(e) => format!("listen: {e}"),
+                }
+            }
             "measure_mix" => {
                 if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
                     if let Some(bus) = &self.bus {
@@ -12542,12 +12572,14 @@ impl DemoApp {
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
+            // The guitar rig replaces the keyboard patch (no Keys unit), so it
+            // sits on Shift+F5, next to its keyboard sibling. Asked BEFORE
+            // plain F5: egui matches `NONE` logically, so a Shift+F5 press
+            // would otherwise be consumed as F5 and load Lead + Reverb.
+            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
             if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
-            // The guitar rig replaces the keyboard patch (no Keys unit), so it
-            // sits on Shift+F5, next to its keyboard sibling.
-            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
             if i.consume_key(Modifiers::NONE, Key::F8) { load_demo = true; }
             // Plugin browser (task-18).
             if i.consume_key(Modifiers::NONE, Key::F9) {
@@ -14206,10 +14238,12 @@ impl DemoApp {
                 }
                 if n == 0 { break; }
                 any = true;
-                tuner.process(&chunk[..n]);
+                tuner.push(&chunk[..n]);
             }
             if any {
-                *pitch = tuner.process(&[]);
+                if let Some(p) = tuner.estimate_if_due() {
+                    *pitch = p;
+                }
             }
         }
     }
@@ -15850,6 +15884,13 @@ const EVAL_TASKS: &[EvalTask] = &[
         check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
+        name: "listen_bright", start: EvalStart::OneRig, prompt: "Listen to the synth. Does it sound bright or dull?",
+        check: |_, _, reply| {
+            let reply = reply.to_lowercase();
+            eval_ensure(reply.contains("bright") && !reply.contains("silent") && !reply.contains("no listening model"), || format!("the reply does not say what it heard: {reply}"))
+        },
+    },
+    EvalTask {
         name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
         check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
@@ -15912,8 +15953,21 @@ impl EvalRig {
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
         engine.set_recorder(tap);
         app.recorder = Some(recorder);
+        let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+        engine.set_listen_tap(listen_tap);
+        crate::listen::install(listen_capture);
         app.graph_pub = Some(graph_pub);
-        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        let bus = Arc::new(Mutex::new(bus));
+        let notes = bus.clone();
+        app.note_sink = Some(Box::new(move |ev: NoteEvent| {
+            let cmd = if ev.velocity > 0.0 {
+                Command::NoteOn { note: ev.note, velocity: ev.velocity, source: ev.source }
+            } else {
+                Command::NoteOff { note: ev.note, source: ev.source }
+            };
+            let _ = notes.lock().unwrap().send(cmd);
+        }));
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, bus);
         (app.plugins_clap, app.plugins_lv2) = plugins.clone();
         app.plugins_loaded = true;
         Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
@@ -16278,6 +16332,9 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<VoiceMsg>::new(VOICE_RING);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<VoiceBack>::new(VOICE_RING);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
@@ -17689,6 +17746,23 @@ mod rig_switch_tests {
             assert!(!vis.is_empty(), "rig {rig} has cables");
             for c in vis { assert!(finite(c), "rig {rig} cable {} rope {:?}", c.id, &c.pts[..c.n]); }
         }
+    }
+
+    #[test]
+    fn shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead() {
+        // egui matches `Modifiers::NONE` logically, so a Shift+F5 press that
+        // is asked for after F5 loads Lead + Reverb instead of the guitar rig.
+        let ctx = egui::Context::default();
+        let names = |app: &DemoApp| -> Vec<String> { app.units.iter().map(|u| u.name.clone()).collect() };
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let shifted = |down: bool| egui::Event::Key {
+            key: Key::F5, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::SHIFT,
+        };
+        frame(&mut app, &ctx, vec![shifted(true), shifted(false)]);
+        assert!(names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "Shift+F5 → guitar rig: {:?}", names(&app));
+        frame(&mut app, &ctx, key(Key::F5));
+        assert!(!names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "plain F5 → lead: {:?}", names(&app));
     }
 
     #[test]
@@ -20892,6 +20966,23 @@ mod ui_polish_agent_tests {
         assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
     }
 
+    /// listen runs on its own thread; the batch hands the model its answer,
+    /// in call order, never the "listening" placeholder.
+    #[test]
+    fn the_agents_listen_call_answers_with_what_the_listener_said() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("play_note", serde_json::json!({"note": 60, "ms": 3000})),
+            call("listen", serde_json::json!({"attributes": "warm, 8-bit"})),
+            call("get_status", serde_json::json!({})),
+        ]);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].starts_with("played note 60"), "{}", results[0]);
+        assert!(results[1].starts_with("listen: no listening model"), "{}", results[1]);
+        assert!(results[2].contains("\"meter\""), "{}", results[2]);
+        assert!(live.app.listening.is_none());
+    }
+
     /// The load_sound plan against the app's real answers, on a rig whose
     /// instrument is not Surge.
     #[test]
@@ -23447,3 +23538,4 @@ mod offline_shots {
         }
     }
 }
+

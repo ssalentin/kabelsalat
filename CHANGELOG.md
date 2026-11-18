@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Controller range on a MIDI-mapped knob:** right-click a bound knob and
+  set MIN / MAX under *Controller range*. The controller's whole travel then
+  spans only that stretch, so an expression pedal on organ drive can be held
+  below 60 % and still use its full sweep. The knob shows the reachable
+  stretch in blue between two ticks, *Full range* lifts the limit, and the
+  range is saved with the session. Agents set it with `set_cc_map`
+  `min`/`max`, and `list_cc_maps` reports it.
 - **MIDI strip on the software keyboard:** the keyboard dock now carries a
   pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
   its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's

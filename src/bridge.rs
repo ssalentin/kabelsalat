@@ -548,7 +548,7 @@ mod tests {
         // add_node, as MCP does it: ids from a fresh get_graph.
         let mut g = get_graph();
         let gain = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
-        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 }})), json!({"ok": true}));
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false }})), json!({"ok": true}));
         assert!(get_graph().node(gain).is_some(), "the next call sees node {gain}");
 
         // Three auto-id connects in a row get three distinct ids.

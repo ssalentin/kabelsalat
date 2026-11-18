@@ -21,6 +21,16 @@ releases may still change behaviour and session files.
   search and load them. Floe installs from its release on x86_64; it publishes
   no aarch64 Linux build, and its card says so there. Release downloads are
   checked against a pinned SHA-256.
+- **Aeolus in the instrument catalog:** a pipe organ with additive pipe
+  models, several divisions of stops and a convolution reverb. It installs
+  from its v0.3.0 release on x86_64 and builds from source on aarch64.
+  Aeolus starts with every stop off, so kabelsalat starts it with a
+  principal chorus drawn, and `list_sounds` / `load_sound` offer 12
+  registrations (principals, flutes, celeste, reeds, full organ). The
+  Aeolus unit has a stop panel like a console's stop jamb: Manual III, II,
+  I and Pedal down the left, and each stop of the shown division with an
+  indicator light; a click draws it or pushes it in. The panel reads the stops
+  back from the plugin, so it follows sound and session loads.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code
   and the project's website. `list_instruments` reports the same fields.
@@ -73,6 +83,12 @@ releases may still change behaviour and session files.
   the unit is an instrument. It now uses the background plugin scan, and the
   setBfree session loads in under 1 ms of UI time (was 2.6 to 4.0 s). Agent
   edits of such a rack no longer freeze the window either.
+- **An instrument the assistant adds plays at once:** `add_node` wires a
+  CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
+  rig's synth: the rig's Keys into it and it into the rig's Master. A
+  setBfree added to a rig was left with only its MIDI cable and stayed
+  silent. The assistant also no longer believes LV2 instruments are
+  "coming soon".
 - **MIDI matrix, LV2 instrument columns:** a click in a setBfree (or any LV2
   instrument) column lit or cleared every cell of it, because all its rows
   showed the MIDI cable. Each cell now routes its own source, with the same

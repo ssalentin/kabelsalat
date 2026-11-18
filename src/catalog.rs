@@ -280,6 +280,39 @@ pub static CATALOG: &[CatalogEntry] = &[
         bundles: &["Floe.clap"],
         data: None,
     },
+    CatalogEntry {
+        id: "aeolus",
+        name: "Aeolus",
+        format: Format::Clap,
+        description: "Pipe organ with additive synthesis",
+        about: "A church pipe organ built on Fons Adriaensen's Aeolus: additive pipe models with chiff on the attack, several divisions of stops, tremulant and a convolution reverb.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        repo: "Archie3d/aeolus_plugin",
+        routes: &[InstallRoute::Release {
+            arch: "x86_64",
+            tag: "v0.3.0",
+            asset: "Aeolus-clap-linux-0.3.0.zip",
+            sha256: "498170149337c7d2ce19783156522d3bf489f811c2a61b7323b64071882cc370",
+            artifact: "Aeolus.clap",
+        }, InstallRoute::Source {
+            repo: "Archie3d/aeolus_plugin",
+            submodules: true,
+            // CMakeLists.txt: clap_juce_extensions_plugin(TARGET Aeolus), so
+            // the CLAP target is Aeolus_CLAP. JUCE and clap-juce-extensions
+            // are submodules.
+            build: &[
+                &["cmake", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"],
+                &["cmake", "--build", "build", "--target", "Aeolus_CLAP"],
+            ],
+            artifact: "build/Aeolus_artefacts/Release/CLAP/Aeolus.clap",
+        }],
+        home: Home::Clap,
+        clap_id: Some("com.ArthurBenilov.Aeolus"),
+        lv2_uris: &[],
+        bundles: &["Aeolus.clap"],
+        data: None,
+    },
 ];
 
 impl InstallRoute {
@@ -751,7 +784,7 @@ mod tests {
                 e.id
             );
         }
-        assert_eq!(CATALOG.len(), 7);
+        assert_eq!(CATALOG.len(), 8);
         assert_eq!(CATALOG[0].id, "setbfree", "setBfree is first per the spec");
     }
 
@@ -888,6 +921,15 @@ mod tests {
         let floe = find("floe").unwrap();
         assert!(route_for(floe, "aarch64").is_none(), "Floe ships x86_64 Linux builds only");
         assert_eq!(route_for(find("dexed").unwrap(), "aarch64").unwrap().kind(), "distro");
+
+        let aeolus = find("aeolus").unwrap();
+        let cmds = plan(aeolus, route_for(aeolus, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(cmds[4].argv, ["unzip", "-o", "-q", "/c/aeolus/Aeolus-clap-linux-0.3.0.zip", "-d", "/c/aeolus/unpacked"]);
+        assert_eq!(cmds[6].argv, ["cp", "-r", "/c/aeolus/unpacked/Aeolus.clap", "/home/u/.clap/"]);
+        let cmds = plan(aeolus, route_for(aeolus, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert!(cmds[1].argv.iter().any(|a| a == "--recurse-submodules"), "JUCE comes as a submodule");
+        assert_eq!(cmds[3].argv, ["cmake", "--build", "build", "--target", "Aeolus_CLAP"]);
+        assert_eq!(cmds[5].argv, ["cp", "-r", "/c/aeolus/build/Aeolus_artefacts/Release/CLAP/Aeolus.clap", "/home/u/.clap/"]);
     }
 
     #[test]

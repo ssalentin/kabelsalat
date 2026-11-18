@@ -24,7 +24,7 @@ options=('!lto')
 
 pkgver() {
   cd "$_pkgname"
-  git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+  git describe --long --tags --match 'v[0-9]*' --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
 }
 
 prepare() {

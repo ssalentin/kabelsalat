@@ -57,6 +57,8 @@ pub enum Load {
     MidiProgram(u8),
     /// One value of the plugin's own preset parameter.
     ParamValue { param: u32, value: f64 },
+    /// An Aeolus registration, written as the plugin's CLAP state.
+    AeolusRegistration(&'static crate::aeolus::Registration),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +97,9 @@ pub enum Source {
     /// `.odin` patches in Odin 2's soundbank folder. The factory ones are
     /// compiled into the plugin, so the catalog install copies them there.
     OdinSoundbanks,
+    /// Registrations of Aeolus's built-in organ, kabelsalat's own table
+    /// (`aeolus::REGISTRATIONS`): the plugin has no presets.
+    AeolusRegistrations,
     /// `pset:Preset` files in the LV2 bundles, plus the programmes the
     /// plugin names in its MIDNAM document.
     Lv2Bundles,
@@ -115,6 +120,7 @@ impl Instrument {
             Instrument::Clap(id) if id == SURGE_ID => Source::SurgePatches,
             Instrument::Clap(id) if id == DEXED_ID => Source::DexedCartridges,
             Instrument::Clap(id) if id == ODIN_ID => Source::OdinSoundbanks,
+            Instrument::Clap(id) if id == crate::aeolus::AEOLUS_ID => Source::AeolusRegistrations,
             Instrument::Clap(_) => Source::PresetParameter,
             Instrument::Lv2(_) => Source::Lv2Bundles,
         }
@@ -128,6 +134,7 @@ pub fn scan(instrument: &Instrument) -> Library {
         Source::SurgePatches => surge_library(),
         Source::DexedCartridges => dexed_library(),
         Source::OdinSoundbanks => odin_library(&odin_soundbanks_dir()),
+        Source::AeolusRegistrations => aeolus_library(),
         Source::Lv2Bundles => lv2_library(instrument.id()),
         // Nothing on disk: the plugin is asked.
         Source::PresetParameter => Library::default(),
@@ -181,6 +188,16 @@ fn odin_library(soundbanks: &std::path::Path) -> Library {
     }
     sounds.sort_by_key(|s| (s.category.to_lowercase(), s.name.to_lowercase()));
     Library { kind: "Odin 2 patches".into(), sounds, params: Vec::new() }
+}
+
+fn aeolus_library() -> Library {
+    let sounds = crate::aeolus::REGISTRATIONS.iter().map(|r| Sound {
+        category: r.category.into(),
+        name: r.name.into(),
+        preferred: false,
+        load: Load::AeolusRegistration(r),
+    }).collect();
+    Library { kind: "Aeolus organ registrations".into(), sounds, params: Vec::new() }
 }
 
 /// An LV2 instrument's installed presets plus the MIDI programmes it names.
@@ -335,6 +352,7 @@ pub fn load(sound: &Sound, to: Target) -> Result<(), String> {
             let state = crate::juce::value_tree_to_state(&data).map_err(|e| format!("{}: {e}", path.display()))?;
             plugin()?.0.load_state(&state).map_err(|e| e.to_string())
         }
+        Load::AeolusRegistration(reg) => plugin()?.0.load_state(&crate::aeolus::state(reg)).map_err(|e| e.to_string()),
         Load::ParamValue { param, value } => {
             plugin()?.1.set_param(clack_host::prelude::ClapId::new(*param), *value);
             Ok(())

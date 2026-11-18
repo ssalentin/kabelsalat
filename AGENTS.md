@@ -643,6 +643,21 @@ Learned so far (2026-11-15, UI polish pass):
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
 
+118. **A plugin whose destructor crashes is parked, never freed (CLAP too):**
+    Dexed's destructor segfaulted while other instances rendered (#52, the rule
+    56 class for LV2). `CLAP_NEVER_FREE` ids are deactivated and parked on
+    retire, and `ClapVoice::new_plugin` reuses them, reloading the first
+    instance's fresh state. Add a plugin to that list instead of dropping it.
+119. **A stack column is as wide as its widest face needs:** the uniform mid
+    width put the organ's LESLIE knob over the next unit at 781 px (#58). Rack
+    width and column widths come from `face_min_width`; extend it when a face
+    gets new fixed-size content (`organ_next_to_a_synth_stack_fits_at_the_default_window_size`).
+120. **A test that waits on the audio thread polls with a deadline, and only
+    the step that must time out gets a short timeout:** fixed block counts and a
+    150 ms timeout shared by a "fixed" scanner flaked under full-suite load
+    (#64, `dexed_is_parked_and_reused_not_destroyed`). Stress a new test with
+    a busy CPU (`nproc` spin loops) before shipping it.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

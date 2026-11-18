@@ -3095,11 +3095,27 @@ impl DemoApp {
             mid_w = MAX_MID_W;
             side_w = side_w.min(MAX_MID_W * 1.1);
         }
-        self.rack_w = 2.0 * (pad + rail) + 2.0 * side_w + n_mid as f32 * mid_w + gaps;
+        // A stack column is never narrower than its widest face needs (#58):
+        // an organ's knobs and drawbars do not fit the uniform mid width at
+        // small windows. The COMMITTED arrangement sizes the rack and the
+        // drop targets (no feedback, see col_x below); the arrangement being
+        // DRAWN (the Ctrl-drag preview) sizes what is drawn.
+        let unit_min_w: Vec<f32> = (0..self.units.len()).map(|u| self.face_min_width(u)).collect();
+        let col_w = |cols: &[Vec<usize>]| -> Vec<f32> {
+            (0..n_mid)
+                .map(|j| {
+                    let need = cols.get(j).map_or(0.0, |c| {
+                        c.iter().map(|&u| unit_min_w[u]).fold(0.0, f32::max)
+                    });
+                    mid_w.max(need)
+                })
+                .collect()
+        };
         let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
         widths.push(side_w); // keys
-        for _ in 0..n_mid { widths.push(mid_w); }
+        widths.extend(col_w(&self.stack_cols));
         widths.push(side_w); // master
+        self.rack_w = 2.0 * (pad + rail) + widths.iter().sum::<f32>() + gaps;
         let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
         let mut x = pad + rail;
         for w in &widths { xs.push(x); x += w + gap; }
@@ -3126,6 +3142,21 @@ impl DemoApp {
             _ => None,
         };
         let cols = preview.as_ref().map(|(_, c)| c.clone()).unwrap_or_else(|| self.stack_cols.clone());
+        // The preview gets the widths of the arrangement it shows (an organ
+        // dragged into another column widens that column in the preview
+        // exactly as the release will).
+        let (xs, widths) = if preview.is_some() {
+            let mut w = Vec::with_capacity(n_cols);
+            w.push(side_w);
+            w.extend(col_w(&cols));
+            w.push(side_w);
+            let mut x2 = pad + rail;
+            let mut xs2 = Vec::with_capacity(n_cols);
+            for ww in &w { xs2.push(x2); x2 += ww + gap; }
+            (xs2, w)
+        } else {
+            (xs, widths)
+        };
         self.drop_ghost = None;
         for j in 0..n_mid.min(cols.len()) {
             let cx = xs[j + 1];
@@ -12008,6 +12039,26 @@ impl DemoApp {
     fn knobs_that_fit(width: f32) -> usize {
         let leftmost = width - FACE_X - FACE_PAD_R - KNOB_SLOT_HALF - KNOB_LABEL_W / 2.0;
         if leftmost < 0.0 { 1 } else { (leftmost / KNOB_PITCH) as usize + 1 }
+    }
+
+    /// The narrowest width this unit's face stays legible at (#58): its
+    /// built-in knob row (the leftmost label inside the face grid) and, for
+    /// an organ, its nine drawbars. A stack column is never laid out
+    /// narrower — the organ column used to get the uniform mid width, which
+    /// put LESLIE over the neighbouring unit and hid the drawbars.
+    fn face_min_width(&self, unit: usize) -> f32 {
+        let Some(u) = self.units.get(unit) else { return 0.0 };
+        let knobs = u.knobs.iter().filter(|k| !k.hidden && k.source == KnobSource::BuiltIn).count();
+        let mut need = if knobs > 0 {
+            FACE_PAD_R + KNOB_SLOT_HALF + (knobs - 1) as f32 * KNOB_PITCH + KNOB_LABEL_W / 2.0 + FACE_X
+        } else {
+            0.0
+        };
+        if self.is_organ_unit(unit) {
+            // Nine drawbars at the width `drawbar_rects` demands (≥14 each).
+            need = need.max(FACE_X + crate::organ::DRAWBARS as f32 * 14.0 + 8.0 * 6.0 + FACE_PAD_R);
+        }
+        need
     }
 
     /// Show as many plugin knobs as the unit is wide; the unit's own knobs
@@ -21516,9 +21567,14 @@ mod face_layout_tests {
         let r = app.unit_rects[ui];
         let mut v = Vec::new();
         let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
+        // Title and subtitle are separate items: the split chip clears the
+        // title band and sits above the subtitle band, which a union box
+        // would call an overlap (false positive at narrow keys units).
         let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
-        let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
-        v.push(("header".to_string(), title.union(sub)));
+        v.push(("title".to_string(), title));
+        if u.sub_g.is_some() {
+            v.push(("subtitle".to_string(), Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g))));
+        }
         v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
         for (ki, k) in u.knobs.iter().enumerate() {
             if k.hidden { continue; }
@@ -21636,6 +21692,35 @@ mod face_layout_tests {
         g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.build_rack(&g, &[]);
         check(app, "organ");
+    }
+
+    /// The reported shape (#58): a synth+delay stack next to a setBfree organ
+    /// column, seen at the default window size — the organ column used to be
+    /// as narrow as every other mid column (200 px), which put the LESLIE
+    /// knob over the neighbouring unit and hid the drawbars.
+    #[test]
+    fn organ_next_to_a_synth_stack_fits_at_the_default_window_size() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let delay = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        let organ_ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            let bad = audit(&app);
+            assert!(bad.is_empty(), "face layout violations at {}x{}:\n{}", size.x, size.y, bad.join("\n"));
+            assert!(app.drawbar_rects(organ_ui).is_some(),
+                "drawbars hidden at {}x{}", size.x, size.y);
+        }
     }
 
     #[test]

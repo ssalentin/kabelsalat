@@ -62,6 +62,15 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **Organ face fits at the default window size (#58).** A stack column is
+  never narrower than its widest face needs, so the organ's LESLIE knob no
+  longer lands on the neighbouring unit and the drawbars stay visible; a narrow
+  window pans the rack instead.
+- **Dexed no longer crashes the test suite (#52).** Its destructor segfaults
+  while other plugin instances render, so a retired Dexed is parked and reused
+  by the next one (reset to fresh state), never destroyed.
+- **Flaky scan-cache test (#64):** only the deliberately hanging scanner gets
+  the short timeout.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

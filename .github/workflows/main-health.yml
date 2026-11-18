@@ -1,0 +1,54 @@
+name: Main health
+
+# main does not require PRs to be up to date, so two PRs that are green on
+# their own can still break main together. CI runs on every push to main;
+# this workflow turns a red run into one open issue (label `main-red`) that
+# an agent picks up, and closes it once main is green again.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: main-health
+
+jobs:
+  report:
+    if: >-
+      ${{ github.event.workflow_run.event == 'push'
+      && contains(fromJSON('["success","failure","timed_out"]'), github.event.workflow_run.conclusion) }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      TITLE: ${{ github.event.workflow_run.display_title }}
+    steps:
+      - name: Open, update or close the main-red issue
+        run: |
+          gh label create main-red --color B60205 \
+            --description "CI is red on main (opened by main-health.yml)" 2>/dev/null || true
+          open=$(gh issue list --label main-red --state open --json number -q '.[0].number')
+          if [ "$CONCLUSION" = success ]; then
+            [ -z "$open" ] || gh issue close "$open" \
+              --comment "main is green again at $SHA: $RUN_URL"
+            exit 0
+          fi
+          body="CI failed on \`main\` at $SHA (\"$TITLE\").
+
+          Run: $RUN_URL
+
+          Fix forward with a PR (or revert the breaking merge); this issue closes
+          itself when CI on main is green again."
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "main is red: CI failed at ${SHA::7}" \
+              --label main-red --label testing --body "$body"
+          fi

@@ -15,6 +15,10 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `control.rs` — the typed control plane: `Command` (one API for UI, assistant,
   CLI and MCP), `Graph`/`Node`/`Edge` (nodes carry their `rig`), `Rig`,
   `RigSnapshot`, `merge_rigs`/`split_rigs`, the lock-free `command_bus()` (rtrb).
+- `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
+  atomics, read once), `NodeTimes` (lock-free render time per unit) and the
+  `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`
+  all show.
 - `engine.rs` — `GraphEngine`: voices → DSP → LV2 → per-rig mix → master
   limiter → master saturation. Sums every MasterOut (one per rig). Publishes
   `GraphPub` (graph, rules, mix, voice binding) and edge levels to the UI; the
@@ -25,6 +29,24 @@ agents are in [AGENTS.md](../AGENTS.md).
   larger tables and retire requests through `VoiceMsg` and frees what comes
   back through `VoiceBack`, so the audio thread never allocates or frees
   for a voice.
+- `arp.rs` — the arpeggiator / chord unit and the Keys scale snap (issue #90).
+  `ArpState` is one fixed-size state per `NodeKind::Arp` node: held keys
+  (reference counted), the generated notes that are down, and a step clock in
+  SONG-CLOCK BEATS (the engine feeds `tick` the transport position while the
+  master plays, a free-running phase at the same BPM otherwise; rule 43). The
+  unit sits between a Keys source and the synths like an effect:
+  `Graph::wire_arp` replaces the rig's Keys → synth MIDI cables by Keys → arp
+  → synth. Modes up / down / up-down / random step the pattern (rate 1/4 …
+  1/32 incl. triplets, octaves 1–4, gate, swing); chord mode sounds one
+  triad / 7th / power chord per held key and holds it with the key. Every
+  routing edit that can change an arp note's off path releases through
+  `GraphEngine::release_all`, which cascades into what the arp feeds
+  (`engine/held_notes.rs` checks it). Scale snap is a property of the Keys node
+  (`Node::scale`, `Command::SetKeysScale`): `snap_note` is a pure function of
+  the played note, so a release meets the pitch its note-on snapped to.
+  Knobs live in `engine::knob_specs`; `knob_values_from_args` is the one
+  parser of the `set_arp` agent/MCP tool. `kabelsalat arp-test` renders two
+  bars through a real Surge voice.
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
   plugin scan with a cache, Surge/Dexed patch files.
@@ -40,7 +62,14 @@ agents are in [AGENTS.md](../AGENTS.md).
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
   voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
   MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
-  parameter (YANES). Each `Sound` carries its `Load` (plugin state, parameter
+  parameter (YANES). Aeolus has no presets and starts with every stop off:
+  `aeolus.rs` holds its organ's stop table and a set of registrations, each
+  written as the plugin's JSON state; a freshly instantiated Aeolus gets the
+  default registration in `ClapVoice::instantiate_entry`. Its stops are no
+  parameters, so the Aeolus face's stop panel (`aeolus_rects`) changes one
+  stop by taking the plugin's state, changing that stop (`aeolus::with_stop`)
+  and loading it back; it reads what is drawn (`aeolus::drawn`) once a
+  second and after each change. Each `Sound` carries its `Load` (plugin state, parameter
   value, LV2 preset, programme change), and `load` sends each along its own
   path. `Libraries` scans on a thread of its own and keeps the results;
   `search` / `find` are the one search for every library, and the
@@ -66,10 +95,20 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
+  The player decodes on its own thread; the engine owns its clock and reads the
+  file at the song position (loop, tempo sync as varispeed, Number of Beats,
+  Beat Offset, start at the next bar), so a synced loop cannot drift.
 - `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono
   check, 4-band summary; allocation-free, published via `GraphPub.meter`.
+- `listen.rs` — the audio judge behind the agent's `listen` tool (#35): an
+  armed master tap (pushes only while a listen records), the clip sent as mono
+  16 kHz WAV with the meter's numbers to an audio-capable OpenRouter model
+  (`agent_listen_model`, default Gemini 3.8 Flash, `reasoning: low`), which
+  answers in text (0-10 per attribute plus what it heard). The acting model
+  and Jev read that text, never the audio (rule 82). `listen-test` checks the
+  model ranks known reference clips (real Surge patches) the right way round.
 - `ui.rs` / `theme.rs` — eframe/egui app: rack with physics cables and flip,
   rigs strip, mixer, matrix, sessions, plugin browser, native plugin editors,
   bottom dock (keyboard or assistant); `theme.rs` is the single palette source
@@ -80,12 +119,26 @@ agents are in [AGENTS.md](../AGENTS.md).
   built-in assistant; both expose the same tools (AGENTS.md rule 6). The
   assistant's worker asks a decisions model first (`SHORTCUTS`: one row per
   request it settles, each a plan of tool calls) and hands the rest to a chat
-  model. `llm.rs` is the one client and the route per role (decide, act,
-  perceive); `vision.rs` sizes and encodes the images a model gets (attached
-  by the user, or the app window through `look_at_rack`).
+  model. `llm.rs` is the one client and the route per role (decide, act).
+  The agent takes text only: there is no image input.
 - `session.rs` — sessions (multi-rig), templates.
 
 ## 0. Decision log
+
+- **2026-11-18** — **MIDI strips (AUM parity, #86).** A MIDI effect is a graph
+  node (`NodeKind::MidiFx`: a built-in transposer, or an LV2 plugin that has a
+  MIDI atom in and out and no audio port) whose output is a matrix source
+  (`SourceId::MidiFx(node)`). Notes travel source → unit → instrument: the
+  engine's `pump_midi_fx` feeds each unit's bounded queue into its plugin
+  before the voices render and routes what it emits through the matrix, with
+  no allocation on the audio thread (LV2 instances load on the loader thread
+  like any LV2 unit). Adding a unit re-points the rig's Keys → instrument MIDI
+  cables through it; removing one heals them. Because a unit can change what
+  its own note-off means (a transposer's knob), every edit of a unit's path
+  releases what is held through it first (rule 41; checked by the
+  `Alphabet::Fx` held-notes search and, with a real plugin, by
+  `kabelsalat midifx-test`). CLAP note effects are discovered
+  (`list_midi_fx`, `clap_not_hostable_yet`) but not hosted yet.
 
 - **2026-11-17** — **Instrument profiles, not per-knob learn** (user: map a whole
   Nord Electro 2, drawbars included). Other hosts do this with a per-device
@@ -120,7 +173,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   1:1 through the same control plane the UI uses (§2c).
 - **2026-11-14** — **Embedded plugin editors required** (user): no scattered plugin
   windows — editors open inside the host window (§6). Host runs under XWayland so
-  X11 reparenting works.
+  X11 reparenting works. *Superseded 2026-11-17:* editors are native egui
+  parameter views, and the app runs as a native Wayland client.
+- **2026-11-17** — **Plugin GUIs in their own windows** (user): the plugin's
+  own editor opens on request ("Open plugin window" in the editor pane) as a
+  separate XWayland dialog window that kabelsalat creates and the plugin
+  embeds into. The main app stays a native Wayland client; the native egui
+  pane stays the default editor.
 - **2026-11-14** — **Reason's rack flip adopted as interaction model** (user):
   labeled rack units, Tab flips to the back panel where the cables live (§2a).
 - **2026-11-14** — **Built-in assistant requested** (user): DeepSeek-powered, BYOK,
@@ -197,6 +256,21 @@ agents are in [AGENTS.md](../AGENTS.md).
   UI scale from the compositor (1.6, not winit's 2.33 DPI guess), background
   repaint throttled to 30 fps (UI CPU 24% → 12% unfocused), get_status reports
   render_avg_us / render_max_us / render_late.
+- **2026-11-18** — **DSP load and Engine Info** (#106, AUM parity): one
+  `engine_info::EngineStats` snapshot feeds the DSP readout, the Engine
+  Info popup and `get_engine_info`; nothing else reads the callback counters.
+  The readout sits at the right end of the rig strip, not in the bar above
+  it: at the 760 px minimum that bar has 46 px left once the agent chip
+  shows, so a readout there pushed SYNC out of the window.
+  The render path times every voice and effect into `NodeTimes`, a fixed
+  table of atomics written in render order (row i = the i-th unit of the
+  block, so no search and no allocation; rows restart when the order
+  changes). Cost: one clock read per voice and two per effect, not
+  measurable in `many-voices-test` (median block 503 µs before and after, 10
+  voices, six alternating runs each), so every block is timed. The sound
+  card's output latency and the audio-input latency are shown as "not
+  measured": cpal's `playback − callback` reads 185 ms through pipewire-alsa
+  on a one-quantum graph (`audio-in-test`), and no other figure is measured.
 - **2026-11-15** — **No squished racks** (user): the assistant panel only takes
   the height the rack can spare; big patches keep readable units and pan
   (wheel / trackpad) inside a clipped view with hairline pan indicators.
@@ -408,9 +482,12 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **Frontends are siblings:** egui UI, MCP server, and CLI all call the same control
   plane (`kabelsalat-control`); every command flows through one lock-free ring into
   the engine. This is what guarantees 1:1 MCP coverage (§2c).
-- **Display:** the app runs under XWayland (X11) so plugin editors can be reparented
-  into the main window — CLAP/VST3/LV2 Linux GUIs are X11; native-Wayland plugin
-  GUIs don't exist in practice yet.
+- **Display:** native Wayland (winit), at the compositor's fractional scale.
+  The default editors are native egui parameter views. A plugin's own GUI is
+  X11 on Linux, so it opens in a host-owned XWayland toplevel
+  (`plugin_window.rs`, a `_NET_WM_WINDOW_TYPE_DIALOG` so window managers float
+  it); the UI frame drives the plugin's `timer-support` and
+  `posix-fd-support` callbacks, which JUCE editors paint from.
 - **Threads:** UI (egui) · audio callback (cpal, RT) · MIDI in (midir) · disk pool.
   UI→audio: `rtrb` command rings. Audio→UI: `triple_buffer` snapshots (meters,
   playhead, **per-edge levels for cable animation**) + event ring (notes, xruns).

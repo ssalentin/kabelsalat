@@ -16,15 +16,15 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::control::{
-    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, NodeId, NodeKind,
-    ParamId, PortKind, RigSnapshot,
+    name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
+    NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
 };
 use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::meter::{MasterMeter, MeterSnapshot};
-use crate::player::PlayerSink;
+use crate::player::{read_frame, PlayerCfg, PlayerData};
 use crate::record::RecorderTap;
 use crate::transport::{CountInConfig, MasterClock, Transport};
 
@@ -108,6 +108,19 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
 /// as a SetParam on a SystemAudio node so its GAIN knob and CC bindings work.
 pub const P_SYSTEM_GAIN: ParamId = 66;
 
+/// A built-in MIDI-FX unit's TRANSPOSE knob, in semitones −24..=24 mapped to
+/// 0..1 (`SetParam` on the MidiFx node). CLAP/LV2 MIDI-FX units have no
+/// built-in knobs — their knobs are the plugin's main controls (rule 89).
+pub const P_MIDIFX_SEMI: ParamId = 67;
+
+/// A built-in transposer's knob value in semitones (TRANSPOSE is ±24).
+pub const MIDIFX_SEMI_MAX: i8 = 24;
+
+/// The arp unit's knobs (issue #90): mode, rate, octaves, gate, swing and
+/// the chord shape of chord mode. Normalized 0..1 like every rack knob; the
+/// stepped ones quantize in `arp::ArpState::set_param` (and on the face).
+pub use crate::arp::{P_ARP_CHORD, P_ARP_GATE, P_ARP_MODE, P_ARP_OCTAVE, P_ARP_RATE, P_ARP_SWING};
+
 /// One rack-unit knob: the label on the face (canonical for agents too),
 /// its default, the engine param it drives (None = local-only), and the long
 /// names agents may use instead of the label.
@@ -117,11 +130,20 @@ pub struct KnobSpec {
     pub param: Option<ParamId>,
     /// Not drawn as a knob (the face renders it as a chip); still bindable.
     pub hidden: bool,
+    /// > 1 = a stepped knob: the face snaps the needle to this many evenly
+    /// spaced positions, and `CcScale::stepped` maps a controller onto them.
+    /// The engine quantizes defensively on apply.
+    pub steps: u8,
     pub aliases: &'static [&'static str],
 }
 
 const fn ks(label: &'static str, default: f32, param: Option<ParamId>, aliases: &'static [&'static str]) -> KnobSpec {
-    KnobSpec { label, default, param, hidden: false, aliases }
+    KnobSpec { label, default, param, hidden: false, steps: 0, aliases }
+}
+
+/// A stepped knob (mode/rate-style pickers): `steps` evenly spaced positions.
+const fn ks_steps(label: &'static str, default: f32, param: Option<ParamId>, steps: u8, aliases: &'static [&'static str]) -> KnobSpec {
+    KnobSpec { label, default, param, hidden: false, steps, aliases }
 }
 
 /// A `'static` knob table: `const` items are promoted, `const fn` calls are not.
@@ -140,7 +162,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
         // The plugin's main controls join LEVEL on the face (`main_controls`).
         NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
-        NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
+        NodeKind::MasterOut => knobs!(ks("VOLUME", 0.75, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
             DspKind::Reverb => knobs!(ks("MIX", 0.35, Some(0), &[]), ks("SIZE", 0.5, Some(1), &[])),
@@ -156,7 +178,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         // Drawbars are hidden knobs, painted as faders.
         k @ NodeKind::Lv2 { .. } if crate::organ::is_organ(k) => {
             const fn bar(label: &'static str, i: usize, out: bool, aliases: &'static [&'static str]) -> KnobSpec {
-                KnobSpec { label, default: if out { 1.0 } else { 0.0 }, param: Some(crate::organ::drawbar_param(i)), hidden: true, aliases }
+                KnobSpec { label, default: if out { 1.0 } else { 0.0 }, param: Some(crate::organ::drawbar_param(i)), hidden: true, steps: 9, aliases }
             }
             knobs!(
                 bar("16'", 0, true, &["DRAWBAR 16", "DRAWBAR 1"]),
@@ -179,9 +201,25 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Lv2 { .. } => &[],
         // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
         NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
+        // A hosted MIDI-FX unit's own knobs are the plugin's main controls
+        // (rule 89); the BUILTIN transposer's face shows SEMIS.
+        NodeKind::MidiFx { plugin } => match plugin {
+            MidiFxPlugin::Builtin { .. } => knobs!(ks("SEMIS", 0.5, Some(P_MIDIFX_SEMI), &["TRANSPOSE", "SEMI", "SEMITONES"])),
+            _ => &[],
+        },
+        // The arp's six knobs (issue #90). MODE/RATE/OCT/CHORD are stepped —
+        // the face snaps the needle, and `ArpState::set_param` quantizes.
+        NodeKind::Arp => knobs!(
+            ks_steps("MODE", 0.0, Some(P_ARP_MODE), 5, &["ORDER", "PATTERN"]),
+            ks_steps("RATE", 0.6, Some(P_ARP_RATE), 6, &["SPEED"]), // position 3 = 1/16
+            ks_steps("OCT", 0.0, Some(P_ARP_OCTAVE), 4, &["OCTAVES", "RANGE"]),
+            ks("GATE", 0.75, Some(P_ARP_GATE), &["LENGTH"]),
+            ks("SWING", 0.0, Some(P_ARP_SWING), &["SHUFFLE"]),
+            ks_steps("CHORD", 0.0, Some(P_ARP_CHORD), 8, &["SHAPE", "CHORD SHAPE"]),
+        ),
         NodeKind::AudioIn { .. } => knobs!(
             ks("GAIN", 0.5, Some(P_AUDIO_IN_GAIN), &[]),
-            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, aliases: &["MONITOR"] },
+            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, steps: 0, aliases: &["MONITOR"] },
         ),
     }
 }
@@ -360,6 +398,73 @@ struct Lv2Slot {
     buf: Vec<f32>,
 }
 
+/// Input events a MIDI-FX unit may hold between blocks (a full queue drops,
+/// never allocates).
+const FX_QUEUE_CAP: usize = 256;
+/// Output events one unit may emit per block (one shared engine scratch
+/// buffer; a full one drops).
+const FX_OUT_CAP: usize = 256;
+
+/// A hosted MIDI-FX node: the unit the matrix routes events through (AUM
+/// MIDI strips). The input queue is filled by `apply` at block boundaries
+/// and drained by `pump_midi_fx` on the audio thread — allocation-free
+/// both sides. Without a live processor (still loading, load failed, or a
+/// built-in unit) events pass through unprocessed: the rack stays playable
+/// and note-offs always flow (rule 41).
+struct MidiFxSlot {
+    node: NodeId,
+    /// The hosted plugin. `None` = pass-through.
+    proc: Option<MidiFxProc>,
+    /// The unit's raw-MIDI input queue (preallocated, cleared per pump).
+    in_q: Vec<MidiMsg>,
+    /// BUILT-IN transposer: the TRANSPOSE knob's semitones (CLAP/LV2 units
+    /// ignore this and process with their own plugin).
+    semis: i8,
+    /// `release_all` recursion guard (a wired FX1 → FX2 → FX1 loop).
+    releasing: bool,
+    /// Knob values sent before the plugin is live (rule 113): fixed capacity,
+    /// replayed by `attach_midi_fx_lv2`, never grown on the audio thread.
+    pending: Vec<(ParamId, f32)>,
+}
+
+enum MidiFxProc {
+    /// The loaded LV2 plugin, in the loader's own slot (so its retirement
+    /// goes back through `retire_lv2`, never a free on the audio thread).
+    Lv2(Lv2Slot),
+}
+
+/// Knob values one unit may hold while its plugin loads.
+const FX_PENDING_CAP: usize = 16;
+
+impl MidiFxSlot {
+    fn new(node: NodeId, semis: i8) -> Self {
+        Self {
+            node,
+            proc: None,
+            in_q: Vec::with_capacity(FX_QUEUE_CAP),
+            semis,
+            releasing: false,
+            pending: Vec::with_capacity(FX_PENDING_CAP),
+        }
+    }
+
+    /// Queue one event (allocation-free; a full queue drops the event).
+    fn queue(&mut self, msg: MidiMsg) {
+        if self.in_q.len() < FX_QUEUE_CAP {
+            self.in_q.push(msg);
+        }
+    }
+}
+
+/// Build the slot for a node (rare structural op — allocating here is fine).
+fn midi_fx_slot(n: &crate::control::Node) -> MidiFxSlot {
+    let semis = match &n.kind {
+        NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis } } => *semis,
+        _ => 0,
+    };
+    MidiFxSlot::new(n.id, semis)
+}
+
 /// One `AudioIn` node's render-side state. The ring `consumer` is filled by the
 /// input stream's callback thread (stereo-interleaved) and popped here at block
 /// boundaries — allocation- and lock-free (rule 29/46). Ownership of the live
@@ -446,12 +551,26 @@ fn build_audio_in_slots(graph: &Graph) -> Vec<AudioInSlot> {
         .collect()
 }
 
+/// One arp state per Arp node (rare structural op; capacity 8 pre-reserved
+/// so runtime `AddNode`s within it never allocate).
+fn build_arp_slots(graph: &Graph) -> Vec<crate::arp::ArpState> {
+    let mut v = Vec::with_capacity(8);
+    for n in &graph.nodes {
+        if matches!(n.kind, NodeKind::Arp) {
+            v.push(crate::arp::ArpState::new(n.id));
+        }
+    }
+    v
+}
+
 /// Work the audio thread hands to the LV2 loader thread: instantiating a
 /// plugin (~200 ms for Vitalium), parsing its presets and freeing an
 /// instance all block far longer than one audio buffer.
 enum Lv2Request {
     Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
     Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
+    /// A fresh instance with this state restored, to replace the node's.
+    State { node: NodeId, uri: crate::control::Lv2Uri, gen: u64, state: Vec<u8> },
     Retire(Lv2Slot),
     RetirePreset(crate::lv2::Lv2Preset),
 }
@@ -460,6 +579,7 @@ enum Lv2Request {
 enum Lv2Response {
     Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
     Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
+    Restored { node: NodeId, gen: u64, slot: Lv2Slot },
 }
 
 const LV2_RING: usize = 64;
@@ -470,6 +590,29 @@ fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
         Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2] }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
+            None
+        }
+    }
+}
+
+/// A new instance of `uri` with `state` restored: checked first, because a
+/// state the plugin cannot read can hang the thread restoring it
+/// (`vital::check_patch`).
+fn restored_lv2_slot(node: NodeId, uri: &str, state: &[u8], sample_rate: f64) -> Option<Lv2Slot> {
+    let Some(format) = crate::lv2::state_format(uri) else {
+        eprintln!("lv2 node {node}: no known state format for {uri}");
+        return None;
+    };
+    if let Err(e) = (format.check)(state) {
+        eprintln!("lv2 node {node}: {e}");
+        return None;
+    }
+    let mut slot = load_lv2_slot(node, uri, sample_rate)?;
+    match slot.plugin.restore_state(&[(format.key, format.kind, state)]) {
+        Ok(()) => Some(slot),
+        Err(e) => {
+            eprintln!("lv2 node {node}: {e}");
+            crate::lv2::retire(slot.plugin);
             None
         }
     }
@@ -493,6 +636,9 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
+            Lv2Request::State { node, uri, gen, state } => {
+                restored_lv2_slot(node, uri.as_str(), &state, sample_rate).map(|slot| Lv2Response::Restored { node, gen, slot })
+            }
             Lv2Request::Retire(slot) => {
                 crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
                 None
@@ -578,6 +724,31 @@ fn block_peak(buf: &[f32]) -> f32 {
     buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
 }
 
+/// One source node's strip output gains (L, R), or None when the node has no
+/// strip state (unity — the common case, no work at all). Free function on
+/// field references: the render loops hold a mutable borrow of the slot while
+/// the strip table and graph are read. Constant-power pan like the rig bus:
+/// gl = sqrt(1-pan), gr = sqrt(1+pan).
+fn strip_gains_of(
+    strips: &[(NodeId, StripMix)],
+    graph: &Graph,
+    node: NodeId,
+    solo_rigs: &[bool; 8],
+) -> Option<(f32, f32)> {
+    // A source nobody touched has no entry but is still silenced by another
+    // source's solo in its rig (rule 134).
+    let m = strips.iter().find(|(n, _)| *n == node).map(|(_, m)| *m).unwrap_or(StripMix::DEFAULT);
+    let rig = graph.node(node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+    if m.is_default() && !solo_rigs[rig] { return None; }
+    let g = if m.mute || (solo_rigs[rig] && !m.solo) { 0.0 } else { 1.0 };
+    Some((g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt()))
+}
+
+/// Is this FX node bypassed (#74)? Allocation-free linear scan.
+fn strip_bypassed(strips: &[(NodeId, StripMix)], node: NodeId) -> bool {
+    strips.iter().any(|(n, m)| *n == node && m.bypass)
+}
+
 /// Per-rig mixer state (AUM overview strip). Unity by default.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -594,6 +765,80 @@ impl RigMix {
 
 impl Default for RigMix {
     fn default() -> Self { Self::DEFAULT }
+}
+
+/// How many per-node strip states the engine tracks (and publishes). The
+/// architecture's fixed RT limit is 64 nodes; the table is allocated once in
+/// the constructor and never grows — an entry past it is dropped.
+pub const MAX_STRIP_MIXES: usize = 64;
+
+/// How many master-insert FX the render path walks per block (#77). A longer
+/// chain than this keeps playing but its tail is ignored.
+pub const MAX_MASTER_INSERTS: usize = 8;
+
+/// One source strip's engine state (#73): pan and mute/solo applied to the
+/// node's own output (post LEVEL — the strip fader), plus the insert bypass
+/// flag (#74) an FX node carries in the same table. Solo scope is WITHIN the
+/// node's rig. Unity by default.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct StripMix {
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+    pub bypass: bool,
+}
+
+impl StripMix {
+    pub const DEFAULT: Self = Self { pan: 0.0, mute: false, solo: false, bypass: false };
+    /// True when nothing differs from a node the table never heard of.
+    pub fn is_default(&self) -> bool {
+        *self == Self::DEFAULT
+    }
+}
+
+impl Default for StripMix {
+    fn default() -> Self { Self::DEFAULT }
+}
+
+/// One entry of the published strip table (`GraphPub::strips`). An empty slot
+/// carries `node == NodeId::MAX`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StripPub {
+    pub node: u32,
+    pub mix: StripMix,
+}
+
+impl Default for StripPub {
+    fn default() -> Self { Self { node: u32::MAX, mix: StripMix::DEFAULT } }
+}
+
+impl StripPub {
+    pub const EMPTY: Self = Self { node: u32::MAX, mix: StripMix::DEFAULT };
+}
+
+impl Default for GraphPub {
+    /// `strips` needs a manual impl: derived `Default` only covers arrays
+    /// up to 32 elements.
+    fn default() -> Self {
+        Self {
+            rev: 0,
+            graph: Graph::default(),
+            rules: Vec::new(),
+            mix: [RigMix::DEFAULT; 8],
+            strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
+            system_gain: 0.0,
+            mix_rev: 0,
+            voices: Vec::new(),
+            voices_rev: 0,
+            transport: TransportPub::default(),
+            transport_rev: 0,
+            player: PlayerPub::default(),
+            player_rev: 0,
+            meter: MeterSnapshot::default(),
+            meter_rev: 0,
+        }
+    }
 }
 
 /// Published engine transport + count-in state (copied under `try_lock`, zero allocation).
@@ -622,13 +867,62 @@ impl Default for TransportPub {
     }
 }
 
+/// Published file-player state (issue #84): what the engine is playing and
+/// how — frontends (UI mirror, bridge get_status, MCP) read it under
+/// `player_rev`. Copied under `try_lock`, zero allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerPub {
+    /// A file is loaded.
+    pub loaded: bool,
+    /// The play-enable (AUM's circular toggle) is on.
+    pub enabled: bool,
+    /// Enabled but waiting for the bar line (sync on, transport rolling).
+    pub pending: bool,
+    /// Sounding right now (enabled, started, not finished).
+    pub playing: bool,
+    pub loop_on: bool,
+    pub sync: bool,
+    /// Number of Beats setting (0 = unset).
+    pub beats: f32,
+    /// Beat Offset setting.
+    pub offset: f32,
+    /// Original BPM setting (adopted from "nnn bpm" in the filename on load).
+    pub bpm: f32,
+    /// The tempo the file is played against: beats-derived while loop+sync
+    /// are on, otherwise the original BPM.
+    pub eff_bpm: f32,
+    /// File length in seconds.
+    pub duration: f32,
+    /// Mix gain (0..1).
+    pub gain: f32,
+}
+
+impl Default for PlayerPub {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            enabled: false,
+            pending: false,
+            playing: false,
+            loop_on: false,
+            sync: false,
+            beats: 0.0,
+            offset: 0.0,
+            bpm: crate::player::DEFAULT_BPM,
+            eff_bpm: 0.0,
+            duration: 0.0,
+            gain: 0.0,
+        }
+    }
+}
+
 /// Shared graph publication for frontends (MCP→UI live sync).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
 /// the steady render path never locks it. `rev` lets the UI skip unchanged
 /// snapshots cheaply; duplicate Connects (the UI's per-frame mirror) do NOT
 /// bump it, so UI-originated edits never trigger a rebuild feedback loop.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GraphPub {
     pub rev: u64,
     pub graph: Graph,
@@ -639,6 +933,9 @@ pub struct GraphPub {
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
+    /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
+    /// FX nodes — same publication discipline as `mix` (fixed-size copy).
+    pub strips: [StripPub; MAX_STRIP_MIXES],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     pub mix_rev: u64,
@@ -650,6 +947,9 @@ pub struct GraphPub {
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
+    /// File-player state (loop/sync/enable), bumped by `player_rev`.
+    pub player: PlayerPub,
+    pub player_rev: u64,
     /// Master-bus loudness/peak/band meter (Bravo 1 "measure loop"), bumped by
     /// `meter_rev` every render block via a non-blocking `try_lock` (rule 33).
     pub meter: MeterSnapshot,
@@ -662,12 +962,70 @@ fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
     g.voices_rev = g.voices_rev.wrapping_add(1);
 }
 
+/// The strip table as `GraphPub` publishes it: a fixed array (default =
+/// empty slots), so the audio thread never allocates for a strip edit.
+/// Public for tests that need to fake an engine publication.
+pub fn strips_pub_table(strips: &[(NodeId, StripMix)]) -> [StripPub; MAX_STRIP_MIXES] {
+    let mut out = [StripPub::EMPTY; MAX_STRIP_MIXES];
+    for (i, (node, mix)) in strips.iter().take(MAX_STRIP_MIXES).enumerate() {
+        out[i] = StripPub { node: *node, mix: *mix };
+    }
+    out
+}
+
 impl GraphPub {
     /// Make room for `n` published voices. Called off the audio thread by
     /// whoever raises the engine's voice capacity.
     pub fn reserve_voices(&mut self, n: usize) {
         self.voices.reserve(n.saturating_sub(self.voices.len()));
     }
+}
+
+/// What a played note picks up between a Keys node and its destination: the
+/// zone's octave shift and the Keys node's scale snap (issue #90).
+#[derive(Clone, Copy)]
+struct KeysRoute {
+    shift: i16,
+    scale: Option<crate::arp::ScaleChoice>,
+}
+
+/// The loaded file and its runtime clock. Plain engine-owned state: no
+/// locks, no atomics on the render path.
+struct PlayerFile {
+    /// Interleaved stereo at the file's own rate, shared with the host
+    /// (freed only through the retire ring).
+    samples: Arc<[f32]>,
+    frames: usize,
+    file_sr: f64,
+    duration: f64,
+    /// Play-enable (AUM's circular toggle).
+    enabled: bool,
+    /// Enabled but waiting for the bar line (sync on, transport active).
+    pending: bool,
+    /// Song beat the pending start waits for.
+    target_beats: f64,
+    /// Play position in file frames. Authoritative in free-run; the sync
+    /// path re-derives it from the anchors every frame and mirrors it here.
+    pos: f64,
+    /// The song-clock mapping: file beats ↔ song beats while synced.
+    anchor_song_beats: f64,
+    anchor_file_beats: f64,
+    /// A one-shot (loop off) played past its end.
+    finished: bool,
+}
+
+/// Start sounding from the configured point (Beat Offset), anchored to the
+/// song clock at `song_beats`. Returns the start position in file frames.
+fn player_start_now(p: &mut PlayerFile, cfg: PlayerCfg, song_beats: f64) -> f64 {
+    let ref_bpm = cfg.ref_bpm(p.duration);
+    let start_beats = cfg.start_beats(ref_bpm, p.duration);
+    let pos = start_beats * 60.0 / ref_bpm * p.file_sr;
+    p.pending = false;
+    p.finished = false;
+    p.pos = pos;
+    p.anchor_file_beats = start_beats;
+    p.anchor_song_beats = song_beats;
+    pos
 }
 
 pub struct GraphEngine {
@@ -689,6 +1047,9 @@ pub struct GraphEngine {
     /// instance was live (it loads on its own thread, rule 46); replayed by
     /// `attach_lv2`. Fixed size: no allocation on the audio thread.
     organ_pending: [Option<OrganPending>; 8],
+    /// Control values that arrived before ANY still-loading LV2 instance
+    /// was live (`Lv2Pending`); replayed by `attach_lv2` (rule 113).
+    lv2_pending: [Option<Lv2Pending>; 8],
     // Song clock handed to every CLAP voice. Its tempo is shared by every
     // transport-capable node (per-node run state lives in each DspSlot's
     // SlotTransport); its playing flag is the MASTER transport only.
@@ -702,12 +1063,22 @@ pub struct GraphEngine {
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
+    /// Render time per voice and effect (Engine Info), written per block.
+    node_timer: crate::engine_info::NodeTimer,
     // MIDI routing matrix (source → instrument: channel/transpose/ranges).
     // Default rules mirror "every source plays every instrument"; keyboard
     // zones are NOT matrix rules — a split Keys node's LOW/HIGH ports gate
     // notes by graph wiring (keys_gate).
     matrix: Matrix,
     route_out: Vec<(NodeId, MidiMsg)>,
+    // Hosted MIDI-FX units (AUM MIDI strips): the event path source →
+    // MIDI-FX → rig input. `apply` queues into the slots at block
+    // boundaries; `pump_midi_fx` (render) processes + routes their output.
+    midi_fx: Vec<MidiFxSlot>,
+    /// Scratch: raw MIDI bytes queued into one CLAP MIDI-FX per pump.
+    fx_in: Vec<[u8; 3]>,
+    /// Scratch: output events one MIDI-FX emitted, before routing.
+    fx_out: Vec<crate::lv2::FxOutEvent>,
     /// Test-only delivery log: (dest, note, on) for every gated note event
     /// (incl. split-change releases), so routing is observable without voices.
     #[cfg(test)]
@@ -722,6 +1093,10 @@ pub struct GraphEngine {
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
     // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
     rig_mix: [RigMix; 8],
+    /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
+    /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
+    /// node past it keeps playing at unity. Linear scans, like the rest.
+    strips: Vec<(NodeId, StripMix)>,
     /// A SetRigMix awaits publication to `graph_pub` (retried each block:
     /// the audio thread only ever `try_lock`s the publication).
     mix_dirty: bool,
@@ -736,14 +1111,37 @@ pub struct GraphEngine {
     system_capture: Option<SystemCapture>,
     system_gain: f32,
     system_buf: Vec<f32>,
-    // File player (backing track) mixed into the master.
-    player_sink: Option<PlayerSink>,
+    // File player (backing track) mixed into the master. The decoded file
+    // arrives through `player_rx` (parse happens on the decode thread); the
+    // engine owns the clock and reads the buffer directly — RT-safe, no
+    // locks. Retired buffers leave through `player_back` (dropping a
+    // several-MB allocation on the audio thread would stall it).
+    player: Option<PlayerFile>,
+    player_cfg: PlayerCfg,
     player_gain: f32,
     player_buf: Vec<f32>,
+    /// Decode thread → audio: one decoded file per `play_file`.
+    player_rx: Option<rtrb::Consumer<PlayerData>>,
+    /// Audio → host: buffers to free off the audio thread.
+    player_back: Option<rtrb::Producer<Arc<[f32]>>>,
+    /// Retires waiting while the return ring is full (preallocated).
+    player_backlog: Vec<Arc<[f32]>>,
+    /// The player state changed since its last publication.
+    player_dirty: bool,
     // Audio In nodes (live mic/guitar/interface): one slot per node, rings fed
     // by input callbacks off the audio thread (rule 46).
     audio_in: Vec<AudioInSlot>,
     audio_in_levels: Arc<AudioInLevels>,
+    // Arp nodes (issue #90): one state per node, stepped from render and
+    // fed by the note commands. Capacity 8 pre-reserved so an AddNode
+    // within it never allocates (rare op beyond, like the matrix).
+    arp: Vec<crate::arp::ArpState>,
+    /// Ids of the Keys → synth cables the last arps took over (fixed size, no
+    /// allocation). The UI's per-frame mirror re-sends every cable of ITS
+    /// rack until it adopts the new graph; a Connect of one of these ids
+    /// would plug the keys straight back past the arp (rule 80 class).
+    /// Cleared by a load.
+    arp_taken: [crate::control::EdgeId; 8],
     /// UI → audio: delivers a freshly-opened input ring's consumer to the slot.
     audio_in_rx: Option<rtrb::Consumer<(NodeId, rtrb::Consumer<f32>)>>,
     // Runtime CLAP voice delivery + retirement side channels (host <-> audio).
@@ -768,6 +1166,16 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    // Record-arm state: master mix + up to 8 rig stems.
+    arm_master: bool,
+    arm_rigs: [bool; 8],
+    // Bar-quantized start/stop when record is pressed while transport rolls:
+    // Some((true, beat)) = start at `beat`, Some((false, beat)) = stop at `beat`.
+    record_pending: Option<(bool, f64)>,
+    // Preallocated scratch buffer for each rig's post-fader sum (RT-safe).
+    rig_buf: Vec<f32>,
+    /// The audio judge's master tap (#35): pushes only while a listen records.
+    listen: Option<crate::listen::Tap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
     record_sync: bool,
     // A synced take is armed but not started until the song clock reaches
@@ -802,12 +1210,14 @@ impl GraphEngine {
             .collect();
         let lv2 = build_lv2_slots(&graph, sample_rate);
         let audio_in = build_audio_in_slots(&graph);
+        let arp = build_arp_slots(&graph);
         // Default routing: every source class feeds every rig (full range).
         let mut matrix = Matrix::new();
         matrix.reserve(64);
         // Routes belong to the Clap node, not to the voice that plays it: a
         // voice hosted after startup finds its node already routed.
-        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+        // An arp is a MIDI destination like an instrument (issue #90).
+        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Arp)) {
             matrix.connect(SourceId::Keys, n.id);
             // Cover hardware device ids 0..MAX so any connected device routes;
             // the per-rig `rig_device` filter then selects which one is heard.
@@ -824,6 +1234,12 @@ impl GraphEngine {
             }
         }
         let route_cap = matrix.rules.len().max(64);
+        let midi_fx = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
+            .map(midi_fx_slot)
+            .collect();
         Self {
             graph,
             drain,
@@ -833,10 +1249,11 @@ impl GraphEngine {
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
             fx_done: Vec::with_capacity(256),
-            master_vol: 1.0,
+            master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             organ_pending: [None; 8],
+            lv2_pending: [None; 8],
             transport: Transport::stopped(96.0),
             master_clock: MasterClock::Stopped,
             count_in: CountInConfig::default(),
@@ -846,8 +1263,12 @@ impl GraphEngine {
             transport_dirty: false,
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
+            node_timer: crate::engine_info::NodeTimer::new(),
             matrix,
             route_out: Vec::with_capacity(route_cap),
+            midi_fx,
+            fx_in: Vec::with_capacity(FX_QUEUE_CAP),
+            fx_out: Vec::with_capacity(FX_OUT_CAP),
             #[cfg(test)]
             note_log: Vec::new(),
             #[cfg(test)]
@@ -857,17 +1278,25 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
+            strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             rig_snapshot: None,
             graph_pub: None,
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
-            player_sink: None,
+            player: None,
+            player_cfg: PlayerCfg::default(),
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
+            player_rx: None,
+            player_back: None,
+            player_backlog: Vec::with_capacity(8),
+            player_dirty: false,
             audio_in,
             audio_in_levels: Arc::new(AudioInLevels::new()),
+            arp,
+            arp_taken: [crate::control::EdgeId::MAX; 8],
             audio_in_rx: None,
             voice_rx: None,
             voice_back_tx: None,
@@ -878,6 +1307,11 @@ impl GraphEngine {
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             recorder: None,
+            arm_master: true,
+            arm_rigs: [false; 8],
+            record_pending: None,
+            rig_buf: vec![0.0; 8192 * 2],
+            listen: None,
             record_sync: false,
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
@@ -920,6 +1354,10 @@ impl GraphEngine {
     /// default MIDI routes (only its rig's device when the rig has one).
     fn attach_lv2(&mut self, slot: Lv2Slot) {
         let node = slot.node;
+        if self.is_midi_fx(node) {
+            self.attach_midi_fx_lv2(slot);
+            return;
+        }
         let inst = slot.plugin.is_instrument();
         self.lv2.push(slot);
         // The face's organ values sent while the instance was loading.
@@ -934,7 +1372,21 @@ impl GraphEngine {
                 }
             }
         }
+        // Control values any still-loading LV2 node was sent (rule 113).
+        if let Some(i) = self.lv2_pending.iter().position(|p| p.is_some_and(|p| p.node == node)) {
+            let p = self.lv2_pending[i].take().unwrap();
+            if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+                for &(ordinal, v) in p.pairs.iter().take(p.count) {
+                    s.plugin.set_control_normalized(ordinal as usize, v);
+                }
+            }
+        }
         if inst {
+            // Units wired to this instrument route to it from now on.
+            for k in 0..self.midi_fx.len() {
+                let fx = self.midi_fx[k].node;
+                self.route_midi_fx_outputs(fx);
+            }
             let device = self.graph.node(node)
                 .and_then(|n| self.rig_meta.get(n.rig as usize))
                 .and_then(|m| m.midi_device);
@@ -949,6 +1401,22 @@ impl GraphEngine {
                     }
                 }
             }
+        }
+    }
+
+    /// Put an instance with restored state in place of the node's own.
+    fn adopt_restored_lv2(&mut self, node: NodeId, gen: u64, slot: Lv2Slot) {
+        let live = gen == self.lv2_gen && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
+        match self.lv2.iter().position(|s| s.node == node) {
+            Some(i) if live => {
+                let old = std::mem::replace(&mut self.lv2[i], slot);
+                self.retire_lv2(old);
+            }
+            None if live && self.lv2.len() < self.lv2.capacity() => {
+                self.attach_lv2(slot);
+                self.publish_graph();
+            }
+            _ => self.retire_lv2(slot),
         }
     }
 
@@ -985,7 +1453,7 @@ impl GraphEngine {
             match msg {
                 Lv2Response::Loaded { node, gen, slot } => {
                     let wanted = gen == self.lv2_gen
-                        && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }))
+                        && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. } | NodeKind::MidiFx { .. }))
                         && !self.lv2.iter().any(|s| s.node == node)
                         && self.lv2.len() < self.lv2.capacity();
                     if wanted {
@@ -995,6 +1463,7 @@ impl GraphEngine {
                         self.retire_lv2(slot);
                     }
                 }
+                Lv2Response::Restored { node, gen, slot } => self.adopt_restored_lv2(node, gen, slot),
                 Lv2Response::Preset { node, preset } => {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
@@ -1161,28 +1630,347 @@ impl GraphEngine {
         self.audio_in.iter().find(|s| s.node == node).map(|s| (s.dropped, s.starved))
     }
 
-    /// Attach the file-player ring consumer (decode thread started elsewhere).
-    pub fn set_player_sink(&mut self, sink: PlayerSink) {
-        self.player_sink = Some(sink);
+    /// Attach the file-player channels: `rx` delivers decoded files from the
+    /// decode thread (popped at block boundaries), `back` returns retired
+    /// buffers to whoever can free them off the audio thread.
+    pub fn set_player_channels(
+        &mut self,
+        rx: rtrb::Consumer<PlayerData>,
+        back: rtrb::Producer<Arc<[f32]>>,
+    ) {
+        self.player_rx = Some(rx);
+        self.player_back = Some(back);
+    }
+
+    /// The file player's own stereo output of the last rendered block, before
+    /// gain and the master chain (self-tests measure the loop seam and the
+    /// beat lock on it).
+    pub fn player_block(&self, frames: usize) -> &[f32] {
+        &self.player_buf[..(frames * 2).min(self.player_buf.len())]
+    }
+
+    /// Current file-player state for frontends (rule 33: what the engine
+    /// owns is published back).
+    pub fn player_pub(&self) -> PlayerPub {
+        let cfg = &self.player_cfg;
+        let p = self.player.as_ref();
+        PlayerPub {
+            loaded: p.is_some(),
+            enabled: p.map_or(false, |p| p.enabled),
+            pending: p.map_or(false, |p| p.pending),
+            playing: p.map_or(false, |p| p.enabled && !p.pending && !p.finished),
+            loop_on: cfg.loop_on,
+            sync: cfg.sync,
+            beats: cfg.beats,
+            offset: cfg.offset,
+            bpm: cfg.bpm,
+            eff_bpm: p.map_or(0.0, |p| cfg.ref_bpm(p.duration) as f32),
+            duration: p.map_or(0.0, |p| p.duration as f32),
+            gain: self.player_gain,
+        }
+    }
+
+    /// Load a decoded file (from the decode thread's ring): adopt the
+    /// filename BPM (AUM: it is the original-BPM default) and start it —
+    /// at the next bar line when sync is on and the transport rolls, else
+    /// now. Retires whatever file it replaces.
+    fn load_player(&mut self, d: PlayerData) {
+        let old = self.player.take();
+        if let Some(b) = d.bpm {
+            self.player_cfg.bpm = b;
+        }
+        let frames = d.frames().max(1);
+        let mut p = PlayerFile {
+            samples: d.samples,
+            file_sr: d.sample_rate.max(1) as f64,
+            duration: frames as f64 / d.sample_rate.max(1) as f64,
+            frames,
+            enabled: true,
+            pending: false,
+            target_beats: 0.0,
+            pos: 0.0,
+            anchor_song_beats: 0.0,
+            anchor_file_beats: 0.0,
+            finished: false,
+        };
+        if self.player_cfg.sync && self.master_clock.is_active() {
+            p.pending = true;
+            p.target_beats = self.player_target_beats();
+        } else {
+            player_start_now(&mut p, self.player_cfg, self.transport.beats);
+        }
+        self.player = Some(p);
+        self.player_dirty = true;
+        if let Some(old) = old {
+            self.retire_player(old.samples);
+        }
+    }
+
+    /// The bar line a synced start waits for: beat 0 (the song's own
+    /// downbeat) during a count-in, else the next bar boundary.
+    fn player_target_beats(&self) -> f64 {
+        if self.master_clock.is_counting_in() {
+            0.0
+        } else {
+            crate::transport::next_bar_beats(self.transport.beats)
+        }
+    }
+
+    /// Hand a retired decoded buffer to the host so it is freed off the
+    /// audio thread. A full return ring parks it in the preallocated
+    /// backlog; the only remaining option leaks, never frees here.
+    fn retire_player(&mut self, samples: Arc<[f32]>) {
+        let item = match self.player_back.as_mut() {
+            Some(tx) => match tx.push(samples) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(s)) => s,
+            },
+            None => samples,
+        };
+        if self.player_backlog.len() < self.player_backlog.capacity() {
+            self.player_backlog.push(item);
+        } else {
+            std::mem::forget(item);
+        }
+    }
+
+    /// Drain the retire backlog into the return ring (one slot per block is
+    /// plenty — loads are rare).
+    fn flush_player_backlog(&mut self) {
+        while let Some(item) = self.player_backlog.pop() {
+            let Some(tx) = self.player_back.as_mut() else {
+                self.player_backlog.push(item);
+                return;
+            };
+            if let Err(rtrb::PushError::Full(s)) = tx.push(item) {
+                self.player_backlog.push(s);
+                return;
+            }
+        }
+    }
+
+    /// Fill the player mix buffer for this block: the AUM FilePlayer clock.
+    /// While sync is on and the song clock rolls, the file position is
+    /// DERIVED from the song beats (same factor the metronome counts with,
+    /// rule 43) — drift-free by construction, and a tempo change is
+    /// followed in the same block with no phase jump. Otherwise the
+    /// position integrates at the session tempo (sync on, transport idle)
+    /// or the file's own rate (sync off). Allocation-free.
+    fn fill_player(&mut self, frames: usize, block_start_beats: f64, beat_inc: f64) {
+        let n2 = frames * 2;
+        while let Some(rx) = self.player_rx.as_mut() {
+            let Ok(d) = rx.pop() else { break };
+            self.load_player(d);
+        }
+        self.flush_player_backlog();
+        let Some(p) = self.player.as_mut() else {
+            for x in &mut self.player_buf[..n2] {
+                *x = 0.0;
+            }
+            return;
+        };
+        let cfg = self.player_cfg;
+        let bpm = self.transport.bpm;
+        let sr = self.sample_rate;
+        let rolling = self.master_clock == MasterClock::Playing;
+        // The clock only truly rolls once it has advanced: the block that
+        // ends a count-in flips to Playing without advancing (beat 0 is the
+        // FIRST frame of the block after it).
+        let clock_live = rolling && (self.transport.beats > 0.0 || self.transport.seconds > 0.0);
+        let ref_bpm = cfg.ref_bpm(p.duration);
+        let total_beats = (ref_bpm * p.duration / 60.0).max(1e-9);
+        let mut dirty = false;
+        for i in 0..frames {
+            let song_b = block_start_beats + i as f64 * beat_inc;
+            // Position this frame reads, or None for silence.
+            let mut pos: Option<f64> = None;
+            if p.pending {
+                let wait = cfg.sync
+                    && self.master_clock.is_active()
+                    && (!clock_live || song_b < p.target_beats);
+                if !wait {
+                    // The bar line arrived (or sync/transport no longer
+                    // asks for it): start at the configured point, anchored
+                    // to the song clock exactly here.
+                    pos = Some(player_start_now(p, cfg, song_b));
+                    dirty = true;
+                }
+            } else if p.enabled && !p.finished {
+                if cfg.sync && rolling {
+                    // Song-clock-derived position: file beats advance 1:1
+                    // with song beats at matched varispeed, so the loop
+                    // pass lasts exactly its beats in song beats and a
+                    // tempo change is followed without a phase jump.
+                    let file_beats = p.anchor_file_beats + (song_b - p.anchor_song_beats);
+                    let b = if cfg.loop_on { file_beats.rem_euclid(total_beats) } else { file_beats };
+                    let t = b * 60.0 / ref_bpm;
+                    if !cfg.loop_on && t >= p.duration {
+                        p.finished = true;
+                        dirty = true;
+                    } else {
+                        pos = Some(t * p.file_sr);
+                        p.pos = t * p.file_sr; // coherent handover to free-run
+                    }
+                } else {
+                    // Free-run: read at the current position, then advance
+                    // by the rate the song clock would run at (sync on) or
+                    // the file's own rate (sync off).
+                    if cfg.loop_on {
+                        p.pos = p.pos.rem_euclid(p.frames as f64);
+                    } else if p.pos >= p.frames as f64 {
+                        p.finished = true;
+                        dirty = true;
+                    }
+                    let rate = if cfg.sync { bpm / ref_bpm } else { 1.0 };
+                    pos = Some(p.pos);
+                    p.pos += rate * p.file_sr / sr;
+                    if p.pos >= p.frames as f64 {
+                        if cfg.loop_on {
+                            p.pos = p.pos.rem_euclid(p.frames as f64);
+                        } else {
+                            p.finished = true;
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+            let (sound, x) = match pos {
+                Some(x) if x.is_finite() => {
+                    // A looped position sitting exactly on the end (float
+                    // rounding at the seam) wraps; it must never re-anchor.
+                    let x = if cfg.loop_on && x >= p.frames as f64 { x.rem_euclid(p.frames as f64) } else { x };
+                    ((0.0..p.frames as f64).contains(&x), x)
+                }
+                Some(_) => {
+                    // Heal (rule 32): a non-finite position restarts the
+                    // file instead of seeding NaNs into the mix.
+                    let start = player_start_now(p, cfg, song_b);
+                    (start.is_finite() && (0.0..p.frames as f64).contains(&start), start)
+                }
+                None => (false, 0.0),
+            };
+            if sound {
+                let s = read_frame(&p.samples, p.frames, x, cfg.loop_on);
+                self.player_buf[i * 2] = s[0];
+                self.player_buf[i * 2 + 1] = s[1];
+            } else {
+                self.player_buf[i * 2] = 0.0;
+                self.player_buf[i * 2 + 1] = 0.0;
+            }
+        }
+        if dirty {
+            self.player_dirty = true;
+        }
     }
 
     /// Attach the master recording tap (writer thread started elsewhere).
     pub fn set_recorder(&mut self, tap: RecorderTap) {
+        tap.shared().set_arms(self.arm_master, &self.arm_rigs);
         self.recorder = Some(tap);
     }
 
-    /// Start recording the master output (idempotent). No-op without a tap.
-    fn record_start(&mut self) {
+    pub fn set_listen_tap(&mut self, tap: crate::listen::Tap) {
+        self.listen = Some(tap);
+    }
+
+    fn record_mask(&self) -> u16 {
+        let mut mask = if self.arm_master { crate::record::MASK_MASTER } else { 0 };
+        for rig in 0..8u8 {
+            if self.arm_rigs[rig as usize] && self.recorder.as_ref().is_some_and(|r| r.stem_ready(rig)) {
+                mask |= crate::record::mask_rig(rig);
+            }
+        }
+        mask
+    }
+
+    fn record_start_now(&mut self) {
+        self.record_pending = None;
+        let mask = self.record_mask();
         if let Some(rec) = &mut self.recorder {
-            rec.begin();
+            rec.set_pending(false);
+            if mask != 0 {
+                rec.begin(mask);
+            }
         }
     }
 
-    /// Stop recording (idempotent). No-op without a tap.
-    fn record_stop(&mut self) {
+    fn record_stop_now(&mut self) {
+        self.record_pending = None;
         if let Some(rec) = &mut self.recorder {
+            rec.set_pending(false);
             rec.stop();
         }
+    }
+
+    /// Start recording armed targets (bar-quantized when transport is rolling).
+    fn record_start(&mut self) {
+        let recording = self.recorder.as_ref().is_some_and(|r| r.shared().is_recording());
+        if recording {
+            if matches!(self.record_pending, Some((false, _))) {
+                self.record_pending = None;
+                if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
+            }
+            return;
+        }
+        if self.record_mask() == 0 {
+            return;
+        }
+        if self.master_clock == MasterClock::Playing {
+            if matches!(self.record_pending, Some((true, _))) {
+                return;
+            }
+            let bpb = crate::transport::BEATS_PER_BAR as f64;
+            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
+            self.record_pending = Some((true, next_bar));
+            if let Some(rec) = &mut self.recorder {
+                rec.set_pending(true);
+            }
+        } else {
+            self.record_start_now();
+        }
+    }
+
+    /// Stop recording (bar-quantized when transport is rolling; double-stop stops immediately).
+    fn record_stop(&mut self) {
+        let recording = self.recorder.as_ref().is_some_and(|r| r.shared().is_recording());
+        if !recording {
+            if self.record_pending.is_some() {
+                self.record_pending = None;
+                if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
+            }
+            return;
+        }
+        if matches!(self.record_pending, Some((false, _))) || self.master_clock != MasterClock::Playing {
+            self.record_stop_now();
+        } else {
+            let bpb = crate::transport::BEATS_PER_BAR as f64;
+            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
+            self.record_pending = Some((false, next_bar));
+            if let Some(rec) = &mut self.recorder {
+                rec.set_pending(true);
+            }
+        }
+    }
+
+    /// What `render`'s master chain (limiter, WARM, master volume) makes of
+    /// a summed rig signal, starting from a fresh limiter: the master output
+    /// of a take that began after silence with nothing else mixed in
+    /// (monitor, count-in, system audio, player, master inserts). `record-test` rebuilds the
+    /// master from the stems with it, sample for sample.
+    pub fn master_chain_from_silence(&self, sum: &[f32]) -> Vec<f32> {
+        let mut lim = MasterLimiter::new(self.sample_rate);
+        let drive = 1.0 + self.master_warm * 3.0;
+        let mut out = Vec::with_capacity(sum.len());
+        for f in sum.chunks_exact(2) {
+            let (l, r) = lim.process(f[0], f[1], drive, self.master_vol);
+            out.push(l);
+            out.push(r);
+        }
+        out
     }
 
     pub fn graph(&self) -> &Graph {
@@ -1303,8 +2091,17 @@ impl GraphEngine {
     }
 
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
-    pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {
-        self.edge_levels.clone()
+    pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {        self.edge_levels.clone()
+    }
+
+    /// Lock-free render time per voice and effect node.
+    pub fn node_times_handle(&self) -> Arc<crate::engine_info::NodeTimes> {
+        self.node_timer.handle()
+    }
+
+    /// The strip table as it goes into `GraphPub::strips`.
+    fn strips_pub(&self) -> [StripPub; MAX_STRIP_MIXES] {
+        strips_pub_table(&self.strips)
     }
 
     /// Publish every audio edge's level = its source node's output peak this
@@ -1317,6 +2114,17 @@ impl GraphEngine {
                 continue;
             }
             let src = e.from.node;
+            // A master-insert cable (Master OUT → FX) carries the mix bus the
+            // FX ran on: its level is the FX's own output peak, so the cable
+            // glows with what actually flows through it.
+            if self.graph.node(src).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut)) {
+                let peak = self.dsp.iter().find(|d| d.node == e.to.node).map(|d| block_peak(&d.buf[..n2]))
+                    .or_else(|| self.lv2.iter().find(|l| l.node == e.to.node).map(|l| block_peak(&l.buf[..n2])));
+                if let Some(p) = peak {
+                    self.edge_levels.store(e.id, p);
+                }
+                continue;
+            }
             let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
                 block_peak(&v.scratch[..n2])
             } else if let Some(d) = self.dsp.iter().find(|d| d.node == src) {
@@ -1368,6 +2176,19 @@ impl GraphEngine {
         for l in &self.lv2 { add(l.node, &l.buf); }
     }
 
+    /// Which rigs have a soloed source (#73): solo scope is WITHIN a rig — a
+    /// soloed source silences only the other sources of its own rig, while
+    /// rig buses keep their own global solo. Allocation-free.
+    fn rigs_with_solo_source(&self) -> [bool; 8] {
+        let mut solo = [false; 8];
+        for (node, m) in &self.strips {
+            if !m.solo { continue; }
+            let rig = self.graph.node(*node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+            solo[rig] = true;
+        }
+        solo
+    }
+
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
@@ -1379,8 +2200,322 @@ impl GraphEngine {
         slot.plugin.control_descs().get(nth).map(|c| c.value)
     }
 
+    /// Arp verification hook (self-test): the notes this arp node has
+    /// generated and not released — chord mode holds 3 per key (a triad).
+    pub fn arp_sounding(&self, node: NodeId) -> Vec<u8> {
+        self.arp.iter().find(|a| a.node == node).map(|a| a.sounding()).unwrap_or_default()
+    }
+
+    /// Arp verification hook (self-test): the keys this arp node holds.
+    pub fn arp_held(&self, node: NodeId) -> Vec<u8> {
+        self.arp.iter().find(|a| a.node == node).map(|a| a.held_notes().collect()).unwrap_or_default()
+    }
+
+    /// One "time passed" step of every arp node: the held-notes check's
+    /// Tick — it drives the real note delivery the same way `render` does.
+    #[cfg(test)]
+    pub(crate) fn arp_test_step(&mut self) {
+        let mut arps = std::mem::take(&mut self.arp);
+        for a in &mut arps {
+            let (node, vel) = (a.node, a.velocity());
+            let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
+            a.test_step(&mut emit);
+        }
+        self.arp = arps;
+    }
+
     fn has_midi_cable(&self, dest: NodeId) -> bool {
         self.graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == dest)
+    }
+
+    /// Does a MIDI cable carry THIS unit's output to `dest`? The output leg
+    /// of a MIDI-FX chain is gated by its own cable, exactly like a Keys
+    /// node's leg is (`keys_route`).
+    fn fx_cable(&self, fx: NodeId, dest: NodeId) -> bool {
+        self.graph
+            .edges
+            .iter()
+            .any(|e| e.kind == PortKind::Midi && e.from.node == fx && e.to.node == dest)
+    }
+
+    /// Is `node` a hosted MIDI-FX unit?
+    fn is_midi_fx(&self, node: NodeId) -> bool {
+        matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::MidiFx { .. }))
+    }
+
+    /// Default matrix rules for one MIDI-FX node (rule 105: routes belong to
+    /// the node): the rig's input sources feed the unit (`device`: only that
+    /// hardware device, else the keyboard and every device), and its output
+    /// cables become rules. Both legs also need their cable (`keys_route`
+    /// gates the input, `fx_cable` the output). Idempotent.
+    fn route_midi_fx(&mut self, fx: NodeId, device: Option<u32>) {
+        let connect = |src: SourceId, m: &mut Matrix| {
+            if !m.rules.iter().any(|r| r.source == src && r.dest == fx) {
+                m.connect(src, fx);
+            }
+        };
+        match device {
+            Some(dev) => connect(SourceId::Hardware(dev), &mut self.matrix),
+            None => {
+                connect(SourceId::Keys, &mut self.matrix);
+                for dev in 0..MAX_HW_DEVICES {
+                    connect(SourceId::Hardware(dev), &mut self.matrix);
+                }
+            }
+        }
+        self.route_midi_fx_outputs(fx);
+    }
+
+    /// Wire + route a freshly added MIDI-FX node like an instrument is
+    /// (rule 19: playable out of the box). Wiring inserts the unit into its
+    /// rig's chain: the instruments' direct Keys cables are replaced, so
+    /// everything held on them is released first (rule 41).
+    fn setup_midi_fx(&mut self, id: NodeId, wire: bool) {
+        if wire {
+            let rig = self.graph.node(id).map_or(0, |n| n.rig);
+            for inst in self.graph.midi_sinks(rig) {
+                self.release_all(inst);
+            }
+            self.graph.wire_midi_fx(id);
+        }
+        let device = self
+            .graph
+            .node(id)
+            .and_then(|n| self.rig_meta.get(n.rig as usize))
+            .and_then(|m| m.midi_device);
+        self.route_midi_fx(id, device);
+    }
+
+    /// May an event that came from `origin` enter `fx`? The per-rig source
+    /// switches gate the chain behind the unit: it accepts when some
+    /// instrument it feeds accepts that source (a unit feeding only chained
+    /// units or LV2 instruments always accepts). Note-offs never ask —
+    /// a stray release is harmless, a dropped one hangs a note (rule 41).
+    fn fx_accepts(&self, fx: NodeId, origin: SourceId) -> bool {
+        let mut fed = false;
+        for r in self.matrix.rules.iter() {
+            if r.source != SourceId::MidiFx(fx) || !r.enabled {
+                continue;
+            }
+            fed = true;
+            match self.voices.iter().find(|v| v.node == r.dest) {
+                Some(v) if source_accepted(v, origin) => return true,
+                Some(_) => {}
+                None => return true,
+            }
+        }
+        !fed
+    }
+
+    /// Release every MIDI-FX unit upstream of `node` (an instrument whose
+    /// source switch or device filter is about to change): the filter that
+    /// used to pass a held key's note-on would drop its note-off (rule 41).
+    fn release_upstream(&mut self, node: NodeId) {
+        let mut i = 0;
+        while let Some(r) = self.matrix.rules.get(i) {
+            i += 1;
+            if r.dest == node {
+                if let SourceId::MidiFx(fx) = r.source {
+                    self.release_all(fx);
+                }
+            }
+        }
+    }
+
+    /// Set a MIDI-FX unit's knob: the built-in transposer's semitones, or a
+    /// plugin control. Before the plugin is live the value is parked. A
+    /// transposer's semitones change the pitch a held note's release takes,
+    /// so the unit releases first.
+    fn apply_midi_fx_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
+        let Some(i) = self.midi_fx.iter().position(|s| s.node == node) else { return false };
+        let v = v.clamp(0.0, 1.0);
+        if param == P_MIDIFX_SEMI && matches!(self.midi_fx[i].proc, None) {
+            let semis = ((v * 2.0 - 1.0) * MIDIFX_SEMI_MAX as f32).round() as i8;
+            if semis != self.midi_fx[i].semis {
+                self.release_all(node);
+                self.midi_fx[i].semis = semis;
+            }
+            return true;
+        }
+        // A hosted plugin's knob may change what its note-offs mean (the
+        // transposition a held note leaves with): when the value really
+        // moves, everything held through the unit is released first
+        // (rule 41; found by `midifx-test`: a note-off at the new pitch left
+        // the old one sounding).
+        let moves = matches!(&self.midi_fx[i].proc, Some(MidiFxProc::Lv2(s))
+            if s.plugin.control_normalized(param as usize).is_some_and(|cur| (cur - v).abs() > 1e-4));
+        if moves {
+            self.release_all(node);
+        }
+        let slot = &mut self.midi_fx[i];
+        match &mut slot.proc {
+            Some(MidiFxProc::Lv2(s)) => s.plugin.set_control_normalized(param as usize, v),
+            _ => match slot.pending.iter_mut().find(|(p, _)| *p == param) {
+                Some(e) => e.1 = v,
+                None => {
+                    if slot.pending.len() < slot.pending.capacity() {
+                        slot.pending.push((param, v));
+                    }
+                }
+            },
+        }
+        true
+    }
+
+    /// A loaded MIDI-only LV2 plugin takes its node's place in the event
+    /// path. The note-off path of everything held changes with it, so the
+    /// unit releases (rule 41); parked knob values replay (rule 113).
+    fn attach_midi_fx_lv2(&mut self, slot: Lv2Slot) {
+        let node = slot.node;
+        if !slot.plugin.is_midi_fx() || !self.midi_fx.iter().any(|s| s.node == node) {
+            eprintln!("midi-fx node {node}: {} is not a MIDI unit", slot.plugin.uri());
+            self.retire_lv2(slot);
+            return;
+        }
+        self.release_all(node);
+        let Some(i) = self.midi_fx.iter().position(|s| s.node == node) else { return };
+        let mut slot = slot;
+        for k in 0..self.midi_fx[i].pending.len() {
+            let (param, v) = self.midi_fx[i].pending[k];
+            slot.plugin.set_control_normalized(param as usize, v);
+        }
+        self.midi_fx[i].pending.clear();
+        if let Some(MidiFxProc::Lv2(old)) = self.midi_fx[i].proc.replace(MidiFxProc::Lv2(slot)) {
+            self.retire_lv2(old);
+        }
+    }
+
+    /// Run every MIDI-FX unit for one block: the events queued by `apply`
+    /// go in, the plugin's output is routed on through the matrix
+    /// (`SourceId::MidiFx(node)`), gated by the unit's own output cables.
+    /// A unit without a live plugin passes events through (transposed when
+    /// it is the built-in one). Allocation-free: every buffer is preallocated
+    /// and bounded.
+    fn pump_midi_fx(&mut self, frames: usize) {
+        use crate::lv2::FxOutEvent;
+        for i in 0..self.midi_fx.len() {
+            let node = self.midi_fx[i].node;
+            self.fx_in.clear();
+            self.fx_out.clear();
+            {
+                let slot = &mut self.midi_fx[i];
+                for m in slot.in_q.drain(..) {
+                    if self.fx_in.len() < self.fx_in.capacity() {
+                        self.fx_in.push([m.status | m.channel, m.data[0], m.data[1]]);
+                    }
+                }
+            }
+            let slot = &mut self.midi_fx[i];
+            match &mut slot.proc {
+                Some(MidiFxProc::Lv2(s)) => {
+                    for &ev in self.fx_in.iter() {
+                        s.plugin.send_midi(ev);
+                    }
+                    s.plugin.process(&[], &mut [], frames);
+                    s.plugin.read_midi_out(&mut self.fx_out);
+                }
+                None => {
+                    let semis = slot.semis as i16;
+                    for &d in self.fx_in.iter() {
+                        if self.fx_out.len() >= self.fx_out.capacity() {
+                            break;
+                        }
+                        let status = d[0] & 0xF0;
+                        let ch = d[0] & 0x0F;
+                        let is_note = matches!(status, 0x80 | 0x90);
+                        let note = if is_note {
+                            match shifted(d[1], semis) {
+                                Some(n) => n,
+                                None => continue,
+                            }
+                        } else {
+                            d[1]
+                        };
+                        self.fx_out.push(match status {
+                            0x90 if d[2] > 0 => FxOutEvent::NoteOn { channel: ch, note, velocity: d[2] },
+                            0x80 | 0x90 => FxOutEvent::NoteOff { channel: ch, note },
+                            _ => FxOutEvent::Midi(d),
+                        });
+                    }
+                }
+            }
+            for j in 0..self.fx_out.len() {
+                let ev = self.fx_out[j];
+                self.deliver_fx_event(node, ev);
+            }
+        }
+    }
+
+    /// Route one event a MIDI-FX unit emitted to everything its output
+    /// cables reach (rule transforms apply, like any matrix route).
+    fn deliver_fx_event(&mut self, fx: NodeId, ev: crate::lv2::FxOutEvent) {
+        use crate::lv2::FxOutEvent;
+        let msg = match ev {
+            FxOutEvent::NoteOn { channel, note, velocity } => MidiMsg::note_on(channel, note, velocity),
+            FxOutEvent::NoteOff { channel, note } => MidiMsg::note_off(channel, note, 0),
+            FxOutEvent::Midi(d) => MidiMsg::new(d[0] & 0xF0, d[0] & 0x0F, d[1], d[2]),
+        };
+        self.matrix.route_into(SourceId::MidiFx(fx), msg, &mut self.route_out);
+        for k in 0..self.route_out.len() {
+            let (dest, m) = self.route_out[k];
+            if !self.fx_cable(fx, dest) {
+                continue;
+            }
+            let is_on = m.status == 0x90 && m.data[1] > 0;
+            let is_off = m.status == 0x80 || (m.status == 0x90 && m.data[1] == 0);
+            if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                if dest != fx {
+                    self.midi_fx[j].queue(m);
+                }
+                continue;
+            }
+            if is_on || is_off {
+                #[cfg(test)]
+                self.note_log.push((dest, m.data[0], is_on));
+                let note = m.data[0];
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                    if is_on {
+                        s.voice.note_on(note as u16, m.data[1] as f64 / 127.0);
+                    } else {
+                        s.voice.note_off(note as u16);
+                    }
+                }
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                    if s.plugin.is_instrument() {
+                        if is_on {
+                            s.plugin.note_on(note, m.data[1]);
+                        } else {
+                            s.plugin.note_off(note);
+                        }
+                    }
+                }
+            } else if m.status == 0xB0 {
+                if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                    s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                }
+                if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                    if s.plugin.is_instrument() {
+                        s.plugin.control_change(m.data[0], m.data[1]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Matrix rules for the output cables of a MIDI-FX unit: one rule per
+    /// MIDI cable leaving it (idempotent). Called when a cable is added and
+    /// when an LV2 instrument attaches (its rules come with the load).
+    fn route_midi_fx_outputs(&mut self, fx: NodeId) {
+        for i in 0..self.graph.edges.len() {
+            let e = &self.graph.edges[i];
+            if e.kind == PortKind::Midi && e.from.node == fx {
+                let dest = e.to.node;
+                if !self.matrix.rules.iter().any(|r| r.source == SourceId::MidiFx(fx) && r.dest == dest) {
+                    self.matrix.connect(SourceId::MidiFx(fx), dest);
+                }
+            }
+        }
+        self.fit_route_out();
     }
 
     fn apply_dsp_or_master_param(&mut self, node: NodeId, param: ParamId, v: f32) -> bool {
@@ -1415,11 +2550,40 @@ impl GraphEngine {
         }
     }
 
+    /// Park a control value for an LV2 instance that is still loading
+    /// (`attach_lv2` replays it). Most recent value per ordinal wins; the
+    /// table is small and fixed — a template load parks one value per knob.
+    fn park_lv2(&mut self, node: NodeId, ordinal: u16, value: f32) {
+        let mut slot = None;
+        for (i, p) in self.lv2_pending.iter().enumerate() {
+            if p.as_ref().is_some_and(|p| p.node == node) {
+                slot = Some(i);
+                break;
+            }
+        }
+        if slot.is_none() {
+            slot = self.lv2_pending.iter().position(|p| p.is_none());
+        }
+        let Some(i) = slot else {
+            eprintln!("lv2 pending table full: value for node {node} dropped");
+            return;
+        };
+        let p = self.lv2_pending[i].get_or_insert(Lv2Pending { node, pairs: [(0, 0.0); 8], count: 0 });
+        if let Some(existing) = p.pairs.iter_mut().take(p.count).find(|(o, _)| *o == ordinal) {
+            existing.1 = value;
+        } else if p.count < p.pairs.len() {
+            p.pairs[p.count] = (ordinal, value);
+            p.count += 1;
+        }
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
         let v = value as f32;
-        if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
+        if self.midi_fx.iter().any(|s| s.node == node) {
+            self.apply_midi_fx_param(node, param, v)
+        } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
             // setBfree's face controls are MIDI CCs (organ.rs); every other
             // LV2 knob maps param index → nth control port (normalized).
             match crate::organ::ccs(param, v) {
@@ -1440,6 +2604,12 @@ impl GraphEngine {
                 p.values[k] = v;
                 p.set |= 1 << k;
             }
+            true
+        } else if self.graph.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
+            // Any other LV2 node still loading on the loader thread: park
+            // the value, never drop it (rule 113; the template's amp Drive
+            // is one of these between LoadGraph and attach).
+            self.park_lv2(node, param.min(0xFFFF) as u16, v);
             true
         } else if param == P_LEVEL && self.voices.iter().any(|s| s.node == node) {
             if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
@@ -1467,6 +2637,17 @@ impl GraphEngine {
                 }
                 _ => false,
             }
+        } else if (crate::arp::P_ARP_MODE..=crate::arp::P_ARP_CHORD).contains(&param)
+            && self.arp.iter().any(|a| a.node == node)
+        {
+            // An arp unit's knobs (issue #90). Settings that shape the burst
+            // release what is sounding first (rule 41) — ArpState handles it.
+            self.with_arp_slot(node, |a, eng| {
+                let (nid, vel) = (a.node, a.velocity());
+                let mut emit = |n: u8, on: bool| eng.deliver_arp_note(nid, n, on, vel);
+                a.set_param(param, value, &mut emit)
+            })
+            .unwrap_or(false)
         } else {
             self.apply_dsp_or_master_param(node, param, v)
         }
@@ -1483,11 +2664,12 @@ impl GraphEngine {
         self.keys_route(dest, played).is_some()
     }
 
-    /// The Keys zone a played note reaches `dest` through: `Some(semitones)`
-    /// of that zone's octave shift, `None` if no Keys cable carries the note
-    /// there. Note-on and note-off take the same answer, so a release always
-    /// meets the pitch its note-on started (rule 41). Allocation-free.
-    fn keys_route(&self, dest: NodeId, played: u8) -> Option<i16> {
+    /// What a played note picks up on its way from a Keys node to `dest`:
+    /// that zone's octave shift, and the Keys node's scale snap (issue #90).
+    /// Note-on and note-off take the same answer — the snap is a pure
+    /// function of the note — so a release always meets the pitch its
+    /// note-on started (rule 41). Allocation-free.
+    fn keys_route(&self, dest: NodeId, played: u8) -> Option<KeysRoute> {
         self.graph.nodes.iter().find_map(|n| {
             if !matches!(n.kind, NodeKind::Keys) { return None; }
             let port = split_port(n.split, played);
@@ -1496,23 +2678,161 @@ impl GraphEngine {
                     && e.from.node == n.id
                     && e.from.port == port
                     && e.to.node == dest
-            }).then(|| crate::control::Graph::zone_shift(n, played))
+            }).then(|| KeysRoute {
+                shift: crate::control::Graph::zone_shift(n, played),
+                scale: n.scale,
+            })
         })
     }
 
-    /// Note-off for all 128 notes on one instrument. The matrix is stateless,
-    /// so every edit that can change a held note's note-off path (split, rule,
-    /// MIDI cable, source filter, node removal, graph load) calls this first.
-    /// Rare op, allocation-free. Checked by `held_notes` (verify-held-notes).
+    /// The note that reaches `dest`: the matrix-transformed note, the zone's
+    /// octave shift, and (Some scale) the Keys node's snap to the nearest
+    /// in-scale note. Pure: a note-off computes the same outgoing note its
+    /// note-on did.
+    fn routed_note(m: &MidiMsg, route: &KeysRoute) -> Option<u8> {
+        let out = shifted(m.note(), route.shift)?;
+        Some(match route.scale {
+            Some(sc) => crate::arp::snap_note(out, sc),
+            None => out,
+        })
+    }
+
+    /// Note-off for all 128 notes on one instrument node. The matrix is
+    /// stateless, so every edit that can change a held note's note-off path
+    /// (split, rule, MIDI cable, source filter, node removal, graph load)
+    /// calls this first. An Arp node CASCADES: its held keys and generated
+    /// notes die, and so does everything it feeds — an arp-generated note's
+    /// off path is the arp's own cable, which the edit may be about to move
+    /// (rule 41). Rare op, allocation-free (fixed 8-deep fan-out). Checked
+    /// by `held_notes` (verify-held-notes).
+    ///
+    /// A MIDI-FX dest releases BOTH sides of the unit (rule 41): the events
+    /// still in its input queue are dropped (they never reached the plugin),
+    /// all-notes-off is queued into the plugin itself, and every instrument
+    /// the unit feeds is released (its own notes can be sounding there).
     fn release_all(&mut self, dest: NodeId) {
+        if self.arp.iter().any(|a| a.node == dest) {
+            let mut fed = [0u32; 8];
+            let mut n_fed = 0usize;
+            for i in 0..self.graph.edges.len() {
+                let e = &self.graph.edges[i];
+                if e.kind == PortKind::Midi && e.from.node == dest && n_fed < fed.len() {
+                    if !fed[..n_fed].contains(&e.to.node) {
+                        fed[n_fed] = e.to.node;
+                        n_fed += 1;
+                    }
+                }
+            }
+            self.with_arp_slot(dest, |a, eng| {
+                let (node, vel) = (a.node, a.velocity());
+                let mut emit = |note: u8, on: bool| eng.deliver_arp_note(node, note, on, vel);
+                a.release_all(&mut emit);
+            });
+            for i in 0..n_fed {
+                self.release_instrument(fed[i]);
+            }
+            return;
+        }
+        self.release_instrument(dest);
+    }
+
+    /// Note-off for all 128 notes on one instrument (voice or LV2).
+    fn release_instrument(&mut self, dest: NodeId) {
         if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
             for n in 0..128u16 { s.voice.note_off(n); }
         }
         if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
             for n in 0..128u8 { s.plugin.note_off(n); }
         }
+        if self.is_midi_fx(dest) {
+            let Some(fx) = self.midi_fx.iter_mut().find(|s| s.node == dest) else { return };
+            // Cycle guard: a user-wired FX1 → FX2 → FX1 loop must not recurse
+            // forever; the second entry only requeues all-notes-off.
+            if !fx.releasing {
+                fx.releasing = true;
+                // Own queue: never-delivered events die here.
+                fx.in_q.clear();
+                // All-notes-off INTO the plugin: the queue is capped, and
+                // 128 events fit (FX_QUEUE_CAP = 256), so this never drops.
+                for note in 0..128u8 {
+                    fx.queue(MidiMsg::note_off(0, note, 0));
+                }
+                // Downstream: every instrument the unit feeds, by rule
+                // index (allocation-free), enabled or not — a just-disabled
+                // rule may have been the path a note took.
+                let mut i = 0;
+                while let Some(r) = self.matrix.rules.get(i) {
+                    i += 1;
+                    if r.source == SourceId::MidiFx(dest) {
+                        let inst = r.dest;
+                        self.release_all(inst);
+                    }
+                }
+                if let Some(fx) = self.midi_fx.iter_mut().find(|s| s.node == dest) {
+                    fx.releasing = false;
+                }
+            }
+        }
         #[cfg(test)]
         self.note_log.push((dest, 255, false)); // 255 = all-notes-off marker
+    }
+
+    /// Run `f` on the arp slot of `node` with the engine passable to its
+    /// emit path. `self.arp` is moved out for the call (pointer swap, no
+    /// allocation) so `deliver_arp_note` can borrow the engine freely.
+    fn with_arp_slot<R>(&mut self, node: NodeId, f: impl FnOnce(&mut crate::arp::ArpState, &mut Self) -> R) -> Option<R> {
+        let mut arps = std::mem::take(&mut self.arp);
+        let out = arps.iter_mut().find(|a| a.node == node).map(|a| f(a, self));
+        self.arp = arps;
+        out
+    }
+
+    /// Deliver one note the arp generated to every instrument the arp node
+    /// feeds by MIDI cable — plain graph wiring (the matrix routes sources,
+    /// and the arp is not a source; its level/scale are its own knobs).
+    /// Block-boundary timing, the timing of every other note here.
+    fn deliver_arp_note(&mut self, arp_node: NodeId, note: u8, on: bool, vel: f32) {
+        for i in 0..self.graph.edges.len() {
+            let e = &self.graph.edges[i];
+            if e.kind != PortKind::Midi || e.from.node != arp_node { continue; }
+            let dest = e.to.node;
+            #[cfg(test)]
+            self.note_log.push((dest, note, on));
+            // An arp wired into a MIDI strip (arp → unit → synth): the unit
+            // takes the note into its queue like one from the keys.
+            if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                let v7 = (vel.clamp(0.0, 1.0) * 127.0) as u8;
+                self.midi_fx[j].queue(if on { MidiMsg::note_on(0, note, v7) } else { MidiMsg::note_off(0, note, 0) });
+                continue;
+            }
+            if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                if on {
+                    s.voice.note_on(note as u16, vel as f64);
+                } else {
+                    s.voice.note_off(note as u16);
+                }
+            }
+            if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                if s.plugin.is_instrument() {
+                    if on {
+                        s.plugin.note_on(note, 127);
+                    } else {
+                        s.plugin.note_off(note);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The arp's own beat clock at this moment: the song position while the
+    /// master transport plays (rule 43 — the pattern sits on the music's
+    /// grid), else the slot's free-running phase (a live arp keeps arping
+    /// between songs at the transport's BPM).
+    fn arp_clock(&self, node: NodeId) -> f64 {
+        let playing = self.transport.playing;
+        self.arp.iter().find(|a| a.node == node)
+            .map(|a| if playing { self.transport.beats } else { a.phase })
+            .unwrap_or(0.0)
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -1520,9 +2840,38 @@ impl GraphEngine {
             self.drain_voice_msgs();
         }
         match cmd {
-            Command::AddNode { kind, name, rig } => {
+            Command::AddNode { kind, name, rig, wire } => {
                 let id = self.graph.add_node(kind.clone(), name);
                 self.graph.set_rig(id, rig);
+                if wire && !matches!(kind, NodeKind::MidiFx { .. }) {
+                    if matches!(kind, NodeKind::Arp) {
+                        // The arp takes over the rig's Keys→synth MIDI cables:
+                        // every note held on those synths loses its off path
+                        // (rule 41). Release them BEFORE rewiring.
+                        let mut taken = 0usize;
+                        for i in 0..self.graph.edges.len() {
+                            let e = &self.graph.edges[i];
+                            if e.kind != PortKind::Midi || e.to.node == id { continue; }
+                            if self.graph.node(e.from.node)
+                                .is_some_and(|n| matches!(n.kind, NodeKind::Keys) && n.rig == rig)
+                            {
+                                let (dest, eid) = (e.to.node, e.id);
+                                self.release_all(dest);
+                                let synth = self.graph.node(dest).is_some_and(|d| matches!(d.kind, NodeKind::Clap { .. }));
+                                if synth && taken < self.arp_taken.len() {
+                                    self.arp_taken[taken] = eid;
+                                    taken += 1;
+                                }
+                            }
+                        }
+                        for slot in &mut self.arp_taken[taken..] {
+                            *slot = crate::control::EdgeId::MAX;
+                        }
+                        self.graph.wire_arp(id);
+                    } else {
+                        self.graph.wire_instrument(id);
+                    }
+                }
                 let sr = self.sample_rate;
                 match &kind {
                     NodeKind::Dsp(dk) => {
@@ -1532,6 +2881,15 @@ impl GraphEngine {
                         }
                     }
                     NodeKind::Lv2 { uri } => self.request_lv2(id, *uri),
+                    NodeKind::MidiFx { plugin } => {
+                        if let Some(n) = self.graph.node(id) {
+                            self.midi_fx.push(midi_fx_slot(n));
+                        }
+                        if let MidiFxPlugin::Lv2 { uri } = plugin {
+                            self.request_lv2(id, *uri);
+                        }
+                        self.setup_midi_fx(id, wire);
+                    }
                     NodeKind::AudioIn { device, channels } => {
                         self.audio_in.push(AudioInSlot::new(id, *channels, device.clone()));
                     }
@@ -1543,16 +2901,42 @@ impl GraphEngine {
                         self.fit_route_out();
                         self.bind_free_voices();
                     }
+                    // A MIDI destination like an instrument: its input rules
+                    // come with the node so the keys route to it at once.
+                    NodeKind::Arp => {
+                        self.arp.push(crate::arp::ArpState::new(id));
+                        self.matrix.connect(SourceId::Keys, id);
+                        for dev in 0..MAX_HW_DEVICES {
+                            self.matrix.connect(SourceId::Hardware(dev), id);
+                        }
+                        self.fit_route_out();
+                    }
                     _ => {}
                 }
                 self.publish_graph();
             }
             Command::RemoveNode(id) => {
                 // An idle voice keeps a held note and replays it when rebound.
+                // (An Arp node cascades: its generated notes die with it.)
                 self.release_all(id);
+                let rig_of_fx = self.graph.node(id).filter(|n| matches!(n.kind, NodeKind::MidiFx { .. })).map(|n| n.rig);
                 self.graph.remove_node(id);
+                if let Some(i) = self.midi_fx.iter().position(|s| s.node == id) {
+                    let slot = self.midi_fx.remove(i);
+                    if let Some(MidiFxProc::Lv2(s)) = slot.proc {
+                        self.retire_lv2(s);
+                    }
+                    // Notes of the removed unit are released; its rules go
+                    // with it, and the rig's instruments get their direct
+                    // cables back so the rack stays playable.
+                    self.matrix.rules.retain(|r| r.dest != id && r.source != SourceId::MidiFx(id));
+                    if let Some(rig) = rig_of_fx {
+                        self.graph.heal_midi_after_fx(rig);
+                    }
+                }
                 self.dsp.retain(|s| s.node != id);
                 self.audio_in.retain(|s| s.node != id);
+                self.arp.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
                     let slot = self.lv2.remove(i);
                     self.retire_lv2(slot);
@@ -1567,16 +2951,30 @@ impl GraphEngine {
             Command::Connect { id, from, to, kind } => {
                 // Publish only on a real change: the UI's per-frame mirror
                 // re-sends duplicate Connects, which must not bump the rev.
+                // No release: a cable plugged after a note-on only ever
+                // delivers a stray note-off to a dest that never sounded
+                // (and the arp ignores offs for keys it never held) — the
+                // held-notes check proves this path safe.
+                if self.arp_taken.contains(&id) {
+                    return;
+                }
                 if self.graph.connect_with_id(id, from, to, kind) {
+                    if kind == PortKind::Midi && self.is_midi_fx(from.node) {
+                        self.route_midi_fx_outputs(from.node);
+                    }
                     self.publish_graph();
                 }
             }
             Command::Disconnect(id) => {
-                // keys_gate drops a note-off whose Keys cable is gone.
+                // keys_gate drops a note-off whose Keys cable is gone; an
+                // arp-generated note's off path is the arp's own cable and a
+                // MIDI-FX unit's output cable is a note-off path of its own.
                 let fed = self.graph.edges.iter().find(|e| {
                     e.id == id
                         && e.kind == PortKind::Midi
-                        && self.graph.node(e.from.node).map_or(false, |n| matches!(n.kind, NodeKind::Keys))
+                        && self.graph.node(e.from.node).map_or(false, |n| {
+                            matches!(n.kind, NodeKind::Keys | NodeKind::Arp | NodeKind::MidiFx { .. })
+                        })
                 });
                 if let Some(dest) = fed.map(|e| e.to.node) {
                     self.release_all(dest);
@@ -1604,6 +3002,19 @@ impl GraphEngine {
                     }
                 }
             }
+            Command::LoadLv2State { node, state } => {
+                let Some(NodeKind::Lv2 { uri }) = self.graph.node(node).map(|n| n.kind.clone()) else { return };
+                let gen = self.lv2_gen;
+                if let Some(tx) = self.lv2_req.as_mut() {
+                    if tx.push(Lv2Request::State { node, uri, gen, state }).is_err() {
+                        eprintln!("lv2 loader queue full: state for node {node} dropped");
+                    }
+                    return;
+                }
+                if let Some(slot) = restored_lv2_slot(node, uri.as_str(), &state, self.sample_rate) {
+                    self.adopt_restored_lv2(node, gen, slot);
+                }
+            }
             Command::ProgramChange { node, program } => {
                 let program = program.min(127);
                 if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
@@ -1613,6 +3024,7 @@ impl GraphEngine {
                 }
             }
             Command::LoadGraph { graph } => {
+                self.arp_taken = [crate::control::EdgeId::MAX; 8];
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
                 // path; a future version can rebuild off-thread and swap.
@@ -1633,6 +3045,22 @@ impl GraphEngine {
                     })
                     .collect();
                 self.audio_in = build_audio_in_slots(&self.graph);
+                while let Some(slot) = self.midi_fx.pop() {
+                    if let Some(MidiFxProc::Lv2(s)) = slot.proc {
+                        self.retire_lv2(s);
+                    }
+                }
+                self.midi_fx = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
+                    .map(midi_fx_slot)
+                    .collect();
+                // Arp nodes of the new graph start fresh (the loop above
+                // released every old node — an old arp cascaded to what it
+                // fed, and the slots themselves die with the old graph).
+                self.arp = build_arp_slots(&self.graph);
                 // Old instances are freed (on the loader thread when it runs);
                 // new ones load below, after the matrix is rebuilt.
                 while let Some(slot) = self.lv2.pop() {
@@ -1652,6 +3080,13 @@ impl GraphEngine {
                     .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
                     .map(|n| n.id)
                     .collect();
+                let arp_ids: Vec<NodeId> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::Arp))
+                    .map(|n| n.id)
+                    .collect();
                 self.matrix = Matrix::new();
                 self.matrix.reserve(64);
                 for &id in &clap_ids {
@@ -1660,18 +3095,33 @@ impl GraphEngine {
                         self.matrix.connect(SourceId::Hardware(dev), id);
                     }
                 }
+                // Arp nodes are MIDI destinations like instruments.
+                for &id in &arp_ids {
+                    self.matrix.connect(SourceId::Keys, id);
+                    for dev in 0..MAX_HW_DEVICES {
+                        self.matrix.connect(SourceId::Hardware(dev), id);
+                    }
+                }
+                let fx_ids: Vec<NodeId> = self.midi_fx.iter().map(|s| s.node).collect();
+                for fx in fx_ids {
+                    self.route_midi_fx(fx, None);
+                }
                 self.fit_route_out();
                 self.rig_meta.clear();
                 // Values parked for the old graph's organs (ids are reused).
                 self.organ_pending = [None; 8];
+                self.lv2_pending = [None; 8];
                 for i in 0..self.graph.nodes.len() {
-                    if let NodeKind::Lv2 { uri } = self.graph.nodes[i].kind {
-                        let id = self.graph.nodes[i].id;
-                        self.request_lv2(id, uri);
+                    let id = self.graph.nodes[i].id;
+                    match self.graph.nodes[i].kind {
+                        NodeKind::Lv2 { uri } => self.request_lv2(id, uri),
+                        NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri } } => self.request_lv2(id, uri),
+                        _ => {}
                     }
                 }
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
+                self.strips.clear();
                 if self.master_clock.is_counting_in() {
                     self.master_clock = MasterClock::Stopped;
                     self.transport.set_playing(false);
@@ -1684,6 +3134,7 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::LoadRigs { rigs, active } => {
+                self.arp_taken = [crate::control::EdgeId::MAX; 8];
                 // Rare structural op: merge the rig graphs into one patch and
                 // reuse the LoadGraph rebuild (DSP, LV2, CLAP voice remap in
                 // node-id order, matrix), then bind each rig's
@@ -1718,6 +3169,18 @@ impl GraphEngine {
                         for id in insts {
                             self.matrix.connect(SourceId::Hardware(dev), id);
                         }
+                        // The rig's MIDI-FX units: only that device feeds
+                        // them, and their output rules came out with the rest.
+                        let fxs: Vec<NodeId> = self
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|n| n.rig == tag && matches!(n.kind, NodeKind::MidiFx { .. }))
+                            .map(|n| n.id)
+                            .collect();
+                        for fx in fxs {
+                            self.route_midi_fx(fx, Some(dev));
+                        }
                     }
                     // Keep the voice-level source filter consistent with the
                     // matrix (a second gate on top of the cable + matrix).
@@ -1741,10 +3204,29 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(shift) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = shifted(m.note(), shift) else { continue };
+                    let Some(route) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = Self::routed_note(&m, &route) else { continue };
+                    // An arp destination: the note joins its hold (or, chord
+                    // mode, sounds its chord at once); the arp generates its
+                    // own notes downstream from here.
+                    if self.arp.iter().any(|a| a.node == dest) {
+                        let now = self.arp_clock(dest);
+                        let vel = velocity as f32;
+                        self.with_arp_slot(dest, |a, eng| {
+                            let (node, v) = (a.node, a.velocity());
+                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
+                            a.note_in(out, vel, now, &mut emit);
+                        });
+                        continue;
+                    }
                     #[cfg(test)]
                     self.note_log.push((dest, out, true));
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        if self.fx_accepts(dest, source) {
+                            self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+                        }
+                        continue;
+                    }
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_on(out as u16, velocity as f64);
@@ -1762,10 +3244,24 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(shift) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = shifted(m.note(), shift) else { continue };
+                    let Some(route) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = Self::routed_note(&m, &route) else { continue };
+                    // The release meets the arp at the same snapped pitch its
+                    // note-on did; the arp stops what it had going.
+                    if self.arp.iter().any(|a| a.node == dest) {
+                        self.with_arp_slot(dest, |a, eng| {
+                            let (node, v) = (a.node, a.velocity());
+                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
+                            a.note_out(out, &mut emit);
+                        });
+                        continue;
+                    }
                     #[cfg(test)]
                     self.note_log.push((dest, out, false));
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        self.midi_fx[j].queue(MidiMsg::new(m.status, m.channel, out, m.data[1]));
+                        continue;
+                    }
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
                         if source_accepted(s, source) {
                             s.voice.note_off(out as u16);
@@ -1781,6 +3277,7 @@ impl GraphEngine {
             Command::SetRigSource { node, keyboard, hardware } => {
                 // source_accepted would drop the note-off of a source turned off.
                 self.release_all(node);
+                self.release_upstream(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.src_keys = keyboard;
                     s.src_hw = hardware;
@@ -1798,6 +3295,7 @@ impl GraphEngine {
             }
             Command::SetRigDevice { node, device } => {
                 self.release_all(node);
+                self.release_upstream(node);
                 if let Some(s) = self.voices.iter_mut().find(|s| s.node == node) {
                     s.rig_device = device;
                 }
@@ -1809,6 +3307,54 @@ impl GraphEngine {
                 if let Some(b) = mute { m.mute = b; }
                 if let Some(b) = solo { m.solo = b; }
                 self.mix_dirty = true;
+            }
+            Command::SetStripMix { node, pan, mute, solo } => {
+                let e = self.strips.iter_mut().find(|(n, _)| *n == node);
+                match e {
+                    Some((_, m)) => {
+                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
+                        if let Some(b) = mute { m.mute = b; }
+                        if let Some(b) = solo { m.solo = b; }
+                    }
+                    None => {
+                        if self.strips.len() >= MAX_STRIP_MIXES { return; }
+                        let mut m = StripMix::DEFAULT;
+                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
+                        if let Some(b) = mute { m.mute = b; }
+                        if let Some(b) = solo { m.solo = b; }
+                        if m.is_default() { return; }
+                        self.strips.push((node, m));
+                    }
+                }
+                self.strips.retain(|(_, m)| !m.is_default());
+                self.mix_dirty = true;
+            }
+            Command::SetStripBypass { node, bypass } => {
+                if bypass {
+                    match self.strips.iter_mut().find(|(n, _)| *n == node) {
+                        Some((_, m)) => m.bypass = true,
+                        None => {
+                            if self.strips.len() < MAX_STRIP_MIXES {
+                                self.strips.push((node, StripMix { bypass: true, ..StripMix::DEFAULT }));
+                            }
+                        }
+                    }
+                } else if let Some((_, m)) = self.strips.iter_mut().find(|(n, _)| *n == node) {
+                    m.bypass = false;
+                    self.strips.retain(|(_, m)| !m.is_default());
+                }
+                self.mix_dirty = true;
+            }
+            Command::RenameNode { node, name } => {
+                // Metadata in the graph (sessions carry it with the patch);
+                // the graph publication makes every frontend see it.
+                let n = crate::control::name_str(&name).trim();
+                if !n.is_empty() {
+                    if let Some(m) = self.graph.nodes.iter_mut().find(|m| m.id == node) {
+                        m.name = crate::control::name_bytes(n);
+                        self.publish_graph();
+                    }
+                }
             }
             Command::SetNodeSplit { node, point } => {
                 // A Keys-node property: only a real change on a Keys node acts.
@@ -1849,6 +3395,27 @@ impl GraphEngine {
                         }
                     }
                     self.graph.set_zone_octave(node, zone, octave);
+                    self.publish_graph();
+                }
+            }
+            Command::SetKeysScale { node, scale } => {
+                // A Keys-node property (like a split move): a scale change
+                // mid-hold would snap the release to a different pitch than
+                // its note-on snapped to — release everything this Keys node
+                // feeds, from all ports, BEFORE the snap moves (rule 41).
+                let choice = scale.map(|c| crate::arp::ScaleChoice { key: c.key.min(11), ..c });
+                let is_change = self.graph.node(node).is_some_and(|n| {
+                    matches!(n.kind, NodeKind::Keys) && n.scale != choice
+                });
+                if is_change {
+                    for i in 0..self.graph.edges.len() {
+                        let e = &self.graph.edges[i];
+                        if e.kind == PortKind::Midi && e.from.node == node {
+                            let dest = e.to.node;
+                            self.release_all(dest);
+                        }
+                    }
+                    self.graph.set_scale(node, choice);
                     self.publish_graph();
                 }
             }
@@ -1904,6 +3471,20 @@ impl GraphEngine {
                         }
                         continue;
                     }
+                    // A MIDI-FX unit takes the CC into its plugin (needs its cable).
+                    if let Some(j) = self.midi_fx.iter().position(|s| s.node == dest) {
+                        match mapping {
+                            // A learned knob (PluginParam target) moves the unit's control.
+                            Some(b) => {
+                                self.apply_midi_fx_param(dest, b.param, norm as f32);
+                                #[cfg(test)]
+                                self.cc_log.push((dest, b.param, norm));
+                            }
+                            None if self.has_midi_cable(dest) => self.midi_fx[j].queue(m),
+                            None => {}
+                        }
+                        continue;
+                    }
                     let has_midi = self.has_midi_cable(dest);
                     let param = mapping.map(|m| m.param);
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
@@ -1940,6 +3521,47 @@ impl GraphEngine {
                         } else if self.apply_engine_param(dest, pid, norm) {
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
+                        }
+                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        // An unmapped CC reaches an LV2 instrument the same
+                        // way it reaches a CLAP voice: the plugin implements
+                        // the controller (mod wheel CC 1, sustain CC 64, …).
+                        if s.plugin.is_instrument() && has_midi {
+                            s.plugin.control_change(m.data[0], m.data[1]);
+                            #[cfg(test)]
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    }
+                }
+            }
+            Command::PitchBend { source, channel, value } => {
+                // A bend is a channel message like CC: routed through the
+                // matrix, passed through to the instruments (plugins bend
+                // what they play); no binding applies to it.
+                let msg = MidiMsg::pitch_bend(channel, value);
+                self.matrix.route_into(source, msg, &mut self.route_out);
+                for i in 0..self.route_out.len() {
+                    let (dest, m) = self.route_out[i];
+                    let has_midi = self.has_midi_cable(dest);
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        if !has_midi || !source_accepted(s, source) {
+                            continue;
+                        }
+                        s.voice.send_pitch_bend_rt(m.channel, m.pitch_bend_value());
+                        #[cfg(test)]
+                        self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                    } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
+                        // A Clap node whose voice is not hosted yet: nothing to
+                        // bend (same shape as the CC path; logged under test).
+                        #[cfg(test)]
+                        if has_midi {
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        if s.plugin.is_instrument() && has_midi {
+                            s.plugin.pitch_bend(m.pitch_bend_value());
+                            #[cfg(test)]
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
                         }
                     }
                 }
@@ -1998,7 +3620,76 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::SetPlayer { gain } => {
-                self.player_gain = gain.clamp(0.0, 1.0);
+                let gain = gain.clamp(0.0, 1.0);
+                if (self.player_gain - gain).abs() > 1e-9 {
+                    self.player_gain = gain;
+                    self.player_dirty = true;
+                }
+            }
+            Command::SetPlayerCfg { loop_on, sync, beats, offset, bpm } => {
+                let old = self.player_cfg;
+                if let Some(v) = loop_on {
+                    self.player_cfg.loop_on = v;
+                }
+                if let Some(v) = sync {
+                    self.player_cfg.sync = v;
+                }
+                if let Some(v) = beats {
+                    self.player_cfg.beats = v.max(0.0);
+                }
+                if let Some(v) = offset {
+                    self.player_cfg.offset = v.clamp(-64.0, 64.0);
+                }
+                if let Some(v) = bpm {
+                    self.player_cfg.bpm = v.clamp(20.0, 300.0);
+                }
+                if self.player_cfg == old {
+                    return;
+                }
+                if let Some(p) = self.player.as_mut() {
+                    // Looping again unfreezes a one-shot that ran out.
+                    if self.player_cfg.loop_on {
+                        p.finished = false;
+                    }
+                    // A pending start with sync now off begins immediately
+                    // (AUM: no sync, no waiting for the quantum).
+                    if p.pending && !self.player_cfg.sync {
+                        player_start_now(p, self.player_cfg, self.transport.beats);
+                    } else if p.enabled
+                        && !p.pending
+                        && !p.finished
+                        && old.sync != self.player_cfg.sync
+                        && self.master_clock == MasterClock::Playing
+                    {
+                        // Toggle sync mid-play without a jump: re-anchor
+                        // the song-clock mapping at the current position.
+                        let ref_bpm = self.player_cfg.ref_bpm(p.duration);
+                        let t = (p.pos / p.file_sr).clamp(0.0, p.duration);
+                        p.anchor_file_beats = t * ref_bpm / 60.0;
+                        p.anchor_song_beats = self.transport.beats;
+                    }
+                }
+                self.player_dirty = true;
+            }
+            Command::SetPlayerEnable { on } => {
+                let target = self.player_target_beats();
+                let Some(p) = self.player.as_mut() else { return };
+                if on {
+                    p.enabled = true;
+                    if self.player_cfg.sync && self.master_clock.is_active() {
+                        // AUM: while the transport rolls, the play-enable
+                        // starts at the next sync-quantum (bar) boundary;
+                        // during a count-in that is beat 0.
+                        p.pending = true;
+                        p.target_beats = target;
+                    } else {
+                        player_start_now(p, self.player_cfg, self.transport.beats);
+                    }
+                } else {
+                    p.enabled = false;
+                    p.pending = false;
+                }
+                self.player_dirty = true;
             }
             // Global transport = MASTER: fan out to every transport-capable
             // node (all start together on the downbeat). Per-node
@@ -2033,6 +3724,15 @@ impl GraphEngine {
             }
             Command::RecordStart => self.record_start(),
             Command::RecordStop => self.record_stop(),
+            Command::SetRecordArm { rig, armed } => {
+                match rig {
+                    None => self.arm_master = armed,
+                    Some(r) => self.arm_rigs[(r as usize).min(7)] = armed,
+                }
+                if let Some(rec) = &self.recorder {
+                    rec.shared().set_arms(self.arm_master, &self.arm_rigs);
+                }
+            }
             Command::SetRecordSync { on } => {
                 if !on {
                     self.record_sync_pending = false; // a count-in still running must not start a take
@@ -2084,6 +3784,16 @@ impl GraphEngine {
             if changed {
                 self.publish_graph();
             }
+            // File player (AUM): a synced, enabled player starts WITH the
+            // transport, anchored to the song clock's beat 0 — right after
+            // any count-in, so an aligned loop lands on the downbeat.
+            if self.player_cfg.sync {
+                if let Some(p) = self.player.as_mut().filter(|p| p.enabled) {
+                    p.pending = true;
+                    p.target_beats = 0.0;
+                    self.player_dirty = true;
+                }
+            }
         } else {
             let was_active = self.master_clock.is_active() || self.transport.playing;
             self.master_clock = MasterClock::Stopped;
@@ -2113,7 +3823,15 @@ impl GraphEngine {
         } else {
             self.record_sync_pending = false;
             if self.record_sync {
-                self.record_stop();
+                self.record_stop_now();
+            } else if self.record_pending.is_some() {
+                let stop_now = matches!(self.record_pending, Some((false, _)));
+                self.record_pending = None;
+                if stop_now {
+                    self.record_stop_now();
+                } else if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
             }
         }
     }
@@ -2159,8 +3877,19 @@ impl GraphEngine {
                 s.buf[i * 2] = ol * g;
                 s.buf[i * 2 + 1] = or * g;
             }
+            // A backlog (capture ahead of its consumer) is cut to the target
+            // fill in one go; the ring holds interleaved stereo, so every
+            // discard is a whole frame (one sample would swap L and R).
+            let backlog = s.drift.catch_up(consumer.slots());
+            if backlog > 0 {
+                for _ in 0..backlog {
+                    let _ = consumer.pop();
+                }
+                s.dropped += (backlog / 2) as u64;
+            }
             match s.drift.action(consumer.slots()) {
                 DriftAction::DropOne => {
+                    let _ = consumer.pop();
                     let _ = consumer.pop();
                     s.dropped += 1;
                 }
@@ -2174,6 +3903,9 @@ impl GraphEngine {
 
     /// Render one device block, allocation-free.
     pub fn render(&mut self, data: &mut [f32], ch: usize) {
+        if let Some(rec) = &mut self.recorder {
+            rec.drain_stems();
+        }
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
         }
@@ -2182,10 +3914,24 @@ impl GraphEngine {
         // beat 0 (immediately on play without a count-in, or right after one).
         if self.record_sync_pending && self.master_clock == MasterClock::Playing {
             self.record_sync_pending = false;
-            self.record_start();
+            self.record_start_now();
+        }
+        // Bar-quantized start/stop when record was pressed while transport rolls.
+        if let Some((start, target_beat)) = self.record_pending {
+            if self.master_clock == MasterClock::Playing && self.transport.beats >= target_beat - 1e-9 {
+                if start {
+                    self.record_start_now();
+                } else {
+                    self.record_stop_now();
+                }
+            }
         }
         self.drain_voice_msgs();
         self.publish_voices();
+        // MIDI-FX units run before the instruments render, so the notes they
+        // emit sound in the same block the events arrived in.
+        let fx_frames = data.len() / ch;
+        self.pump_midi_fx(fx_frames);
         // Attach freshly-opened input captures (UI opened a device for a node):
         // a (node, ring consumer) pair, swapped in place of any stale consumer.
         while let Some(rx) = self.audio_in_rx.as_mut() {
@@ -2200,6 +3946,7 @@ impl GraphEngine {
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
+                    g.strips = self.strips_pub();
                     g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
@@ -2217,8 +3964,13 @@ impl GraphEngine {
             return;
         }
         let n2 = frames * 2;
+        // Per-source strip state (#73), once per block: which rigs have a
+        // soloed source decides every source's mute/solo gain below.
+        let solo_rigs = self.rigs_with_solo_source();
 
         // 1. Every instrument renders and applies its level.
+        self.node_timer.begin_block();
+        let mut node_t0 = std::time::Instant::now();
         for s in &mut self.voices {
             // A free voice (no Clap node bound): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
@@ -2226,17 +3978,53 @@ impl GraphEngine {
             for x in s.scratch[..n2].iter_mut() {
                 *x *= s.level;
             }
+            // Strip mix (mute/solo/pan) at the source's own output: the edge
+            // levels published from this buffer stay post-fader (rule 53).
+            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, s.node, &solo_rigs) {
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in s.scratch[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for f in s.scratch[..n2].chunks_exact_mut(2) {
+                        f[0] *= gl;
+                        f[1] *= gr;
+                    }
+                }
+            }
+            // One clock read per voice: each ends where the next begins.
+            let now = std::time::Instant::now();
+            self.node_timer.record(s.node, now - node_t0);
+            node_t0 = now;
         }
 
         // 1a. Audio In nodes: pull the input ring into each node's stereo
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
+        for a in &mut self.audio_in {
+            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, a.node, &solo_rigs) {
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in a.buf[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for f in a.buf[..n2].chunks_exact_mut(2) {
+                        f[0] *= gl;
+                        f[1] *= gr;
+                    }
+                }
+            }
+        }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
         // normal audio routing like any DSP node.
         let (sr, bpm) = (self.sample_rate, self.transport.bpm);
         let beat_inc = Transport::beats_per_frame(bpm, sr);
+        // Song position of THIS block's first frame — the file player and
+        // the metronome both count beats from it with the same factor
+        // (rule 43). Snapped before the clock advances below.
+        let block_start_beats = self.transport.beats;
         let block_beats = frames as f64 * beat_inc;
         let counting_in_this_block = self.master_clock.is_counting_in();
         let suppress_wrap_click = matches!(
@@ -2246,10 +4034,45 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
+                if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, d.node, &solo_rigs) {
+                    if gl == gr {
+                        if gl != 1.0 {
+                            for x in d.buf[..n2].iter_mut() { *x *= gl; }
+                        }
+                    } else {
+                        for f in d.buf[..n2].chunks_exact_mut(2) {
+                            f[0] *= gl;
+                            f[1] *= gr;
+                        }
+                    }
+                }
             }
         }
         if counting_in_this_block {
             render_metronome(&mut self.count_in_slot, &mut self.count_in_buf[..n2], frames, sr, bpm, suppress_wrap_click);
+        }
+        // 2a-arp. Arpeggiator units step on the SONG CLOCK while the master
+        // transport plays (rule 43: the pattern sits on the music's grid, and
+        // a tempo change retempoes it mid-beat), and on their own free-run
+        // beat phase at the same BPM when it does not — a live arp keeps
+        // arping between songs. Mirroring the song position into the phase
+        // while playing makes the stop seamless; a rewind (Play) is caught
+        // by the tick's retime instead of machine-gunning missed steps.
+        {
+            let mut arps = std::mem::take(&mut self.arp);
+            for a in &mut arps {
+                if self.transport.playing {
+                    a.phase = self.transport.beats;
+                }
+                let (t0, t1) = (a.phase, a.phase + block_beats);
+                let (node, vel) = (a.node, a.velocity());
+                let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
+                a.tick(t0, t1, &mut emit);
+                if !self.transport.playing {
+                    a.phase = t1;
+                }
+            }
+            self.arp = arps;
         }
         match self.master_clock {
             MasterClock::Stopped => {}
@@ -2283,15 +4106,26 @@ impl GraphEngine {
                 }
             }
         }
-        if self.transport_dirty {
+        if self.transport_dirty || self.player_dirty {
             let tp = self.transport_pub();
+            let pp = self.player_pub();
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
-                    g.transport = tp;
-                    g.transport_rev = g.transport_rev.wrapping_add(1);
-                    self.transport_dirty = false;
+                    if self.transport_dirty {
+                        g.transport = tp;
+                        g.transport_rev = g.transport_rev.wrapping_add(1);
+                        self.transport_dirty = false;
+                    }
+                    if self.player_dirty {
+                        g.player = pp;
+                        g.player_rev = g.player_rev.wrapping_add(1);
+                        self.player_dirty = false;
+                    }
                 },
-                None => self.transport_dirty = false,
+                None => {
+                    self.transport_dirty = false;
+                    self.player_dirty = false;
+                }
             }
         }
 
@@ -2308,18 +4142,46 @@ impl GraphEngine {
         self.fx_done.extend((0..n_dsp).map(|i| self.dsp[i].kind == DspKind::Metronome));
         self.fx_done.extend(std::iter::repeat(false).take(self.lv2.len()));
         while let Some(f) = self.next_effect(n_dsp, n_fx) {
+            let node_t0 = std::time::Instant::now();
             self.fx_done[f] = true;
             let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
             self.sum_audio_into(node, &mut bus[..n2]);
+            // Bypass (#74): the slot passes its summed input through
+            // unchanged; its knobs keep their values for when it returns.
+            let bypassed = strip_bypassed(&self.strips, node);
+            let strip_gain = strip_gains_of(&self.strips, &self.graph, node, &solo_rigs);
             if f < n_dsp {
                 let d = &mut self.dsp[f];
                 d.buf[..n2].copy_from_slice(&bus[..n2]);
-                d.proc.process(&mut d.buf[..n2], frames);
+                if !bypassed {
+                    d.proc.process(&mut d.buf[..n2], frames);
+                }
             } else {
                 let slot = &mut self.lv2[f - n_dsp];
-                slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                if bypassed {
+                    slot.buf[..n2].copy_from_slice(&bus[..n2]);
+                } else {
+                    slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                }
             }
+            // An LV2 node that is a SOURCE (an instrument) carries strip
+            // state; effects do not (their strip row is the bypass flag).
+            if let Some((gl, gr)) = strip_gain {
+                let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in buf[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for fr in buf[..n2].chunks_exact_mut(2) {
+                        fr[0] *= gl;
+                        fr[1] *= gr;
+                    }
+                }
+            }
+            self.node_timer.record(node, node_t0.elapsed());
         }
+        self.node_timer.end_block();
         self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
@@ -2330,12 +4192,11 @@ impl GraphEngine {
                 cap.read(&mut self.system_buf[..n2]);
             }
         }
-        let ply = self.player_gain > 0.0 && self.player_sink.is_some();
-        if ply {
-            if let Some(sink) = &mut self.player_sink {
-                sink.read(&mut self.player_buf[..n2]);
-            }
-        }
+        // File player: read the decoded buffer at the clock's position
+        // (loop/sync/beat-offset all live in the engine, issue #84). Runs
+        // even without a master node so the clock stays true.
+        self.fill_player(frames, block_start_beats, beat_inc);
+        let ply = self.player.is_some() && self.player_gain > 0.0;
         let mut peak = 0.0f32;
         // Multi-rig: sum every rig's MasterOut to the physical output. Fixed
         // stack array — no allocation on the audio thread (max 8 rigs).
@@ -2367,67 +4228,81 @@ impl GraphEngine {
             }
             for mi in 0..n_masters {
                 let master = masters[mi];
+                let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(7);
                 let (gl, gr) = gains[mi];
-                if gl == 0.0 && gr == 0.0 { continue; } // muted: skip the work
-                for v in &self.voices {
-                    if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
-                        continue;
+                let rig_buf = &mut self.rig_buf[..n2];
+                for x in rig_buf.iter_mut() {
+                    *x = 0.0;
+                }
+                if gl != 0.0 || gr != 0.0 {
+                    for v in &self.voices {
+                        if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = v.scratch[i * 2]; // mono in: center to both
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += v.scratch[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
+                            }
+                        }
                     }
-                    if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = v.scratch[i * 2]; // mono in: center to both
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
+                    for d in &self.dsp {
+                        if !self.graph.has_route(d.node, master, PortKind::Audio) {
+                            continue;
                         }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += v.scratch[i * 2] * gl;
-                            acc[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
+                        if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = d.buf[i * 2];
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += d.buf[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
+                            }
                         }
+                    }
+                    for slot in &self.lv2 {
+                        if !self.graph.has_route(slot.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = slot.buf[i * 2];
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += slot.buf[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
+                            }
+                        }
+                    }
+                    // Audio In wired into this master (OUT jack → graph routing).
+                    for a in &self.audio_in {
+                        if !self.graph.has_route(a.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        for i in 0..frames {
+                            rig_buf[i * 2] += a.buf[i * 2] * gl;
+                            rig_buf[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                        }
+                    }
+                    for i in 0..n2 {
+                        acc[i] += rig_buf[i];
                     }
                 }
-                for d in &self.dsp {
-                    if !self.graph.has_route(d.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = d.buf[i * 2];
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
-                        }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += d.buf[i * 2] * gl;
-                            acc[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
-                        }
-                    }
-                }
-                for slot in &self.lv2 {
-                    if !self.graph.has_route(slot.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = slot.buf[i * 2];
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
-                        }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += slot.buf[i * 2] * gl;
-                            acc[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
-                        }
-                    }
-                }
-                // Audio In wired into this master (OUT jack → graph routing).
-                for a in &self.audio_in {
-                    if !self.graph.has_route(a.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    for i in 0..frames {
-                        acc[i * 2] += a.buf[i * 2] * gl;
-                        acc[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                if let Some(rec) = &mut self.recorder {
+                    if rec.is_stem_active(rig as u8) {
+                        rec.push_rig_stereo(rig as u8, rig_buf);
                     }
                 }
             }
@@ -2469,6 +4344,49 @@ impl GraphEngine {
                     acc[i] += self.player_buf[i] * g;
                 }
             }
+            // Master inserts (#77): FX nodes wired FROM a MasterOut node
+            // (Master OUT → FX → FX → …) run on the summed mix bus, in chain
+            // order, BEFORE the fixed limiter + warmth. The cables stay the
+            // truth — an insert is exactly an audio edge out of a master.
+            // Allocation-free: a fixed stack table, linear scans.
+            let mut inserts = [(NodeId::MAX, false); MAX_MASTER_INSERTS];
+            let mut n_ins = 0usize;
+            loop {
+                if n_ins >= MAX_MASTER_INSERTS { break; }
+                let mut next = None;
+                for f in 0..(self.dsp.len() + self.lv2.len()) {
+                    let (node, is_dsp) = if f < self.dsp.len() {
+                        (self.dsp[f].node, true)
+                    } else {
+                        (self.lv2[f - self.dsp.len()].node, false)
+                    };
+                    if inserts[..n_ins].iter().any(|(n, _)| *n == node) { continue; }
+                    let fed = if n_ins == 0 {
+                        masters[..n_masters].iter().any(|&m| self.graph.has_route(m, node, PortKind::Audio))
+                    } else {
+                        self.graph.has_route(inserts[n_ins - 1].0, node, PortKind::Audio)
+                    };
+                    if fed { next = Some((node, is_dsp)); break; }
+                }
+                match next {
+                    Some(x) => inserts[n_ins] = x,
+                    None => break,
+                }
+                n_ins += 1;
+            }
+            for &(node, is_dsp) in inserts.iter().take(n_ins) {
+                if strip_bypassed(&self.strips, node) { continue; }
+                if is_dsp {
+                    let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) else { continue };
+                    d.buf[..n2].copy_from_slice(&acc[..n2]);
+                    d.proc.process(&mut d.buf[..n2], frames);
+                    acc.copy_from_slice(&d.buf[..n2]);
+                } else {
+                    let Some(slot) = self.lv2.iter_mut().find(|s| s.node == node) else { continue };
+                    slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
+                    acc.copy_from_slice(&slot.buf[..n2]);
+                }
+            }
             let drive = 1.0 + self.master_warm * 3.0;
             let vol = self.master_vol;
             let lim = &mut self.master_lim;
@@ -2487,6 +4405,9 @@ impl GraphEngine {
             // user hears. RT-safe — push never blocks; a full ring drops frames.
             if let Some(rec) = &mut self.recorder {
                 rec.push_stereo(data, ch);
+            }
+            if let Some(listen) = &mut self.listen {
+                listen.push_stereo(data, ch);
             }
             // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
             // output the user hears.
@@ -2510,6 +4431,20 @@ struct OrganPending {
     set: u16,
 }
 
+/// Control-port values waiting for an LV2 instance that is still loading on
+/// the loader thread (rule 46): parked here by `apply_engine_param` and
+/// replayed by `attach_lv2` — the general case of `organ_pending` (rule 113:
+/// a value sent before the instance is live is parked, never dropped; the
+/// Guitar rig's template Drive otherwise never reached the amp). Fixed size,
+/// no allocation (audio thread).
+#[derive(Clone, Copy)]
+struct Lv2Pending {
+    node: NodeId,
+    /// (control ordinal, normalized value), most recent per ordinal.
+    pairs: [(u16, f32); 8],
+    count: usize,
+}
+
 /// Zero-latency peak limiter for the master bus: holds the summed signal
 /// under `CEILING` so the warmth stage after it only colours, never buzzes.
 /// No lookahead (it would add its window to every played note); the brief
@@ -2518,7 +4453,6 @@ struct MasterLimiter {
     env: f32,
     gain: f32,
     rel: f32,
-    atk: f32,
     /// Mean square of the reference chain (`tanh` at `DRIVE_REF`, made up)
     /// and of the chain at the current WARM, over `LOUDNESS_SECS`.
     ms_ref: f32,
@@ -2569,7 +4503,7 @@ impl MasterLimiter {
     fn new(sample_rate: f64) -> Self {
         let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
         Self {
-            env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001),
+            env: 0.0, gain: 1.0, rel: coef(0.120),
             ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
             dc: [(0.0, 0.0); 2],
             dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
@@ -2622,8 +4556,11 @@ impl MasterLimiter {
         let peak = l.abs().max(r.abs());
         self.env = peak.max(self.env * self.rel);
         let target = if self.env > Self::CEILING { Self::CEILING / self.env } else { 1.0 };
-        let coef = if target < self.gain { self.atk } else { self.rel };
-        self.gain = coef * self.gain + (1.0 - coef) * target;
+        if target < self.gain {
+            self.gain = target;
+        } else {
+            self.gain = self.rel * self.gain + (1.0 - self.rel) * target;
+        }
         self.gain
     }
 }
@@ -2800,10 +4737,47 @@ mod master_limiter_tests {
             assert!((p - MasterLimiter::CEILING).abs() < 0.01, "amp {amp}: held at {p}");
         }
     }
+
+    #[test]
+    fn sudden_chord_onset_never_overshoots_and_default_vol_stays_below_knee() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let default_vol = super::knob_specs(&crate::control::NodeKind::MasterOut)
+            .iter()
+            .find(|k| k.param == Some(super::P_VOL))
+            .unwrap()
+            .default;
+        let drive = 1.0 + 0.15 * 3.0;
+        let mut max_out = 0.0f32;
+        for i in 0..4800 {
+            let x = 4.0 * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin().max(0.001)
+                + if i == 0 { 4.0 } else { 0.0 };
+            let (l, _) = lim.process(x, x, drive, default_vol);
+            max_out = max_out.max(l.abs());
+        }
+        assert!(max_out <= MasterLimiter::KNEE, "default master_vol={default_vol} must keep chord onsets below knee ({max_out} > {})", MasterLimiter::KNEE);
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// Rule 129: a source nobody touched has no strip entry, yet another
+    /// source's solo in its rig must still silence it.
+    #[test]
+    fn another_sources_solo_silences_an_untouched_source() {
+        use crate::control::{name_bytes, Graph, NodeKind};
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("A"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("B"));
+        let strips = [(b, super::StripMix { solo: true, ..super::StripMix::DEFAULT })];
+        let mut solo = [false; 8];
+        solo[0] = true;
+        assert_eq!(super::strip_gains_of(&strips, &g, a, &solo), Some((0.0, 0.0)), "untouched A is silenced by B's solo");
+        let b_gain = super::strip_gains_of(&strips, &g, b, &solo).expect("the soloed source has a gain");
+        assert!(b_gain.0 > 0.99 && b_gain.1 > 0.99, "the soloed source plays: {b_gain:?}");
+        assert_eq!(super::strip_gains_of(&[], &g, a, &[false; 8]), None, "no solo, no entry: untouched path");
+    }
+
     use crate::matrix::{CcTarget, Matrix, MidiMsg, SourceId};
 
     fn dests(m: &Matrix, src: SourceId, msg: MidiMsg) -> Vec<u32> {
@@ -2901,6 +4875,98 @@ mod tests {
         // Non-Keys nodes ignore the command.
         assert!(play(&mut e, &mut bus, Command::SetNodeSplit { node: 1, point: Some(60) }).is_empty());
         assert_eq!(e.graph().node(1).unwrap().split, None);
+    }
+
+    fn add_arp(engine: &mut super::GraphEngine, bus: &mut crate::control::CommandBus) -> u32 {
+        use crate::control::{name_bytes, Command, NodeKind};
+        play(engine, bus, Command::AddNode { kind: NodeKind::Arp, name: name_bytes("ARP"), rig: 0, wire: true });
+        engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::Arp)).expect("the arp was added").id
+    }
+
+    #[test]
+    fn an_arp_takes_over_the_keys_cables_and_a_stale_reconnect_cannot_undo_it() {
+        use crate::control::{Command, PortKind, PortRef};
+        let (mut e, mut bus) = split_engine(None, false);
+        play(&mut e, &mut bus, on(60));
+        let log = play(&mut e, &mut bus, Command::AddNode {
+            kind: crate::control::NodeKind::Arp, name: crate::control::name_bytes("ARP"), rig: 0, wire: true });
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "held notes on both synths are released before the rewire: {log:?}");
+        let arp = e.graph().nodes.iter().find(|n| matches!(n.kind, crate::control::NodeKind::Arp)).unwrap().id;
+        let midi = |e: &super::GraphEngine| e.graph().edges.iter().filter(|x| x.kind == PortKind::Midi).map(|x| (x.from.node, x.to.node)).collect::<Vec<_>>();
+        assert!(midi(&e).contains(&(0, arp)) && midi(&e).contains(&(arp, 1)) && midi(&e).contains(&(arp, 4)), "keys → arp → both synths: {:?}", midi(&e));
+        assert!(!midi(&e).contains(&(0, 1)) && !midi(&e).contains(&(0, 4)), "no direct keys → synth cable is left: {:?}", midi(&e));
+        // The UI's per-frame mirror still holds the old cables until it adopts the new graph.
+        play(&mut e, &mut bus, Command::Connect { id: 1, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi });
+        play(&mut e, &mut bus, Command::Connect { id: 6, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 4, port: 0 }, kind: PortKind::Midi });
+        assert!(!midi(&e).contains(&(0, 1)) && !midi(&e).contains(&(0, 4)), "the stale cables stayed out: {:?}", midi(&e));
+        // A load starts over: the id is free again.
+        let g = crate::control::Graph::demo_patch();
+        play(&mut e, &mut bus, Command::LoadGraph { graph: g });
+        assert!(midi(&e).contains(&(0, 1)));
+    }
+
+    #[test]
+    fn the_arp_arpeggiates_the_held_keys_into_its_synths_and_every_release_silences_it() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        // Held keys reach the arp, not the synths.
+        assert!(play(&mut e, &mut bus, on(60)).is_empty(), "a held key plays nothing by itself");
+        assert!(play(&mut e, &mut bus, on(64)).is_empty());
+        assert_eq!(e.arp_held(arp), vec![60, 64]);
+        // Time passes: the arp starts its pattern on both synths.
+        e.note_log.clear();
+        e.arp_test_step();
+        let ons: Vec<(u32, u8)> = e.note_log.iter().filter(|x| x.2).map(|x| (x.0, x.1)).collect();
+        assert!(ons.contains(&(1, 60)) && ons.contains(&(4, 60)), "the first note goes to both synths: {ons:?}");
+        // Releasing every key silences the arp's notes on both.
+        let mut log = play(&mut e, &mut bus, off(60));
+        log.extend(play(&mut e, &mut bus, off(64)));
+        assert!(e.arp_sounding(arp).is_empty() && e.arp_held(arp).is_empty());
+        let downs: Vec<(u32, u8)> = log.iter().filter(|x| !x.2).map(|x| (x.0, x.1)).collect();
+        let sounding_at_tick: Vec<u8> = ons.iter().filter(|x| x.0 == 1).map(|x| x.1).collect();
+        assert!(downs.contains(&(1, *sounding_at_tick.last().unwrap())) && downs.contains(&(4, *sounding_at_tick.last().unwrap())),
+            "the burst the tick left down went off on both synths: {log:?}");
+        // Removing the arp while keys are held silences what it fed.
+        play(&mut e, &mut bus, on(60));
+        e.arp_test_step();
+        let log = play(&mut e, &mut bus, Command::RemoveNode(arp));
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "RemoveNode releases the synths it fed: {log:?}");
+    }
+
+    #[test]
+    fn chord_mode_sounds_three_voices_per_key_through_the_engine() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        play(&mut e, &mut bus, Command::SetParam { node: arp, param: crate::arp::P_ARP_MODE, value: crate::arp::step_value(3, 5) as f64 });
+        let log = play(&mut e, &mut bus, on(60));
+        let on_a: Vec<u8> = log.iter().filter(|x| x.0 == 1 && x.2).map(|x| x.1).collect();
+        assert_eq!(on_a, vec![60, 64, 67], "one key, a triad on synth A: {log:?}");
+        let log = play(&mut e, &mut bus, off(60));
+        let off_a: Vec<u8> = log.iter().filter(|x| x.0 == 1 && !x.2).map(|x| x.1).collect();
+        assert_eq!(off_a, vec![60, 64, 67], "the key's release takes the whole chord off: {log:?}");
+        assert!(e.arp_sounding(arp).is_empty());
+    }
+
+    #[test]
+    fn scale_snap_moves_a_key_and_its_release_to_the_same_note() {
+        use crate::control::Command;
+        use crate::arp::{Scale, ScaleChoice};
+        let (mut e, mut bus) = split_engine(None, false);
+        let cmaj = ScaleChoice { scale: Scale::Major, key: 0 };
+        play(&mut e, &mut bus, Command::SetKeysScale { node: 0, scale: Some(cmaj) });
+        assert_eq!(e.graph().node(0).unwrap().scale, Some(cmaj));
+        assert_eq!(play(&mut e, &mut bus, on(61)), vec![(1, 60, true), (4, 60, true)], "C# plays as C on both synths");
+        assert_eq!(play(&mut e, &mut bus, off(61)), vec![(1, 60, false), (4, 60, false)], "its release meets the C");
+        assert_eq!(play(&mut e, &mut bus, on(62)), vec![(1, 62, true), (4, 62, true)], "an in-scale key is untouched");
+        // Changing the scale while a key is held releases first (rule 41).
+        let log = play(&mut e, &mut bus, Command::SetKeysScale { node: 0, scale: None });
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "{log:?}");
+        assert_eq!(play(&mut e, &mut bus, on(61)), vec![(1, 61, true), (4, 61, true)], "snapping off: the key plays as pressed");
+        // Only Keys nodes snap.
+        play(&mut e, &mut bus, Command::SetKeysScale { node: 1, scale: Some(cmaj) });
+        assert_eq!(e.graph().node(1).unwrap().scale, None);
     }
 
     #[test]
@@ -3564,6 +5630,7 @@ mod tests {
             kind: NodeKind::Dsp(crate::control::DspKind::Gain),
             name: crate::control::name_bytes("G"),
             rig: 0,
+            wire: false,
         });
         engine.render(&mut buf, 2);
         assert_eq!(rev(), 1);
@@ -3681,6 +5748,41 @@ mod tests {
         let s = snap.lock().unwrap();
         assert!(s.rigs.is_empty());
         assert_eq!(s.active, 0);
+    }
+
+    #[test]
+    fn lv2_values_sent_while_the_instance_loads_are_parked_and_replayed() {
+        use crate::control::{command_bus, name_bytes, Graph, Lv2Uri, NodeKind};
+        // Rule 113 for every LV2 node, not only the organ: a SetParam that
+        // arrives while the instance is still on the loader thread is parked
+        // and replayed at attach — the Guitar rig template's amp Drive is
+        // one between LoadGraph and attach. Probes the real plugin when the
+        // Guitarix card is installed, skips in CI.
+        let uri = crate::guitar::AMP;
+        let (mut bus, drain) = command_bus();
+        let mut g = Graph::default();
+        let amp = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes("AMP"));
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        if engine.lv2.is_empty() {
+            return; // the plugin is not installed (CI): nothing to park for
+        }
+        let Some(slot) = engine.lv2.pop() else { return };
+        let mut buf = vec![0.0f32; 256 * 2];
+        bus.send(Command::SetParam { node: amp, param: crate::guitar::AMP_DRIVE_CTRL as super::ParamId, value: 1.0 });
+        engine.render(&mut buf, 2); // drains the command: parks (no live slot)
+        assert!(
+            engine.lv2_pending.iter().any(|p| p.is_some_and(|p| p.node == amp)),
+            "the value sent while loading is parked, not dropped"
+        );
+        engine.attach_lv2(slot);
+        let live = engine.lv2.iter().find(|s| s.node == amp).unwrap();
+        let desc = live.plugin.control_descs()[crate::guitar::AMP_DRIVE_CTRL].clone();
+        assert!(
+            (desc.value - desc.max).abs() < 1e-6,
+            "the parked Drive was replayed at attach: {} (max {})",
+            desc.value, desc.max
+        );
+        engine.lv2_pending = [None; 8];
     }
 
     #[test]
@@ -3933,6 +6035,80 @@ mod tests {
         for _ in 0..4 { engine.render(&mut buf, 2); }
         let at_min = main.param_value(cutoff.id).expect("cutoff readback");
         assert!((at_min - cutoff.min).abs() < 1e-3, "CC 0 should reach min {}: got {at_min}", cutoff.min);
+    }
+
+    /// GitHub #97: a keyboard-strip pitch bend routes through the matrix
+    /// like a CC — every rig the Keys source feeds bends, gated by the
+    /// MIDI cable (and, with a hosted voice, the per-rig keyboard switch).
+    #[test]
+    fn pitch_bend_routes_to_the_rigs_the_keys_feed() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        // +4095 = 0x2FFF: lsb 127, msb 95.
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 4095 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 127, 95), (4, 127, 95)], "both rigs bend by +4095");
+        // Center: 0 = 0x2000 (lsb 0, msb 64).
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 0, 64), (4, 0, 64)], "back to center on both");
+        // The strip's mod (CC 1) and sustain (CC 64) also pass through to
+        // the rigs the keys feed.
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 1, value: 127 });
+        bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 127 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 1, 127), (4, 1, 127), (1, 64, 127), (4, 64, 127)], "mod and sustain reach every rig the keys feed");
+    }
+
+    /// GitHub #97, the audible half: a full pitch bend (+2 st at Surge's
+    /// default range) raises the rendered pitch — counted as zero crossings
+    /// of the master output, like `organ-test` counts drawbar brightness.
+    #[test]
+    fn surge_pitch_bend_bends_the_note() {
+        let Ok((voice, _main)) = crate::host::ClapVoice::new(48000.0) else { return };
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![(surge, voice)]);
+        let mut buf = vec![0.0f32; 256 * 2];
+        // Zero crossings/s of the left channel: a saw's period crosses twice,
+        // so crossings/s ≈ 2 × the fundamental.
+        let mut crossings = |engine: &mut super::GraphEngine, blocks: usize, settle: usize| -> f32 {
+            for _ in 0..settle { engine.render(&mut buf, 2); }
+            let mut n = 0usize;
+            for _ in 0..blocks {
+                engine.render(&mut buf, 2);
+                for i in (2..buf.len()).step_by(2) {
+                    if (buf[i - 2] <= 0.0) != (buf[i] <= 0.0) { n += 1; }
+                }
+            }
+            n as f32 * 48000.0 / (blocks as f32 * 256.0)
+        };
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        let straight = crossings(&mut engine, 100, 20);
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 8191 });
+        let bent = crossings(&mut engine, 100, 20);
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+        let back = crossings(&mut engine, 100, 20);
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        engine.render(&mut buf, 2);
+        println!("pitch bend: {straight:.0} → {bent:.0} → {back:.0} crossings/s (full up = +2 st ≈ ×1.12)");
+        assert!(straight > 50.0, "no signal at the master: {straight:.0} crossings/s");
+        assert!(bent > straight * 1.05, "full pitch bend did not raise the pitch: {straight:.0} → {bent:.0} crossings/s");
+        assert!(
+            (back / straight - 1.0).abs() < 0.05,
+            "releasing the wheel did not return to the straight pitch: {straight:.0} → {back:.0} crossings/s"
+        );
     }
 
     #[test]
@@ -4244,6 +6420,94 @@ pub fn organ_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `midifx-test`: the REAL Carla "MIDI Transpose" LV2 plugin as a MIDI strip
+/// (issue #86). Scripted events → matrix → MIDI-FX unit → rig instrument:
+/// the instrument must receive the transposed pitch, a knob value sent while
+/// the plugin still loads must apply (rule 113), and a key released after the
+/// knob moved must leave nothing sounding (rule 41).
+pub fn midifx_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, MidiFxPlugin, NodeKind, PortKind, PortRef};
+    use crate::matrix::SourceId;
+    const TRANSPOSE: &str = "http://kxstudio.sf.net/carla/plugins/miditranspose";
+    const OSC: &str = "urn:distrho:vitalium";
+    let sr = 48000.0;
+    anyhow::ensure!(crate::lv2::Lv2Plugin::load(TRANSPOSE, sr, 512).is_ok_and(|p| p.is_midi_fx()), "Carla MIDI Transpose is not installed");
+    anyhow::ensure!(crate::lv2::Lv2Plugin::load(OSC, sr, 512).is_ok_and(|p| p.is_instrument()), "Vitalium is not installed");
+    let semis_ctl = crate::lv2::control_descs_for_uri(TRANSPOSE)
+        .into_iter()
+        .find(|c| c.symbol == "semitones")
+        .ok_or_else(|| anyhow::anyhow!("the plugin has no 'semitones' control"))?;
+    let norm = |semis: f32| ((semis - semis_ctl.min) / (semis_ctl.max - semis_ctl.min)) as f64;
+
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Lv2 { uri: Lv2Uri::new(TRANSPOSE) } }, name_bytes("MIDI TRANSPOSE"));
+    let inst = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(OSC) }, name_bytes("OSC"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: fx, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi);
+    g.connect_with_id(3, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+    engine.spawn_lv2_loader();
+    let mut buf = vec![0.0f32; 512 * 2];
+    bus.send(Command::LoadGraph { graph: g });
+    // +7 semitones, sent before the plugin is live.
+    bus.send(Command::SetParam { node: fx, param: semis_ctl.index as u32, value: norm(7.0) });
+    let t0 = std::time::Instant::now();
+    let live = |e: &GraphEngine| e.midi_fx.iter().any(|s| s.node == fx && s.proc.is_some()) && e.lv2.iter().any(|s| s.node == inst);
+    while !live(&engine) && t0.elapsed().as_secs() < 15 {
+        engine.render(&mut buf, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    anyhow::ensure!(live(&engine), "the MIDI unit and the instrument did not load within 15 s");
+
+    let mut peak = |engine: &mut GraphEngine, blocks: usize| {
+        let mut p = 0.0f32;
+        for _ in 0..blocks {
+            engine.render(&mut buf, 2);
+            p = buf.iter().fold(p, |m, s| m.max(s.abs()));
+        }
+        p
+    };
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    let held = peak(&mut engine, 20);
+    let ev = engine.lv2_last_note(inst);
+    println!("midifx-test: C4 through MIDI Transpose (+7, set while loading) reached the instrument as {ev:?}; master peak {held:.4}");
+    anyhow::ensure!(matches!(ev, Some([0x90, 67, _])), "expected note-on 67 at the instrument, got {ev:?}");
+    anyhow::ensure!(held > 1e-3, "the instrument is silent behind the MIDI unit");
+    // Move the knob while the key is held, then release the key.
+    bus.send(Command::SetParam { node: fx, param: semis_ctl.index as u32, value: norm(-5.0) });
+    peak(&mut engine, 5);
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let after = peak(&mut engine, 94);
+    println!("midifx-test: knob moved to -5 while C4 was held, key released: master peak afterwards {after:.5} (held {held:.4})");
+    anyhow::ensure!(after < held * 0.01, "a note stayed on after release: the unit lost a note-off when its knob moved");
+    // The new setting applies to the next note.
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    peak(&mut engine, 5);
+    let ev = engine.lv2_last_note(inst);
+    println!("midifx-test: next C4 at -5 reached the instrument as {ev:?}");
+    anyhow::ensure!(matches!(ev, Some([0x90, 55, _])), "expected note-on 55 after the knob moved, got {ev:?}");
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let tail = peak(&mut engine, 94);
+    anyhow::ensure!(tail < held * 0.01, "second note stayed on after release");
+    // Removing the unit while a key is held must release it, not strand it.
+    bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+    peak(&mut engine, 5);
+    bus.send(Command::RemoveNode(fx));
+    peak(&mut engine, 5);
+    bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+    peak(&mut engine, 375);
+    let removed = peak(&mut engine, 94);
+    anyhow::ensure!(removed < held * 0.01, "removing the MIDI unit under a held key left the note sounding");
+    println!("midifx-test: OK — Carla MIDI Transpose transposes through the matrix, takes knob values sent while loading, and leaves no held note after a knob move or removal");
+    Ok(())
+}
+
 pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     use crate::control::{command_bus, name_bytes, Command, Graph, Lv2Uri, NodeKind, PortKind, PortRef};
     use crate::matrix::SourceId;
@@ -4318,10 +6582,36 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     let legato_after = peak_over(&mut engine, 94);
     println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
     anyhow::ensure!(legato_after < legato * 0.01, "LV2 instrument {uri} leaves a legato note hanging (note-off and note-on in one block)");
+    // The keyboard strip's standard signals (GitHub #97) reach an LV2
+    // instrument as-is: modulation (CC 1), sustain (CC 64) and pitch bend.
+    // What they DO is the plugin's business, like a pedal over real MIDI.
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 1, value: 90 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e == [0xB0, 1, 90]),
+        "mod wheel CC 1 did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 127 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e == [0xB0, 64, 127]),
+        "sustain CC 64 did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 2010 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e[0] == 0xE0 && (((e[2] as i16) << 7) | e[1] as i16) - 8192 == 2010),
+        "pitch bend did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    // Leave the plugin centered and the pedal up for what follows.
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 0 });
+    bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+    peak_over(&mut engine, 2);
+    println!("lv2-instrument-engine-test: strip signals (mod, sustain, bend) delivered");
     // Through a built-in effect, like a live organ rig (setBfree → Drive →
     // Master): the effect must hear the LV2 instrument.
     let drive = master + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0, wire: false });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
@@ -4333,6 +6623,142 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     println!("lv2-instrument-engine-test: through a Saturation unit: master peak held={through:.4}");
     anyhow::ensure!(through > 1e-3, "LV2 instrument {uri} → built-in effect → Master is silent");
     println!("lv2-instrument-engine-test: OK — Keys → {uri} → Master is audible and releases");
+    Ok(())
+}
+
+/// Share of the signal's power that is not the `freq` sine (least-squares
+/// fit of one sine+cosine over `x`): ~0 for a clean tone, grows with
+/// distortion. Robust to a slowly decaying envelope, unlike a single
+/// Goertzel bin.
+fn non_fundamental_share(x: &[f32], freq: f32, sr: f32) -> f32 {
+    let k = 2.0 * std::f32::consts::PI * freq / sr;
+    let (mut ss, mut cc, mut sc, mut xs, mut xc, mut xx) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
+    for (i, &v) in x.iter().enumerate() {
+        let (s, c) = ((k * i as f32).sin() as f64, (k * i as f32).cos() as f64);
+        let v = v as f64;
+        ss += s * s; cc += c * c; sc += s * c;
+        xs += v * s; xc += v * c; xx += v * v;
+    }
+    let det = ss * cc - sc * sc;
+    if det.abs() < 1e-9 || xx < 1e-12 {
+        return 0.0;
+    }
+    let a = (xs * cc - xc * sc) / det;
+    let b = (xc * ss - xs * sc) / det;
+    let fit = a * xs + b * xc;
+    ((xx - fit).max(0.0) / xx) as f32
+}
+
+/// `guitar-rig-test` (issue #92): the Guitar rig template end to end — a
+/// synthetic plucked-string input into the Audio In ring, through the
+/// template's stomps, amp and cabinet, audibly transformed at the Master.
+/// Skips cleanly when the Guitarix card is not installed.
+pub fn guitar_rig_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, Command, NodeKind};
+    let sr = 48000.0f32;
+    if crate::lv2::Lv2Plugin::load(crate::guitar::AMP, sr as f64, 512).is_err() {
+        println!("guitar-rig-test: SKIP — the Guitarix card is not installed (catalog card 'guitarix')");
+        return Ok(());
+    }
+    let session = crate::session::Template::GuitarRig.session();
+    let ain = session.graph.nodes.iter()
+        .find(|n| matches!(n.kind, NodeKind::AudioIn { .. }))
+        .map(|n| n.id)
+        .ok_or_else(|| anyhow::anyhow!("the Guitar rig template has no Audio In"))?;
+    let (mut bus, drain) = command_bus();
+    // The app's path (rule 46): the loader thread instantiates the LV2 units
+    // after a LoadGraph; the rig's values follow, and nothing is fed until
+    // every unit is live (an unattached unit would pass nothing and make the
+    // measurement a race).
+    let mut engine = GraphEngine::new(crate::control::Graph::default(), drain, sr as f64, vec![]);
+    engine.spawn_lv2_loader();
+    bus.send(Command::LoadGraph { graph: session.graph.clone() });
+    for p in session.params() {
+        bus.send(Command::SetParam { node: p.node, param: p.param, value: p.value });
+    }
+    let want = session.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Lv2 { .. })).count();
+    let t0 = std::time::Instant::now();
+    let mut warm = vec![0.0f32; crate::bridge::BUFFER_FRAMES as usize * 2];
+    while engine.lv2.len() < want {
+        anyhow::ensure!(t0.elapsed().as_secs() < 15, "the guitarix units did not load ({}/{want})", engine.lv2.len());
+        engine.render(&mut warm, 2);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for _ in 0..8 { engine.render(&mut warm, 2); }
+    // Side channel + data ring, exactly as the app's capture path hands them
+    // to the engine (the unit tests do the same).
+    let (mut side_tx, side_rx) = rtrb::RingBuffer::<(u32, rtrb::Consumer<f32>)>::new(8);
+    engine.set_audio_in_channel(side_rx);
+    let ring = sr as usize * 2; // one second of stereo input
+    let (mut data_tx, data_rx) = rtrb::RingBuffer::<f32>::new(ring);
+    let _ = side_tx.push((ain, data_rx));
+
+    // The "string": a 220 Hz tone with a slow pluck envelope (the tube stage
+    // needs level to crunch, so the decay is gentle), then a 40 ms fade so
+    // the input ends at silence (a starved ring repeats its last sample —
+    // never leave it holding a nonzero constant).
+    let steady_secs = 1.0f32;
+    let n = (sr * steady_secs) as usize;
+    let mut input = Vec::with_capacity(n * 2);
+    for i in 0..n {
+        let t = i as f32 / sr;
+        let env = (-t * 0.8).exp();
+        let s = (2.0 * std::f32::consts::PI * 220.0 * t).sin() * 0.45 * env;
+        input.push(s);
+        input.push(s);
+    }
+    let fade = (0.04 * sr) as usize;
+    for i in 0..fade {
+        let g = 1.0 - i as f32 / fade as f32;
+        input[i * 2] *= g;
+        input[i * 2 + 1] *= g;
+    }
+    // Render in 256-frame blocks, feeding the ring as the engine drains it.
+    let block = crate::bridge::BUFFER_FRAMES as usize;
+    let mut buf = vec![0.0f32; block * 2];
+    let mut master: Vec<f32> = Vec::with_capacity(n * 2);
+    let mut fed = 0usize;
+    engine.render(&mut buf, 2); // attach the consumer, settle the chain
+    // A capture delivers a block at a time, never a second at once (the
+    // engine cuts a backlog to its target fill, Drift::catch_up): keep the
+    // ring two blocks ahead of the render.
+    while master.len() < n * 2 {
+        while fed < input.len() && ring - data_tx.slots() < block * 4 && data_tx.push(input[fed]).is_ok() {
+            fed += 1;
+        }
+        engine.render(&mut buf, 2);
+        master.extend_from_slice(&buf);
+    }
+    let steady = &master[..n * 2];
+    let l: Vec<f32> = steady.iter().step_by(2).copied().collect();
+    let peak = l.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+    // The middle of the steady phase, clear of the pluck envelope's start.
+    let mid = &l[(n / 4)..(3 * n / 4)];
+    // 100 ms of the middle: short enough that the pluck decay is flat.
+    let win = &mid[mid.len() / 2..mid.len() / 2 + (sr as usize / 10)];
+    let ratio = non_fundamental_share(win, 220.0, sr);
+    let rms = (mid.iter().map(|s| (s * s) as f64).sum::<f64>() / mid.len() as f64).sqrt() as f32;
+
+    // The tail: input silent, the delay/reverb part of the chain still sounds.
+    // The first 100 ms are the played note's own decay; the peak after that
+    // is the echoes and the reverb.
+    let mut tail_peak = 0.0f32;
+    for blk in 0..(sr as usize * 12 / 10 / block) {
+        engine.render(&mut buf, 2);
+        if blk * block >= sr as usize / 10 {
+            tail_peak = buf.iter().fold(tail_peak, |m, s| m.max(s.abs()));
+        }
+    }
+    let (dropped, starved) = engine.audio_in_status(ain).unwrap_or((0, 0));
+    println!(
+        "guitar-rig-test: Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master\n  \
+         steady peak {peak:.4} RMS {rms:.4} · non-fundamental power {ratio:.4} · \
+         tail peak after silence {tail_peak:.4} · ring {dropped} dropped {starved} starved"
+    );
+    anyhow::ensure!(peak > 1e-3, "the rig is silent at the master (peak {peak:.4})");
+    anyhow::ensure!(ratio > 0.005, "the rig is transparent (non-fundamental power {ratio:.4}): the amp did not transform the input");
+    anyhow::ensure!(tail_peak > 1e-4, "no delay/reverb tail after the input stopped (peak {tail_peak:.4})");
+    println!("guitar-rig-test: OK — the input is audible and audibly transformed on the way to Master");
     Ok(())
 }
 
@@ -4356,7 +6782,7 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
             engine.spawn_lv2_loader();
         }
         let inst = keys.max(master) + 1;
-        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0 });
+        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0, wire: false });
         bus.send(Command::Connect { id: 1, from: PortRef { node: keys, port: 0 }, to: PortRef { node: inst, port: 0 }, kind: PortKind::Midi });
         bus.send(Command::Connect { id: 2, from: PortRef { node: inst, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
         let mut buf = vec![0.0f32; 256 * 2];
@@ -4510,12 +6936,13 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             anyhow::ensure!(last == Some([0xC0, *program, 0]), "the plugin's last MIDI event is {last:?}, expected programme change {program}");
             format!("programme change {program} reached the plugin")
         }
-        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) => {
+        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) | Load::AeolusRegistration(_) => {
             let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
             let state = main.save_state()?;
             anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
             "plugin state changed".to_string()
         }
+        Load::VitalPatch(path) => vital_patch_readback(&mut engine, node, path)?,
         Load::Lv2Preset(uri) => {
             let preset = crate::lv2::discover_presets(instrument.id())
                 .into_iter().find(|p| p.uri == *uri).ok_or_else(|| anyhow::anyhow!("preset {uri} vanished"))?;
@@ -4535,20 +6962,62 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     anyhow::ensure!(after.rms > 1e-4, "'{label}' is silent (rms {:.5})", after.rms);
     let distance = before.distance(after);
     anyhow::ensure!(distance > 0.1, "'{label}' sounds like the sound before it (distance {distance:.3})");
-    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2})",
+    // Aeolus' face draws one stop the way the face does it (state out, one
+    // stop changed, state in): the pedal's Bourdon 16 must be heard and read back.
+    let mut stop = String::new();
+    if instrument.id() == crate::aeolus::AEOLUS_ID {
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let next = crate::aeolus::with_stop(&main.save_state()?, 3, 1, true).ok_or_else(|| anyhow::anyhow!("no Pedal Bourdon 16 in the state"))?;
+        main.load_state(&next)?;
+        for _ in 0..40 {
+            engine.render(&mut buf, 2);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let drawn = crate::aeolus::drawn(&main.save_state()?).ok_or_else(|| anyhow::anyhow!("the stops do not read back"))?;
+        anyhow::ensure!(drawn[3] == 0b10, "the pedal reads back {:#b}, expected only Bourdon 16", drawn[3]);
+        let bourdon = timbre_of_note(&mut engine, &mut bus, 60, sr);
+        let d = after.distance(bourdon);
+        anyhow::ensure!(d > 0.1, "drawing the Bourdon 16 changed nothing (distance {d:.3})");
+        stop = format!(" · stop Pedal Bourdon 16 drawn, reads back, rms {:.4} ~{:.0} Hz (distance {d:.2})", bourdon.rms, bourdon.zero_cross_hz);
+    }
+    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2}){stop}",
         library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
+}
+
+/// Does the node's Vitalium now hold `path`'s patch? Its saved state must
+/// carry the patch's settings: every number in it, wavetables aside, and
+/// the tempo, which follows the host's song clock.
+fn vital_patch_readback(engine: &mut GraphEngine, node: NodeId, path: &std::path::Path) -> anyhow::Result<String> {
+    let parse = |bytes: &[u8]| -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::from_str(String::from_utf8_lossy(bytes).trim_end_matches('\0'))?)
+    };
+    let patch = parse(&std::fs::read(path)?)?;
+    let slot = engine.lv2.iter_mut().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+    let saved = parse(&slot.plugin.saved_state("urn:juce:stateBinary")?)?;
+    let (want, have) = (&patch["settings"], &saved["settings"]);
+    let numbers: Vec<(&String, f64)> = want.as_object().into_iter().flatten().filter(|(k, _)| *k != "beats_per_minute").filter_map(|(k, v)| Some((k, v.as_f64()?))).collect();
+    let same = numbers.iter().filter(|(k, v)| have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0))).count();
+    let differ: Vec<String> = numbers.iter().filter(|(k, v)| !have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0)))
+        .map(|(k, v)| format!("{k} {v} → {}", have[k.as_str()])).collect();
+    anyhow::ensure!(!numbers.is_empty() && same == numbers.len(), "{same} of {} patch settings hold the patch's value ({})", numbers.len(), differ.join(", "));
+    Ok(format!("{same}/{} patch settings hold the patch's values", numbers.len()))
 }
 
 /// `sound-library-test`: every catalog instrument installed on this machine
 /// lists its sound library, answers a search and loads one sound through
 /// the real engine, proven by a readback and by the note sounding different.
-pub fn sound_library_test() -> anyhow::Result<()> {
+/// `queries` (`<catalog id>=<words>`) replace the built-in search per
+/// instrument, e.g. `vitalium=woody` to load an imported Vital patch.
+pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
     use crate::sounds::Instrument;
+    let asked = |id: &str| queries.iter().find_map(|q| q.strip_prefix(id).and_then(|r| r.strip_prefix('=')).map(str::to_string));
     // A search the instrument's library should answer.
-    let query = |id: &str| match id {
+    let builtin = |id: &str| match id {
         "setbfree" => "jazz",
         "dexed" => "brass",
         "vitalium" => "pad",
+        "aeolus" => "flute",
         _ => "bass",
     };
     let clap = crate::host::list_clap_plugins();
@@ -4569,7 +7038,8 @@ pub fn sound_library_test() -> anyhow::Result<()> {
             println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
                 if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
         }
-        match sound_library_check(&instrument, query(entry.id)) {
+        let query = asked(entry.id).unwrap_or_else(|| builtin(entry.id).to_string());
+        match sound_library_check(&instrument, &query) {
             Ok(line) => println!("  {:<9} {line}", entry.name),
             Err(e) => {
                 println!("  {:<9} FAILED: {e:#}", entry.name);
@@ -4602,7 +7072,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
 
     // Insert a dynamically added gain node: surge -> gain -> master.
     let gain = keys.max(surge).max(master) + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false });
     bus.send(Command::SetParam { node: gain, param: 0, value: 1.0 });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });
@@ -4759,9 +7229,149 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     // Volume 0 on both rigs → silence.
     bus.send(Command::SetRigMix { rig: 0, vol: Some(0.0), pan: Some(0.0), mute: None, solo: None });
     bus.send(Command::SetRigMix { rig: 1, vol: Some(0.0), pan: None, mute: None, solo: None });
+    // The master's DC blocker and limiter ring on for ~100 ms after a cut
+    // (rule 133): flush that tail, then measure what stays.
+    for _ in 0..30 { engine.render(&mut buf, 2); }
     let (zero_l, zero_r) = measure(&mut engine, &mut buf);
     anyhow::ensure!(zero_l < 1e-4 && zero_r < 1e-4, "vol 0 not silent ({zero_l}, {zero_r})");
     println!("rig-mix-test: OK — mute/solo/vol/pan shape the rig sum (both {both_l:.4}, muted {muted_l:.4}, solo {solo_l:.4}, pan R {pan_r:.4})");
+
+    // ---- #73: per-SOURCE strip mix in a two-source rig ------------------
+    // One rig, TWO synths into the SAME master: muting/soloing one source
+    // must change only that source (#73 acceptance). LoadGraph remaps the
+    // two hosted voices onto the new Clap nodes in node-id order.
+    let (sa, sb) = (1u32, 2u32);
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let s1 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: s1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(4, PortRef { node: s1, port: 0 }, PortRef { node: m, port: 1 }, PortKind::Audio);
+        let _ = (s0, s1);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    // Every measurement retriggers the note: Surge's envelope decays, so a
+    // measurement taken later would read lower for no mixing reason.
+    let shot = |bus: &mut crate::control::CommandBus, e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
+        bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+        for _ in 0..40 { e.render(buf, 2); }
+        bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for _ in 0..12 {
+            e.render(buf, 2);
+            for f in buf.chunks(2) {
+                pl = pl.max(f[0].abs());
+                pr = pr.max(f[1].abs());
+            }
+        }
+        (pl, pr)
+    };
+    let (src_both_l, src_both_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(src_both_l > 1e-3 && src_both_r > 1e-3, "two sources produced no output ({src_both_l}, {src_both_r})");
+    // Mute source A → only source B sounds.
+    bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(true), solo: None });
+    let (b_only_l, _b_only_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(b_only_l > 1e-3, "muted source A killed source B too ({b_only_l})");
+    anyhow::ensure!(src_both_l > b_only_l * 1.1, "muting one source changed nothing (both {src_both_l} vs b-only {b_only_l})");
+    // Unmute, then solo source B ≈ the same "B only" picture.
+    bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(false), solo: None });
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(true) });
+    let (solo_b_l, _solo_b_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!((solo_b_l - b_only_l).abs() < b_only_l * 0.25, "source solo != source mute-other (solo {solo_b_l} vs b-only {b_only_l})");
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(false) });
+    // Pan source A hard left: source B stays on both channels.
+    bus.send(Command::SetStripMix { node: sa, pan: Some(-1.0), mute: None, solo: None });
+    let (pan_src_l, pan_src_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(pan_src_r < src_both_r * 0.8, "hard-left pan did not reduce right (both {src_both_r} vs {pan_src_r})");
+    anyhow::ensure!(pan_src_l > 1e-3 && pan_src_r > 1e-3, "source pan killed a channel (L {pan_src_l}, R {pan_src_r})");
+    bus.send(Command::SetStripMix { node: sa, pan: Some(0.0), mute: None, solo: None });
+    // Strip state is published back (rule 33): attach a publication, change
+    // one strip, and read the entry the UI mirror adopts.
+    let pub_: std::sync::Arc<std::sync::Mutex<GraphPub>> = Default::default();
+    engine.set_graph_pub(pub_.clone());
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: Some(true), solo: None });
+    engine.render(&mut buf, 2);
+    let strips = pub_.lock().unwrap().strips;
+    let sb_entry = strips.iter().find(|s| s.node == sb).map(|s| s.mix);
+    anyhow::ensure!(sb_entry == Some(StripMix { pan: 0.0, mute: true, solo: false, bypass: false }),
+        "strip state not published back: {strips:?}");
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: Some(false), solo: None });
+
+    // ---- #74: bypass passes the input through --------------------------
+    // Source A → GAIN(0) → master: silent while the gain is 0, audible the
+    // moment the unit is bypassed (its knobs untouched).
+    // Effects slew their gain over ~10 ms: let the change settle, then measure.
+    let settled = |e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
+        for _ in 0..8 { e.render(buf, 2); }
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for _ in 0..8 {
+            e.render(buf, 2);
+            for f in buf.chunks(2) {
+                pl = pl.max(f[0].abs());
+                pr = pr.max(f[1].abs());
+            }
+        }
+        (pl, pr)
+    };
+    let gain = 2u32;
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::SetParam { node: gain, param: 0, value: 0.0 });
+    let silent = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(silent < 1e-3, "gain 0 did not silence the chain ({silent})");
+    bus.send(Command::SetStripBypass { node: gain, bypass: true });
+    let bypassed = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(bypassed > 1e-3, "bypass did not pass the input through ({bypassed})");
+    bus.send(Command::SetStripBypass { node: gain, bypass: false });
+    let again = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(again < 1e-3, "un-bypassing did not restore the effect ({again})");
+
+    // ---- #77: master inserts run on the summed bus, pre-limiter ---------
+    // Master OUT → GAIN: the whole mix passes through the insert, and its
+    // gain scales the summed output.
+    let mfx = 3u32;
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("INSERT"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: m, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+        let _ = (s0, keys);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::SetParam { node: mfx, param: 0, value: 1.0 });
+    let with_insert = settled(&mut engine, &mut buf).0;
+    bus.send(Command::SetParam { node: mfx, param: 0, value: 0.25 });
+    let insert_quiet = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(with_insert > 1e-3, "master insert chain produced no output ({with_insert})");
+    anyhow::ensure!(insert_quiet < with_insert * 0.6 && insert_quiet > with_insert * 0.05,
+        "master insert gain did not scale the summed mix (1.0 → {with_insert:.4}, 0.25 → {insert_quiet:.4})");
+    bus.send(Command::SetStripBypass { node: mfx, bypass: true });
+    let insert_bypassed = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(insert_bypassed > insert_quiet * 1.8, "bypassing the master insert did not pass the mix ({insert_bypassed} vs {insert_quiet})");
+    println!("strip-mix: OK — source mute/solo/pan only touch their source, bypass passes through, master inserts shape the sum");
+    println!("  source both {src_both_l:.4} → B-only {b_only_l:.4}, solo B {solo_b_l:.4}; gain-0 {silent:.4} → bypass {bypassed:.4}; insert 1.0 {with_insert:.4} → 0.25 {insert_quiet:.4} → bypass {insert_bypassed:.4}");
     Ok(())
 }
 
@@ -4959,6 +7569,31 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         median / budget_us * 100.0
     );
 
+    // Engine Info's node statistics, from the same blocks: every unit has a
+    // row, and together they explain most of the block.
+    let stats = crate::engine_info::EngineStats::build(
+        crate::engine_info::EngineCounters {
+            sample_rate: SR as u32,
+            callback_frames: BLOCK as u32,
+            render_avg_ns: (median * 1000.0) as u32,
+            ..Default::default()
+        },
+        Some(&engine.node_times_handle()),
+        0,
+        |node| units.iter().position(|(n, _)| *n == node).map(|i| plugins[i].0.clone()),
+    );
+    println!("  node statistics (avg / max per {BLOCK}-frame block, share of the {budget_us:.0} us budget):");
+    for n in &stats.nodes {
+        println!("    {:<10} node {:>2}  avg {:7.1} us  max {:7.1} us  {:5.2} %", n.name, n.node, n.avg_us, n.max_us, n.percent);
+    }
+    let node_sum: f64 = stats.nodes.iter().map(|n| n.avg_us).sum();
+    println!("    sum of units {node_sum:.0} us = {:.0} % of the median block ({median:.0} us)", node_sum / median * 100.0);
+    anyhow::ensure!(stats.nodes.len() == units.len(), "{} of {} units were timed", stats.nodes.len(), units.len());
+    anyhow::ensure!(stats.nodes.iter().all(|n| n.avg_us > 0.0 && n.max_us >= n.avg_us), "a unit has no render time: {:?}", stats.nodes);
+    // The averages follow the latest blocks, so a spike lifts them over the
+    // median; the worst block bounds them.
+    anyhow::ensure!(node_sum > median * 0.5 && node_sum < max, "units sum to {node_sum:.0} us (median block {median:.0} us, worst {max:.0} us)");
+
     // Retire: every voice comes back and is stopped and deactivated here.
     for (vid, _) in &mains {
         tx.push(VoiceMsg::Retire(*vid)).map_err(|_| anyhow::anyhow!("voice ring full"))?;
@@ -4975,7 +7610,9 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         freed += 1;
     }
     anyhow::ensure!(mains.is_empty(), "{} voices never came back", mains.len());
-    for _ in 0..8 {
+    // The master's 5 Hz DC blocker rings on after the cut (rule 133): the
+    // residual of this chord falls below 1e-4 after about 48 blocks.
+    for _ in 0..64 {
         engine.render(&mut buf, 2);
     }
     anyhow::ensure!(block_peak(&buf) < 1e-4, "sound after every voice was retired");
@@ -4984,6 +7621,125 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         units.len(),
         table_cap * 2
     );
+    Ok(())
+}
+
+/// `kabelsalat arp-test` (issue #90): Keys → Arp → a real Surge XT voice →
+/// Master through the real engine. Two bars at 120 BPM of an up pattern over
+/// a held triad must be C E G repeating on the 1/16 grid (125 ms apart, to
+/// the block) and audible; chord mode must sound three voices per held key
+/// and release them with the key; the Keys scale snap must move a C# to C
+/// before the arp sees it.
+pub fn arp_test() -> anyhow::Result<()> {
+    use crate::arp::{step_value, ArpMode, ChordShape, Scale, ScaleChoice, P_ARP_CHORD, P_ARP_MODE};
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef, SURGE_PLUGIN_ID};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+    const BPM: f64 = 120.0;
+
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    let arp = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_PLUGIN_ID) }, name_bytes("SURGE"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: arp, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: arp, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+    g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g.connect_with_id(4, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g.clone(), drain, SR, vec![]);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: g, ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
+    let (mut tx, rx) = rtrb::RingBuffer::<VoiceMsg>::new(16);
+    let (back_tx, _back) = rtrb::RingBuffer::<VoiceBack>::new(16);
+    engine.set_voice_channels(rx, back_tx);
+    let (voice, _main) = ClapVoice::new_plugin(SR, SURGE_PLUGIN_ID)?;
+    tx.push(VoiceMsg::Add(VoiceSlot::new(voice))).map_err(|_| anyhow::anyhow!("voice ring full"))?;
+    let mut buf = vec![0.0f32; BLOCK * 2];
+    bus.send(Command::SetBpm { bpm: BPM as f32 });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_held(arp).is_empty() && engine.arp_sounding(arp).is_empty(), "a fresh arp is not silent");
+
+    // 1. Up pattern, two bars.
+    for note in [60u8, 64, 67] {
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    }
+    let blocks = (SR * 60.0 / BPM * 8.0 / BLOCK as f64).ceil() as usize; // 8 beats
+    let mut onsets: Vec<(usize, u8)> = Vec::new();
+    let mut last: Vec<u8> = Vec::new();
+    let mut peak = 0.0f32;
+    for b in 0..blocks {
+        engine.render(&mut buf, 2);
+        peak = peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+        let now = engine.arp_sounding(arp);
+        for n in &now {
+            if !last.contains(n) {
+                onsets.push((b, *n));
+            }
+        }
+        last = now;
+    }
+    let notes: Vec<u8> = onsets.iter().map(|o| o.1).collect();
+    println!("  up, 1/16 @ {BPM} BPM, 2 bars: {} steps, first 9: {:?}", notes.len(), &notes[..notes.len().min(9)]);
+    anyhow::ensure!((31..=33).contains(&notes.len()), "expected 32 sixteenth steps in 2 bars, got {}", notes.len());
+    for (i, n) in notes.iter().enumerate() {
+        let want = [60u8, 64, 67][i % 3];
+        anyhow::ensure!(*n == want, "step {i}: played {n}, the up pattern wants {want} ({notes:?})");
+    }
+    let step_blocks = SR * 60.0 / BPM / 4.0 / BLOCK as f64; // 125 ms in blocks
+    for w in onsets.windows(2) {
+        let gap = (w[1].0 - w[0].0) as f64;
+        anyhow::ensure!((gap - step_blocks).abs() <= 1.01, "steps {gap} blocks apart, the 1/16 grid is {step_blocks:.2}");
+    }
+    anyhow::ensure!(peak > 1e-3, "the arpeggio is silent: peak {peak}");
+    println!("    audible (peak {peak:.3}); steps {:.1} ms apart on the grid", step_blocks * BLOCK as f64 / SR * 1000.0);
+
+    // Releasing every key silences the arp at once.
+    for note in [60u8, 64, 67] {
+        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    }
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty() && engine.arp_held(arp).is_empty(), "arp still holds notes after the release");
+
+    // 2. Chord mode: three voices per held key.
+    let knob = |bus: &mut crate::control::CommandBus, param: u32, pos: usize, n: usize| {
+        bus.send(Command::SetParam { node: arp, param, value: step_value(pos, n) as f64 });
+    };
+    knob(&mut bus, P_ARP_MODE, ArpMode::ALL.iter().position(|m| *m == ArpMode::Chord).unwrap(), ArpMode::ALL.len());
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "one key must sound a triad, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 65, 67, 69, 72], "two keys, two triads, got {:?}", engine.arp_sounding(arp));
+    let sevenths = ChordShape::ALL.iter().position(|c| *c == ChordShape::Dominant7).unwrap();
+    knob(&mut bus, P_ARP_CHORD, sevenths, ChordShape::ALL.len());
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).len() == 8, "dominant 7ths on two keys = 8 voices, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![65, 69, 72, 75], "releasing C leaves F7, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 65, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "chords left sounding after both releases");
+    println!("  chord mode: 1 key → 3 voices, 2 keys → 6, 7th shape → 4 per key, release clears them");
+
+    // 3. Scale snap on the Keys node: C# in C major sounds as C.
+    bus.send(Command::SetKeysScale { node: keys, scale: Some(ScaleChoice { scale: Scale::Major, key: 0 }) });
+    knob(&mut bus, P_ARP_CHORD, 0, ChordShape::ALL.len());
+    bus.send(Command::NoteOn { note: 61, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "C# in C major must snap to C, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 61, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "the snapped note's release did not meet its pitch");
+    println!("  scale snap: C# in C major → C (triad 60 64 67), released cleanly");
+
+    println!("arp-test: OK");
     Ok(())
 }
 
@@ -5332,4 +8088,48 @@ pub fn meter_test() -> anyhow::Result<()> {
         snap.true_peak_db, snap.band_db, snap.low_end_corr
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod midifx_cc_tests {
+    use super::*;
+    use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef};
+    use crate::matrix::{CcTarget, SourceId};
+
+    /// Keys → built-in transposer → Master (no instrument: only the unit's knob is observed).
+    fn engine_with_strip() -> (GraphEngine, crate::control::CommandBus, u32) {
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis: 0 } }, name_bytes("TRANSPOSE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+        let _ = master;
+        bus.send(Command::LoadGraph { graph: g });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        (engine, bus, fx)
+    }
+
+    fn semis(e: &GraphEngine, fx: u32) -> i8 {
+        e.midi_fx.iter().find(|s| s.node == fx).expect("unit").semis
+    }
+
+    #[test]
+    fn a_learned_cc_moves_a_midi_strips_knob() {
+        for target in [CcTarget::Knob, CcTarget::PluginParam] {
+            let (mut engine, mut bus, fx) = engine_with_strip();
+            let mut buf = vec![0.0f32; 64 * 2];
+            let dev = SourceId::Hardware(0);
+            bus.send(Command::MatrixCcMap { source: dev, dest: fx, cc: 20, param: Some(P_MIDIFX_SEMI), target, scale: Default::default() });
+            bus.send(Command::Cc { source: dev, channel: 0, cc: 20, value: 127 });
+            engine.render(&mut buf, 2);
+            assert_eq!(semis(&engine, fx), MIDIFX_SEMI_MAX, "{target:?}: full CC = top of the range");
+            bus.send(Command::Cc { source: dev, channel: 0, cc: 20, value: 0 });
+            engine.render(&mut buf, 2);
+            assert_eq!(semis(&engine, fx), -MIDIFX_SEMI_MAX, "{target:?}: zero CC = bottom");
+        }
+    }
 }

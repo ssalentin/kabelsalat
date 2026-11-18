@@ -76,7 +76,7 @@ pub fn now_ms() -> u64 {
 fn refused_while_paused(req: &Value) -> bool {
     let op = req.get("op").and_then(Value::as_str);
     let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
-    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_") || tool == "look_at_rack";
+    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_");
     op == Some("cmd") || (op == Some("ui") && !reads)
 }
 
@@ -98,16 +98,17 @@ pub static SAMPLE_RATE: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_MAX_US: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_LAST_FRAMES: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_LATE: AtomicU32 = AtomicU32::new(0);
-/// Smoothed (EMA, 1/64) render time in microseconds.
-pub static RENDER_AVG_US: AtomicU32 = AtomicU32::new(0);
+/// Smoothed (EMA, 1/64) render time. Nanoseconds: in whole microseconds the
+/// step's division dropped up to 63 µs, and a 50 µs render read 0.
+pub static RENDER_AVG_NS: AtomicU32 = AtomicU32::new(0);
 
 /// Record one callback's render time (called from the audio thread; atomics only).
 pub fn note_render(elapsed: std::time::Duration, frames: usize, sample_rate: f64) {
     let us = elapsed.as_micros().min(u32::MAX as u128) as u32;
     RENDER_MAX_US.fetch_max(us, Ordering::Relaxed);
     RENDER_LAST_FRAMES.store(frames as u32, Ordering::Relaxed);
-    let avg = RENDER_AVG_US.load(Ordering::Relaxed);
-    RENDER_AVG_US.store(avg - avg / 64 + us / 64, Ordering::Relaxed);
+    let ns = elapsed.as_nanos().min(u32::MAX as u128) as u32;
+    RENDER_AVG_NS.store(crate::engine_info::ema_ns(RENDER_AVG_NS.load(Ordering::Relaxed), ns), Ordering::Relaxed);
     let budget_us = frames as f64 / sample_rate * 1e6;
     if us as f64 > budget_us * 0.8 {
         RENDER_LATE.fetch_add(1, Ordering::Relaxed);
@@ -303,6 +304,17 @@ fn handle_line_with_pub(
                 Ok(c) => c,
                 Err(e) => return err_reply(format!("invalid Command: {e}")),
             };
+            if let Some(rec) = crate::record::LIVE_RECORDER.get() {
+                match cmd {
+                    Command::SetRecordArm { rig: Some(r), armed: true } => rec.ensure_stem(r),
+                    Command::RecordStart => {
+                        if let Ok(s) = rigs.lock() {
+                            rec.set_rig_names(s.rigs.iter().map(|m| m.name.clone()).collect());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // Agent undo: let the app snapshot BEFORE the engine applies the
             // edit (best effort — an idle/absent UI must not block the bus).
             // Never while holding the bus lock: the UI frame may need it.
@@ -351,6 +363,9 @@ fn handle_line_with_pub(
                 Err(e) => err_reply(e),
             }
         }
+        // The audio judge records the master and waits for the listening
+        // model: seconds, on this connection's thread, never the UI's.
+        Some("listen") => json!({"ok": true, "data": crate::listen::listen(req.get("args").unwrap_or(&json!({})))}),
         Some("query") => match req.get("name").and_then(Value::as_str) {
             Some("get_graph") => {
                 // The engine's publication is authoritative; the UI's copy
@@ -404,6 +419,7 @@ fn handle_line_with_pub(
                     .and_then(|p| p.lock().ok())
                     .map(|g| serde_json::to_value(g.meter).unwrap_or(serde_json::Value::Null))
                     .unwrap_or(serde_json::Value::Null);
+                let c = crate::engine_info::EngineCounters::load();
                 json!({"ok": true, "data": {
                     "nodes": g.nodes.len(),
                     "edges": g.edges.len(),
@@ -419,12 +435,12 @@ fn handle_line_with_pub(
                     "bpm": tp.bpm,
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
-                    "xruns": XRUNS.load(Ordering::Relaxed),
-                    "render_max_us": RENDER_MAX_US.load(Ordering::Relaxed),
-                    "render_frames": RENDER_LAST_FRAMES.load(Ordering::Relaxed),
-                    "render_late": RENDER_LATE.load(Ordering::Relaxed),
-                    "render_avg_us": RENDER_AVG_US.load(Ordering::Relaxed),
-                    "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                    "xruns": c.xruns,
+                    "render_max_us": c.render_max_us,
+                    "render_frames": c.callback_frames,
+                    "render_late": c.render_late,
+                    "render_avg_us": c.render_avg_ns / 1000,
+                    "midi_latency_ms": c.midi_latency_us as f64 / 1000.0,
                     "rigs": rig_count,
                     "active_rig": active_rig,
                     "meter": meter,
@@ -473,8 +489,13 @@ pub fn connect() -> anyhow::Result<UnixStream> {
 /// Tool calls are sequential, so a fresh connection per request is simple
 /// and robust (the server handles connections sequentially).
 pub fn request(req: &Value) -> anyhow::Result<Value> {
+    request_within(req, Duration::from_secs(5))
+}
+
+/// `request` for a call that takes longer than a tool call usually does.
+pub fn request_within(req: &Value, wait: Duration) -> anyhow::Result<Value> {
     let stream = connect()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(wait))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut writer = stream.try_clone()?;
     writeln!(writer, "{}", serde_json::to_string(req)?)?;
@@ -548,7 +569,7 @@ mod tests {
         // add_node, as MCP does it: ids from a fresh get_graph.
         let mut g = get_graph();
         let gain = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
-        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 }})), json!({"ok": true}));
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false }})), json!({"ok": true}));
         assert!(get_graph().node(gain).is_some(), "the next call sees node {gain}");
 
         // Three auto-id connects in a row get three distinct ids.
@@ -630,6 +651,14 @@ mod tests {
         let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0, &rigs);
         assert_eq!(reply["data"]["rigs"], json!(2));
         assert_eq!(reply["data"]["active_rig"], json!(1));
+    }
+
+    #[test]
+    fn listen_is_answered_on_the_bridge_thread() {
+        let (bus, _drain, graph, level, rigs) = fixtures();
+        let reply = handle_line(r#"{"op":"listen","args":{"attributes":"warm"}}"#, &bus, &graph, &level, 48000.0, &rigs);
+        assert_eq!(reply["ok"], json!(true));
+        assert!(reply["data"].as_str().unwrap().starts_with("listen: no listening model"), "{reply}");
     }
 
     #[test]

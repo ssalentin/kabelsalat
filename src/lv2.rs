@@ -331,12 +331,23 @@ extern "C" {
     fn lilv_instance_free(instance: *mut LilvInstance);
 }
 
+/// One MIDI event a MIDI-FX plugin wrote to its output port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxOutEvent {
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+    NoteOff { channel: u8, note: u8 },
+    /// Raw 3-byte channel-voice MIDI (CC, pitch bend, aftertouch).
+    Midi([u8; 3]),
+}
+
 #[derive(Debug, Clone)]
 pub struct Lv2PluginInfo {
     pub uri: String,
     pub name: String,
     pub num_ports: u32,
     pub is_instrument: bool,
+    /// A MIDI-only unit: events in, events out, no audio port at all.
+    pub is_midi_fx: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -633,6 +644,41 @@ unsafe fn classify_instrument(world: *mut LilvWorld, plugin: *const LilvPlugin) 
     })
 }
 
+/// Is the plugin a MIDI effect (AUM "MIDI strips"): a MIDI atom input AND a
+/// MIDI atom output and no audio port. Never an instrument (that class
+/// verdict, rule 72, wins) — the port shape decides only among the
+/// non-instrument classes, where it is a fact (no audio port, so it can never
+/// be an audio effect), not a guess. Carla's MIDI Transpose/Gain/Channel
+/// Filter are `lv2:UtilityPlugin`s of this shape.
+unsafe fn classify_midi_fx(world: *mut LilvWorld, plugin: *const LilvPlugin) -> bool {
+    if classify_instrument(world, plugin) {
+        return false;
+    }
+    let (atom_in, atom_out, audio) = midi_shape(world, plugin);
+    atom_in && atom_out && audio == 0
+}
+
+/// (has an atom input, has an atom output, audio port count).
+unsafe fn midi_shape(world: *mut LilvWorld, plugin: *const LilvPlugin) -> (bool, bool, u32) {
+    let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+    let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+    let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
+    let (mut atom_in, mut atom_out, mut n_audio) = (false, false, 0u32);
+    for i in 0..lilv_plugin_get_num_ports(plugin) {
+        let port = lilv_plugin_get_port_by_index(plugin, i);
+        if lilv_port_is_a(plugin, port, audio) {
+            n_audio += 1;
+        }
+        if lilv_port_is_a(plugin, port, atom) {
+            if lilv_port_is_a(plugin, port, input) { atom_in = true } else { atom_out = true }
+        }
+    }
+    lilv_node_free(audio);
+    lilv_node_free(atom);
+    lilv_node_free(input);
+    (atom_in, atom_out, n_audio)
+}
+
 /// The class verdict: Some(true) for an instrument, Some(false) for any other
 /// specific LV2 class, None when only generic types (lv2:Plugin, doap:Project)
 /// are declared.
@@ -747,6 +793,7 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
                         name: node_owned(lilv_plugin_get_name(plugin)),
                         num_ports: lilv_plugin_get_num_ports(plugin),
                         is_instrument: classify_instrument(world, plugin),
+                        is_midi_fx: classify_midi_fx(world, plugin),
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
@@ -946,6 +993,63 @@ unsafe fn query_worker_interface(desc: &Lv2Descriptor) -> Option<Lv2WorkerInterf
 }
 
 const LV2_MIDNAM_INTERFACE_URI: &[u8] = b"http://ardour.org/lv2/midnam#interface\0";
+const LV2_STATE_INTERFACE_URI: &[u8] = b"http://lv2plug.in/ns/ext/state#interface\0";
+const LV2_STATE_IS_POD: u32 = 1;
+const LV2_STATE_IS_PORTABLE: u32 = 2;
+
+type Lv2StateRetrieve = extern "C" fn(*mut c_void, u32, *mut usize, *mut u32, *mut u32) -> *const c_void;
+
+type Lv2StateStore = extern "C" fn(*mut c_void, u32, *const c_void, usize, u32, u32) -> i32;
+
+/// `LV2_State_Interface` (lv2/state/state.h).
+#[repr(C)]
+struct Lv2StateInterface {
+    save: Option<extern "C" fn(Lv2Handle, Lv2StateStore, *mut c_void, u32, *const *const Lv2Feature) -> i32>,
+    restore: Option<extern "C" fn(Lv2Handle, Lv2StateRetrieve, *mut c_void, u32, *const *const Lv2Feature) -> i32>,
+}
+
+/// How a plugin's state is handed over: the one property it restores from,
+/// and the check a value must pass before the plugin sees it.
+pub struct StateFormat {
+    pub key: &'static str,
+    pub kind: &'static str,
+    pub check: fn(&[u8]) -> Result<(), String>,
+}
+
+const ATOM_CHUNK: &str = "http://lv2plug.in/ns/ext/atom#Chunk";
+
+/// The state format of a plugin whose state the app hands over; None for
+/// every other plugin. JUCE's LV2 wrapper keeps the whole state in one
+/// chunk (`urn:juce:stateBinary`); for Vitalium that chunk is a Vital patch.
+pub fn state_format(uri: &str) -> Option<StateFormat> {
+    (uri == crate::vital::URI).then_some(StateFormat { key: "urn:juce:stateBinary", kind: ATOM_CHUNK, check: crate::vital::check_patch })
+}
+
+/// One property a restore hands the plugin: (key URID, type URID, value).
+struct StateProperty<'a> {
+    key: u32,
+    kind: u32,
+    value: &'a [u8],
+}
+
+extern "C" fn state_store(handle: *mut c_void, key: u32, value: *const c_void, size: usize, kind: u32, _flags: u32) -> i32 {
+    unsafe {
+        let saved = &mut *(handle as *mut Vec<(u32, u32, Vec<u8>)>);
+        saved.push((key, kind, std::slice::from_raw_parts(value as *const u8, size).to_vec()));
+    }
+    0
+}
+
+extern "C" fn state_retrieve(handle: *mut c_void, key: u32, size: *mut usize, kind: *mut u32, flags: *mut u32) -> *const c_void {
+    unsafe {
+        let props = &*(handle as *const Vec<StateProperty<'_>>);
+        let Some(p) = props.iter().find(|p| p.key == key) else { return std::ptr::null() };
+        if !size.is_null() { *size = p.value.len(); }
+        if !kind.is_null() { *kind = p.kind; }
+        if !flags.is_null() { *flags = LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE; }
+        p.value.as_ptr() as *const c_void
+    }
+}
 
 /// Ardour's MIDNAM interface (`extension_data(midnam#interface)`): the plugin
 /// hands out a MIDNAM XML document that names its MIDI programmes.
@@ -1031,6 +1135,7 @@ pub struct Lv2Plugin {
     urid_sequence: u32,
     urid_midi: u32,
     is_inst: bool,
+    is_midi_fx: bool,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
     // Worker extension: the schedule feature handed to instantiate, the shared
@@ -1230,12 +1335,13 @@ impl Lv2Plugin {
             lilv_node_free(control);
             lilv_node_free(input);
             lilv_node_free(atom_class);
-            anyhow::ensure!(!audio_out.is_empty(), "{uri} has no audio output");
+            let is_midi_fx = classify_midi_fx(world, plugin);
+            anyhow::ensure!(!audio_out.is_empty() || is_midi_fx, "{uri} has no audio output");
             anyhow::ensure!(!audio_in.is_empty() || atom_in.is_some(), "{uri} has no audio/atom input");
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
         }
     }
 
@@ -1292,6 +1398,14 @@ impl Lv2Plugin {
         }
     }
 
+    /// The nth control input as a normalized 0..1 knob value (allocation-free).
+    pub fn control_normalized(&self, nth: usize) -> Option<f32> {
+        let &port = self.control_in.get(nth)?;
+        let &(lo, hi) = self.control_ranges.get(nth)?;
+        let v = self.buffers[port][0];
+        Some(if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.0 })
+    }
+
     /// Describe all control-input ports with their current buffer values.
     pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
         self.control_meta
@@ -1323,6 +1437,56 @@ impl Lv2Plugin {
         self.is_inst
     }
 
+    /// True for a MIDI-only unit (MIDI in, MIDI out, no audio port).
+    pub fn is_midi_fx(&self) -> bool {
+        self.is_midi_fx
+    }
+
+    /// Queue one raw 3-byte channel-voice message (channel kept) for the
+    /// next run(). Allocation-free; a full buffer drops the event.
+    pub fn send_midi(&mut self, ev: [u8; 3]) {
+        self.queue_midi(ev);
+    }
+
+    /// Append the MIDI events the plugin wrote to its first atom output in
+    /// the last run() into `out` (bounded by `out`'s capacity, so a
+    /// preallocated vector never allocates). Note-on/off arrive as such,
+    /// other channel-voice messages as raw bytes.
+    pub fn read_midi_out(&self, out: &mut Vec<FxOutEvent>) {
+        let Some((_, buf)) = self.atom_out.first() else { return };
+        // The chunk header was rewritten by the plugin into a sequence atom.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+        let size = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let ty = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if ty != self.urid_sequence {
+            return;
+        }
+        let end = (8 + size).min(bytes.len());
+        let mut at = 16; // atom header (8) + sequence unit/pad (8)
+        while at + 16 <= end && out.len() < out.capacity() {
+            let n = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+            let ety = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+            let body = at + 16;
+            if body + n > end {
+                break;
+            }
+            if ety == self.urid_midi && n >= 3 {
+                let d = [bytes[body], bytes[body + 1], bytes[body + 2]];
+                let (status, ch) = (d[0] & 0xF0, d[0] & 0x0F);
+                out.push(match status {
+                    0x90 if d[2] > 0 => FxOutEvent::NoteOn { channel: ch, note: d[1], velocity: d[2] },
+                    0x80 | 0x90 => FxOutEvent::NoteOff { channel: ch, note: d[1] },
+                    0xB0 | 0xE0 | 0xA0 => FxOutEvent::Midi(d),
+                    _ => {
+                        at = body + ((n + 7) & !7);
+                        continue;
+                    }
+                });
+            }
+            at = body + ((n + 7) & !7);
+        }
+    }
+
     /// Queue a MIDI note-on for the next run() (frame 0). Events queue up
     /// within a block, so every note of a chord reaches the plugin.
     pub fn note_on(&mut self, note: u8, velocity: u8) {
@@ -1337,6 +1501,21 @@ impl Lv2Plugin {
     /// Queue a MIDI control change (channel 1) for the next run().
     pub fn control_change(&mut self, cc: u8, value: u8) {
         self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
+    }
+
+    /// Queue a MIDI pitch bend (channel 1, signed 14-bit, 0 = center) for
+    /// the next run().
+    pub fn pitch_bend(&mut self, value: i16) {
+        let v = (value.clamp(-8192, 8191) + 8192) as u16;
+        self.queue_midi([0xE0, (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]);
+    }
+
+    /// Queue a channel-pressure (aftertouch) message: how wind patches read
+    /// breath (allocation-free).
+    pub fn channel_pressure(&mut self, value: u8) {
+        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &[0xD0, value & 0x7F]) {
+            self.last_event = Some([0xD0, value & 0x7F, 0]);
+        }
     }
 
     /// Queue a MIDI programme change for the next run() (allocation-free).
@@ -1365,6 +1544,58 @@ impl Lv2Plugin {
                 free(text);
             }
             Some(xml)
+        }
+    }
+
+    /// Restore the plugin's state from `(key URI, atom type URI, value)`
+    /// properties through its `state#interface`. Blocks for as long as the
+    /// plugin takes (a Vital patch rebuilds its wavetables): call it on the
+    /// loader thread, before the instance goes to the audio thread.
+    pub fn restore_state(&mut self, properties: &[(&str, &str, &[u8])]) -> anyhow::Result<()> {
+        let restore = self.state_interface()?.restore.ok_or_else(|| anyhow::anyhow!("{} has no state restore", self.uri))?;
+        // The JUCE wrapper pushes a control port to the plugin only when it
+        // differs from the value it saw last; one block lets it see the
+        // ports as they are now (a reused instance comes back at defaults),
+        // so the first block after the restore overrides nothing.
+        let silence = vec![0.0f32; 2];
+        let mut out = vec![0.0f32; 2];
+        self.process(&silence, &mut out, 1);
+        let urid = &mut *self._urid as *mut UridMap as *mut c_void;
+        let map = |uri: &str| {
+            let c = std::ffi::CString::new(uri).unwrap_or_default();
+            urid_map_cb(urid, c.as_ptr())
+        };
+        let props: Vec<StateProperty<'_>> = properties.iter().map(|(k, t, v)| StateProperty { key: map(k), kind: map(t), value: v }).collect();
+        unsafe {
+            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let status = restore((*self.instance).lv2_handle, state_retrieve, &props as *const Vec<StateProperty<'_>> as *mut c_void, 0, features.as_ptr());
+            anyhow::ensure!(status == 0, "{} refused the state (status {status})", self.uri);
+        }
+        Ok(())
+    }
+
+    /// The state property stored under `key`, as the plugin saves it now.
+    /// Same thread rules as `restore_state`.
+    pub fn saved_state(&mut self, key: &str) -> anyhow::Result<Vec<u8>> {
+        let save = self.state_interface()?.save.ok_or_else(|| anyhow::anyhow!("{} has no state save", self.uri))?;
+        let mut saved: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        let c = std::ffi::CString::new(key)?;
+        let key = urid_map_cb(&mut *self._urid as *mut UridMap as *mut c_void, c.as_ptr());
+        unsafe {
+            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let status = save((*self.instance).lv2_handle, state_store, &mut saved as *mut _ as *mut c_void, 0, features.as_ptr());
+            anyhow::ensure!(status == 0, "{} could not save its state (status {status})", self.uri);
+        }
+        saved.into_iter().find(|p| p.0 == key).map(|p| p.2).ok_or_else(|| anyhow::anyhow!("{} saved nothing under that key", self.uri))
+    }
+
+    fn state_interface(&self) -> anyhow::Result<&Lv2StateInterface> {
+        unsafe {
+            let desc = &*(*self.instance).lv2_descriptor;
+            let ext = desc.extension_data.ok_or_else(|| anyhow::anyhow!("{} has no extension data", self.uri))?;
+            let ptr = ext(LV2_STATE_INTERFACE_URI.as_ptr() as *const c_char);
+            anyhow::ensure!(!ptr.is_null(), "{} has no state interface", self.uri);
+            Ok(&*(ptr as *const Lv2StateInterface))
         }
     }
 
@@ -2188,6 +2419,40 @@ mod tests {
         retire(plugin);
     }
 
+    /// Rising zero crossings per second of the left channel.
+    fn pitch_hz(plugin: &mut Lv2Plugin, note: u8) -> f32 {
+        let input = vec![0.0f32; 256 * 2];
+        let mut output = vec![0.0f32; 256 * 2];
+        plugin.note_on(note, 100);
+        let mut left: Vec<f32> = Vec::new();
+        for _ in 0..80 {
+            plugin.process(&input, &mut output, 256);
+            left.extend(output.iter().step_by(2));
+        }
+        plugin.note_off(note);
+        for _ in 0..40 { plugin.process(&input, &mut output, 256); }
+        let tail = &left[left.len() / 2..];
+        let rising = tail.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        rising as f32 * 48000.0 / tail.len() as f32
+    }
+
+    #[test]
+    fn a_restored_vital_patch_is_what_vitalium_plays() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut plugin) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
+        let init = pitch_hz(&mut plugin, 57);
+        assert!((init - 220.0).abs() < 15.0, "init patch plays A3 at 220 Hz, measured {init}");
+        let saved = plugin.saved_state("urn:juce:stateBinary").expect("save");
+        let text = String::from_utf8_lossy(&saved);
+        let mut patch: serde_json::Value = serde_json::from_str(text.trim_end_matches('\0')).expect("Vitalium saves JSON");
+        patch["settings"]["osc_1_transpose"] = serde_json::json!(12.0);
+        let patch = patch.to_string();
+        plugin.restore_state(&[("urn:juce:stateBinary", "http://lv2plug.in/ns/ext/atom#Chunk", patch.as_bytes())]).expect("restore");
+        let up = pitch_hz(&mut plugin, 57);
+        assert!((up - 440.0).abs() < 30.0, "the patch's +12 transpose plays A4 at 440 Hz, measured {up}");
+        retire(plugin);
+    }
+
     #[test]
     fn reused_vitalium_starts_fresh_and_still_plays() {
         let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2208,6 +2473,98 @@ mod tests {
         }
         assert!(peak > 1e-4, "a reused instance still plays: peak={peak}");
         retire(again);
+    }
+
+    #[test]
+    fn guitarix_amps_process_from_the_first_block() {
+        // Guitarix's amps declare an `lv2:enabled` port named BYPASS with
+        // default 1 (bypassed). The host must enable such a plugin on
+        // instantiation: a unit the player adds starts processing (the
+        // Guitar rig would pass audio untouched otherwise). Probes the real
+        // plugin when the Guitarix card is installed, skips in CI.
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut amp) = Lv2Plugin::load(crate::guitar::AMP, 48000.0, 512) else { return };
+
+        fn harmonics_over_fundamental(amp: &mut Lv2Plugin, bypass: Option<f32>) -> f32 {
+            let block = 512usize;
+            let mut inp = vec![0.0f32; block * 2];
+            let mut out = vec![0.0f32; block * 2];
+            let mut l = Vec::new();
+            for b in 0..(48000 / block) {
+                for i in 0..block {
+                    let s = (2.0 * std::f32::consts::PI * 220.0 * ((b * block + i) as f32 / 48000.0)).sin() * 0.45;
+                    inp[i * 2] = s;
+                    inp[i * 2 + 1] = s;
+                }
+                amp.process(&inp, &mut out, block);
+                if b > 20 {
+                    l.extend(out.iter().step_by(2).copied());
+                }
+            }
+            let g = |x: &[f32], f: f32| {
+                let k = 2.0 * std::f32::consts::PI * f / 48000.0;
+                let (mut s1, mut s2) = (0.0f32, 0.0f32);
+                for &v in x {
+                    let s0 = v + 2.0 * k.cos() * s1 - s2;
+                    s2 = s1;
+                    s1 = s0;
+                }
+                (s1 * s1 + s2 * s2 - 2.0 * k.cos() * s1 * s2) / (x.len().max(1) as f32).powi(2)
+            };
+            let f0 = g(&l, 220.0);
+            if f0 <= 1e-12 {
+                return 0.0;
+            }
+            (g(&l, 440.0) + g(&l, 660.0) + g(&l, 880.0)) / f0
+        }
+
+        let by_desc = amp.control_descs().into_iter().find(|d| d.symbol == "BYPASS");
+        let Some(desc) = by_desc else {
+            // No enabled port: the amp crunches as it declares.
+            let plain = harmonics_over_fundamental(&mut amp, None);
+            assert!(plain > 0.02, "the amp transforms its input (harmonics {plain:.4})");
+            retire(amp);
+            return;
+        };
+        // The amp as the bundle ships it: enabled (per the LV2 `enabled`
+        // designation, 1 = processing) but nearly clean at its defaults.
+        let as_shipped = harmonics_over_fundamental(&mut amp, None);
+        println!("guitarix amp as the bundle ships it (BYPASS={}): harmonics {as_shipped:.4}", desc.value);
+        assert!(as_shipped > 0.0, "the enabled port must not mute the amp: {as_shipped:.4}");
+        // The Guitar rig drives its amp: "Drive" (the tube stage's gain)
+        // is the one control that turns the modelled clean channel into a
+        // crunch — the template sets it to its maximum.
+        let ctl = |p: &Lv2Plugin, sym: &str| p.control_descs().into_iter().find(|d| d.symbol == sym).expect(sym);
+        let (drive, pregain, distortion, highgain) = (
+            ctl(&amp, "Drive"), ctl(&amp, "PreGain"), ctl(&amp, "Distortion"), ctl(&amp, "HIGHGAIN"),
+        );
+        assert_eq!(drive.index, crate::guitar::AMP_DRIVE_CTRL, "the template's Drive ordinal follows the plugin's port order");
+        for (sym, idx, v) in [
+            ("Drive", drive.index, 1.0),
+            ("Distortion", distortion.index, 0.8),
+            ("HIGHGAIN", highgain.index, 1.0),
+            ("PreGain", pregain.index, 0.8),
+        ] {
+            amp.set_control_normalized(idx, v);
+            println!("guitarix amp with {sym}={v}: harmonics {:.4}", harmonics_over_fundamental(&mut amp, None));
+        }
+        // The template's amp: everything at the plugin's declared defaults
+        // (normalized: PreGain 0 dB = 0.5, Distortion 20 = ~0.19) except Drive.
+        for (idx, v) in [
+            (drive.index, 1.0),
+            (pregain.index, 0.5),
+            (distortion.index, (20.0f32 - 1.0) / 99.0),
+            (highgain.index, 0.0),
+        ] {
+            amp.set_control_normalized(idx, v);
+        }
+        let driven = harmonics_over_fundamental(&mut amp, None);
+        println!("guitarix amp at the template's setting (Drive max, rest default): harmonics {driven:.4}");
+        assert!(
+            driven > as_shipped * 2.0 + 0.02,
+            "the rig's amp setting must transform the input: as-shipped {as_shipped:.4} vs driven {driven:.4}"
+        );
+        retire(amp);
     }
 
     // -- LV2 worker plumbing -------------------------------------------------

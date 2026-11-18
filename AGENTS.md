@@ -15,10 +15,10 @@ cargo build
 scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transport
 ```
 
-- Environment: `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000`
+- Environment: `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000`
   (the harness sets these itself). Single frames of the real app: `scripts/shot.sh out.png [pid]`
   (window buffer only; never `grim -o`/`-g`, rule 108).
-- Key injection: `scripts/xtest_key.py` (XTEST; F11/F12 = keycodes 95/96, F4 = 0xffc1).
+- Key injection: `wtype` (Wayland virtual keyboard): `wtype -k F4`, `wtype -k Tab`, `wtype "text"`.
 - Visual review = DeepSeek vision via the app's BYOK key
   (`~/.config/kabelsalat/config.json`, field `deepseek_api_key` — NEVER print or
   commit it). POST `https://api.deepseek.com/chat/completions`, model
@@ -117,16 +117,18 @@ Learned so far (2026-11-15, UI polish pass):
     `assistant::tools()` + `exec_tool` + MCP; destructive ones need
     `confirm=true` after asking the user.
 24. **Live-app automation is focus-guarded:** the user may be using the
-    desktop — send XTEST keys/clicks and take `grim` evidence only after
+    desktop — send `wtype` keys or `scripts/click.sh` clicks and take `grim` evidence only after
     checking `hyprctl activewindow` is kabelsalat (scripts must abort
     otherwise); a stray F12 went to another window once.
 25. **Routing tools update the UI mirror too:** every tool that changes
     engine routing (`set_rig_source`, …) must also update the UI state it
     drives (`rig_sources`), or chips and matrix show stale state.
-26. **UI scale = the compositor's monitor scale (`ui_scale_target`):**
-    never trust winit's XWayland DPI guess (2.33 on the 1.6x eDP-1) —
-    it inflated every element ~46% and squished the rack. Check
-    `ui scale: first-frame ppp=` in the log; `KABELSALAT_UI_SCALE` overrides.
+26. **UI scale = the compositor's scale, as winit reports it on Wayland:**
+    the app is a native Wayland client and never forces XWayland, whose DPI
+    guess (2.33 on the 1.6x eDP-1) inflated every element ~46% and squished
+    the rack. Only `KABELSALAT_UI_SCALE`, tests and windowless renders (1.6)
+    override it (`ui_scale_override`). Check `ui scale: first-frame ppp=` in
+    the log and the window's buffer size (2560x1600 maximized on eDP-1).
 27. **Size scroll areas explicitly in fixed-height panels:** set
     `min_scrolled_height` AND `max_height` to the measured remainder —
     egui's default 64px minimum pushed the assistant header out of its
@@ -409,14 +411,13 @@ Learned so far (2026-11-15, UI polish pass):
     tools take the 0-based `rig`. The chat model put a reverb into rig B
     for "rig 1" in 2 of 22 runs; with the mapping stated in the system
     prompt, 0 of 24 (`agent-eval --task reverb_and_tempo --runs 24`).
-82. **A turn with an image skips the decisions model:** measured with
-    `kabelsalat jev-test --image <file> <request>`. Jev reads a written note
-    (action `tempo` at p = 1.00) but its typed answers cannot return the
-    value the note states, and what it sees leaks into the other answers (a
+82. **Jev decides from text, never from media:** with an image attached
+    (measured before image input was removed), Jev read a written note
+    (action `tempo` at p = 1.00) but its typed answers could not return the
+    value the note stated, and what it saw leaked into the other answers (a
     mixer screenshot made it name rig 1 at p = 0.95 and a keys sound at
-    0.88 for a request that names neither). The seeing model
-    (`agent_perceive_model`) acts for that turn; re-measure before sending
-    images to Jev.
+    0.88 for a request that named neither). A model that perceives
+    (hears, sees) writes what it found as text; Jev decides from that text.
 83. **Assistant dock uses `exact_size`, a 176 px floor, and a clipped single-row header:**
     `default_size` froze the panel at its first-frame height and `150` px left
     one transcript line clipped by the header (`bug1_transcript_shows_three_lines_unclipped_at_min_size_and_781x950`).
@@ -428,8 +429,8 @@ Learned so far (2026-11-15, UI polish pass):
     `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
 86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
     duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
-87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`, and attachment thumbnails drop their `TextureHandle` on clear:**
-    align `Confirm`/`Cancel` and the attachment chip to the message text column (`78.0` px), load the ~32 px thumbnail once per `Image::bytes` Arc (`sync_chat_thumb`), and clear `chat_thumb` on removal/submit so egui frees the texture (`agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle`).
+87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`:**
+    align `Confirm`/`Cancel` to the message text column (`78.0` px) (`agent_panel_defect6_confirm_aligns_with_the_transcript_column`).
 88. **A key shows lit for as long as it is held, from every source:** only
     laptop keys counted as held, so a note held on the FM-1 (or any hardware
     keyboard) blinked for one 0.09 s LED tail and the key went dark while it
@@ -631,13 +632,13 @@ Learned so far (2026-11-15, UI polish pass):
     the cross alignment altogether). `ui.set_min_height(26.0)` before the
     label (`a_catalog_source_code_button_opens_the_repo` compares centres).
 
-114. **A release has its packages, or the workflow says why:** v0.1.0 was
+118. **A release has its packages, or the workflow says why:** v0.1.0 was
     tagged before `release.yml` existed, so its release shipped without one
     file and nothing failed. Release notes link each AppImage by URL
     (`release-notes.sh` fails when there is none); a tag without packages is
     backfilled with `gh workflow run release.yml -f tag=vX.Y.Z`. After a
     tag push, check `gh release view vX.Y.Z --json assets`.
-115. **Packaging scripts resolve their path arguments before any `cd`:**
+119. **Packaging scripts resolve their path arguments before any `cd`:**
     `appimage.sh` changed into its work directory and then handed linuxdeploy
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
@@ -646,6 +647,290 @@ Learned so far (2026-11-15, UI polish pass):
     `add_clap_rig`, `add_lv2_instrument`, `add_lv2_effect`, and
     `add_metronome_to_active_rig` left `stage_view` on `StageView::Plugins`,
     so clicking "New rig" appeared to do nothing (`plugins_stage_new_rig_switches_to_rack`).
+118. **A plugin editor is judged by its window, not by `gui.show`'s answer:**
+    Odin 2 returns false from `show` yet attaches and paints its editor;
+    treating that as failure refused a working GUI. `editor-test` checks the
+    plugin put a child window into ours, and that it closes and reopens.
+119. **Plugin editor windows are dialogs:** Hyprland tiled a plain X11
+    toplevel (781x950, the plugin squeezed to fit); `PluginWindow` sets
+    `_NET_WM_WINDOW_TYPE_DIALOG`, so it floats at the plugin's own size. Its
+    class is `kabelsalat-plugin`; `scripts/shot.sh <out> <pid> <title>`
+    captures one.
+120. **Plugin timers run only while that plugin's editor is open:** JUCE's
+    timers drive one message loop per process; running every Surge's timers
+    each frame deadlocked the unit suite, whose tests host Surge on parallel
+    threads (`voice_host_tests` hung 3 of 4 runs, 12 of 12 passed after).
+    `ClapVoiceMain::pump` returns at once without an editor.
+118. **An instrument a tool adds is wired like a rig's synth:** the agent
+    put setBfree into rig A with `add_node` and connected only its MIDI
+    cable, so the organ rendered into nothing (its strip LED moved, the rig
+    bus stayed dark). `AddNode { wire: true }` (Clap always; LV2 when the
+    scan says `is_instrument`) runs `Graph::wire_instrument` in the engine
+    and in headless MCP's mirror alike. Keep prompts in step with what the
+    app hosts: "LV2 instruments are coming soon" made the model give up on a
+    working organ
+    (`an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master`).
+120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+    a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
+    `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
+    −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
+    dB meter). `gain_for` drops instantly when `target < gain` (120 ms
+    release prevents waveform tracking), `P_VOL` defaults to `0.75`
+    (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
+    red only above `0.95` (−3 dBFS).
+118. **Check a plugin state before the plugin restores it:** Vitalium opens a
+    modal alert box for a patch it cannot parse, and that box waits for a
+    message loop no thread here runs, so the restoring thread hung for good
+    (a hand-written patch without `sample`/`wavetables`/`lfos`). Every state
+    goes through its `lv2::state_format` check (`vital::check_patch`) on the
+    loader thread before `restore_state`; test patches start from the
+    plugin's own saved state, never a hand-written fragment.
+121. **Delete build output you no longer need:** parallel sessions left a
+    dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
+    copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
+    held in RAM) reached 98 %, swap filled, and a build killed the session.
+    When your PR is merged or your work is abandoned, `rm -rf` your own
+    `CARGO_TARGET_DIR` and the binaries you copied. Before a long build,
+    check `df -h /tmp ~` and `free -h`. You may delete another session's
+    target dir only when no process uses it (`pgrep -fa <dir>` is empty)
+    and its branch is merged.
+122. **A column sized beside another takes what is left in the row:** the
+    Sessions list was sized `avail - left - 25`, but the row's item spacing
+    sat between the columns too, so the Delete button ran 6 pt past the
+    sheet. Size the last column from `ui.available_width()` at the point you
+    allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
+    checks the row buttons stay inside the sheet).
+120. **An instrument starts playable:** Aeolus starts with every stop off,
+    so the catalog install built, loaded and scanned it, and middle C peaked
+    at 0.000. Play a note on a fresh instance of every new catalog
+    instrument (`catalog-install-test <id>`); one that starts silent gets a
+    starting state (`aeolus::initial_state`, applied where every CLAP voice
+    is instantiated) and its sounds as a `Source` (rule 93).
+121. **Test a face element in the rack the app opens with:** the Aeolus
+    stop panel passed its layout tests on a lone, tall unit, yet in the
+    real app (two instruments stacked over their delays, units 250 px
+    tall) it found no room and was not drawn at all. A face test asserts
+    the element IS shown in a stacked default rack at 1280x800 and
+    1600x1000, not only that what is shown does not overlap.
+
+123. **Every instrument column of the matrix has one route per cell:** an
+    LV2 instrument column drew every row from its MIDI cable, so one click
+    lit or cleared the whole column. LV2 cells are the enabled flags of their
+    `(source, node)` matrix rules, shown and toggled with the same keyboard
+    switch + hardware radio group as CLAP cells (`matrix_cell_on`,
+    `toggled_sources`). Test a new column kind with
+    `an_lv2_column_toggles_one_cell_like_a_clap_column`.
+124. **A small window shows the whole app, not a corner of it:** the rack
+    had fixed 200/220 px column floors and 60 px margins, so below ~950 px
+    it panned and cut Keys and Master off; stage sheets kept 30 px margins
+    and a 200 px minimum that painted into the docks; the mixer's dB marks
+    stacked on a short meter. Column floors come from the faces
+    (`face_min_w`: own knobs, title clear of the LED, Master's meter), a
+    small stage switches to `RackChrome::TIGHT`, a short but wide stage
+    lays the stacks out in one row (`rack_flat`), and sheets clip to
+    themselves. `every_view_fits_small_windows` fails on any text overlap,
+    text outside the window or sideways rack overflow in every view at six
+    window sizes × three docks; `face_layout_tests` audits faces at the same
+    sizes. See the result without the desktop:
+    `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
+    (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
+125. **UI scale follows the monitor the window is on:** the launch-time
+    focused monitor's scale ran a window on the 1.0x external screen at the
+    laptop's 1.6x (a 1368 px window laid out as 855 px). As a native Wayland
+    client (rule 26) the app takes winit's per-surface scale, which changes
+    when the window moves; never poll `hyprctl` for it.
+126. **Tracked text advances by a width that is never zero:**
+    `layout_tracked` used `glyph_width`, which answered 0 in a busy test
+    run and stacked "kabelsalat" on one spot; the laid-out glyph's width
+    is the fallback.
+127. **A rack rebuild never scans plugins:** `build_rack` called
+    `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
+    load (and every agent edit) of a rack with an LV2 unit classified all
+    ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
+    `classify_lv2_units` reads the background scan's list and runs again when
+    the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+128. **`max_tokens` counts a thinking model's hidden reasoning:** the
+    listening model got 400 and spent 242 to 326 of them reasoning, so
+    answers stopped mid-line ("SCORES\n8-bit: 0\nsoft") and read as missing
+    scores. Give reasoning models ≥ 4000 and cap the thinking with
+    `reasoning.effort` instead; check `usage.completion_tokens_details`.
+129. **Blocking HTTP never runs on the MCP server's async runtime:** the
+    headless MCP `listen` built a `reqwest::blocking` client inside an rmcp
+    tool and the process panicked ("Cannot drop a runtime in a context where
+    blocking is not allowed"). Run it on a `std::thread` and join.
+130. **A reference the model judges must be the thing it names:** synthetic
+    naive saws alias, so every model heard the "fanfare" as chiptune and
+    `listen-test` failed for the reference, not the model. Reference clips
+    are real instrument patches rendered through the engine.
+131. **An eval harness wires every path the live app wires:** `EvalRig` had
+    no `note_sink`, so the agent's `play_note` reached nothing and every
+    agent-eval master was silent (`listen` heard −120 dBFS). Before trusting
+    an eval of a new tool, check that what it observes is live there.
+132. **A feature PR ships its README entry, and fresh shots when users can
+    see the difference:** the plugin-editor windows (#71) merged without a
+    line in "What you can do", and the README's feature list quietly went
+    stale. A PR labelled `enhancement` updates `README.md` (its entry under
+    "What you can do", or "Install") in the same change, and when the feature
+    changes what the app shows or how it is played, re-captures the
+    screenshots that entry shows (`scripts/shot.sh` into `docs/shots/`,
+    rule 108 review). `.github/workflows/readme-check.yml`
+    (`scripts/ci/readme-check.sh`, self-tested on real `gh api` output with
+    `--selftest`) fails an `enhancement` PR without a README change and warns
+    when `src/ui.rs`/`src/theme.rs` changed without a screenshot — label
+    only real features, so the fail stays meaningful.
+133. **A silence check flushes the master's tails first:** the master's DC
+    blocker and limiter ring on for ~100 ms after a cut, and effects slew their
+    gain over ~10 ms, so `rig-mix-test`'s "vol 0 is silent" failed on `main`
+    (0.003 residual, peak over the first blocks). Render and discard ~30
+    blocks before measuring what must be silent; compare levels of a decaying
+    note only after retriggering it (`shot` in the strip-mix section).
+134. **Solo silences sources that have no strip entry:** `strip_gains_of`
+    returned "untouched" for a source without an entry, so soloing source B
+    left source A playing at full level (0.36 vs 0.22 peak). Treat a missing
+    entry as the default mix and let the rig's solo flag decide
+    (`another_sources_solo_silences_an_untouched_source`).
+135. **A draggable widget's id is keyed by what it is, never by where it is:**
+    a live strip reorder moved the strip under the pointer, and the
+    position-derived id handed the drag to whichever strip now sat in the old
+    slot, so two strips swapped back and forth. Use
+    `Id::new(("strip_name", node))` with `ui.interact`, and hit-test the
+    previous frame's rects (`mixer_strip_rects_prev`): the current frame's
+    list only holds the strips already drawn
+    (`dragging_a_strip_name_reorders_it_live`).
+136. **A 1-based slot is 1-based everywhere:** `Move { to }` was documented
+    and tested as the slot shown on the strip (1 = first) but inserted at a
+    0-based index, so "move to slot 1" landed second. Convert once, at the
+    edit (`to.clamp(1, len) - 1`), and send the shown number from the UI.
+
+141. **Input-ring discards are whole stereo frames, and a backlog is cut at
+    once:** `DropOne` popped ONE sample of an interleaved ring (swapping L and
+    R from then on) and trimmed a startup backlog one sample per block, so
+    monitoring ran 330-570 ms late. `Drift::catch_up` cuts everything above
+    the target in whole frames; `monitor-latency-test` measures the loop
+    itself (about 19 ms median, 10 ms best, once it recirculates).
+142. **A UI frame runs a heavy estimator once, never per chunk:** the tuner's
+    YIN (millions of multiply-adds) ran for each 512-sample chunk of a
+    one-second backlog, so loading the Guitar rig froze the window until the
+    compositor offered to terminate it; `pump_audio_in_tuners` also called
+    `process(&[])`, which always answered "no pitch". `Tuner::push` is cheap,
+    `estimate_if_due` runs at most every 50 ms
+    (`a_backlog_costs_one_estimate_not_one_per_chunk`). The tuner's feed is
+    one L+R-mixed sample per frame, never the interleaved stream.
+143. **Shift variants of a key are asked before the plain key:** egui matches
+    `Modifiers::NONE` logically, so Shift+F5 was consumed as F5 (Lead +
+    Reverb) and the Guitar rig never loaded
+    (`shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead`).
+144. **A self-test of LV2 units follows the app's load path:** `LoadGraph` on
+    an engine with `spawn_lv2_loader`, wait until every LV2 slot attached
+    (rule 46), then feed. Building the engine with the graph instantiated
+    the plugins inside the constructor and aborted with heap corruption in
+    about one run in four; the measurement also raced the attach. Judge
+    "transformed" by the share of power outside the fundamental
+    (`non_fundamental_share`), not a single Goertzel bin of a decaying tone.
+
+128. **Dock controls are painted from the theme, never stock `egui::Slider`:**
+    the VEL slider's rail has the panel's own fill on the dark dock, so only a
+    tiny handle showed. Use a `PAPER_SINK` track + `CREAM` fill like the strip's
+    wheels (`kb_strip_sends_the_standard_midi_signals` drives it by pointer),
+    and look at the screenshot before calling a control done.
+133. **A plugin whose destructor crashes is parked, never freed (CLAP too):**
+    Dexed's destructor segfaulted while other instances rendered (#52, the rule
+    56 class for LV2). `CLAP_NEVER_FREE` ids are deactivated and parked on
+    retire (the editor closed first; `Drop` is bypassed with `ManuallyDrop`),
+    and `ClapVoice::new_plugin` reuses them, reloading the first instance's
+    state. Add a plugin to that list instead of dropping it.
+134. **A column's width floor comes from its faces, and a face with fixed-size
+    content says so:** the uniform mid width put the organ's LESLIE knob over
+    the next unit at 781 px (#58). `face_min_w` feeds `mid_floor`; extend it
+    when a face gets new fixed-size content
+    (`organ_next_to_a_synth_stack_fits_at_the_default_window_size`).
+135. **A test of a plugin's state never compares against a "fresh" baseline
+    other tests can move, and it polls with a deadline:** Dexed's fresh state
+    differs by length depending on what other instances in the process did, so
+    `init == reused` failed 1 run in 3 in the full suite (#64,
+    `dexed_is_parked_and_reused_not_destroyed`). Assert the change you made
+    (customized state replaced), wait on the audio thread with a bounded poll,
+    and give only the step that must time out a short timeout. Stress a new
+    test with a busy CPU and repeated full-suite runs before shipping it.
+136. **A transient message never shares a row with a title:** a
+    right-to-left layout inside `horizontal_wrapped` paints over the previous
+    labels at 781 px (#65). Title and subtitle go in a plain `horizontal` row
+    (subtitle truncated), status text gets its own wrapped row
+    (`plugins_header_message_never_overlaps_the_subtitle`).
+
+
+128. **A looped read that lands on the file end wraps, never "heals":** at the
+    seam a derived position can equal `frames` by float rounding; the NaN-heal
+    path restarted the file from its Beat Offset and silently re-anchored a
+    synced loop one pass out of phase. Only non-finite positions heal; looped
+    ones `rem_euclid` (`beat_offset_shifts_the_start_point`). A synced start
+    armed in the block the transport starts waits for the NEXT bar by design:
+    arm it before `TransportPlay` to land on beat 0.
+137. **One knob-value ↔ position mapping for stepped knobs:** the face
+    snaps to `round(v * (n-1))`, but the engine floored `v * n` and the
+    agent tool divided by `n`, so a MODE/RATE/OCT value the tool wrote could
+    land one step off (OCT 2 became 1, the default RATE was no position at
+    all). `arp::step_index` / `step_value` are the only mapping, and a
+    stepped knob's default is an exact position (`arp-test`, `arp::tests`).
+138. **A rewire the engine does itself outlives the UI's stale mirror:**
+    `AddNode` of an arp removes the rig's Keys → synth cables, but the UI
+    re-sends every cable of ITS rack each frame until it adopts the new
+    graph, and that `Connect` plugged the keys back past the arp
+    (`agent-eval --task arp_updown` 0/3). The engine remembers the ids it took
+    over (`arp_taken`, fixed size, cleared by a load) and ignores their
+    Connect (`an_arp_takes_over_the_keys_cables_and_a_stale_reconnect_cannot_undo_it`).
+139. **Every MIDI destination kind is routed in the constructor, in
+    LoadGraph and in AddNode:** `GraphEngine::new` built Keys/hardware rules
+    for CLAP and LV2 nodes only, so a rack that STARTS with an arp had no
+    route into it (0 steps in `arp-test`). Add a new destination kind to all
+    three, and test it by starting an engine with that graph.
+140. **A pattern starts at its first note, not at the grid index:** the arp
+    began at `grid_step % len`, so a chord pressed mid-bar began on its
+    second or third note. Keep the grid index (onset, swing parity) and the
+    pattern position apart (`a_press_mid_bar_starts_the_pattern_on_its_first_note`).
+    In the held-notes check, judge arps by "the last release silences
+    everything", never per key: chords of two held keys can share a pitch.
+145. **A hosted MIDI effect's knob move releases what is held through it:**
+    Carla's MIDI Transpose maps a note-off with the CURRENT semitones, so
+    moving the knob between a key's note-on (+7 → 67) and note-off (−5 → 55)
+    left the instrument's 67 sounding. `apply_midi_fx_param` calls
+    `release_all` when a hosted plugin's value really changes
+    (`kabelsalat midifx-test` runs the real plugin through the engine).
+146. **An exhaustive search stores hashes, never state text, and splits
+    its alphabet:** the held-notes search kept each state's JSON (6.7 GB at
+    800 k states), the OOM killer ended the session's shells again and
+    again, and the full product of routing × MIDI-FX edits has no reachable
+    fixpoint. States are hashes, the halves run as separate scenarios
+    (`Scenario::{Routing, Arp, RoutingWithStrip, Fx}`, 30–100 k states each),
+    and a long run goes in `systemd-run --user -p MemoryMax=3G`.
+147. **An integer moving average keeps what its division drops:**
+    `RENDER_AVG_US` did `avg - avg/64 + us/64` in whole microseconds, and
+    both divisions dropped up to 63 µs: a 50 µs render read 0 and a steady
+    300 µs one read 256, so the DSP load of a light rack read 0 %. Average in
+    nanoseconds with `engine_info::ema_ns` (a signed step, rounded towards
+    the sample), and test a new average on a constant input from below and
+    from above (`the_average_converges_on_small_and_large_times`).
+148. **A headless shot starts from an app that never ran a frame:**
+    `offline_shots::shot` makes a new egui context and font atlas, but the
+    app keeps galleys (wordmark, knob captions, hints) laid out in the
+    atlas of the context it ran in before. `engine_info_shots` and
+    `mixer_parity_shots` ran frames first and drew those as glyph soup;
+    build a fresh app per image and open every PNG before using it as
+    evidence.
+149. **Never end a turn on a build or test you have not read the end of:**
+    on #6, three turns in a row said "running `cargo test`, waiting for the
+    output" and ended; the background job died with the session, nobody
+    read a result, and the work stalled for hours. Run builds and tests in
+    the FOREGROUND with the maximum timeout (600000 ms; split into
+    `--no-run` then the run if needed). If one must run in the background,
+    block on it (`t3_background_wait`) before replying, and report its exit
+    code and `test result:` line. "Waiting for the output" is never a
+    final message.
+150. **Compare plugin audio only inside one render:** two Surge instances
+    fed the same notes differ in almost every sample (free-running
+    oscillator phases), so a stem compared against a second, soloed run
+    failed on 124770 of 124800 samples. `record-test` rebuilds the master
+    from the stems of the same take (`master_chain_from_silence`) instead.
 
 ## Working on kabelsalat
 
@@ -654,17 +939,27 @@ Learned so far (2026-11-15, UI polish pass):
   with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
   `testing`) and milestones per release; how and why it is built =
   `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
-  released changes = `CHANGELOG.md` (add yours under
-  **Unreleased**); rules = this file. Read open issues with
+  released changes = `CHANGELOG.md`, but add yours as a fragment
+  `changes/<branch>.md` (`changes/README.md`; never edit CHANGELOG.md in a
+  feature PR, parallel PRs conflict there); rules = this file. Read open issues with
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
-- **Releases:** SemVer tags `vX.Y.Z` on `main`. Pushing the tag builds every
-  package (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and
-  publishes the GitHub release from that version's CHANGELOG block; the steps
-  before the tag are in `docs/PACKAGING.md` ("Cut a release").
+- **New features (user, 2026-11-18):** a feature is an issue labelled
+  `enhancement`, and the PR that implements it carries the label too. That
+  PR updates `README.md` in the same change — the feature's entry under
+  "What you can do" (or "Install") — and, when it changes what users see,
+  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
+  The `readme-check` workflow (rule 132) fails it otherwise and warns when
+  UI code changed without a screenshot.
+- **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
+  `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
+  opens the release PR, its merge is tagged, and the tag builds every package
+  (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and publishes
+  the GitHub release. A `nightly` pre-release of `main` is rebuilt every
+  night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
-  `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+  `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
@@ -674,17 +969,19 @@ Learned so far (2026-11-15, UI polish pass):
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
+  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
+  (calls the listening model; prints rankings and latency),
+  `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
+  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree
   for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
-  model APIs and costs a few cents; three requests carry an image, and
-  `look_at_rack` gets `docs/shots/mixer.png` in place of a window) and
-  `kabelsalat jev-test` shows Jev's decisions (`--image <file> <request>`
-  asks about one request without and with an image). A new shortcut row
+  model APIs and costs a few cents; `listen_bright` also calls the listening
+  model) and `kabelsalat jev-test` shows Jev's
+  decisions. A new shortcut row
   needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
   with
   `| grep -E '^(  [a-z]|\||agent-eval)'`. Unit tests of the loop run on
@@ -693,10 +990,10 @@ Learned so far (2026-11-15, UI polish pass):
   the running app); one-shot: `kabelsalat send '<json>'`.
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
   shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
-  (rule 55), inject keys with `scripts/xtest_key.py` (F4 = 0xffc1, F1–F10 = X
-  keycodes 67–76, F11/F12 = 95/96 — the script handles it), then
-  `scripts/shot.sh out.png <pid>` (rule 108).
-  Mouse clicks need screen coords: window origin × monitor scale + egui pos.
+  (rule 55), inject keys with `wtype -k F4` (rule 24), then
+  `scripts/shot.sh out.png <pid>` (rule 108). Click with
+  `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
+  points; needs `wlrctl`, here built into `~/.local/bin`).
 - **Hyprland window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
 
@@ -728,29 +1025,25 @@ Learned so far (2026-11-15, UI polish pass):
   and shows the evidence, then queue it with `gh pr merge --auto --squash`
   (see "Merging"). Never leave finished work only on the local machine or
   only on a branch. Remove the worktree once its PR is merged.
-- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
-  (admins included), the branch must be up to date, and the required checks
-  `test (x86_64)`, `test (aarch64)`, `flatpak cargo-sources.json is current`
-  and `human gate` must pass. GitHub merges a queued auto-merge PR once they
+- **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
+  (admins included), and the required checks `test (x86_64)` and
+  `test (aarch64)` must pass.
+  Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
-  `gh pr merge` without `--auto`. `human gate`
-  (`scripts/ci/human-gate.sh`, run from `main` via `pull_request_target`,
-  so a PR cannot edit it to pass) holds only PRs that change the rules
-  agents work under or what ships: `AGENTS.md`, `.github/`, `.githooks/`,
-  `scripts/ci/`, `scripts/check-images.sh`, `Cargo.toml`, `packaging/`.
-  Everything else merges on green CI, so the evidence rules above are what
-  keeps it safe. Add the `needs-human` label to a PR whose risk neither the
-  tests nor its evidence cover.
-  Such a PR waits until the user adds `human-approved`; **agents never add
-  or remove `human-approved`**, and a PR body for one lists the evidence the
-  user needs (screenshots, self-test output). Self-tests with real plugins
+  `gh pr merge` without `--auto`. Everything merges on green CI, so the
+  evidence rules above are what keeps it safe. Self-tests with real plugins
   and audio do not run in CI, so their output belongs in every PR body that
-  changes the code they cover. When `main` moves, update the branch
-  (`gh pr update-branch`) so the queued merge can proceed.
+  changes the code they cover. Update a branch only when it conflicts with
+  `main`; `resolve-conflicts.yml` merges `main` into PRs whose conflicts are
+  appended Markdown lines by itself, so `git pull` before you push again, and
+  resolve a PR labelled `merge-conflict` yourself. An open `main-red` issue means `main` is broken: fixing it comes
+  before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).
-- **No X11 child windows** — plugin editors are native egui.
+- **Plugin GUIs only in their own windows:** the main window is native
+  Wayland and never embeds X11. A plugin's own editor opens in a separate
+  `PluginWindow` (XWayland) on request; check with `kabelsalat editor-test`.
 - **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside
   `ctx.fonts_mut`/`ui.fonts_mut` — layout under the lock, paint after release.
 - RT discipline: the audio render path is allocation-free; UI animation reads

@@ -1,7 +1,5 @@
 # Reviewed images (AGENTS.md rule 108): each shows only kabelsalat or a
 # design reference. Checked by scripts/check-images.sh in the pre-commit hook and CI.
-ef238382437a2859129ceb23487ce3ad98b8adfd6d0e78f136f444dd2081e6fc  assets/agent-eval/note-mute-rig-2.png
-22cf03aee8fc615fd6da14bd66adca3914ded93f151cf2370901269d3fe85b7d  assets/agent-eval/note-tempo-90.jpg
 1c18db4582a9bb5d557417d42cea16d6831dd12a5e70b5062f8811cbee7f83e4  assets/logo.png
 0fe34d604255b36fb9c8c8aadbac80af995a85875f457a0d686b9a583b9d9d50  docs/design-ref/hurricane-1-api.jpg
 9a6b05791dcb267cdcb39342a736ed9200bd400417e5a136ba66faca77677ad1  docs/design-ref/hurricane-1.png
@@ -19,8 +17,10 @@ a9da411160fdf78ee0772a5742a6222586ad945635256406f2df56cb3fce4934  docs/shots/fro
 2012e27905217955977a69f2e7bd87c9fe9739daf8839518df176363b7aad293  docs/shots/keyboard.png
 14c16a07cce139113ab14b53890c6e46c2ed9823681bf300306b479f707ceb1f  docs/shots/matrix.png
 8111efa677cba827b8336b390513944a847cbf7111e5ebd22e2b3fe43ec4f5e3  docs/shots/midi-matrix.png
-aa1aa1b3cf1a6893466d903bddfc291f897e639cfdcf5f9b46e34f1dad3ab297  docs/shots/mixer.png
+196bfe47a875ee97037fceea70774c681e7e32656310678c97c91db1067cae24  docs/shots/mixer.png
 8528711ad4a92c1ba64222d91244b4b8536b9bd2f06ebe8f02ccd3a88181aa7a  docs/shots/polish-before-after.png
 27353440cc3f222ed194d6680ac612f899dde66227eacb5041d08b2eeb892099  docs/shots/topbar-agent.png
 6a37d157cf194d7b58c4fc5bded089740e7452af76fdf51e07c226f5ea1271dd  docs/shots/topbar-compact.png
 95cbb4a57f123409d159c2955e248a16a7e31b6e273bb82334004bd5686ca5af  docs/shots/topbar-last-take.png
+d1fda85b34ee85aa96682d0303aef9ba5e00c22b2803ce57cb2e5576f9316e1f  docs/shots/guitar-rig.png
+c2e222bf24ff42871df6c00b2bfcdc2ae3edd2460b403bdd53119a1362161c27  docs/shots/midi-strip.png

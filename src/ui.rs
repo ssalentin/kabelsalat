@@ -28,8 +28,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, ToolCall, ToolOutput, UserMessage};
-use crate::vision::Image;
+use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
@@ -68,6 +67,10 @@ const SUBTEXT: Color32 = theme::CREAM_MID;
 /// Knob radius on unit faces (labels and display captions share its baseline).
 const KNOB_R: f32 = 17.0;
 const METER_SEGS: usize = 14;
+/// Top of Master's meter in a face too short for its caption (under the subtitle).
+const METER_TOP_SHORT: f32 = 60.0;
+/// Width of a Master meter segment.
+const METER_SEG_W: f32 = 22.0;
 /// Face grid (rack-local px), shared by every unit face: content starts on
 /// the title's left edge, keeps FACE_PAD_R from the right border and
 /// FACE_PAD_B under the lowest label. The knob row sits on the bottom of
@@ -438,6 +441,13 @@ fn connect_hw_input(
                             cq.pop_front();
                         }
                     }
+                } else if st == 0xE0 {
+                    // Pitch bend from a wheel/wind controller: to the engine
+                    // like a CC (the pitch-bend half of #68). The UI animates
+                    // nothing here, so no queue.
+                    let ch = msg[0] & 0x0F;
+                    let val = ((msg[2] as i16) << 7 | msg[1] as i16) - 8192;
+                    let _ = direct.send_bend(SourceId::Hardware(dev), ch, val, std::time::Instant::now());
                 }
             }
         },
@@ -490,6 +500,21 @@ impl HwDirect {
         crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
         ok
     }
+
+    /// Send one hardware pitch bend straight to the engine from the midir
+    /// thread, like [`Self::send_cc`].
+    fn send_bend(&self, source: SourceId, channel: u8, value: i16, created: std::time::Instant) -> bool {
+        let Ok(guard) = self.bus.lock() else { return false };
+        let Some(bus) = guard.as_ref() else { return false };
+        let cmd = Command::PitchBend {
+            source,
+            channel: channel & 0x0F,
+            value: value.clamp(-8192, 8191),
+        };
+        let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
+        crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
+        ok
+    }
 }
 
 /// Sink for [`NoteEvent`]s. `Send` so the engine can move it to its own thread.
@@ -530,6 +555,9 @@ struct Knob {
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
+    /// > 1 = a stepped picker (MODE, RATE, …): the value snaps to this many
+    /// evenly spaced positions — on drag, on load, and before publishing.
+    steps: u8,
     /// Hidden from the face (still settable/bindable — e.g. AudioIn MON, shown
     /// as a chip instead of a knob). Skipped by draw + face-layout audit.
     hidden: bool,
@@ -566,8 +594,25 @@ impl KnobSource {
 }
 
 impl Knob {
+    /// Snap to the knob's steps (a no-op on a continuous knob).
+    fn quantize(&self, v: f32) -> f32 {
+        if self.steps < 2 {
+            return v.clamp(0.0, 1.0);
+        }
+        let n = (self.steps - 1) as f32;
+        (v.clamp(0.0, 1.0) * n).round() / n
+    }
+
+    /// The knob's current value as a step index (0-based, for readouts).
+    fn step_index(&self) -> usize {
+        if self.steps < 2 {
+            return 0;
+        }
+        (self.value * (self.steps - 1) as f32).round().clamp(0.0, (self.steps - 1) as f32) as usize
+    }
+
     fn set_immediate(&mut self, v: f32) {
-        let v = v.clamp(0.0, 1.0);
+        let v = self.quantize(v);
         self.value = v;
         self.display_value = v;
         self.glide_from = v;
@@ -575,7 +620,7 @@ impl Knob {
     }
 
     fn glide_to(&mut self, v: f32, reduce_motion: bool) {
-        let v = v.clamp(0.0, 1.0);
+        let v = self.quantize(v);
         self.value = v;
         if reduce_motion || (self.display_value - v).abs() < 1e-4 {
             self.display_value = v;
@@ -614,6 +659,29 @@ const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
 const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
 /// How often plugin knobs follow their plugin (values and renamed controls).
 const MAIN_POLL_SECS: f32 = 0.1;
+/// How often an Aeolus face re-reads which stops its plugin has drawn (the
+/// face's own clicks and sound loads update it at once).
+const AEOLUS_POLL_SECS: f32 = 1.0;
+
+/// An Aeolus unit's stop panel: what the plugin has drawn (None until read,
+/// or for an organ other than the default one) and the division shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AeolusFace {
+    drawn: Option<[u32; 4]>,
+    division: usize,
+}
+
+impl Default for AeolusFace {
+    /// Manual I, where the registration a fresh Aeolus starts with sits.
+    fn default() -> Self { AeolusFace { drawn: None, division: 2 } }
+}
+
+/// Where an Aeolus face lays out its division tabs and the stops of the
+/// division it shows (rack-local).
+struct AeolusRects {
+    tabs: [Rect; 4],
+    stops: Vec<Rect>,
+}
 /// Readback pause after the UI or a CC moved a plugin knob.
 const READBACK_HOLD_SECS: f32 = 0.3;
 /// The warm shift an instrument's audio cable carries (the former TONE
@@ -638,6 +706,10 @@ enum UnitKind {
     Master,
     /// Live audio input (mic/guitar/interface): a source with an audio OUT.
     AudioIn,
+    /// Hosted MIDI effect (AUM MIDI strip): MIDI in, MIDI out.
+    MidiFx,
+    /// The arpeggiator / chord unit (issue #90): one MIDI in, one MIDI out.
+    Arp,
 }
 
 struct Unit {
@@ -713,6 +785,7 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         glide_t: 1.0,
         default,
         param,
+        steps: 0,
         hidden: false,
         sent: None,
         clap: None,
@@ -721,23 +794,20 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
     }
 }
 
+/// Build a stepped knob (a picker: MODE, RATE …): `steps` even positions.
+fn stepped_knob(label: &'static str, default: f32, param: Option<u32>, steps: u8) -> Knob {
+    let mut k = knob(label, default, param);
+    k.steps = steps.max(2);
+    k.set_immediate(default);
+    k
+}
+
 /// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
 /// and persisted; the face renders its state as a chip instead.
 fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob {
-        label: label.to_string(),
-        value: default,
-        display_value: default,
-        glide_from: default,
-        glide_t: 1.0,
-        default,
-        param,
-        hidden: true,
-        sent: None,
-        clap: None,
-        source: KnobSource::BuiltIn,
-        label_g: None,
-    }
+    let mut k = knob(label, default, param);
+    k.hidden = true;
+    k
 }
 
 /// Which plugin moves a main-control knob.
@@ -760,6 +830,9 @@ fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarg
         glide_t: 1.0,
         default: c.normalized(c.default),
         param: matches!(target, MainTarget::Lv2).then_some(c.id),
+        // Plugin parameters keep their own stepping (the plugin rounds);
+        // the rack's stepped knobs are the built-in ones (knob_specs).
+        steps: 0,
         hidden: false,
         sent: Some(norm),
         clap: matches!(target, MainTarget::Clap)
@@ -905,7 +978,7 @@ struct SavedRule {
 }
 
 /// `s` moved onto `graph`, every node id mapped by `remap` (None drops it):
-/// knobs, plugin states and matrix routes follow their node.
+/// knobs, plugin states, matrix routes and mixer strips follow their node.
 fn remap_session(
     s: &crate::session::Session,
     graph: Graph,
@@ -927,6 +1000,15 @@ fn remap_session(
         .collect();
     if !rules.is_empty() {
         ns.set_matrix(serde_json::to_value(&rules).ok());
+    }
+    // Mixer strips (#72–77) and their display order follow their node.
+    for st in s.strips() {
+        if let Some(node) = remap(st.node) { ns.set_strip(crate::session::StripSaved { node, ..*st }); }
+    }
+    let order: Vec<u32> = s.strip_order().iter().filter_map(|n| remap(*n)).collect();
+    if !order.is_empty() { ns.set_strip_order(order); }
+    for (&old, label) in s.strip_knobs() {
+        if let Some(node) = remap(old) { ns.set_strip_knob(node, label.clone()); }
     }
     ns
 }
@@ -1081,7 +1163,7 @@ struct TranscriptRun {
 
 /// Maximum tool chips shown in a finished or long run before `"+N more"`.
 const COLLAPSED_RUN_CHIPS: usize = 3;
-/// Left indent of transcript message text, chips, Confirm/Cancel, and attachments
+/// Left indent of transcript message text, chips and Confirm/Cancel
 /// (6 px leading margin + 66 px role column + 6 px spacing).
 const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 
@@ -1091,7 +1173,7 @@ const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 /// sees what the calls before it really did.
 struct ToolBatch {
     todo: VecDeque<(ToolCall, Option<usize>)>,
-    results: Vec<ToolOutput>,
+    results: Vec<String>,
     waiting: Option<(Waiting, Option<usize>)>,
     user_idx: usize,
 }
@@ -1103,99 +1185,8 @@ enum Waiting {
     /// list_sounds / load_sound on an instrument whose library is still
     /// being scanned: the call runs once the scan is done.
     SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
-    /// look_at_rack: the screenshot of a coming frame. The tool's own
-    /// line is kept for the result.
-    RackShot { said: String, deadline: std::time::Instant },
-}
-
-/// Thumbnail height and row height for the chat's attached image chip.
-const ATTACH_THUMB_H: f32 = 32.0;
-const ATTACH_ROW_H: f32 = 40.0;
-
-/// Cached egui texture for the currently attached chat image (loaded once per
-/// attachment and dropped immediately when the attachment is cleared).
-struct ChatThumb {
-    bytes: Arc<[u8]>,
-    tex: Option<egui::TextureHandle>,
-    size: [usize; 2],
-}
-
-fn truncate_attachment_name(name: &str) -> String {
-    if name.chars().count() > 40 {
-        format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>())
-    } else {
-        name.to_string()
-    }
-}
-
-fn sync_chat_thumb(ctx: &egui::Context, chat_image: &Option<Image>, chat_thumb: &mut Option<ChatThumb>) {
-    let Some(img) = chat_image.as_ref() else {
-        *chat_thumb = None;
-        return;
-    };
-    if chat_thumb.as_ref().is_some_and(|t| Arc::ptr_eq(&t.bytes, &img.bytes)) {
-        return;
-    }
-    let (tex, size) = match img.thumbnail_rgba(64) {
-        Some((sz, rgba)) => {
-            let color = egui::ColorImage::from_rgba_unmultiplied(sz, &rgba);
-            let handle = ctx.load_texture("assistant_chat_thumb", color, egui::TextureOptions::LINEAR);
-            (Some(handle), sz)
-        }
-        None => (None, [32, 32]),
-    };
-    *chat_thumb = Some(ChatThumb {
-        bytes: Arc::clone(&img.bytes),
-        tex,
-        size,
-    });
-}
-
-/// The tool that shows an agent the app window.
-const LOOK_TOOL: &str = "look_at_rack";
-/// How long look_at_rack waits for the frame's pixels.
-const RACK_SHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// look_at_rack's screenshot of the app window. The tool only asks; the
-/// frame path sends the request (it has the egui context), the windowing
-/// integration answers after it painted, and a worker thread scales and
-/// encodes the pixels. Whoever waits takes the result on a later frame.
-#[derive(Default)]
-struct RackShot {
-    wanted: bool,
-    ready: Arc<Mutex<Option<Result<Image, String>>>>,
-    /// Bridge (MCP) callers waiting for it, each with its deadline.
-    remote: Vec<(std::sync::mpsc::Sender<String>, std::time::Instant)>,
-}
-
-impl RackShot {
-    /// Ask the integration for the next frame's pixels.
-    fn request(&mut self, ctx: &egui::Context) {
-        if !std::mem::take(&mut self.wanted) { return; }
-        // A frame that came after its caller gave up is not this look's.
-        if let Ok(mut slot) = self.ready.lock() { *slot = None; }
-        let (ready, repaint) = (self.ready.clone(), ctx.clone());
-        ctx.request_screenshot(move |frame: Arc<egui::ColorImage>| {
-            std::thread::spawn(move || {
-                let image = Image::from_rgba("kabelsalat window", frame.size, frame.as_raw());
-                if let Ok(mut slot) = ready.lock() { *slot = Some(image); }
-                repaint.request_repaint();
-            });
-        });
-    }
-
-    fn take(&self) -> Option<Result<Image, String>> {
-        self.ready.lock().ok().and_then(|mut slot| slot.take())
-    }
-}
-
-/// look_at_rack's result once the frame arrived, or why there is none.
-fn rack_shot_output(said: &str, shot: Option<Result<Image, String>>) -> ToolOutput {
-    match shot {
-        Some(Ok(image)) => ToolOutput { text: format!("{said}: {}", image.describe()), image: Some(image) },
-        Some(Err(why)) => format!("error: the screenshot could not be encoded: {why}").into(),
-        None => format!("error: no screenshot within {} s — the window is hidden or the app runs without one", RACK_SHOT_WAIT.as_secs()).into(),
-    }
+    /// listen: recording the master and asking the listening model.
+    Listen(std::sync::mpsc::Receiver<String>),
 }
 
 /// The tools that read an instrument's sound library.
@@ -1224,6 +1215,14 @@ struct KnobMenu {
     pos: Pos2,
 }
 
+/// The Keys-face scale picker, opened from the SCALE chip's readout:
+/// which Keys unit, at which screen position.
+#[derive(Clone, Copy)]
+struct ScaleMenu {
+    unit: usize,
+    pos: Pos2,
+}
+
 /// One bit per note source for `notes_down`: the computer keyboard, each
 /// hardware device (indices past 29 share a bit), everything else.
 fn note_source_bit(src: SourceId) -> u32 {
@@ -1240,7 +1239,30 @@ fn note_name(n: u8) -> String {
     format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
 }
 
-/// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
+/// The Keys-face SCALE readout text: key + a scale short enough for the
+/// field ("C MIN", "F# H.MIN"). The menu spells the scale out.
+fn short_scale_label(c: crate::arp::ScaleChoice) -> String {
+    const SHORT: [&str; 8] = ["MAJ", "MIN", "DOR", "MIX", "H.MIN", "PENTA", "M.PEN", "BLUES"];
+    let i = crate::arp::Scale::ALL.into_iter().position(|s| s == c.scale).unwrap_or(0);
+    format!("{} {}", crate::arp::KEY_NAMES[c.key.min(11) as usize], SHORT[i])
+}
+
+/// One matrix click on an instrument's sources: keyboard is a switch,
+/// hardware a radio group (all devices, one device, or off).
+fn toggled_sources(src: (bool, bool), dev: Option<u32>, row: MatrixRow, on: bool) -> ((bool, bool), Option<u32>) {
+    let (mut src, mut dev) = (src, dev);
+    match row {
+        MatrixRow::Keys => src.0 = on,
+        MatrixRow::HwAll => { src.1 = on; if on { dev = None; } }
+        MatrixRow::HwDev(d) => {
+            if on { src.1 = true; dev = Some(d); }
+            else if dev == Some(d) { src.1 = false; }
+        }
+    }
+    (src, dev)
+}
+
+/// Effective cell state for an instrument column: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
 /// `src` = the rig's (keyboard, hardware) source pair.
 fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
@@ -1270,10 +1292,50 @@ fn audio_in_sub(device: Option<&str>, ch: AudioInChannel) -> String {
     format!("{dev} · {}", ch.label())
 }
 
+/// An Aeolus stop name ("Open Diapason\n8") on one line within `max_w`
+/// (screen px): the whole name, else organists' short forms ("Op. Diap.
+/// 16"), else letters off the end with "…". The footage always stays.
+fn fit_stop_label(painter: &egui::Painter, name: &str, font: FontId, max_w: f32) -> String {
+    // One line, footages as the drawbars print them (2⅔, not 2 2/3).
+    let full = name.replace('\n', " ").replace(" 2/3", "⅔").replace(" 1/3", "⅓").replace(" 3/5", "⅗");
+    let fits = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x <= max_w;
+    // Organists' own short forms, the gentler ones first; last, a double
+    // diapason loses its "open" ("Dbl. Diap. 16").
+    let shorten = |label: &str, words: &[(&str, &str)]| label.split(' ')
+        .filter_map(|w| match words.iter().find(|(long, _)| *long == w) {
+            Some((_, "")) => None,
+            Some((_, short)) => Some(*short),
+            None => Some(w),
+        })
+        .collect::<Vec<_>>().join(" ");
+    const SOFT: &[(&str, &str)] = &[
+        ("Diapason", "Diap."), ("Principal", "Princ."), ("Double", "Dbl."), ("Harmonic", "Harm."),
+        ("Chimney", "Chim."), ("Sesquialtera", "Sesq."), ("Fourniture", "Fourn."), ("Quintadena", "Quint."),
+        ("Violoncell", "Cello"), ("Cornopean", "Cornop."), ("Fifteenth", "15th"), ("Twelfth", "12th"),
+        ("Bombarde", "Bomb."), ("Trombone", "Tromb."), ("Larigot", "Lar."), ("Mixture", "Mixt."),
+    ];
+    const HARD: &[(&str, &str)] = &[("Open", "Op."), ("Flute", "Fl."), ("Stopt", "St."), ("Spitz", "Sp."),
+        ("Bassoon", "Bsn."), ("Trumpet", "Tpt."), ("Nazard", "Naz."), ("Humana", "Hum."), ("Gemshorn", "Gemsh.")];
+    let soft = shorten(&full, SOFT);
+    let hard = shorten(&soft, HARD);
+    let bare = shorten(&hard, &[("Op.", "")]);
+    for label in [full.as_str(), soft.as_str(), hard.as_str(), bare.as_str()] {
+        if fits(label) { return label.to_string(); }
+    }
+    // Letters off the name, never off the footage (the last word).
+    let (stem, foot) = bare.rsplit_once(' ').unwrap_or(("", bare.as_str()));
+    let chars: Vec<char> = stem.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t = format!("{}… {foot}", chars[..n].iter().collect::<String>().trim_end().trim_end_matches('.'));
+        if fits(&t) { return t; }
+    }
+    foot.to_string()
+}
+
 /// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
 /// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
 /// Runs once per unit at galley-build time, never on the frame path.
-fn sentence_case(s: &str) -> String {
+pub(crate) fn sentence_case(s: &str) -> String {
     s.split_whitespace()
         .enumerate()
         .map(|(i, w)| {
@@ -1332,14 +1394,102 @@ fn nav_separator(ui: &mut egui::Ui) {
 /// The REC chip: tomato fill + a filled dot only while recording (Hurricane:
 /// tomato is reserved for the active record state); a calm dark chip with a
 /// dim open dot when idle. `secs` shows elapsed time while recording.
-fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
+/// Microseconds for Engine Info: a decimal below 10, where it still says something.
+fn fmt_us(us: f64) -> String {
+    if us < 10.0 { format!("{us:.1} µs") } else { format!("{us:.0} µs") }
+}
+
+const ENGINE_INFO_ROW_H: f32 = 21.0;
+/// Right-aligned number columns of the node table (avg, max, share).
+const ENGINE_INFO_COLS: [f32; 3] = [66.0, 66.0, 52.0];
+
+/// Section caption of Engine Info, with right-aligned column captions over
+/// the node table's numbers: tracked micro-caps like `theme::section_label`.
+fn engine_info_section(ui: &mut egui::Ui, w: f32, title: &str, cols: &[&str]) {
+    ui.add_space(10.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
+    let (title_l, col_ls) = ui.fonts_mut(|f| {
+        let mut caps = |t: &str| theme::layout_tracked(f, &t.to_uppercase(), FontId::proportional(10.0), 0.14);
+        (caps(title), cols.iter().map(|c| caps(c)).collect::<Vec<_>>())
+    });
+    let p = ui.painter();
+    let top = |l: &theme::TrackedLabel| rect.center().y - l.size.y * 0.5;
+    theme::paint_tracked(p, Pos2::new(rect.left(), top(&title_l)), &title_l, theme::INK_2);
+    let mut x = rect.right();
+    for (l, cw) in col_ls.iter().zip(ENGINE_INFO_COLS).rev() {
+        // The last letter's tracking is not ink: the caption ends on the column's edge.
+        theme::paint_tracked(p, Pos2::new(x - l.size.x + 1.4, top(l)), l, theme::INK_2);
+        x -= cw;
+    }
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+    ui.add_space(3.0);
+}
+
+/// One "label … value" line of Engine Info.
+fn engine_info_row(ui: &mut egui::Ui, w: f32, label: &str, value: &str, value_col: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ENGINE_INFO_ROW_H), egui::Sense::hover());
+    let p = ui.painter();
+    p.text(rect.left_center(), egui::Align2::LEFT_CENTER, label, FontId::proportional(12.5), theme::CREAM_META);
+    p.text(rect.right_center(), egui::Align2::RIGHT_CENTER, value, FontId::monospace(12.0), value_col);
+    resp
+}
+
+/// One unit of the node table: name (cut to its column), average, maximum
+/// and the average's share of one buffer.
+fn engine_info_node_row(ui: &mut egui::Ui, w: f32, n: &crate::engine_info::NodeStat) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ENGINE_INFO_ROW_H), egui::Sense::hover());
+    let name_w = (w - ENGINE_INFO_COLS.iter().sum::<f32>() - 8.0).max(40.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(n.name.clone(), FontId::proportional(12.5), theme::CREAM_META);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+    let name_g = ui.fonts_mut(|f| f.layout_job(job));
+    let elided = name_g.elided;
+    let p = ui.painter();
+    p.galley(Pos2::new(rect.left(), rect.center().y - name_g.size().y * 0.5), name_g, theme::CREAM_META);
+    let values = [fmt_us(n.avg_us), fmt_us(n.max_us), format!("{:.1} %", n.percent)];
+    let mut x = rect.right();
+    for (v, cw) in values.iter().zip(ENGINE_INFO_COLS).rev() {
+        p.text(Pos2::new(x, rect.center().y), egui::Align2::RIGHT_CENTER, v, FontId::monospace(12.0), theme::CREAM);
+        x -= cw;
+    }
+    if elided {
+        resp.on_hover_text(&n.name);
+    }
+}
+
+/// The DSP readout's laid-out texts (`DemoApp::dsp_chip_layout`).
+struct DspChip {
+    label: Arc<egui::Galley>,
+    value: Arc<egui::Galley>,
+    /// Width of the value's slot (the widest value).
+    value_w: f32,
+    xruns: Option<Arc<egui::Galley>>,
+    /// Border for a high or critical load.
+    stroke: Option<Color32>,
+    width: f32,
+}
+
+impl DspChip {
+    const GAP: f32 = 6.0;
+}
+
+fn rec_chip(ui: &mut egui::Ui, recording: bool, pending: bool, secs: f64) -> egui::Response {
     let (fill, stroke, txt) = if recording {
         (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
+    } else if pending {
+        (theme::DARK_PANEL_HI, theme::ACCENT_DEEP, theme::CREAM)
     } else {
         (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
     };
-    let dot = if recording { "●" } else { "○" };
-    let label = if recording { format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60) } else { format!("{dot} REC") };
+    let dot = if recording { "●" } else if pending { "◐" } else { "○" };
+    let label = if recording && pending {
+        format!("{dot} REC {}:{:02} · BAR", (secs as u64) / 60, (secs as u64) % 60)
+    } else if recording {
+        format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60)
+    } else if pending {
+        format!("{dot} REC · BAR")
+    } else {
+        format!("{dot} REC")
+    };
     ui.scope(|ui| {
         let base = egui::style::WidgetVisuals {
             bg_fill: fill,
@@ -1377,7 +1527,17 @@ fn make_unit(node: &Node) -> Unit {
     // Knobs come from the one table agents resolve names against (#19).
     let knobs: Vec<Knob> = crate::engine::knob_specs(&node.kind)
         .iter()
-        .map(|k| if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) })
+        .map(|k| {
+            let mut k2 = if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) };
+            if k.steps > 1 && !k.hidden {
+                k2 = stepped_knob(k.label, k.default, k.param, k.steps);
+            } else if k.steps > 1 {
+                // A hidden stepped knob (organ drawbars): snaps without a face.
+                k2.steps = k.steps;
+                k2.set_immediate(k.default);
+            }
+            k2
+        })
         .collect();
     let (node_kind, sub, ins, outs, jacks): (
         UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<(Dir, usize, f32, &'static str)>,
@@ -1394,10 +1554,15 @@ fn make_unit(node: &Node) -> Unit {
         ),
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
-            vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
+            vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![PortKind::Audio],
             // L · R as a stereo pair, MONO apart (between them it read as a
-            // center channel — vision review).
-            vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
+            // center channel — vision review). OUT feeds the master inserts
+            // (#77): a cable Master OUT → FX marks an insert before the
+            // fixed limiter.
+            vec![
+                (Dir::In, 0, 0.16, "IN L"), (Dir::In, 1, 0.36, "IN R"), (Dir::In, 2, 0.58, "IN MONO"),
+                (Dir::Out, 0, 0.88, "OUT"),
+            ],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
@@ -1429,10 +1594,24 @@ fn make_unit(node: &Node) -> Unit {
             vec![PortKind::Audio], vec![PortKind::Audio],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
         ),
+        NodeKind::MidiFx { plugin } => (
+            UnitKind::MidiFx,
+            match plugin {
+                crate::control::MidiFxPlugin::Builtin { .. } => "midi fx · transpose".into(),
+                crate::control::MidiFxPlugin::Lv2 { .. } => "midi fx · lv2".into(),
+            },
+            vec![PortKind::Midi], vec![PortKind::Midi],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "MIDI OUT")],
+        ),
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
             vec![(Dir::Out, 0, 0.62, "OUT")],
+        ),
+        NodeKind::Arp => (
+            UnitKind::Arp, "midi arp · chord mode".into(),
+            vec![PortKind::Midi], vec![PortKind::Midi],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "MIDI OUT")],
         ),
         NodeKind::AudioIn { device, channels } => (
             UnitKind::AudioIn, audio_in_sub(device.as_deref(), *channels),
@@ -1597,6 +1776,13 @@ struct HelpRow {
 const FACE_CTL_H: f32 = 24.0;
 const SPLIT_CHIP_W: f32 = 58.0;
 const SPLIT_READOUT_W: f32 = 46.0;
+/// Keys-face SCALE readout width: "C MAJOR" in Medium 12 with ≥ 8px padding.
+const SCALE_READOUT_W: f32 = 64.0;
+/// Arp face status field (mode · rate · octaves) and the least it is drawn at.
+const ARP_STATUS_W: f32 = 168.0;
+/// The narrowest face width (past its margins) the stacked SCALE control takes.
+const SCALE_NARROW_MIN_W: f32 = 96.0;
+const ARP_STATUS_MIN_W: f32 = 120.0;
 const BPM_STEP_W: f32 = 22.0;
 const BPM_VALUE_W: f32 = 66.0;
 const METRO_TAP_W: f32 = 48.0;
@@ -1667,6 +1853,30 @@ enum Hit {
     Background,
 }
 
+/// Which saved session a two-step confirm in the Sessions view is armed for.
+#[derive(Clone, Debug, PartialEq)]
+enum SessionConfirm {
+    Delete(String),
+    Overwrite(String),
+}
+
+/// Where autosave writes while no saved session is open.
+const AUTOSAVE_NAME: &str = "Autosave";
+/// Seconds between autosave checks.
+const AUTOSAVE_INTERVAL: f32 = 20.0;
+/// Seconds after a load before autosave records what was loaded.
+const AUTOSAVE_SETTLE: f32 = 2.0;
+
+/// Autosave of the open session (`session_autosave` in config.json).
+struct Autosave {
+    enabled: bool,
+    due: f32,
+    /// What is on disk under the open session's name, or what was loaded.
+    /// None: the next check records the rack without writing, so a fresh
+    /// start or a template never replaces a saved session unchanged.
+    saved: Option<crate::session::Session>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum StageView {
     #[default]
@@ -1688,6 +1898,48 @@ enum DockView {
     None,
     Keyboard,
     Assistant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum NavFilter {
+    #[default]
+    Channels,
+    Plugins,
+    All,
+}
+
+impl NavFilter {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Channels => "channels",
+            Self::Plugins => "plugins",
+            Self::All => "all",
+        }
+    }
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "channels" => Some(Self::Channels),
+            "plugins" => Some(Self::Plugins),
+            "all" | "" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum NavRow {
+    Rig { rig: u8, name: String },
+    Channel { rig: u8, node: u32, label: String, color: Option<Color32> },
+    Plugin { rig: u8, node: u32, owner: u32, label: String, kind_label: &'static str },
+}
+
+/// How long a Navigator jump flashes its mixer strip.
+const NAV_FLASH_S: f32 = 1.4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NavJumpTarget {
+    Node(u32),
+    Rig(u8),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1736,6 +1988,35 @@ enum Drag {
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
 /// axis). All rack drawing goes through this.
+/// The rack's margins and spacing (points). A small window drops to `TIGHT`
+/// before any face goes below its floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RackChrome {
+    /// Stage edge to the rack, each side.
+    margin: f32,
+    /// Stage top to the rack's view.
+    top: f32,
+    /// Room for the hint line under the rack.
+    hint: f32,
+    /// Rack edge to the units.
+    pad: f32,
+    /// Width of the side rails.
+    rail: f32,
+    /// Between units.
+    gap: f32,
+    /// Corner radius of the rack panel.
+    radius: f32,
+}
+
+impl RackChrome {
+    const ROOMY: Self = Self { margin: 30.0, top: 40.0, hint: 36.0, pad: 20.0, rail: 14.0, gap: 12.0, radius: 36.0 };
+    const TIGHT: Self = Self { margin: 8.0, top: 8.0, hint: 30.0, pad: 10.0, rail: 8.0, gap: 8.0, radius: 22.0 };
+}
+
+/// Readable floors of a rack unit (points).
+const MIN_UNIT_H: f32 = 136.0;
+const FACE_MIN_W: f32 = 150.0;
+
 #[derive(Clone, Copy)]
 struct Xform {
     center: Pos2, // screen
@@ -1779,6 +2060,8 @@ struct UndoSnap {
     session: crate::session::Session,
     rigs: Vec<crate::control::RigMeta>,
     mix: [crate::engine::RigMix; 8],
+    arm_master: bool,
+    arm_rigs: [bool; 8],
     active: usize,
     /// Per-voice source switches, device and patch name (not in the session).
     voices: Vec<VoiceRow>,
@@ -1802,8 +2085,14 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "load_sound", "list_sounds", "list_params", "list_cc_maps", "set_cc_map", "clear_cc_map",
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
-    "save_rig", "load_rig", "list_rig_presets",
-    "list_instruments", "install_instrument", "play_file", "stop_file", LOOK_TOOL,
+    "save_rig", "load_rig", "list_rig_presets", "load_template",
+    "list_instruments", "install_instrument", "play_file", "stop_file",
+    "set_scale", "set_arp",
+    "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
+    "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
+    "get_engine_info", "reset_engine_peaks",
+    "get_strip_knobs", "set_strip_knob",
+    "list_channels",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -1814,14 +2103,61 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo" | LOOK_TOOL)
+        || matches!(name, "record_status" | "measure_mix" | "listen" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig")
+    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks")
+}
+
+/// File-player settings carried by play_file/set_player args (AUM
+/// FilePlayer parity, issue #84). Builds the bus command when at least one
+/// is present; None fields keep the engine's current value.
+fn player_cfg_command(args: &serde_json::Value) -> Option<Command> {
+    let flag = |k: &str| args.get(k).and_then(|v| v.as_bool());
+    let num = |k: &str| args.get(k).and_then(|v| v.as_f64()).map(|n| n as f32);
+    let cfg = Command::SetPlayerCfg {
+        loop_on: flag("loop"),
+        sync: flag("sync"),
+        beats: num("beats"),
+        offset: num("offset"),
+        bpm: num("bpm"),
+    };
+    let Command::SetPlayerCfg { loop_on, sync, beats, offset, bpm } = &cfg else { unreachable!() };
+    (loop_on.is_some() || sync.is_some() || beats.is_some() || offset.is_some() || bpm.is_some())
+        .then_some(cfg)
+}
+
+/// Human summary of the settings a tool call carried ("" when none).
+fn player_cfg_summary(args: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = args.get("loop").and_then(|v| v.as_bool()) {
+        parts.push(if v { "looping".into() } else { "one-shot".into() });
+    }
+    if let Some(v) = args.get("sync").and_then(|v| v.as_bool()) {
+        parts.push(if v {
+            "synced to the tempo (starts at the next bar while the transport rolls)".into()
+        } else {
+            "own rate".into()
+        });
+    }
+    if let Some(v) = args.get("beats").and_then(|v| v.as_f64()) {
+        parts.push(format!("{v} beats"));
+    }
+    if let Some(v) = args.get("offset").and_then(|v| v.as_f64()) {
+        parts.push(format!("offset {v:+} beats"));
+    }
+    if let Some(v) = args.get("bpm").and_then(|v| v.as_f64()) {
+        parts.push(format!("{v} BPM file tempo"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(", "))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1995,6 +2331,7 @@ struct DemoApp {
     press: Option<(Hit, Pos2)>,
     pending: Option<Pending>,
     selected: Option<u32>,
+    selected_unit: Option<u32>,
     hover: Option<Hit>,
 
     key_leds: [f32; 13],
@@ -2011,8 +2348,12 @@ struct DemoApp {
     show_help: bool,
     show_stats: bool,
     session_name: String,
+    /// The saved session the rack came from or was last saved as; autosave
+    /// writes there (`AUTOSAVE_NAME` while None).
+    open_session: Option<String>,
+    autosave: Autosave,
     session_msg: String,
-    confirm_delete_session: Option<String>,
+    confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
@@ -2061,6 +2402,10 @@ struct DemoApp {
     /// stage view, the current pan offset, and the rack's clip (Some only
     /// while overflowing).
     rack_overflow: Vec2,
+    /// Margins and spacing the last `layout` used (roomy, or tight in a small window).
+    rack_chrome: RackChrome,
+    /// The stacks are laid out in one row (a short, wide window).
+    rack_flat: bool,
     rack_pan: Vec2,
     rack_clip: Option<Rect>,
     /// Unsimulated time carried to the next frame (fixed rope step).
@@ -2092,6 +2437,7 @@ struct DemoApp {
     caption_output_g: Option<Arc<theme::TrackedLabel>>,
     caption_echoes_g: Option<Arc<theme::TrackedLabel>>,
     caption_notes_g: Option<Arc<theme::TrackedLabel>>,
+    /// The arp face's caption (issue #90).
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
@@ -2122,7 +2468,6 @@ struct DemoApp {
     popup_open_at_start: bool,
     settings_decide_input: String,
     settings_act_input: String,
-    settings_perceive_input: String,
     settings_deepseek_key: String,
     settings_openrouter_key: String,
     settings_msg: String,
@@ -2132,6 +2477,8 @@ struct DemoApp {
     drop_ghost: Option<Rect>,
     /// Committed mid-column centers + stack height (drop-target geometry).
     col_x: Vec<f32>,
+    /// Each stack's committed (left x, width) in rack-local points.
+    col_span: Vec<(f32, f32)>,
     stack_tall_h: f32,
     /// Every instrument's sound library, scanned off this thread (rule 46).
     sounds: crate::sounds::Libraries,
@@ -2157,6 +2504,8 @@ struct DemoApp {
     /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
     /// up agent highlights.
     ui_mix_grace: [f32; 8],
+    /// Last frame's dt (peak-hold decay and strip animations read it).
+    ui_dt: f32,
     ui_transport_grace: f32,
     ui_node_grace: std::collections::HashMap<u32, f32>,
     /// Attribution hint when `exec_tool` triggers a bus command that lands back
@@ -2180,6 +2529,16 @@ struct DemoApp {
     dock_rect: Rect,
     /// Last frame's key area inside the dock keyboard (points).
     dock_kb_rect: Rect,
+    /// Software-keyboard MIDI strip (GitHub #97): pitch-bend wheel position
+    /// (-1..=1, 0 = center, springs back on release), modulation wheel
+    /// (0..=1, stays), sustain pedal (CC 64, the instruments hold the
+    /// notes themselves). The velocity slider drives the Keys VEL knob.
+    kb_bend: f32,
+    kb_mod: f32,
+    kb_sustain: bool,
+    /// Last frame's strip rects: [pitch wheel, mod wheel, sustain chip, VEL
+    /// slider] (tests + hit-testing).
+    kb_strip: [Rect; 4],
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
     /// Motion (design polish): staged fade-in after a template/session load.
@@ -2196,12 +2555,65 @@ struct DemoApp {
     cc_learn: Option<CcLearn>,
     knob_menu: Option<KnobMenu>,
     knob_menu_rect: Rect,
+    /// The Keys-face scale picker (issue #90), open on a SCALE readout.
+    scale_menu: Option<ScaleMenu>,
+    scale_menu_rect: Rect,
     rule_cc_num: u8,
     rule_param_id: u32,
     rule_param_filter: String,
     rule_param_cache: Option<(u32, Vec<(u32, String)>)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
+    /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
+    /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
+    /// node id like the session's strips (`remap_session` carries them).
+    strips: Vec<StripUiRow>,
+    /// Source strip display order (#77), flat across rigs: a rig's strips are
+    /// the entries whose node is in that rig, in this order; unlisted nodes
+    /// follow in unit order.
+    strip_order: Vec<u32>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id (knob
+    /// label or parameter name/id). Unlisted nodes use their default.
+    strip_knobs: std::collections::BTreeMap<u32, String>,
+    /// Grace deadlines per node so echoes of direct UI strip edits never
+    /// overwrite the mirror from the engine's own publication.
+    ui_strip_grace: std::collections::HashMap<u32, f32>,
+    /// Peak hold + clip per strip meter (#72), keyed by node id (sources) /
+    /// `rig_strip_key(rig)` (buses) / `MASTER_STRIP_KEY` (master out).
+    mixer_peaks: std::collections::HashMap<u32, PeakHold>,
+    /// Last frame's strip rects in the mixer stage: (rig, node, rect) —
+    /// drag-to-reorder hit tests and the layout tests.
+    mixer_strip_rects: Vec<(u8, u32, Rect)>,
+    /// Last frame's strip rects: a drag hit-tests strips drawn after it.
+    mixer_strip_rects_prev: Vec<(u8, u32, Rect)>,
+    /// Last frame's meter rects in the mixer stage: (key, rect incl. the
+    /// clip light on top) — the clip-clear click and the tests.
+    mixer_meter_rects: Vec<(u32, Rect)>,
+    /// Last frame's quick-knob rects in the mixer stage: (node_id, rect).
+    mixer_quick_knob_rects: Vec<(u32, Rect)>,
+    /// Active drag on a mixer quick knob: (node_id, knob_idx, unquantized value).
+    mixer_knob_drag: Option<(u32, usize, f32)>,
+    /// The strip being dragged to reorder (#77): (node, rig).
+    mixer_strip_drag: Option<(u32, u8)>,
+    /// Strip rename popup (#77): the node being renamed + its edit buffer.
+    strip_rename: Option<(u32, String)>,
+    /// Strip colour palette popup (#77): the node being coloured.
+    strip_color_pick: Option<u32>,
+    /// Insert picker popup (#74): the strip whose "+ insert" was pressed
+    /// (None = the master out's chain).
+    insert_pick: Option<Option<u32>>,
+    /// Insert picker's filter text.
+    insert_filter: String,
+    /// Navigator side panel (issue #108): hidden by default, never saved.
+    nav_open: bool,
+    nav_filter: NavFilter,
+    nav_folded: std::collections::HashSet<u32>,
+    nav_pan_target: Option<u32>,
+    mixer_scroll_target: Option<NavJumpTarget>,
+    mixer_flash: Option<(u32, f32)>,
+    nav_panel_rect: Rect,
+    nav_row_rects: Vec<(NavRow, Rect)>,
+    nav_chevron_rects: Vec<(u32, Rect)>,
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
     last_mix_rev: u64,
     /// Last adopted `GraphPub::meter_rev` (engine master-meter publication,
@@ -2209,6 +2621,9 @@ struct DemoApp {
     last_meter_rev: u64,
     /// Mirrored master-bus meter snapshot (read by `measure_mix`, `get_status`).
     master_meter: crate::meter::MeterSnapshot,
+    /// A `listen` call in flight: its thread records the master and asks the
+    /// listening model, and the tool batch waits for this answer.
+    listening: Option<std::sync::mpsc::Receiver<String>>,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
     /// A destructive assistant action waiting for the chat's Confirm /
@@ -2221,11 +2636,6 @@ struct DemoApp {
     transcript_runs: HashMap<usize, TranscriptRun>,
     /// Index in `assistant.history` of the `"user"` turn currently running.
     active_run_user_idx: Option<usize>,
-    rack_shot: RackShot,
-    /// The image attached to the chat message being written.
-    chat_image: Option<Image>,
-    /// Thumbnail texture handle for `chat_image`, freed when removed.
-    chat_thumb: Option<ChatThumb>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Save-rig-preset modal: (rig index, preset name being edited).
@@ -2318,6 +2728,20 @@ struct DemoApp {
     /// MIDI arrivals then fake the downstream envelope instead.
     edge_levels: Option<Arc<EdgeLevels>>,
 
+    // --- Engine load (DSP readout, Engine Info, get_engine_info) ---
+    /// Render time per unit from the engine (lock-free). None = no engine.
+    node_times: Option<Arc<crate::engine_info::NodeTimes>>,
+    /// The snapshot every reader shows, refreshed four times a second so
+    /// the numbers stay readable.
+    engine_stats: crate::engine_info::EngineStats,
+    engine_stats_at: f32,
+    engine_info_open: bool,
+    engine_info_rect: Rect,
+    dsp_chip_rect: Rect,
+    /// Stands in for the audio callback's counters, which no test has.
+    #[cfg(test)]
+    test_counters: Option<crate::engine_info::EngineCounters>,
+
     // --- Audio In (live mic/guitar/interface, issue #28) ---
     /// Per-node input level (pre-gain peak), engine → UI, lock-free.
     audio_in_levels: Option<Arc<AudioInLevels>>,
@@ -2358,6 +2782,14 @@ struct DemoApp {
     last_graph_rev: u64,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
+    /// Retired player buffers the engine handed back: dropped here (UI
+    /// thread) so a multi-MB decode never frees on the audio thread.
+    player_retire_rx: Option<rtrb::Consumer<Arc<[f32]>>>,
+    /// File-player state as the engine published it (loop/sync/enable —
+    /// rule 33: settings any frontend can change are mirrored from the
+    /// engine, never guessed locally). Read by get_status.
+    player: crate::engine::PlayerPub,
+    last_player_rev: u64,
     /// Master recorder status (engine writes `recording`/`dropped`; the writer
     /// thread owns the path/seconds). Read-only here — the REC button sends
     /// RecordStart/Stop through the command bus, the engine stays authoritative.
@@ -2365,6 +2797,10 @@ struct DemoApp {
     /// "Sync to transport" toggle mirror (the engine is authoritative via
     /// Command::SetRecordSync; this only drives the chip's display).
     record_sync: bool,
+    /// Record-arm mirror: master + per-rig stem arms (authoritative on engine).
+    arm_master: bool,
+    arm_rigs: [bool; 8],
+    ui_arm_grace: f32,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
 
@@ -2378,6 +2814,11 @@ struct DemoApp {
     editor_params: Vec<ParamDesc>,
     /// `ui_time` of the last plugin poll for main-control knobs.
     main_poll_at: f32,
+    /// Aeolus faces by node id: the stops its plugin has drawn and the
+    /// division the face shows (aeolus.rs).
+    aeolus_faces: HashMap<u32, AeolusFace>,
+    /// `ui_time` of the last read of the Aeolus plugins' stops.
+    aeolus_poll_at: f32,
     /// LV2 main-control values waiting for their knobs, which appear only
     /// once the plugin's controls are resolved: a loaded session's values
     /// (sent to the engine) and the values carried over a rack rebuild (the
@@ -2393,8 +2834,14 @@ struct DemoApp {
     lv2_editor_controls: Vec<crate::lv2::Lv2ControlDesc>,
     lv2_editor_presets: Vec<crate::lv2::Lv2Preset>,
     lv2_preset_name: Option<String>,
+    /// Plugin state the app restored into an LV2 node (a Vital patch), by
+    /// node id. The engine builds new LV2 instances on every graph load, so
+    /// sessions, rig edits and undo carry it and restore it.
+    lv2_states: HashMap<u32, Vec<u8>>,
     lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
+    /// Why the open editor's plugin window did not open.
+    plugin_window_error: Option<String>,
     /// Last single click on a unit (unit, time) for double-click detection.
     last_unit_click: Option<(usize, std::time::Instant)>,
 }
@@ -2431,6 +2878,7 @@ impl DemoApp {
             press: None,
             pending: None,
             selected: None,
+            selected_unit: None,
             hover: None,
             key_leds: [0.0; 13],
             note_leds: [0.0; 128],
@@ -2440,8 +2888,14 @@ impl DemoApp {
             show_help: false,
             show_stats: false,
             session_name: String::new(),
+            open_session: None,
+            autosave: Autosave {
+                enabled: crate::assistant::load_session_autosave(),
+                due: AUTOSAVE_SETTLE,
+                saved: None,
+            },
             session_msg: String::new(),
-            confirm_delete_session: None,
+            confirm_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
@@ -2468,6 +2922,8 @@ impl DemoApp {
             stats_line: String::new(),
             rack_w: 640.0,
             rack_overflow: Vec2::ZERO,
+            rack_chrome: RackChrome::ROOMY,
+            rack_flat: false,
             rack_pan: Vec2::ZERO,
             rack_clip: None,
             rack_h: 560.0,
@@ -2505,13 +2961,13 @@ impl DemoApp {
             popup_open_at_start: false,
             settings_decide_input: String::new(),
             settings_act_input: String::new(),
-            settings_perceive_input: String::new(),
             settings_deepseek_key: String::new(),
             settings_openrouter_key: String::new(),
             settings_msg: String::new(),
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
+            col_span: Vec::new(),
             stack_tall_h: 0.0,
             // Tests never scan the machine's patch folders.
             sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
@@ -2525,6 +2981,7 @@ impl DemoApp {
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
+            ui_dt: 1.0 / 60.0,
             ui_transport_grace: -1.0,
             ui_node_grace: std::collections::HashMap::new(),
             pending_agent_origin: None,
@@ -2537,6 +2994,10 @@ impl DemoApp {
             fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
             dock_kb_rect: Rect::NOTHING,
+            kb_bend: 0.0,
+            kb_mod: 0.0,
+            kb_sustain: false,
+            kb_strip: [Rect::NOTHING; 4],
             hw_leds: Vec::new(),
             load_fade: 1.0,
             unit_hover: Vec::new(),
@@ -2546,22 +3007,46 @@ impl DemoApp {
             cc_learn: None,
             knob_menu: None,
             knob_menu_rect: Rect::NOTHING,
+            scale_menu: None,
+            scale_menu_rect: Rect::NOTHING,
             rule_cc_num: 74,
             rule_param_id: 0,
             rule_param_filter: String::new(),
             rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
+            strips: Vec::new(),
+            strip_order: Vec::new(),
+            strip_knobs: std::collections::BTreeMap::new(),
+            ui_strip_grace: std::collections::HashMap::new(),
+            mixer_peaks: std::collections::HashMap::new(),
+            mixer_strip_rects: Vec::new(),
+            mixer_strip_rects_prev: Vec::new(),
+            mixer_meter_rects: Vec::new(),
+            mixer_quick_knob_rects: Vec::new(),
+            mixer_knob_drag: None,
+            mixer_strip_drag: None,
+            strip_rename: None,
+            strip_color_pick: None,
+            insert_pick: None,
+            insert_filter: String::new(),
+            nav_open: false,
+            nav_filter: NavFilter::Channels,
+            nav_folded: std::collections::HashSet::new(),
+            nav_pan_target: None,
+            mixer_scroll_target: None,
+            mixer_flash: None,
+            nav_panel_rect: Rect::NOTHING,
+            nav_row_rects: Vec::new(),
+            nav_chevron_rects: Vec::new(),
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
+            listening: None,
             confirm_delete_rig: None,
             pending_confirm: None,
             tool_batch: None,
             transcript_runs: HashMap::new(),
             active_run_user_idx: None,
-            rack_shot: RackShot::default(),
-            chat_image: None,
-            chat_thumb: None,
             rename_rig_dialog: None,
             save_rig_dialog: None,
             load_rig_dialog: None,
@@ -2613,6 +3098,14 @@ impl DemoApp {
             bus: None,
             out_level: None,
             edge_levels: None,
+            node_times: None,
+            engine_stats: Default::default(),
+            engine_stats_at: f32::NEG_INFINITY,
+            engine_info_open: false,
+            engine_info_rect: Rect::NOTHING,
+            dsp_chip_rect: Rect::NOTHING,
+            #[cfg(test)]
+            test_counters: None,
             audio_in_levels: None,
             audio_in_tx: None,
             audio_in_streams: std::collections::HashMap::new(),
@@ -2631,13 +3124,21 @@ impl DemoApp {
             graph_pub: None,
             last_graph_rev: 0,
             player_ctrl: None,
+            player_retire_rx: None,
+            player: crate::engine::PlayerPub::default(),
+            last_player_rev: 0,
             recorder: None,
             record_sync: false,
+            arm_master: true,
+            arm_rigs: [false; 8],
+            ui_arm_grace: 0.0,
             graph_sig: Vec::new(),
             editor_open: false,
             editor_rig: 0,
             editor_params: Vec::new(),
             main_poll_at: 0.0,
+            aeolus_faces: HashMap::new(),
+            aeolus_poll_at: f32::NEG_INFINITY,
             lv2_main_restore: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
@@ -2646,8 +3147,10 @@ impl DemoApp {
             lv2_editor_controls: Vec::new(),
             lv2_editor_presets: Vec::new(),
             lv2_preset_name: None,
+            lv2_states: HashMap::new(),
             lv2_editor_request: None,
             editor_status: String::new(),
+            plugin_window_error: None,
             last_unit_click: None,
         };
 
@@ -2676,23 +3179,20 @@ impl DemoApp {
         self.units.clear();
         self.cables.clear();
         self.base_graph = graph.clone();
+        self.lv2_states.retain(|node, _| matches!(graph.node(*node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. })));
         for node in &graph.nodes {
             self.units.push(make_unit(node));
         }
         self.fit_voice_tables(&old_clap_nodes);
-        // Classify LV2 instruments (hot-wire matrix sink columns). Rare
-        // structural op: the discovery scan runs only when LV2 nodes exist.
+        // Classify LV2 instruments (hot-wire matrix sink columns) from the
+        // background scan: a discovery here took 1.3 s on every agent edit
+        // adopted through build_rack. A scan still running reclassifies the
+        // units when it lands (poll_plugin_scan).
         if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
-            let infos = lv2_discover();
-            for u in &mut self.units {
-                if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
-                    u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-                    if u.lv2_inst {
-                        u.sub = "lv2 synth".into();
-                        u.sub_g = None;
-                    }
-                }
+            if !self.plugins_loaded {
+                self.start_plugin_scan(false);
             }
+            self.classify_lv2_units();
         }
         // Size the rect slots before adding cables (add_cable_id reads them to
         // seed the spring rest shape; layout() fills real rects on frame 1).
@@ -2726,12 +3226,18 @@ impl DemoApp {
         self.compute_groups();
         // Reset interaction state that referenced the old rack.
         self.selected = None;
+        self.selected_unit = None;
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
         self.knob_menu = None;
         self.knob_menu_rect = Rect::NOTHING;
         self.hover = None;
+        self.nav_pan_target = None;
+        self.mixer_scroll_target = None;
+        self.mixer_flash = None;
+        let live_nodes: std::collections::HashSet<u32> = self.units.iter().map(|u| u.node_id).collect();
+        self.nav_folded.retain(|id| live_nodes.contains(id));
         self.graph_sig.clear(); // force shared-graph re-mirror
         self.prewarm_sound_libraries();
         // No load_fade reset here: build_rack also serves sync adoptions
@@ -2744,6 +3250,14 @@ impl DemoApp {
         self.cc_learn = None;
         self.rule_param_cache = None;
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
+        // Strip meters hold per-node transients: a rebuilt rack means new
+        // ids, so peak holds and clip lights start over (#72). The strip
+        // rows themselves are session state, restored by apply_session.
+        self.mixer_peaks.clear();
+        self.mixer_strip_drag = None;
+        self.strip_rename = None;
+        self.strip_color_pick = None;
+        self.insert_pick = None;
         // Open/refresh input captures for every AudioIn node (structural only).
         self.sync_audio_in_captures();
     }
@@ -2794,6 +3308,14 @@ impl DemoApp {
             if !in_rig(u) || matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { claimed[i] = true; }
         }
         let mut cols: Vec<Vec<usize>> = Vec::new();
+        // MIDI strips sit in front of the instruments they feed, in chain
+        // (node) order: one single-unit column each.
+        for i in 0..self.units.len() {
+            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::MidiFx) {
+                claimed[i] = true;
+                cols.push(vec![i]);
+            }
+        }
         for i in 0..self.units.len() {
             // Skip claimed units: another rig's synth must not open an
             // (invisible) column in this rig's view.
@@ -2815,7 +3337,7 @@ impl DemoApp {
             cols.push(col);
         }
         for i in 0..self.units.len() {
-            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_)) {
+            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_) | UnitKind::Arp) {
                 claimed[i] = true;
                 cols.push(vec![i]);
             }
@@ -2844,6 +3366,7 @@ impl DemoApp {
         self.compute_groups();
         // Interaction state referenced the old view's geometry.
         self.selected = None;
+        self.selected_unit = None;
         self.pending = None;
         self.drag = Drag::None;
         self.press = None;
@@ -2901,9 +3424,15 @@ impl DemoApp {
             .min_by(|a, b| (drop.x - a.1).abs().total_cmp(&(drop.x - b.1).abs()))
             .map(|(j, _)| j)?;
         let others = self.stack_cols.get(tj)?.iter().filter(|&&u| u != unit).count();
-        let pad = 20.0;
-        let slot = self.stack_tall_h / (others + 1) as f32;
-        let tr = (((drop.y - pad) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
+        // A stack reads top to bottom, or left to right in a flat rack.
+        let (start, along, span) = if self.rack_flat {
+            let (x0, w) = self.col_span[tj];
+            (x0, drop.x, w)
+        } else {
+            (self.rack_chrome.pad, drop.y, self.stack_tall_h)
+        };
+        let slot = span / (others + 1) as f32;
+        let tr = (((along - start) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
         Some((tj, tr))
     }
 
@@ -3033,13 +3562,11 @@ impl DemoApp {
                 (&["Ctrl", "drag"], "a unit to rearrange the rack"),
                 (&["click"], "a cable to select its path"),
                 (&["Del"], "remove the selected cable"),
-                (&["F9"], "plugin browser"),
+                (&["B", "F9"], "plugin browser"),
                 (&["M", "F10"], "mixer view (sources → rig bus → master)"),
-                (&["N"], "MIDI matrix view (also F11)"),
-                (&["C"], "chat with the assistant (also F12)"),
-                (&["B"], "plugin browser (also F9)"),
-                (&["F11"], "MIDI matrix view"),
-                (&["F12"], "assistant"),
+                (&["N", "F11"], "MIDI matrix view"),
+                (&["C", "F12"], "chat with the assistant"),
+                (&["Q"], "navigator side list (rigs, channels & plugins)"),
                 (&[","], "settings"),
                 (&["I"], "MIDI + performance info"),
             ]),
@@ -3061,62 +3588,84 @@ impl DemoApp {
         self.toolbar_top = rect.top();
         // Adaptive rack: KEYS (left, full height) | one column per instrument
         // stack (instrument + its FX chain) | MASTER (right, full height).
-        let rows = self.layout_rows.max(1);
-        let n_mid = self.stack_cols.len();
-        // Readable floors: below them the rack grows past the stage and pans
-        // (wheel / trackpad) instead of squishing faces.
-        const MIN_UNIT_H: f32 = 140.0;
-        const MIN_MID_W: f32 = 200.0;
-        const MIN_SIDE_W: f32 = 220.0;
+        // A window too short for the stacks but wide enough lays each chain
+        // out in one row instead (instrument, then its FX, left to right).
+        let stacked_rows = self.layout_rows.max(1);
+        let floor = |u: usize| self.face_min_w(u);
+        let keys_floor = self.keys_unit.map_or(FACE_MIN_W, floor);
+        let master_floor = self.master_unit.map_or(FACE_MIN_W, floor);
+        let mid_floor = self.stack_cols.iter().flatten().map(|&u| floor(u)).fold(FACE_MIN_W, f32::max);
+        let n_stacks = self.stack_cols.len();
+        let n_flat: usize = self.stack_cols.iter().map(|c| c.len()).sum();
         // Caps sized for the 1.6x design scale (1600x1000 points): the rack
         // uses the stage instead of floating small in it.
-        let fit_w = (rect.width() - 60.0).clamp(560.0, 1480.0);
-        // No masthead any more (user 2026-11-15: Play button removed, brand in
-        // the top bar) — the stage overhead is just margins + the hint line.
-        self.unit_h = ((rect.height() - 150.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
-        let gap = 12.0;
-        let pad = 20.0;
-        let rail = 14.0;
-        self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
-        let n_cols = n_mid + 2; // keys + stacks + master
+        let usable = |c: &RackChrome, n_mid: usize| (rect.width() - 2.0 * c.margin).min(1480.0)
+            - 2.0 * (c.pad + c.rail) - (n_mid as f32 + 1.0) * c.gap;
+        let unit_room = |c: &RackChrome, rows: usize| {
+            let rf = rows as f32;
+            (rect.height() - c.top - c.hint - 2.0 * c.pad - (rf - 1.0) * c.gap) / rf
+        };
+        let floor_w = |n_mid: usize| keys_floor + master_floor + n_mid as f32 * mid_floor;
+        let fits = |c: &RackChrome, n_mid: usize, rows: usize| usable(c, n_mid) >= floor_w(n_mid) && unit_room(c, rows) >= MIN_UNIT_H;
+        let (ch, flat) = if fits(&RackChrome::ROOMY, n_stacks, stacked_rows) {
+            (RackChrome::ROOMY, false)
+        } else if stacked_rows > 1 && unit_room(&RackChrome::TIGHT, stacked_rows) < MIN_UNIT_H
+            && fits(&RackChrome::TIGHT, n_flat, 1) {
+            (RackChrome::TIGHT, true)
+        } else {
+            (RackChrome::TIGHT, false)
+        };
+        self.rack_chrome = ch;
+        self.rack_flat = flat;
+        let (rows, n_mid) = if flat { (1, n_flat) } else { (stacked_rows, n_stacks) };
+        let rf = rows as f32;
+        let n_cols = n_mid + 2; // keys + middle columns + master
+        self.unit_h = unit_room(&ch, rows).clamp(MIN_UNIT_H, 250.0);
+        let (gap, pad, rail) = (ch.gap, ch.pad, ch.rail);
+        self.rack_h = pad * 2.0 + rf * self.unit_h + (rf - 1.0) * gap;
         let gaps = (n_cols as f32 - 1.0) * gap;
-        let usable_fit = fit_w - 2.0 * (pad + rail) - gaps;
+        let usable_fit = usable(&ch, n_mid);
         let side_frac = if n_mid == 0 { 0.5 } else if n_mid <= 2 { 0.26 } else { 0.20 };
         let mid_frac = if n_mid == 0 { 0.0 } else { (1.0 - 2.0 * side_frac) / n_mid as f32 };
-        let (mut side_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
-        if n_mid > 0 && mid_w < MIN_MID_W {
-            mid_w = MIN_MID_W;
-            side_w = side_w.max(MIN_SIDE_W);
-        }
+        let (mut keys_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
         // A lone stack must not stretch across half the stage (a one-synth
         // rig read as a mostly empty face): cap the column, the rack centers.
         const MAX_MID_W: f32 = 420.0;
         if n_mid > 0 && mid_w > MAX_MID_W {
             mid_w = MAX_MID_W;
-            side_w = side_w.min(MAX_MID_W * 1.1);
+            keys_w = keys_w.min(MAX_MID_W * 1.1);
         }
-        self.rack_w = 2.0 * (pad + rail) + 2.0 * side_w + n_mid as f32 * mid_w + gaps;
-        let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
-        widths.push(side_w); // keys
-        for _ in 0..n_mid { widths.push(mid_w); }
-        widths.push(side_w); // master
-        let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
-        let mut x = pad + rail;
-        for w in &widths { xs.push(x); x += w + gap; }
-        let tall_h = rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
+        let mut master_w = keys_w;
+        if keys_w < keys_floor.max(master_floor) || (n_mid > 0 && mid_w < mid_floor) {
+            // Floors first (Keys and Master each their own), the rest of the
+            // stage shared as before.
+            let extra = (usable_fit - floor_w(n_mid)).max(0.0);
+            keys_w = keys_floor + extra * side_frac;
+            master_w = master_floor + extra * side_frac;
+            mid_w = mid_floor + extra * mid_frac;
+        }
+        self.rack_w = 2.0 * (pad + rail) + keys_w + master_w + n_mid as f32 * mid_w + gaps;
+        let mid_x = |j: usize| pad + rail + keys_w + gap + j as f32 * (mid_w + gap);
+        let tall_h = rf * self.unit_h + (rf - 1.0) * gap;
         let mk = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
         if self.unit_rects.len() != self.units.len() {
             self.unit_rects = vec![Rect::NOTHING; self.units.len()];
         }
         if let Some(k) = self.keys_unit {
-            self.unit_rects[k] = mk(xs[0], pad, widths[0], tall_h);
+            self.unit_rects[k] = mk(pad + rail, pad, keys_w, tall_h);
         }
         if let Some(m) = self.master_unit {
-            self.unit_rects[m] = mk(xs[n_cols - 1], pad, widths[n_cols - 1], tall_h);
+            self.unit_rects[m] = mk(mid_x(n_mid), pad, master_w, tall_h);
         }
-        // Column centers of the COMMITTED layout: the drop target is judged
+        // Stack spans of the COMMITTED layout: the drop target is judged
         // from these, so the live preview below cannot feed back into it.
-        self.col_x = (0..n_mid).map(|j| xs[j + 1] + widths[j + 1] / 2.0).collect();
+        let mut first = 0;
+        self.col_span = self.stack_cols.iter().map(|c| {
+            let (x0, n) = if flat { (mid_x(first), c.len().max(1)) } else { (mid_x(first), 1) };
+            first += if flat { c.len() } else { 1 };
+            (x0, n as f32 * mid_w + (n as f32 - 1.0) * gap)
+        }).collect();
+        self.col_x = self.col_span.iter().map(|(x, w)| x + w / 2.0).collect();
         self.stack_tall_h = tall_h;
         // While Ctrl-dragging a unit, lay the others out AS IF it were
         // released here (user: show the layout before release); the ghost
@@ -3127,28 +3676,33 @@ impl DemoApp {
         };
         let cols = preview.as_ref().map(|(_, c)| c.clone()).unwrap_or_else(|| self.stack_cols.clone());
         self.drop_ghost = None;
-        for j in 0..n_mid.min(cols.len()) {
-            let cx = xs[j + 1];
-            let cw = widths[j + 1];
-            // A shorter stack stretches its units to the full column height
-            // (one rack size for every rig, no empty rows).
-            let len = cols[j].len().max(1);
-            let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
-            for r in 0..cols[j].len() {
-                let u = cols[j][r];
-                let y = pad + r as f32 * (uh + gap);
-                let rr = mk(cx, y, cw, uh);
-                if preview.as_ref().map_or(false, |(d, _)| *d == u) {
-                    self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
-                } else {
-                    self.unit_rects[u] = rr;
+        let mut place = |u: usize, rr: Rect| {
+            if preview.as_ref().map_or(false, |(d, _)| *d == u) {
+                self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
+            } else {
+                self.unit_rects[u] = rr;
+            }
+        };
+        if flat {
+            for (i, &u) in cols.iter().flatten().enumerate().take(n_mid) {
+                place(u, mk(mid_x(i), pad, mid_w, tall_h));
+            }
+        } else {
+            for j in 0..n_mid.min(cols.len()) {
+                // A shorter stack stretches its units to the full column height
+                // (one rack size for every rig, no empty rows).
+                let len = cols[j].len().max(1);
+                let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
+                for r in 0..cols[j].len() {
+                    place(cols[j][r], mk(mid_x(j), pad + r as f32 * (uh + gap), mid_w, uh));
                 }
             }
         }
-        // Stage view for the rack: below the masthead, above the hint line.
+        // Stage view for the rack: above the hint line.
+        let side_m = ch.margin.min(16.0);
         let view = Rect::from_min_max(
-            Pos2::new(rect.left() + 16.0, rect.top() + 40.0),
-            Pos2::new(rect.right() - 16.0, rect.bottom() - 36.0),
+            Pos2::new(rect.left() + side_m, rect.top() + ch.top),
+            Pos2::new(rect.right() - side_m, rect.bottom() - ch.hint),
         );
         let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
         if ov != self.rack_overflow {
@@ -3160,11 +3714,12 @@ impl DemoApp {
             self.rack_pan.x.clamp(-ov.x / 2.0, ov.x / 2.0),
             self.rack_pan.y.clamp(-ov.y / 2.0, ov.y / 2.0),
         );
-        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0).then_some(view.expand(8.0));
+        // The clip keeps 8 px of air around the view, except into the hint line.
+        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0)
+            .then_some(Rect::from_min_max(view.min - Vec2::splat(8.0), Pos2::new(view.max.x + 8.0, view.max.y)));
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
-            if ov.y > 0.0 { view.center().y - self.rack_h / 2.0 + self.rack_pan.y }
-            else { rect.center().y - self.rack_h / 2.0 - 8.0 },
+            view.center().y - self.rack_h / 2.0 + self.rack_pan.y,
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -3573,7 +4128,7 @@ impl DemoApp {
                 }
             }
         }
-        let Some(pub_) = &self.graph_pub else { return };
+        let Some(pub_) = self.graph_pub.clone() else { return };
         let Ok(g) = pub_.lock() else { return };
         let now = self.ui_time;
         // Mixer mirror: adopt remote (MCP/CLI/agent) SetRigMix changes —
@@ -3587,6 +4142,53 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            // Strip mirror (#73/#74): adopt the engine's per-node table the
+            // same way (rule 33) — a remote SetStripMix/SetStripBypass shows
+            // in the mixer without a rebuild. UI-side echoes are inside
+            // their grace window and keep the local row.
+            let mut strip_nodes: Vec<u32> = Vec::new();
+            let mut strip_changed: Vec<u32> = Vec::new();
+            for p in g.strips.iter().filter(|p| p.node != u32::MAX) {
+                strip_nodes.push(p.node);
+                if now >= self.ui_strip_grace.get(&p.node).copied().unwrap_or(-1.0) {
+                    let m = p.mix;
+                    let cur = self.strip_row(p.node);
+                    if (cur.pan, cur.mute, cur.solo, cur.bypass) != (m.pan, m.mute, m.solo, m.bypass) {
+                        strip_changed.push(p.node);
+                    }
+                    self.with_strip_row(p.node, |row| {
+                        row.pan = m.pan;
+                        row.mute = m.mute;
+                        row.solo = m.solo;
+                        row.bypass = m.bypass;
+                    });
+                }
+            }
+            for row in self.strips.iter_mut() {
+                if !strip_nodes.contains(&row.node) && now >= self.ui_strip_grace.get(&row.node).copied().unwrap_or(-1.0) {
+                    // The engine dropped the node's state (un-mute, un-bypass):
+                    // back to the plain row, colour and collapse stay.
+                    row.pan = 0.0;
+                    row.mute = false;
+                    row.solo = false;
+                    row.bypass = false;
+                }
+            }
+            self.strips.retain(|s| !s.is_plain());
+            if !strip_changed.is_empty() {
+                let pending = self.take_pending_agent_origin();
+                let n_rigs = self.rig_count();
+                for n in &strip_changed {
+                    if pending.is_none() {
+                        let uname = self.unit_display_name(*n);
+                        let rig = self.units.iter().find(|u| u.node_id == *n).map_or(0, |u| if n_rigs > 1 { u.rig as usize } else { 0 });
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Source mix → {uname}"), vec![*n], now);
+                    } else {
+                        self.agent_activity.touch_node(*n, now);
+                    }
+                }
+            }
             // System-audio GAIN knobs follow SetSystemAudio from any frontend
             // (one engine-wide gain; `sent` matches so it is not echoed back).
             if !matches!(self.drag, Drag::Knob { .. }) {
@@ -3633,6 +4235,23 @@ impl DemoApp {
                 self.time = 0.0;
             }
             self.playing = now_playing;
+        }
+        if now >= self.ui_arm_grace {
+            if let Some(rec) = &self.recorder {
+                if rec.is_live() {
+                    let s = rec.snapshot();
+                    self.arm_master = s.armed_master;
+                    for (i, a) in s.armed_rigs.iter().enumerate().take(8) {
+                        self.arm_rigs[i] = *a;
+                    }
+                }
+            }
+        }
+        // File-player mirror (rule 33): settings can come from any frontend
+        // (chat, MCP, CLI send) — the engine's publication is the truth.
+        if g.player_rev != self.last_player_rev {
+            self.last_player_rev = g.player_rev;
+            self.player = g.player;
         }
         let graph_rev_changed = g.rev != self.last_graph_rev;
         // The engine's voice binding. While it has not published the load
@@ -3731,6 +4350,14 @@ impl DemoApp {
             }
             self.base_graph.set_split(n.id, n.split);
             if let Some(sg) = shared.as_mut() { sg.set_split(n.id, n.split); }
+            // Scale snap (a Keys property, issue #90): adopted in place like
+            // the split — a remote set_scale flips the face without a rebuild.
+            let was_scale = self.base_graph.node(n.id).map(|old| old.scale);
+            if was_scale.is_some_and(|w| w != n.scale) && now >= self.ui_node_grace.get(&n.id).copied().unwrap_or(-1.0) {
+                touched_nodes.push(n.id);
+            }
+            self.base_graph.set_scale(n.id, n.scale);
+            if let Some(sg) = shared.as_mut() { sg.set_scale(n.id, n.scale); }
             // Zone octaves ride along (set_split above reset them on unsplit).
             if n.split.is_some() {
                 let was_oct = self.base_graph.node(n.id).map(|o| o.zone_octave);
@@ -3969,6 +4596,7 @@ impl DemoApp {
         let rules = std::mem::take(&mut self.rule_edits);
         self.build_rack(&adopted, &[]);
         self.rule_edits = rules;
+        self.strip_knobs.retain(|n, _| self.units.iter().any(|u| u.node_id == *n));
         self.lv2_main_restore = carried.into_iter().map(|p| (p, false)).collect();
         for (nid, param, ki, disp, from, gt) in knob_glides {
             if let Some(u) = self.units.iter_mut().find(|u| u.node_id == nid) {
@@ -4046,11 +4674,13 @@ impl DemoApp {
                     None => format!("Add {what}"),
                 }
             }
-            LOOK_TOOL => "Look at the rack".into(),
             "get_graph" => "Read rack graph".into(),
             "get_status" => "Check status".into(),
             "get_rigs" => "List rigs".into(),
+            "list_channels" => "List channels".into(),
             "measure_mix" => "Measure mix".into(),
+            "get_engine_info" => "Check engine load".into(),
+            "reset_engine_peaks" => "Reset engine peaks".into(),
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
                 format!("Play {}", note_name(note))
@@ -4068,6 +4698,41 @@ impl DemoApp {
             "set_rig_mix" => {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 format!("Mix {}", self.rig_name(rig))
+            }
+            "set_strip_mix" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Source mix → {}", self.unit_display_name(node))
+            }
+            "set_node_bypass" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Bypass {}", self.unit_display_name(node))
+            }
+            "add_insert" => format!(
+                "Insert → {}",
+                args.get("name").and_then(|v| v.as_str())
+                    .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
+                    .or_else(|| args.get("uri").and_then(|v| v.as_str()))
+                    .unwrap_or("effect")
+            ),
+            "remove_insert" => {
+                let fx = args.get("fx").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Remove insert {}", self.unit_display_name(fx))
+            }
+            "rename_strip" => {
+                let new_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("strip");
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Rename {} → {new_name}", self.unit_display_name(node))
+            }
+            "set_strip_color" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Colour → {}", self.unit_display_name(node))
+            }
+            "move_strip" => "Reorder strip".into(),
+            "collapse_strip" => "Collapse strip".into(),
+            "get_strip_knobs" => "Read strip knobs".into(),
+            "set_strip_knob" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Quick knob → {}", self.unit_display_name(node))
             }
             "set_rig_device" => match args.get("rig").and_then(|v| v.as_u64()) {
                 Some(r) => format!("Set {} MIDI input", self.rig_name(r as usize)),
@@ -4123,6 +4788,11 @@ impl DemoApp {
             "record_start" => "Start recording".into(),
             "record_stop" => "Stop recording".into(),
             "record_status" => "Recording status".into(),
+            "set_record_arm" => match args.get("rig").and_then(|v| v.as_u64()) {
+                Some(r) if !args.get("target").and_then(|v| v.as_str()).is_some_and(|t| t.eq_ignore_ascii_case("master")) =>
+                    format!("Arm rig {} for recording", r + 1),
+                _ => "Arm master for recording".into(),
+            },
             "system_audio" => "System audio level".into(),
             "play_file" => "Play audio file".into(),
             "stop_file" => "Stop audio file".into(),
@@ -4205,20 +4875,21 @@ impl DemoApp {
         if let Some(mut batch) = self.tool_batch.take() {
             if let Some((waiting, chip_idx)) = batch.waiting.take() {
                 let outcome = match &waiting {
-                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
-                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
-                        None if std::time::Instant::now() < *deadline => None,
-                        shot => Some(rack_shot_output(said, shot)),
-                    },
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit),
                     Waiting::SoundScan { call, deadline } => {
                         let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
-                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args).into())
+                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args))
                     }
+                    Waiting::Listen(answer) => match answer.try_recv() {
+                        Ok(text) => Some(text),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("listen: the listening thread ended without an answer".into()),
+                    },
                 };
                 match outcome {
                     Some(result) => {
                         if let Some(ci) = chip_idx {
-                            self.finish_chip(batch.user_idx, ci, &result.text);
+                            self.finish_chip(batch.user_idx, ci, &result);
                         }
                         batch.results.push(result);
                     }
@@ -4238,20 +4909,21 @@ impl DemoApp {
                 let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
                 let before = engine_edit.then(|| self.rack_ids());
                 let result = self.run_assistant_tool(&call.name, &call.args);
+                if let Some(answer) = self.listening.take().filter(|_| call.name == "listen") {
+                    batch.waiting = Some((Waiting::Listen(answer), chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
                 batch.waiting = match before {
                     Some(before) => Some((
                         Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
-                        chip_idx,
-                    )),
-                    None if call.name == LOOK_TOOL => Some((
-                        Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT },
                         chip_idx,
                     )),
                     None => {
                         if let Some(ci) = chip_idx {
                             self.finish_chip(batch.user_idx, ci, &result);
                         }
-                        batch.results.push(result.into());
+                        batch.results.push(result);
                         continue;
                     }
                 };
@@ -4379,7 +5051,7 @@ impl DemoApp {
     fn toggle_stage(&mut self, view: StageView) {
         self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
         if self.stage_view != StageView::Sessions {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
         }
         if self.stage_view != StageView::Settings {
             self.settings_msg.clear();
@@ -4394,7 +5066,15 @@ impl DemoApp {
     fn capture_undo(&mut self) -> Option<UndoSnap> {
         let session = self.capture_session("Undo").ok()?;
         let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
-        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, voices: self.voice_rows() })
+        Some(UndoSnap {
+            session,
+            rigs,
+            mix: self.rig_mix,
+            arm_master: self.arm_master,
+            arm_rigs: self.arm_rigs,
+            active: self.active_rig,
+            voices: self.voice_rows(),
+        })
     }
 
     fn voice_rows(&self) -> Vec<VoiceRow> {
@@ -4461,6 +5141,11 @@ impl DemoApp {
         self.adopt_rig_devices();
         self.restore_voice_rows(&snap.voices);
         self.rig_mix = snap.mix;
+        self.set_record_arm(None, snap.arm_master);
+        for i in 0..list.len().min(8) {
+            self.set_record_arm(Some(i), snap.arm_rigs[i]);
+        }
+        self.sync_recorder_rig_names();
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
         for i in 0..list.len() { self.send_rig_mix(i); }
@@ -4492,9 +5177,16 @@ impl DemoApp {
         let playing = self.take_play_until > self.ui_time;
         let gain = if playing { 0.0 } else { 0.8 };
         if let Some(pc) = &self.player_ctrl {
-            if playing { pc.stop() } else { pc.play(path) }
+            if !playing {
+                pc.play(path);
+            }
         }
         if let Some(bus) = &self.bus {
+            // The play-enable is the engine's (AUM circular toggle): stopping
+            // disables it; the load from pc.play() enables and starts.
+            if playing {
+                let _ = bus.lock().unwrap().send(Command::SetPlayerEnable { on: false });
+            }
             let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
         }
         self.take_play_until = if playing { 0.0 } else { self.ui_time + secs as f32 + 0.2 };
@@ -4515,13 +5207,18 @@ impl DemoApp {
     }
 
     fn stage_sheet_rects(&self, rect: Rect, min_h: f32) -> (Rect, Rect) {
-        let top = self.toolbar_top + 20.0;
-        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min((rect.width() - 16.0).max(200.0));
+        // A small stage gives its margins to the sheet's content; the sheet
+        // never reaches past the stage (its users clip to it, so a short
+        // stage scrolls instead of painting into a dock).
+        let tight = rect.width() < 1000.0 || rect.height() < 560.0;
+        let (margin, inner) = if tight { (8.0, Vec2::new(18.0, 14.0)) } else { (20.0, Vec2::new(32.0, 26.0)) };
+        let top = self.toolbar_top + margin;
+        let w = (rect.width() - 3.0 * margin).clamp(560.0, 1240.0).min((rect.width() - 2.0 * margin).max(200.0));
         let sheet = Rect::from_min_max(
             Pos2::new(rect.center().x - w / 2.0, top),
-            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + min_h)),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - margin).max(top + min_h).min(rect.bottom())),
         );
-        (sheet, sheet.shrink2(Vec2::new(32.0, 26.0)))
+        (sheet, sheet.shrink2(inner))
     }
 
     /// Snapshot the current patch + knobs + plugin state into a Session.
@@ -4568,6 +5265,11 @@ impl DemoApp {
                 rig += 1;
             }
         }
+        for (&node, state) in &self.lv2_states {
+            if let Some(NodeKind::Lv2 { uri }) = s.graph.node(node).map(|n| n.kind.clone()) {
+                s.set_plugin_state(node, uri.as_str(), state.clone());
+            }
+        }
         // Shaped matrix routes and CC/MIDI-learn bindings (rule 33 mirror).
         let mut rules: Vec<SavedRule> = self.rule_edits.iter()
             .filter(|((_, dest), _)| s.graph.node(*dest).is_some())
@@ -4578,6 +5280,21 @@ impl DemoApp {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
+        // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
+        // display order, keyed by node like every other session value.
+        for u in &self.units {
+            let row = self.strip_row(u.node_id);
+            if !row.is_plain() { s.set_strip(row.saved()); }
+        }
+        let order: Vec<u32> = self.strip_order.iter()
+            .filter(|n| self.units.iter().any(|u| u.node_id == **n))
+            .copied().collect();
+        if !order.is_empty() { s.set_strip_order(order); }
+        for (&node, label) in &self.strip_knobs {
+            if s.graph.node(node).is_some() {
+                s.set_strip_knob(node, label.clone());
+            }
+        }
         Ok(s)
     }
 
@@ -4624,6 +5341,13 @@ impl DemoApp {
                 self.clap_plugin_ids.remove(pos);
                 self.clap_voice_ids.remove(pos);
                 main.retire(slot.into_voice());
+            }
+        }
+        // Retired file-player buffers: dropping them here is the whole
+        // point (the audio thread only moves the Arc into the ring).
+        while let Some(rx) = self.player_retire_rx.as_mut() {
+            if rx.pop().is_err() {
+                break;
             }
         }
     }
@@ -4744,9 +5468,10 @@ impl DemoApp {
         self.load_graph_into_engine(&s.graph);
         self.voice_hold_rev = Some(self.last_graph_rev);
         // The editor referenced the old voice mapping; close it.
-        self.editor_open = false;
+        if std::mem::take(&mut self.editor_open) {
+            self.editor_status = "editor closed (rack reloaded)".into();
+        }
         self.editor_params.clear();
-        self.editor_status = "editor closed (rack reloaded)".into();
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
         self.reset_rig_inputs();
@@ -4762,7 +5487,53 @@ impl DemoApp {
                 }
             }
         }
+        // After LoadGraph, so the loader builds each node's instance first and
+        // then the one with its state that replaces it.
+        self.lv2_states.clear();
+        let restored: Vec<(u32, Vec<u8>)> = s.graph.nodes.iter().filter_map(|n| match &n.kind {
+            NodeKind::Lv2 { uri } => s.plugin_state(n.id).filter(|st| st.plugin_id == uri.as_str()).map(|st| (n.id, st.data.clone())),
+            _ => None,
+        }).collect();
+        for (node, state) in restored {
+            if let Err(e) = self.restore_lv2_state(node, state.clone()) {
+                // Kept anyway: the next save or rig edit restores it.
+                self.lv2_states.insert(node, state);
+                self.session_msg = format!("plugin state of node {node} not restored: {e}");
+            }
+        }
         self.restore_session_rules(s);
+        // Mixer strips (#72–77) follow their nodes through the remap: rows
+        // only the UI touches (colour, collapse) and the engine's strip
+        // state, re-sent because the load dropped the engine's table.
+        self.strips = s.strips().iter().map(StripUiRow::from_saved).collect();
+        self.strip_order = s.strip_order().to_vec();
+        self.strip_knobs = s.strip_knobs().clone();
+        self.mixer_knob_drag = None;
+        self.send_all_strip_state();
+        Ok(())
+    }
+
+    /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
+    /// sessions. The node gets a fresh instance with its controls at their
+    /// defaults, so its plugin knobs go back to their defaults too.
+    fn restore_lv2_state(&mut self, node: u32, state: Vec<u8>) -> Result<(), String> {
+        if let Some(bus) = &self.bus {
+            if !bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::LoadLv2State { node, state: state.clone() }) {
+                return Err("command bus full, try again".into());
+            }
+        }
+        self.lv2_states.insert(node, state);
+        if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
+            for k in u.knobs.iter_mut().filter(|k| k.source != KnobSource::BuiltIn && k.param.is_some()) {
+                k.set_immediate(k.default);
+                k.sent = Some(k.default);
+            }
+        }
+        if self.lv2_editor_node == Some(node) {
+            if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node).map(|n| n.kind.clone()) {
+                self.lv2_editor_controls = crate::lv2::control_descs_for_uri(uri.as_str());
+            }
+        }
         Ok(())
     }
 
@@ -4813,6 +5584,8 @@ impl DemoApp {
     /// Load a starter template (playable pre-wired rack + default knobs).
     fn load_template(&mut self, t: Template) {
         let s = t.session();
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = format!("Loaded template '{}'", t.title()),
             Err(e) => self.session_msg = format!("Template failed: {e}"),
@@ -4822,6 +5595,8 @@ impl DemoApp {
     /// Reload the default two-stack demo patch.
     fn load_demo_patch(&mut self) {
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = "Loaded demo patch".into(),
             Err(e) => self.session_msg = format!("Demo failed: {e}"),
@@ -4833,6 +5608,8 @@ impl DemoApp {
     /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
     /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
     fn load_multi_rig_demo(&mut self) {
+        self.open_session = None;
+        self.autosave_rebase();
         fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
             let mut g = Graph::default();
             g.reserve(8, 8);
@@ -4854,6 +5631,10 @@ impl DemoApp {
         let rigs = vec![mk_rig("Rig A", true), mk_rig("Rig B", false)];
         let merged = crate::control::merge_rigs(&rigs);
         self.build_rack(&merged, &[]);
+        self.strips.clear();
+        self.strip_order.clear();
+        self.strip_knobs.clear();
+        self.mixer_knob_drag = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
         if let Some(bus) = &self.bus {
@@ -4894,12 +5675,26 @@ impl DemoApp {
                 "count_in_bars": self.count_in_bars,
                 "record_sync": self.record_sync,
                 "bpm": self.bpm,
+                "player": serde_json::json!({
+                    "loaded": self.player.loaded,
+                    "enabled": self.player.enabled,
+                    "pending": self.player.pending,
+                    "playing": self.player.playing,
+                    "loop": self.player.loop_on,
+                    "sync": self.player.sync,
+                    "beats": self.player.beats,
+                    "offset": self.player.offset,
+                    "bpm": self.player.bpm,
+                    "eff_bpm": self.player.eff_bpm,
+                    "duration": self.player.duration,
+                    "gain": self.player.gain,
+                }),
                 "cables": self.cables.len(),
                 "fps": self.fps,
                 "buffer_frames": crate::bridge::BUFFER_FRAMES,
                 "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
-                "xruns": crate::bridge::XRUNS.load(std::sync::atomic::Ordering::Relaxed),
-                "midi_latency_ms": crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+                "xruns": self.engine_counters().xruns,
+                "midi_latency_ms": self.engine_counters().midi_latency_us as f64 / 1000.0,
                 "layout": {
                     "stage_h": self.stage_rect.height(), "unit_h": self.unit_h, "rows": self.layout_rows,
                     "rack_w": self.rack_w, "rack_h": self.rack_h,
@@ -4915,6 +5710,26 @@ impl DemoApp {
                 })).collect::<Vec<_>>(),
             })
             .to_string(),
+            "listen" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let args = args.clone();
+                let spawned = std::thread::Builder::new().name("listen".into()).spawn(move || {
+                    let _ = tx.send(crate::listen::listen(&args));
+                });
+                match spawned {
+                    Ok(_) => {
+                        self.listening = Some(rx);
+                        "listening".into()
+                    }
+                    Err(e) => format!("listen: {e}"),
+                }
+            }
+            "get_engine_info" => serde_json::to_string(&self.engine_stats_now())
+                .unwrap_or_else(|e| format!("engine info serialize: {e}")),
+            "reset_engine_peaks" => {
+                self.reset_engine_peaks();
+                "reset: worst render time, late blocks, xruns and each unit's maximum start again from now".into()
+            }
             "measure_mix" => {
                 if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
                     if let Some(bus) = &self.bus {
@@ -5010,28 +5825,86 @@ impl DemoApp {
                     None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed, octaves reset"),
                 }
             }
+            "set_scale" => {
+                // Keys scale snap (issue #90): key + scale, or off.
+                let unit = match args.get("node").and_then(|v| v.as_u64()) {
+                    Some(n) => self.units.iter().position(|u| u.node_id == n as u32),
+                    None => self.keys_unit,
+                };
+                let Some(unit) = unit.filter(|&u| matches!(self.units[u].node_kind, UnitKind::Keys)) else {
+                    return "set_scale needs a Keys node (get_graph kind Keys; omit = the one in view)".into();
+                };
+                let node = self.units[unit].node_id;
+                let choice = if args.get("off").and_then(|v| v.as_bool()) == Some(true) {
+                    None
+                } else {
+                    let key = match args.get("key").and_then(|v| v.as_str()) {
+                        Some(k) => match crate::arp::key_from_name(k) {
+                            Some(k) => k,
+                            None => return format!("set_scale: '{k}' is not a key (C, C#, D, … B, or 0..11)"),
+                        },
+                        None => args.get("key").and_then(|v| v.as_u64()).map(|k| (k.min(11)) as u8).unwrap_or(0),
+                    };
+                    let scale = match args.get("scale").and_then(|v| v.as_str()) {
+                        Some(s) => match crate::arp::Scale::from_name(s) {
+                            Some(s) => s,
+                            None => return format!("set_scale: '{s}' is not a scale (major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues)"),
+                        },
+                        None => crate::arp::Scale::Major,
+                    };
+                    Some(crate::arp::ScaleChoice { key, scale })
+                };
+                self.ui_node_grace.insert(node, self.ui_time + 0.6);
+                self.set_keys_scale(unit, choice);
+                if self.graph_pub.is_some() {
+                    self.pending_agent_origin = Some((origin, now + 1.0));
+                }
+                let summary = match choice {
+                    Some(c) => format!("Keys snap to {}", c.label()),
+                    None => "Keys scale snap off".into(),
+                };
+                self.agent_activity.record(origin, summary.clone(), vec![node], now);
+                match choice {
+                    Some(c) => format!("keys node {node}: out-of-scale keys now snap to the nearest in-scale note — {}", c.label()),
+                    None => format!("keys node {node}: scale snap off — every key plays as pressed"),
+                }
+            }
+            "set_arp" => {
+                // The arp unit's knobs by name (issue #90).
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()) else {
+                    return "set_arp needs 'node' (an arp node id from get_graph)".into();
+                };
+                let Some(unit) = self.units.iter().position(|u| u.node_id == node as u32
+                    && matches!(u.node_kind, UnitKind::Arp)) else {
+                    return format!("node {node} is not an arp unit (get_graph kind arp)");
+                };
+                let wanted = match crate::arp::knob_values_from_args(args) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
+                let applied: Vec<&'static str> = wanted.iter()
+                    .filter_map(|&(label, _, v)| {
+                        let i = self.units[unit].knob_index(label)?;
+                        self.set_unit_knob(unit, i, v);
+                        Some(label)
+                    })
+                    .collect();
+                self.agent_activity.touch_rig(self.units[unit].rig as usize, now);
+                self.agent_activity.record(origin, format!("Arp → {}", applied.join(", ").to_lowercase()), vec![node as u32], now);
+                format!("arp node {node}: {} set", applied.join(", ").to_lowercase())
+            }
             "save_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                match self.capture_session(name) {
-                    Ok(s) => {
-                        let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                        match path.and_then(|p| s.save(&p).map(|_| p)) {
-                            Ok(p) => format!("saved session '{}' to {}", name, p.display()),
-                            Err(e) => format!("save failed: {e}"),
-                        }
-                    }
-                    Err(e) => format!("capture failed: {e}"),
+                match self.save_session_as(&Self::sessions_dir(), name) {
+                    Ok(p) => format!("saved session '{}' to {}", name, p.display()),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "load_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                match path.and_then(|p| crate::session::Session::load(&p)) {
-                    Ok(s) => match self.apply_session(&s) {
-                        Ok(_) => format!("loaded session '{}' — knobs + plugin state restored", name),
-                        Err(e) => format!("apply failed: {e}"),
-                    },
-                    Err(e) => format!("load failed: {e}"),
+                match self.open_saved_session(&Self::sessions_dir(), name) {
+                    Ok(()) => format!("loaded session '{}' — knobs + plugin state restored", name),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "list_sessions" => {
@@ -5150,30 +6023,57 @@ impl DemoApp {
                     return format!("play_file: no file at '{path}'");
                 }
                 if let Some(pc) = &self.player_ctrl {
+                    // AUM FilePlayer settings ride along (issue #84): they
+                    // must land BEFORE the decoded file, so the engine arms
+                    // the start with them already in force.
+                    if let Some(cfg) = player_cfg_command(args) {
+                        if let Some(bus) = &self.bus {
+                            let _ = bus.lock().unwrap().send(cfg);
+                        }
+                    }
                     pc.play(path);
                     if let Some(bus) = &self.bus {
                         let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
                     }
-                    format!("playing '{path}' at gain {gain:.2} (backing track mixed to master)")
+                    let what = player_cfg_summary(args);
+                    format!("playing '{path}' at gain {gain:.2}{what} (backing track mixed to master)")
                 } else {
                     "file player unavailable (no audio)".into()
                 }
             }
             "stop_file" => {
-                if let Some(pc) = &self.player_ctrl {
-                    pc.stop();
-                }
                 if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain: 0.0 });
+                    // Disable the play-enable; the file and its settings stay
+                    // (play_file or the take button restart at the start).
+                    let _ = bus.lock().unwrap().send(Command::SetPlayerEnable { on: false });
                 }
                 "file player stopped".into()
             }
             "set_player" => {
-                let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                let gain = args.get("gain").and_then(|v| v.as_f64()).map(|g| g.clamp(0.0, 1.0) as f32);
+                let cfg = player_cfg_command(args);
+                if gain.is_none() && cfg.is_none() {
+                    return "set_player needs gain and/or playback settings (loop, sync, beats, offset, bpm)".into();
                 }
-                format!("file player gain {gain:.2}")
+                if let Some(bus) = &self.bus {
+                    if let Some(gain) = gain {
+                        let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                    }
+                    if let Some(cfg) = cfg {
+                        let _ = bus.lock().unwrap().send(cfg);
+                    }
+                }
+                let mut out = String::new();
+                if let Some(gain) = gain {
+                    out.push_str(&format!("file player gain {gain:.2}"));
+                }
+                let what = player_cfg_summary(args);
+                if out.is_empty() {
+                    out = what.trim_start_matches(" · ").to_string();
+                } else {
+                    out.push_str(&what);
+                }
+                out
             }
             "set_rig_device" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
@@ -5516,6 +6416,269 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("Mix → {} (vol {:.2})", self.rig_name(rig), m.vol), nodes, now);
                 format!("rig {rig}: vol {:.2} pan {:.2} mute {} solo {}", m.vol, m.pan, m.mute, m.solo)
             }
+            "set_strip_mix" => {
+                // Per-source strip mix (#73): pan/mute/solo on ONE source
+                // node, applied at its own output (solo scope: its rig).
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let pan = args.get("pan").and_then(|v| v.as_f64()).map(|p| p.clamp(-1.0, 1.0) as f32);
+                let mute = args.get("mute").and_then(|v| v.as_bool());
+                let solo = args.get("solo").and_then(|v| v.as_bool());
+                self.with_strip_row(node, |row| {
+                    if let Some(p) = pan { row.pan = p; }
+                    if let Some(m) = mute { row.mute = m; }
+                    if let Some(s) = solo { row.solo = s; }
+                });
+                self.send_strip_mix(node);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let row = self.strip_row(node);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Source mix → {}", self.unit_display_name(node)), vec![node], now);
+                format!("{} (node {node}): pan {:.2} mute {} solo {} — solo mutes the other sources of its rig", self.unit_display_name(node), row.pan, row.mute, row.solo)
+            }
+            "set_node_bypass" => {
+                // Insert bypass (#74): the FX passes its input through.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let bypass = args.get("bypass").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.with_strip_row(node, |row| row.bypass = bypass);
+                self.send_strip_bypass(node);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Bypass {} → {}", self.unit_display_name(node), if bypass { "on" } else { "off" }), vec![node], now);
+                format!("{} (node {node}): bypass {}", self.unit_display_name(node), bypass)
+            }
+            "add_insert" => {
+                // Add an effect to a strip's insert chain (#74): source node
+                // (or omit source = the master out's chain, #77).
+                let source = args.get("source").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if let Some(s) = source {
+                    if !self.units.iter().any(|u| u.node_id == s) {
+                        return format!("no unit with node id {s} (see get_graph)");
+                    }
+                }
+                let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let name = args.get("name").and_then(|v| v.as_str()).map(String::from);
+                let (kind, label) = match kind_str.as_str() {
+                    "dsp" => {
+                        let dsp = args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let dk = match dsp.as_str() {
+                            "delay" => Some(DspKind::Delay), "reverb" => Some(DspKind::Reverb),
+                            "filter" => Some(DspKind::Filter), "eq3" | "eq" => Some(DspKind::Eq3),
+                            "saturation" | "drive" => Some(DspKind::Saturation), "limiter" => Some(DspKind::Limiter),
+                            "gain" => Some(DspKind::Gain), "pan" => Some(DspKind::Pan),
+                            _ => None,
+                        };
+                        match dk {
+                            Some(k) => (NodeKind::Dsp(k.clone()), name.unwrap_or_else(|| sentence_case(dsp.as_str()))),
+                            None => return format!("add_insert: unknown dsp '{dsp}' (gain, pan, eq3, filter, limiter, saturation, delay, reverb)"),
+                        }
+                    }
+                    "lv2" => {
+                        let uri = args.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                        if uri.is_empty() { return "add_insert needs a uri for kind=lv2 (see list_plugins)".into(); }
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_insert again in a few seconds".into();
+                        }
+                        let known = self.plugins_lv2.iter().find(|p| p.uri == uri && !p.is_instrument);
+                        let label = match known {
+                            Some(p) => p.name.clone(),
+                            None => return format!("add_insert: '{uri}' is not an installed LV2 effect (see list_plugins)"),
+                        };
+                        (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name.unwrap_or(label))
+                    }
+                    _ => return "add_insert needs kind=dsp (with dsp=…) or kind=lv2 (with uri=…)".into(),
+                };
+                let res = match source {
+                    Some(s) => self.strip_insert_edit(s, StripInsertEdit::Add { kind, name: label.clone() }),
+                    None => self.master_insert_edit(StripInsertEdit::Add { kind, name: label.clone() }),
+                };
+                match res {
+                    Ok(msg) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        let nodes: Vec<u32> = match source {
+                            Some(s) => vec![s],
+                            None => self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect(),
+                        };
+                        for n in &nodes { self.agent_activity.touch_node(*n, now); }
+                        self.agent_activity.record(origin, format!("Insert → {label}"), nodes, now);
+                        format!("{msg}; the rack cables moved with it (the chain is the cables)")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "remove_insert" => {
+                let fx = args.get("fx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let source = args.get("source").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if !self.units.iter().any(|u| u.node_id == fx) {
+                    return format!("no unit with node id {fx} (see get_graph)");
+                }
+                let res = match source {
+                    Some(s) => self.strip_insert_edit(s, StripInsertEdit::Remove { fx }),
+                    None => self.master_insert_edit(StripInsertEdit::Remove { fx }),
+                };
+                match res {
+                    Ok(msg) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(fx, now);
+                        self.agent_activity.record(origin, format!("Remove insert {}", self.unit_display_name(fx)), vec![fx], now);
+                        format!("{msg}; the chain closed up")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "rename_strip" => {
+                // #77: the strip's name is the node's name (sessions carry it).
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                match self.apply_strip_name(node, &name) {
+                    Ok(n) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(node, now);
+                        self.agent_activity.record(origin, format!("Rename → {n}"), vec![node], now);
+                        format!("renamed node {node} → {n}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "set_strip_color" => {
+                // #77: hex 0xRRGGBB or a palette word; None clears it.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let raw = args.get("color").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let color = if raw.is_empty() || raw == "none" || raw == "off" {
+                    None
+                } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix('#')) {
+                    match u32::from_str_radix(hex, 16) {
+                        Ok(rgb) => Some(egui::Color32::from_rgb(((rgb >> 16) & 0xFF) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)),
+                        Err(_) => return format!("set_strip_color: '{raw}' is not a hex colour (0xRRGGBB or a name)"),
+                    }
+                } else {
+                    // Palette word → the nearest of the strip palette.
+                    let names = ["teal", "amber", "rose", "sand", "violet", "cyan"];
+                    match names.iter().position(|n| raw.starts_with(n)) {
+                        Some(i) => Some(STRIP_PALETTE[i]),
+                        None => return format!("set_strip_color: '{raw}' — use 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan) or none"),
+                    }
+                };
+                self.with_strip_row(node, |row| row.color = color);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Colour → {}", self.unit_display_name(node)), vec![node], now);
+                let shown = color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())).unwrap_or_else(|| "none".into());
+                format!("{} (node {node}): colour {shown} — saved with the session", self.unit_display_name(node))
+            }
+            "move_strip" => {
+                // #77: display order within the strip's rig.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let to = args.get("to").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                let Some(unit) = self.units.iter().position(|u| u.node_id == node) else {
+                    return format!("no unit with node id {node} (see get_graph)");
+                };
+                let rig = self.units[unit].rig;
+                let sources = self.rig_strip_sources(rig);
+                let at = sources.iter().position(|&u| u == unit).unwrap_or(0);
+                let target = sources.get(to.saturating_sub(1)).or_else(|| sources.last()).copied();
+                let Some(tu) = target else { return "this rig has no strips to reorder".into() };
+                let before = self.units[tu].node_id;
+                self.reorder_strip(rig, node, before);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Move strip → slot {to}"), vec![node], now);
+                format!("moved {} to slot {to} of its rig (display order — the sound is unchanged)", self.unit_display_name(node))
+            }
+            "collapse_strip" => {
+                // #77: collapse (or expand) a strip to its mini form.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let collapsed = args.get("collapsed").and_then(|v| v.as_bool());
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let was = self.strip_row(node).collapsed;
+                let next = collapsed.unwrap_or(!was);
+                self.with_strip_row(node, |row| row.collapsed = next);
+                self.agent_activity.touch_node(node, now);
+                format!("{} (node {node}): {}", self.unit_display_name(node), if next { "collapsed (mini strip)" } else { "expanded" })
+            }
+            "get_strip_knobs" => {
+                // #107: effective quick knob + choices per mixer strip/insert node.
+                let filter_node = args.get("node").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if let Some(n) = filter_node {
+                    if !self.units.iter().any(|u| u.node_id == n) {
+                        return format!("no unit with node id {n} (see get_graph)");
+                    }
+                }
+                let mut entries: Vec<serde_json::Value> = Vec::new();
+                for (ui_idx, u) in self.units.iter().enumerate() {
+                    if filter_node.is_some_and(|n| n != u.node_id) { continue; }
+                    if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Arp) { continue; }
+                    let qk = self.quick_knob(ui_idx);
+                    let knob = qk.map(|i| u.knobs[i].label.clone());
+                    let param_name = qk.map(|i| {
+                        u.knobs[i].source.plugin_name()
+                            .unwrap_or(u.knobs[i].label.as_str())
+                            .to_string()
+                    });
+                    let value = qk.map(|i| u.knobs[i].value);
+                    let choices: Vec<String> = u.knobs.iter()
+                        .filter(|k| is_rack_knob(k))
+                        .map(|k| k.label.clone())
+                        .collect();
+                    entries.push(serde_json::json!({
+                        "node": u.node_id,
+                        "name": sentence_case(&u.name),
+                        "rig": u.rig,
+                        "knob": knob,
+                        "param_name": param_name,
+                        "value": value,
+                        "custom": self.strip_knobs.contains_key(&u.node_id),
+                        "choices": choices,
+                    }));
+                }
+                serde_json::json!({ "strips": entries }).to_string()
+            }
+            "set_strip_knob" => {
+                // #107: assign (or reset with "") one node's mixer quick knob.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let knob_arg = args.get("knob").and_then(|v| v.as_str()).unwrap_or("");
+                let Some(ui_idx) = self.units.iter().position(|u| u.node_id == node) else {
+                    return format!("no unit with node id {node} (see get_graph)");
+                };
+                if knob_arg.trim().is_empty() {
+                    self.strip_knobs.remove(&node);
+                    let def = self.quick_knob(ui_idx)
+                        .map(|i| self.units[ui_idx].knobs[i].label.clone())
+                        .unwrap_or_else(|| "none".into());
+                    self.agent_activity.touch_node(node, now);
+                    self.agent_activity.record(origin, format!("Quick knob {} → default ({def})", self.unit_display_name(node)), vec![node], now);
+                    return format!("{} (node {node}): quick knob reset to default ({def}) — saved with the session", self.unit_display_name(node));
+                }
+                let kind = self.base_graph.node(node).map(|n| &n.kind);
+                let Some(ki) = resolve_unit_quick_knob_choice(&self.units[ui_idx], kind, knob_arg) else {
+                    let avail: Vec<&str> = self.units[ui_idx].knobs.iter()
+                        .filter(|k| is_rack_knob(k))
+                        .map(|k| k.label.as_str())
+                        .collect();
+                    if avail.is_empty() {
+                        return format!("{} (node {node}) has no knobs", self.unit_display_name(node));
+                    }
+                    return format!("no knob '{knob_arg}' on {} (node {node}) — available: {}", self.unit_display_name(node), avail.join(", "));
+                };
+                let k = &self.units[ui_idx].knobs[ki];
+                let store = k.source.plugin_name().unwrap_or(&k.label).to_string();
+                let label = k.label.clone();
+                self.strip_knobs.insert(node, store);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Quick knob {} → {label}", self.unit_display_name(node)), vec![node], now);
+                format!("{} (node {node}): quick knob set to {label} — saved with the session", self.unit_display_name(node))
+            }
             "list_plugins" => {
                 if !self.plugin_lists_ready() {
                     return "scanning installed plugins in the background (first run) — ask again in a few seconds".into();
@@ -5590,12 +6753,13 @@ impl DemoApp {
                 if self.recorder.is_none() || self.bus.is_none() {
                     return "recording unavailable: no audio engine (recorder/bus missing)".into();
                 }
+                self.sync_recorder_rig_names();
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::RecordStart);
                 }
                 let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
                 self.agent_activity.record(origin, "Record start", masters, now);
-                "recording started (master output → ~/Music/kabelsalat/)".into()
+                "recording started (armed targets → ~/Music/kabelsalat/)".into()
             }
             "record_stop" => {
                 if let Some(bus) = &self.bus {
@@ -5611,6 +6775,34 @@ impl DemoApp {
                     .unwrap_or_else(|e| format!("record status: {e}")),
                 None => "{\"recording\":false,\"available\":false}".into(),
             },
+            "set_record_arm" => {
+                let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                let rig_arg = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+                let armed = args.get("armed").and_then(|v| v.as_bool()).unwrap_or(true);
+                let which: Option<usize> = if target.eq_ignore_ascii_case("master") || (rig_arg.is_none() && target.is_empty()) {
+                    None
+                } else {
+                    let r = rig_arg.unwrap_or(0);
+                    let n = self.rig_count();
+                    if r >= n {
+                        return format!("no rig {r}: there are {n}");
+                    }
+                    Some(r)
+                };
+                self.set_record_arm(which, armed);
+                let label = match which {
+                    None => "Master arm".to_string(),
+                    Some(r) => format!("Rig {} arm", r + 1),
+                };
+                self.agent_activity.record(origin, format!("{label} = {armed}"), vec![], now);
+                serde_json::json!({
+                    "target": match which { None => "master", Some(_) => "rig" },
+                    "rig": which,
+                    "armed": armed,
+                    "armed_master": self.arm_master,
+                    "armed_rigs": self.arm_rigs[..self.rig_count().min(8)],
+                }).to_string()
+            }
             "set_record_sync" => {
                 let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(!self.record_sync);
                 self.record_sync = on;
@@ -5664,6 +6856,10 @@ impl DemoApp {
                     "lead_reverb" | "lead" => { self.load_template(Template::LeadReverb); Some("Loaded template 'Lead + Reverb'".to_string()) }
                     "drums_bass" | "drums" => { self.load_template(Template::DrumsBass); Some("Loaded template 'Drums + Bass'".to_string()) }
                     "ambient_pad" | "ambient" | "pad" => { self.load_template(Template::AmbientPad); Some("Loaded template 'Ambient Pad'".to_string()) }
+                    "guitar_rig" | "guitar" => {
+                        self.load_template(Template::GuitarRig);
+                        Some("Loaded template 'Guitar Rig' — Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; pick the input device on the Audio In unit's face, the tuner is there too".to_string())
+                    }
                     "demo" => { self.load_demo_patch(); Some("Loaded the demo patch".to_string()) }
                     "multi_rig" | "rigs" => { self.load_multi_rig_demo(); Some("Loaded the multi-rig demo (2 rigs) — switch with set_active_rig or 1–9".to_string()) }
                     _ => None,
@@ -5674,7 +6870,7 @@ impl DemoApp {
                         self.agent_activity.record(origin, format!("Template: {name}"), nodes, now);
                         msg
                     }
-                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, demo, multi_rig)"),
+                    None => format!("unknown template '{name}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)"),
                 }
             }
             "add_node" => {
@@ -5683,6 +6879,7 @@ impl DemoApp {
                 let kind = match kind_str.as_str() {
                     "keys" => Some(NodeKind::Keys),
                     "clap" => Some(NodeKind::Clap { plugin_id: name_bytes(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
+                    "arp" | "arpeggiator" => Some(NodeKind::Arp),
                     "dsp" => match args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().as_str() {
                         "gain" => Some(NodeKind::Dsp(DspKind::Gain)),
                         "pan" => Some(NodeKind::Dsp(DspKind::Pan)),
@@ -5702,6 +6899,15 @@ impl DemoApp {
                     }),
                     "system_audio" => Some(NodeKind::SystemAudio),
                     "master_out" => Some(NodeKind::MasterOut),
+                    "midi_fx" | "midi-fx" => match (args.get("uri").and_then(|v| v.as_str()), args.get("plugin_id").and_then(|v| v.as_str())) {
+                        (Some(uri), _) => Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri: Lv2Uri::new(uri) } }),
+                        (None, Some(_)) => return "CLAP note effects are listed by list_midi_fx but cannot be hosted yet: use an LV2 MIDI plugin (uri) or the built-in transposer (no uri)".into(),
+                        (None, None) => {
+                            let semis = args.get("semis").and_then(|v| v.as_i64()).unwrap_or(0)
+                                .clamp(-(crate::engine::MIDIFX_SEMI_MAX as i64), crate::engine::MIDIFX_SEMI_MAX as i64) as i8;
+                            Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis } })
+                        }
+                    },
                     _ => None,
                 };
                 // Global: any rig by index; default = the rig in view.
@@ -5710,24 +6916,72 @@ impl DemoApp {
                 if rig >= n_rigs {
                     return format!("no rig {rig}: there are {n_rigs} (0..{}) — add one with add_rig", n_rigs - 1);
                 }
+                let wire = match &kind {
+                    Some(NodeKind::Clap { .. }) => true,
+                    Some(NodeKind::Lv2 { uri }) => {
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
+                        }
+                        self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+                    }
+                    Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
+                        }
+                        if !self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_midi_fx) {
+                            return format!("'{}' is not an installed LV2 MIDI plugin (see list_midi_fx)", uri.as_str());
+                        }
+                        true
+                    }
+                    Some(NodeKind::MidiFx { .. }) => true,
+                    // An arp inserts between the rig's Keys and its synth(s).
+                    Some(NodeKind::Arp) => true,
+                    _ => false,
+                };
+                let is_midi_fx = matches!(kind, Some(NodeKind::MidiFx { .. }));
                 match kind {
                     Some(k) => {
+                        let is_arp = matches!(k, NodeKind::Arp);
                         if let Some(bus) = &self.bus {
-                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 });
+                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8, wire });
                             if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                         }
                         self.agent_activity.touch_rig(rig, now);
                         self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
-                        format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        if is_midi_fx {
+                            format!("added MIDI effect to rig {rig} '{}': inserted between the rig's Keys and its instruments (Keys → it → instruments, MIDI); do not connect these again", self.rig_name(rig))
+                        } else if wire && is_arp {
+                            format!("added an arp to rig {rig} '{}', inserted like GarageBand's: the rig's Keys → arp (MIDI) and arp → the rig's synth(s) (MIDI); held keys now arpeggiate (MODE/RATE/OCT/GATE/SWING/CHORD are its face knobs)", self.rig_name(rig))
+                        } else if wire {
+                            format!("added {kind_str} instrument to rig {rig} '{}', wired like a standard rig: the rig's Keys → it (MIDI) and it → the rig's Master L and R (audio); do not connect these again", self.rig_name(rig))
+                        } else {
+                            format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        }
                     }
                     None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
-            LOOK_TOOL => {
-                self.rack_shot.wanted = true;
-                self.agent_activity.record(origin, "Look at the rack", vec![], now);
-                "screenshot of the kabelsalat window".into()
+            "list_midi_fx" => {
+                if !self.plugin_lists_ready() {
+                    return "scanning installed plugins in the background (first run) — try list_midi_fx again in a few seconds".into();
+                }
+                let lv2: Vec<_> = self.plugins_lv2.iter().filter(|p| p.is_midi_fx)
+                    .map(|p| serde_json::json!({"uri": p.uri, "name": p.name})).collect();
+                let clap: Vec<_> = self.plugins_clap.iter().filter(|p| crate::host::is_note_effect(p))
+                    .map(|p| serde_json::json!({"plugin_id": p.id, "name": p.name})).collect();
+                serde_json::json!({
+                    "builtin": [{"name": "Transpose", "add_with": "add_node kind=midi_fx (optionally semis)"}],
+                    "lv2": lv2,
+                    "clap_not_hostable_yet": clap,
+                }).to_string()
+            }
+            "list_channels" => {
+                let raw = args.get("filter").and_then(|v| v.as_str()).unwrap_or("all");
+                let Some(filter) = NavFilter::parse(raw) else {
+                    return format!("list_channels: unknown filter '{raw}' (use channels | plugins | all)");
+                };
+                self.channels_json(filter).to_string()
             }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -5963,6 +7217,7 @@ impl DemoApp {
         }
         self.lv2_editor_node = None;
         self.editor_rig = rig;
+        self.plugin_window_error = None;
         self.editor_filter.clear();
         let pool_idx = self.clap_pool_idx(rig);
         self.editor_params = pool_idx
@@ -6030,6 +7285,19 @@ impl DemoApp {
         if let Some(lv2_node) = self.lv2_editor_node {
             let mut open = self.editor_open;
             let mut chosen_preset: Option<crate::lv2::Lv2Preset> = None;
+            let mut chosen_patch: Option<crate::sounds::Sound> = None;
+            // Vital patches (`sounds::Source::VitalPatches`) list above the LV2
+            // presets; None while the library is scanned.
+            let patches: Option<Vec<crate::sounds::Sound>> = match self.base_graph.node(lv2_node).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) if uri.as_str() == crate::vital::URI => {
+                    match self.sounds.get(&crate::sounds::Instrument::Lv2(uri.as_str().to_string())) {
+                        crate::sounds::Lookup::Ready(library) => Some(library.sounds.iter()
+                            .filter(|s| matches!(s.load, crate::sounds::Load::VitalPatch(_))).cloned().collect()),
+                        _ => None,
+                    }
+                }
+                _ => Some(Vec::new()),
+            };
             let mut ctrl_changes: Vec<(usize, f32, f32)> = Vec::new();
             egui::Window::new(egui::RichText::new(format!("{} — presets & parameters", self.lv2_editor_name))
                     .font(theme::medium_font(16.0)).color(theme::INK))
@@ -6045,6 +7313,18 @@ impl DemoApp {
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
                     egui::ScrollArea::vertical().id_salt("lv2_preset_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
                         let mut shown = 0usize;
+                        match &patches {
+                            None => { ui.label(egui::RichText::new("scanning Vital patches…").size(12.0).color(theme::INK_2)); }
+                            Some(patches) => for s in patches {
+                                let text = if s.category.is_empty() { s.name.clone() } else { format!("{} · {}", s.category, s.name) };
+                                if !words.iter().all(|w| text.to_lowercase().contains(w.as_str())) { continue; }
+                                shown += 1;
+                                let selected = self.lv2_preset_name.as_deref() == Some(s.name.as_str());
+                                if ui.selectable_label(selected, egui::RichText::new(text).size(12.5).color(theme::CREAM)).clicked() {
+                                    chosen_patch = Some(s.clone());
+                                }
+                            },
+                        }
                         for p in &self.lv2_editor_presets {
                             let hay = p.name.to_lowercase();
                             if !words.iter().all(|w| hay.contains(w.as_str())) {
@@ -6109,6 +7389,13 @@ impl DemoApp {
             if !open {
                 self.lv2_editor_node = None;
             }
+            if let Some(patch) = chosen_patch {
+                let unit = self.instrument_units().into_iter().find(|u| u.node == lv2_node);
+                self.editor_status = match unit.ok_or_else(|| "that unit is not an instrument".to_string()).and_then(|u| self.load_sound_into(&u, &patch)) {
+                    Ok(()) => format!("loaded {}", patch.label()),
+                    Err(e) => format!("sound failed: {e}"),
+                };
+            }
             if let Some(preset) = chosen_preset {
                 if let Some(bus) = &self.bus {
                     bus.lock().unwrap().send(Command::LoadLv2Preset { node: lv2_node, preset_uri: preset.uri.clone() });
@@ -6156,6 +7443,24 @@ impl DemoApp {
             .fixed_size([480.0, 700.0])
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
+                if let Some(main) = pool_idx.and_then(|i| self._surge_main.get_mut(i)) {
+                    if main.has_editor() {
+                        let open = main.editor_open();
+                        let label = if open { "Close plugin window" } else { "Open plugin window" };
+                        if theme::chip_button(ui, label, open).on_hover_text("the plugin's own editor, in a window of its own").clicked() {
+                            self.plugin_window_error = None;
+                            if open {
+                                main.close_editor();
+                            } else if let Err(e) = main.open_editor(&format!("{name} · kabelsalat")) {
+                                self.plugin_window_error = Some(format!("{e:#}"));
+                            }
+                        }
+                        if let Some(e) = &self.plugin_window_error {
+                            ui.label(egui::RichText::new(e).size(12.0).color(theme::CLIP_BRIGHT));
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
                 let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
                 // Sound: exchange the instrument (patch) of THIS synth.
                 let browser = match plugin_id {
@@ -6311,10 +7616,11 @@ impl DemoApp {
 
     // -- hot-wire MIDI matrix ------------------------------------
 
-    /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments).
+    /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments),
+    /// plus arp units (a MIDI destination whose input routes by matrix rules).
     fn matrix_sinks(&self) -> Vec<usize> {
         self.units.iter().enumerate()
-            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst)
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst || matches!(u.node_kind, UnitKind::Arp))
             .map(|(i, _)| i)
             .collect()
     }
@@ -6329,7 +7635,7 @@ impl DemoApp {
     fn midi_cable_to(&self, inst: usize) -> Option<usize> {
         self.cables.iter().position(|c| {
             c.dying < 0.0 && c.kind == PortKind::Midi && c.dst == inst
-                && matches!(self.units.get(c.src).map(|u| &u.node_kind), Some(UnitKind::Keys))
+                && matches!(self.units.get(c.src).map(|u| &u.node_kind), Some(UnitKind::Keys | UnitKind::MidiFx))
         })
     }
 
@@ -6342,39 +7648,73 @@ impl DemoApp {
         }
     }
 
-    /// Toggle one matrix cell live. CLAP columns map to the engine's source
-    /// filters + device binding (SetRigSource/SetRigDevice); LV2 instrument
-    /// columns are gated by the MIDI cable alone. Turning a cell ON also
+    /// Toggle one matrix cell live. Every instrument column has the same
+    /// rows: the keyboard switch and a radio group of hardware (all / one
+    /// device / off). CLAP columns store them as the voice's source filter
+    /// (SetRigSource/SetRigDevice); LV2 instrument columns as the enabled
+    /// flag of each (source, node) matrix rule. Turning a cell ON also
     /// hot-wires the MIDI cable if it was unplugged.
     fn matrix_toggle(&mut self, inst: usize, row: MatrixRow, on: bool) {
-        let is_clap = matches!(self.units.get(inst).map(|u| &u.node_kind), Some(UnitKind::Clap));
+        let Some(unit) = self.units.get(inst) else { return };
+        let (is_clap, node) = (matches!(unit.node_kind, UnitKind::Clap), unit.node_id);
         if !is_clap {
-            // LV2 instrument: the cable IS the route.
             if on { self.ensure_midi_cable(inst); }
-            else if let Some(ci) = self.midi_cable_to(inst) { self.unplug_cable(ci, true); }
+            let (src, dev) = self.lv2_sources(node);
+            let (src, dev) = toggled_sources(src, dev, row, on);
+            self.set_lv2_sources(node, src, dev);
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
         if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
-        let node = self.units[inst].node_id;
-        {
-            let s = &mut self.rig_sources[rig];
-            let d = &mut self.rig_device[rig];
-            match row {
-                MatrixRow::Keys => s.0 = on,
-                MatrixRow::HwAll => { s.1 = on; if on { *d = None; } }
-                MatrixRow::HwDev(dev) => {
-                    if on { s.1 = true; *d = Some(dev); }
-                    else if *d == Some(dev) { s.1 = false; }
-                }
-            }
-        }
+        let (src, dev) = toggled_sources(self.rig_sources[rig], self.rig_device[rig], row, on);
+        self.rig_sources[rig] = src;
+        self.rig_device[rig] = dev;
         self.send_rig_source(node);
         if matches!(row, MatrixRow::HwAll | MatrixRow::HwDev(_)) {
-            let device = self.rig_device[rig];
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: dev });
+            }
+        }
+    }
+
+    /// Whether one matrix cell routes (what the grid draws).
+    fn matrix_cell_on(&self, inst: usize, row: MatrixRow) -> bool {
+        let Some(u) = self.units.get(inst) else { return false };
+        let (src, dev) = if matches!(u.node_kind, UnitKind::Clap) {
+            let rig = self.rig_of_unit(inst).unwrap_or(0);
+            (self.rig_sources.get(rig).copied().unwrap_or((true, true)), self.rig_device.get(rig).copied().flatten())
+        } else {
+            self.lv2_sources(u.node_id)
+        };
+        clap_cell(src, dev, self.midi_cable_to(inst).is_some(), row)
+    }
+
+    /// An LV2 instrument's sources as the CLAP filter shape, read from its
+    /// matrix rules (a missing rule routes): keyboard, any hardware, and
+    /// the one device when not every hardware rule is on.
+    fn lv2_sources(&self, node: u32) -> ((bool, bool), Option<u32>) {
+        let routes = |src: SourceId| self.rule_edits.get(&(src, node)).is_none_or(|e| e.enabled);
+        let hw: Vec<u32> = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| routes(SourceId::Hardware(d))).collect();
+        let dev = (hw.len() < crate::engine::MAX_HW_DEVICES as usize).then(|| hw.first().copied()).flatten();
+        ((routes(SourceId::Keys), !hw.is_empty()), dev)
+    }
+
+    /// Write an LV2 instrument's sources as the enabled flags of its matrix
+    /// rules; a rule's shape (transpose, range, …) is kept.
+    fn set_lv2_sources(&mut self, node: u32, src: (bool, bool), dev: Option<u32>) {
+        let wanted = std::iter::once((SourceId::Keys, src.0)).chain((0..crate::engine::MAX_HW_DEVICES)
+            .map(|d| (SourceId::Hardware(d), src.1 && dev.is_none_or(|b| b == d))));
+        for (source, enabled) in wanted {
+            let mut edit = self.rule_edits.get(&(source, node)).cloned().unwrap_or_default();
+            if edit.enabled == enabled { continue; }
+            edit.enabled = enabled;
+            edit.cc_only = false;
+            let cmd = edit.to_command(source, node);
+            if edit.is_default() { self.rule_edits.remove(&(source, node)); }
+            else { self.rule_edits.insert((source, node), edit); }
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(cmd);
             }
         }
     }
@@ -6615,17 +7955,7 @@ impl DemoApp {
                     _ => Self::matrix_source_head(ui, src),
                 }
                 for &s in &sinks {
-                    let u = &self.units[s];
-                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
-                    let gate = self.midi_cable_to(s).is_some();
-                    let on = if is_clap {
-                        let rig = self.rig_of_unit(s).unwrap_or(0);
-                        let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
-                        let dev = self.rig_device.get(rig).copied().flatten();
-                        clap_cell(src, dev, gate, *row)
-                    } else {
-                        gate // LV2: the cable is the route (all sources)
-                    };
+                    let on = self.matrix_cell_on(s, *row);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
@@ -6747,6 +8077,26 @@ impl DemoApp {
             UnitKind::Master => vec![(P_VOL, "Volume".into()), (P_WARM, "Warmth".into())],
             UnitKind::Keys => Vec::new(),
             UnitKind::AudioIn => vec![(P_AUDIO_IN_GAIN, "Gain".into()), (P_AUDIO_IN_MONITOR, "Monitor".into())],
+            UnitKind::MidiFx => match self.base_graph.node(node_id).map(|n| &n.kind) {
+                Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                    crate::lv2::control_descs_for_uri(uri.as_str())
+                        .into_iter()
+                        .map(|c| (c.index as u32, c.name))
+                        .collect()
+                }
+                Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { .. } }) => {
+                    vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())]
+                }
+                _ => Vec::new(),
+            },
+            UnitKind::Arp => vec![
+                (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
+                (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
+                (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
+                (crate::arp::P_ARP_GATE, "Gate".into()),
+                (crate::arp::P_ARP_SWING, "Swing".into()),
+                (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
+            ],
         }
     }
 
@@ -6834,6 +8184,7 @@ impl DemoApp {
             SourceId::Keys => (1, 0),
             SourceId::Virtual(v) => (2, v),
             SourceId::FilePlayer(f) => (3, f),
+            SourceId::MidiFx(n) => (4, n),
         }
     }
 
@@ -7279,6 +8630,595 @@ impl DemoApp {
         }
     }
 
+    fn set_record_arm(&mut self, rig: Option<usize>, armed: bool) {
+        self.ui_arm_grace = self.ui_time + 0.6;
+        match rig {
+            None => {
+                self.arm_master = armed;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRecordArm { rig: None, armed });
+                }
+            }
+            Some(r) => {
+                let r = r.min(7);
+                self.arm_rigs[r] = armed;
+                if armed {
+                    if let Some(rec) = &self.recorder {
+                        rec.ensure_stem(r as u8);
+                    }
+                }
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRecordArm { rig: Some(r as u8), armed });
+                }
+            }
+        }
+        self.sync_recorder_rig_names();
+    }
+
+    fn sync_recorder_rig_names(&self) {
+        if let Some(rec) = &self.recorder {
+            let n = self.rig_count();
+            let names: Vec<String> = (0..n).map(|i| self.rig_name(i)).collect();
+            rec.set_rig_names(names);
+        }
+    }
+
+    // -- mixer strips (#72–77) ----------------------------------------------
+
+    /// One node's strip state (a default row when untouched).
+    fn strip_row(&self, node: u32) -> StripUiRow {
+        self.strips.iter().find(|s| s.node == node).copied().unwrap_or_else(|| StripUiRow::new(node))
+    }
+
+    /// Read-modify-write one node's strip row; the caller publishes the parts
+    /// the engine owns.
+    fn with_strip_row(&mut self, node: u32, f: impl FnOnce(&mut StripUiRow)) {
+        match self.strips.iter_mut().find(|s| s.node == node) {
+            Some(row) => f(row),
+            None => {
+                let mut row = StripUiRow::new(node);
+                f(&mut row);
+                self.strips.push(row);
+            }
+        }
+        self.strips.retain(|s| !s.is_plain());
+    }
+
+    /// Publish one node's pan/mute/solo to the engine (SetStripMix, #73) and
+    /// arm the echo grace so the engine's own publication does not fight the
+    /// local mirror.
+    fn send_strip_mix(&mut self, node: u32) {
+        let row = self.strip_row(node);
+        self.ui_strip_grace.insert(node, self.ui_time + 0.6);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetStripMix {
+                node,
+                pan: Some(row.pan),
+                mute: Some(row.mute),
+                solo: Some(row.solo),
+            });
+        }
+    }
+
+    /// Publish one FX node's bypass flag to the engine (#74).
+    fn send_strip_bypass(&mut self, node: u32) {
+        let row = self.strip_row(node);
+        self.ui_strip_grace.insert(node, self.ui_time + 0.6);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetStripBypass { node, bypass: row.bypass });
+        }
+    }
+
+    /// Re-send every strip's engine state after a load reset it (rule 20:
+    /// the engine drops its strip table on LoadGraph/LoadRigs).
+    fn send_all_strip_state(&mut self) {
+        let nodes: Vec<u32> = self.strips.iter().map(|s| s.node).collect();
+        for node in nodes {
+            self.send_strip_mix(node);
+            self.send_strip_bypass(node);
+        }
+    }
+
+    /// The strips of one rig in display order (#77): `strip_order` first,
+    /// unlisted sources after in unit order.
+    fn rig_strip_sources(&self, rig: u8) -> Vec<usize> {
+        let mut units = self.mixer_sources(rig);
+        units.sort_by_key(|(unit, _)| {
+            let node = self.units.get(*unit).map(|u| u.node_id).unwrap_or(u32::MAX);
+            self.strip_order.iter().position(|n| *n == node).unwrap_or(usize::MAX)
+        });
+        units.into_iter().map(|(unit, _)| unit).collect()
+    }
+
+    /// A source strip's insert chain (#74): the linear FX run between the
+    /// source and its rig's master, or `None` when the wiring is custom
+    /// (branches, merges, a dry path) — shown as "custom", never guessed.
+    fn strip_chain(&self, source: usize) -> Option<Vec<usize>> {
+        let rig = self.units.get(source)?.rig;
+        let out_units = |unit: usize| -> Vec<usize> {
+            let mut nexts: Vec<usize> = self.cables.iter()
+                .filter(|c| c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0)
+                .filter_map(|c| if c.dst != unit { Some(c.dst) } else { None })
+                .collect();
+            nexts.sort_unstable();
+            nexts.dedup();
+            nexts
+        };
+        // FX = a non-source, non-Keys, non-Master rack unit (an effect).
+        let is_fx = |unit: usize| self.units.get(unit).map_or(false, |u| {
+            u.rig == rig
+                && !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Clap | UnitKind::AudioIn)
+                && !u.lv2_inst
+        });
+        // Walk: every hop must be an FX unit with exactly one distinct audio
+        // input (the previous node) and at most one distinct output, ending
+        // at the rig's master.
+        let mut chain = Vec::new();
+        let mut cur = source;
+        for _ in 0..64 {
+            let nexts = out_units(cur);
+            match nexts.len() {
+                0 => break,
+                1 => {
+                    let next_u = &self.units[nexts[0]];
+                    if next_u.rig != rig { return None; }
+                    if matches!(next_u.node_kind, UnitKind::Master) {
+                        return Some(chain); // reached the rig bus: linear.
+                    }
+                    if !is_fx(nexts[0]) { return None; }
+                    // Exactly one distinct audio input: the previous node.
+                    let mut ins: Vec<usize> = self.cables.iter()
+                        .filter(|c| c.kind == PortKind::Audio && c.dst == nexts[0] && c.dying < 0.0 && c.src != nexts[0])
+                        .map(|c| c.src).collect();
+                    ins.sort_unstable();
+                    ins.dedup();
+                    if ins.len() != 1 || ins[0] != cur { return None; }
+                    chain.push(nexts[0]);
+                    cur = nexts[0];
+                }
+                _ => return None,
+            }
+        }
+        None // never reached a master: custom or broken wiring.
+    }
+
+    /// The master out's insert chain (#77): FX nodes fed BY a master node, in
+    /// chain order (master → FX → FX → …).
+    fn master_chain(&self) -> Vec<usize> {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut masters: Vec<u32> = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Master))
+            .map(|u| u.node_id).collect();
+        masters.sort_unstable();
+        masters.dedup();
+        loop {
+            if chain.len() >= crate::engine::MAX_MASTER_INSERTS { break; }
+            let from = chain.last().map(|&unit| self.units[unit].node_id);
+            let mut next = None;
+            for (i, u) in self.units.iter().enumerate() {
+                if chain.contains(&i) || !matches!(u.node_kind, UnitKind::Dsp(_)) { continue; }
+                let fed = match from {
+                    None => self.cables.iter().any(|c| {
+                        c.kind == PortKind::Audio && c.dying < 0.0 && c.dst == i && c.src != i
+                            && self.units.get(c.src).map(|s| masters.contains(&s.node_id)).unwrap_or(false)
+                    }),
+                    Some(f) => self.cables.iter().any(|c| {
+                        c.kind == PortKind::Audio && c.dying < 0.0 && c.dst == i && c.src != i
+                            && self.units.get(c.src).map(|s| s.node_id) == Some(f)
+                    }),
+                };
+                if fed { next = Some(i); break; }
+            }
+            match next {
+                Some(unit) => chain.push(unit),
+                None => break,
+            }
+        }
+        chain
+    }
+
+    fn node_plugin_info(&self, unit: usize) -> Option<(String, &'static str)> {
+        let u = self.units.get(unit)?;
+        let kind = &self.base_graph.nodes.iter().find(|n| n.id == u.node_id)?.kind;
+        match kind {
+            NodeKind::Clap { plugin_id } => {
+                let label = self.plugin_display_name(&name_str(plugin_id))
+                    .unwrap_or_else(|| sentence_case(&u.name));
+                Some((label, "CLAP"))
+            }
+            NodeKind::Lv2 { .. } => Some((sentence_case(&u.name), "LV2")),
+            NodeKind::Dsp(_) | NodeKind::Arp | NodeKind::SystemAudio => Some((sentence_case(&u.name), "built-in")),
+            NodeKind::MidiFx { plugin } => Some((
+                sentence_case(&u.name),
+                if matches!(plugin, crate::control::MidiFxPlugin::Lv2 { .. }) { "LV2" } else { "built-in" },
+            )),
+            NodeKind::AudioIn { .. } | NodeKind::Keys | NodeKind::MasterOut => None,
+        }
+    }
+
+    fn channel_plugins(&self, unit: usize) -> Vec<(u32, String, &'static str)> {
+        let Some(u) = self.units.get(unit) else { return Vec::new() };
+        let mut out = Vec::new();
+        if let Some((label, kind_label)) = self.node_plugin_info(unit) {
+            out.push((u.node_id, label, kind_label));
+        }
+        for fx in self.strip_chain(unit).unwrap_or_default() {
+            if let (Some(fu), Some((label, kind_label))) = (self.units.get(fx), self.node_plugin_info(fx)) {
+                out.push((fu.node_id, label, kind_label));
+            }
+        }
+        out
+    }
+
+    /// Rigs, their source channels and each channel's plugin chain, as the
+    /// Navigator and `list_channels` show them (#108). Folds are the
+    /// panel's business, so the agent always sees every row.
+    fn nav_rows(&self, filter: NavFilter) -> Vec<NavRow> {
+        let mut out = Vec::new();
+        for r in 0..self.rig_count() {
+            let rig = r as u8;
+            let rig_name = self.rig_name(r);
+            let sources = self.rig_strip_sources(rig);
+            let mut rig_rows = Vec::new();
+            for unit in sources {
+                let u = &self.units[unit];
+                let node = u.node_id;
+                let label = sentence_case(&u.name);
+                let color = self.strip_row(node).color;
+                let plugins = match filter {
+                    NavFilter::Channels => Vec::new(),
+                    NavFilter::Plugins | NavFilter::All => self.channel_plugins(unit),
+                };
+                if filter == NavFilter::Plugins && plugins.is_empty() {
+                    continue;
+                }
+                rig_rows.push(NavRow::Channel { rig, node, label, color });
+                rig_rows.extend(plugins.into_iter().map(|(pnode, plabel, kind_label)| NavRow::Plugin {
+                    rig, node: pnode, owner: node, label: plabel, kind_label,
+                }));
+            }
+            if filter == NavFilter::Plugins && rig_rows.is_empty() {
+                continue;
+            }
+            out.push(NavRow::Rig { rig, name: rig_name });
+            out.extend(rig_rows);
+        }
+        out
+    }
+
+    fn pan_rack_to_unit(&mut self, node: u32) {
+        let Some(ui) = self.units.iter().position(|u| u.node_id == node) else { return };
+        if !self.visible(ui) { return; }
+        let Some(&r) = self.unit_rects.get(ui) else { return };
+        if !r.is_positive() || !r.min.is_finite() || !r.max.is_finite() { return; }
+        let ov = self.rack_overflow;
+        if ov.x <= 0.0 && ov.y <= 0.0 { return; }
+        let c = r.center();
+        let target = Vec2::new(self.rack_w * 0.5 - c.x, self.rack_h * 0.5 - c.y);
+        self.rack_pan = Vec2::new(
+            target.x.clamp(-ov.x * 0.5, ov.x * 0.5),
+            target.y.clamp(-ov.y * 0.5, ov.y * 0.5),
+        );
+    }
+
+    /// Switch to the row's rig, then select + pan to its unit (rack) or
+    /// scroll to + flash its strip (mixer). The pan waits for the next
+    /// layout: the rig switch regroups the rack.
+    fn nav_jump(&mut self, row: &NavRow) {
+        let (rig, unit, strip) = match *row {
+            NavRow::Rig { rig, .. } => {
+                let first = self.rig_strip_sources(rig).first().map(|&u| self.units[u].node_id);
+                (rig, None, first.map_or(NavJumpTarget::Rig(rig), NavJumpTarget::Node))
+            }
+            NavRow::Channel { rig, node, .. } => (rig, Some(node), NavJumpTarget::Node(node)),
+            NavRow::Plugin { rig, node, owner, .. } => (rig, Some(node), NavJumpTarget::Node(owner)),
+        };
+        self.set_active_rig(rig as usize);
+        self.selected_unit = unit;
+        self.nav_pan_target = unit;
+        if unit.is_none() { self.rack_pan = Vec2::ZERO; }
+        if self.stage_view == StageView::Mixer {
+            self.mixer_scroll_target = Some(strip);
+            if let NavJumpTarget::Node(n) = strip { self.mixer_flash = Some((n, self.ui_time + NAV_FLASH_S)); }
+        }
+    }
+
+    fn channels_json(&self, filter: NavFilter) -> serde_json::Value {
+        let rows: Vec<serde_json::Value> = self.nav_rows(filter).into_iter().map(|row| match row {
+            NavRow::Rig { rig, name } => serde_json::json!({
+                "type": "rig",
+                "rig": rig,
+                "name": name,
+            }),
+            NavRow::Channel { rig, node, label, color } => serde_json::json!({
+                "type": "channel",
+                "rig": rig,
+                "node": node,
+                "label": label,
+                "color": color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())),
+            }),
+            NavRow::Plugin { rig, node, owner, label, kind_label } => serde_json::json!({
+                "type": "plugin",
+                "rig": rig,
+                "node": node,
+                "owner": owner,
+                "label": label,
+                "kind": kind_label,
+            }),
+        }).collect();
+        serde_json::json!({
+            "filter": filter.as_str(),
+            "active_rig": self.active_rig,
+            "rows": rows,
+        })
+    }
+
+    /// One line of `text` cut to `max_w` with an ellipsis (size kept).
+    fn ellipsized(painter: &egui::Painter, text: &str, font: FontId, color: Color32, max_w: f32) -> Arc<Galley> {
+        let measure = |t: &str, size: f32| painter.layout_no_wrap(t.to_owned(), FontId::new(size, font.family.clone()), color).size().x;
+        let (t, _) = fit_label(text, font.size, font.size, max_w, measure);
+        painter.layout_no_wrap(t, font, color)
+    }
+
+    fn navigator_panel_ui(&mut self, root: &mut egui::Ui) {
+        if !self.nav_open {
+            self.nav_panel_rect = Rect::NOTHING;
+            self.nav_row_rects.clear();
+            self.nav_chevron_rects.clear();
+            return;
+        }
+        let win_w = root.ctx().content_rect().width().max(320.0);
+        let nav_w = (win_w * 0.22).clamp(216.0, 268.0).round();
+        self.nav_row_rects.clear();
+        self.nav_chevron_rects.clear();
+        let mut close = false;
+        let mut jump: Option<NavRow> = None;
+        let mut toggle_fold: Option<u32> = None;
+        let resp = egui::Panel::right("navigator")
+            .exact_size(nav_w)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PAPER)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .inner_margin(egui::Margin::symmetric(10, 10)),
+            )
+            .show(root, |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                let avail_w = ui.available_width().max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(avail_w, 24.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        theme::section_label(ui, "Navigator");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "×", false).on_hover_text("hide navigator (Q)").clicked() {
+                                close = true;
+                            }
+                        });
+                    },
+                );
+                ui.add_space(4.0);
+                // Segmented filter: CHANNELS | PLUGINS | ALL (tomato only for selected).
+                egui::Frame::new()
+                    .fill(theme::PAPER_SINK)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(2.0)
+                    .inner_margin(egui::Margin::same(2))
+                    .show(ui, |ui| {
+                        let inner_w = ui.available_width().max(120.0);
+                        let segs = [
+                            ("CHANNELS", NavFilter::Channels),
+                            ("PLUGINS", NavFilter::Plugins),
+                            ("ALL", NavFilter::All),
+                        ];
+                        let font = theme::medium_font(10.0);
+                        let natural: Vec<f32> = segs.iter()
+                            .map(|(lbl, _)| ui.painter().layout_no_wrap((*lbl).into(), font.clone(), theme::INK).size().x + 14.0)
+                            .collect();
+                        let sum: f32 = natural.iter().sum();
+                        let extra = ((inner_w - sum).max(0.0)) / segs.len() as f32;
+                        let widths: Vec<f32> = natural.iter().map(|w| (w + extra).floor()).collect();
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            for ((lbl, f), w) in segs.iter().zip(widths) {
+                                let on = self.nav_filter == *f;
+                                let (rect, resp) = ui.allocate_exact_size(egui::vec2((w - 1.5).max(28.0), 24.0), egui::Sense::click());
+                                let hov = resp.hovered();
+                                let fill = if on {
+                                    theme::ACCENT_DEEP
+                                } else if hov {
+                                    theme::DARK_PANEL_HI
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let txt = if on {
+                                    theme::ON_ACCENT
+                                } else if hov {
+                                    theme::CREAM
+                                } else {
+                                    theme::CREAM_MID
+                                };
+                                ui.painter().rect_filled(rect, 2.0, fill);
+                                let g = ui.painter().layout_no_wrap((*lbl).into(), font.clone(), txt);
+                                ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
+                                if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                if resp.clicked() { self.nav_filter = *f; }
+                            }
+                        });
+                    });
+                ui.add_space(4.0);
+                Self::stage_hairline(ui);
+                ui.add_space(4.0);
+                let rows = self.nav_rows(self.nav_filter);
+                let scroll_h = ui.available_height().max(1.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("navigator_scroll")
+                    .min_scrolled_height(scroll_h)
+                    .max_height(scroll_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let row_w = ui.available_width().max(100.0);
+                        for (i, row) in rows.iter().enumerate() {
+                            match row {
+                                NavRow::Rig { rig, name } => {
+                                    let active = *rig as usize == self.active_rig;
+                                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(row_w, 24.0), egui::Sense::click());
+                                    let hov = resp.hovered();
+                                    if hov {
+                                        ui.painter().rect_filled(rect, 2.0, theme::DARK_PANEL_HI);
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if active {
+                                        let bar = Rect::from_min_size(Pos2::new(rect.left() + 2.0, rect.top() + 5.0), egui::vec2(2.0, rect.height() - 10.0));
+                                        ui.painter().rect_filled(bar, 1.0, theme::ACCENT);
+                                    }
+                                    let col = if active { theme::INK } else { theme::INK_2 };
+                                    let g = Self::ellipsized(
+                                        ui.painter(),
+                                        &format!("{} · {name}", rig + 1),
+                                        theme::medium_font(11.5),
+                                        col,
+                                        (rect.width() - 16.0).max(16.0),
+                                    );
+                                    ui.painter().galley(Pos2::new(rect.left() + 10.0, rect.center().y - g.size().y * 0.5), g, col);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if resp.clicked() { jump = Some(row.clone()); }
+                                }
+                                NavRow::Channel { rig, node, label, color } => {
+                                    let selected = *rig as usize == self.active_rig && self.selected_unit == Some(*node);
+                                    let has_plugins = matches!(rows.get(i + 1), Some(NavRow::Plugin { owner, .. }) if owner == node);
+                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(row_w, 28.0), egui::Sense::hover());
+                                    let (chev_rect, body_rect) = if has_plugins {
+                                        let cr = Rect::from_min_size(Pos2::new(rect.left() + 4.0, rect.top()), egui::vec2(20.0, rect.height()));
+                                        let br = Rect::from_min_max(Pos2::new(cr.right(), rect.top()), rect.max);
+                                        (Some(cr), br)
+                                    } else {
+                                        (None, rect)
+                                    };
+                                    let chev_resp = chev_rect.map(|cr| ui.interact(cr, egui::Id::unique(("nav_chev", *node)), egui::Sense::click()));
+                                    let body_resp = ui.interact(body_rect, egui::Id::unique(("nav_chan", *node)), egui::Sense::click());
+                                    let chev_hov = chev_resp.as_ref().is_some_and(|r| r.hovered());
+                                    let row_hov = body_resp.hovered() || chev_hov;
+                                    if row_hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                    let fill = match color {
+                                        Some(c) => theme::alpha(*c, if row_hov { 0.28 } else { 0.17 }),
+                                        None => if row_hov { theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.06) } else { theme::DARK_PANEL_HI },
+                                    };
+                                    let border = if selected {
+                                        theme::ACCENT
+                                    } else if let Some(c) = color {
+                                        theme::alpha(*c, 0.55)
+                                    } else {
+                                        theme::HAIRLINE
+                                    };
+                                    ui.painter().rect_filled(rect, 4.0, fill);
+                                    ui.painter().rect_stroke(rect, 4.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                    if let Some(c) = color {
+                                        let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(3.0, rect.height() - 6.0));
+                                        ui.painter().rect_filled(spine, 1.5, *c);
+                                    } else if selected {
+                                        let spine = Rect::from_min_size(Pos2::new(rect.left() + 1.0, rect.top() + 3.0), egui::vec2(3.0, rect.height() - 6.0));
+                                        ui.painter().rect_filled(spine, 1.5, theme::ACCENT);
+                                    }
+                                    if let Some(cr) = chev_rect {
+                                        let folded = self.nav_folded.contains(node);
+                                        let gcol = if chev_hov { theme::CREAM } else { theme::CREAM_MID };
+                                        // Painted, not a glyph: the UI font has no ▸/▾.
+                                        let c = cr.center();
+                                        let pts = if folded {
+                                            vec![c + Vec2::new(-2.0, -4.0), c + Vec2::new(3.0, 0.0), c + Vec2::new(-2.0, 4.0)]
+                                        } else {
+                                            vec![c + Vec2::new(-4.0, -2.0), c + Vec2::new(4.0, -2.0), c + Vec2::new(0.0, 3.0)]
+                                        };
+                                        ui.painter().add(egui::Shape::convex_polygon(pts, gcol, Stroke::NONE));
+                                        self.nav_chevron_rects.push((*node, cr));
+                                    }
+                                    let text_x = if has_plugins { rect.left() + 26.0 } else { rect.left() + 10.0 };
+                                    let max_w = (rect.right() - 8.0 - text_x).max(16.0);
+                                    let g = Self::ellipsized(ui.painter(), label, theme::medium_font(12.5), theme::CREAM, max_w);
+                                    ui.painter().galley(Pos2::new(text_x, rect.center().y - g.size().y * 0.5), g, theme::CREAM);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if chev_resp.as_ref().is_some_and(|r| r.clicked()) {
+                                        toggle_fold = Some(*node);
+                                    } else if body_resp.clicked() {
+                                        jump = Some(row.clone());
+                                    }
+                                }
+                                NavRow::Plugin { owner, .. } if self.nav_folded.contains(owner) => {}
+                                NavRow::Plugin { rig, node, owner, label, kind_label } => {
+                                    let selected = *rig as usize == self.active_rig && self.selected_unit == Some(*node);
+                                    let bypassed = self.strip_row(*node).bypass;
+                                    let (slot, _) = ui.allocate_exact_size(egui::vec2(row_w, 24.0), egui::Sense::hover());
+                                    let gx = slot.left() + 7.0;
+                                    ui.painter().line_segment(
+                                        [Pos2::new(gx, slot.top() - 2.0), Pos2::new(gx, slot.bottom() + 2.0)],
+                                        Stroke::new(1.0, theme::HAIRLINE),
+                                    );
+                                    let rect = Rect::from_min_max(Pos2::new(slot.left() + 14.0, slot.top()), slot.max);
+                                    let resp = ui.interact(rect, egui::Id::unique(("nav_plug", *owner, *node)), egui::Sense::click());
+                                    let hov = resp.hovered();
+                                    if hov { ui.ctx().set_cursor_icon(CursorIcon::PointingHand); }
+                                    let fill = if hov { theme::DARK_PANEL_HI } else { theme::PAPER_SINK };
+                                    let border = if selected { theme::ACCENT } else { theme::HAIRLINE };
+                                    ui.painter().rect_filled(rect, 3.0, fill);
+                                    ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+                                    let icon_c = Pos2::new(rect.left() + 11.0, rect.center().y);
+                                    let icon_col = if selected { theme::ACCENT } else if bypassed { theme::MUTED } else { theme::CREAM_MID };
+                                    match *kind_label {
+                                        "CLAP" => {
+                                            ui.painter().rect_filled(Rect::from_center_size(icon_c, egui::vec2(7.0, 7.0)), 1.5, icon_col);
+                                            ui.painter().circle_filled(icon_c, 1.3, theme::DARK_PANEL);
+                                        }
+                                        "LV2" => {
+                                            ui.painter().circle_stroke(icon_c, 3.2, Stroke::new(1.4, icon_col));
+                                        }
+                                        _ => {
+                                            ui.painter().rect_filled(Rect::from_center_size(icon_c, egui::vec2(5.5, 5.5)), 1.0, icon_col);
+                                        }
+                                    }
+                                    let kg = ui.painter().layout_no_wrap((*kind_label).into(), FontId::proportional(9.5), theme::CREAM_DIM);
+                                    let kx = rect.right() - 8.0 - kg.size().x;
+                                    ui.painter().galley(Pos2::new(kx, rect.center().y - kg.size().y * 0.5), kg, theme::CREAM_DIM);
+                                    let name_x = rect.left() + 20.0;
+                                    let name_col = if bypassed { theme::CREAM_DIM } else { theme::CREAM };
+                                    let max_w = (kx - 6.0 - name_x).max(16.0);
+                                    let ng = Self::ellipsized(ui.painter(), label, FontId::proportional(11.5), name_col, max_w);
+                                    ui.painter().galley(Pos2::new(name_x, rect.center().y - ng.size().y * 0.5), ng, name_col);
+                                    self.nav_row_rects.push((row.clone(), rect));
+                                    if resp.clicked() { jump = Some(row.clone()); }
+                                }
+                            }
+                        }
+                    });
+            });
+        self.nav_panel_rect = resp.response.rect;
+        if let Some(node) = toggle_fold {
+            if !self.nav_folded.remove(&node) {
+                self.nav_folded.insert(node);
+            }
+        }
+        if let Some(row) = jump {
+            self.nav_jump(&row);
+        }
+        if close {
+            self.nav_open = false;
+        }
+    }
+
+    /// A source's live audio level for its strip meter (post-fader, rule 53):
+    /// the published per-edge peak of its outgoing audio cables; without an
+    /// engine the MIDI activity LED stands in (demo).
+    fn strip_audio_level(&self, unit: usize) -> f32 {
+        if let Some(l) = &self.edge_levels {
+            return self.cables.iter()
+                .filter(|c| c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0)
+                .map(|c| edge_display_level(l.load(c.id)).min(1.0))
+                .fold(0.0f32, f32::max);
+        }
+        self.units.get(unit).map(|u| u.led).unwrap_or(0.0)
+    }
+
     /// Mirror the rig snapshot's device bindings into the per-synth source
     /// filters: every synth voice of a device-bound rig takes only that
     /// device (H on, K off). Indexes by VOICE slot, not rig index.
@@ -7302,12 +9242,6 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
-                LOOK_TOOL => {
-                    // Answered by `serve_rack_shots` once the frame arrived.
-                    self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote);
-                    self.rack_shot.remote.push((reply, std::time::Instant::now() + RACK_SHOT_WAIT));
-                    continue;
-                }
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
@@ -7392,12 +9326,19 @@ impl DemoApp {
     fn load_sound_into(&mut self, unit: &crate::sounds::Unit, sound: &crate::sounds::Sound) -> Result<(), String> {
         let pool = unit.slot.and_then(|s| self.clap_pool_idx(s));
         let clap = pool.and_then(|i| Some((self._surge_main.get_mut(i)?, self.surge_controllers.get(i)?)));
-        let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
-        crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
-        drop(bus);
+        if let crate::sounds::Load::VitalPatch(path) = &sound.load {
+            let state = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
+            crate::vital::check_patch(&state)?;
+            self.restore_lv2_state(unit.node, state)?;
+        } else {
+            let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
+        }
         if let crate::sounds::Load::MidiProgram(p) = sound.load {
             self.adopt_program_drawbars(unit.node, p);
         }
+        // An Aeolus registration changed the stops: the face reads them now.
+        if let crate::sounds::Load::AeolusRegistration(_) = sound.load { self.aeolus_poll_at = f32::NEG_INFINITY; }
         match unit.slot {
             Some(slot) => {
                 if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
@@ -7407,29 +9348,6 @@ impl DemoApp {
             None => {}
         }
         Ok(())
-    }
-
-    /// Answer the bridge callers that wait for look_at_rack: every one gets
-    /// the frame that arrived, or an error once its wait is over. The reply
-    /// is JSON: `{"text", "png_base64"}`.
-    fn serve_rack_shots(&mut self) {
-        if self.rack_shot.remote.is_empty() { return; }
-        let now = std::time::Instant::now();
-        let reply = |out: ToolOutput| match &out.image {
-            Some(image) => serde_json::json!({ "text": out.text, "png_base64": image.base64() }).to_string(),
-            None => out.text,
-        };
-        match self.rack_shot.take() {
-            Some(shot) => {
-                let out = reply(rack_shot_output("screenshot of the kabelsalat window", Some(shot)));
-                for (to, _) in self.rack_shot.remote.drain(..) { let _ = to.send(out.clone()); }
-            }
-            None => self.rack_shot.remote.retain(|(to, deadline)| {
-                if now < *deadline { return true; }
-                let _ = to.send(reply(rack_shot_output("", None)));
-                false
-            }),
-        }
     }
 
     /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
@@ -7468,60 +9386,42 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
-                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
+                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
         }
-        let image = self.chat_image.take();
-        self.chat_thumb = None;
-        let shown = match &image {
-            Some(image) => format!("{t} [image: {}]", image.name).trim_start().to_string(),
-            None => t.clone(),
-        };
-        let text = format!("{}\n{}", self.chat_context(), if t.is_empty() { "(see the attached image)" } else { &t });
+        let text = format!("{}\n{t}", self.chat_context());
         self.undo_job = None; // a new request = a new undo step
         self.pending_confirm = None; // a typed answer replaces the buttons
-        self.assistant.send_user_message(shown, UserMessage { text, image });
+        self.assistant.send_user_display(t, text);
         let user_idx = self.assistant.history.len().saturating_sub(1);
         self.active_run_user_idx = Some(user_idx);
         self.transcript_runs.entry(user_idx).or_default();
     }
 
-    /// Attach an image to the chat message being written and show the chat.
-    /// A file that is no image is named in the transcript.
-    fn attach_chat_image(&mut self, image: Result<Image, String>) {
-        match image {
-            Ok(image) => {
-                self.chat_image = Some(image);
-                self.chat_thumb = None;
+    /// A dropped Vital bank or patch is imported; other dropped files are
+    /// not for the app.
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            let name = file.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x)) {
+                self.import_vital(file.path());
             }
-            Err(why) => self.assistant.history.push(ChatLine { role: "error".into(), text: format!("not attached: {why}") }),
         }
-        if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
     }
 
-    /// Images the user handed over this frame: a file dropped on the window,
-    /// or an image pasted while the assistant is open.
-    fn take_chat_images(&mut self, ctx: &egui::Context) {
-        let (dropped, pasted) = ctx.input(|i| (
-            i.raw.dropped_files.clone(),
-            i.events.iter().find_map(|e| match e { egui::Event::PasteImage(image) => Some(image.clone()), _ => None }),
-        ));
-        for file in dropped {
-            let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-            let too_big = std::fs::metadata(file.path()).is_ok_and(|m| m.len() > crate::vision::MAX_FILE_BYTES);
-            let image = if too_big {
-                Err(format!("{name} is larger than {} MB", crate::vision::MAX_FILE_BYTES / 1_000_000))
-            } else {
-                file.bytes().and_then(|bytes| Image::from_file(&name, &bytes))
-            };
-            self.attach_chat_image(image);
-        }
-        if let Some(image) = pasted.filter(|_| self.assistant_open()) {
-            self.attach_chat_image(Image::from_rgba("pasted image", image.size, image.as_raw()));
-        }
+    /// Import a dropped Vital bank or patch where Vitalium reads presets,
+    /// and list it: the library is read again on its next use.
+    fn import_vital(&mut self, path: &std::path::Path) {
+        self.session_msg = match crate::vital::import(path, &crate::vital::data_dir()) {
+            Ok(added) => {
+                self.sounds.forget(&crate::sounds::Instrument::Lv2(crate::vital::URI.to_string()));
+                format!("{added}: Vitalium's sound list has them")
+            }
+            Err(e) => format!("not imported: {e}"),
+        };
     }
 
     fn switch_model(&mut self, m: &str) -> String {
@@ -7614,8 +9514,10 @@ impl DemoApp {
         // Mixer follows its rig; the new rig starts at unity (applied after
         // the reload — build_rack resets the mixer).
         let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        let mut arms = [false; 8];
         for (i, (k, _)) in rigs.iter().enumerate() {
             mix[i] = k.map_or(crate::engine::RigMix::DEFAULT, |o| self.rig_mix[o.min(7)]);
+            arms[i] = k.map_or(false, |o| self.arm_rigs[o.min(7)]);
         }
         let active = match delete {
             None => rigs.len() - 1,
@@ -7644,6 +9546,7 @@ impl DemoApp {
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
         for i in 0..list.len() { self.send_rig_mix(i); }
+        for i in 0..8 { self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false }); }
         self.session_msg = msg;
         self.editor_status.clear(); // not "rack reloaded" noise for a rig edit
     }
@@ -7874,6 +9777,9 @@ impl DemoApp {
             }
             for st in src_sess.plugin_states() {
                 combined.set_plugin_state(st.node, &st.plugin_id, st.data.clone());
+            }
+            for (&node, label) in src_sess.strip_knobs() {
+                combined.set_strip_knob(node, label.clone());
             }
         }
         let mut rules: Vec<SavedRule> = Vec::new();
@@ -8121,7 +10027,12 @@ impl DemoApp {
                             if add.clicked() { add_rig = true; }
                         }
                         nav_separator(ui);
-                        let scroll_w = ui.available_width().max(1.0);
+                        // The DSP readout keeps the strip's right end; the
+                        // rigs scroll in what is left. (The bar above is
+                        // full at the minimum width once an agent chip shows.)
+                        self.refresh_engine_stats();
+                        let dsp = self.dsp_chip_layout(ui);
+                        let scroll_w = (ui.available_width() - dsp.width - 8.0).max(1.0);
                         egui::ScrollArea::horizontal()
                             .id_salt("rig_strip")
                             .max_width(scroll_w)
@@ -8215,14 +10126,26 @@ impl DemoApp {
                                             self.load_rig_dialog = Some(None);
                                         }
                                         if n > 1 {
-                                            ui.add_space(8.0);
+                                            // The hint is the first thing to go: shown only where it fits whole.
                                             let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
-                                            ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
-                                                .size(11.0).color(theme::INK_2));
+                                            let room = scroll_w - (ui.min_rect().width() + 8.0);
+                                            for hint in [format!("{keys} or arrow keys switch the view · all rigs keep sounding"), format!("{keys} or ←→ switch the view")] {
+                                                let g = ui.painter().layout_no_wrap(hint.clone(), FontId::proportional(11.0), theme::INK_2);
+                                                if g.size().x <= room {
+                                                    ui.add_space(8.0);
+                                                    ui.label(egui::RichText::new(hint).size(11.0).color(theme::INK_2));
+                                                    break;
+                                                }
+                                            }
                                         }
                                     },
                                 );
                             });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.dsp_chip(ui, dsp).clicked() {
+                                self.engine_info_open = !self.engine_info_open;
+                            }
+                        });
                     },
                 );
             });
@@ -8330,6 +10253,11 @@ impl DemoApp {
                     ui.painter().rect_stroke(group.expand(3.0), 4.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Outside);
                     self.dock_group_rect = group;
                     if let Some(d) = dock { self.toggle_dock(d); }
+                    if !compact { ui.add_space(8.0); } else { ui.add_space(2.0); }
+                    // Compact: the short label keeps SYNC inside a 760 pt window.
+                    let nav = theme::chip_button(ui, if compact { "Nav" } else { "Navigator" }, self.nav_open)
+                        .on_hover_text("Navigator · key Q");
+                    if nav.clicked() { self.nav_open = !self.nav_open; }
                     // External agent (MCP --attach): visible while it acts,
                     // one click pauses it (Bravo item 7, without a per-start
                     // consent prompt — the user drives the app from outside).
@@ -8362,9 +10290,10 @@ impl DemoApp {
                     if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
                     let snap = self.recorder.as_ref().map(|r| r.snapshot());
+                    let pending = snap.as_ref().map(|s| s.pending).unwrap_or(false);
                     let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
                     let rec_err = snap.as_ref().and_then(|s| s.error.clone());
-                    if rec_chip(ui, recording, secs).on_hover_text("record the master output to ~/Music/kabelsalat/").clicked() {
+                    if rec_chip(ui, recording, pending, secs).on_hover_text("record armed targets to ~/Music/kabelsalat/ (bar-quantized while playing)").clicked() {
                         self.toggle_recording();
                     }
                     if let Some(err) = rec_err {
@@ -8453,18 +10382,79 @@ impl DemoApp {
         } else {
             self.session_name.trim().to_string()
         };
-        match self.capture_session(&name) {
-            Ok(s) => {
-                let path = crate::session::Session::package_path(dir, &name);
-                match path.and_then(|p| s.save(&p).map(|_| p)) {
-                    Ok(_) => {
-                        self.confirm_delete_session = None;
-                        self.session_msg = format!("Saved '{name}'");
+        self.confirm_session = None;
+        self.session_msg = match self.save_session_as(dir, &name) {
+            Ok(_) => format!("Saved '{name}'"),
+            Err(e) => e,
+        };
+    }
+
+    /// Save the rack as `name`, replacing a saved session of that name; it
+    /// becomes the open session, which autosave keeps writing.
+    fn save_session_as(&mut self, dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+        let s = self.capture_session(name).map_err(|e| format!("Capture failed: {e}"))?;
+        let path = crate::session::Session::package_path(dir, name)
+            .and_then(|p| s.save(&p).map(|_| p))
+            .map_err(|e| format!("Save failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave.saved = Some(s);
+        Ok(path)
+    }
+
+    /// Load the saved session `name`; it becomes the open session.
+    fn open_saved_session(&mut self, dir: &std::path::Path, name: &str) -> Result<(), String> {
+        let s = crate::session::Session::package_path(dir, name)
+            .and_then(|p| crate::session::Session::load(&p))
+            .map_err(|e| format!("Load failed: {e}"))?;
+        self.apply_session(&s).map_err(|e| format!("Apply failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave_rebase();
+        Ok(())
+    }
+
+    /// The rack now holds something autosave has not seen (a load, a
+    /// template): record it once it settled, before writing anything.
+    fn autosave_rebase(&mut self) {
+        self.autosave.saved = None;
+        self.autosave.due = AUTOSAVE_SETTLE;
+    }
+
+    fn autosave_target(&self) -> String {
+        self.open_session.clone().unwrap_or_else(|| AUTOSAVE_NAME.to_string())
+    }
+
+    /// Counts down to the next autosave check; true when one is due.
+    fn autosave_due(&mut self, dt: f32) -> bool {
+        if !self.autosave.enabled {
+            return false;
+        }
+        self.autosave.due -= dt;
+        if self.autosave.due > 0.0 {
+            return false;
+        }
+        self.autosave.due = AUTOSAVE_INTERVAL;
+        true
+    }
+
+    /// Write the open session if the rack changed since it was saved or
+    /// loaded. Plugin state is read here, so this runs on the UI thread.
+    fn autosave_now(&mut self, dir: &std::path::Path) {
+        let name = self.autosave_target();
+        let Ok(s) = self.capture_session(&name) else { return };
+        match &self.autosave.saved {
+            None => self.autosave.saved = Some(s),
+            Some(prev) if prev.same_content(&s) => {}
+            Some(_) => {
+                match crate::session::Session::package_path(dir, &name).and_then(|p| s.save(&p)) {
+                    Ok(()) => {
+                        self.session_msg = format!("Autosaved '{name}'");
+                        self.autosave.saved = Some(s);
                     }
-                    Err(e) => self.session_msg = format!("Save failed: {e}"),
+                    Err(e) => self.session_msg = format!("Autosave failed: {e}"),
                 }
             }
-            Err(e) => self.session_msg = format!("Capture failed: {e}"),
         }
     }
 
@@ -8485,6 +10475,7 @@ impl DemoApp {
         let names = Self::list_saved_sessions(dir);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
@@ -8517,6 +10508,13 @@ impl DemoApp {
 
                 let mut load_session: Option<String> = None;
                 let mut delete_session: Option<String> = None;
+                let mut overwrite_session: Option<String> = None;
+                let open_session = self.open_session.clone();
+                let autosave_line = if self.autosave.enabled {
+                    format!("Autosave on: changes go to '{}' every {} s.", self.autosave_target(), AUTOSAVE_INTERVAL as u32)
+                } else {
+                    "Autosave off (Settings).".to_string()
+                };
                 let mut do_save = false;
                 let mut load_tpl: Option<Template> = None;
                 let mut load_demo = false;
@@ -8539,6 +10537,8 @@ impl DemoApp {
                     if theme::primary_button(ui, "Save current patch").clicked() {
                         *do_save = true;
                     }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&autosave_line).size(11.5).color(theme::INK_2));
                     ui.add_space(16.0);
                     Self::stage_hairline(ui);
                     ui.add_space(14.0);
@@ -8571,6 +10571,7 @@ impl DemoApp {
                             Template::LeadReverb => ("Keys → Surge → Reverb", "F5"),
                             Template::DrumsBass => ("Dual Surge layers", "F6"),
                             Template::AmbientPad => ("Surge → Delay → Reverb", "F7"),
+                            Template::GuitarRig => ("Live input → stomps → amp", "⇧F5"),
                         };
                         if template_row(ui, t.title(), &format!("{desc} · {key_hint}"), "load a playable pre-wired rack") {
                             *load_tpl = Some(*t);
@@ -8597,8 +10598,9 @@ impl DemoApp {
 
                 let draw_right = |ui: &mut egui::Ui,
                                   names: &[String],
-                                  confirm_delete: &mut Option<String>,
+                                  confirm: &mut Option<SessionConfirm>,
                                   load_session: &mut Option<String>,
+                                  overwrite_session: &mut Option<String>,
                                   delete_session: &mut Option<String>,
                                   list_h: f32| {
                     theme::section_label(ui, &format!("Saved sessions ({})", names.len()));
@@ -8630,33 +10632,81 @@ impl DemoApp {
                                             .color(theme::INK_2),
                                     );
                                     ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new(name)
-                                            .font(theme::medium_font(14.5))
-                                            .color(theme::INK),
-                                    );
+                                    let is_open = open_session.as_deref() == Some(name.as_str());
+                                    // Buttons first, then the name in what is left of the row
+                                    // (rule 100): a long name truncates instead of running
+                                    // under Load in a narrow sheet.
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let confirming = confirm_delete.as_deref() == Some(name.as_str());
-                                        if confirming {
-                                            if theme::chip_button(ui, "Cancel", false).clicked() {
-                                                *confirm_delete = None;
+                                        match confirm.as_ref() {
+                                            Some(SessionConfirm::Delete(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm delete", true).clicked() {
+                                                    *delete_session = Some(name.clone());
+                                                }
                                             }
-                                            ui.add_space(6.0);
-                                            if theme::danger_button(ui, "Confirm delete", true).clicked() {
-                                                *delete_session = Some(name.clone());
+                                            Some(SessionConfirm::Overwrite(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm overwrite", true)
+                                                    .on_hover_text(format!("replace '{name}' with the current patch"))
+                                                    .clicked()
+                                                {
+                                                    *overwrite_session = Some(name.clone());
+                                                }
                                             }
-                                        } else {
-                                            if theme::danger_button(ui, "Delete", false)
-                                                .on_hover_text(format!("delete '{name}' from disk"))
-                                                .clicked()
-                                            {
-                                                *confirm_delete = Some(name.clone());
-                                            }
-                                            ui.add_space(6.0);
-                                            if theme::primary_button(ui, "Load").clicked() {
-                                                *load_session = Some(name.clone());
+                                            _ => {
+                                                if theme::danger_button(ui, "Delete", false)
+                                                    .on_hover_text(format!("delete '{name}' from disk"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Delete(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::chip_button(ui, "Overwrite", false)
+                                                    .on_hover_text(format!("save the current patch over '{name}'"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Overwrite(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::primary_button(ui, "Load").clicked() {
+                                                    *load_session = Some(name.clone());
+                                                }
                                             }
                                         }
+                                        ui.add_space(8.0);
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            let open_tag = egui::RichText::new("open").size(11.5).color(theme::INK_2);
+                                            let open_w = if is_open {
+                                                ui.spacing().item_spacing.x
+                                                    + egui::WidgetText::from(open_tag.clone())
+                                                        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+                                                        .size()
+                                                        .x
+                                            } else {
+                                                0.0
+                                            };
+                                            let name_w = (ui.available_width() - open_w).max(0.0);
+                                            ui.scope(|ui| {
+                                                ui.set_max_width(name_w);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name)
+                                                            .font(theme::medium_font(14.5))
+                                                            .color(if is_open { theme::LIVE_TEAL } else { theme::INK }),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                            if is_open {
+                                                ui.label(open_tag);
+                                            }
+                                        });
                                     });
                                 });
                                 ui.add_space(8.0);
@@ -8691,6 +10741,7 @@ impl DemoApp {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                         ui.add_space(12.0);
+                        let right_w = ui.available_width().min(right_w);
                         ui.allocate_ui_with_layout(
                             egui::vec2(right_w, h),
                             egui::Layout::top_down(egui::Align::Min),
@@ -8699,8 +10750,9 @@ impl DemoApp {
                                 draw_right(
                                     ui,
                                     &names,
-                                    &mut self.confirm_delete_session,
+                                    &mut self.confirm_session,
                                     &mut load_session,
+                                    &mut overwrite_session,
                                     &mut delete_session,
                                     list_h,
                                 );
@@ -8728,8 +10780,9 @@ impl DemoApp {
                             draw_right(
                                 ui,
                                 &names,
-                                &mut self.confirm_delete_session,
+                                &mut self.confirm_session,
                                 &mut load_session,
+                                &mut overwrite_session,
                                 &mut delete_session,
                                 200.0,
                             );
@@ -8749,18 +10802,25 @@ impl DemoApp {
                     self.load_multi_rig_demo();
                 }
                 if let Some(name) = load_session {
-                    self.confirm_delete_session = None;
-                    let path = crate::session::Session::package_path(dir, &name);
-                    match path.and_then(|p| crate::session::Session::load(&p)) {
-                        Ok(s) => match self.apply_session(&s) {
-                            Ok(_) => self.session_msg = format!("Loaded '{name}'"),
-                            Err(e) => self.session_msg = format!("Apply failed: {e}"),
-                        },
-                        Err(e) => self.session_msg = format!("Load failed: {e}"),
-                    }
+                    self.confirm_session = None;
+                    self.session_msg = match self.open_saved_session(dir, &name) {
+                        Ok(()) => format!("Loaded '{name}'"),
+                        Err(e) => e,
+                    };
+                }
+                if let Some(name) = overwrite_session {
+                    self.confirm_session = None;
+                    self.session_msg = match self.save_session_as(dir, &name) {
+                        Ok(_) => format!("Overwrote '{name}'"),
+                        Err(e) => e,
+                    };
                 }
                 if let Some(name) = delete_session {
-                    self.confirm_delete_session = None;
+                    self.confirm_session = None;
+                    if self.open_session.as_deref() == Some(name.as_str()) {
+                        self.open_session = None;
+                        self.autosave_rebase();
+                    }
                     match Self::delete_saved_session(dir, &name) {
                         Ok(()) => self.session_msg = format!("Deleted '{name}'"),
                         Err(e) => self.session_msg = format!("Delete failed: {e}"),
@@ -8826,9 +10886,22 @@ impl DemoApp {
                 self.plugins_lv2 = lv2;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
+                self.classify_lv2_units();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.plugin_scan = None,
+        }
+    }
+
+    /// Mark the rack's LV2 units that the plugin scan calls instruments.
+    fn classify_lv2_units(&mut self) {
+        for u in &mut self.units {
+            let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { continue };
+            u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+            if u.lv2_inst {
+                u.sub = "lv2 synth".into();
+                u.sub_g = None;
+            }
         }
     }
 
@@ -9007,6 +11080,214 @@ impl DemoApp {
         }
     }
 
+    /// Add a MIDI strip (LV2 MIDI plugin, or the built-in transposer when
+    /// `uri` is None) to the active rig: the engine inserts it between the
+    /// rig's Keys and its instruments (`Graph::wire_midi_fx`).
+    fn add_midi_fx_to_active_rig(&mut self, uri: Option<&str>, name: &str) {
+        let plugin = match uri {
+            Some(u) => crate::control::MidiFxPlugin::Lv2 { uri: Lv2Uri::new(u) },
+            None => crate::control::MidiFxPlugin::Builtin { semis: 0 },
+        };
+        let Some(bus) = &self.bus else {
+            self.plugin_msg = "No engine attached".into();
+            return;
+        };
+        let _ = bus.lock().unwrap().send(Command::AddNode {
+            kind: NodeKind::MidiFx { plugin },
+            name: name_bytes(name),
+            rig: self.active_rig as u8,
+            wire: true,
+        });
+        self.plugin_msg = format!("Added MIDI strip '{name}' — Keys → {name} → instruments");
+    }
+
+    /// One insert edit (#74): add, remove or move an FX inside a strip's
+    /// linear chain. The cables stay the truth — the edit is a graph edit
+    /// (AddNode + Connect/Disconnect), applied through the SAME reload every
+    /// other rig edit uses (`capture_session` → new graph → `apply_session`
+    /// → canonical remap), so knobs, synth states, rules and strips all
+    /// travel with it and the rack back panel shows the new cables.
+    fn strip_insert_edit(&mut self, source: u32, edit: StripInsertEdit) -> Result<String, String> {
+        let (mut g, mut fx, tail) = self.strip_chain_graph(source)?;
+        let old_fx = fx.clone();
+        let rig = g.node(source).map(|n| n.rig).unwrap_or(0);
+        let msg = match &edit {
+            StripInsertEdit::Add { kind, name } => {
+                let node = g.add_node(kind.clone(), name_bytes(name));
+                g.set_rig(node, rig);
+                fx.push(node);
+                format!("Added {} — chained before the rig bus", sentence_case(name))
+            }
+            StripInsertEdit::Remove { fx: victim } => {
+                let pos = fx.iter().position(|n| *n == *victim)
+                    .ok_or_else(|| format!("node {victim} is not an insert of node {source}"))?;
+                fx.remove(pos);
+                format!("Removed insert node {victim}")
+            }
+            StripInsertEdit::Move { fx: moved, to } => {
+                let pos = fx.iter().position(|n| *n == *moved)
+                    .ok_or_else(|| format!("node {moved} is not an insert of node {source}"))?;
+                if fx.len() < 2 { return Err("only one insert — nothing to reorder".into()); }
+                fx.remove(pos);
+                // `to` is the 1-based slot shown on the strip (as in the tools).
+                let to = (*to).clamp(1, fx.len() + 1);
+                fx.insert(to - 1, *moved);
+                format!("Moved insert node {moved} to slot {to}")
+            }
+        };
+        self.rewire_chain_edges(&mut g, source, &old_fx, &fx, tail);
+        if let StripInsertEdit::Remove { fx: victim } = &edit {
+            g.remove_node(*victim);
+        }
+        self.reload_with_graph(g)?;
+        Ok(msg)
+    }
+
+    /// One master-insert edit (#77): an FX node fed BY a MasterOut node runs
+    /// on the summed mix before the fixed limiter. Same graph-edit reload as
+    /// source inserts; the chain starts at the active rig's master.
+    fn master_insert_edit(&mut self, edit: StripInsertEdit) -> Result<String, String> {
+        let masters: Vec<u32> = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Master))
+            .map(|u| u.node_id).collect();
+        let start = self.units.iter()
+            .find(|u| matches!(u.node_kind, UnitKind::Master) && (self.rig_count() <= 1 || u.rig == self.active_rig as u8))
+            .map(|u| u.node_id)
+            .or_else(|| masters.first().copied())
+            .ok_or("no master out to insert into")?;
+        let mut g = self.base_graph.clone();
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+        }
+        let mut fx: Vec<u32> = self.master_chain().iter().map(|&u| self.units[u].node_id).collect();
+        let old_fx = fx.clone();
+        let rig = g.node(start).map(|n| n.rig).unwrap_or(0);
+        let msg = match &edit {
+            StripInsertEdit::Add { kind, name } => {
+                let node = g.add_node(kind.clone(), name_bytes(name));
+                g.set_rig(node, rig);
+                fx.push(node);
+                format!("Added {} — master insert, before the limiter", sentence_case(name))
+            }
+            StripInsertEdit::Remove { fx: victim } => {
+                let pos = fx.iter().position(|n| *n == *victim)
+                    .ok_or_else(|| format!("node {victim} is not a master insert"))?;
+                fx.remove(pos);
+                format!("Removed master insert node {victim}")
+            }
+            StripInsertEdit::Move { fx: moved, to } => {
+                let pos = fx.iter().position(|n| *n == *moved)
+                    .ok_or_else(|| format!("node {moved} is not a master insert"))?;
+                if fx.len() < 2 { return Err("only one master insert — nothing to reorder".into()); }
+                fx.remove(pos);
+                // `to` is the 1-based slot shown on the strip (as in the tools).
+                let to = (*to).clamp(1, fx.len() + 1);
+                fx.insert(to - 1, *moved);
+                format!("Moved master insert {moved} to slot {to}")
+            }
+        };
+        // The master chain has no tail: the last insert feeds the output.
+        self.rewire_chain_edges(&mut g, start, &old_fx, &fx, None);
+        if let StripInsertEdit::Remove { fx: victim } = &edit {
+            g.remove_node(*victim);
+        }
+        self.reload_with_graph(g)?;
+        Ok(msg)
+    }
+
+    /// The mirror graph (base nodes + living cables), the strip's verified
+    /// linear FX chain in node ids, and the chain's single tail node (the rig
+    /// master; None = custom wiring — callers show it instead of guessing).
+    fn strip_chain_graph(&self, source: u32) -> Result<(Graph, Vec<u32>, Option<u32>), String> {
+        let mut g = self.base_graph.clone();
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+        }
+        let unit = self.units.iter().position(|u| u.node_id == source)
+            .ok_or_else(|| format!("no strip with node {source}"))?;
+        let Some(fx_units) = self.strip_chain(unit) else {
+            return Err("this strip's wiring is custom — patch it on the rack back".into());
+        };
+        let fx: Vec<u32> = fx_units.iter().map(|&f| self.units[f].node_id).collect();
+        // The chain's end (source when it feeds the master directly) and its
+        // single distinct audio target = the tail. Preserve the tail hop's
+        // exact (to-port) shapes — stereo pairs stay stereo pairs.
+        let end = fx.last().copied().unwrap_or(source);
+        let mut tails: Vec<u32> = g.edges.iter()
+            .filter(|e| e.kind == CPortKind::Audio && e.from.node == end)
+            .map(|e| e.to.node).collect();
+        tails.sort_unstable();
+        tails.dedup();
+        if tails.len() != 1 { return Err("this strip's wiring is custom — patch it on the rack back".into()); }
+        Ok((g, fx, Some(tails[0])))
+    }
+
+    /// Rewire one chain run in `g` from `start` through the FX to `tail`:
+    /// drop the OLD run's hop edges (node pairs `[start, old_fx…, tail]`) and
+    /// connect the NEW order. The tail hop keeps the exact to-port shapes it
+    /// had (a stereo pair into the master stays one); a master chain has no
+    /// tail — its last insert feeds the output.
+    fn rewire_chain_edges(&mut self, g: &mut Graph, start: u32, old_fx: &[u32], new_fx: &[u32], tail: Option<u32>) {
+        let old_end = old_fx.last().copied().unwrap_or(start);
+        let tail_ports: Vec<u8> = match tail {
+            Some(t) => g.edges.iter()
+                .filter(|e| e.kind == CPortKind::Audio && e.from.node == old_end && e.to.node == t)
+                .map(|e| e.to.port).collect(),
+            None => Vec::new(),
+        };
+        let mut old_run: Vec<u32> = vec![start];
+        old_run.extend_from_slice(old_fx);
+        if let Some(t) = tail { old_run.push(t); }
+        for pair in old_run.windows(2) {
+            g.edges.retain(|e| !(e.kind == CPortKind::Audio && e.from.node == pair[0] && e.to.node == pair[1]));
+        }
+        let fresh = |g: &Graph| g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let mut prev = start;
+        for &f in new_fx {
+            let id = fresh(g);
+            g.connect_with_id(id, PortRef { node: prev, port: 0 }, PortRef { node: f, port: 0 }, CPortKind::Audio);
+            prev = f;
+        }
+        if let Some(t) = tail {
+            for p in if tail_ports.is_empty() { vec![0u8] } else { tail_ports } {
+                let id = fresh(g);
+                g.connect_with_id(id, PortRef { node: prev, port: 0 }, PortRef { node: t, port: p }, CPortKind::Audio);
+            }
+        }
+    }
+
+    /// Reload the rack with an edited graph, keeping the mixer, strips and
+    /// the rig in view (rule 20: applied AFTER the reload). The canonical
+    /// remap inside `apply_session` carries knobs, states, rules and strips
+    /// to their new node ids.
+    fn reload_with_graph(&mut self, g: Graph) -> Result<(), String> {
+        let keep_rig = self.active_rig;
+        let keep_mix = self.rig_mix;
+        let mut s = self.capture_session("mixer edit").map_err(|e| e.to_string())?;
+        s.graph = g;
+        self.apply_session(&s).map_err(|e| e.to_string())?;
+        self.rig_mix = keep_mix;
+        self.active_rig = usize::MAX; // force set_active_rig to regroup
+        self.set_active_rig(keep_rig);
+        for i in 0..self.rig_count() { self.send_rig_mix(i); }
+        self.send_all_strip_state();
+        Ok(())
+    }
+
     /// Add a Metronome node to the active rig and wire it to that rig's MasterOut.
     fn add_metronome_to_active_rig(&mut self) {
         let rig = self.active_rig as u8;
@@ -9035,6 +11316,8 @@ impl DemoApp {
         self.build_rack(&g, &[]);
         self.rig_mix = keep_mix;
         self.set_active_rig(keep_rig);
+        // The load dropped the engine's strip table: re-publish it (rule 20).
+        self.send_all_strip_state();
         self.plugin_msg = "Added Metronome — wired to Master".into();
         self.stage_view = StageView::Rack;
     }
@@ -9126,26 +11409,32 @@ impl DemoApp {
         let help = self.show_help;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                // Title + subtitle in a plain row (a wrapped row's galleys start
+                // at its left edge and overlap, rule 100); the subtitle
+                // truncates. The confirmation gets a row of its own (#65).
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
-                            .size(13.0)
-                            .color(theme::INK_2),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
+                                .size(13.0)
+                                .color(theme::INK_2),
+                        )
+                        .truncate(),
                     );
-                    if !self.plugin_msg.is_empty() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let col = if self.plugin_msg.contains("failed") {
-                                theme::CLIP_BRIGHT
-                            } else {
-                                theme::LIVE_TEAL
-                            };
-                            ui.label(egui::RichText::new(&self.plugin_msg).size(12.5).color(col));
-                        });
-                    }
                 });
+                if !self.plugin_msg.is_empty() {
+                    let col = if self.plugin_msg.contains("failed") {
+                        theme::CLIP_BRIGHT
+                    } else {
+                        theme::LIVE_TEAL
+                    };
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
+                }
                 ui.add_space(12.0);
 
                 let mut do_refresh = false;
@@ -9182,7 +11471,7 @@ impl DemoApp {
 
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome adds to the active rig")
+                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome and MIDI strips add to the active rig")
                         .size(12.0)
                         .color(theme::INK_2),
                 );
@@ -9199,6 +11488,7 @@ impl DemoApp {
                 let mut add_metro = false;
                 let mut add_clap: Option<(String, String)> = None;
                 let mut add_lv2: Option<(String, String, bool)> = None;
+                let mut add_midi_fx: Option<(Option<String>, String)> = None;
                 let mut install_request: Option<String> = None;
 
                 egui::ScrollArea::vertical()
@@ -9418,15 +11708,41 @@ impl DemoApp {
                         if show_builtin {
                             theme::section_label(ui, "Built-in");
                             ui.add_space(8.0);
-                            Self::plugin_card(ui, card_w, |ui, iw| {
-                                card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
-                                ui.add_space(12.0);
-                                if theme::primary_button(ui, "Add to rig").clicked() {
-                                    add_metro = true;
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                Self::plugin_card(ui, card_w, |ui, iw| {
+                                    card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
+                                    ui.add_space(12.0);
+                                    if theme::primary_button(ui, "Add to rig").clicked() {
+                                        add_metro = true;
+                                    }
+                                });
+                                if cols > 1 {
+                                    Self::plugin_card(ui, card_w, |ui, iw| {
+                                        card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
+                                        ui.add_space(12.0);
+                                        if theme::primary_button(ui, "Add MIDI strip").clicked() {
+                                            add_midi_fx = Some((None, "Transpose".to_string()));
+                                        }
+                                    });
                                 }
                             });
+                            if cols == 1 {
+                                ui.add_space(gap);
+                                Self::plugin_card(ui, card_w, |ui, iw| {
+                                    card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
+                                    ui.add_space(12.0);
+                                    if theme::primary_button(ui, "Add MIDI strip").clicked() {
+                                        add_midi_fx = Some((None, "Transpose".to_string()));
+                                    }
+                                });
+                            }
                             need_divider = true;
                         }
 
@@ -9493,7 +11809,9 @@ impl DemoApp {
                                         ui.spacing_mut().item_spacing.x = gap;
                                         for p in row {
                                             Self::plugin_card(ui, card_w, |ui, iw| {
-                                                let (badge, bcol) = if p.is_instrument {
+                                                let (badge, bcol) = if p.is_midi_fx {
+                                                    ("MIDI FX", theme::LIVE_TEAL)
+                                                } else if p.is_instrument {
                                                     ("INST", theme::LIVE_TEAL)
                                                 } else {
                                                     ("FX", theme::INK_2)
@@ -9505,6 +11823,12 @@ impl DemoApp {
                                                         .truncate(),
                                                 );
                                                 ui.add_space(12.0);
+                                                if p.is_midi_fx {
+                                                    if theme::primary_button(ui, "Add MIDI strip").on_hover_text(&p.uri).clicked() {
+                                                        add_midi_fx = Some((Some(p.uri.clone()), p.name.clone()));
+                                                    }
+                                                    return;
+                                                }
                                                 ui.horizontal(|ui| {
                                                     ui.spacing_mut().item_spacing.x = 6.0;
                                                     let inst_resp = if p.is_instrument {
@@ -9536,6 +11860,9 @@ impl DemoApp {
                 if add_metro {
                     self.add_metronome_to_active_rig();
                 }
+                if let Some((uri, name)) = add_midi_fx {
+                    self.add_midi_fx_to_active_rig(uri.as_deref(), &name);
+                }
                 if let Some((id, name)) = add_clap {
                     self.add_clap_rig(&id, &name);
                 }
@@ -9561,7 +11888,6 @@ impl DemoApp {
         match role {
             crate::llm::Role::Decide => &mut self.settings_decide_input,
             crate::llm::Role::Act => &mut self.settings_act_input,
-            crate::llm::Role::Perceive => &mut self.settings_perceive_input,
         }
     }
 
@@ -9582,6 +11908,7 @@ impl DemoApp {
             SaveKey(Endpoint, String),
             RemoveKey(Endpoint),
             ToggleReduceMotion,
+            ToggleAutosave,
             SetCountIn(bool, u8),
             SetAudioOutput(Option<String>),
         }
@@ -9598,7 +11925,6 @@ impl DemoApp {
         let decide_on = self.assistant.decide_enabled();
         let decide_route = self.assistant.route_for(Role::Decide);
         let act_route = self.assistant.route_for(Role::Act);
-        let perceive_route = self.assistant.route_for(Role::Perceive);
         let (outputs, out_current) = self
             .audio_out
             .lock()
@@ -9606,12 +11932,14 @@ impl DemoApp {
             .unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         let reduce_motion = self.reduce_motion;
+        let autosave_on = self.autosave.enabled;
         let count_in_enabled = self.count_in_enabled;
         let count_in_bars = self.count_in_bars;
-        let detected_scale = ui_scale_target();
+        let detected_scale = ui.ctx().pixels_per_point();
         let mut actions: Vec<SettingsAction> = Vec::new();
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
@@ -9631,6 +11959,11 @@ impl DemoApp {
                 ui.label(
                     egui::RichText::new("agent models · API keys · preferences · Tab / Esc: back to the rack")
                         .size(13.0)
+                        .color(theme::INK_2),
+                );
+                ui.label(
+                    egui::RichText::new(format!("kabelsalat {}", crate::VERSION))
+                        .size(12.5)
                         .color(theme::INK_2),
                 );
                 ui.add_space(12.0);
@@ -9653,13 +11986,11 @@ impl DemoApp {
                         let route = match role {
                             Role::Decide => &decide_route,
                             Role::Act => &act_route,
-                            Role::Perceive => &perceive_route,
                         };
                         let choices = crate::assistant::role_model_choices(role, keys, &route.model);
                         let desc = match role {
                             Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
                             Role::Act => "Handles conversation, questions, and multi-step rack edits.",
-                            Role::Perceive => "Reads attached screenshots and images for turns that carry one.",
                         };
 
                         ui.horizontal(|ui| {
@@ -9871,6 +12202,19 @@ impl DemoApp {
                     ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Autosave sessions").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, if autosave_on { "On" } else { "Off" }, autosave_on).clicked() {
+                                actions.push(SettingsAction::ToggleAutosave);
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Saves changes to the open session every 20 s and on quit; unsaved patches go to 'Autosave' (session_autosave).").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
@@ -9941,7 +12285,7 @@ impl DemoApp {
                             );
                         });
                     });
-                    ui.label(egui::RichText::new("Detected from display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
+                    ui.label(egui::RichText::new("From the display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
                 };
 
                 egui::ScrollArea::vertical()
@@ -10027,6 +12371,16 @@ impl DemoApp {
                         "Reduce motion enabled".into()
                     } else {
                         "Reduce motion disabled".into()
+                    };
+                }
+                SettingsAction::ToggleAutosave => {
+                    self.autosave.enabled = !self.autosave.enabled;
+                    self.autosave_rebase();
+                    let saved = crate::assistant::save_session_autosave(self.autosave.enabled);
+                    self.settings_msg = match (saved, self.autosave.enabled) {
+                        (Err(e), _) => format!("Saving the autosave setting failed: {e}"),
+                        (Ok(()), true) => "Autosave enabled".into(),
+                        (Ok(()), false) => "Autosave disabled".into(),
                     };
                 }
                 SettingsAction::SetCountIn(enabled, bars) => {
@@ -10285,8 +12639,6 @@ impl DemoApp {
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
                                  chat_input: &mut String,
-                                 chat_image: &mut Option<Image>,
-                                 chat_thumb: &mut Option<ChatThumb>,
                                  assistant: &mut Assistant,
                                  transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
@@ -10336,10 +12688,7 @@ impl DemoApp {
                     }
 
                     let col_h = ui.available_height().max(40.0);
-                    // The attachment chip has a fixed row, so the history
-                    // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 } else { 0.0 };
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + 4.0;
                     let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
@@ -10475,60 +12824,6 @@ impl DemoApp {
                                 }
                             }
                         });
-                    sync_chat_thumb(ui.ctx(), chat_image, chat_thumb);
-                    if let Some(img) = chat_image.as_ref() {
-                        let mut remove_image = false;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), ATTACH_ROW_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
-                                egui::Frame::new()
-                                    .fill(theme::DARK_PANEL_HI)
-                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                    .corner_radius(2.0)
-                                    .inner_margin(egui::Margin::symmetric(8, 4))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 8.0;
-                                            let thumb_info = chat_thumb.as_ref();
-                                            let [tw, th] = thumb_info.map_or([32, 32], |t| t.size);
-                                            let aspect = (tw as f32 / th.max(1) as f32).clamp(0.6, 2.0);
-                                            let thumb_sz = egui::vec2((ATTACH_THUMB_H * aspect).round(), ATTACH_THUMB_H);
-                                            let (rect, _) = ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
-                                            if let Some(tex) = thumb_info.and_then(|t| t.tex.as_ref()) {
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    rect,
-                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                                    Color32::WHITE,
-                                                );
-                                                ui.painter().rect_stroke(rect, 1.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                            } else {
-                                                ui.painter().rect_filled(rect, 2.0, theme::PAPER_SINK);
-                                                ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "IMG", theme::medium_font(9.5), theme::CREAM_META);
-                                            }
-                                            let name = truncate_attachment_name(&img.name);
-                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(theme::CREAM)).truncate());
-                                            let close = ui.add(
-                                                egui::Button::new(egui::RichText::new("×").font(theme::medium_font(13.0)).color(theme::CREAM))
-                                                    .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::NONE)
-                                                    .min_size(egui::vec2(22.0, 24.0)),
-                                            ).on_hover_text("remove the image");
-                                            if close.clicked() {
-                                                remove_image = true;
-                                            }
-                                        });
-                                    });
-                            },
-                        );
-                        if remove_image {
-                            *chat_image = None;
-                            *chat_thumb = None;
-                        }
-                    }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
                         let edit = egui::Frame::new()
@@ -10542,7 +12837,7 @@ impl DemoApp {
                                         .id_salt("assistant_chat_input")
                                         .frame(egui::Frame::NONE)
                                         .desired_width((ui.available_width() - 82.0).max(80.0))
-                                        .hint_text("Ask or instruct… (drop or paste an image to show it)"),
+                                        .hint_text("Ask or instruct…"),
                                 );
                                 if *focus_chat { edit_resp.request_focus(); *focus_chat = false; }
                                 edit_resp
@@ -10550,7 +12845,7 @@ impl DemoApp {
                             .inner;
                         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
-                            && (!chat_input.trim().is_empty() || chat_image.is_some())
+                            && !chat_input.trim().is_empty()
                             && !assistant.busy
                         {
                             *submit_text = Some(chat_input.trim().to_string());
@@ -10571,8 +12866,6 @@ impl DemoApp {
                                     ui,
                                     &mut self.key_input,
                                     &mut self.chat_input,
-                                    &mut self.chat_image,
-                                    &mut self.chat_thumb,
                                     &mut self.assistant,
                                     &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
@@ -10618,11 +12911,10 @@ impl DemoApp {
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                         if self.agent_activity.log.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("No agent edits yet — assistant & MCP/CLI changes appear here and highlight in the rack.")
-                                                    .size(11.5)
-                                                    .color(theme::INK_2),
-                                            );
+                                            // One line: a short dock leaves this list a single row.
+                                            ui.add(egui::Label::new(egui::RichText::new("No agent edits yet")
+                                                .size(11.5).color(theme::INK_2)).truncate())
+                                                .on_hover_text("assistant & MCP/CLI changes appear here and highlight in the rack");
                                             return;
                                         }
                                         for entry in &self.agent_activity.log {
@@ -10654,8 +12946,6 @@ impl DemoApp {
                         ui,
                         &mut self.key_input,
                         &mut self.chat_input,
-                        &mut self.chat_image,
-                        &mut self.chat_thumb,
                         &mut self.assistant,
                         &mut self.transcript_runs,
                         &mut self.assistant_input_h,
@@ -10717,10 +13007,11 @@ impl DemoApp {
     }
 
     /// Keyboard dock height: a share of the WINDOW height (rule 64), never
-    /// below the minimum playable size, and only what the rack can spare
-    /// (rule 22). Whole pixels, so a resize does not jitter the layout.
+    /// below the minimum playable size (header + MIDI strip + keys of at
+    /// least 60 px), and only what the rack can spare (rule 22). Whole
+    /// pixels, so a resize does not jitter the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 140.0; // header + keys of at least 40 px
+        const MIN_H: f32 = 164.0;
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -10750,6 +13041,7 @@ impl DemoApp {
         let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
         let mut note: Option<usize> = None;
         let mut kb_rect = Rect::NOTHING;
+        let mut strip = [Rect::NOTHING; 4];
         // exact_size, not default_size: egui keeps a panel's first size, so
         // the dock never followed a window resize (#23).
         let resp = egui::Panel::bottom("dock")
@@ -10775,6 +13067,68 @@ impl DemoApp {
                                 self.dock = DockView::None;
                             }
                         });
+                    },
+                );
+                ui.add_space(4.0);
+                // --- MIDI control strip (GitHub #97) -------------------------
+                // The standard signals a keyboard sends besides notes, laid
+                // out like GarageBand's: pitch bend and modulation wheels,
+                // the sustain pedal, and the velocity slider. All go out as
+                // the Keys source, so the matrix routes them to the same
+                // rigs the played notes reach.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 56.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        self.kb_wheel_ui(ui, "PITCH", true, &mut strip[0]);
+                        ui.add_space(10.0);
+                        self.kb_wheel_ui(ui, "MOD", false, &mut strip[1]);
+                        ui.add_space(14.0);
+                        let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
+                            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
+                        strip[2] = sus.rect;
+                        if sus.clicked() {
+                            self.kb_sustain = !self.kb_sustain;
+                            self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
+                            self.kb_strip_pulse(0.85);
+                        }
+                        ui.add_space(14.0);
+                        // Velocity: one source of truth — the Keys unit's VEL
+                        // knob, which the laptop keys and clicks already
+                        // scale by (find it by label, rule 92).
+                        let ki = self.keys_idx();
+                        let vel_idx = self.units.get(ki).and_then(|u| u.knob_index("VEL"));
+                        let vel = vel_idx
+                            .and_then(|i| self.units.get(ki).map(|u| u.knobs[i].value))
+                            .unwrap_or(0.8);
+                        let (track, resp) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::click_and_drag());
+                        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
+                        strip[3] = track;
+                        let mut vel_new = vel;
+                        if resp.dragged() || resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                            }
+                        }
+                        if (vel_new - vel).abs() > f32::EPSILON {
+                            if let Some(i) = vel_idx {
+                                if let Some(u) = self.units.get_mut(ki) {
+                                    // Rule 109: the drawn knob follows at once.
+                                    u.knobs[i].set_immediate(vel_new);
+                                }
+                            }
+                        }
+                        let painter = ui.painter();
+                        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
+                        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
+                        painter.rect_filled(
+                            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
+                            1.0,
+                            theme::CREAM,
+                        );
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(format!("VEL {:.2}", vel_new)).size(11.0).color(theme::INK_2));
                     },
                 );
                 ui.add_space(4.0);
@@ -10823,6 +13177,7 @@ impl DemoApp {
             });
         self.dock_rect = resp.response.rect;
         self.dock_kb_rect = kb_rect;
+        self.kb_strip = strip;
         self.assistant_rect = Rect::NOTHING;
         self.assistant_input_rect = Rect::NOTHING;
         if let Some(semi) = note {
@@ -10836,6 +13191,103 @@ impl DemoApp {
         self.current_source = SourceId::Keys;
         self.fire_keys(note, 0.95);
         self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note));
+    }
+
+    /// One keyboard-strip channel message, out as the Keys source: the same
+    /// bus the played notes take, so the matrix routes it to the same rigs
+    /// (and per-rig keyboard switches gate it the same way).
+    fn kb_cc(&mut self, cc: u8, value: u8) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| {
+                b.send(Command::Cc { source: SourceId::Keys, channel: 0, cc, value })
+            });
+        }
+    }
+
+    /// One keyboard-strip pitch bend (signed 14-bit, 0 = center).
+    fn kb_bend_cmd(&mut self, value: i16) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| {
+                b.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value })
+            });
+        }
+    }
+
+    /// A strip message pulses the Keys unit's living MIDI cables, so the
+    /// rack shows the wheels feeding the rigs (the note pulse path).
+    fn kb_strip_pulse(&mut self, amp: f32) {
+        let ki = self.keys_idx();
+        if !self.units.get(ki).map(|u| matches!(u.node_kind, UnitKind::Keys)).unwrap_or(false) {
+            return;
+        }
+        for ci in 0..self.cables.len() {
+            let c = &mut self.cables[ci];
+            if c.src == ki && c.kind == PortKind::Midi && c.dying < 0.0 {
+                c.spawn_pulse(0.0, amp);
+            }
+        }
+    }
+
+    /// One strip wheel (GitHub #97): a small vertical track the pointer
+    /// drags — pitch (`spring`, value -1..=1, back to center on release,
+    /// like a real wheel) or modulation (value 0..=1, holds). Sends only
+    /// when the quantized MIDI value moves, so a frame that rounds to the
+    /// same bend/CC sends nothing.
+    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, label: &str, spring: bool, rect_out: &mut Rect) {
+        const W: f32 = 26.0;
+        const H: f32 = 40.0;
+        let mut track = Rect::NOTHING;
+        ui.vertical(|ui| {
+            let (t_rect, resp) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::click_and_drag());
+            track = t_rect;
+            // Pointer → value: the track bottom is the rest position (pitch:
+            // -1), the top is the extreme. Absolute, like a real wheel.
+            let mut value = if spring { self.kb_bend } else { self.kb_mod };
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let t = ((t_rect.bottom() - pos.y) / t_rect.height()).clamp(0.0, 1.0);
+                    value = if spring { t * 2.0 - 1.0 } else { t };
+                }
+            } else if spring && resp.drag_stopped() {
+                value = 0.0;
+            }
+            if spring {
+                let after = (value * 8191.0).round() as i16;
+                if after != (self.kb_bend * 8191.0).round() as i16 {
+                    self.kb_bend = value;
+                    self.kb_bend_cmd(after);
+                    self.kb_strip_pulse(0.3 + value.abs() * 0.5);
+                }
+            } else {
+                let after = (value * 127.0).round() as u8;
+                if after != (self.kb_mod * 127.0).round() as u8 {
+                    self.kb_mod = value;
+                    self.kb_cc(1, after);
+                    self.kb_strip_pulse(0.3 + value * 0.5);
+                }
+            }
+            let painter = ui.painter().clone();
+            painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
+            painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            if spring {
+                // The center detent a pitch wheel returns to.
+                let cy = t_rect.center().y;
+                painter.line_segment(
+                    [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
+                    Stroke::new(1.0, theme::MUTED),
+                );
+            }
+            let t = if spring { (value + 1.0) * 0.5 } else { value };
+            let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
+            let thumb = Rect::from_min_size(
+                Pos2::new(t_rect.left() + 3.0, yc - 2.0),
+                Vec2::new(t_rect.width() - 6.0, 4.0),
+            );
+            painter.rect_filled(thumb, 1.0, theme::CREAM);
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(label).size(9.5).color(theme::INK_2));
+        });
+        *rect_out = track;
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -11005,7 +13457,10 @@ impl DemoApp {
                 self._surge_main.get(idx).map(|m| m.main_controls().clone())
             }
             _ => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
-                Some(NodeKind::Lv2 { uri }) => crate::lv2::main_controls_cached(uri.as_str()),
+                Some(NodeKind::Lv2 { uri })
+                | Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                    crate::lv2::main_controls_cached(uri.as_str())
+                }
                 _ => None,
             },
         }
@@ -11050,7 +13505,7 @@ impl DemoApp {
                     }
                 }
                 // An LV2 unit, once its plugin's controls are resolved.
-                UnitKind::Dsp(_) if self.units[ui].main_from.is_none() => {
+                UnitKind::Dsp(_) | UnitKind::MidiFx if self.units[ui].main_from.is_none() => {
                     let Some(found) = self.unit_main_controls(ui) else { continue };
                     let u = &mut self.units[ui];
                     set_main_knobs(u, found.face(), MainTarget::Lv2, |c| c.default);
@@ -11121,7 +13576,7 @@ impl DemoApp {
             label: crate::main_controls::knob_label(&p.name),
             value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, hidden: false, sent: Some(norm),
+            param: None, hidden: false, sent: Some(norm), steps: 0,
             clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
             source: KnobSource::Pinned(p.name.clone()), label_g: None,
         });
@@ -11288,12 +13743,17 @@ impl DemoApp {
         self.master_transport(self.playing);
     }
 
-    /// Toggle master recording (REC chip). The engine is the authority: it
+    /// Toggle master/stem recording (REC chip). The engine is the authority: it
     /// flips the recorder's recording flag and messages the writer thread.
     fn toggle_recording(&mut self) {
-        let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
+        self.sync_recorder_rig_names();
+        let (recording, pending) = self
+            .recorder
+            .as_ref()
+            .map(|r| (r.is_recording(), r.is_pending()))
+            .unwrap_or((false, false));
         if let Some(bus) = &self.bus {
-            let cmd = if recording { Command::RecordStop } else { Command::RecordStart };
+            let cmd = if recording || pending { Command::RecordStop } else { Command::RecordStart };
             let _ = bus.lock().unwrap().send(cmd);
         }
     }
@@ -11372,6 +13832,79 @@ impl DemoApp {
         self.units.get(unit)
             .and_then(|u| self.base_graph.node(u.node_id))
             .is_some_and(|n| crate::organ::is_organ(&n.kind))
+    }
+
+    /// Is this unit Aeolus (a stop panel on its face)?
+    fn is_aeolus_unit(&self, unit: usize) -> bool {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .is_some_and(|n| matches!(&n.kind, NodeKind::Clap { plugin_id } if name_str(plugin_id) == crate::aeolus::AEOLUS_ID))
+    }
+
+    /// The division an Aeolus unit's face shows.
+    fn aeolus_division(&self, unit: usize) -> usize {
+        self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default().division
+    }
+
+    /// An Aeolus face, between the header and the knob row: a column of
+    /// division tabs on the left (III, II, I, P, top to bottom as on the
+    /// console), and the shown division's stops in columns right of it.
+    /// None when the stops do not fit at a readable size (never squeeze,
+    /// rule 22).
+    fn aeolus_rects(&self, unit: usize) -> Option<AeolusRects> {
+        if !self.is_aeolus_unit(unit) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let (left, right) = (r.left() + FACE_X, r.right() - FACE_PAD_R);
+        let (top, bottom) = (r.top() + 64.0, self.knob_row_y(unit) - KNOB_R - 14.0);
+        let (tab_w, cell_h, row_gap, col_gap, min_cell_w) = (28.0, 17.0, 3.0, 4.0, 52.0);
+        let fit_rows = ((bottom - top + row_gap) / (cell_h + row_gap)).floor().max(0.0) as usize;
+        if fit_rows < 4 { return None; }
+        let tabs: [Rect; 4] = std::array::from_fn(|i|
+            Rect::from_min_size(Pos2::new(left, top + i as f32 * (cell_h + row_gap)), Vec2::new(tab_w, cell_h)));
+        let n = crate::aeolus::DIVISIONS[self.aeolus_division(unit)].stops.len();
+        let rows = fit_rows.min(n);
+        let cols = n.div_ceil(rows);
+        let grid_left = left + tab_w + 2.0 * col_gap;
+        let cell_w = (right - grid_left - (cols - 1) as f32 * col_gap) / cols as f32;
+        if cell_w < min_cell_w { return None; }
+        // Fill column by column, like the stop jambs of a console.
+        let stops = (0..n).map(|i| {
+            let (c, row) = (i / rows, i % rows);
+            Rect::from_min_size(Pos2::new(grid_left + c as f32 * (cell_w + col_gap), top + row as f32 * (cell_h + row_gap)), Vec2::new(cell_w, cell_h))
+        }).collect();
+        Some(AeolusRects { tabs, stops })
+    }
+
+    /// Draw or push in stop `stop` of the division an Aeolus face shows: the
+    /// plugin's own state with that one stop changed goes back into it (its
+    /// stops are no parameters, aeolus.rs), and the face reads the result.
+    fn toggle_aeolus_stop(&mut self, node: u32, stop: usize) -> Result<(), String> {
+        let face = self.aeolus_faces.get(&node).copied().unwrap_or_default();
+        let on = face.drawn.map_or(true, |d| d[face.division] >> stop & 1 == 0);
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running: no stop to draw")?;
+        let state = main.save_state().map_err(|e| format!("Aeolus state: {e}"))?;
+        let next = crate::aeolus::with_stop(&state, face.division, stop, on)
+            .ok_or("this Aeolus has its own organ: its stops are not on the face")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus stop: {e}"))?;
+        self.aeolus_faces.entry(node).or_default().drawn = crate::aeolus::drawn(&next);
+        Ok(())
+    }
+
+    /// Keep each Aeolus face's stops in step with its plugin (a sound load,
+    /// a session load or a new voice changes them): read every
+    /// `AEOLUS_POLL_SECS`, and forget faces whose unit is gone.
+    fn sync_aeolus_faces(&mut self) {
+        let aeolus: Vec<(usize, u32)> = (0..self.units.len()).filter(|&u| self.is_aeolus_unit(u)).map(|u| (u, self.units[u].node_id)).collect();
+        self.aeolus_faces.retain(|n, _| aeolus.iter().any(|(_, a)| a == n));
+        if aeolus.is_empty() || self.ui_time - self.aeolus_poll_at < AEOLUS_POLL_SECS { return; }
+        self.aeolus_poll_at = self.ui_time;
+        for (_, node) in aeolus {
+            let Some(main) = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i)) else { continue };
+            let drawn = main.save_state().ok().and_then(|s| crate::aeolus::drawn(&s));
+            self.aeolus_faces.entry(node).or_default().drawn = drawn;
+        }
     }
 
     /// An organ face's nine drawbar slots (rack-local), left to right from
@@ -11543,6 +14076,23 @@ impl DemoApp {
         if let Ok(mut g) = self.shared_graph.lock() { g.set_split(node, point); }
     }
 
+    /// Set or clear a Keys unit's scale snap (face picker, assistant). The
+    /// engine releases held notes on every instrument the node feeds and
+    /// publishes; headless applies locally. Returns false for a non-Keys unit.
+    fn set_keys_scale(&mut self, unit: usize, choice: Option<crate::arp::ScaleChoice>) -> bool {
+        let Some(u) = self.units.get(unit) else { return false };
+        if !matches!(u.node_kind, UnitKind::Keys) { return false; }
+        let node = u.node_id;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetKeysScale { node, scale: choice });
+        }
+        if self.graph_pub.is_none() {
+            self.base_graph.set_scale(node, choice);
+            if let Ok(mut g) = self.shared_graph.lock() { g.set_scale(node, choice); }
+        }
+        true
+    }
+
     /// Unit names fed by a Keys unit's output `port` (living MIDI cables).
     fn zone_targets(&self, keys: usize, port: usize) -> Vec<String> {
         self.cables.iter()
@@ -11690,6 +14240,10 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        self.ui_dt = dt;
+        if self.autosave_due(dt) {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Audio In tuner: drain each open capture's tuner ring and run YIN.
         if !self.audio_in_tuners.is_empty() {
             self.pump_audio_in_tuners();
@@ -12034,6 +14588,25 @@ impl DemoApp {
         }
     }
 
+    /// Narrowest face that still shows the unit's own knobs, header and LED
+    /// (plugin knobs give way first, `fit_plugin_knobs`).
+    fn face_min_w(&self, unit: usize) -> f32 {
+        let Some(u) = self.units.get(unit) else { return FACE_MIN_W };
+        let own = u.knobs.iter().filter(|k| k.source == KnobSource::BuiltIn && !k.hidden).count();
+        // Left of the knob row: Master's meter segments (a display just hides;
+        // the meter's caption sits above the knob row and may run over it).
+        let meter = if matches!(u.node_kind, UnitKind::Master) { METER_SEG_W + 8.0 } else { 0.0 };
+        let knobs = if own == 0 { 0.0 } else {
+            FACE_X + meter + KNOB_LABEL_W / 2.0 + KNOB_SLOT_HALF + (own - 1) as f32 * KNOB_PITCH + FACE_PAD_R
+        };
+        // The title clears the LED (top right); the subtitle row runs under it.
+        // Keys: the SCALE control (chip + readout) on its own row when narrow.
+        let keys_ctl = if matches!(u.node_kind, UnitKind::Keys) { FACE_X + SPLIT_CHIP_W + 1.0 + SCALE_READOUT_W + FACE_PAD_R } else { 0.0 };
+        let title = FACE_X + u.name_g.as_ref().map_or(0.0, |g| g.size().x) + 30.0;
+        let sub = FACE_X + u.sub_g.as_ref().map_or(0.0, |g| g.size.x) + 10.5;
+        knobs.max(title).max(sub).max(FACE_MIN_W).ceil()
+    }
+
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
         let r = self.unit_rects[unit];
         let Some(u) = self.units.get(unit) else {
@@ -12165,6 +14738,11 @@ impl DemoApp {
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates: F5/F6/F7, demo patch on F8 (task-17).
+            // The guitar rig replaces the keyboard patch (no Keys unit), so it
+            // sits on Shift+F5, next to its keyboard sibling. Asked BEFORE
+            // plain F5: egui matches `NONE` logically, so a Shift+F5 press
+            // would otherwise be consumed as F5 and load Lead + Reverb.
+            if i.consume_key(Modifiers::SHIFT, Key::F5) { load_tpl = Some(Template::GuitarRig); }
             if i.consume_key(Modifiers::NONE, Key::F5) { load_tpl = Some(Template::LeadReverb); }
             if i.consume_key(Modifiers::NONE, Key::F6) { load_tpl = Some(Template::DrumsBass); }
             if i.consume_key(Modifiers::NONE, Key::F7) { load_tpl = Some(Template::AmbientPad); }
@@ -12189,6 +14767,9 @@ impl DemoApp {
             if i.consume_key(Modifiers::NONE, Key::B) {
                 self.toggle_stage(StageView::Plugins);
             }
+            if i.consume_key(Modifiers::NONE, Key::Q) {
+                self.nav_open = !self.nav_open;
+            }
             if i.consume_key(Modifiers::NONE, Key::F10) {
                 self.toggle_stage(StageView::Mixer);
             }
@@ -12200,13 +14781,15 @@ impl DemoApp {
             }
             if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
+                else if self.engine_info_open { self.engine_info_open = false; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
+                else if self.scale_menu.is_some() { self.scale_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
-                else if self.confirm_delete_session.is_some() { self.confirm_delete_session = None; }
+                else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
-                else { self.selected = None; }
+                else { self.selected = None; self.selected_unit = None; }
             }
             if i.consume_key(Modifiers::NONE, Key::Delete) || i.consume_key(Modifiers::NONE, Key::Backspace) {
                 if let Some(sel) = self.selected {
@@ -12255,6 +14838,13 @@ impl DemoApp {
             self.drag = Drag::None;
             return;
         };
+
+        // Engine Info lies over the stage: a click on it is its own, never
+        // the rack's underneath.
+        if self.engine_info_open && self.engine_info_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
 
         // Stage view mode: the rack is not on screen, so its hit-testing is inert
         // except the masthead's Play circle (Tab returns to the rack). The
@@ -12338,6 +14928,17 @@ impl DemoApp {
         }
         if pressed && self.knob_menu.is_some() {
             self.knob_menu = None;
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        // The scale picker owns its clicks the same way: a press on its Area
+        // is its own widget's; a press anywhere else closes it.
+        if self.scale_menu.is_some() && self.scale_menu_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if pressed && self.scale_menu.is_some() {
+            self.scale_menu = None;
             self.hover = Some(Hit::Background);
             return;
         }
@@ -12570,6 +15171,20 @@ impl DemoApp {
                         && self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.value.contains(l.to_pos2()))) => {
                         // A click on a zone readout is not a ping.
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.scale_rects(ui).map_or(false, |(chip, readout)|
+                            chip.contains(l.to_pos2()) || readout.contains(l.to_pos2())) => {
+                        // Keys-face SCALE (issue #90): the lit chip snaps off,
+                        // the readout (or the whole OFF control) opens the picker.
+                        let (chip, _) = self.scale_rects(ui).unwrap();
+                        if self.keys_scale(ui).is_some() && chip.contains(l.to_pos2()) {
+                            let nid = self.units[ui].node_id;
+                            self.ui_node_grace.insert(nid, self.ui_time + 0.6);
+                            self.set_keys_scale(ui, None);
+                        } else {
+                            self.scale_menu = Some(ScaleMenu { unit: ui, pos: s });
+                        }
+                    }
                     Some(Hit::Unit(ui)) if self.side == Side::Front && self.on_face_field(ui, l.to_pos2()) => {
                         // A click on a drag readout (split point / BPM) is not a ping.
                     }
@@ -12614,6 +15229,17 @@ impl DemoApp {
                         && self.audio_in_device_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
                         self.cycle_audio_in_device(ui);
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.aeolus_rects(ui).is_some_and(|a| a.tabs.iter().chain(&a.stops).any(|r| r.contains(l.to_pos2()))) => {
+                        // Aeolus face: a division tab shows that division, a stop toggles.
+                        let a = self.aeolus_rects(ui).unwrap();
+                        let node = self.units[ui].node_id;
+                        if let Some(d) = a.tabs.iter().position(|r| r.contains(l.to_pos2())) {
+                            self.aeolus_faces.entry(node).or_default().division = d;
+                        } else if let Some(stop) = a.stops.iter().position(|r| r.contains(l.to_pos2())) {
+                            if let Err(e) = self.toggle_aeolus_stop(node, stop) { self.plugin_msg = e; }
+                        }
+                    }
                     Some(Hit::Unit(ui)) => {
                         // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
                         // A single click still pings the unit.
@@ -12643,9 +15269,11 @@ impl DemoApp {
                             self.ping_unit(ui);
                         }
                     }
-                    Some(Hit::Background) | None => {
+                    // A release over a side panel (the Navigator's own row
+                    // click) must not clear the selection it just made.
+                    Some(Hit::Background) | None if rect.contains(s) => {
                         if self.pending.is_some() { self.pending = None; }
-                        else { self.selected = None; }
+                        else { self.selected = None; self.selected_unit = None; }
                     }
                     _ => {}
                 }
@@ -12676,7 +15304,6 @@ impl DemoApp {
             }
         };
         ctx.set_cursor_icon(icon);
-        let _ = rect;
     }
 
     // -- drawing ----------------------------------------------------------
@@ -12695,7 +15322,7 @@ impl DemoApp {
         let mut rp = painter.clone();
         if let Some(clip) = self.rack_clip { rp.set_clip_rect(clip.intersect(rect)); }
         rp.set_opacity(self.load_fade);
-        rp.rect_filled(rack, 36.0, CHASSIS);
+        rp.rect_filled(rack, self.rack_chrome.radius, CHASSIS);
 
         if self.xf.sy > 0.04 {
             self.draw_rails(&rp);
@@ -12713,10 +15340,10 @@ impl DemoApp {
     /// Hairline pan indicators when the rack overflows the stage: a thumb
     /// showing the visible part on the bottom / right edge of the view.
     fn draw_pan_bars(&self, painter: &egui::Painter) {
-        let Some(view) = self.rack_clip.map(|c| c.shrink(8.0)) else { return };
+        let Some(view) = self.rack_clip.map(|c| Rect::from_min_max(c.min + Vec2::splat(8.0), Pos2::new(c.max.x - 8.0, c.max.y))) else { return };
         let ov = self.rack_overflow;
         if ov.x > 0.0 {
-            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 6.0), Pos2::new(view.right() - 40.0, view.bottom() + 9.0));
+            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 2.0), Pos2::new(view.right() - 40.0, view.bottom() + 5.0));
             let frac = view.width() / self.rack_w;
             let t = 0.5 - self.rack_pan.x / ov.x.max(1.0); // pan +ov/2 = left end
             let w = track.width() * frac;
@@ -12749,6 +15376,7 @@ impl DemoApp {
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
         let help = self.show_help;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
@@ -12815,7 +15443,7 @@ impl DemoApp {
             .filter(|(_, u)| match u.node_kind {
                 UnitKind::Clap => true,
                 UnitKind::AudioIn => true,
-                UnitKind::Keys | UnitKind::Master => false,
+                UnitKind::Keys | UnitKind::Master | UnitKind::MidiFx | UnitKind::Arp => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })
@@ -12824,25 +15452,60 @@ impl DemoApp {
             .collect()
     }
 
-    /// Set a unit knob from the mixer and publish it (same path as the rack).
+    /// Effective quick knob index of `unit` (#107), resolving any explicit
+    /// `strip_knobs` assignment by label/name/id first, else the default.
+    fn quick_knob(&self, unit: usize) -> Option<usize> {
+        let u = self.units.get(unit)?;
+        let explicit = self.strip_knobs.get(&u.node_id).map(String::as_str);
+        let kind = self.base_graph.node(u.node_id).map(|n| &n.kind);
+        quick_knob(u, explicit, kind)
+    }
+
+    /// Set a unit knob from the mixer and publish it (same path as the rack:
+    /// `SetParam` for engine/LV2 knobs, `ClapController::set_param` for CLAP
+    /// main/pinned knobs).
     fn set_unit_knob(&mut self, unit: usize, knob: usize, v: f32) {
-        let Some(u) = self.units.get_mut(unit) else { return };
-        let Some(k) = u.knobs.get_mut(knob) else { return };
-        k.set_immediate(v);
-        if let (Some(p), Some(bus)) = (k.param, &self.bus) {
-            if bus.lock().unwrap().send(Command::SetParam { node: u.node_id, param: p, value: k.value as f64 }) {
-                k.sent = Some(k.value);
+        let (node_id, param, val, clap_pin) = {
+            let Some(u) = self.units.get_mut(unit) else { return };
+            let Some(k) = u.knobs.get_mut(knob) else { return };
+            k.set_immediate(v);
+            (u.node_id, k.param, k.value, k.clap)
+        };
+        if let (Some(p), Some(bus)) = (param, &self.bus) {
+            if bus.lock().unwrap().send(Command::SetParam { node: node_id, param: p, value: val as f64 }) {
+                if let Some(k) = self.units.get_mut(unit).and_then(|u| u.knobs.get_mut(knob)) {
+                    k.sent = Some(val);
+                }
+            }
+        }
+        if let Some(pin) = clap_pin {
+            let slots = self.clap_rigs();
+            let hold_until = self.ui_time + READBACK_HOLD_SECS;
+            if let Some(ctl) = slots.iter().find(|(_, n)| *n == node_id)
+                .and_then(|(slot, _)| self.clap_slot_map.get(*slot).copied().flatten())
+                .and_then(|idx| self.surge_controllers.get(idx))
+            {
+                ctl.set_param(ClapId::new(pin.id), pin.min + val as f64 * (pin.max - pin.min));
+                if let Some(k) = self.units.get_mut(unit).and_then(|u| u.knobs.get_mut(knob)) {
+                    if let Some(p) = k.clap.as_mut() {
+                        p.sent = val;
+                        p.hold_until = hold_until;
+                    }
+                }
             }
         }
     }
 
     /// Mixer stage: every source → its rig bus → Master out, as channel
-    /// strips. Source faders drive the units' own level knobs; the rig bus is
-    /// the engine's per-rig mix (vol/pan/mute/solo). A main-stage view like the
-    /// matrix (rule 8) — Tab / Esc return to the rack.
+    /// strips (#72–77): dB faders with a unity detent, peak hold + clip light,
+    /// per-source mute/solo/pan, insert slots (a view of the cable chain),
+    /// quick parameter knobs (#107), strip names, colours, drag order and
+    /// collapse. A main-stage view like the matrix (rule 8) — Tab / Esc
+    /// return to the rack.
     fn mixer_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
+        let ctx = ui.ctx().clone();
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
@@ -12850,42 +15513,64 @@ impl DemoApp {
         let help = self.show_help;
         let n = self.rig_count();
         self.mixer_fader_rects.clear();
+        self.mixer_strip_rects_prev = std::mem::take(&mut self.mixer_strip_rects);
+        self.mixer_meter_rects.clear();
+        self.mixer_quick_knob_rects.clear();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
         let app_streams = self.app_streams_shown();
         let mut stream_changes: Vec<(u64, Option<f32>, Option<bool>)> = Vec::new();
         let mut out_pick: Option<Option<String>> = None;
+        // Insert edits are applied AFTER the frame's layout (a mid-frame
+        // rack rebuild seeds NaN cable springs — rule 32).
+        let mut edits: Vec<PendingInsertEdit> = Vec::new();
         let (outputs, out_current) = self.audio_out.lock()
             .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("every source → its rig bus → Master out · Tab / Esc: back to the rack")
+                    ui.label(egui::RichText::new("every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack")
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(14.0);
-                let h = ui.available_height();
-                // Strip height: name + sub + fader + value + bus controls.
-                let fader_h = (h - 210.0).clamp(90.0, 480.0);
+                // Strip height: name + meta + source slot + inserts + fader +
+                // readout + bus controls. A short sheet keeps a usable fader
+                // and scrolls the rest.
+                let view_h = ui.available_height().max(1.0);
+                let max_inserts = (0..n).flat_map(|r| self.rig_strip_sources(r as u8))
+                    .filter(|&u| !self.strip_row(self.units[u].node_id).collapsed)
+                    .map(|u| self.strip_chain(u).map_or(0, |c| c.len()))
+                    .max().unwrap_or(0)
+                    .max(self.master_chain().len());
+                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32;
+                let fader_h = (view_h - overhead).clamp(64.0, 480.0);
+                let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
                     let scroll_w = ui.available_width().max(200.0);
-                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, view_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         // Center the strips in the sheet while they fit (a left-
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
-                        let strips: usize = (0..n).map(|r| self.mixer_sources(r as u8).len() + 1).sum();
-                        let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
-                        let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
+                        let sources_w: f32 = (0..n).map(|r| {
+                            let s_w: f32 = self.rig_strip_sources(r as u8).iter().map(|&u| {
+                                let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                w + gap
+                            }).sum();
+                            s_w + STRIP_W + gap
+                        }).sum();
+                        let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 15.0 + gap };
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + sys + 152.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
-                        egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad);
                                 for rig in 0..n {
                                     if rig > 0 {
-                                        let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                        let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                                     }
                                     ui.vertical(|ui| {
@@ -12893,7 +15578,11 @@ impl DemoApp {
                                         // A group HEADING, not a chip: a filled chip read as a
                                         // filter/tab while every rig is shown (vision review).
                                         // The rig in the rack view gets an "IN VIEW" tag.
-                                        let group_w = (self.mixer_sources(rig as u8).len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
+                                        let sources = self.rig_strip_sources(rig as u8);
+                                        let group_w: f32 = sources.iter().map(|&u| {
+                                            let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                            w + ui.spacing().item_spacing.x
+                                        }).sum::<f32>() + STRIP_W;
                                         // Heading truly centered over ITS strips; the "shown in
                                         // rack" tag sits on a subline reserved for every rig, so
                                         // headings stay centered and strips stay aligned.
@@ -12914,61 +15603,11 @@ impl DemoApp {
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
                                         ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
-                                            for (unit, knob) in self.mixer_sources(rig as u8) {
-                                                let (uname, sub, level) = {
-                                                    let u = &self.units[unit];
-                                                    (sentence_case(&u.name), u.sub.clone(), u.led)
-                                                };
-                                                let mut v = knob.map(|k| self.units[unit].knobs[k].value);
-                                                mixer_strip(ui, &uname, &sub, &mut v, level, fader_h);
-                                                if let (Some(k), Some(v)) = (knob, v) {
-                                                    if (v - self.units[unit].knobs[k].value).abs() > f32::EPSILON {
-                                                        self.set_unit_knob(unit, k, v);
-                                                    }
-                                                }
+                                            for unit in sources {
+                                                self.source_strip_ui(ui, unit, fader_h, &mut edits);
                                             }
                                             // The rig bus: engine per-rig mix.
-                                            let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
-                                            let mut m = self.rig_mix[rig.min(7)];
-                                            let mut v = Some(m.vol);
-                                            // One column: fader, then PAN and M/S directly under it.
-                                            let mut changed = false;
-                                            ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                                let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
-                                                self.mixer_fader_rects.push(fr);
-                                                changed = v != Some(m.vol);
-                                                m.vol = v.unwrap_or(m.vol);
-                                                ui.add_space(4.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(8.0);
-                                                    theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
-                                                    let mut p = m.pan;
-                                                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
-                                                        .custom_formatter(|v, _| pan_text(v as f32))
-                                                        .custom_parser(parse_pan)));
-                                                    if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
-                                                });
-                                                ui.add_space(4.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(18.0);
-                                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                                    let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
-                                                            .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
-                                                        .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
-                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                                                    if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; changed = true; }
-                                                    let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
-                                                            .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
-                                                        .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
-                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                                                    if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; changed = true; }
-                                                });
-                                            });
-                                            if changed {
-                                                self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
-                                                self.rig_mix[rig.min(7)] = m;
-                                                self.send_rig_mix(rig);
-                                            }
+                                            self.rig_bus_strip_ui(ui, rig, fader_h);
                                         });
                                     });
                                 }
@@ -12976,7 +15615,7 @@ impl DemoApp {
                                 // (YouTube in the browser, …) gets a strip —
                                 // its PipeWire stream volume and mute.
                                 if !app_streams.is_empty() {
-                                    let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                     ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                                     ui.vertical(|ui| {
                                         let gap = ui.spacing().item_spacing.x;
@@ -12989,21 +15628,23 @@ impl DemoApp {
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
                                         ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
-                                            for st in &app_streams {
+                                            for (si, st) in app_streams.iter().enumerate() {
                                                 ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                                                     // "(2) Neo Soul … - YouTube" → "Neo Soul …": the tab counter is noise.
                                                     let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
                                                     let shown = st.volume.min(1.0);
-                                                    let mut v = Some(shown);
-                                                    // What the app plays, dB-scaled (rule 62).
-                                                    let level = meter_db_pos(crate::audio_out::stream_level(&self.stream_levels, st.index));
-                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, level, fader_h);
-                                                    ui.interact(fr, egui::Id::new(("app_stream_tip", st.index)), egui::Sense::hover())
-                                                        .on_hover_text(format!("{} — {}", st.app, st.title));
-                                                    if let Some(nv) = v {
-                                                        if (nv - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(nv), None)); }
-                                                    }
-                                                    ui.add_space(4.0);
+                                                    let mut v = shown;
+                                                    // What the app plays, dB-scaled (rule 62), with the
+                                                    // same peak hold + clip as the patch strips (#72).
+                                                    let level = crate::audio_out::stream_level(&self.stream_levels, st.index);
+                                                    let key = app_stream_key(si);
+                                                    let fr = self.strip_fader_ui(ui, key, &mut v, level, fader_h);
+                                                    ui.interact(fr, egui::Id::unique(("app_stream_tip", st.index)), egui::Sense::hover())
+                                                        .on_hover_text(format!("{} — {}", st.app, title));
+                                                    if (v - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(v), None)); }
+                                                    ui.add_space(2.0);
+                                                    ui.label(egui::RichText::new(db_readout(v)).size(11.0).monospace().color(theme::CREAM_MID));
+                                                    ui.add_space(2.0);
                                                     let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
                                                             .color(if st.muted { theme::DARK_PANEL } else { theme::CREAM_MID }))
                                                         .fill(if st.muted { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
@@ -13018,74 +15659,884 @@ impl DemoApp {
                                 }
                                 // Master out sits right after the last rig bus
                                 // (the sum they feed) — not pinned far away.
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
-                                ui.vertical(|ui| {
-                                    ui.set_width(170.0);
-                                    theme::section_label(ui, "Master out");
-                                    // Output device (#31): which sound card kabelsalat plays to.
-                                    let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
-                                        .map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
-                                    let selected = match &out_wanted {
-                                        Some(w) => label_of(w),
-                                        None => "System default".to_string(),
-                                    };
-                                    theme::Dropdown::new("dd_mixer_audio_output", &selected)
-                                        .width(160.0)
-                                        .popup_min_width(240.0)
-                                        .text_size(11.5)
-                                        .show_ui(ui, |menu| {
-                                            if menu.item(out_wanted.is_none(), "System default") {
-                                                out_pick = Some(None);
-                                            }
-                                            for o in &outputs {
-                                                if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                                                    out_pick = Some(Some(o.raw.clone()));
-                                                }
-                                            }
-                                        })
-                                        .on_hover_text("the sound card kabelsalat plays to");
-                                    if let Some(c) = &out_current {
-                                        ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
-                                    }
-                                    ui.add_space(4.0);
-                                    let rigs = if n == 1 { "1 rig · peak meter".to_string() } else { format!("sum of {n} rigs · peak meter") };
-                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
-                                    ui.add_space(8.0);
-                                    // Meter + dB scale: a labeled peak meter, not a missing fader.
-                                    let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
-                                    let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
-                                    paint_meter(ui.painter(), mr, meter_db_pos(self.meter), meter_db_pos(self.meter_peak));
-                                    for db in [0.0f32, -6.0, -12.0, -24.0, -48.0] {
-                                        // Labels only (a tick hairline beside "0" read as "-0"),
-                                        // with a real minus sign.
-                                        let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
-                                        let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
-                                        ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
-                                            label, FontId::monospace(9.5), theme::CREAM_DIM);
-                                    }
-                                    ui.add_space(6.0);
-                                    // Meter-only strip: say so with a live peak readout.
-                                    let db = if self.meter_peak < 0.001 { "−∞ dB".to_string() } else { format!("{:.0} dB", 20.0 * self.meter_peak.log10()) };
-                                    ui.label(egui::RichText::new(db).size(11.0).monospace().color(theme::CREAM_MID))
-                                        .on_hover_text("output peak (meter only — set levels on the rig buses and sources)");
-                                });
+                                self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
                             });
                         });
                     });
                 });
             });
         });
+        // Insert edits apply after the frame's layout (rule 32) and answer
+        // in the same place the rack's own messages go.
+        for e in edits.drain(..) {
+            let res = match e.source {
+                Some(s) => self.strip_insert_edit(s, e.edit),
+                None => self.master_insert_edit(e.edit),
+            };
+            if let Ok(msg) = res {
+                self.session_msg = msg;
+            } else if let Err(msg) = res {
+                self.session_msg = msg;
+            }
+        }
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
         if let Some(o) = out_pick { self.set_audio_output(o); }
+        // Strip popups (rename modal, colour palette, insert picker).
+        if !self.show_help {
+            self.strip_rename_modal(&ctx);
+            self.strip_palette_ui(&ctx);
+            self.insert_picker_ui(&ctx, &mut edits);
+        }
         if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// One source strip (#72–77): name (click renames, drag reorders),
+    /// colour dot, collapse chevron, insert slots, the dB fader with peak
+    /// hold + clip, pan and mute/solo.
+    fn source_strip_ui(&mut self, ui: &mut egui::Ui, unit: usize, fader_h: f32, edits: &mut Vec<PendingInsertEdit>) {
+        let (node, rig, name, sub) = {
+            let u = &self.units[unit];
+            (u.node_id, u.rig, sentence_case(&u.name), u.sub.clone())
+        };
+        let knob = self.units[unit].knobs.iter().position(|k| k.param.is_some()
+            && matches!(k.label.as_str(), "LEVEL" | "GAIN" | "VOLUME" | "VOL"));
+        let row = self.strip_row(node);
+        let collapsed = row.collapsed;
+        let w = if collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+        let level = self.strip_audio_level(unit);
+        let mut gain: Option<f32> = None;
+        let source_patch = self.clap_rigs().into_iter()
+            .find(|(_, nid)| *nid == node)
+            .and_then(|(slot, _)| self.patch_names.get(slot).and_then(|p| p.clone()));
+        let strip = ui.allocate_ui_with_layout(egui::vec2(w, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_width(w);
+            // Name: click renames, drag reorders (#77). A coloured strip
+            // names itself in its colour; the spine under it is drawn once
+            // the column rect is known (below).
+            // Keyed by node, not by position: a live reorder moves the strip
+            // under the pointer, and a positional id would hand the drag to
+            // whichever strip now sits in the old slot (it ping-ponged).
+            let (nr, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+            let name_col = row.color.unwrap_or(theme::INK);
+            let name_rect = if collapsed {
+                ui.painter().text(nr.center(), egui::Align2::CENTER_CENTER, truncate_chars(&name, 6),
+                    egui::FontId::proportional(13.0), name_col);
+                nr
+            } else {
+                // Colour dot left, collapse chevron right, the name between.
+                let inner_l = nr.left() + STRIP_SPINE_W + SLOT_PAD_L;
+                let inner_r = nr.right() - SLOT_PAD_R;
+                let dr = Rect::from_center_size(Pos2::new(inner_l + 6.0, nr.center().y), egui::vec2(12.0, 12.0));
+                let dresp = ui.interact(dr, egui::Id::new(("strip_color_dot", node)), egui::Sense::click());
+                if let Some(c) = row.color {
+                    ui.painter().circle_filled(dr.center(), 4.0, c);
+                } else {
+                    ui.painter().circle_stroke(dr.center(), 4.0, Stroke::new(1.2, theme::CREAM_DIM));
+                }
+                if dresp.clicked() { self.strip_color_pick = Some(node); }
+                dresp.on_hover_text("strip colour");
+                let cr = Rect::from_center_size(Pos2::new(inner_r - 9.0, nr.center().y), egui::vec2(18.0, 18.0));
+                if strip_collapse_chip(ui, cr, egui::Id::new(("strip_collapse", node)))
+                    .on_hover_text("collapse this strip").clicked()
+                {
+                    self.with_strip_row(node, |r| r.collapsed = true);
+                }
+                let between = Rect::from_min_max(Pos2::new(dr.right() + 4.0, nr.top()), Pos2::new(cr.left() - 4.0, nr.bottom()));
+                let g = fit_galley(ui.painter(), &name, egui::FontId::proportional, &[13.0], between.width(), name_col);
+                ui.painter().galley(between.center() - g.size() * 0.5, g, name_col);
+                between
+            };
+            let name_resp = ui.interact(name_rect, egui::Id::new(("strip_name", node)), egui::Sense::click_and_drag());
+            if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::Grab); }
+            if name_resp.clicked() { self.strip_rename = Some((node, name)); }
+            if name_resp.dragged() {
+                self.mixer_strip_drag = Some((node, rig));
+                if let Some(p) = name_resp.interact_pointer_pos() {
+                    // Live reorder (#77): the dragged strip takes the place of
+                    // the one the pointer is over. Rects come from the last frame.
+                    let target = self.mixer_strip_rects_prev.iter()
+                        .find(|(r2, _, rr)| *r2 == rig && rr.contains(p))
+                        .map(|(_, n2, _)| *n2);
+                    if let Some(t) = target {
+                        if t != node { self.reorder_strip(rig, node, t); }
+                    }
+                }
+            }
+            name_resp.on_hover_text("click: rename · drag: reorder the strip");
+            if collapsed {
+                // Mini strip (#77): meter with peak hold, dB readout, M/S,
+                // and an expand chip. The full strip is one click away.
+                self.strip_meter_ui(ui, node, level, 48.0);
+                let readout = knob.map(|k| self.units[unit].knobs[k].value).unwrap_or(0.0);
+                ui.label(egui::RichText::new(db_readout(readout)).size(10.0).monospace().color(theme::CREAM_MID));
+                ui.add_space(2.0);
+                let mut ms = row;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    if strip_ms_button(ui, &mut ms, 'M').clicked() {
+                        self.with_strip_row(node, |r| r.mute = ms.mute);
+                        self.send_strip_mix(node);
+                    }
+                    if strip_ms_button(ui, &mut ms, 'S').clicked() {
+                        self.with_strip_row(node, |r| r.solo = ms.solo);
+                        self.send_strip_mix(node);
+                    }
+                });
+                ui.add_space(2.0);
+                if theme::chip_button(ui, "▸", false).on_hover_text("expand this strip").clicked() {
+                    self.with_strip_row(node, |r| r.collapsed = false);
+                }
+            } else {
+                // Source slot (#107): quick knob + instrument/patch plate aligned
+                // in the same column grid as the insert slots below it.
+                let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
+                let (knob_rect, plate_rect) = strip_slot_rects(sr);
+                ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
+                let plate_label = source_patch.clone().unwrap_or_else(|| sentence_case(&sub));
+                let caption = self.quick_knob_caption(unit);
+                paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + PLATE_PAD_X + 2.0, &plate_label,
+                    caption.as_deref(), theme::CREAM, theme::CREAM_MID);
+                self.strip_quick_knob_ui(ui, knob_rect, unit, false);
+                let tip = match &source_patch {
+                    Some(p) => format!("{} · {p}", sentence_case(&sub)),
+                    None => sentence_case(&sub),
+                };
+                ui.interact(plate_rect, egui::Id::new(("strip_src_plate", node)), egui::Sense::hover())
+                    .on_hover_text(tip);
+                // Insert slots (#74/#107): a view of the cable chain.
+                let chain = self.strip_chain(unit);
+                self.insert_rows_ui(ui, Some(node), chain.as_deref(), edits);
+                // The dB fader (#72) drives the unit's own level knob.
+                let readout;
+                if let Some(k) = knob {
+                    let old = self.units[unit].knobs[k].value;
+                    let mut g = old;
+                    self.strip_fader_ui(ui, node, &mut g, level, fader_h);
+                    if (g - old).abs() > f32::EPSILON { gain = Some(g); }
+                    readout = g;
+                } else {
+                    ui.add_space(fader_h.min(80.0));
+                    theme::tracked_label(ui, "NO FADER", 9.0, 0.12, theme::CREAM_DIM)
+                        .on_hover_text("this source has no level knob — set it on its face");
+                    readout = 0.0;
+                }
+                // Readout + pan + M/S (#73).
+                ui.label(egui::RichText::new(db_readout(readout)).size(10.5).monospace().color(theme::CREAM_MID))
+                    .on_hover_text("this source's level · double-click the fader: 0 dB");
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(((w - 92.0) * 0.5).max(4.0));
+                    theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
+                    let mut p = row.pan;
+                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
+                        .custom_formatter(|v, _| pan_text(v as f32))
+                        .custom_parser(parse_pan)));
+                    if r.on_hover_text("source pan (L −1 … +1 R) · drag").changed() {
+                        self.with_strip_row(node, |rw| rw.pan = p);
+                        self.send_strip_mix(node);
+                    }
+                });
+                ui.add_space(3.0);
+                let mut ms = row;
+                ui.horizontal(|ui| {
+                    ui.add_space(((w - 46.0) * 0.5).max(4.0));
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if strip_ms_button(ui, &mut ms, 'M').on_hover_text("mute this source").clicked() {
+                        self.with_strip_row(node, |r| r.mute = ms.mute);
+                        self.send_strip_mix(node);
+                    }
+                    if strip_ms_button(ui, &mut ms, 'S').on_hover_text("solo this source (within its rig)").clicked() {
+                        self.with_strip_row(node, |r| r.solo = ms.solo);
+                        self.send_strip_mix(node);
+                    }
+                });
+            }
+        });
+        let rect = strip.response.rect;
+        if self.mixer_scroll_target == Some(NavJumpTarget::Node(node)) {
+            ui.scroll_to_rect_animation(rect, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+            self.mixer_scroll_target = None;
+        }
+        if let Some((flash_node, exp)) = self.mixer_flash {
+            if flash_node == node && self.ui_time < exp {
+                let t = ((exp - self.ui_time) / NAV_FLASH_S).clamp(0.0, 1.0);
+                ui.painter().rect_filled(rect.expand(3.0), 4.0, theme::alpha(theme::ACCENT, 0.14 * t));
+                ui.painter().rect_stroke(rect.expand(3.0), 4.0, Stroke::new(2.0, theme::alpha(theme::ACCENT, t)), egui::StrokeKind::Inside);
+            }
+        }
+        // The colour spine (#77): a 3px stripe down the strip's left edge.
+        if let Some(c) = row.color {
+            let spine = Rect::from_min_size(rect.min, egui::vec2(STRIP_SPINE_W, rect.height()));
+            ui.painter().rect_filled(spine, 1.5, c);
+        }
+        if let (Some(k), Some(g)) = (knob, gain) {
+            self.set_unit_knob(unit, k, g);
+        }
+        self.mixer_strip_rects.push((rig, node, rect));
+    }
+
+    /// The rig bus strip: the engine's per-rig mix (vol/pan/mute/solo) with
+    /// the same dB fader, peak hold and clip as the sources (#72).
+    fn rig_bus_strip_ui(&mut self, ui: &mut egui::Ui, rig: usize, fader_h: f32) {
+        let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
+        let mut m = self.rig_mix[rig.min(7)];
+        let mut vol = m.vol;
+        let old = (m.vol, m.pan, m.mute, m.solo);
+        let armed = self.arm_rigs[rig.min(7)];
+        let mut arm_toggle = false;
+        let bus_resp = ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_width(STRIP_W);
+            ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
+            theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.12, theme::INK_2);
+            ui.add_space(8.0);
+            let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h);
+            self.mixer_fader_rects.push(fr);
+            ui.label(egui::RichText::new(db_readout(vol)).size(10.5).monospace().color(theme::CREAM_MID))
+                .on_hover_text("this rig's level · double-click the fader: 0 dB");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(((STRIP_W - 92.0) * 0.5).max(4.0));
+                theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
+                let mut p = m.pan;
+                let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
+                    .custom_formatter(|v, _| pan_text(v as f32))
+                    .custom_parser(parse_pan)));
+                if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // M · S · R: three 26 px buttons, 4 px apart.
+                ui.add_space(((STRIP_W - 86.0) * 0.5).max(4.0));
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
+                        .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                    .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; }
+                let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
+                        .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                    .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; }
+                let rb = egui::Button::new(egui::RichText::new("R").size(11.0)
+                        .color(if armed { theme::ON_ACCENT } else { theme::CREAM_MID }))
+                    .fill(if armed { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(rb).on_hover_text("arm this rig's post-fader stem for recording").clicked() { arm_toggle = true; }
+            });
+        });
+        if arm_toggle {
+            self.set_record_arm(Some(rig), !armed);
+        }
+        if self.mixer_scroll_target == Some(NavJumpTarget::Rig(rig as u8)) {
+            ui.scroll_to_rect_animation(bus_resp.response.rect, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
+            self.mixer_scroll_target = None;
+        }
+        let changed = (m.vol, m.pan, m.mute, m.solo) != old || vol != old.0;
+        if changed {
+            m.vol = vol;
+            self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
+            self.rig_mix[rig.min(7)] = m;
+            self.send_rig_mix(rig);
+        }
+    }
+
+    /// The master out strip (#72/#77): a full channel strip — dB fader
+    /// driving the master VOLUME, the labeled peak meter with peak hold and
+    /// clip, its own insert slots before the fixed limiter, and the output
+    /// device choice (#31).
+    #[allow(clippy::type_complexity)]
+    fn master_strip_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        fader_h: f32,
+        outputs: (Vec<crate::audio_out::OutputDevice>, Option<String>, Option<String>),
+        out_pick: &mut Option<Option<String>>,
+        edits: &mut Vec<PendingInsertEdit>,
+    ) {
+        let (outputs, out_current, out_wanted) = outputs;
+        let n = self.rig_count();
+        // The fader drives the master unit in view (every master's VOLUME
+        // knob is the same engine param).
+        let master_knob = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master)
+            && (n <= 1 || u.rig == self.active_rig as u8))
+            .and_then(|mi| self.units[mi].knob_index("VOLUME").map(|k| (mi, k)));
+        let mut gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value);
+        ui.vertical(|ui| {
+            ui.set_width(152.0);
+            theme::section_label(ui, "Master out");
+            // Output device (#31): which sound card kabelsalat plays to.
+            let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
+                .map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
+            let selected = match &out_wanted {
+                Some(w) => label_of(w),
+                None => "System default".to_string(),
+            };
+            theme::Dropdown::new("dd_mixer_audio_output", &selected)
+                .width(144.0)
+                .popup_min_width(240.0)
+                .text_size(11.5)
+                .show_ui(ui, |menu| {
+                    if menu.item(out_wanted.is_none(), "System default") {
+                        *out_pick = Some(None);
+                    }
+                    for o in &outputs {
+                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                            *out_pick = Some(Some(o.raw.clone()));
+                        }
+                    }
+                })
+                .on_hover_text("the sound card kabelsalat plays to");
+            if let Some(c) = &out_current {
+                ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
+            }
+            ui.add_space(4.0);
+            // Master inserts (#77): before the fixed limiter.
+            let chain = self.master_chain();
+            self.insert_rows_ui(ui, None, Some(&chain), edits);
+            let insert_note = if chain.is_empty() {
+                "inserts here run on the whole mix, before the fixed limiter"
+            } else {
+                "inserts run on the whole mix, before the fixed limiter"
+            };
+            ui.label(egui::RichText::new(insert_note).size(10.5).color(theme::INK_2))
+                .on_hover_text("Master out → insert → … → limiter · warmth (fixed)");
+            ui.add_space(6.0);
+            // Fader + meter share one row: the dB scale labels name the stops.
+            let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
+            let fr = Rect::from_min_size(area.min, egui::vec2(30.0, fader_h));
+            let mr = Rect::from_min_size(Pos2::new(area.right() - 14.0, area.top()), egui::vec2(14.0, fader_h));
+            let mut ph = self.mixer_peaks.entry(MASTER_STRIP_KEY).or_insert_with(PeakHold::new);
+            peak_hold_update(&mut ph, self.meter, self.ui_time, self.ui_dt);
+            let mut clip_clicked = false;
+            let clip = Rect::from_min_size(Pos2::new(mr.left(), mr.top() - 7.0), egui::vec2(mr.width(), 5.0));
+            let clip_resp = ui.interact(clip, egui::Id::unique("master_clip"), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if clip_resp.clicked() { clip_clicked = true; }
+            if clip_resp.hovered() {
+                clip_resp.on_hover_text(if ph.clip { "0 dBFS reached — click to clear" } else { "clip light" });
+            }
+            let held = ph.held;
+            if clip_clicked { ph.clip = false; }
+            paint_meter(ui.painter(), mr, meter_db_pos(self.meter), 0.0);
+            if held > 0.02 {
+                let y = mr.bottom() - mr.height() * held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(mr.left(), y - 1.0), egui::vec2(mr.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            self.mixer_meter_rects.push((MASTER_STRIP_KEY, mr));
+            // The dB fader (#72) drives the master VOLUME knob.
+            let cap_h = 12.0;
+            let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
+            ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
+            // Unity + −12 dB ticks (the meter's dB curve, rule 62).
+            for (g, len) in [(1.0f32, 6.0), (10f32.powf(-12.0 / 20.0), 4.0)] {
+                let y = y0 + (y1 - y0) * fader_pos(g);
+                ui.painter().line_segment([Pos2::new(fr.center().x - len, y), Pos2::new(fr.center().x + len, y)], Stroke::new(1.0, theme::CREAM_DIM));
+            }
+            if let Some((mu, vk)) = master_knob {
+                let _ = (mu, vk);
+                let fid = egui::Id::unique("master_fader");
+                let resp = ui.interact(fr, fid, egui::Sense::click_and_drag());
+                if resp.dragged() {
+                    let dy = resp.drag_delta().y;
+                    let mut pos = fader_pos(gain.unwrap_or(0.75)) - dy / (y0 - y1);
+                    if pos > UNITY_DETENT_POS { pos = 1.0; }
+                    gain = Some(fader_gain(pos));
+                }
+                if resp.double_clicked() { gain = Some(1.0); }
+                if let Some(g) = gain {
+                    let y = y0 + (y1 - y0) * fader_pos(g);
+                    ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
+                    let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
+                    ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
+                    ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+                }
+                resp.on_hover_text("master volume · double-click: 0 dB");
+            }
+            // The ends first; a mark too close to one already drawn is left out
+            // (a short meter put "0 dB", "−6" and "−12" on top of each other).
+            let mut drawn: Vec<f32> = Vec::new();
+            for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
+                let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
+                if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
+                drawn.push(y);
+                let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
+                ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
+                    label, egui::FontId::monospace(9.5), theme::CREAM_DIM);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(db_readout(gain.unwrap_or(0.75))).size(11.0).monospace().color(theme::CREAM_MID))
+                .on_hover_text("master volume · the last stage is the limiter, then warmth");
+            let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+            ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
+                .on_hover_text("peak meter of everything kabelsalat plays");
+            ui.add_space(4.0);
+            let arm_m = self.arm_master;
+            let rmb = egui::Button::new(egui::RichText::new(if arm_m { "● ARM" } else { "○ ARM" }).size(11.0)
+                    .color(if arm_m { theme::ON_ACCENT } else { theme::CREAM_MID }))
+                .fill(if arm_m { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
+                .corner_radius(2.0).min_size(egui::vec2(58.0, 22.0));
+            if ui.add(rmb).on_hover_text("arm the master mix for recording").clicked() {
+                self.set_record_arm(None, !arm_m);
+            }
+        });
+        if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
+            self.set_unit_knob(mu, vk, g);
+        }
+    }
+
+    /// The dB fader + its meter, shared by every strip (#72). `gain` is the
+    /// fader's value; the meter shows `level` with a ~1.5 s peak hold and a
+    /// clip light that stays lit until clicked. Returns the fader's rect.
+    fn strip_fader_ui(&mut self, ui: &mut egui::Ui, key: u32, gain: &mut f32, level: f32, fader_h: f32) -> Rect {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
+        let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
+        let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top() + 8.0), egui::vec2(6.0, fader_h - 8.0));
+        // Peak hold + clip (#72): one table keyed by the strip.
+        let dt = self.ui_dt;
+        let now = self.ui_time;
+        let mut clip_clicked = false;
+        {
+            let ph = self.mixer_peaks.entry(key).or_insert_with(PeakHold::new);
+            peak_hold_update(ph, level, now, dt);
+            let clip = Rect::from_min_size(Pos2::new(mr.left() - 1.0, r.top()), egui::vec2(8.0, 5.0));
+            // Id::unique hashes its salt with a fixed seed: key the light by
+            // the strip or every strip's clip light would share ONE id.
+            let cresp = ui.interact(clip, egui::Id::unique(("strip_clip", key)), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if ph.clip {
+                if cresp.clicked() { clip_clicked = true; }
+                cresp.on_hover_text("0 dBFS reached — click to clear");
+            }
+            // Meter + held peak line.
+            paint_meter(ui.painter(), mr, meter_db_pos(level), 0.0);
+            if ph.held > 0.02 {
+                let y = mr.bottom() - mr.height() * ph.held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(mr.left(), y - 1.0), egui::vec2(mr.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            if clip_clicked { ph.clip = false; }
+        }
+        self.mixer_meter_rects.push((key, mr));
+        // Track + cap.
+        let cap_h = 12.0;
+        let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
+        ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
+        // Unity + −12 dB ticks (the meter's dB curve, rule 62).
+        for (g, len) in [(1.0f32, 6.0), (10f32.powf(-12.0 / 20.0), 4.0)] {
+            let y = y0 + (y1 - y0) * fader_pos(g);
+            ui.painter().line_segment([Pos2::new(fr.center().x - len, y), Pos2::new(fr.center().x + len, y)], Stroke::new(1.0, theme::CREAM_DIM));
+        }
+        if resp.dragged() {
+            let dy = resp.drag_delta().y;
+            let mut pos = fader_pos(*gain) - dy / (y0 - y1);
+            // Unity detent (#72): the top of the travel snaps to exactly 0 dB.
+            if pos > UNITY_DETENT_POS { pos = 1.0; }
+            *gain = fader_gain(pos);
+        }
+        if resp.double_clicked() { *gain = 1.0; }
+        let y = y0 + (y1 - y0) * fader_pos(*gain);
+        ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
+        let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
+        ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
+        ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+        resp.on_hover_text("drag to set · double-click: 0 dB (unity)");
+        fr
+    }
+
+    /// A collapsed strip's mini meter (with the same peak hold + clip).
+    fn strip_meter_ui(&mut self, ui: &mut egui::Ui, key: u32, level: f32, h: f32) {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::hover());
+        let dt = self.ui_dt;
+        let now = self.ui_time;
+        let mut clear_clip = false;
+        {
+            let ph = self.mixer_peaks.entry(key).or_insert_with(PeakHold::new);
+            peak_hold_update(ph, level, now, dt);
+            let clip = Rect::from_min_size(Pos2::new(r.left(), r.top()), egui::vec2(r.width(), 4.0));
+            let cresp = ui.interact(clip, egui::Id::unique(("mini_clip", key)), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if ph.clip && cresp.clicked() { clear_clip = true; }
+            let body = Rect::from_min_size(Pos2::new(r.left(), r.top() + 6.0), egui::vec2(r.width(), h - 6.0));
+            paint_meter(ui.painter(), body, meter_db_pos(level), 0.0);
+            if ph.held > 0.02 {
+                let y = body.bottom() - body.height() * ph.held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(body.left(), y - 1.0), egui::vec2(body.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            self.mixer_meter_rects.push((key, body));
+        }
+        if clear_clip {
+            if let Some(ph) = self.mixer_peaks.get_mut(&key) { ph.clip = false; }
+        }
+        resp.on_hover_text("peak hold · red = clipped (click the light to clear)");
+    }
+
+    /// Caption of `unit`'s mixer quick knob (#107), shown beside the knob.
+    fn quick_knob_caption(&self, unit: usize) -> Option<String> {
+        self.quick_knob(unit).map(|ki| self.units[unit].knobs[ki].label.to_uppercase())
+    }
+
+    /// One mixer quick knob (#107) in a slot row's `knob_rect`: dial painted
+    /// via `paint_knob_dial`, drag/double-click updates the underlying rack
+    /// knob, and right-click opens a `theme::Dropdown` listing the unit's knobs.
+    fn strip_quick_knob_ui(&mut self, ui: &mut egui::Ui, knob_rect: Rect, unit: usize, dimmed: bool) {
+        let Some(ki) = self.quick_knob(unit) else { return };
+        let (node_id, label, full_name, val, default) = {
+            let u = &self.units[unit];
+            let k = &u.knobs[ki];
+            (u.node_id, k.label.clone(), k.source.plugin_name().map(str::to_string), k.value, k.default)
+        };
+        let resp = ui.interact(knob_rect, egui::Id::new(("strip_quick_knob", node_id)), egui::Sense::click_and_drag());
+        self.mixer_quick_knob_rects.push((node_id, knob_rect));
+
+        if resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical); }
+        if resp.drag_started() {
+            self.mixer_knob_drag = Some((node_id, ki, val));
+        }
+        if resp.dragged() {
+            let dy = resp.drag_delta().y;
+            let mut accum = match self.mixer_knob_drag {
+                Some((n, idx, cur)) if n == node_id && idx == ki => cur,
+                _ => val,
+            };
+            accum = (accum - dy * 0.006).clamp(0.0, 1.0);
+            self.mixer_knob_drag = Some((node_id, ki, accum));
+            self.set_unit_knob(unit, ki, accum);
+        }
+        if resp.drag_stopped() && self.mixer_knob_drag.is_some_and(|(n, _, _)| n == node_id) {
+            self.mixer_knob_drag = None;
+        }
+        if resp.double_clicked() {
+            self.mixer_knob_drag = None;
+            self.set_unit_knob(unit, ki, default);
+        }
+
+        let disp = self.units[unit].knobs[ki].display_value;
+        let hovered = resp.hovered();
+        let dragging = resp.dragged();
+        let ring = if hovered || dragging { TEXT } else if dimmed { theme::MUTED } else { BORDER };
+        let accent = if dimmed { theme::CREAM_DIM } else { theme::ACCENT };
+        paint_knob_dial(
+            ui.painter(),
+            |l| l.to_pos2(),
+            knob_rect.center().to_vec2(),
+            Vec2::splat(QUICK_KNOB_R),
+            disp,
+            hovered,
+            dragging,
+            ring,
+            accent,
+            QUICK_KNOB_ARC_GAP,
+            1.4,
+        );
+
+        let choices: Vec<(usize, String, String)> = self.units[unit].knobs.iter().enumerate()
+            .filter(|(_, k)| is_rack_knob(k))
+            .map(|(i, k)| {
+                let store = k.source.plugin_name().unwrap_or(&k.label).to_string();
+                let item_label = match k.source.plugin_name() {
+                    Some(full) if !full.eq_ignore_ascii_case(&k.label) => format!("{} · {}", k.label, full),
+                    _ => k.label.clone(),
+                };
+                (i, store, item_label)
+            })
+            .collect();
+        let mut picked: Option<String> = None;
+        theme::Dropdown::new(("strip_quick_dd", node_id), &label)
+            .popup_min_width(190.0)
+            .text_size(11.5)
+            .show_context_menu(&resp, |menu| {
+                for &(i, ref store, ref item_label) in &choices {
+                    if menu.item(i == ki, item_label) {
+                        picked = Some(store.clone());
+                    }
+                }
+            });
+        if let Some(choice) = picked {
+            self.strip_knobs.insert(node_id, choice);
+        }
+        let tip_name = full_name.as_deref().unwrap_or(&label);
+        let cur_v = self.units[unit].knobs[ki].value;
+        resp.on_hover_text(format!("{tip_name}: {cur_v:.2} · drag to adjust · double-click: reset · right-click: assign knob"));
+    }
+
+    /// Insert slots (#74/#107): a view of the strip's cable chain. A linear
+    /// chain lists its FX (quick knob, bypass dot, drag to reorder, × to
+    /// remove) plus an "+ insert" picker; custom wiring says so instead of
+    /// guessing.
+    fn insert_rows_ui(&mut self, ui: &mut egui::Ui, source: Option<u32>, chain: Option<&[usize]>, edits: &mut Vec<PendingInsertEdit>) {
+        let Some(chain) = chain else {
+            theme::tracked_label(ui, "CUSTOM WIRING", 9.0, 0.12, theme::MUTED)
+                .on_hover_text("this strip's cables branch or merge — its effects are all still there, patch them on the rack back (Tab)");
+            return;
+        };
+        let w = ui.available_width();
+        let stride = SLOT_H + ui.spacing().item_spacing.y;
+        for (slot, &fx) in chain.iter().enumerate() {
+            let (node, name) = {
+                let u = &self.units[fx];
+                (u.node_id, sentence_case(&u.name))
+            };
+            let row = self.strip_row(node);
+            let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
+            let (knob_rect, plate_rect) = strip_slot_rects(sr);
+            let resp = ui.interact(plate_rect, egui::Id::new(("insert_slot", node)), egui::Sense::click_and_drag());
+            let x = Rect::from_min_size(Pos2::new(plate_rect.right() - 17.0, plate_rect.center().y - 8.0), egui::vec2(16.0, 16.0));
+            let xresp = ui.interact(x, egui::Id::new(("insert_remove", node)), egui::Sense::click());
+            let row_hovered = resp.hovered() || xresp.hovered();
+            let fill = if row.bypass { theme::MUTED } else { theme::DARK_PANEL_HI };
+            ui.painter().rect_filled(plate_rect, 2.0, fill);
+            // Bypass dot (#74): a click toggles pass-through.
+            let dot = Rect::from_min_size(Pos2::new(plate_rect.left() + 4.0, plate_rect.center().y - 4.0), egui::vec2(8.0, 8.0));
+            let dresp = ui.interact(dot, egui::Id::new(("insert_bypass", node)), egui::Sense::click());
+            let dot_col = if row.bypass { theme::MUTED } else { theme::LIVE_TEAL };
+            if row.bypass {
+                ui.painter().circle_stroke(dot.center(), 3.5, Stroke::new(1.6, dot_col));
+            } else {
+                ui.painter().circle_filled(dot.center(), 3.5, dot_col);
+            }
+            if dresp.clicked() {
+                self.with_strip_row(node, |r| r.bypass = !r.bypass);
+                self.send_strip_bypass(node);
+            }
+            dresp.on_hover_text(if row.bypass { "bypassed — click to enable" } else { "click to bypass (the effect passes its input through)" });
+            // Name + quick-knob caption; the caption yields to × on hover.
+            let caption = if row_hovered { None } else { self.quick_knob_caption(fx) };
+            paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + 15.0, &format!("{} {name}", slot + 1),
+                caption.as_deref(),
+                if row.bypass { theme::CREAM_DIM } else { theme::CREAM },
+                if row.bypass { theme::CREAM_DIM } else { theme::CREAM_MID });
+            self.strip_quick_knob_ui(ui, knob_rect, fx, row.bypass);
+            // Drag reorders (one edit when the drag ends — the rack reloads).
+            if resp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+            if resp.drag_stopped() {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let top = sr.top() - slot as f32 * stride;
+                    let to = ((p.y - top) / stride).floor().clamp(0.0, chain.len() as f32 - 1.0) as usize + 1;
+                    if to != slot + 1 {
+                        edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Move { fx: node, to } });
+                    }
+                }
+            }
+            // Remove (shown on hover).
+            if row_hovered {
+                ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
+                if xresp.clicked() {
+                    edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Remove { fx: node } });
+                }
+            }
+            resp.on_hover_text("drag to reorder the chain · × removes the insert");
+            xresp.on_hover_text("remove this insert (the chain closes up)");
+        }
+        if theme::chip_button(ui, "+ insert", false)
+            .on_hover_text("add an effect to this strip's chain (built-in or an installed LV2 effect)")
+            .clicked()
+        {
+            self.insert_pick = Some(source);
+        }
+    }
+
+    /// Strip rename modal (#77): the node's name travels with the graph, so
+    /// the rack face, matrix and agents all show it.
+    fn strip_rename_modal(&mut self, ctx: &egui::Context) {
+        let Some((node, name)) = self.strip_rename.take() else { return };
+        let mut text = name;
+        let mut decided: Option<Option<String>> = None;
+        let modal = egui::Modal::new(egui::Id::new("strip_rename_modal")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(egui::RichText::new("Rename strip").size(16.0).strong().color(theme::INK));
+            ui.add_space(8.0);
+            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("strip_rename_text").desired_width(300.0).char_limit(24));
+            if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Rename").clicked() { decided = Some(Some(text.clone())); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decided = Some(None); }
+            });
+        });
+        if modal.should_close() && decided.is_none() { decided = Some(None); }
+        match decided {
+            Some(Some(t)) => match self.apply_strip_name(node, &t) {
+                Ok(n) => self.session_msg = format!("Renamed the strip → {n}"),
+                Err(e) => self.session_msg = e,
+            },
+            Some(None) | None => {}
+        }
+    }
+
+    /// The strip colour palette (#77), anchored like the knob menu: a click
+    /// outside closes it.
+    fn strip_palette_ui(&mut self, ctx: &egui::Context) {
+        let Some(node) = self.strip_color_pick else { return };
+        let clicked_elsewhere = ctx.input(|i| i.pointer.primary_clicked() || i.pointer.secondary_clicked());
+        let mut chosen: Option<Option<egui::Color32>> = None;
+        let screen = self.stage_rect;
+        let area = egui::Area::new(egui::Id::unique("strip_palette"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.center() - egui::vec2(95.0, 40.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(190.0);
+                        ui.label(egui::RichText::new("Strip colour").font(theme::medium_font(12.5)).color(theme::INK));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for &c in STRIP_PALETTE.iter() {
+                                let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                                ui.painter().circle_filled(r.center(), 8.0, c);
+                                if resp.clicked() { chosen = Some(Some(c)); }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        if theme::chip_button(ui, "No colour", false).clicked() { chosen = Some(None); }
+                    });
+            });
+        let inside = area.response.rect.contains(ctx.pointer_hover_pos().unwrap_or_default());
+        if chosen.is_some() || (clicked_elsewhere && !inside) {
+            self.strip_color_pick = None;
+            if let Some(c) = chosen {
+                self.with_strip_row(node, |row| row.color = c);
+            }
+        }
+    }
+
+    /// The insert picker (#74): built-in DSP effects and the installed LV2
+    /// effects (from the background scan — rule 57), with a filter.
+    fn insert_picker_ui(&mut self, ctx: &egui::Context, edits: &mut Vec<PendingInsertEdit>) {
+        let Some(source) = self.insert_pick else { return };
+        let mut chosen: Option<(NodeKind, String)> = None;
+        let mut close = false;
+        let screen = self.stage_rect;
+        let area = egui::Area::new(egui::Id::unique("insert_picker"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.center() - egui::vec2(150.0, 160.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(280.0);
+                        ui.label(egui::RichText::new("Add insert").font(theme::medium_font(12.5)).color(theme::INK));
+                        ui.add_space(4.0);
+                        let words: Vec<String> = self.insert_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+                        ui.add_sized([ui.available_width(), 20.0],
+                            egui::TextEdit::singleline(&mut self.insert_filter).hint_text("filter effects…"));
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().id_salt("insert_picker_scroll").max_height(240.0).auto_shrink([false, false]).show(ui, |ui| {
+                            let matches = |name: &str| {
+                                let low = name.to_lowercase();
+                                words.iter().all(|w| low.contains(w.as_str()))
+                            };
+                            let mut shown = 0usize;
+                            for (kind, label) in [
+                                (DspKind::Delay, "Delay"), (DspKind::Reverb, "Reverb"), (DspKind::Filter, "Filter"),
+                                (DspKind::Eq3, "Eq 3"), (DspKind::Saturation, "Saturation"), (DspKind::Limiter, "Limiter"),
+                                (DspKind::Gain, "Gain"), (DspKind::Pan, "Pan"),
+                            ] {
+                                if !words.is_empty() && !matches(label) { continue; }
+                                shown += 1;
+                                if theme::chip_button(ui, label, false).clicked() {
+                                    chosen = Some((NodeKind::Dsp(kind), label.to_string()));
+                                }
+                            }
+                            if self.plugin_lists_ready() {
+                                for p in self.plugins_lv2.iter().filter(|p| !p.is_instrument) {
+                                    if !words.is_empty() && !matches(&p.name) { continue; }
+                                    if shown > 200 { break; }
+                                    shown += 1;
+                                    if theme::chip_button(ui, &p.name, false).on_hover_text(&p.uri).clicked() {
+                                        chosen = Some((NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) }, p.name.clone()));
+                                    }
+                                }
+                            } else if words.is_empty() {
+                                ui.label(egui::RichText::new("scanning installed LV2 effects in the background…").size(11.0).color(theme::INK_2));
+                            }
+                            if words.is_empty() {
+                                ui.label(egui::RichText::new("filter to see LV2 effects too").size(10.5).color(theme::CREAM_DIM));
+                            }
+                        });
+                    });
+            });
+        let inside = area.response.rect.contains(ctx.pointer_hover_pos().unwrap_or_default());
+        if ctx.input(|i| i.pointer.primary_clicked()) && !inside { close = true; }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+        if chosen.is_some() || close {
+            self.insert_pick = None;
+            self.insert_filter.clear();
+            if let Some((kind, name)) = chosen {
+                edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Add { kind, name } });
+            }
+        }
+    }
+
+    /// Reorder one strip (#77): move `node` before `before` in its rig's
+    /// display order; the flat `strip_order` is rebuilt per rig so it never
+    /// carries a removed node.
+    fn reorder_strip(&mut self, rig: u8, node: u32, before: u32) {
+        if node == before { return; }
+        let mut order: Vec<u32> = Vec::new();
+        for r in 0..self.rig_count() {
+            let mut nodes: Vec<u32> = self.rig_strip_sources(r as u8).iter()
+                .map(|&u| self.units[u].node_id).collect();
+            if r as u8 == rig {
+                let from = nodes.iter().position(|n| *n == node);
+                let to = nodes.iter().position(|n| *n == before).unwrap_or(nodes.len());
+                if let Some(from) = from {
+                    nodes.remove(from);
+                    let to = to.min(nodes.len());
+                    nodes.insert(to, node);
+                } else {
+                    nodes.push(node);
+                }
+            }
+            order.extend(nodes);
+        }
+        self.strip_order = order;
+    }
+
+    /// Apply a strip rename (#77): the name is graph state — the mirror, the
+    /// rack face and the engine's published graph all take it at once.
+    fn apply_strip_name(&mut self, node: u32, name: &str) -> Result<String, String> {
+        let n: String = name.trim().chars().take(24).collect();
+        if n.is_empty() { return Err("the strip needs a name".into()); }
+        if let Some(m) = self.base_graph.nodes.iter_mut().find(|m| m.id == node) {
+            m.name = name_bytes(&n);
+        }
+        if let Some(sg) = self.shared_graph.lock().ok().as_mut() {
+            if let Some(m) = sg.nodes.iter_mut().find(|m| m.id == node) {
+                m.name = name_bytes(&n);
+            }
+        }
+        for u in self.units.iter_mut().filter(|u| u.node_id == node) {
+            u.name = n.clone();
+            u.name_g = None;
+            u.label_fit_w = f32::INFINITY;
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::RenameNode { node, name: name_bytes(&n) });
+        }
+        Ok(n)
     }
 
     /// Tab: in any non-rack stage view it returns to the rack; otherwise it flips the rack.
     fn on_tab(&mut self) {
         if self.stage_view != StageView::Rack {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
             self.stage_view = StageView::Rack;
         } else {
             self.start_flip();
@@ -13094,8 +16545,10 @@ impl DemoApp {
 
     fn draw_rails(&self, painter: &egui::Painter) {
         let xf = &self.xf;
-        for side_x in [8.0, self.rack_w - 22.0] {
-            let rail = Rect::from_min_size(Pos2::new(side_x, 8.0), Vec2::new(14.0, self.rack_h - 16.0));
+        let RackChrome { pad, rail: w, .. } = self.rack_chrome;
+        let inset = pad * 0.4;
+        for side_x in [inset, self.rack_w - inset - w] {
+            let rail = Rect::from_min_size(Pos2::new(side_x, inset), Vec2::new(w, self.rack_h - 2.0 * inset));
             painter.rect_filled(xf.rect(rail), 4.0, RAIL);
         }
         // No screws — the editorial language has no hardware chrome (§4.2).
@@ -13163,6 +16616,7 @@ impl DemoApp {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let unit_selected = self.selected_unit == Some(u.node_id);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
@@ -13171,7 +16625,7 @@ impl DemoApp {
             // (~120ms ease). Drag = 2px accent inset keyline; Agent = teal keyline.
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
-            if dragging {
+            if dragging || unit_selected {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
                 let sw = 1.8 + 1.4 * pulse;
@@ -13188,7 +16642,7 @@ impl DemoApp {
             // touched by an agent. Activity is the LED's job alone — the
             // strip no longer flashes with it (one signal, not two).
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
-            let strip_col = if dragging {
+            let strip_col = if dragging || unit_selected {
                 theme::ACCENT
             } else if agent_t > 0.01 {
                 mix(BORDER, theme::AGENT_COLOR, agent_t)
@@ -13214,15 +16668,21 @@ impl DemoApp {
                 UnitKind::Keys => {
                     self.draw_notes_display(painter, ui);
                     self.draw_split_face(painter, ui);
+                    self.draw_scale_face(painter, ui);
                     self.draw_zone_octaves(painter, ui);
                 }
-                UnitKind::Clap => self.draw_surge_display(painter, ui),
+                UnitKind::Clap => {
+                    self.draw_surge_display(painter, ui);
+                    self.draw_aeolus_face(painter, ui);
+                }
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) if self.is_organ_unit(ui) => self.draw_organ_face(painter, ui),
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, ui),
                 UnitKind::AudioIn => self.draw_audio_in_face(painter, ui),
+                UnitKind::MidiFx => self.draw_dsp_display(painter, ui),
+                UnitKind::Arp => self.draw_arp_display(painter, ui),
             }
 
             for ki in 0..u.knobs.len() {
@@ -13316,6 +16776,132 @@ impl DemoApp {
         }
     }
 
+    /// Keys-face scale controls (rack-local): the SCALE chip +, right of it,
+    /// the key/scale readout (e.g. "C MAJOR"). One row BELOW the SPLIT
+    /// control (and below the zone steppers while split), right-aligned with
+    /// them. None when the unit is too small (never squeeze, rule 22).
+    fn scale_rects(&self, unit: usize) -> Option<(Rect, Rect)> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Keys) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        // Below the SPLIT row; while split, below the zone steppers.
+        let y = match self.split_rects(unit) {
+            Some((_, split_readout)) => {
+                let below_zones = self.zone_rects(unit)
+                    .map(|z| z.iter().map(|z| z.value.bottom()).fold(f32::MIN, f32::max) + 6.0);
+                below_zones.unwrap_or(split_readout.bottom() + 8.0)
+            }
+            None => r.top() + 14.0,
+        };
+        let readout = Rect::from_min_size(
+            Pos2::new(r.right() - 36.0 - SCALE_READOUT_W, y),
+            Vec2::new(SCALE_READOUT_W, FACE_CTL_H),
+        );
+        let chip = Rect::from_min_size(
+            Pos2::new(readout.left() - 1.0 - SPLIT_CHIP_W, y),
+            Vec2::new(SPLIT_CHIP_W, FACE_CTL_H),
+        );
+        let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
+        let (chip, readout) = if chip.left() >= r.left() + FACE_X + name_w + 8.0 {
+            if readout.right() > r.right() - FACE_PAD_R + 0.5 { return None; }
+            (chip, readout)
+        } else {
+            // A narrow Keys column: the control drops under the subtitle and
+            // stacks, SCALE on top of its readout, over the face's own
+            // width (a narrow rack must not hide it: the arp's six knobs
+            // squeeze the Keys column to its floor).
+            let avail = r.width() - FACE_X - FACE_PAD_R;
+            if avail < SCALE_NARROW_MIN_W { return None; }
+            let y = y.max(r.top() + 62.0);
+            let w = avail.min(SPLIT_CHIP_W + 1.0 + SCALE_READOUT_W);
+            let chip = Rect::from_min_size(Pos2::new(r.left() + FACE_X, y), Vec2::new(w, FACE_CTL_H));
+            let readout = if self.keys_scale(unit).is_some() {
+                Rect::from_min_size(Pos2::new(chip.left(), chip.bottom() + 4.0), Vec2::new(w, FACE_CTL_H))
+            } else {
+                Rect::from_min_size(chip.left_bottom(), Vec2::ZERO) // OFF is one control
+            };
+            (chip, readout)
+        };
+        // Room above the knob row (labels sit below the knobs).
+        if chip.bottom().max(readout.bottom()) + 4.0 > self.knob_row_y(unit) - KNOB_R - 10.0 { return None; }
+        Some((chip, readout))
+    }
+
+    /// The Keys node's scale as the engine published it (base graph mirror).
+    fn keys_scale(&self, unit: usize) -> Option<crate::arp::ScaleChoice> {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .and_then(|n| n.scale)
+    }
+
+    /// Keys face: the SCALE chip (snap on/off) + readout (key + scale), the
+    /// readout opening the scale picker.
+    fn draw_scale_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some((chip, readout)) = self.scale_rects(unit) else { return };
+        let choice = self.keys_scale(unit);
+        let menu_open = self.scale_menu.is_some_and(|m| m.unit == unit);
+        let hov_chip = self.face_hovered(painter, unit, chip) || menu_open;
+        match choice {
+            None => {
+                let whole = chip.union(readout);
+                let hov = hov_chip || self.face_hovered(painter, unit, readout);
+                self.paint_face_chip(painter, whole, "SCALE · OFF", false, hov);
+            }
+            Some(c) => {
+                self.paint_face_chip(painter, chip, "SCALE", true, hov_chip);
+                let frame = chip.union(readout).expand(2.0);
+                painter.rect_stroke(self.xf.rect(frame), 3.0, Stroke::new(1.0, theme::HAIRLINE_DARK), egui::StrokeKind::Inside);
+                let active = menu_open || self.face_hovered(painter, unit, readout);
+                self.paint_face_field(painter, readout, active);
+                let short = short_scale_label(c);
+                self.face_text(painter, readout.center(), &short, theme::medium_font(12.0), TEXT);
+            }
+        }
+    }
+
+    /// Arp face status field (rack-local): top right, right-aligned with the
+    /// Keys face's scale/split row and clear of the title. None when the unit
+    /// is too narrow for it (never squeeze, rule 22).
+    fn arp_status_rect(&self, unit: usize) -> Option<Rect> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Arp) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
+        let left = r.left() + FACE_X + name_w + 14.0;
+        let right = r.right() - 36.0;
+        let w = (right - left).min(ARP_STATUS_W);
+        if w < ARP_STATUS_MIN_W { return None; }
+        Some(Rect::from_min_size(Pos2::new(right - w, r.top() + 14.0), Vec2::new(w, FACE_CTL_H)))
+    }
+
+    /// The status line of what the knobs say: the mode, and for a stepping
+    /// mode the rate + octave span; for chord mode the chord shape.
+    fn arp_status_text(&self, unit: usize) -> Option<String> {
+        let u = self.units.get(unit)?;
+        let read = |label: &str| u.knob_index(label).map(|i| u.knobs[i].step_index());
+        let mode = crate::arp::ArpMode::ALL[read("MODE")?.min(4)];
+        Some(if mode == crate::arp::ArpMode::Chord {
+            format!("CHORD · {}", crate::arp::ChordShape::ALL[read("CHORD").unwrap_or(0).min(7)].label())
+        } else {
+            format!(
+                "{} · {} · {} OCT",
+                mode.label(),
+                crate::arp::ArpRate::ALL[read("RATE").unwrap_or(3).min(5)].label(),
+                read("OCT").unwrap_or(0).min(3) + 1
+            )
+        })
+    }
+
+    /// Arp face (issue #90): the status field above. The knobs are the
+    /// controls; what the arp plays is heard and seen on the keys.
+    fn draw_arp_display(&self, painter: &egui::Painter, unit: usize) {
+        let (Some(field), Some(text)) = (self.arp_status_rect(unit), self.arp_status_text(unit)) else { return };
+        self.paint_face_field(painter, field, false);
+        self.face_text(painter, field.center(), &text, theme::medium_font(11.5), TEXT);
+    }
+
     /// Organ face: nine drawbars, pulled down out of their tracks like a
     /// tonewheel organ's (brown sub-octaves, cream foundation and octaves,
     /// dark mutations), with the position on each bar's cap.
@@ -13351,6 +16937,67 @@ impl DemoApp {
                 self.face_text(painter, Pos2::new(bar.center().x, bar.bottom() - 8.0), &pos.to_string(), theme::medium_font(11.0), ink);
             }
         }
+    }
+
+    /// Aeolus face, drawn like a console's stop jamb rather than a grid of
+    /// buttons: each stop is its name beside an indicator light (live teal
+    /// when drawn, an unlit ring when not), no box. The division tabs are
+    /// plain labels; the shown one is cream with an accent bar (selection),
+    /// and a small teal dot marks a division with stops drawn. A hairline
+    /// parts tabs from stops. Hover lifts a row onto a faint plate.
+    fn draw_aeolus_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some(a) = self.aeolus_rects(unit) else { return };
+        let face = self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default();
+        let hover_plate = |rect: Rect| painter.rect_filled(self.xf.rect(rect), 2.0, alpha(theme::CREAM, 0.06));
+        let tab_font = theme::medium_font(11.0);
+        for (d, tab) in a.tabs.iter().enumerate() {
+            let hov = self.face_hovered(painter, unit, *tab);
+            let shown = d == face.division;
+            if hov && !shown { hover_plate(*tab); }
+            if shown {
+                let bar = Rect::from_min_size(tab.min + Vec2::new(0.0, 2.0), Vec2::new(2.0, tab.height() - 4.0));
+                painter.rect_filled(self.xf.rect(bar), 1.0, theme::ACCENT);
+            }
+            let ink = if shown || hov { theme::CREAM } else { theme::CREAM_DIM };
+            self.face_text(painter, Pos2::new(tab.left() + 13.0, tab.center().y), crate::aeolus::division_tab(d), tab_font.clone(), ink);
+            if face.drawn.is_some_and(|b| b[d] != 0) {
+                self.ell(painter, Vec2::new(tab.right() - 3.5, tab.center().y), 2.0, theme::LIVE_TEAL, Stroke::NONE);
+            }
+        }
+        // The rule between the tab column and the stops.
+        let x = a.tabs[0].right() + 4.0;
+        painter.line_segment([self.xf.p(Vec2::new(x, a.tabs[0].top() + 1.0)), self.xf.p(Vec2::new(x, a.tabs[3].bottom() - 1.0))],
+            Stroke::new(1.0, theme::HAIRLINE));
+
+        let font = FontId::proportional(10.5);
+        let stops = crate::aeolus::DIVISIONS[face.division].stops;
+        for (i, (rect, name)) in a.stops.iter().zip(stops).enumerate() {
+            let on = face.drawn.is_some_and(|b| b[face.division] >> i & 1 == 1);
+            let hov = self.face_hovered(painter, unit, *rect);
+            if hov { hover_plate(*rect); }
+            let led = Vec2::new(rect.left() + 5.0, rect.center().y);
+            if on {
+                self.ell(painter, led, 6.0, alpha(theme::LIVE_TEAL, 0.18), Stroke::NONE);
+                self.ell(painter, led, 3.2, theme::LIVE_TEAL, Stroke::NONE);
+            } else {
+                self.ell(painter, led, 3.0, Color32::TRANSPARENT, Stroke::new(1.0, if hov { theme::CREAM_DIM } else { theme::MUTED }));
+            }
+            let ink = if on { theme::CREAM } else if hov { theme::CREAM_META } else { theme::CREAM_DIM };
+            let text_left = rect.left() + 12.0;
+            let label = fit_stop_label(painter, name, font.clone(), (rect.right() - text_left - 2.0) * self.xf.sx);
+            self.face_text_left(painter, Pos2::new(text_left, rect.center().y), &label, font.clone(), ink);
+        }
+    }
+
+    /// Single-line face text starting at rack-local `left_center` (its left
+    /// edge, vertically centred), faded with the flip like `face_text`.
+    fn face_text_left(&self, painter: &egui::Painter, left_center: Pos2, text: &str, font: FontId, color: Color32) {
+        if self.text_alpha <= 0.01 { return; }
+        let g = painter.layout_no_wrap(text.into(), font, color);
+        let pos = self.xf.p(Vec2::new(left_center.x, left_center.y - g.size().y / 2.0));
+        let mut tp = painter.clone();
+        tp.set_opacity(self.text_alpha);
+        tp.galley(pos, g, color);
     }
 
     /// Keys face, split: one octave stepper per zone ("LOW +1"), BPM style.
@@ -13581,8 +17228,16 @@ impl DemoApp {
         let r = self.unit_rects[unit];
         let x = r.left() + FACE_X;
         let bottom = self.knob_row_y(unit) + KNOB_R;
-        let pitch = ((bottom - (r.top() + 84.0)) / METER_SEGS as f32).clamp(4.0, 17.0);
+        let pitch = (bottom - (r.top() + 84.0)) / METER_SEGS as f32;
+        // A short face drops the OUTPUT caption and starts the meter under the header.
+        let pitch = if pitch >= 4.0 { pitch.min(17.0) } else { ((bottom - (r.top() + METER_TOP_SHORT)) / METER_SEGS as f32).max(2.0) };
         (x, bottom, pitch)
+    }
+
+    /// Whether Master's meter has room for its OUTPUT caption.
+    fn meter_caption_shown(&self, unit: usize) -> bool {
+        let (_, bottom, pitch) = self.meter_geom(unit);
+        bottom - METER_SEGS as f32 * pitch - 18.0 >= self.unit_rects[unit].top() + METER_TOP_SHORT
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
@@ -13594,7 +17249,7 @@ impl DemoApp {
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
-                Vec2::new(22.0, pitch * 0.72),
+                Vec2::new(METER_SEG_W, pitch * 0.72),
             );
             let col = theme::meter_color(i as f32 / (n - 1) as f32);
             let fill = if i < lit { col } else { theme::METER_TRACK };
@@ -13614,10 +17269,231 @@ impl DemoApp {
         // the meter, not floating on the knob-label row (vision review).
         let top = bottom - n as f32 * pitch;
         // Left-aligned with the meter column and the title (face grid).
-        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        if self.meter_caption_shown(unit) {
+            self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        }
     }
 
     // -- Audio In face (issue #28) -------------------------------------------
+
+    fn engine_counters(&self) -> crate::engine_info::EngineCounters {
+        #[cfg(test)]
+        if let Some(c) = self.test_counters { return c; }
+        crate::engine_info::EngineCounters::load()
+    }
+
+    /// The engine's load right now, units under their display names.
+    fn engine_stats_now(&self) -> crate::engine_info::EngineStats {
+        let inputs = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::AudioIn))
+            .map(|u| u.channels.count())
+            .sum();
+        crate::engine_info::EngineStats::build(self.engine_counters(), self.node_times.as_deref(), inputs, |node| {
+            self.units.iter().find(|u| u.node_id == node).map(|u| sentence_case(&u.name))
+        })
+    }
+
+    fn refresh_engine_stats(&mut self) {
+        if self.ui_time - self.engine_stats_at >= 0.25 {
+            self.engine_stats_at = self.ui_time;
+            self.engine_stats = self.engine_stats_now();
+        }
+    }
+
+    fn reset_engine_peaks(&mut self) {
+        crate::engine_info::reset_counter_peaks();
+        if let Some(t) = &self.node_times { t.reset_peaks(); }
+        #[cfg(test)]
+        if let Some(c) = &mut self.test_counters {
+            (c.render_max_us, c.render_late, c.xruns) = (0, 0, 0);
+        }
+        self.engine_stats_at = f32::NEG_INFINITY;
+    }
+
+    /// The DSP readout's texts, laid out: the average render time as a
+    /// share of one buffer, and the xrun count once the device reported any.
+    /// The value's slot is as wide as "100 %", so the readout's width
+    /// follows the xrun count alone, never the load.
+    fn dsp_chip_layout(&self, ui: &egui::Ui) -> DspChip {
+        use crate::engine_info::LoadLevel;
+        let st = &self.engine_stats;
+        let value = if st.audio_live { format!("{:.0} %", st.dsp_percent) } else { "–".to_string() };
+        let (value_col, stroke) = match LoadLevel::of(st.dsp_percent) {
+            LoadLevel::Normal => (theme::CREAM, None),
+            LoadLevel::High => (theme::CABLE_AMBER, Some(theme::CABLE_AMBER)),
+            // CLIP_RED text is 3.2:1 on the chip; the border carries the red.
+            LoadLevel::Critical => (theme::CLIP_BRIGHT, Some(theme::CLIP_RED)),
+        };
+        let xruns = (st.xruns > 0).then(|| format!("{} xrun{}", st.xruns, if st.xruns == 1 { "" } else { "s" }));
+        let font = FontId::proportional(12.5);
+        let (label, value, value_w, xruns) = ui.fonts_mut(|f| (
+            f.layout_no_wrap("DSP".into(), font.clone(), theme::CREAM_MID),
+            f.layout_no_wrap(value, font.clone(), value_col),
+            f.layout_no_wrap("100 %".into(), font.clone(), theme::CREAM).size().x,
+            xruns.map(|t| f.layout_no_wrap(t, font.clone(), theme::CLIP_BRIGHT)),
+        ));
+        let width = theme::CHIP_PAD_X * 2.0 + label.size().x + DspChip::GAP + value_w
+            + xruns.as_ref().map_or(0.0, |g| DspChip::GAP * 2.0 + g.size().x);
+        DspChip { label, value, value_w, xruns, stroke, width: width.ceil() }
+    }
+
+    /// The DSP readout: a click opens Engine Info.
+    fn dsp_chip(&mut self, ui: &mut egui::Ui, chip: DspChip) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(chip.width, 26.0), egui::Sense::click());
+        self.dsp_chip_rect = rect;
+        if ui.is_rect_visible(rect) {
+            let open = self.engine_info_open;
+            let fill = if open || resp.hovered() { mix(theme::DARK_PANEL_HI, theme::CREAM, if open { 0.10 } else { 0.07 }) } else { theme::DARK_PANEL_HI };
+            let stroke = chip.stroke.unwrap_or(if open { theme::HAIRLINE_DARK } else if resp.hovered() { theme::MUTED } else { theme::HAIRLINE });
+            let p = ui.painter();
+            p.rect_filled(rect, 2.0, fill);
+            p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+            let mid = |g: &Arc<egui::Galley>| rect.center().y - g.size().y * 0.5;
+            let mut x = rect.left() + theme::CHIP_PAD_X;
+            p.galley(Pos2::new(x, mid(&chip.label)), chip.label.clone(), theme::CREAM_MID);
+            x += chip.label.size().x + DspChip::GAP + chip.value_w;
+            p.galley(Pos2::new(x - chip.value.size().x, mid(&chip.value)), chip.value.clone(), theme::CREAM);
+            if let Some(g) = &chip.xruns {
+                p.galley(Pos2::new(x + DspChip::GAP * 2.0, mid(g)), g.clone(), theme::CLIP_BRIGHT);
+            }
+        }
+        let st = &self.engine_stats;
+        let mut tip = if st.audio_live {
+            format!("DSP load: rendering takes {:.0} % of each {:.2} ms buffer on average", st.dsp_percent, st.buffer_ms)
+        } else {
+            "DSP load: no audio output is running".to_string()
+        };
+        if st.xruns > 0 {
+            tip.push_str(&format!("\n{} xruns (dropouts the audio device reported) since the last reset", st.xruns));
+        }
+        tip.push_str("\nClick for Engine Info");
+        resp.on_hover_text(tip)
+    }
+
+    /// Engine Info (AUM's sheet of the same name): the audio session, the
+    /// load, the latencies that are measured, and the render time per unit.
+    /// A popup under the DSP readout, flush with its right edge; Esc, the
+    /// readout or a click elsewhere closes it.
+    fn engine_info_ui(&mut self, ctx: &egui::Context) {
+        if !self.engine_info_open {
+            self.engine_info_rect = Rect::NOTHING;
+            return;
+        }
+        use crate::engine_info::LoadLevel;
+        const WIDTH: f32 = 344.0;
+        const MARGIN: f32 = 12.0;
+        const HEADER_H: f32 = 26.0;
+        const HEADER_GAP: f32 = 8.0;
+        let screen = ctx.content_rect();
+        let anchor = self.dsp_chip_rect.right_bottom() + Vec2::new(0.0, 6.0);
+        let width = WIDTH.min(screen.width() - 16.0 - MARGIN * 2.0);
+        let st = self.engine_stats.clone();
+        let mut reset = false;
+        let area = egui::Area::new(egui::Id::unique("engine_info"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(anchor)
+            .constrain(true)
+            .show(ctx, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(MARGIN as i8)).show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(HEADER_H);
+                        ui.label(egui::RichText::new("Engine info").font(theme::medium_font(14.0)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "Reset peaks", false)
+                                .on_hover_text("start the maximum, late blocks, xruns and each unit's maximum again from now")
+                                .clicked()
+                            {
+                                reset = true;
+                            }
+                        });
+                    });
+                    ui.add_space(HEADER_GAP);
+                    // Everything under the header scrolls in what the window
+                    // leaves (rule 27: the remainder is measured, never
+                    // egui's default), behind a bar that shows without a hover.
+                    let body_h = (screen.bottom() - 8.0 - MARGIN - ui.cursor().top()).max(60.0);
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    egui::ScrollArea::vertical()
+                        .max_height(body_h)
+                        .min_scrolled_height(body_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let w = ui.available_width();
+                            let row = |ui: &mut egui::Ui, label: &str, value: String, col: Color32| engine_info_row(ui, w, label, &value, col);
+                            let plain = theme::CREAM;
+
+                            engine_info_section(ui, w, "Audio session", &[]);
+                            if st.sample_rate > 0 {
+                                row(ui, "Sample rate", format!("{} Hz", st.sample_rate), plain);
+                                row(ui, "Buffer size", format!("{} frames", st.buffer_frames), plain);
+                                row(ui, "Buffer duration", format!("{:.2} ms", st.buffer_ms), plain);
+                            } else {
+                                row(ui, "Output", "no audio output".into(), theme::CREAM_DIM);
+                            }
+                            row(ui, "Inputs", st.inputs.to_string(), plain);
+                            row(ui, "Outputs", st.outputs.to_string(), plain);
+
+                            engine_info_section(ui, w, "Load", &[]);
+                            let load_col = match LoadLevel::of(st.dsp_percent) {
+                                LoadLevel::Normal => plain,
+                                LoadLevel::High => theme::CABLE_AMBER,
+                                LoadLevel::Critical => theme::CLIP_BRIGHT,
+                            };
+                            let bad = |n: u32| if n > 0 { theme::CLIP_BRIGHT } else { plain };
+                            if st.audio_live {
+                                row(ui, "DSP load", format!("{:.1} %", st.dsp_percent), load_col);
+                                row(ui, "Render time, average", fmt_us(st.render_avg_us), plain);
+                                row(ui, "Render time, maximum", fmt_us(st.render_max_us as f64), plain);
+                            } else {
+                                row(ui, "DSP load", "not running".into(), theme::CREAM_DIM);
+                            }
+                            row(ui, "Late blocks", st.late_blocks.to_string(), bad(st.late_blocks))
+                                .on_hover_text("buffers that took more than 80 % of their time to render");
+                            row(ui, "Xruns", st.xruns.to_string(), bad(st.xruns))
+                                .on_hover_text("dropouts the audio device reported");
+
+                            engine_info_section(ui, w, "Latency", &[]);
+                            match st.midi_input_latency_ms {
+                                Some(ms) => row(ui, "MIDI input", format!("{ms:.2} ms"), plain),
+                                None => row(ui, "MIDI input", "no event yet".into(), theme::CREAM_DIM),
+                            }
+                            .on_hover_text("measured: how long a hardware MIDI event waits before the engine plays it");
+                            if st.sample_rate > 0 {
+                                row(ui, "Output buffer", format!("{:.2} ms", st.buffer_ms), plain)
+                                    .on_hover_text("one buffer: the delay the engine itself adds to every note");
+                            }
+                            const UNMEASURED: &str = "kabelsalat does not measure this, and the audio API's own figure is not reliable through PipeWire's ALSA layer.\n`kabelsalat monitor-latency-test` measures the real input to output round trip.";
+                            row(ui, "Sound card output", "not measured".into(), theme::CREAM_DIM).on_hover_text(UNMEASURED);
+                            row(ui, "Audio input", "not measured".into(), theme::CREAM_DIM).on_hover_text(UNMEASURED);
+
+                            engine_info_section(ui, w, "Node statistics", &["avg", "max", "block"]);
+                            if st.nodes.is_empty() {
+                                row(ui, "No instrument or effect has rendered yet", String::new(), plain);
+                            }
+                            for n in &st.nodes {
+                                engine_info_node_row(ui, w, n);
+                            }
+                            if st.nodes_not_timed > 0 {
+                                row(ui, &format!("{} more units are not timed", st.nodes_not_timed), String::new(), plain);
+                            }
+                        });
+                });
+            });
+        self.engine_info_rect = area.response.rect;
+        if reset {
+            self.reset_engine_peaks();
+            self.refresh_engine_stats();
+        }
+        let pressed_outside = ctx
+            .input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None })
+            .is_some_and(|p| !self.engine_info_rect.contains(p) && !self.dsp_chip_rect.contains(p));
+        if pressed_outside {
+            self.engine_info_open = false;
+        }
+    }
 
     /// The AudioIn node's input level (pre-gain peak), engine → UI, lock-free.
     fn audio_in_level(&self, node: u32) -> f32 {
@@ -13653,7 +17529,8 @@ impl DemoApp {
     fn audio_in_chips_y(&self, unit: usize) -> Option<f32> {
         let r = *self.unit_rects.get(unit)?;
         let y = (r.top() + 60.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
-        if y + FACE_CTL_H + 8.0 > self.knob_row_y(unit) {
+        // Clear of the input meter, which starts 20 px above the knob row.
+        if y + FACE_CTL_H + 4.0 > self.knob_row_y(unit) - 20.0 {
             return None;
         }
         Some(y)
@@ -13728,10 +17605,12 @@ impl DemoApp {
                 }
                 if n == 0 { break; }
                 any = true;
-                tuner.process(&chunk[..n]);
+                tuner.push(&chunk[..n]);
             }
             if any {
-                *pitch = tuner.process(&[]);
+                if let Some(p) = tuner.estimate_if_due() {
+                    *pitch = p;
+                }
             }
         }
     }
@@ -13902,13 +17781,22 @@ impl DemoApp {
         let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
         let learn_col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
 
-        // Unfilled disc (§4.6): 1.5px hairline ring, cream on hover, MIDI pulse when learning.
-        self.ell(painter, c, r, Color32::TRANSPARENT,
-            Stroke::new(1.5, if is_learning { learn_col } else if hovered || dragging { TEXT } else { BORDER }));
-
-        // Flat value arc: hairline track + solid accent arc + flat end dot
-        // (theme helper; the closure carries the flip transform).
-        theme::value_arc(painter, |l| xf.p(l), c, r, k.display_value, theme::ACCENT);
+        let border_col = if is_learning { learn_col } else if hovered || dragging { TEXT } else { BORDER };
+        let rx = r * xf.sx;
+        let ry = r * xf.sy;
+        paint_knob_dial(
+            painter,
+            |l| xf.p(l),
+            c,
+            Vec2::new(rx, ry),
+            k.display_value,
+            hovered,
+            dragging,
+            border_col,
+            theme::ACCENT,
+            4.5,
+            2.2,
+        );
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -13916,18 +17804,6 @@ impl DemoApp {
                 Stroke::new(2.2, alpha(learn_col, 0.70 + 0.30 * pulse)));
         }
 
-        // Active/dragging knob: the CTA inset-keyline motif as focus state.
-        if dragging {
-            let disc = Rect::from_center_size(c.to_pos2(), Vec2::splat(2.0 * r));
-            theme::inset_keyline(painter, xf.rect(disc), r, theme::ACCENT, 2.0, 2.5);
-        }
-
-        // Pointer: center → 0.62r needle, 2px cream.
-        let a0 = 135.0f32.to_radians();
-        let sweep = 270.0f32.to_radians();
-        let ang = a0 + sweep * k.display_value;
-        let tip = xf.p(c + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
-        painter.line_segment([xf.p(c), tip], Stroke::new(2.0, TEXT));
         let lw = k.label_g.as_ref().map_or(0.0, |g| g.size.x);
         self.text_tracked(painter, c + Vec2::new(-lw / 2.0, r + KNOB_LABEL_GAP), &k.label_g, SUBTEXT);
 
@@ -14077,19 +17953,110 @@ impl DemoApp {
         }
     }
 
+    /// The Keys-face scale picker (issue #90): one popup per Keys unit —
+    /// the 12 keys as a chip row, the scales under them, an Off chip, and
+    /// the current choice spelled out. Picking applies at once.
+    fn scale_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.scale_menu else {
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        };
+        if self.stage_view != StageView::Rack || self.side != Side::Front {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        }
+        let Some(u) = self.units.get(menu.unit) else {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        };
+        if !matches!(u.node_kind, UnitKind::Keys) {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        }
+        let unit = menu.unit;
+        let current = self.keys_scale(unit);
+        let title = format!("Keys · scale snap");
+        // (unit, choice) picked this frame — applied after the Area closes.
+        let mut picked: Option<Option<crate::arp::ScaleChoice>> = None;
+        let area = egui::Area::new(egui::Id::new("keys_scale_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(232.0);
+                        ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
+                        let status = match current {
+                            Some(c) => c.label(),
+                            None => "out-of-scale keys play as pressed".into(),
+                        };
+                        ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
+                        ui.add_space(7.0);
+                        // The key: one chip row of 12.
+                        ui.horizontal_wrapped(|ui| {
+                            for k in 0..12u8 {
+                                let on = current.is_some_and(|c| c.key == k);
+                                if theme::chip_button(ui, crate::arp::KEY_NAMES[k as usize], on).clicked() {
+                                    let scale = current.map_or(crate::arp::Scale::Major, |c| c.scale);
+                                    picked = Some(Some(crate::arp::ScaleChoice { key: k, scale }));
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
+                        // The scale: one chip per scale, wrapped (labels are
+                        // long enough that two rows read better than one).
+                        ui.horizontal_wrapped(|ui| {
+                            for s in crate::arp::Scale::ALL {
+                                let on = current.is_some_and(|c| c.scale == s);
+                                if theme::chip_button(ui, s.label(), on).clicked() {
+                                    let key = current.map_or(0, |c| c.key);
+                                    picked = Some(Some(crate::arp::ScaleChoice { key, scale: s }));
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
+                        if theme::chip_button(ui, "Scale snap off", current.is_none()).clicked() {
+                            picked = Some(None);
+                        }
+                    });
+            });
+        self.scale_menu_rect = area.response.rect;
+        if let Some(choice) = picked {
+            self.scale_menu = None;
+            let nid = self.units[unit].node_id;
+            self.ui_node_grace.insert(nid, self.ui_time + 0.6);
+            self.set_keys_scale(unit, choice);
+        }
+    }
+
     fn draw_back(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
             if !self.visible(ui) { continue; }
             let r = self.unit_rects[ui];
             let dragging = matches!(self.drag, Drag::Unit { unit: i, .. } if i == ui);
+            let unit_selected = self.selected_unit == Some(u.node_id);
             let sr = xf.rect(r);
             let agent_t = self.agent_activity.node_alpha(u.node_id, self.ui_time);
             let pulse = self.agent_activity.node_pulse(u.node_id, self.ui_time, self.reduce_motion);
             // Same flat plate treatment as the front (§4.4).
             painter.rect_filled(sr, 2.0, CHASSIS);
             let ht = self.unit_hover.get(ui).copied().unwrap_or(0.0);
-            if dragging {
+            if dragging || unit_selected {
                 theme::inset_keyline(painter, sr, 2.0, theme::ACCENT, 2.0, 2.5);
             } else if agent_t > 0.01 {
                 let sw = 1.8 + 1.4 * pulse;
@@ -14101,7 +18068,7 @@ impl DemoApp {
                 let rule = mix(BORDER, theme::ACCENT, ht);
                 painter.rect_stroke(sr, 2.0, Stroke::new(1.0, alpha(rule, 0.3 + 0.7 * ht)), egui::StrokeKind::Inside);
             }
-            let active = u.led > 0.05 || dragging;
+            let active = u.led > 0.05 || dragging || unit_selected;
             let strip = Rect::from_min_size(r.min + Vec2::new(12.0, 12.0), Vec2::new(2.0, r.height() - 24.0));
             let strip_col = if active {
                 theme::ACCENT
@@ -14208,7 +18175,7 @@ impl DemoApp {
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
-            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 1.0) * 0.85)
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.75) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
@@ -14443,11 +18410,10 @@ impl DemoApp {
         if self.stats_timer <= 0.0 || self.stats_line.is_empty() {
             self.stats_timer = 0.25;
             let pulses: usize = self.cables.iter().map(|c| c.pulses.iter().filter(|p| p.active).count()).sum();
-            let midi_ms = crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            let sr = crate::bridge::SAMPLE_RATE.load(std::sync::atomic::Ordering::Relaxed);
-            let audio = if sr > 0 {
-                let frames = crate::bridge::BUFFER_FRAMES;
-                format!("{:.1} kHz · {frames} fr ({:.1} ms)", sr as f64 / 1000.0, frames as f64 / sr as f64 * 1000.0)
+            let c = self.engine_counters();
+            let midi_ms = c.midi_latency_us as f64 / 1000.0;
+            let audio = if c.sample_rate > 0 {
+                format!("{:.1} kHz · {} fr ({:.1} ms)", c.sample_rate as f64 / 1000.0, c.buffer_frames(), c.buffer_ms())
             } else { "no audio".into() };
             let midi = self.last_midi.as_deref().unwrap_or("no MIDI yet");
             let _ = pulses;
@@ -14589,50 +18555,397 @@ fn parse_pan(s: &str) -> Option<f64> {
 }
 
 /// Mixer channel-strip width (sources and rig buses share it).
-const STRIP_W: f32 = 116.0;
+const STRIP_W: f32 = 122.0;
+/// Width of a strip collapsed to its mini form (#77).
+const STRIP_COLLAPSED_W: f32 = 46.0;
+/// Width of a coloured strip's spine (#77), drawn down its left edge.
+const STRIP_SPINE_W: f32 = 3.0;
+/// Slot rows (source + inserts, #74/#107) keep the insert rows' pitch from
+/// before quick knobs, so a strip is never taller than it was without them.
+const SLOT_H: f32 = 20.0;
+/// Clearance of slot content from the spine (left) and the strip's edge
+/// (right; the strip gap adds to it).
+const SLOT_PAD_L: f32 = 6.0;
+const SLOT_PAD_R: f32 = 3.0;
+const SLOT_GAP: f32 = 3.0;
+/// Text inset inside a slot plate (rule 7).
+const PLATE_PAD_X: f32 = 5.0;
+const QUICK_KNOB_R: f32 = 6.0;
+const QUICK_KNOB_ARC_GAP: f32 = 2.0;
+const QUICK_KNOB_COL_W: f32 = 19.0;
 
-fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>, level: f32, fader_h: f32) -> Rect {
-    let w = STRIP_W;
-    let mut fader_rect = Rect::NOTHING;
-    ui.allocate_ui_with_layout(egui::vec2(w, fader_h + 90.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-        ui.set_width(w);
-        let name = if name.chars().count() > 11 { format!("{}…", name.chars().take(10).collect::<String>()) } else { name.to_string() };
-        ui.label(egui::RichText::new(name).size(13.0).strong().color(theme::INK));
-        let sub = sub.split('·').next().unwrap_or("").trim().to_uppercase();
-        let sub = if sub.chars().count() > 13 { format!("{}…", sub.chars().take(12).collect::<String>()) } else { sub };
-        theme::tracked_label(ui, &sub, 9.0, 0.12, theme::INK_2);
-        ui.add_space(8.0);
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
-        fader_rect = r;
-        let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
-        let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top()), egui::vec2(6.0, fader_h));
-        let p = ui.painter();
-        // Track: hairline groove; travel keeps the cap fully inside the rect.
-        let cap_h = 12.0;
-        let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
-        p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
-        if let Some(v) = value.as_mut() {
-            if resp.dragged() {
-                let dy = resp.drag_delta().y;
-                *v = (*v - dy / (y0 - y1)).clamp(0.0, 1.0);
-            }
-            if resp.double_clicked() { *v = 0.8; }
-            let y = y0 + (y1 - y0) * *v;
-            p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
-            let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
-            p.rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
-            p.line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
-        }
-        paint_meter(p, mr, level, level);
-        if value.is_some() {
-            resp.on_hover_text("drag to set · double-click: 0.80");
-        }
-        ui.add_space(6.0);
-        let txt = value.map_or("—".to_string(), |v| format!("{v:.2}"));
-        ui.label(egui::RichText::new(txt).size(11.0).monospace().color(theme::CREAM_MID));
-    });
-    fader_rect
+/// Shared knob dial painter (rack face + mixer quick knobs): disc ring, flat
+/// value arc, active inset keyline, and pointer needle.
+#[allow(clippy::too_many_arguments)]
+fn paint_knob_dial(
+    painter: &egui::Painter,
+    map: impl Fn(Vec2) -> Pos2,
+    center: Vec2,
+    radii: Vec2,
+    value: f32,
+    hovered: bool,
+    dragging: bool,
+    border_col: Color32,
+    accent: Color32,
+    arc_gap: f32,
+    dot_r: f32,
+) {
+    let sc = map(center);
+    let r = radii.x.min(radii.y);
+    let ring = Stroke::new(if r < 12.0 { 1.2 } else { 1.5 }, border_col);
+    if (radii.x - radii.y).abs() < 0.05 {
+        painter.circle_stroke(sc, radii.x, ring);
+    } else {
+        painter.add(egui::Shape::ellipse_stroke(sc, radii, ring));
+    }
+    let track_w = if r < 12.0 { 1.5 } else { 2.0 };
+    let arc_w = if r < 12.0 { 1.8 } else { 2.4 };
+    theme::value_arc_sized(painter, &map, center, r, arc_gap, dot_r, track_w, arc_w, value, accent);
+    if dragging {
+        let disc = Rect::from_center_size(sc, Vec2::splat(2.0 * r));
+        theme::inset_keyline(painter, disc, r, accent, if r < 12.0 { 1.5 } else { 2.0 }, if r < 12.0 { 1.8 } else { 2.5 });
+    }
+    let a0 = 135.0f32.to_radians();
+    let sweep = 270.0f32.to_radians();
+    let ang = a0 + sweep * value;
+    let tip = map(center + Vec2::new(ang.cos(), ang.sin()) * (r * 0.62));
+    let _ = hovered;
+    painter.line_segment([sc, tip], Stroke::new(if r < 12.0 { 1.6 } else { 2.0 }, TEXT));
 }
+
+/// Grid rects of one mixer slot row: (quick-knob box at the right edge,
+/// plate left of it), inside `SLOT_PAD_L` from the spine and `SLOT_PAD_R`
+/// from the strip's right edge.
+fn strip_slot_rects(sr: Rect) -> (Rect, Rect) {
+    let left = sr.left() + STRIP_SPINE_W + SLOT_PAD_L;
+    let right = sr.right() - SLOT_PAD_R;
+    let knob_rect = Rect::from_min_max(Pos2::new(right - QUICK_KNOB_COL_W, sr.top()), Pos2::new(right, sr.bottom()));
+    let plate_rect = Rect::from_min_max(
+        Pos2::new(left, sr.top() + 1.0),
+        Pos2::new(knob_rect.left() - SLOT_GAP, sr.bottom() - 1.0),
+    );
+    (knob_rect, plate_rect)
+}
+
+/// Lay out `text` at the first of `sizes` (0.5 px steps, rule 17) that fits
+/// `max_w`, else ellipsized at the last size.
+fn fit_galley(painter: &egui::Painter, text: &str, font: fn(f32) -> egui::FontId, sizes: &[f32], max_w: f32, color: Color32) -> Arc<Galley> {
+    let last = *sizes.last().expect("at least one size");
+    for &size in sizes {
+        let g = painter.layout_no_wrap(text.to_string(), font(size), color);
+        if g.size().x <= max_w {
+            return g;
+        }
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t = format!("{}\u{2026}", chars[..n].iter().collect::<String>());
+        let g = painter.layout_no_wrap(t, font(last), color);
+        if g.size().x <= max_w {
+            return g;
+        }
+    }
+    painter.layout_no_wrap("\u{2026}".into(), font(last), color)
+}
+
+const SLOT_NAME_SIZES: [f32; 2] = [11.0, 10.5];
+const SLOT_CAPTION_SIZES: [f32; 3] = [8.5, 8.0, 7.5];
+
+/// Paint a slot plate's name (from `name_x`) and, right-aligned beside the
+/// quick knob, its caption. They share the plate: the caption first steps
+/// down its sizes to leave the name whole; only if that fails does it keep
+/// at least 45 % and both ellipsize.
+fn paint_slot_texts(
+    painter: &egui::Painter,
+    plate: Rect,
+    name_x: f32,
+    name: &str,
+    caption: Option<&str>,
+    name_col: Color32,
+    cap_col: Color32,
+) {
+    const GAP: f32 = 4.0;
+    let right = plate.right() - PLATE_PAD_X;
+    let avail = (right - name_x).max(0.0);
+    let name_font: fn(f32) -> egui::FontId = egui::FontId::proportional;
+    let cap_g = caption.map(|c| {
+        let name_w = fit_galley(painter, name, name_font, &SLOT_NAME_SIZES, f32::INFINITY, name_col).size().x;
+        let beside_whole_name = fit_galley(painter, c, theme::medium_font, &SLOT_CAPTION_SIZES, avail - name_w - GAP, cap_col);
+        if beside_whole_name.text() == c {
+            beside_whole_name
+        } else {
+            fit_galley(painter, c, theme::medium_font, &SLOT_CAPTION_SIZES, (avail - name_w - GAP).max(avail * 0.45), cap_col)
+        }
+    });
+    let cap_w = cap_g.as_ref().map_or(0.0, |g| g.size().x + GAP);
+    let name_g = fit_galley(painter, name, name_font, &SLOT_NAME_SIZES, avail - cap_w, name_col);
+    let cy = plate.center().y;
+    painter.galley(Pos2::new(name_x, cy - name_g.size().y * 0.5), name_g, name_col);
+    if let Some(g) = cap_g {
+        painter.galley(Pos2::new(right - g.size().x, cy - g.size().y * 0.5), g, cap_col);
+    }
+}
+
+/// Knobs eligible for mixer quick-knob assignment (#107): built-in hidden
+/// knobs (AudioIn MON, setBfree drawbars) stay on their chips/faders, while
+/// plugin main/pinned knobs stay available even when `fit_plugin_knobs` hides
+/// them on a narrow rack face.
+fn is_rack_knob(k: &Knob) -> bool {
+    !k.hidden || k.source != KnobSource::BuiltIn
+}
+
+/// Resolve an explicit quick-knob choice (label, full plugin parameter name,
+/// `knob_specs` alias, or numeric parameter id) on `u`.
+fn resolve_unit_quick_knob_choice(u: &Unit, kind: Option<&NodeKind>, choice: &str) -> Option<usize> {
+    let q = choice.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let q_up = q.to_uppercase();
+    if let Some(i) = u.knobs.iter().position(|k| {
+        is_rack_knob(k) && k.source.plugin_name().is_some_and(|n| n.eq_ignore_ascii_case(q))
+    }) {
+        return Some(i);
+    }
+    if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && k.label.to_uppercase() == q_up) {
+        return Some(i);
+    }
+    if let Some(spec) = kind.and_then(|nk| crate::engine::find_knob_spec(nk, q)) {
+        if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && k.source == KnobSource::BuiltIn && k.label == spec.label) {
+            return Some(i);
+        }
+    }
+    if let Ok(pid) = q.parse::<u32>() {
+        if let Some(i) = u.knobs.iter().position(|k| {
+            is_rack_knob(k) && (k.clap.map(|c| c.id) == Some(pid) || k.param == Some(pid))
+        }) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Effective quick knob of `u` (#107): explicit user choice if that knob
+/// still exists, else the default:
+/// - plugin unit: first main control (`KnobSource::Main`), else first rack knob;
+/// - effect / other unit: `MIX` / dry-wet knob from `knob_specs` if it has one,
+///   else first rack knob;
+/// - `None` when the unit has no rack knobs.
+fn quick_knob(u: &Unit, explicit: Option<&str>, kind: Option<&NodeKind>) -> Option<usize> {
+    if let Some(choice) = explicit.and_then(|c| resolve_unit_quick_knob_choice(u, kind, c)) {
+        return Some(choice);
+    }
+    let is_plugin = matches!(u.node_kind, UnitKind::Clap)
+        || matches!(kind, Some(NodeKind::Lv2 { .. }))
+        || u.knobs.iter().any(|k| is_rack_knob(k) && matches!(k.source, KnobSource::Main(_)));
+    if is_plugin {
+        if let Some(i) = u.knobs.iter().position(|k| is_rack_knob(k) && matches!(k.source, KnobSource::Main(_))) {
+            return Some(i);
+        }
+    } else if let Some(i) = u.knobs.iter().position(|k| {
+        is_rack_knob(k) && k.source == KnobSource::BuiltIn
+            && matches!(k.label.as_str(), "MIX" | "DRY/WET" | "WET")
+    }) {
+        return Some(i);
+    }
+    u.knobs.iter().position(is_rack_knob)
+}
+
+/// ---- dB faders (#72) ----------------------------------------------------
+
+/// Fader position of a gain: the SAME dB curve the meters use (`meter_db_pos`,
+/// −60 dBFS … 0 dBFS), so a fader's travel matches its meter and the readout
+/// is what the ear hears. 0 gain = fully down.
+fn fader_pos(gain: f32) -> f32 {
+    meter_db_pos(gain)
+}
+
+/// The gain a fader position means (inverse of [`fader_pos`]). The bottom of
+/// the travel (pos ≤ 0) is silence — a fader pulled all the way down mutes.
+fn fader_gain(pos: f32) -> f32 {
+    let pos = pos.clamp(0.0, 1.0);
+    // The bottom of the travel is a detent too: −∞, not −58 dB.
+    if pos <= FADER_FLOOR_POS { return 0.0; }
+    10f32.powf((60.0 * pos - 60.0) / 20.0)
+}
+
+/// Unity (0 dB) sits at the top of the travel; dragging within this distance
+/// of it snaps to exactly 1.0 (the detent).
+const UNITY_DETENT_POS: f32 = 0.985;
+/// Below this travel position the fader is fully closed (−∞).
+const FADER_FLOOR_POS: f32 = 0.02;
+
+/// A fader's readout: `−3.2 dB`, `0 dB` at unity, `−∞` when silent (#72).
+fn db_readout(gain: f32) -> String {
+    if gain < 1e-4 { "\u{2212}\u{221e}".into() }
+    else if (gain - 1.0).abs() < 0.0005 { "0 dB".into() }
+    else { format!("\u{2212}{:.1} dB", -(20.0 * gain.log10())) }
+}
+
+/// ---- strip meters: peak hold + clip (#72) -------------------------------
+
+/// One strip meter's peak hold and clip state.
+#[derive(Clone, Copy, Debug)]
+struct PeakHold {
+    /// Held level as a dB meter position (0..1).
+    held: f32,
+    /// `ui_time` when the peak was last touched.
+    at: f32,
+    /// Lit while a block reached 0 dBFS; cleared by a click.
+    clip: bool,
+}
+
+impl PeakHold {
+    fn new() -> Self {
+        Self { held: 0.0, at: -1.0, clip: false }
+    }
+}
+
+/// How long a peak stays held before it falls back with the signal (~1.5 s).
+const PEAK_HOLD_SECS: f32 = 1.5;
+
+/// Update one strip's peak hold + clip from its current level (0..1 linear).
+fn peak_hold_update(ph: &mut PeakHold, level: f32, now: f32, dt: f32) {
+    let pos = meter_db_pos(level);
+    if pos >= ph.held {
+        ph.held = pos;
+        ph.at = now;
+    } else if now - ph.at > PEAK_HOLD_SECS {
+        // Held long enough: relax toward the live level (fast enough to read
+        // as falling, slow enough to see where the peak was).
+        ph.held = (ph.held - dt * 0.5).max(pos).max(0.0);
+    }
+    if level >= 0.999 {
+        ph.clip = true;
+    }
+}
+
+/// Meter-table keys: sources are keyed by their node id; rig buses and the
+/// master out get their own key space at the top of the u32 range (merge-safe:
+/// node ids come from a graph's small counters).
+fn rig_strip_key(rig: usize) -> u32 {
+    u32::MAX - rig.min(7) as u32
+}
+const MASTER_STRIP_KEY: u32 = u32::MAX - 8;
+
+/// ---- per-node strip mirror (#73/#77) ------------------------------------
+
+/// One strip's UI state, keyed by node id. The engine-side part (pan/mute/
+/// solo/bypass) mirrors `Command::SetStripMix` / `SetStripBypass` and the
+/// engine's publication (rule 33); colour and collapse are UI-local session
+/// state (#77).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StripUiRow {
+    node: u32,
+    pan: f32,
+    mute: bool,
+    solo: bool,
+    bypass: bool,
+    color: Option<egui::Color32>,
+    collapsed: bool,
+}
+
+impl StripUiRow {
+    fn new(node: u32) -> Self {
+        Self { node, pan: 0.0, mute: false, solo: false, bypass: false, color: None, collapsed: false }
+    }
+    /// True while nothing differs from a node nobody ever touched.
+    fn is_plain(&self) -> bool {
+        *self == Self::new(self.node)
+    }
+    /// The engine half of the row (pan/mute/solo) as a session entry.
+    fn saved(&self) -> crate::session::StripSaved {
+        crate::session::StripSaved {
+            node: self.node,
+            pan: self.pan,
+            mute: self.mute,
+            solo: self.solo,
+            bypass: self.bypass,
+            color: self.color.map(|c| ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32),
+            collapsed: self.collapsed,
+        }
+    }
+    fn from_saved(s: &crate::session::StripSaved) -> Self {
+        let color = s.color.map(|rgb| {
+            egui::Color32::from_rgb(((rgb >> 16) & 0xFF) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)
+        });
+        Self { node: s.node, pan: s.pan, mute: s.mute, solo: s.solo, bypass: s.bypass, color, collapsed: s.collapsed }
+    }
+}
+
+/// One insert-slot edit (#74/#77), as the mixer strip and the agent tools
+/// express it: add an FX to the chain's end, remove one, or move one to a
+/// new slot (1-based; 0 = the source itself).
+#[derive(Clone, Debug)]
+enum StripInsertEdit {
+    Add { kind: NodeKind, name: String },
+    Remove { fx: u32 },
+    Move { fx: u32, to: usize },
+}
+
+/// An insert edit queued during a mixer frame, applied after its layout — a
+/// mid-frame rack rebuild would seed NaN cable springs (rule 32).
+/// `source = None` means the master out's chain.
+#[derive(Clone)]
+struct PendingInsertEdit {
+    source: Option<u32>,
+    edit: StripInsertEdit,
+}
+
+/// Truncate a label to `n` characters with an ellipsis.
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() > n { format!("{}\u{2026}", s.chars().take(n.saturating_sub(1)).collect::<String>()) } else { s.to_string() }
+}
+
+/// The strip's collapse chip (#77): `chip_button`'s fill and hairline at
+/// 18 px so it fits the 20 px name row; the chevron is drawn, not a glyph.
+fn strip_collapse_chip(ui: &mut egui::Ui, rect: Rect, id: egui::Id) -> egui::Response {
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    let hot = resp.hovered();
+    let fill = if hot { mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07) } else { theme::DARK_PANEL_HI };
+    let p = ui.painter();
+    p.rect(rect, 2.0, fill, Stroke::new(1.0, if hot { theme::MUTED } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+    let c = rect.center();
+    let st = Stroke::new(1.5, theme::CREAM);
+    p.line_segment([c + Vec2::new(-3.5, -1.5), c + Vec2::new(0.0, 2.0)], st);
+    p.line_segment([c + Vec2::new(0.0, 2.0), c + Vec2::new(3.5, -1.5)], st);
+    resp
+}
+
+/// One small M/S button pair member (#73). `row` is the strip's current
+/// state (the caller toggles and publishes on click).
+fn strip_ms_button(ui: &mut egui::Ui, row: &mut StripUiRow, which: char) -> egui::Response {
+    let on = match which {
+        'M' => row.mute,
+        _ => row.solo,
+    };
+    let (fill, txt) = if on {
+        (if which == 'M' { theme::CHIP_ON } else { theme::LIVE_TEAL }, theme::DARK_PANEL)
+    } else {
+        (theme::DARK_PANEL_HI, theme::CREAM_MID)
+    };
+    ui.add(egui::Button::new(egui::RichText::new(which.to_string()).size(11.0).color(txt))
+        .fill(fill)
+        .corner_radius(2.0)
+        .min_size(egui::vec2(20.0, 18.0)))
+}
+
+/// Meter-table key of an app-stream strip (they share the strip peak table;
+/// the patch's node ids live far below the top of the u32 range).
+fn app_stream_key(slot: usize) -> u32 {
+    u32::MAX - 40 - slot.min(24) as u32
+}
+
+/// The strip colour palette (#77): warm/neutral jacket hues (rule 3 — tomato
+/// stays reserved for selection/CTAs) plus the live teal.
+const STRIP_PALETTE: [egui::Color32; 6] = [
+    theme::LIVE_TEAL,
+    theme::CABLE_AMBER,
+    theme::CABLE_ROSE,
+    theme::CABLE_SAND,
+    theme::CABLE_VIOLET,
+    theme::CABLE_CYAN,
+];
 
 /// Lit segments of an n-segment meter. Below the -60 dBFS floor (0.001)
 /// nothing lights: the smoothed meter decays toward zero without reaching
@@ -14682,6 +18995,7 @@ impl DemoApp {
         }
         self.load_fade < 1.0
             || self.tap_flash_t > 0.0
+            || self.mixer_flash.is_some_and(|(_, exp)| self.ui_time < exp)
             || !self.fading_units.is_empty()
             || !self.fading_cables.is_empty()
             || self.units.iter().any(|u| u.knobs.iter().any(|k| k.glide_t < 1.0))
@@ -14695,21 +19009,18 @@ impl DemoApp {
         self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
 
-        // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
-        // output, and eframe re-applies it AFTER the app creator runs — so the
-        // correction must live here, on the frame path, not in the creator.
-        // The target is the COMPOSITOR's monitor scale (ui_scale_target):
-        // winit-under-XWayland derives 2.33 from the panel's physical DPI on
-        // a 1.6x Hyprland output, which inflated every element by ~46% and
-        // squished the rack (user report 2026-11-15).
-        let target = ui_scale_target();
-        if (ctx.pixels_per_point() - target).abs() > 0.01 {
-            ctx.set_pixels_per_point(target);
-            eprintln!("ui scale: corrected to {target:.2} on frame path");
+        // eframe applies the window's scale after the app creator runs, so an
+        // override lives here, on the frame path.
+        let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+        if let Some(target) = ui_scale_override(native) {
+            if (ctx.pixels_per_point() - target).abs() > 0.01 {
+                ctx.set_pixels_per_point(target);
+                eprintln!("ui scale: set to {target:.2} on frame path");
+            }
         }
         static SCALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SCALE_LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!("ui scale: first-frame ppp={:.2}", ctx.pixels_per_point());
+            eprintln!("ui scale: first-frame ppp={:.2} native={native:?}", ctx.pixels_per_point());
         }
 
         if self.flip_requested {
@@ -14742,13 +19053,14 @@ impl DemoApp {
             }
         }
 
-        self.take_chat_images(&ctx);
+        self.take_dropped_files(&ctx);
 
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
         self.rig_inputs_panel(ui);
         self.rig_overview_panel(ui);
         self.dock_panel_ui(ui);
+        self.navigator_panel_ui(ui);
 
         // Native rig editor (task-26): handle open/close requests from unit
         // double-clicks. No X11 — the editor is a plain egui window drawn below.
@@ -14781,9 +19093,10 @@ impl DemoApp {
         }
         self.poll_assistant();
         self.serve_ui_inbox();
-        self.serve_rack_shots();
-        self.rack_shot.request(&ctx);
         self.sync_from_engine();
+        for main in &mut self._surge_main {
+            main.pump();
+        }
         self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
@@ -14848,7 +19161,16 @@ impl DemoApp {
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
         self.sync_main_knobs();
+        self.sync_aeolus_faces();
         self.layout(rect);
+        if let Some(node) = self.nav_pan_target.take() {
+            let old_pan = self.rack_pan;
+            self.pan_rack_to_unit(node);
+            self.xf.center += self.rack_pan - old_pan;
+        }
+        if self.mixer_flash.is_some_and(|(_, exp)| self.ui_time >= exp) {
+            self.mixer_flash = None;
+        }
         self.fit_plugin_knobs();
         if !typing(&ctx) {
             self.handle_input(&ctx, rect);
@@ -14868,6 +19190,8 @@ impl DemoApp {
             StageView::Settings => self.settings_stage(ui),
         }
         self.knob_menu_ui(&ctx);
+        self.scale_menu_ui(&ctx);
+        self.engine_info_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
         self.save_rig_modal(&ctx);
@@ -14878,6 +19202,9 @@ impl DemoApp {
         // animation / agent run is active; ~30 fps when unfocused and idle.
         if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
+        } else if self._surge_main.iter().any(|m| m.editor_open()) {
+            // Plugin editors paint from timers this frame loop runs.
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -14909,6 +19236,9 @@ impl eframe::App for DemoApp {
     }
 
     fn on_exit(&mut self) {
+        if self.autosave.enabled {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Native editor holds no plugin GUI; just drop its cached state.
         self.editor_open = false;
         self.editor_params.clear();
@@ -14977,6 +19307,37 @@ pub fn run_session_test() -> anyhow::Result<()> {
     anyhow::ensure!(app.cables.iter().any(|c| c.src == k && c.src_port == 1 && app.units[c.dst].node_id == 4),
         "HIGH cable (Keys port 1 → Surge B) not restored");
     println!("  keys split: point C4 + HIGH cable round-trip, two MIDI outs — OK");
+
+    // --- Mixer strips (#72–77): names, colours, mute/solo/pan, collapse and
+    // order round-trip through the package (rule 65). Non-default values. ---
+    {
+        app.apply_session(&crate::session::Session::load(&pkg)?)?;
+        let node = app.units[1].node_id; // Surge A
+        let amber = crate::session::StripSaved {
+            node, pan: -0.35, mute: true, solo: false, bypass: false,
+            color: Some(0xE2A64E), collapsed: true,
+        };
+        app.apply_strip_name(node, "Bass wurli").map_err(anyhow::Error::msg)?;
+        app.with_strip_row(node, |r| {
+            r.pan = amber.pan;
+            r.mute = amber.mute;
+            r.color = Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E));
+            r.collapsed = true;
+        });
+        app.strip_knobs.insert(node, "LEVEL".into());
+        let saved = app.capture_session("strips")?;
+        saved.save(&crate::session::Session::package_path(&dir, "selftest-strips")?)?;
+        app.load_demo_patch();
+        let loaded = crate::session::Session::load(&crate::session::Session::package_path(&dir, "selftest-strips")?)?;
+        app.apply_session(&loaded)?;
+        anyhow::ensure!(app.units.iter().any(|u| u.name == "Bass wurli"), "strip name not restored");
+        let row = app.strip_row(node);
+        anyhow::ensure!(row.mute && (row.pan + 0.35).abs() < 1e-6, "strip pan/mute not restored: {row:?}");
+        anyhow::ensure!(row.color == Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E)), "strip colour not restored");
+        anyhow::ensure!(row.collapsed, "strip collapse not restored");
+        anyhow::ensure!(app.strip_knobs.get(&node).map(String::as_str) == Some("LEVEL"), "strip quick knob not restored");
+        println!("  mixer strips: name, colour, mute/pan, collapse, quick knob round-trip — OK");
+    }
 
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
@@ -15092,8 +19453,6 @@ const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
 struct EvalTask {
     name: &'static str,
     start: EvalStart,
-    /// An image the user attaches to the request (a path in the repository).
-    image: Option<&'static str>,
     prompt: &'static str,
     /// Err says what is off. Gets the engine (what reached a plugin) and
     /// the agent's final reply for questions.
@@ -15184,25 +19543,25 @@ fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
 
 const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
-        name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
+        name: "tempo", start: EvalStart::Demo, prompt: "Set the tempo to 100 BPM.",
         check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
-        name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
+        name: "ask_tempo", start: EvalStart::Demo, prompt: "What tempo are we at?",
         check: |app, _, reply| {
             eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
             eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
         },
     },
     EvalTask {
-        name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
+        name: "split_c4", start: EvalStart::Demo, prompt: "Split the keyboard at C4.",
         check: |app, _, _| {
             let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
             eval_ensure(split == Some(60), || format!("split point is {split:?}"))
         },
     },
     EvalTask {
-        name: "split_zones", start: EvalStart::Demo, image: None,
+        name: "split_zones", start: EvalStart::Demo,
         prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
         check: |app, _, _| {
             let g = eval_graph(app);
@@ -15217,14 +19576,14 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
+        name: "warm_pad", start: EvalStart::OneRig, prompt: "Load a warm pad.",
         check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
         },
     },
     EvalTask {
-        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, prompt: "Load a bass sound on the YANES rig.",
         check: |app, _, _| {
             let preset = eval_preset_param(app, 1)?;
             eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
@@ -15232,7 +19591,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, prompt: "Give the organ rig a jazz drawbar preset.",
         check: |app, engine, _| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15242,7 +19601,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, prompt: "Load a warm pad on the organ rig.",
         check: |app, engine, reply| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15252,7 +19611,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
+        name: "add_reverb", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and wire it in.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
@@ -15260,11 +19619,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
+        name: "delay_after_synth", start: EvalStart::OneRig, prompt: "Put a delay after the synth.",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
     },
     EvalTask {
-        name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
+        name: "remove_delay", start: EvalStart::TwoRigs, prompt: "Remove the delay from rig 1.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
@@ -15276,7 +19635,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
+        name: "metronome", start: EvalStart::OneRig, prompt: "Add a metronome and start it.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -15286,25 +19645,25 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
+        name: "add_rig", start: EvalStart::Demo, prompt: "Add a new rig.",
         check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
     },
     EvalTask {
-        name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
+        name: "rig2_volume", start: EvalStart::TwoRigs, prompt: "Set rig 2 volume to 50 %.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
+        name: "mute_rig1", start: EvalStart::TwoRigs, prompt: "Mute rig 1.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
     },
     EvalTask {
-        name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
+        name: "delete_rig2", start: EvalStart::TwoRigs, prompt: "Delete rig 2.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
             let asked = app.pending_confirm.as_ref()
@@ -15313,7 +19672,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        name: "bass_rig", start: EvalStart::OneRig, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
             let patch = eval_patch(app, 1)?;
@@ -15323,21 +19682,21 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
+        name: "rig2_quieter", start: EvalStart::TwoRigs, prompt: "Make rig 2 a bit quieter.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
+        name: "rig1_pan_left", start: EvalStart::TwoRigs, prompt: "Pan rig 1 to the left.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
             eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
+        name: "rig2_reverb", start: EvalStart::TwoRigs, prompt: "Insert a reverb into rig 2.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
@@ -15345,11 +19704,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
+        name: "reverb_this_rig", start: EvalStart::OneRig, prompt: "Add a reverb to this rig",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
     },
     EvalTask {
-        name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
+        name: "rig2_bass", start: EvalStart::TwoRigs, prompt: "Load a bass sound into rig 2.",
         check: |app, _, _| {
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
@@ -15357,7 +19716,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
+        name: "start_metronome", start: EvalStart::OneRigMetronome, prompt: "Start the metronome.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -15365,57 +19724,73 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
+        name: "record", start: EvalStart::OneRig, prompt: "Start recording.",
         check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
-        name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
+        name: "arp_updown", start: EvalStart::OneRig,
+        prompt: "Make the keys arpeggiate: an up-down arpeggio in eighth notes over two octaves.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let keys = eval_node(&g, 0, "keys", |k| matches!(k, NodeKind::Keys))?;
+            let arp = eval_node(&g, 0, "arp", |k| matches!(k, NodeKind::Arp))?;
+            let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, arp), || "the keys do not feed the arp".into())?;
+            eval_ensure(eval_midi_cable(&g, arp, 0, synth), || "the arp does not feed the synth".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 0, synth), || format!("the keys still play the synth directly, past the arp (midi cables {:?})", g.edges.iter().filter(|e| e.kind == CPortKind::Midi).map(|e| (e.id, e.from.node, e.to.node)).collect::<Vec<_>>()))?;
+            let u = app.units.iter().find(|u| u.node_id == arp).ok_or("no arp unit")?;
+            let at = |l: &str| u.knob_index(l).map(|i| u.knobs[i].step_index()).ok_or(format!("no {l} knob"));
+            eval_ensure(at("MODE")? == 2, || format!("MODE is step {}, up-down is 2", at("MODE").unwrap_or(9)))?;
+            eval_ensure(at("RATE")? == 1, || format!("RATE is step {}, 1/8 is 1", at("RATE").unwrap_or(9)))?;
+            eval_ensure(at("OCT")? == 1, || format!("OCT is step {}, 2 octaves is 1", at("OCT").unwrap_or(9)))
+        },
+    },
+    EvalTask {
+        name: "scale_keys", start: EvalStart::OneRig,
+        prompt: "Make the keyboard play only the A minor pentatonic scale, so I cannot hit a wrong note.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let keys = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).ok_or("no keys node")?;
+            let want = crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 };
+            eval_ensure(keys.scale == Some(want), || format!("the keys snap to {:?}, not A min penta", keys.scale.map(|c| c.label())))
+        },
+    },
+    EvalTask {
+        name: "listen_bright", start: EvalStart::OneRig, prompt: "Listen to the synth. Does it sound bright or dull?",
+        check: |_, _, reply| {
+            let reply = reply.to_lowercase();
+            eval_ensure(reply.contains("bright") && !reply.contains("silent") && !reply.contains("no listening model"), || format!("the reply does not say what it heard: {reply}"))
+        },
+    },
+    EvalTask {
+        name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
         check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
     },
     EvalTask {
-        name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
-        prompt: "Do what the note says.",
-        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
-    },
-    EvalTask {
-        name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
-        prompt: "Do what the note says.",
+        name: "guitar_rig", start: EvalStart::OneRig, prompt: "Build me a guitar rig.",
         check: |app, _, _| {
-            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
-            eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
-        },
-    },
-    EvalTask {
-        name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
-        prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
-            eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
-        },
-    },
-    EvalTask {
-        name: "look_at_rack", start: EvalStart::Demo, image: None,
-        prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
-        },
+            // The Guitar rig template's shape (issue #92): a live input through
+            // stomps into the amp and cabinet, all the way to the master.
+            let g = eval_graph(app);
+            let ain = eval_node(&g, 0, "audio in", |k| matches!(k, NodeKind::AudioIn { .. }))?;
+            let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut))?;
+            eval_ensure(eval_audio_path(&g, ain, master), || "the Audio In does not reach the master".into())?;
+            let amp = eval_node(&g, 0, "amp", |k| matches!(k, NodeKind::Lv2 { uri } if crate::guitar::is_amp_uri(uri.as_str())))?;
+            let cab = eval_node(&g, 0, "cabinet", |k| matches!(k, NodeKind::Lv2 { uri } if uri.as_str() == crate::guitar::CABINET))?;
+            eval_ensure(eval_audio_path(&g, ain, amp) && eval_audio_path(&g, amp, cab) && eval_audio_path(&g, cab, master),
+                || "the amp and cabinet are not chained between the input and the master".into())?;
+            for (kind, what) in [(DspKind::Delay, "delay"), (DspKind::Reverb, "reverb")] {
+                let fx = eval_one_dsp(&g, 0, &kind)?;
+                eval_ensure(eval_audio_path(&g, ain, fx) && eval_audio_path(&g, fx, master),
+                    || format!("the {what} is not in the input's chain"))?;
+            }
+            Ok(())
+        }
     },
 ];
-
-/// The frame the eval rig hands look_at_rack: the rig has no window, so a
-/// stored screenshot of the app (mixer view) stands in for its pixels.
-const EVAL_WINDOW_SHOT: &str = "docs/shots/mixer.png";
-
-fn eval_image(path: &str) -> anyhow::Result<Image> {
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-    let bytes = std::fs::read(&file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-    Image::from_file(path.rsplit('/').next().unwrap_or(path), &bytes).map_err(anyhow::Error::msg)
-}
-
 
 /// A headless app on an offline engine: no window, no audio device, no
 /// hardware scan. Frames run the app's real frame path; each frame renders
@@ -15427,8 +19802,6 @@ struct EvalRig {
     ctx: egui::Context,
     buf: Vec<f32>,
     started: std::time::Instant,
-    /// What a screenshot request gets (`EVAL_WINDOW_SHOT`).
-    window_shot: Arc<egui::ColorImage>,
 }
 
 type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
@@ -15452,14 +19825,24 @@ impl EvalRig {
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
         engine.set_recorder(tap);
         app.recorder = Some(recorder);
+        let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+        engine.set_listen_tap(listen_tap);
+        crate::listen::install(listen_capture);
         app.graph_pub = Some(graph_pub);
-        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        let bus = Arc::new(Mutex::new(bus));
+        let notes = bus.clone();
+        app.note_sink = Some(Box::new(move |ev: NoteEvent| {
+            let cmd = if ev.velocity > 0.0 {
+                Command::NoteOn { note: ev.note, velocity: ev.velocity, source: ev.source }
+            } else {
+                Command::NoteOff { note: ev.note, source: ev.source }
+            };
+            let _ = notes.lock().unwrap().send(cmd);
+        }));
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, bus);
         (app.plugins_clap, app.plugins_lv2) = plugins.clone();
         app.plugins_loaded = true;
-        let shot = eval_image(EVAL_WINDOW_SHOT)?;
-        let (size, rgba) = crate::vision::decode_png(&shot.bytes).map_err(anyhow::Error::msg)?;
-        let window_shot = Arc::new(egui::ColorImage::from_rgba_unmultiplied(size, &rgba));
-        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now(), window_shot })
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
     }
 
     fn frame(&mut self) {
@@ -15469,11 +19852,6 @@ impl EvalRig {
         let app = &mut self.app;
         let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear(); // rule 11
-        for command in out.viewport_output.values().flat_map(|v| &v.commands) {
-            if let egui::ViewportCommand::Screenshot(wanted) = command {
-                wanted.clone().complete(self.window_shot.clone());
-            }
-        }
         self.engine.render(&mut self.buf, 2);
     }
 
@@ -15554,7 +19932,6 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
     anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
     rig.load(task.start)?;
-    rig.app.chat_image = task.image.map(eval_image).transpose()?;
     rig.app.submit_chat(task.prompt.to_string());
     let sent = std::time::Instant::now();
     while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
@@ -15615,8 +19992,6 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
     let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
     anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
         EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
-    // The frame path asks the compositor for its scale otherwise.
-    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
     let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
 
     let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
@@ -15757,10 +20132,13 @@ struct BuiltAudio {
     level: Arc<std::sync::atomic::AtomicU32>,
     sample_rate: f64,
     player_ctrl: crate::player::PlayerControl,
+    /// Retired player buffers to free on this (UI) thread.
+    player_retire_rx: rtrb::Consumer<Arc<[f32]>>,
     recorder: std::sync::Arc<crate::record::RecorderShared>,
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
     edge_levels: Arc<EdgeLevels>,
+    node_times: Arc<crate::engine_info::NodeTimes>,
     audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
     audio_in_levels: Arc<AudioInLevels>,
 }
@@ -15802,6 +20180,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     );
     let level = engine.level_handle();
     let edge_levels = engine.edge_levels_handle();
+    let node_times = engine.node_times_handle();
     // Multi-rig snapshot: engine publishes rig list/active on LoadRigs; the
     // bridge + UI read it (the audio render path never locks it).
     let rig_snapshot = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
@@ -15821,14 +20200,23 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
             Err(e) => eprintln!("system audio: capture unavailable: {e}"),
         }
     }
-    // File player (backing track): decode thread + ring; UI holds the control.
-    let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
-    engine.set_player_sink(player_sink);
+    // File player (backing track): the decode thread parses WAVs off the
+    // UI and audio threads and hands each decoded buffer to the engine
+    // through this ring. The engine owns the clock (loop/sync/beats,
+    // issue #84) and returns retired buffers here; the UI frame drops them
+    // so nothing big is ever freed on the audio thread.
+    let (player_tx, player_rx) = rtrb::RingBuffer::<crate::player::PlayerData>::new(4);
+    let (player_back_tx, player_retire_rx) = rtrb::RingBuffer::<Arc<[f32]>>::new(4);
+    engine.set_player_channels(player_rx, player_back_tx);
+    let player_ctrl = crate::player::start(player_tx);
     // Master recorder: writer thread + ring; engine holds the tap, the UI (and
     // the bridge via LIVE_RECORDER) hold the shared status.
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<VoiceMsg>::new(VOICE_RING);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<VoiceBack>::new(VOICE_RING);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
@@ -15884,45 +20272,32 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         level,
         sample_rate,
         player_ctrl,
+        player_retire_rx,
         recorder,
         rig_snapshot,
         graph_pub,
         edge_levels,
+        node_times,
         audio_in_tx,
         audio_in_levels,
     })
 }
 
-/// UI scale (egui pixels_per_point): KABELSALAT_UI_SCALE overrides; else the
-/// focused Hyprland monitor's scale (what every native app on this output
-/// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
-/// Computed once — the hyprctl query never runs on the frame path again.
 /// Width a recessed text field's frame adds around its text: 8px inner
 /// margin and a 1px stroke on each side.
 const RECESSED_INPUT_CHROME: f32 = 18.0;
 
-fn ui_scale_target() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let valid = |s: f32| (1.0..=3.0).contains(&s);
-        if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
-            return s;
-        }
-        if cfg!(test) { return 1.6; }
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let out = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
-            if let Ok(out) = out {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    let mons = v.as_array().cloned().unwrap_or_default();
-                    let pick = mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first());
-                    if let Some(s) = pick.and_then(|m| m["scale"].as_f64()).map(|s| s as f32).filter(|s| valid(*s)) {
-                        return s;
-                    }
-                }
-            }
-        }
-        1.6
-    })
+/// UI scale (egui pixels_per_point) when the compositor's is not used:
+/// KABELSALAT_UI_SCALE, or 1.6 (the design target, 1600x1000 points on a
+/// 2560x1600 panel) without a window (tests, headless renders). A window
+/// keeps the scale the compositor gives it (fractional on Wayland).
+fn ui_scale_override(native: Option<f32>) -> Option<f32> {
+    let valid = |s: f32| (1.0..=3.0).contains(&s);
+    std::env::var("KABELSALAT_UI_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|s| valid(*s))
+        .or((cfg!(test) || native.is_none()).then_some(1.6))
 }
 
 impl DemoApp {
@@ -15947,7 +20322,7 @@ impl DemoApp {
     }
 
     /// Stage `--demo-agent` offline for visual screenshots: finished run,
-    /// live running run with animated phase, attached image chip, Confirm /
+    /// live running run with animated phase, Confirm /
     /// Cancel prompt, and optional mid-flight rack animations.
     fn stage_demo_agent(&mut self, animate_rack: bool) {
         self.assistant.key_set = true;
@@ -16002,26 +20377,7 @@ impl DemoApp {
         self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
             step: 2,
             model: "deepseek-chat".into(),
-            seeing: false,
         });
-        let mut sketch = vec![28u8; 24 * 16 * 4];
-        for y in 0..16usize {
-            for x in 0..24usize {
-                let i = (y * 24 + x) * 4;
-                sketch[i + 3] = 255;
-                if (y == 4 && (3..=19).contains(&x)) || (y == 11 && (3..=12).contains(&x)) {
-                    sketch[i] = theme::CREAM.r();
-                    sketch[i + 1] = theme::CREAM.g();
-                    sketch[i + 2] = theme::CREAM.b();
-                } else if (6..=9).contains(&y) && (15..=20).contains(&x) {
-                    sketch[i] = theme::ACCENT.r();
-                    sketch[i + 1] = theme::ACCENT.g();
-                    sketch[i + 2] = theme::ACCENT.b();
-                }
-            }
-        }
-        self.chat_image = Image::from_rgba("rack-sketch.png", [24, 16], &sketch).ok();
-        self.chat_thumb = None;
         self.pending_confirm = Some(PendingConfirm {
             tool: "delete_rig".into(),
             args: serde_json::json!({"rig": 1}),
@@ -16034,35 +20390,6 @@ impl DemoApp {
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
-    // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
-    // must reparent into our window; (2) winit has no fractional-scale support,
-    // so native Wayland on a 1.6x Hyprland output renders a logical-resolution
-    // buffer that the compositor upscales (blurry). With Omarchy's
-    // xwayland force_zero_scaling, X11 renders 1:1 at native pixels — sharp —
-    // and egui's pixels_per_point handles element sizing.
-    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-    }
-    // winit >= 0.29 REMOVED WINIT_UNIX_BACKEND: it picks Wayland whenever
-    // WAYLAND_DISPLAY is set, else X11 via DISPLAY. To actually force X11
-    // (required for editor embedding), hide the Wayland socket — but only
-    // when an X display is available, so we never strand the app backend-less.
-    let have_x = std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-        || std::fs::read_dir("/tmp/.X11-unix").map(|mut d| d.next().is_some()).unwrap_or(false);
-    if have_x && std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        std::env::remove_var("WAYLAND_DISPLAY");
-        eprintln!("ui: forcing X11 backend (WAYLAND_DISPLAY hidden; embedding needs XWayland)");
-    }
-    // Text input without an input-method server (#30): with XMODIFIERS
-    // =@im=fcitx every typed character goes through fcitx5's XIM bridge, which
-    // under XWayland stopped delivering text after a while — every text field
-    // went dead while shortcuts (plain key events) kept working. The rack
-    // needs no IME (umlauts come straight from the XKB layout), so use X's
-    // local input method. KABELSALAT_IME=1 keeps the system IME.
-    if std::env::var_os("KABELSALAT_IME").is_none() && std::env::var_os("XMODIFIERS").is_some() {
-        std::env::remove_var("XMODIFIERS");
-        eprintln!("ui: text input via the local X input method (XMODIFIERS cleared; KABELSALAT_IME=1 keeps fcitx/ibus)");
-    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
@@ -16083,15 +20410,6 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
         "kabelsalat",
         options,
         Box::new(move |cc| {
-            // Trust eframe's detected scale (1.6 on the fractional-HiDPI eDP-1).
-            // Only fall back to the native 1.6 if detection reports ~1.0 —
-            // forcing a higher value makes elements oversized.
-            let ppp = cc.egui_ctx.pixels_per_point();
-            cc.egui_ctx.set_pixels_per_point(ui_scale_target());
-            eprintln!(
-                "ui scale: detected={ppp:.2} used={:.2}",
-                cc.egui_ctx.pixels_per_point()
-            );
             cc.egui_ctx.set_visuals(theme::visuals());
             theme::install_spacing(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);
@@ -16112,10 +20430,12 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             sample_rate,
                             player_ctrl,
+                            player_retire_rx,
                             recorder,
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            node_times,
                             audio_in_tx,
                             audio_in_levels,
                         } = ba;
@@ -16159,10 +20479,12 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             shared_graph,
                             player_ctrl,
+                            player_retire_rx,
                             recorder,
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            node_times,
                             audio_in_tx,
                             audio_in_levels,
                         ));
@@ -16187,18 +20509,22 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     level,
                     shared_graph,
                     player_ctrl,
+                    player_retire_rx,
                     recorder,
                     rig_snapshot,
                     graph_pub,
                     edge_levels,
+                    node_times,
                     audio_in_tx,
                     audio_in_levels,
                 )) => {
                     app.shared_graph = shared_graph;
                     app.edge_levels = Some(edge_levels);
+                    app.node_times = Some(node_times);
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
+                    app.player_retire_rx = Some(player_retire_rx);
                     app.recorder = Some(recorder);
                     app.audio_in_tx = Some(audio_in_tx);
                     app.audio_in_levels = Some(audio_in_levels);
@@ -16939,19 +21265,19 @@ mod rig_switch_tests {
             "the stage ends where the assistant begins: stage {:?} panel {:?}", app.stage_rect, app.assistant_rect);
     }
 
-    /// One rig with 6 instrument stacks of 4 units (Surge → 3 FX) — the
-    /// kind of patch an agent builds; it must not squish.
+    /// One rig with 8 instrument stacks of 7 units (Surge → 6 FX): more than
+    /// a 1600x1000 window holds even at the face floors; it must not squish.
     fn big_patch_app() -> (DemoApp, egui::Context) {
         let mut g = Graph::default();
         g.reserve(64, 64);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut eid = 1;
-        for _ in 0..6 {
+        for _ in 0..8 {
             let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
             g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi); eid += 1;
             let mut prev = synth;
-            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
+            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb, DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
                 let fx = g.add_node(NodeKind::Dsp(k), name_bytes("FX"));
                 g.connect_with_id(eid, PortRef { node: prev, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio); eid += 1;
                 prev = fx;
@@ -16968,11 +21294,12 @@ mod rig_switch_tests {
     #[test]
     fn big_patch_keeps_readable_units_and_pans() {
         let (mut app, ctx) = big_patch_app();
-        assert_eq!(app.stack_cols.len(), 6);
-        assert_eq!(app.layout_rows, 4);
-        assert!(app.unit_h >= 140.0, "unit height floor, not squished: {}", app.unit_h);
+        assert_eq!(app.stack_cols.len(), 8);
+        assert_eq!(app.layout_rows, 7);
+        assert!(app.unit_h >= MIN_UNIT_H, "unit height floor, not squished: {}", app.unit_h);
         let mid_w = app.unit_rects[app.stack_cols[0][0]].width();
-        assert!(mid_w >= 200.0, "column width floor: {mid_w}");
+        let floor = app.stack_cols.iter().flatten().map(|&u| app.face_min_w(u)).fold(0.0, f32::max);
+        assert!(mid_w >= floor, "column width floor: {mid_w} < {floor}");
         let ov = app.rack_overflow;
         assert!(ov.x > 0.0 && ov.y > 0.0, "the rack overflows the stage instead: {ov:?}");
         assert!(app.rack_clip.is_some());
@@ -17067,7 +21394,7 @@ mod rig_switch_tests {
 
         // The agent adds a unit: the engine publishes, the app adopts it.
         assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::AddNode {
-            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0 }));
+            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0, wire: false }));
         pump(&mut app, &mut drain, 4);
         assert!(app.base_graph.nodes.iter().any(|n| n.name == name_bytes("DELAY C")), "the agent edit was adopted");
         assert!(bound(&app), "the binding survives the agent edit");
@@ -17311,6 +21638,23 @@ mod rig_switch_tests {
             assert!(!vis.is_empty(), "rig {rig} has cables");
             for c in vis { assert!(finite(c), "rig {rig} cable {} rope {:?}", c.id, &c.pts[..c.n]); }
         }
+    }
+
+    #[test]
+    fn shift_f5_loads_the_guitar_rig_and_plain_f5_the_lead() {
+        // egui matches `Modifiers::NONE` logically, so a Shift+F5 press that
+        // is asked for after F5 loads Lead + Reverb instead of the guitar rig.
+        let ctx = egui::Context::default();
+        let names = |app: &DemoApp| -> Vec<String> { app.units.iter().map(|u| u.name.clone()).collect() };
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
+        let shifted = |down: bool| egui::Event::Key {
+            key: Key::F5, physical_key: None, pressed: down, repeat: false, modifiers: Modifiers::SHIFT,
+        };
+        frame(&mut app, &ctx, vec![shifted(true), shifted(false)]);
+        assert!(names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "Shift+F5 → guitar rig: {:?}", names(&app));
+        frame(&mut app, &ctx, key(Key::F5));
+        assert!(!names(&app).iter().any(|n| n.eq_ignore_ascii_case("AUDIO IN")), "plain F5 → lead: {:?}", names(&app));
     }
 
     #[test]
@@ -17736,7 +22080,7 @@ mod rig_switch_tests {
         assert_eq!(stopped, "file player stopped");
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
-        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayer { gain } if *gain == 0.0)), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayerEnable { on: false })), "{cmds:?}");
     }
 
     #[test]
@@ -19006,6 +23350,35 @@ mod split_bpm_tests {
         }
     }
 
+    /// Vitalium's editor lists its Vital patches by bank above its LV2 presets.
+    #[test]
+    fn vitaliums_editor_lists_its_vital_patches() {
+        fn library(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+            use crate::sounds::{Load, Sound};
+            let patch = |bank: &str, name: &str| Sound { category: bank.into(), name: name.into(), preferred: false, load: Load::VitalPatch(format!("/nowhere/{name}.vital").into()) };
+            match instrument {
+                crate::sounds::Instrument::Lv2(uri) if uri == crate::vital::URI => crate::sounds::Library {
+                    kind: "Vital patches".into(),
+                    sounds: vec![patch("ElectrowindsVol1", "Woody"), patch("ElectrowindsVol1_Dry", "Woody_Dry")],
+                    params: vec![],
+                },
+                _ => Default::default(),
+            }
+        }
+        let mut g = Graph::default();
+        g.reserve(4, 4);
+        let vital = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, name_bytes("VITALIUM"));
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(library);
+        app.build_rack(&g, &[]);
+        app.toggle_lv2_editor(vital, crate::vital::URI, "VITALIUM");
+        let ctx = egui::Context::default();
+        let texts = (0..3).map(|_| frame(&mut app, &ctx, vec![])).last().unwrap();
+        for listed in ["ElectrowindsVol1 · Woody", "ElectrowindsVol1_Dry · Woody_Dry"] {
+            assert!(texts.iter().any(|t| t == listed), "{listed} is listed: {texts:?}");
+        }
+    }
+
     #[test]
     fn vitalium_and_dexed_editor_support() {
         let _one_at_a_time = crate::lv2::VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -19027,6 +23400,30 @@ mod split_bpm_tests {
         assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
         frame(&mut app, &ctx, vec![]);
         assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
+    }
+
+    /// Rule 127: a session load classifies LV2 units from the background
+    /// scan, never a scan of its own, and a scan that lands later fixes them.
+    #[test]
+    fn session_load_classifies_lv2_from_the_background_scan() {
+        let uri = "urn:test:organ";
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst, is_midi_fx: false };
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = vec![info(false)];
+        app.plugins_loaded = true;
+        let s = crate::session::Session::new("organ", DemoApp::build_lv2_instrument_graph(uri, "Organ"));
+        app.apply_session(&s).unwrap();
+        let node = s.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Lv2 { .. })).unwrap().id;
+        let organ = |app: &DemoApp| app.units.iter().position(|u| u.node_id == node).expect("organ unit");
+        assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((Vec::new(), vec![info(true)])).unwrap();
+        app.plugin_scan = Some(rx);
+        app.poll_plugin_scan();
+        let u = &app.units[organ(&app)];
+        assert!(u.lv2_inst, "a landing scan reclassifies the loaded rack");
+        assert_eq!(u.sub, "lv2 synth");
     }
 
     #[test]
@@ -19555,7 +23952,7 @@ mod split_bpm_tests {
         // exec_tool, and record_start does not claim success without a recorder.
         let tools = crate::assistant::tools();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
-        for t in ["record_start", "record_stop", "record_status", "set_record_sync"] {
+        for t in ["record_start", "record_stop", "record_status", "set_record_sync", "set_record_arm"] {
             assert!(names.contains(&t), "assistant tools missing {t}");
         }
 
@@ -19576,6 +23973,47 @@ mod split_bpm_tests {
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
         assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordSync { on: true })), "sent SetRecordSync: {cmds:?}");
+
+        // set_record_arm: rig 0 arms its stem, master can be disarmed, and a
+        // rig that does not exist is refused (never clamped onto another rig).
+        let r = app.exec_tool("set_record_arm", &serde_json::json!({"rig": 0, "armed": true}));
+        assert!(r.contains("\"armed\":true"), "{r}");
+        assert!(app.arm_rigs[0]);
+        app.exec_tool("set_record_arm", &serde_json::json!({"target": "master", "armed": false}));
+        assert!(!app.arm_master);
+        let r = app.exec_tool("set_record_arm", &serde_json::json!({"rig": 9, "armed": true}));
+        assert!(r.contains("no rig 9"), "{r}");
+        assert!(!app.arm_rigs[7], "an out-of-range rig never arms the last slot");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordArm { rig: Some(0), armed: true })), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordArm { rig: None, armed: false })), "{cmds:?}");
+    }
+
+    #[test]
+    fn record_arms_survive_a_rig_add_and_its_undo() {
+        // Rule 59/106: arm state is per rig and follows it through a rig add
+        // (renumbering reload) and an undo of a LATER job. Non-default values
+        // (rig armed, master disarmed) so a reset would show.
+        let (mut app, ctx) = demo();
+        app.submit_chat("arm".into());
+        app.exec_tool("set_record_arm", &serde_json::json!({"rig": 0, "armed": true}));
+        app.exec_tool("set_record_arm", &serde_json::json!({"target": "master", "armed": false}));
+        app.submit_chat("add a rig".into());
+        app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 2);
+        assert!(app.arm_rigs[0], "rig A stays armed across the rig add");
+        assert!(!app.arm_rigs[1], "the new rig starts disarmed");
+        assert!(!app.arm_master);
+        app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 1, "the rig add was undone");
+        assert!(app.arm_rigs[0], "undoing the later job keeps rig A armed");
+        assert!(!app.arm_master, "and the master disarmed");
+        app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.arm_rigs[0] && app.arm_master, "undoing the arm job restores the defaults");
     }
 
     #[test]
@@ -19660,6 +24098,7 @@ mod stage_views_tests {
             name: "Lush Verb".into(),
             num_ports: 4,
             is_instrument: false,
+            is_midi_fx: false,
         }];
         let ctx = egui::Context::default();
         let size = Vec2::new(1600.0, 1000.0);
@@ -19756,6 +24195,7 @@ mod stage_views_tests {
             name: "Room Reverb".into(),
             num_ports: 4,
             is_instrument: false,
+            is_midi_fx: false,
         }];
         app.stage_view = StageView::Plugins;
         let ctx = egui::Context::default();
@@ -19846,14 +24286,159 @@ mod stage_views_tests {
         assert!(texts.iter().any(|t| t == "Stage Jam"), "saved session rendered: {texts:?}");
         assert!(texts.iter().any(|t| t == "Delete"), "delete action rendered");
 
-        app.confirm_delete_session = Some("Stage Jam".into());
+        app.confirm_session = Some(SessionConfirm::Delete("Stage Jam".into()));
         run_frame(&mut app, &ctx, Vec2::new(1280.0, 800.0), key(Key::Escape));
-        assert!(app.confirm_delete_session.is_none());
+        assert!(app.confirm_session.is_none());
         assert_eq!(app.stage_view, StageView::Sessions, "first Esc cancels delete confirm");
 
         DemoApp::delete_saved_session(&dir, "Stage Jam").unwrap();
         assert!(DemoApp::list_saved_sessions(&dir).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ksalat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn on_disk(dir: &std::path::Path, name: &str) -> crate::session::Session {
+        crate::session::Session::load(&crate::session::Session::package_path(dir, name).unwrap()).unwrap()
+    }
+
+    fn turn_a_knob(app: &mut DemoApp) {
+        let k = app.units.iter_mut().flat_map(|u| u.knobs.iter_mut()).find(|k| k.param.is_some()).unwrap();
+        k.value = if k.value > 0.5 { 0.2 } else { 0.8 };
+    }
+
+    #[test]
+    fn autosave_writes_the_open_session_only_after_a_change() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-change");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let saved = on_disk(&dir, "Jam");
+
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Saved 'Jam'", "an unchanged rack is not written again");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Autosaved 'Jam'");
+        let after = on_disk(&dir, "Jam");
+        assert!(!after.same_content(&saved), "the change reached the open session");
+        assert!(after.same_content(&app.capture_session("Jam").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "no second session appears");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_never_writes_a_template_over_the_session_that_was_open() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-template");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let jam = on_disk(&dir, "Jam");
+
+        app.load_template(Template::LeadReverb);
+        assert_eq!(app.open_session, None);
+        app.autosave_now(&dir);
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "the first check after a load only records it");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, format!("Autosaved '{AUTOSAVE_NAME}'"));
+        assert!(on_disk(&dir, "Jam").same_content(&jam), "the session that was open is untouched");
+        assert!(on_disk(&dir, AUTOSAVE_NAME).same_content(&app.capture_session(AUTOSAVE_NAME).unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_session_becomes_the_autosave_target() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-load");
+        app.session_name = "Song".into();
+        app.save_current_session(&dir);
+        app.load_template(Template::AmbientPad);
+
+        app.open_saved_session(&dir, "Song").unwrap();
+        assert_eq!(app.open_session.as_deref(), Some("Song"));
+        assert_eq!(app.session_name, "Song", "the name field shows the open session");
+        assert!(app.autosave_target() == "Song");
+
+        app.autosave.enabled = true;
+        assert!(!app.autosave_due(AUTOSAVE_SETTLE / 2.0));
+        assert!(app.autosave_due(AUTOSAVE_SETTLE), "the first check comes once the load settled");
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL - 1.0));
+        assert!(app.autosave_due(1.0));
+        app.autosave.enabled = false;
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL * 2.0), "off means no checks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stage_frame(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(shape: &Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                Shape::Vec(v) => for s in v { walk(s, out) },
+                _ => {}
+            }
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| app.sessions_stage_in(ui, dir));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn click_text(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, label: &str) {
+        let texts = stage_frame(app, ctx, dir, vec![]);
+        let pos = texts.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("'{label}' not drawn: {texts:?}")).1.center();
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        stage_frame(app, ctx, dir, vec![egui::Event::PointerMoved(pos)]);
+        stage_frame(app, ctx, dir, vec![b(true)]);
+        stage_frame(app, ctx, dir, vec![b(false)]);
+    }
+
+    #[test]
+    fn overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("overwrite");
+        app.session_name = "Take one".into();
+        app.save_current_session(&dir);
+        let first = on_disk(&dir, "Take one");
+        app.load_template(Template::DrumsBass);
+        turn_a_knob(&mut app);
+        let ctx = egui::Context::default();
+
+        click_text(&mut app, &ctx, &dir, "Overwrite");
+        assert_eq!(app.confirm_session, Some(SessionConfirm::Overwrite("Take one".into())));
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Confirm overwrite"), "{texts:?}");
+        assert!(on_disk(&dir, "Take one").same_content(&first), "nothing is written before the confirm");
+
+        click_text(&mut app, &ctx, &dir, "Confirm overwrite");
+        assert_eq!(app.session_msg, "Overwrote 'Take one'");
+        assert_eq!(app.confirm_session, None);
+        assert_eq!(app.open_session.as_deref(), Some("Take one"));
+        let now = on_disk(&dir, "Take one");
+        assert!(!now.same_content(&first));
+        assert!(now.same_content(&app.capture_session("Take one").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Take one".to_string()]);
+
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "open"), "the open session is marked");
+        let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+        for (label, r) in texts.iter().filter(|(t, _)| ["Load", "Overwrite", "Delete"].contains(&t.as_str())) {
+            assert!(r.right() + 8.0 <= inner.right() + 0.5, "'{label}' at {r:?} leaves the sheet ({inner:?})");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -19950,183 +24535,12 @@ mod ui_polish_agent_tests {
             for _ in 0..400 {
                 self.frame();
                 match self.worker_rx.try_recv() {
-                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results.into_iter().map(|r| r.text).collect(),
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results,
                     Ok(_) => panic!("the app sent something other than tool results"),
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
                 }
             }
             panic!("the app never answered the batch");
-        }
-    }
-
-    /// One frame at `size`. Returns the screenshot requests the frame sent:
-    /// the windowing integration completes them after it painted.
-    fn frame_asking(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<egui::ScreenshotCallback> {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-        out.viewport_output.values().flat_map(|v| &v.commands)
-            .filter_map(|c| match c { egui::ViewportCommand::Screenshot(wanted) => Some(wanted.clone()), _ => None })
-            .collect()
-    }
-
-    #[test]
-    fn look_at_rack_holds_its_batch_until_the_frame_arrives_and_answers_with_the_picture() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
-            call("look_at_rack", serde_json::json!({})),
-            call("set_bpm", serde_json::json!({"bpm": 100})),
-        ])).unwrap();
-        // A frame that arrived after an earlier look gave up.
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("late", [4, 2], &[9; 32]));
-        let mut wanted = frame_asking(&mut app, &ctx, WINDOW);
-        assert_eq!(wanted.len(), 1, "the frame that runs the call asks for a screenshot");
-        for _ in 0..3 {
-            assert!(frame_asking(&mut app, &ctx, WINDOW).is_empty(), "one request per look");
-        }
-        assert!(worker_rx.try_recv().is_err(), "no answer before the frame arrived: frames keep running meanwhile");
-        assert_ne!(app.bpm, 100.0, "the call after it waits its turn");
-
-        wanted.remove(0).complete(Arc::new(egui::ColorImage::filled([2000, 1250], Color32::from_rgb(20, 22, 24))));
-        let results = (0..500).find_map(|_| {
-            frame_asking(&mut app, &ctx, WINDOW);
-            match worker_rx.try_recv() {
-                Ok(crate::assistant::ToWorker::ToolResults(results)) => Some(results),
-                _ => { std::thread::sleep(std::time::Duration::from_millis(4)); None }
-            }
-        }).expect("the batch is answered once the frame is encoded");
-        let shot = results[0].image.as_ref().expect("the first result carries the picture");
-        assert_eq!(shot.size, Some([1400, 875]), "scaled down for the model");
-        assert!(shot.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-        assert_eq!(results[0].text, "screenshot of the kabelsalat window: kabelsalat window (1400×875 px)");
-        assert!(results[1].text.contains("100 BPM") && results[1].image.is_none());
-        assert_eq!(app.bpm, 100.0);
-    }
-
-    #[test]
-    fn look_at_rack_says_so_when_no_frame_arrives() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        app.tool_batch = Some(ToolBatch {
-            todo: VecDeque::new(),
-            results: Vec::new(),
-            waiting: Some((Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }, None)),
-            user_idx: 0,
-        });
-        app.poll_assistant();
-        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
-        assert!(results[0].text.starts_with("error: no screenshot within 2 s") && results[0].image.is_none(), "{:?}", results[0].text);
-    }
-
-    #[test]
-    fn a_bridge_caller_gets_the_screenshot_as_base64_png_or_an_error_past_its_wait() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.rack_shot.remote.push((tx.clone(), std::time::Instant::now() + RACK_SHOT_WAIT));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().is_err(), "nothing to send yet");
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("kabelsalat window", [4, 2], &[9; 32]));
-        app.serve_rack_shots();
-        let reply: serde_json::Value = serde_json::from_str(&rx.try_recv().expect("answered with the frame")).unwrap();
-        assert_eq!(reply["text"], "screenshot of the kabelsalat window: kabelsalat window (4×2 px)");
-        assert!(reply["png_base64"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG file in base64");
-        assert!(app.rack_shot.remote.is_empty());
-
-        app.rack_shot.remote.push((tx, std::time::Instant::now()));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().unwrap().starts_with("error: no screenshot"));
-    }
-
-    #[test]
-    fn look_at_rack_is_a_tool_of_the_assistant_the_app_and_the_bridge() {
-        let tools = crate::assistant::tools();
-        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == LOOK_TOOL));
-        assert!(UI_BRIDGE_TOOLS.contains(&LOOK_TOOL));
-        assert!(include_str!("mcp.rs").contains("ui_bridge_tool(\"look_at_rack\""));
-        let mut app = DemoApp::new_with_sink(None);
-        assert_eq!(app.exec_tool(LOOK_TOOL, &serde_json::json!({})), "screenshot of the kabelsalat window");
-        assert!(app.rack_shot.wanted && app.undo_past.is_empty(), "looking asks for a frame and changes nothing");
-    }
-
-    #[derive(Debug)]
-    struct Dropped(std::path::PathBuf, Vec<u8>);
-
-    impl egui::DroppedFile for Dropped {
-        fn path(&self) -> &std::path::Path { &self.0 }
-        fn bytes(&self) -> Result<Vec<u8>, String> { Ok(self.1.clone()) }
-    }
-
-    fn drop_file(app: &mut DemoApp, ctx: &egui::Context, name: &str, bytes: Vec<u8>) {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, WINDOW));
-        raw.dropped_files = vec![Arc::new(Dropped(std::path::PathBuf::from("/nowhere").join(name), bytes))];
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-    }
-
-    #[test]
-    fn a_dropped_or_pasted_image_is_a_removable_chip_and_goes_out_with_the_next_message() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        let png = Image::from_rgba("x", [8, 4], &[200; 8 * 4 * 4]).unwrap();
-
-        // Pasting belongs to the open chat; a drop opens it.
-        let paste = || vec![egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([8, 4], Color32::RED)))];
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert!(app.chat_image.is_none() && !app.assistant_open(), "a paste with the assistant closed is not for the chat");
-        drop_file(&mut app, &ctx, "notes.txt", b"hello".to_vec());
-        assert!(app.chat_image.is_none());
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("not attached: notes.txt is neither a PNG nor a JPEG"));
-        drop_file(&mut app, &ctx, "rack.png", png.bytes.to_vec());
-        assert!(app.assistant_open(), "dropping an image opens the assistant");
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("rack.png (8×4 px)"));
-
-        let texts = run_frame(&mut app, &ctx, WINDOW, vec![]);
-        assert!(texts.iter().any(|(t, _)| t == "rack.png"), "the chip names the image: {texts:?}");
-        assert!(!texts.iter().any(|(t, _)| t.contains("px)")), "no debug pixel size in chip: {texts:?}");
-        let remove = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(_, r)| *r).expect("attachment remove button");
-        click_at(&mut app, &ctx, WINDOW, remove.center());
-        assert!(app.chat_image.is_none(), "clicking × removes the image");
-
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("pasted image (8×4 px)"));
-        app.submit_chat("what is this?".into());
-        let Ok(crate::assistant::ToWorker::User(sent)) = worker_rx.try_recv() else { panic!("nothing was sent") };
-        assert!(sent.text.starts_with("[context:") && sent.text.ends_with("\nwhat is this?"), "{}", sent.text);
-        assert_eq!(sent.image.map(|i| i.size), Some(Some([8, 4])));
-        assert!(app.chat_image.is_none(), "the image leaves with its message");
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("what is this? [image: pasted image]"));
-    }
-
-    #[test]
-    fn the_attachment_chip_and_the_input_row_fit_the_panel_at_its_minimum_size() {
-        let mut app = DemoApp::new_with_sink(None);
-        app.load_multi_rig_demo();
-        app.assistant.key_set = true;
-        app.dock = DockView::Assistant;
-        let ctx = egui::Context::default();
-        let min_size = Vec2::new(760.0, 520.0);
-        for _ in 0..4 { run_frame(&mut app, &ctx, min_size, vec![]); }
-        let long_name = format!("{}.png", "a-very-long-screenshot-name".repeat(6));
-        app.chat_image = Some(Image::from_rgba(&long_name, [8, 4], &[200; 8 * 4 * 4]).unwrap());
-        // The first frame with the chip counts: nothing may jump out of the panel.
-        for frame in 0..3 {
-            let texts = run_frame(&mut app, &ctx, min_size, vec![]);
-            let panel = app.assistant_rect;
-            let chip = texts.iter().find(|(t, _)| t.contains("screenshot-name")).map(|(_, r)| *r).expect("chip painted");
-            assert!(panel.contains_rect(chip), "frame {frame}: chip {chip:?} outside the panel {panel:?}");
-            assert!(panel.contains_rect(app.assistant_input_rect), "frame {frame}: input row {:?} outside the panel {panel:?}", app.assistant_input_rect);
-            assert!(chip.bottom() <= app.assistant_input_rect.top() + 0.5, "frame {frame}: the chip sits above the input row");
-            let send = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("Send painted");
-            assert!(panel.contains_rect(send), "frame {frame}: Send {send:?} outside the panel");
-            assert!(app.unit_h >= 140.0, "the rack keeps its height");
         }
     }
 
@@ -20170,6 +24584,93 @@ mod ui_polish_agent_tests {
         }
     }
 
+    fn vital_test_patch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ksalat-ui-vital-{}", std::process::id())).join("Woody.vital")
+    }
+
+    fn vital_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        use crate::sounds::{Instrument, Library, Load, Sound};
+        match instrument {
+            Instrument::Lv2(uri) if uri == crate::vital::URI => Library {
+                kind: "Vital patches".into(),
+                sounds: vec![Sound { category: "Winds".into(), name: "Woody".into(), preferred: false, load: Load::VitalPatch(vital_test_patch()) }],
+                params: vec![],
+            },
+            other => test_sounds(other),
+        }
+    }
+
+    /// A Vital patch is Vitalium's state: loading one sends it to the engine,
+    /// and it stays with its unit through a session save and load and a rig
+    /// edit that renumbers the unit, each of which loads new LV2 instances.
+    #[test]
+    fn a_loaded_vital_patch_survives_sessions_and_rig_edits() {
+        let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}}).to_string().into_bytes();
+        std::fs::create_dir_all(vital_test_patch().parent().unwrap()).unwrap();
+        std::fs::write(vital_test_patch(), &patch).unwrap();
+        let vital = (NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, "VITALIUM");
+        let rigs = vec![
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Winds", &[vital]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(vital_sounds);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        for u in app.units.iter_mut().filter(|u| u.name == "VITALIUM") { u.lv2_inst = true; }
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let node = node_named(&app, 1, "VITALIUM");
+
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "woody", "rig": 1}));
+        assert_eq!(out, format!("loaded 'Winds/Woody' into Vitalium (node {node}), rig 1 'Rig B'"));
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)), "{sent:?}");
+
+        let saved = app.capture_session("Winds").unwrap();
+        assert_eq!(saved.plugin_state(node).map(|s| (s.plugin_id.as_str(), &s.data)), Some((crate::vital::URI, &patch)));
+        let dir = vital_test_patch().parent().unwrap().join("session");
+        saved.save(&dir).expect("a session with a Vital patch saves");
+        let loaded = crate::session::Session::load(&dir).unwrap();
+        app.apply_session(&loaded).unwrap();
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        let load = sent.iter().position(|c| matches!(c, Command::LoadRigs { .. } | Command::LoadGraph { .. })).expect("the graph is loaded");
+        let state = sent.iter().position(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)).expect("the patch is restored");
+        assert!(load < state, "the patch follows the graph load that builds the node's instance: {sent:?}");
+
+        // Deleting rig A renumbers the Vitalium node.
+        app.edit_rigs(Some(0));
+        let moved = node_named(&app, 0, "VITALIUM");
+        assert_ne!(moved, node);
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == moved && *state == patch)), "{sent:?}");
+        assert_eq!(app.capture_session("after").unwrap().plugin_state(moved).map(|s| &s.data), Some(&patch));
+        let _ = std::fs::remove_dir_all(vital_test_patch().parent().unwrap());
+    }
+
+    /// A Vital bank dropped on the window lands where Vitalium reads presets.
+    #[test]
+    fn a_dropped_vital_bank_is_imported_not_attached() {
+        let dir = std::env::temp_dir().join(format!("ksalat-ui-vitalbank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bank = dir.join("Winds.vitalbank");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&bank).unwrap());
+            zip.start_file("Winds/Presets/Woody.vital", zip::write::SimpleFileOptions::default()).unwrap();
+            let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}});
+            std::io::Write::write_all(&mut zip, patch.to_string().as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        // SAFETY: only this test reads XDG_DATA_HOME (vital::data_dir).
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.join("data")) };
+        let mut app = DemoApp::new_with_sink(None);
+        app.import_vital(&bank);
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        assert_eq!(app.session_msg, "added 1 Vital patches (Winds): Vitalium's sound list has them");
+        assert!(dir.join("data/Vitalium/Winds/Presets/Woody.vital").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn instrument_rig(name: &str, instruments: &[(NodeKind, &str)]) -> crate::control::Rig {
         let mut g = Graph::default();
         g.reserve(8, 8);
@@ -20201,6 +24702,36 @@ mod ui_polish_agent_tests {
         let (bus, drain) = command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         (app, drain)
+    }
+
+    /// User 2026-11-17: one click in an organ's matrix column selected
+    /// every cell of it, because all its rows showed the MIDI cable.
+    #[test]
+    fn an_lv2_column_toggles_one_cell_like_a_clap_column() {
+        let (mut app, drain) = app_of_instruments();
+        app.hw_devices = vec!["FM-1 24:0".into(), "MIDIMATE 28:0".into()];
+        let organ = app.units.iter().position(|u| u.rig == 1 && u.name == "ORGAN").expect("organ");
+        let node = app.units[organ].node_id;
+        let rows = [MatrixRow::Keys, MatrixRow::HwAll, MatrixRow::HwDev(0), MatrixRow::HwDev(1)];
+        let cells = |app: &DemoApp| rows.map(|r| app.matrix_cell_on(organ, r));
+        assert_eq!(cells(&app), [true, true, false, false], "keyboard and all hardware by default");
+
+        app.matrix_toggle(organ, MatrixRow::Keys, false);
+        assert_eq!(cells(&app), [false, true, false, false], "only the keyboard cell went off");
+        app.matrix_toggle(organ, MatrixRow::HwDev(1), true);
+        assert_eq!(cells(&app), [false, false, false, true], "one device replaces all hardware");
+        app.matrix_toggle(organ, MatrixRow::Keys, true);
+        assert_eq!(cells(&app), [true, false, false, true], "the keyboard is independent of hardware");
+        assert!(app.midi_cable_to(organ).is_some(), "the cable stays plugged");
+
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.render(&mut vec![0.0f32; 64 * 2], 2);
+        let rules = pub_.lock().unwrap().rules.clone();
+        let muted: Vec<SourceId> = rules.iter().filter(|r| r.dest == node && !r.enabled).map(|r| r.source).collect();
+        let others = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| d != 1).map(SourceId::Hardware);
+        assert_eq!(muted, others.collect::<Vec<_>>(), "the engine mutes every source but the keyboard and device 1");
     }
 
     fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
@@ -20416,6 +24947,23 @@ mod ui_polish_agent_tests {
         assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
     }
 
+    /// listen runs on its own thread; the batch hands the model its answer,
+    /// in call order, never the "listening" placeholder.
+    #[test]
+    fn the_agents_listen_call_answers_with_what_the_listener_said() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("play_note", serde_json::json!({"note": 60, "ms": 3000})),
+            call("listen", serde_json::json!({"attributes": "warm, 8-bit"})),
+            call("get_status", serde_json::json!({})),
+        ]);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].starts_with("played note 60"), "{}", results[0]);
+        assert!(results[1].starts_with("listen: no listening model"), "{}", results[1]);
+        assert!(results[2].contains("\"meter\""), "{}", results[2]);
+        assert!(live.app.listening.is_none());
+    }
+
     /// The load_sound plan against the app's real answers, on a rig whose
     /// instrument is not Surge.
     #[test]
@@ -20496,7 +25044,6 @@ mod ui_polish_agent_tests {
         assert_eq!(app.rig_mix[0].vol, 0.5);
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
         assert_eq!(results.len(), 3, "one result per call, in call order");
-        let results: Vec<String> = results.into_iter().map(|r| r.text).collect();
         assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
         assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
     }
@@ -20524,6 +25071,34 @@ mod ui_polish_agent_tests {
         assert!(results.iter().all(|r| r.contains("new cable id")), "{results:?}");
         let wired = |from: u32, to: u32| live.app.cables.iter().any(|c| live.app.units[c.src].node_id == from && live.app.units[c.dst].node_id == to);
         assert!(wired(1, id as u32) && wired(id as u32, master), "both cables exist");
+    }
+
+    #[test]
+    fn an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master() {
+        let mut live = Live::new();
+        // As in the app: LV2 loads off the render path (other tests hold LILV_LOCK for seconds).
+        live.engine.spawn_lv2_loader();
+        live.run_batch(vec![call("load_template", serde_json::json!({"name": "multi_rig"}))]);
+        for _ in 0..6 { live.frame(); }
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        live.app.plugins_lv2 = vec![lv2(TEST_ORGAN, true), lv2("urn:test:fx", false)];
+        live.app.plugins_loaded = true;
+        let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
+        let g = engine_graph(&live);
+        let in_rig_a = |kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == 0 && kind(&n.kind)).map(|n| n.id).unwrap();
+        let (keys, master) = (in_rig_a(|k| matches!(k, NodeKind::Keys)), in_rig_a(|k| matches!(k, NodeKind::MasterOut)));
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": TEST_ORGAN, "name": "setBfree", "rig": 0})),
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": "urn:test:fx", "name": "fx", "rig": 0})),
+        ]);
+        let g = engine_graph(&live);
+        let node = |uri: &str| g.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Lv2 { uri: u } if u.as_str() == uri)).map(|n| n.id).unwrap();
+        let (organ, fx) = (node(TEST_ORGAN), node("urn:test:fx"));
+        assert!(g.has_route(keys, organ, CPortKind::Midi), "Keys -> organ: {:?}", g.edges);
+        assert!(g.has_route_port(organ, master, 0, CPortKind::Audio) && g.has_route_port(organ, master, 1, CPortKind::Audio), "organ -> Master L/R: {:?}", g.edges);
+        assert_eq!(results[0].matches("new cable id").count(), 1, "{}", results[0]);
+        assert_eq!(results[0].split("new cable id ").nth(1).unwrap().split(',').count(), 3, "the result names the three cables: {}", results[0]);
+        assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
     }
 
     #[test]
@@ -20845,9 +25420,108 @@ mod ui_polish_agent_tests {
         assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
         assert!(kb_big.height() > kb_small.height());
         let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
-        assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
+        assert!(h_tiny >= 163.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
+        // The MIDI strip fits above the keys at every size (GitHub #97).
+        for _ in 0..3 { run_frame(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]); }
+        let sr = app.kb_strip;
+        assert!(sr.iter().all(|r| r.is_positive() && r.width() > 0.0), "strip laid out: {sr:?}");
+        let kb = app.dock_kb_rect;
+        assert!(sr.iter().all(|r| r.bottom() <= kb.top() + 0.5), "strip stays above the keys: {sr:?} vs {kb:?}");
+        assert!(sr.iter().all(|r| r.top() >= app.dock_rect.top()), "strip inside the dock");
+    }
+
+    /// GitHub #97: the dock's MIDI strip sends the standard keyboard
+    /// signals — pitch bend (springs back to center on release),
+    /// modulation (holds its value), sustain (CC 64 toggle) — and the VEL
+    /// slider drives the Keys unit's VEL knob (found by label, rule 92;
+    /// assert the DRAWN value, rule 109).
+    #[test]
+    fn kb_strip_sends_the_standard_midi_signals() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        let strip = app.kb_strip;
+        assert!(strip.iter().all(|r| r.is_positive()), "strip laid out: {strip:?}");
+        let mut sent = Vec::new();
+
+        // Press-drag-release, in points, like a user moves a wheel.
+        let ptr = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        let drag_to = |app: &mut DemoApp, from: Pos2, to: Pos2| {
+            run_frame(app, &ctx, size, vec![egui::Event::PointerMoved(from)]);
+            run_frame(app, &ctx, size, vec![ptr(from, true)]);
+            for i in 1..=4 {
+                let p = from + (to - from) * (i as f32 / 4.0);
+                run_frame(app, &ctx, size, vec![egui::Event::PointerMoved(p)]);
+            }
+            run_frame(app, &ctx, size, vec![ptr(to, false)]);
+        };
+
+        // Pitch wheel: from the bottom (-1) to the top (+1), released there.
+        let w = strip[0];
+        drag_to(&mut app, Pos2::new(w.center().x, w.bottom() - 2.0), Pos2::new(w.center().x, w.top() + 2.0));
+        drain.drain(|c| sent.push(c));
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::PitchBend { source: SourceId::Keys, value, .. } if *value > 4000)),
+            "the drag sent a bend up: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::PitchBend { .. })).collect::<Vec<_>>()
+        );
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::PitchBend { source: SourceId::Keys, value: 0, .. })),
+            "releasing the wheel springs back to center: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::PitchBend { .. })).collect::<Vec<_>>()
+        );
+        assert_eq!(app.kb_bend, 0.0, "the wheel is at rest after release");
+
+        // Mod wheel: from the bottom (0) to the top (1), released there.
+        sent.clear();
+        let m = strip[1];
+        // Past the top: the value clamps to the extreme.
+        drag_to(&mut app, Pos2::new(m.center().x, m.bottom() - 2.0), Pos2::new(m.center().x, m.top() - 6.0));
+        drain.drain(|c| sent.push(c));
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::Cc { source: SourceId::Keys, cc: 1, value: 127, .. })),
+            "the drag sent CC 1 (modulation) at full: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::Cc { cc: 1, .. })).collect::<Vec<_>>()
+        );
+        assert!(app.kb_mod > 0.9, "the mod wheel HOLDS its value: {}", app.kb_mod);
+
+        // Sustain pedal: on, then off.
+        sent.clear();
+        click_at(&mut app, &ctx, size, strip[2].center());
+        drain.drain(|c| sent.push(c));
+        sent.retain(|c| matches!(c, Command::Cc { .. })); // the frame also re-publishes cables
+        assert!(matches!(sent.as_slice(), [Command::Cc { source: SourceId::Keys, cc: 64, value: 127, .. }]), "pedal down is CC 64 = 127: {sent:?}");
+        assert!(app.kb_sustain);
+        sent.clear();
+        click_at(&mut app, &ctx, size, strip[2].center());
+        drain.drain(|c| sent.push(c));
+        sent.retain(|c| matches!(c, Command::Cc { .. })); // the frame also re-publishes cables
+        assert!(matches!(sent.as_slice(), [Command::Cc { source: SourceId::Keys, cc: 64, value: 0, .. }]), "pedal up is CC 64 = 0: {sent:?}");
+        assert!(!app.kb_sustain);
+        // Strip messages pulse the Keys unit's MIDI cables, like notes do.
+        let ki = app.keys_idx();
+        assert!(
+            app.cables.iter().any(|c| c.src == ki && c.kind == PortKind::Midi && c.pulses.iter().any(|p| p.active)),
+            "a strip send lit the keys MIDI cable"
+        );
+
+        // Velocity: the slider drives the Keys unit's VEL knob.
+        let ki_vel = app.units.get(ki).and_then(|u| u.knob_index("VEL")).expect("Keys has a VEL knob");
+        let before = app.units[ki].knobs[ki_vel].display_value;
+        let s = strip[3];
+        click_at(&mut app, &ctx, size, Pos2::new(s.left() + s.width() * 0.45, s.center().y));
+        let after = app.units[ki].knobs[ki_vel].display_value;
+        assert!(after != before, "the VEL slider moved the knob: {before} → {after}");
+        assert!((after - app.units[ki].knobs[ki_vel].value).abs() < 1e-6, "drawn and stored VEL agree: {after}");
+        assert!((after - 0.45).abs() < 0.05, "the track maps the pointer to the value: {after}");
     }
 
     /// User report: the software keyboard must show a note as long as it is
@@ -21026,8 +25700,7 @@ mod ui_polish_agent_tests {
 
         for (phase, expected) in [
             (RunPhase::Deciding, "Jev · deciding"),
-            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
-            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }, "DeepSeek · step 2"),
         ] {
             app.assistant.phase = Some(phase);
             let texts = run_frame(&mut app, &ctx, size, vec![]);
@@ -21304,8 +25977,7 @@ mod ui_polish_agent_tests {
         assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
-        // Attached image chip + Confirm / Cancel prompt + Replay chip.
-        assert!(texts.iter().any(|(t, _)| t == "rack-sketch.png"), "missing attached image chip: {texts:?}");
+        // Confirm / Cancel prompt + Replay chip.
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "debug size text must be gone: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
@@ -21444,8 +26116,6 @@ mod ui_polish_agent_tests {
         let chip_not_applied = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL);
         let chip_failed = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
         let cancel_btn = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_name = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_x = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
         let danger_confirm = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
 
         for (name, r) in [
@@ -21458,8 +26128,6 @@ mod ui_polish_agent_tests {
             ("chip NotApplied", chip_not_applied),
             ("chip Failed", chip_failed),
             ("Cancel", cancel_btn),
-            ("attachment name", attach_name),
-            ("attachment ×", attach_x),
             ("danger Confirm", danger_confirm),
         ] {
             assert!(r >= 4.5, "{name} contrast {r:.2}:1 < 4.5:1");
@@ -21468,39 +26136,27 @@ mod ui_polish_agent_tests {
     }
 
     #[test]
-    fn agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle() {
+    fn agent_panel_defect6_confirm_aligns_with_the_transcript_column() {
         let mut app = DemoApp::new_with_sink(None);
         app.stage_demo_agent(false);
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let size = Vec2::new(1280.0, 950.0);
 
-        let run_capture = |app: &mut DemoApp, events: Vec<egui::Event>| {
+        let run_capture = |app: &mut DemoApp| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-            raw.events = events;
             let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             let mut texts = Vec::new();
             let mut rects = Vec::new();
             for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
-            let set_ids: Vec<egui::TextureId> = out.textures_delta.set.iter().map(|(id, _)| *id).collect();
-            let free_ids = out.textures_delta.free.clone();
             out.textures_delta.clear();
-            (texts, rects, set_ids, free_ids)
+            (texts, rects)
         };
+        for _ in 0..2 { run_capture(&mut app); }
+        let (texts, rects) = run_capture(&mut app);
 
-        // Frame 1: thumbnail texture created once.
-        let (_, _, set1, _) = run_capture(&mut app, vec![]);
-        let tex_id = app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()).expect("thumbnail texture loaded");
-        assert!(set1.contains(&tex_id), "frame 1 uploads thumbnail texture {tex_id:?}");
-
-        // Settle layout and verify Frame N does NOT re-upload thumbnail texture.
-        let _ = run_capture(&mut app, vec![]);
-        let (texts, rects, set3, _) = run_capture(&mut app, vec![]);
-        assert!(!set3.contains(&tex_id), "thumbnail texture must not be recreated on subsequent frames");
-        assert_eq!(app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()), Some(tex_id));
-
-        // Alignment: Confirm/Cancel and attachment chip share the transcript text column left edge.
+        // Alignment: Confirm/Cancel share the transcript text column left edge.
         let msg_left = texts.iter().find(|(t, _)| t.contains("Brighten Surge A")).map(|(_, r)| r.left()).expect("msg text");
         let chip_text_r = texts.iter().find(|(t, _)| t.contains("Split keys → C4")).map(|(_, r)| *r).expect("chip text");
         let chip_box = rects.iter()
@@ -21512,43 +26168,13 @@ mod ui_polish_agent_tests {
             .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(confirm_text_r))
             .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
             .expect("confirm button box").0;
-        let attach_text_r = texts.iter().find(|(t, _)| t == "rack-sketch.png").map(|(_, r)| *r).expect("attach name");
-        let attach_box = rects.iter()
-            .filter(|(r, fill, _)| *fill == theme::DARK_PANEL_HI && r.contains_rect(attach_text_r))
-            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
-            .expect("attach chip box").0;
         assert!(
             (confirm_box.left() - chip_box.left()).abs() <= 0.5 && (confirm_box.left() - msg_left).abs() <= 2.0,
             "Confirm left ({}) != transcript column (chip {}, msg {msg_left})",
             confirm_box.left(),
             chip_box.left()
         );
-        assert!(
-            (attach_box.left() - chip_box.left()).abs() <= 0.5 && (attach_box.left() - msg_left).abs() <= 2.0,
-            "Attachment chip left ({}) != transcript column (chip {}, msg {msg_left})",
-            attach_box.left(),
-            chip_box.left()
-        );
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "no debug pixel dimensions: {texts:?}");
-
-        // Remove via × -> texture handle dropped and freed in textures_delta.free.
-        let x_pos = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).unwrap().1.center();
-        let mut freed = Vec::new();
-        for pressed in [true, false] {
-            let ev = vec![
-                egui::Event::PointerMoved(x_pos),
-                egui::Event::PointerButton {
-                    pos: x_pos,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: Modifiers::NONE,
-                },
-            ];
-            freed.extend(run_capture(&mut app, ev).3);
-        }
-        freed.extend(run_capture(&mut app, vec![]).3);
-        assert!(app.chat_image.is_none() && app.chat_thumb.is_none(), "attachment and thumb cleared");
-        assert!(freed.contains(&tex_id), "removed attachment must free thumbnail texture {tex_id:?}, freed: {freed:?}");
     }
 }
 
@@ -21572,9 +26198,13 @@ mod face_layout_tests {
         let r = app.unit_rects[ui];
         let mut v = Vec::new();
         let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
+        // Title and subtitle are separate items: the split chip clears the
+        // title band and sits above the subtitle band, which a union box
+        // would call an overlap (false positive at narrow keys units).
         let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
         let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
-        v.push(("header".to_string(), title.union(sub)));
+        v.push(("title".to_string(), title));
+        v.push(("subtitle".to_string(), sub));
         v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
         for (ki, k) in u.knobs.iter().enumerate() {
             if k.hidden { continue; }
@@ -21602,13 +26232,21 @@ mod face_layout_tests {
         }
         if matches!(u.node_kind, UnitKind::Master) {
             let (x, bottom, pitch) = app.meter_geom(ui);
-            let top = bottom - METER_SEGS as f32 * pitch - 18.0;
-            let w = sz(&app.caption_output_g).x.max(22.0);
-            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
+            let top = bottom - METER_SEGS as f32 * pitch;
+            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + METER_SEG_W, bottom))));
+            if app.meter_caption_shown(ui) {
+                v.push(("meter caption".into(), Rect::from_min_size(Pos2::new(x, top - 18.0), sz(&app.caption_output_g))));
+            }
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
+        if let Some((chip, readout)) = app.scale_rects(ui) { v.push(("scale".into(), chip.union(readout))); }
+        if let Some(f) = app.arp_status_rect(ui) { v.push(("arp status".into(), f)); }
         if let Some(b) = app.drawbar_rects(ui) {
             v.push(("drawbars".into(), b[0].union(b[crate::organ::DRAWBARS - 1])));
+        }
+        if let Some(a) = app.aeolus_rects(ui) {
+            v.push(("aeolus tabs".into(), a.tabs[0].union(a.tabs[3])));
+            v.push(("aeolus stops".into(), a.stops.iter().fold(Rect::NOTHING, |u, r| u.union(*r))));
         }
         if let Some(z) = app.zone_rects(ui) {
             v.push(("zone low".into(), z[0].all()));
@@ -21655,10 +26293,15 @@ mod face_layout_tests {
     fn check(mut app: DemoApp, what: &str) {
         let ctx = egui::Context::default();
         let mut all = Vec::new();
-        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
-            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
-            for v in audit(&app) { all.push(format!("[{what} {}x{}] {v}", size.x, size.y)); }
+        let small = super::window_size_layout_tests::SIZES.map(|(w, h)| Vec2::new(w, h));
+        for dock in [DockView::None, DockView::Keyboard, DockView::Assistant] {
+            app.dock = dock;
+            for size in [Vec2::new(2560.0, 1440.0)].into_iter().chain(small) {
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                for v in audit(&app) { all.push(format!("[{what} {}x{} {dock:?}] {v}", size.x, size.y)); }
+            }
         }
+        app.dock = DockView::None;
         assert!(all.is_empty(), "face layout violations:\n{}", all.join("\n"));
     }
 
@@ -21681,6 +26324,43 @@ mod face_layout_tests {
         check(app, "split keys, two rigs");
     }
 
+    /// The demo rack with an arp wired between its Keys and its synths.
+    fn arp_rack() -> DemoApp {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::demo_patch();
+        let id = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+        g.wire_arp(id);
+        app.build_rack(&g, &[]);
+        app
+    }
+
+    #[test]
+    fn arp_and_scale_faces_are_padded_and_clear() {
+        check(arp_rack(), "arp");
+        let mut app = arp_rack();
+        let k = app.keys_unit.unwrap();
+        app.set_keys_scale(k, Some(crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 }));
+        app.set_keys_split(k, Some(60));
+        check(app, "arp, scaled split keys");
+    }
+
+    /// Rule 121: in the rack the app opens with, the elements ARE drawn.
+    #[test]
+    fn the_arp_and_scale_elements_are_shown_in_a_default_sized_rack() {
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            let mut app = arp_rack();
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            let arp = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Arp)).unwrap();
+            assert!(app.visible(arp), "arp unit visible at {size:?}");
+            assert!(app.arp_status_rect(arp).is_some(), "the arp status field is shown at {size:?}");
+            assert!(app.arp_status_text(arp).unwrap().starts_with("UP"), "default pattern reads UP · 1/16 · 1 OCT: {:?}", app.arp_status_text(arp));
+            assert_eq!(app.units[arp].knobs.iter().filter(|k| !k.hidden).count(), 6, "six arp knobs at {size:?}");
+            let keys = app.keys_unit.unwrap();
+            assert!(app.scale_rects(keys).is_some(), "the scale chip is shown on the Keys face at {size:?}");
+        }
+    }
+
     #[test]
     fn organ_faces_with_drawbars_are_padded_and_clear() {
         let mut app = DemoApp::new_with_sink(None);
@@ -21692,6 +26372,155 @@ mod face_layout_tests {
         g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.build_rack(&g, &[]);
         check(app, "organ");
+    }
+
+    /// The reported shape (#58): a synth+delay stack next to a setBfree organ
+    /// column, seen at the default window size — the organ column used to be
+    /// as narrow as every other mid column (200 px), which put the LESLIE
+    /// knob over the neighbouring unit and hid the drawbars.
+    #[test]
+    fn organ_next_to_a_synth_stack_fits_at_the_default_window_size() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let delay = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        let organ_ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            let bad = audit(&app);
+            assert!(bad.is_empty(), "face layout violations at {}x{}:\n{}", size.x, size.y, bad.join("\n"));
+            assert!(app.drawbar_rects(organ_ui).is_some(),
+                "drawbars hidden at {}x{}", size.x, size.y);
+        }
+    }
+
+    /// Keys → Aeolus → Master, its unit with the main knobs a real Aeolus has.
+    fn aeolus_rack() -> (DemoApp, usize) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let organ = g.add_node(NodeKind::Clap { plugin_id: name_bytes(crate::aeolus::AEOLUS_ID) }, name_bytes("AEOLUS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        (app, ui)
+    }
+
+    #[test]
+    fn aeolus_faces_with_stops_are_padded_and_clear() {
+        let (app, _) = aeolus_rack();
+        check(app, "aeolus");
+        // Every division fits, the longest (Manual III, 15 stops) too.
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let a = app.aeolus_rects(ui).unwrap_or_else(|| panic!("no stop panel at {size:?} for division {d}"));
+                assert_eq!(a.stops.len(), crate::aeolus::DIVISIONS[d].stops.len());
+                assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+            }
+        }
+        // The default rack with both Surges swapped for Aeolus: two short
+        // units stacked over their delays (the real app's first look).
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind {
+                *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID);
+                n.name = name_bytes(&format!("AEOLUS {}", n.id));
+            }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            for u in (0..app.units.len()).filter(|&u| app.is_aeolus_unit(u)) {
+                assert!(app.aeolus_rects(u).is_some(), "no stop panel on a stacked Aeolus at {size:?} ({:?})", app.unit_rects[u]);
+            }
+            assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+        }
+        // Other plugins have no stop panel.
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0)); }
+        assert!((0..app.units.len()).all(|u| app.aeolus_rects(u).is_none()));
+    }
+
+    /// In the stacked default rack at 1600x1000 (this laptop's window) every
+    /// stop of every division reads in whole words: short forms, never
+    /// letters cut off with "…". At 1280x800 the chips are ~38 px inside and
+    /// some names are cut; the panel still shows (see above).
+    #[test]
+    fn aeolus_stop_labels_fit_without_cutting_words() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind { *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID); }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ctx = egui::Context::default();
+        let ui = (0..app.units.len()).find(|&u| app.is_aeolus_unit(u)).unwrap();
+        for size in [Vec2::new(1600.0, 1000.0)] {
+            let mut all = Vec::new();
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let a = app.aeolus_rects(ui).unwrap();
+                for (r, name) in a.stops.iter().zip(crate::aeolus::DIVISIONS[d].stops) {
+                    // The width draw_aeolus_face gives the text.
+                    all.push(fit_stop_label(&painter, name, FontId::proportional(10.5), (r.width() - 14.0) * app.xf.sx));
+                }
+            }
+            println!("{size:?}: {all:?}");
+            assert!(all.iter().all(|l| !l.contains('…')), "{size:?}: {all:?}");
+        }
+    }
+
+    /// A division tab shows that division; a stop click with no plugin
+    /// running says so and changes nothing (the plugin's state is the truth).
+    #[test]
+    fn aeolus_tabs_switch_the_division_shown() {
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let click = |app: &mut DemoApp, local: Pos2| {
+            let pos = app.xf.p(local.to_vec2());
+            for ev in [egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }] {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                raw.events = vec![ev];
+                eframe::App::raw_input_hook(app, &ctx, &mut raw);
+                let mut out = ctx.run_ui(raw, |u| app.frame_ui(u));
+                out.textures_delta.clear();
+            }
+        };
+        for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+        assert_eq!(app.aeolus_division(ui), 2, "a fresh face shows Manual I");
+        let pedal = app.aeolus_rects(ui).unwrap().tabs[3];
+        click(&mut app, pedal.center());
+        assert_eq!(app.aeolus_division(ui), 3);
+        assert_eq!(app.aeolus_rects(ui).unwrap().stops.len(), 12, "the pedal's twelve stops");
+        let stop = app.aeolus_rects(ui).unwrap().stops[1];
+        click(&mut app, stop.center());
+        assert!(app.plugin_msg.contains("not running"), "{}", app.plugin_msg);
+        assert_eq!(app.aeolus_faces[&app.units[ui].node_id].drawn, None);
     }
 
     #[test]
@@ -22323,6 +27152,34 @@ mod settings_and_dropdown_tests {
         assert!(texts.iter().any(|(t, _)| t == "set"));
     }
 
+    /// #65: the "New <plugin> rig" confirmation shared the header row with
+    /// the subtitle (right-to-left layout) and was painted over it at 781 px.
+    #[test]
+    fn plugins_header_message_never_overlaps_the_subtitle() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Plugins;
+        app.plugins_loaded = true;
+        app.plugin_msg = "New Aeolus rig \u{2014} Keys\u{2192}Aeolus\u{2192}Master".into();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+            let header: Vec<&(String, Rect)> = texts
+                .iter()
+                .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0 && r.bottom() <= inner.top() + 110.0)
+                .collect();
+            assert!(header.iter().any(|(t, _)| t == "Plugins"), "{size:?}: title painted");
+            assert!(header.iter().any(|(t, _)| t.starts_with("New Aeolus rig")), "{size:?}: message painted: {header:?}");
+            for (i, (a, ra)) in header.iter().enumerate() {
+                assert!(ra.right() <= inner.right() + 1.0, "{size:?}: {a:?} {ra:?} leaves the sheet {inner:?}");
+                for (b, rb) in &header[i + 1..] {
+                    let o = ra.intersect(*rb);
+                    assert!(!(o.width() > 0.5 && o.height() > 0.5), "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn settings_models_and_prefs_reach_assistant_and_fit_narrow_windows() {
         let mut app = DemoApp::new_with_sink(None);
@@ -22335,7 +27192,7 @@ mod settings_and_dropdown_tests {
             assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
             if size.y >= 800.0 {
                 assert!(texts.iter().any(|(t, _)| t == "Chat model"));
-                assert!(texts.iter().any(|(t, _)| t == "Vision model"));
+                assert!(texts.iter().all(|(t, _)| t != "Vision model"), "no vision role: {texts:?}");
                 assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
             }
             for (t, _) in &texts {
@@ -22355,20 +27212,20 @@ mod settings_and_dropdown_tests {
         assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
 
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
-        let vision_dd = texts.iter().find(|(t, _)| t == crate::llm::PERCEIVE_MODEL).expect("Perceive dropdown").1.center();
-        let _ = open_dropdown(&mut app, &ctx, size, vision_dd);
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("Act dropdown").1.center();
+        let _ = open_dropdown(&mut app, &ctx, size, act_dd);
         assert!(egui::Popup::is_any_open(&ctx));
         run_frame(&mut app, &ctx, size, key(Key::Escape));
         assert!(!egui::Popup::is_any_open(&ctx));
         assert_eq!(app.stage_view, StageView::Settings, "first Esc closes dropdown, keeps Settings open");
 
-        app.settings_perceive_input = "openai/gpt-5.4".into();
+        app.settings_act_input = "openai/gpt-5.4".into();
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
         applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        assert_eq!(applies.len(), 3);
-        click_at(&mut app, &ctx, size, applies[2].center());
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Perceive).model, "openai/gpt-5.4");
+        assert_eq!(applies.len(), 2);
+        click_at(&mut app, &ctx, size, applies[1].center());
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, "openai/gpt-5.4");
 
         assert!(app.assistant.decide_enabled());
         assert!(!app.reduce_motion);
@@ -22400,7 +27257,1347 @@ mod settings_and_dropdown_tests {
 }
 
 /// The app hosting real Surge XT voices on an offline engine (`EvalRig`).
+/// Mixer parity (#72/#73/#74/#77) on the offline app: no engine, no plugins —
+/// the mirror and the graph edits are the test surface. The engine halves
+/// (per-source gains, bypass, master inserts) are covered by `rig-mix-test`.
+#[cfg(test)]
+mod mixer_parity_tests {
+    use super::*;
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+    }
+
+    fn click(pos: Pos2) -> Vec<Vec<egui::Event>> {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        vec![vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]]
+    }
+
+    fn drag(from: Pos2, to: Pos2, frames: usize) -> Vec<Vec<egui::Event>> {
+        let b = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let mut evs = vec![vec![egui::Event::PointerMoved(from)], vec![b(from, true)]];
+        for i in 1..=frames {
+            let t = Pos2::new(from.x + (to.x - from.x) * i as f32 / frames as f32, from.y + (to.y - from.y) * i as f32 / frames as f32);
+            evs.push(vec![egui::Event::PointerMoved(t)]);
+        }
+        evs.push(vec![b(to, false)]);
+        evs
+    }
+
+    fn key(key: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// The demo patch (each Surge feeds a delay AND the master: custom), a
+    /// linear patch (Surge → Delay → Reverb → Master: a strip with inserts),
+    /// or a two-rig demo.
+    enum Rack {
+        Demo,
+        Linear,
+        TwoRigs,
+    }
+
+    fn app_with(rack: Rack) -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        match rack {
+            Rack::Demo => app.load_demo_patch(),
+            Rack::TwoRigs => app.load_multi_rig_demo(),
+            Rack::Linear => {
+                let mut g = Graph::default();
+                g.reserve(16, 16);
+                let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+                let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+                g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+                g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(4, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                app.apply_session(&crate::session::Session::new("linear", g)).unwrap();
+            }
+        }
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx)
+    }
+
+    fn open_mixer(app: &mut DemoApp, ctx: &egui::Context) {
+        app.stage_view = StageView::Mixer;
+        for _ in 0..2 { frame(app, ctx, vec![]); }
+    }
+
+    /// The first source strip's (rig, node, rect) in the mixer.
+    fn first_strip(app: &DemoApp) -> (u8, u32, Rect) {
+        app.mixer_strip_rects.iter().copied().next().expect("a source strip")
+    }
+
+    // ---- #72: dB faders --------------------------------------------------
+
+    #[test]
+    fn fader_position_and_db_round_trip() {
+        // The fader rides the meters' own dB curve (issue #72).
+        for gain in [1.0f32, 0.9, 0.85, 0.5, 10f32.powf(-12.0 / 20.0), 10f32.powf(-40.0 / 20.0), 0.003] {
+            let pos = fader_pos(gain);
+            assert!((fader_gain(pos) - gain).abs() < gain * 1e-4, "pos {pos} of gain {gain} reads back {}", fader_gain(pos));
+        }
+        // Unity is the top of the travel; silence the bottom.
+        assert_eq!(fader_pos(1.0), 1.0);
+        assert_eq!(fader_gain(fader_pos(0.5)), 0.5);
+        assert_eq!(fader_gain(0.0), 0.0);
+        assert_eq!(fader_pos(0.0), 0.0);
+        // Readouts (#72): `−3.2 dB`, `0 dB` at unity, `−∞` when silent.
+        assert_eq!(db_readout(1.0), "0 dB");
+        assert_eq!(db_readout(0.0), "\u{2212}\u{221e}");
+        assert_eq!(db_readout(10f32.powf(-3.2 / 20.0)), "\u{2212}3.2 dB");
+    }
+
+    #[test]
+    fn bus_fader_double_click_is_exact_unity_and_the_detent_snaps() {
+        let (mut app, ctx) = app_with(Rack::Demo);
+        app.rig_mix[0].vol = 0.5;
+        open_mixer(&mut app, &ctx);
+        // Double-click: exactly 0 dB (issue #72).
+        let fader = app.mixer_fader_rects[0].center();
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(app.rig_mix[0].vol, 1.0, "double-click gives exactly unity gain");
+        // Dragging into the detent zone snaps to unity too.
+        app.rig_mix[0].vol = 0.5;
+        open_mixer(&mut app, &ctx);
+        let fader = app.mixer_fader_rects[0].center();
+        // 0.5 sits at pos 0.9; drag near the top (pos ≥ 0.985 = the detent).
+        let top = Rect::from_min_size(app.mixer_fader_rects[0].min, egui::vec2(8.0, 8.0));
+        for ev in drag(fader, top.center(), 6) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.rig_mix[0].vol, 1.0, "the detent snaps the fader to 0 dB ({})", app.rig_mix[0].vol);
+    }
+
+    #[test]
+    fn source_fader_moves_the_level_knob_on_the_db_curve() {
+        let (mut app, ctx) = app_with(Rack::Demo);
+        open_mixer(&mut app, &ctx);
+        let (_, node, _) = first_strip(&app);
+        let unit = app.units.iter().position(|u| u.node_id == node).unwrap();
+        let k = app.units[unit].knob_index("LEVEL").expect("Surge's LEVEL knob");
+        let start = app.units[unit].knobs[k].value;
+        assert!(start < 1.0, "the demo starts below unity ({start})");
+        // Drag the fader all the way up: the unity detent gives exactly 0 dB.
+        let (_, mr) = app.mixer_meter_rects.iter().copied().find(|(key, _)| *key == node).expect("the strip's meter");
+        let x = mr.left() - 25.0;
+        for ev in drag(Pos2::new(x, mr.bottom() - 10.0), Pos2::new(x, mr.top() + 4.0), 8) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.units[unit].knobs[k].value, 1.0, "a full pull lands on the 0 dB detent");
+        // And back down to silence: the bottom of the travel is −∞.
+        for ev in drag(Pos2::new(x, mr.top() + 4.0), Pos2::new(x, mr.bottom() + 30.0), 8) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.units[unit].knobs[k].value, 0.0, "a fully closed fader is −∞");
+    }
+
+    #[test]
+    fn peak_hold_lights_decays_and_the_clip_latch_clears_on_click() {
+        // The semantics of one strip meter (#72), deterministically.
+        let mut ph = PeakHold::new();
+        peak_hold_update(&mut ph, 0.5, 1.0, 1.0 / 60.0);
+        assert!(ph.held > 0.6, "a loud block lights the hold");
+        assert!(!ph.clip, "half level is no clip");
+        // The hold stays ~1.5 s while the signal falls.
+        peak_hold_update(&mut ph, 0.0, 1.0 + 1.0, 1.0 / 60.0);
+        let held_before = ph.held;
+        assert_eq!(ph.held, held_before, "inside the window the peak stays held");
+        // After the window it relaxes with the signal.
+        for t in 0..180 {
+            peak_hold_update(&mut ph, 0.0, 2.0 + t as f32 / 60.0, 1.0 / 60.0);
+        }
+        assert!(ph.held < 0.1, "the peak fell back ({})", ph.held);
+        // Clip: latched at 0 dBFS, cleared only by hand.
+        peak_hold_update(&mut ph, 1.0, 5.0, 1.0 / 60.0);
+        assert!(ph.clip, "0 dBFS latches the clip light");
+        peak_hold_update(&mut ph, 0.0, 6.0, 1.0 / 60.0);
+        assert!(ph.clip, "falling does not clear it");
+        ph.clip = false; // the click
+        peak_hold_update(&mut ph, 0.0, 7.0, 1.0 / 60.0);
+        assert!(!ph.clip, "a click clears the light");
+    }
+
+    #[test]
+    fn the_masters_clip_light_is_clickable_at_every_size() {
+        // Rule 64: narrow windows are tested by clicking. The clip latch
+        // clears on a click at the default AND the smallest sizes.
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let (mut app, ctx) = app_with(Rack::Demo);
+            app.mixer_peaks.insert(MASTER_STRIP_KEY, PeakHold { held: 1.0, at: -1.0, clip: true });
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            app.stage_view = StageView::Mixer;
+            for _ in 0..2 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+                raw.time = Some(app.ui_time as f64 + 1.0);
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            }
+            let (_, mr) = app.mixer_meter_rects.iter().copied().find(|(k, _)| *k == MASTER_STRIP_KEY).expect("the master meter");
+            let clip_pos = Pos2::new(mr.left() + 4.0, mr.top() - 4.0);
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+            for ev in click(clip_pos).into_iter().flatten() { raw.events.push(ev); }
+            raw.time = Some(app.ui_time as f64 + 2.0);
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            assert!(!app.mixer_peaks.get(&MASTER_STRIP_KEY).unwrap().clip, "{w}x{h}: the clip light clears on a click");
+        }
+    }
+
+    // ---- #74: insert slots (a view of the cable chain) -------------------
+
+    #[test]
+    fn strips_list_their_linear_chain_and_say_custom_for_branches() {
+        // A linear chain names its FX in order (issue #74).
+        let (app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let chain = app.strip_chain(surge).expect("the linear patch is a linear chain");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["DELAY", "REVERB"], "{names:?}");
+        // The demo patch's dry path (Surge → Delay AND Surge → Master) is
+        // custom: shown, never guessed.
+        let (app, _ctx) = app_with(Rack::Demo);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        assert!(app.strip_chain(surge).is_none(), "the dry path must read as custom wiring");
+    }
+
+    #[test]
+    fn add_remove_and_move_inserts_rewire_the_cables() {
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let before: Vec<(u32, u32)> = app.cables.iter().filter(|c| c.kind == PortKind::Audio && c.src == surge).map(|c| (app.units[c.dst].node_id, 1)).collect();
+        let _ = before;
+
+        // ADD: a Filter lands at the chain's end, before the rig bus.
+        let msg = app.strip_insert_edit(source, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Filter),
+            name: "FILTER".into(),
+        }).expect("the insert edit applies");
+        assert!(msg.contains("Filter"), "{msg}");
+        let chain = app.strip_chain(surge).expect("still linear");
+        assert_eq!(chain.len(), 3, "delay + reverb + the new filter");
+        assert_eq!(app.units[chain[2]].name, "FILTER");
+        // The rack cables moved: delay → reverb → filter → master.
+        let nodes: Vec<u32> = std::iter::once(source)
+            .chain(chain.iter().map(|&u| app.units[u].node_id))
+            .collect();
+        for pair in nodes.windows(2) {
+            assert!(
+                app.cables.iter().any(|c| c.kind == PortKind::Audio
+                    && app.units.get(c.src).map(|u| u.node_id) == Some(pair[0])
+                    && app.units.get(c.dst).map(|u| u.node_id) == Some(pair[1])),
+                "no cable {} → {} after the add ({:?})", pair[0], pair[1], app.cables.iter().map(|c| (c.src, c.dst)).collect::<Vec<_>>()
+            );
+        }
+
+        // MOVE: the filter jumps to slot 1 (before the delay).
+        let filter = app.units[chain[2]].node_id;
+        app.strip_insert_edit(source, StripInsertEdit::Move { fx: filter, to: 1 }).expect("the move applies");
+        let chain = app.strip_chain(surge).expect("still linear after the move");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["FILTER", "DELAY", "REVERB"], "reorder changed the chain: {names:?}");
+        // And the sound follows the cables: filter → delay now.
+        let (f, d) = (app.units[chain[0]].node_id, app.units[chain[1]].node_id);
+        assert!(app.cables.iter().any(|c| c.kind == PortKind::Audio && app.units[c.src].node_id == f && app.units[c.dst].node_id == d),
+            "the cables follow the reorder");
+
+        // REMOVE: the chain closes up.
+        app.strip_insert_edit(source, StripInsertEdit::Remove { fx: filter }).expect("the remove applies");
+        let chain = app.strip_chain(surge).expect("still linear after the remove");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["DELAY", "REVERB"]);
+        assert!(!app.units.iter().any(|u| u.node_id == filter), "the FX node is gone");
+    }
+
+    #[test]
+    fn a_custom_strip_refuses_insert_edits_instead_of_guessing() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let err = app.strip_insert_edit(source, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Reverb),
+            name: "REVERB".into(),
+        }).expect_err("custom wiring must refuse");
+        assert!(err.contains("custom"), "the error names the situation: {err}");
+    }
+
+    #[test]
+    fn master_inserts_are_cables_from_the_master_out() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        // Add a master insert: a cable Master OUT → FX.
+        let msg = app.master_insert_edit(StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Gain),
+            name: "GAIN".into(),
+        }).expect("the master insert applies");
+        assert!(msg.contains("master insert"), "{msg}");
+        let chain = app.master_chain();
+        assert_eq!(chain.len(), 1, "one master insert");
+        let master_node = app.units[app.master_unit.unwrap()].node_id;
+        let fx = chain[0];
+        assert!(app.cables.iter().any(|c| app.units.get(c.src).map(|u| u.node_id) == Some(master_node) && c.dst == fx),
+            "the insert is a cable Master OUT → FX");
+        // Bypassing it is the strip's own row (#74).
+        let node = app.units[fx].node_id;
+        let out = app.exec_tool("set_node_bypass", &serde_json::json!({ "node": node, "bypass": true }));
+        assert!(out.contains("bypass true"), "{out}");
+        assert!(app.strip_row(node).bypass, "the mirror latched the bypass");
+        // Removing it closes the chain (nothing left).
+        app.master_insert_edit(StripInsertEdit::Remove { fx: node }).expect("the remove applies");
+        assert!(app.master_chain().is_empty(), "the master chain is empty again");
+    }
+
+    // ---- #73: per-source mute/solo/pan ------------------------------------
+
+    #[test]
+    fn strip_mix_tools_reach_the_mirror_and_name_the_source() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        // The agent tool (#73, rules 6/23).
+        let out = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": node, "mute": true, "pan": -0.5 }));
+        assert!(out.contains("mute true"), "{out}");
+        assert!(out.contains("pan -0.50"), "{out}");
+        let row = app.strip_row(node);
+        assert!(row.mute && (row.pan + 0.5).abs() < 1e-6, "the mirror holds pan/mute");
+        // A node that is not there says so (rule 77: the model can correct).
+        let bad = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": 999, "mute": true }));
+        assert!(bad.contains("no unit with node id 999"), "{bad}");
+        // Soloing one source is scoped to its rig.
+        let (mut app, _ctx) = app_with(Rack::TwoRigs);
+        let nodes: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        assert_eq!(nodes.len(), 2, "one source per rig");
+        let _ = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nodes[0], "solo": true }));
+        assert!(app.strip_row(nodes[0]).solo);
+        assert!(!app.strip_row(nodes[1]).solo, "the other rig's source is untouched");
+    }
+
+    #[test]
+    fn a_remote_strip_edit_updates_the_mixer_mirror() {
+        // Rule 33: every engine state the UI shows is published back. The app
+        // adopts a published strip table without an engine of its own.
+        let (mut app, ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let pub_: Arc<Mutex<crate::engine::GraphPub>> = Arc::new(Mutex::new(crate::engine::GraphPub {
+            strips: crate::engine::strips_pub_table(&[(node, crate::engine::StripMix { pan: 0.25, mute: true, solo: false, bypass: false })]),
+            mix_rev: 7,
+            ..Default::default()
+        }));
+        app.graph_pub = Some(pub_);
+        app.stage_view = StageView::Rack; // the adoption runs in every view
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let row = app.strip_row(node);
+        assert!(row.mute && (row.pan - 0.25).abs() < 1e-6, "the mirror adopted the published strip ({:?})", row);
+        assert!(app.agent_activity.log.iter().any(|a| a.summary.contains("Source mix") || a.summary.contains("Mix")), "a remote mix edit is attributed");
+    }
+
+    // ---- #77: names, colours, order, collapse ----------------------------
+
+    #[test]
+    fn strip_names_and_colours_survive_a_session_round_trip() {
+        // Rule 65 + issue #77 acceptance: names and colours survive
+        // save/load — tested with NON-default values (rule 59 class).
+        let (mut app, _ctx) = app_with(Rack::TwoRigs);
+        let nodes: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        let amber = egui::Color32::from_rgb(0xE2, 0xA6, 0x4E);
+        app.apply_strip_name(nodes[0], "Bass wurli").unwrap();
+        app.with_strip_row(nodes[0], |r| {
+            r.mute = true;
+            r.pan = -0.35;
+            r.color = Some(amber);
+            r.collapsed = true;
+        });
+        app.reorder_strip(0, nodes[0], nodes[1]); // display order: B first
+
+        let saved = app.capture_session("parity").unwrap();
+        // Wipe: a fresh rack, then reload.
+        app.load_demo_patch();
+        assert!(app.strips.is_empty() || !app.strip_row(nodes[0]).mute, "the demo patch reset the strips");
+        app.apply_session(&saved).unwrap();
+
+        assert!(app.units.iter().any(|u| u.name == "Bass wurli"), "the strip name survived the round trip");
+        let row = app.strip_row(nodes[0]);
+        assert!(row.mute && (row.pan + 0.35).abs() < 1e-6, "pan/mute survived: {row:?}");
+        assert_eq!(row.color, Some(amber), "the colour survived");
+        assert!(row.collapsed, "the collapse flag survived");
+        assert_eq!(app.strip_order, vec![nodes[0], nodes[1]], "the display order survived");
+    }
+
+    #[test]
+    fn undo_restores_strip_state_with_non_default_values() {
+        // Rule 59: the undo snapshot holds everything, tested with values
+        // that differ from the defaults.
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.with_strip_row(node, |r| {
+            r.mute = true;
+            r.color = Some(egui::Color32::from_rgb(0xD9, 0x8B, 0xA0));
+        });
+        app.note_agent_change(AgentOrigin::Assistant);
+        // Then a later job changes them.
+        app.with_strip_row(node, |r| {
+            r.mute = false;
+            r.color = None;
+        });
+        let out = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(out.contains("undid"), "{out}");
+        let row = app.strip_row(node);
+        assert!(row.mute, "undo restored the mute");
+        assert_eq!(row.color, Some(egui::Color32::from_rgb(0xD9, 0x8B, 0xA0)), "undo restored the colour");
+    }
+
+    #[test]
+    fn renaming_a_strip_renames_the_rack_face_and_the_graph() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let out = app.exec_tool("rename_strip", &serde_json::json!({ "node": node, "name": "Lead" }));
+        assert!(out.contains("renamed"), "{out}");
+        assert!(app.units.iter().any(|u| u.node_id == node && u.name == "Lead"), "the face shows the new name");
+        assert_eq!(name_str(&app.base_graph.node(node).unwrap().name), "Lead", "the graph carries it (so sessions do)");
+        // Empty names are refused.
+        let bad = app.exec_tool("rename_strip", &serde_json::json!({ "node": node, "name": "  " }));
+        assert!(bad.contains("needs a name"), "{bad}");
+    }
+
+    /// A rig with TWO sources sharing one master: move/collapse need it.
+    fn two_source_app() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for name in ["SURGE A", "SURGE B"] {
+            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(name));
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+            g.connect_with_id(edge, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        }
+        app.apply_session(&crate::session::Session::new("two sources", g)).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx)
+    }
+
+    #[test]
+    fn colours_move_and_collapse_shape_the_strip() {
+        let (mut app, ctx) = two_source_app();
+        open_mixer(&mut app, &ctx);
+        let strips: Vec<(u8, u32, Rect)> = app.mixer_strip_rects.clone();
+        assert_eq!(strips.len(), 2, "two source strips");
+        let (a, b) = (strips[0].1, strips[1].1);
+        // Colour (a palette word), collapse (the agent tools).
+        let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": a, "color": "amber" }));
+        assert!(out.contains("#E2A64E"), "{out}");
+        let out = app.exec_tool("collapse_strip", &serde_json::json!({ "node": a }));
+        assert!(out.contains("collapsed"), "{out}");
+        frame(&mut app, &ctx, vec![]);
+        let rect = app.mixer_strip_rects.iter().copied().find(|(_, n, _)| *n == a).expect("the collapsed strip");
+        assert!(rect.2.width() < 60.0, "a collapsed strip is the mini form ({})", rect.2.width());
+        let full = app.mixer_strip_rects.iter().copied().find(|(_, n, _)| *n == b).expect("the other strip");
+        assert!(full.2.width() > 100.0, "the uncollapsed strip keeps its width");
+        // Move: display order within the rig.
+        let out = app.exec_tool("move_strip", &serde_json::json!({ "node": a, "to": 2 }));
+        assert!(out.contains("slot 2"), "{out}");
+        assert_eq!(app.rig_strip_sources(0).iter().map(|&u| app.units[u].node_id).collect::<Vec<_>>(), vec![b, a],
+            "the strip moved to slot 2");
+    }
+
+    /// A populated mixer (inserts, colours, collapse, mute, pan, a master
+    /// insert) written as PNGs for the PR's evidence:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_parity_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_parity_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(24, 24);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for s in [a, b, c] {
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+        }
+        g.connect_with_id(edge, PortRef { node: a, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("mixer shots", g)).unwrap();
+        let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.strip_insert_edit(na, StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Reverb), name: "REVERB".into() }).unwrap();
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.master_insert_edit(StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Gain), name: "GAIN".into() }).unwrap();
+        app.apply_strip_name(na, "Bass wurli").unwrap();
+        app.apply_strip_name(nb, "Pad").unwrap();
+        for (n, hex) in [(na, "amber"), (nb, "rose")] {
+            let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": n, "color": hex }));
+            assert!(out.contains('#'), "{out}");
+        }
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": na, "pan": -0.35 }));
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nb, "mute": true }));
+        app.exec_tool("collapse_strip", &serde_json::json!({ "node": nc }));
+        for (i, u) in app.units.iter_mut().enumerate() {
+            if let Some(k) = u.knob_index("LEVEL") { u.knobs[k].set_immediate([0.8, 0.55, 0.9, 0.4][i % 4]); }
+        }
+        app.stage_view = StageView::Mixer;
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
+    }
+
+    #[test]
+    fn dragging_a_strip_name_reorders_it_live() {
+        let (mut app, ctx) = two_source_app();
+        open_mixer(&mut app, &ctx);
+        let strips: Vec<(u8, u32, Rect)> = app.mixer_strip_rects.clone();
+        assert_eq!(strips.len(), 2, "two source strips");
+        let (a, b) = (strips[0], strips[1]);
+        // Drag A's NAME (the strip's top row) onto B: A takes B's place.
+        let name_a = Pos2::new(a.2.center().x, a.2.top() + 10.0);
+        let over_b = b.2.center();
+        for ev in drag(name_a, over_b, 8) { frame(&mut app, &ctx, ev); }
+        let order: Vec<u32> = app.rig_strip_sources(0).iter().map(|&u| app.units[u].node_id).collect();
+        assert_eq!(order, vec![b.1, a.1], "dragging the name moved the strip: {order:?}");
+    }
+
+    #[test]
+    fn the_insert_picker_is_a_view_not_a_second_model() {
+        // #74's design line: the slots ARE the cables. A bypassed insert
+        // keeps its node and its cables.
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let node = app.strip_chain(surge).unwrap()[0];
+        let node_id = app.units[node].node_id;
+        let cables = app.cables.len();
+        let _ = app.exec_tool("set_node_bypass", &serde_json::json!({ "node": node_id, "bypass": true }));
+        assert_eq!(app.cables.len(), cables, "bypassing changes no cable");
+        assert!(app.units.iter().any(|u| u.node_id == node_id), "the FX node stays");
+        assert!(app.strip_chain(surge).is_some(), "the chain view is unchanged");
+        let _ = source;
+    }
+
+    // ---- #107: assignable quick knob per plugin in mixer strips -----------
+
+    fn run_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        run_at_clipped(app, ctx, size, time, events).into_iter().map(|(t, r, _)| (t, r)).collect()
+    }
+
+    /// One frame's painted texts: (text, rect, the clip rect it is painted in).
+    fn run_at_clipped(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(time);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, clip: Rect, out: &mut Vec<(String, Rect, Rect)>) {
+            match s {
+                egui::Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => {
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect(), clip));
+                }
+                egui::Shape::Vec(v) => for x in v { collect(x, clip, out); }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes { collect(&cs.shape, cs.clip_rect, &mut texts); }
+        texts
+    }
+
+    #[test]
+    fn quick_knob_defaults_and_explicit_resolution() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let filt = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("FILTER"));
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRO"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: verb, port: 0 }, PortRef { node: filt, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(5, PortRef { node: filt, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(6, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("qk", g)).unwrap();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+
+        let unit_of = |app: &DemoApp, nid: u32| app.units.iter().position(|u| u.node_id == nid).unwrap();
+        let label_of = |app: &DemoApp, nid: u32| {
+            let ui = unit_of(app, nid);
+            app.quick_knob(ui).map(|ki| app.units[ui].knobs[ki].label.clone())
+        };
+
+        assert_eq!(label_of(&app, surge).as_deref(), Some("CUTOFF"), "plugin unit defaults to its first main control");
+        assert_eq!(label_of(&app, verb).as_deref(), Some("MIX"), "reverb defaults to MIX");
+        assert_eq!(label_of(&app, delay).as_deref(), Some("MIX"), "delay defaults to MIX even though TIME is first");
+        assert_eq!(label_of(&app, filt).as_deref(), Some("CUTOFF"), "effect without MIX defaults to its first knob");
+        assert_eq!(label_of(&app, metro), None, "knob-less unit resolves to None");
+
+        // Explicit choice wins, even when narrow rack faces hide main knobs.
+        app.unit_rects = vec![Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 160.0)); app.units.len()];
+        app.fit_plugin_knobs();
+        app.strip_knobs.insert(surge, "OSC 1 VOL".into());
+        assert_eq!(label_of(&app, surge).as_deref(), Some("OSC 1 VOL"));
+        app.strip_knobs.insert(verb, "SIZE".into());
+        assert_eq!(label_of(&app, verb).as_deref(), Some("SIZE"));
+        // Stale/missing choice falls back to the default.
+        app.strip_knobs.insert(verb, "NONEXISTENT".into());
+        assert_eq!(label_of(&app, verb).as_deref(), Some("MIX"));
+    }
+
+    #[test]
+    fn dragging_and_double_clicking_a_strip_quick_knob_drives_the_rack_and_engine() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        open_mixer(&mut app, &ctx);
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+
+        let verb_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap();
+        let verb_node = app.units[verb_ui].node_id;
+        let mix_ki = app.units[verb_ui].knob_index("MIX").unwrap();
+        let start_val = app.units[verb_ui].knobs[mix_ki].display_value;
+        let kr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == verb_node).expect("reverb quick knob").1;
+
+        for ev in drag(kr.center(), Pos2::new(kr.center().x, kr.center().y - 35.0), 6) {
+            frame(&mut app, &ctx, ev);
+        }
+        let after_val = app.units[verb_ui].knobs[mix_ki].display_value;
+        assert!(after_val > start_val + 0.1, "dragging quick knob moves rack knob display_value ({start_val} -> {after_val})");
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Command::SetParam { node, param: 0, value } if *node == verb_node && (*value - after_val as f64).abs() < 1e-4)),
+            "engine received SetParam for reverb MIX ({cmds:?})"
+        );
+
+        // Double-click resets to the rack knob's default.
+        let mut t = 10.0;
+        let size = Vec2::new(1600.0, 1000.0);
+        let c = kr.center();
+        for ev in [
+            vec![egui::Event::PointerMoved(c)],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE }],
+            vec![egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }],
+        ] {
+            t += 0.05;
+            run_at(&mut app, &ctx, size, t, ev);
+        }
+        let def = app.units[verb_ui].knobs[mix_ki].default;
+        assert!((app.units[verb_ui].knobs[mix_ki].display_value - def).abs() < 1e-5,
+            "double-click resets quick knob to default {def}, got {}", app.units[verb_ui].knobs[mix_ki].display_value);
+
+        // Dragging Surge's quick knob moves its first main control display_value.
+        let surge_ui = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let surge_node = app.units[surge_ui].node_id;
+        let sr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == surge_node).expect("surge quick knob").1;
+        let s_before = app.units[surge_ui].knobs[0].display_value;
+        for ev in drag(sr.center(), Pos2::new(sr.center().x, sr.center().y - 30.0), 6) {
+            frame(&mut app, &ctx, ev);
+        }
+        assert!(app.units[surge_ui].knobs[0].display_value > s_before + 0.1, "source quick knob drives first main control");
+    }
+
+    #[test]
+    fn right_click_pick_persists_across_session_round_trip_and_rig_add() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        app.stage_view = StageView::Mixer;
+        let size = Vec2::new(1600.0, 1000.0);
+        for i in 0..3 { run_at(&mut app, &ctx, size, i as f64, vec![]); }
+
+        let verb_node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        let kr = app.mixer_quick_knob_rects.iter().copied().find(|(n, _)| *n == verb_node).expect("reverb quick knob").1;
+
+        // Right-click opens theme::Dropdown listing the unit's knobs (rule 101: advance time).
+        run_at(&mut app, &ctx, size, 4.0, vec![egui::Event::PointerMoved(kr.center())]);
+        run_at(&mut app, &ctx, size, 4.1, vec![egui::Event::PointerButton {
+            pos: kr.center(), button: egui::PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        run_at(&mut app, &ctx, size, 4.2, vec![egui::Event::PointerButton {
+            pos: kr.center(), button: egui::PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        let texts = run_at(&mut app, &ctx, size, 5.0, vec![]);
+        assert!(egui::Popup::is_any_open(&ctx), "right-click opened quick-knob dropdown");
+        let size_pos = texts.iter().find(|(t, _)| t == "SIZE").expect("SIZE choice in dropdown").1.center();
+
+        // Click "SIZE" in the dropdown.
+        run_at(&mut app, &ctx, size, 5.1, vec![egui::Event::PointerMoved(size_pos)]);
+        run_at(&mut app, &ctx, size, 5.2, vec![egui::Event::PointerButton {
+            pos: size_pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        run_at(&mut app, &ctx, size, 5.3, vec![egui::Event::PointerButton {
+            pos: size_pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(app.strip_knobs.get(&verb_node).map(String::as_str), Some("SIZE"), "right-click pick stored choice");
+
+        // Session round-trip.
+        let saved = app.capture_session("quick-round-trip").unwrap();
+        app.load_demo_patch();
+        assert!(!app.strip_knobs.contains_key(&verb_node), "fresh patch has no override");
+        app.apply_session(&saved).unwrap();
+        assert_eq!(app.strip_knobs.get(&verb_node).map(String::as_str), Some("SIZE"), "session round-trip restored quick knob");
+
+        // Rig add + node-id renumbering (rule 44/106): add a second rig, put an
+        // explicit choice on Rig B's surge, then grow Rig A so Rig B's node ids shift.
+        app.edit_rigs(None);
+        let rig_b_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let rig_a_surge = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.strip_knobs.insert(rig_b_surge, "LEVEL".into());
+        app.strip_insert_edit(rig_a_surge, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Gain),
+            name: "GAIN".into(),
+        }).unwrap();
+        let new_rig_b_surge = app.units.iter().find(|u| u.rig == 1 && matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        assert_ne!(new_rig_b_surge, rig_b_surge, "growing Rig A renumbered Rig B's node ids");
+        assert_eq!(app.strip_knobs.get(&new_rig_b_surge).map(String::as_str), Some("LEVEL"),
+            "quick knob followed Rig B's surge to its new node id {new_rig_b_surge}: {:?}", app.strip_knobs);
+        let new_verb = app.units.iter().find(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        assert_eq!(app.strip_knobs.get(&new_verb).map(String::as_str), Some("SIZE"),
+            "Rig A's reverb choice survived rig edits too");
+    }
+
+    #[test]
+    fn strip_quick_knob_tools_read_and_update_assignments() {
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let verb = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Reverb))).unwrap().node_id;
+        let surge = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+
+        let list: serde_json::Value = serde_json::from_str(&app.exec_tool("get_strip_knobs", &serde_json::json!({}))).unwrap();
+        let strips = list["strips"].as_array().unwrap();
+        let v_entry = strips.iter().find(|s| s["node"] == verb).expect("reverb reported");
+        assert_eq!(v_entry["knob"], "MIX");
+        assert_eq!(v_entry["custom"], false);
+        let s_entry = strips.iter().find(|s| s["node"] == surge).expect("surge reported");
+        assert_eq!(s_entry["knob"], "CUTOFF");
+
+        let set_out = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "SIZE" }));
+        assert!(set_out.contains("SIZE"), "{set_out}");
+        let one: serde_json::Value = serde_json::from_str(&app.exec_tool("get_strip_knobs", &serde_json::json!({ "node": verb }))).unwrap();
+        assert_eq!(one["strips"][0]["knob"], "SIZE");
+        assert_eq!(one["strips"][0]["custom"], true);
+
+        // Empty string resets back to default.
+        let reset_out = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "" }));
+        assert!(reset_out.contains("default"), "{reset_out}");
+        assert!(!app.strip_knobs.contains_key(&verb));
+
+        let bad_knob = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": verb, "knob": "BOGUS" }));
+        assert!(bad_knob.contains("no knob 'BOGUS'"), "{bad_knob}");
+        let bad_node = app.exec_tool("set_strip_knob", &serde_json::json!({ "node": 999, "knob": "MIX" }));
+        assert!(bad_node.contains("no unit with node id 999"), "{bad_node}");
+
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|v| v.as_str()))
+            .collect();
+        for name in ["get_strip_knobs", "set_strip_knob"] {
+            assert!(names.contains(&name), "assistant::tools missing {name}");
+            assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
+        }
+        assert!(tool_is_read_only("get_strip_knobs"));
+        assert!(!tool_is_read_only("set_strip_knob"));
+    }
+
+    #[test]
+    fn mixer_with_inserts_and_quick_knobs_fits_narrow_windows() {
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let (mut app, ctx) = app_with(Rack::Linear);
+            super::main_control_tests::give_clap_units_main_knobs(&mut app);
+            app.stage_view = StageView::Mixer;
+            let size = Vec2::new(w, h);
+            let mut clipped = Vec::new();
+            for i in 0..4 {
+                clipped = run_at_clipped(&mut app, &ctx, size, i as f64, vec![]);
+            }
+            assert_eq!(app.mixer_quick_knob_rects.len(), 3, "{w}x{h}: source + 2 inserts draw quick knobs");
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            for (text, rect, clip) in &clipped {
+                assert!(screen.expand(0.5).contains_rect(*rect), "{w}x{h}: '{text}' leaves window: {rect:?}");
+                assert!(clip.expand(0.5).contains_rect(*rect), "{w}x{h}: '{text}' {rect:?} is cut off by its clip {clip:?}");
+            }
+            // Slot content keeps clear of the colour spine and the strip edge
+            // (rules 7, 52): knobs, captions and plate names alike.
+            let (_, src_node, strip) = *app.mixer_strip_rects.iter()
+                .find(|(_, n, _)| app.mixer_quick_knob_rects.iter().any(|(k, _)| k == n))
+                .expect("the source strip with a quick knob");
+            let inner = Rect::from_min_max(
+                Pos2::new(strip.left() + STRIP_SPINE_W + 6.0, strip.top()),
+                Pos2::new(strip.right(), strip.bottom()),
+            );
+            let knobs: Vec<Rect> = app.mixer_quick_knob_rects.iter().map(|(_, r)| *r)
+                .filter(|r| strip.intersects(*r)).collect();
+            assert_eq!(knobs.len(), 3, "{w}x{h}: the source and its 2 inserts have knobs in strip {src_node}");
+            for k in &knobs {
+                assert!(inner.contains_rect(*k), "{w}x{h}: quick knob {k:?} outside {inner:?}");
+                assert!(k.height() <= 20.0, "{w}x{h}: slot rows keep the 20 px insert pitch, knob box {k:?}");
+            }
+            let row_band = Rect::from_min_max(Pos2::new(strip.left(), knobs[0].top()), Pos2::new(strip.right(), knobs[2].bottom()));
+            let slot_texts: Vec<&(String, Rect, Rect)> = clipped.iter()
+                .filter(|(_, r, _)| row_band.contains(r.center())).collect();
+            for want in ["Surge xt", "CUTOFF", "1 Delay", "2 Reverb", "MIX"] {
+                assert!(slot_texts.iter().any(|(t, _, _)| t == want), "{w}x{h}: '{want}' shown in full in the slot rows: {slot_texts:?}");
+            }
+            // egui skips painting widgets outside the clip, so check the strips
+            // themselves against the sheet's scroll clip.
+            let sheet_clip = slot_texts.iter().find(|(t, _, _)| t == "Surge xt").unwrap().2;
+            for (_, n, r) in &app.mixer_strip_rects {
+                assert!(r.bottom() <= sheet_clip.bottom() + 0.5,
+                    "{w}x{h}: strip {n} {r:?} runs past the sheet {sheet_clip:?}; its M/S are cut off");
+            }
+            for (t, r, _) in &slot_texts {
+                assert!(inner.contains_rect(*r), "{w}x{h}: slot text '{t}' {r:?} touches the spine or edge of {inner:?}");
+            }
+            for (t, r, _) in slot_texts.iter().filter(|(t, _, _)| t == "CUTOFF" || t == "MIX") {
+                let k = knobs.iter().find(|k| k.y_range().contains(r.center().y)).expect("a knob in the caption's row");
+                assert!(r.right() <= k.left() && k.left() - r.right() < 12.0,
+                    "{w}x{h}: caption '{t}' {r:?} sits right beside its knob {k:?}");
+            }
+            let texts: Vec<(String, Rect)> = clipped.iter().map(|(t, r, _)| (t.clone(), *r)).collect();
+            for i in 0..texts.len() {
+                for j in i + 1..texts.len() {
+                    let o = texts[i].1.intersect(texts[j].1);
+                    assert!(!(o.width() > 1.0 && o.height() > 1.0),
+                        "{w}x{h}: '{}' {:?} overlaps '{}' {:?}", texts[i].0, texts[i].1, texts[j].0, texts[j].1);
+                }
+            }
+        }
+    }
+
+    /// Mixer with Surge source + Reverb & Delay inserts + quick knobs at the
+    /// three target window sizes (`KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_quick_knob_shots -- --ignored`).
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_quick_knob_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(24, 24);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for s in [a, b, c] {
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+        }
+        g.connect_with_id(edge, PortRef { node: a, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("quick knob shots", g)).unwrap();
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.apply_strip_name(na, "Bass wurli").unwrap();
+        app.apply_strip_name(nb, "Pad").unwrap();
+        for (n, hex) in [(na, "amber"), (nb, "rose")] {
+            let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": n, "color": hex }));
+            assert!(out.contains('#'), "{out}");
+        }
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": na, "pan": -0.35 }));
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nb, "mute": true }));
+        app.exec_tool("collapse_strip", &serde_json::json!({ "node": nc }));
+        app.exec_tool("set_strip_knob", &serde_json::json!({ "node": nb, "knob": "OSC 1 VOL" }));
+        for (i, u) in app.units.iter_mut().enumerate() {
+            if let Some(k) = u.knob_index("LEVEL") { u.knobs[k].set_immediate([0.8, 0.55, 0.9, 0.4][i % 4]); }
+            if let Some(k) = u.knob_index("CUTOFF") { u.knobs[k].set_immediate(0.65); }
+            if let Some(k) = u.knob_index("MIX") { u.knobs[k].set_immediate(0.45); }
+        }
+        app.stage_view = StageView::Mixer;
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
+    }
+}
+
 /// Skipped when Surge XT is not installed.
+#[cfg(test)]
+mod engine_info_tests {
+    use super::*;
+    use crate::engine_info::{EngineCounters, NodeTimer};
+    use std::time::Duration;
+
+    const SIZE: Vec2 = Vec2 { x: 1280.0, y: 800.0 };
+
+    /// `panel`: painted by the Engine Info popup (the rack's own text lies
+    /// under it and is in the same place).
+    /// `rect` is what shows of the text: its extent inside its clip rect.
+    struct Text { s: String, rect: Rect, color: Color32, panel: bool }
+
+    fn walk(shape: &Shape, clip: Rect, panel: Rect, in_panel: &mut bool, out: &mut Vec<Text>) {
+        match shape {
+            Shape::Rect(r) if (r.rect.min - panel.min).length() < 1.0 && (r.rect.max - panel.max).length() < 1.0 => *in_panel = true,
+            Shape::Text(t) => {
+                let rect = t.galley.rect.translate(t.pos.to_vec2()).intersect(clip);
+                if !rect.is_positive() { return; }
+                out.push(Text {
+                    s: t.galley.text().to_owned(),
+                    rect,
+                    color: t.galley.job.sections.first().map_or(t.fallback_color, |sec| sec.format.color),
+                    panel: *in_panel && panel.contains_rect(rect),
+                });
+            }
+            Shape::Vec(v) => for s in v { walk(s, clip, panel, in_panel, out) },
+            _ => {}
+        }
+    }
+
+    fn run_frame(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<Text> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        // Past egui's area fade-in (rule 101).
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let (mut texts, mut in_panel) = (Vec::new(), false);
+        for cs in &out.shapes { walk(&cs.shape, cs.clip_rect, app.engine_info_rect, &mut in_panel, &mut texts); }
+        texts
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) -> Vec<Text> {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        run_frame(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame(app, ctx, size, vec![b(true)]);
+        run_frame(app, ctx, size, vec![b(false)]);
+        run_frame(app, ctx, size, vec![])
+    }
+
+    fn key(k: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// 48 kHz, 256 frames (5333 µs a buffer), rendering `percent` of it.
+    fn counters(percent: f64) -> EngineCounters {
+        EngineCounters {
+            sample_rate: 48_000,
+            callback_frames: 256,
+            render_avg_ns: (percent / 100.0 * 256.0 / 48_000.0 * 1e9) as u32,
+            ..Default::default()
+        }
+    }
+
+    /// The demo rack showing `c`, laid out at `size`. Three frames: the
+    /// test scale (1.6) is set on the first, and egui lays the next one out
+    /// in the old frame's rect.
+    fn app_at(c: EngineCounters, size: Vec2) -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.test_counters = Some(c);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        (app, ctx)
+    }
+
+    /// Show `c` on the next frame (the readout refreshes four times a second).
+    fn set_counters(app: &mut DemoApp, c: EngineCounters) {
+        app.test_counters = Some(c);
+        app.engine_stats_at = f32::NEG_INFINITY;
+    }
+
+    fn has(texts: &[Text], s: &str) -> bool {
+        texts.iter().any(|t| t.s == s)
+    }
+
+    fn find<'a>(texts: &'a [Text], s: &str) -> &'a Text {
+        texts.iter().find(|t| t.s == s).unwrap_or_else(|| panic!("no text {s:?} in {:?}", texts.iter().map(|t| &t.s).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn the_readout_shows_the_dsp_load_coloured_by_level() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(has(&texts, "DSP"), "the readout is on screen");
+        let value = find(&texts, "22 %");
+        assert_eq!(value.color, theme::CREAM, "below 70 % the value is neutral");
+        assert!(app.dsp_chip_rect.contains_rect(value.rect), "{:?} in {:?}", value.rect, app.dsp_chip_rect);
+        let chip = app.dsp_chip_rect;
+
+        set_counters(&mut app, counters(75.0));
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "75 %").color, theme::CABLE_AMBER, "amber from 70 %");
+
+        set_counters(&mut app, counters(100.0));
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "100 %").color, theme::CLIP_BRIGHT, "red above 90 %");
+        assert_eq!(app.dsp_chip_rect, chip, "the readout keeps its size whatever the load");
+
+        // No output stream: no number is made up.
+        set_counters(&mut app, EngineCounters::default());
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(has(&texts, "–") && !texts.iter().any(|t| t.s.ends_with(" %") && chip.contains_rect(t.rect)), "no load without audio");
+    }
+
+    #[test]
+    fn xruns_show_as_a_count_that_moves_no_rig_button() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        let chip = app.dsp_chip_rect;
+        let in_chip = |texts: &[Text], chip: Rect| texts.iter().filter(|t| chip.contains_rect(t.rect)).map(|t| t.s.clone()).collect::<Vec<_>>();
+        assert_eq!(in_chip(&texts, chip), ["DSP", "22 %"], "no xruns, no count");
+        let rigs = app.rig_chip_rects.clone();
+
+        for (xruns, shown) in [(1, "1 xrun"), (3, "3 xruns"), (250, "250 xruns")] {
+            set_counters(&mut app, EngineCounters { xruns, ..counters(22.0) });
+            let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+            let now = app.dsp_chip_rect;
+            assert_eq!(in_chip(&texts, now), ["DSP", "22 %", shown]);
+            assert_eq!(find(&texts, shown).color, theme::CLIP_BRIGHT);
+            assert!(now.right() == chip.right() && now.left() < chip.left(), "the readout grows to the left from the strip's end");
+            assert_eq!(app.rig_chip_rects, rigs, "{xruns} xruns: the rig buttons stay where they are");
+        }
+    }
+
+    /// The readout keeps the right end of the rig strip at the minimum
+    /// window too, and the rigs scroll in what is left of it.
+    #[test]
+    fn the_readout_survives_the_narrowest_window_with_many_rigs() {
+        let narrow = Vec2::new(760.0, 520.0);
+        let (mut app, ctx) = app_at(EngineCounters { xruns: 12, ..counters(22.0) }, narrow);
+        for _ in 0..3 { app.edit_rigs(None); }
+        for _ in 0..3 { run_frame(&mut app, &ctx, narrow, vec![]); }
+        assert_eq!(app.rig_count(), 4);
+        let texts = run_frame(&mut app, &ctx, narrow, vec![]);
+        let chip = app.dsp_chip_rect;
+        assert!(chip.right() <= narrow.x - 12.0 + 0.5 && chip.right() > narrow.x - 14.0, "at the strip's right end: {chip:?}");
+        for s in ["DSP", "22 %", "12 xruns"] {
+            assert!(chip.contains_rect(find(&texts, s).rect), "{s} in the readout");
+        }
+        // Whatever shows of the rig strip ends before the readout.
+        let strip_y = chip.center().y;
+        let strip: Vec<&Text> = texts.iter().filter(|t| (t.rect.center().y - strip_y).abs() < 10.0 && !chip.contains_rect(t.rect)).collect();
+        assert!(strip.iter().any(|t| t.s == "+ Rig"), "the strip is on screen");
+        for t in strip {
+            assert!(t.rect.right() <= chip.left(), "{:?} at {:?} runs into the readout {chip:?}", t.s, t.rect);
+        }
+        let top_bar_right = texts.iter().filter(|t| t.rect.bottom() < 40.0).map(|t| t.rect.right()).fold(0.0, f32::max);
+        assert!(top_bar_right <= narrow.x, "the bar above is as it was: {top_bar_right}");
+    }
+
+    #[test]
+    fn clicking_the_readout_opens_engine_info_and_esc_or_a_click_elsewhere_closes_it() {
+        let (mut app, ctx) = app_at(EngineCounters { midi_latency_us: 420, render_max_us: 2310, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(!app.engine_info_open);
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open, "a click on the readout opens the panel");
+        for (label, value) in [
+            ("Sample rate", "48000 Hz"), ("Buffer size", "256 frames"), ("Buffer duration", "5.33 ms"),
+            ("Inputs", "0"), ("Outputs", "2"), ("DSP load", "22.0 %"), ("Render time, maximum", "2310 µs"),
+            ("MIDI input", "0.42 ms"), ("Sound card output", "not measured"), ("Audio input", "not measured"),
+        ] {
+            let l = texts.iter().find(|t| t.panel && t.s == label).unwrap_or_else(|| panic!("{label} is not in the panel"));
+            assert!(
+                texts.iter().any(|t| t.panel && t.s == value && (t.rect.center().y - l.rect.center().y).abs() < 2.0),
+                "{label} reads {value}"
+            );
+        }
+
+        // Esc closes the panel and nothing else.
+        app.stage_view = StageView::Mixer;
+        run_frame(&mut app, &ctx, SIZE, key(Key::Escape));
+        assert!(!app.engine_info_open, "Esc closes it");
+        assert_eq!(app.stage_view, StageView::Mixer, "that Esc was the panel's alone");
+        app.stage_view = StageView::Rack;
+
+        // The readout toggles.
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(!app.engine_info_open, "a second click on the readout closes it");
+
+        // A click on the panel is the panel's; one elsewhere closes it.
+        click_at(&mut app, &ctx, SIZE, chip);
+        let inside = app.engine_info_rect.center();
+        let selected = app.selected;
+        click_at(&mut app, &ctx, SIZE, inside);
+        assert!(app.engine_info_open, "a click inside keeps it open");
+        assert_eq!(app.selected, selected, "and never reaches the rack underneath");
+        click_at(&mut app, &ctx, SIZE, Pos2::new(SIZE.x - 40.0, SIZE.y - 40.0));
+        assert!(!app.engine_info_open, "a click elsewhere closes it");
+    }
+
+    #[test]
+    fn engine_info_lists_a_unit_with_recorded_timing_under_its_display_name() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let (surge, delay) = (
+            app.units.iter().find(|u| u.name == "SURGE A").expect("the demo rack has SURGE A").node_id,
+            app.units.iter().find(|u| u.name == "DELAY A").expect("the demo rack has DELAY A").node_id,
+        );
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(delay, Duration::from_micros(7));
+        timer.record(surge, Duration::from_micros(800));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+        app.engine_stats_at = f32::NEG_INFINITY;
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        let row = |name: &str| {
+            let l = texts.iter().find(|t| t.panel && t.s == name).unwrap_or_else(|| panic!("no row {name}"));
+            let mut vals: Vec<&Text> = texts.iter().filter(|t| t.panel && t.s != name && (t.rect.center().y - l.rect.center().y).abs() < 2.0).collect();
+            vals.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+            (l.rect.top(), vals.iter().map(|t| t.s.clone()).collect::<Vec<_>>())
+        };
+        let (surge_y, surge_vals) = row("Surge A");
+        let (delay_y, delay_vals) = row("Delay A");
+        assert_eq!(surge_vals, ["800 µs", "800 µs", "15.0 %"], "avg, max, share of the 5333 µs buffer");
+        assert_eq!(delay_vals, ["7.0 µs", "7.0 µs", "0.1 %"]);
+        assert!(surge_y < delay_y, "the most expensive unit is on top");
+        assert!(!texts.iter().any(|t| t.panel && t.s == "SURGE A"), "display names, never raw graph names (rule 28)");
+    }
+
+    #[test]
+    fn reset_peaks_restarts_the_maximum_late_blocks_and_xruns() {
+        let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 4, xruns: 3, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let node = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let mut timer = NodeTimer::new();
+        for us in [900u64, 100] {
+            timer.begin_block();
+            timer.record(node, Duration::from_micros(us));
+            timer.end_block();
+        }
+        app.node_times = Some(timer.handle());
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(has(&texts, "3 xruns") && has(&texts, "2310 µs") && has(&texts, "900 µs"), "the peaks before the reset");
+        let button = find(&texts, "Reset peaks").rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, button);
+        assert!(app.engine_info_open, "the panel stays open");
+        let st = &app.engine_stats;
+        assert_eq!((st.render_max_us, st.late_blocks, st.xruns), (0, 0, 0));
+        assert!(!has(&texts, "3 xruns") && has(&texts, "DSP"), "the readout's count is gone");
+        assert!((st.dsp_percent - 22.0).abs() < 0.01, "the average is kept");
+
+        // The engine restarts each unit's maximum at its next block.
+        timer.begin_block();
+        timer.record(node, Duration::from_micros(100));
+        timer.end_block();
+        assert_eq!(timer.handle().read().0[0].max_ns, 100_000);
+    }
+
+    #[test]
+    fn the_engine_info_tools_return_the_snapshot_and_reset_it() {
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        for tool in ["get_engine_info", "reset_engine_peaks"] {
+            assert!(names.iter().any(|n| n == tool), "assistant tools missing {tool}");
+            assert!(UI_BRIDGE_TOOLS.contains(&tool), "UI_BRIDGE_TOOLS missing {tool}");
+        }
+        assert!(tool_is_read_only("get_engine_info"));
+        assert!(!tool_is_read_only("reset_engine_peaks") && tool_changes_only_system("reset_engine_peaks"), "a reset is no rack edit: no undo step");
+
+        let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 4, xruns: 3, midi_latency_us: 420, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let node = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(node, Duration::from_micros(800));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
+        for (key, want) in [
+            ("audio_live", serde_json::json!(true)), ("sample_rate", serde_json::json!(48_000)),
+            ("buffer_frames", serde_json::json!(256)), ("inputs", serde_json::json!(0)), ("outputs", serde_json::json!(2)),
+            ("render_max_us", serde_json::json!(2310)), ("late_blocks", serde_json::json!(4)), ("xruns", serde_json::json!(3)),
+            ("midi_input_latency_ms", serde_json::json!(0.42)), ("nodes_not_timed", serde_json::json!(0)),
+        ] {
+            assert_eq!(v[key], want, "{key} in {v}");
+        }
+        assert!((v["dsp_percent"].as_f64().unwrap() - 22.0).abs() < 0.01 && (v["buffer_ms"].as_f64().unwrap() - 5.333).abs() < 0.001, "{v}");
+        assert_eq!(v["nodes"][0]["name"], "Surge A");
+        assert_eq!(v["nodes"][0]["node"], node);
+        assert!((v["nodes"][0]["avg_us"].as_f64().unwrap() - 800.0).abs() < 1e-6 && (v["nodes"][0]["percent"].as_f64().unwrap() - 15.0).abs() < 1e-6, "{v}");
+
+        let undo_steps = app.undo_past.len();
+        let out = app.exec_tool("reset_engine_peaks", &serde_json::json!({}));
+        assert!(out.starts_with("reset"), "{out}");
+        assert_eq!(app.undo_past.len(), undo_steps);
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
+        assert_eq!((v["render_max_us"].as_u64(), v["late_blocks"].as_u64(), v["xruns"].as_u64()), (Some(0), Some(0), Some(0)), "{v}");
+    }
+
+    #[test]
+    fn an_audio_in_unit_counts_its_channels_as_inputs() {
+        let (mut app, _ctx) = app_at(counters(22.0), SIZE);
+        assert_eq!(app.engine_stats_now().inputs, 0, "no Audio In unit, no input");
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::Stereo }, name_bytes("GUITAR"));
+        g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::MonoL }, name_bytes("MIC"));
+        g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        app.apply_session(&crate::session::Session::new("inputs", g)).unwrap();
+        assert_eq!(app.engine_stats_now().inputs, 3, "a stereo and a mono input");
+    }
+
+    /// The panel and the readout stay inside the window, the panel's rows
+    /// inside the panel, at the default size, a tiled half and the minimum.
+    #[test]
+    fn engine_info_fits_the_window_at_every_size() {
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let size = Vec2::new(w, h);
+            let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, xruns: 3, midi_latency_us: 420, ..counters(22.0) }, size);
+            let mut timer = NodeTimer::new();
+            timer.begin_block();
+            for (i, u) in app.units.iter().enumerate() {
+                timer.record(u.node_id, Duration::from_micros(40 + 130 * i as u64));
+            }
+            timer.end_block();
+            app.node_times = Some(timer.handle());
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            run_frame(&mut app, &ctx, size, vec![]);
+            assert!(screen.shrink(8.0).contains_rect(app.dsp_chip_rect), "{w}x{h}: readout {:?} in the window", app.dsp_chip_rect);
+
+            let chip = app.dsp_chip_rect.center();
+            let texts = click_at(&mut app, &ctx, size, chip);
+            let panel = app.engine_info_rect;
+            assert!(app.engine_info_open && screen.contains_rect(panel), "{w}x{h}: panel {panel:?}");
+            assert!(panel.top() >= app.dsp_chip_rect.bottom(), "{w}x{h}: the panel hangs under the readout");
+            assert!((panel.right() - app.dsp_chip_rect.right()).abs() < 1.0, "{w}x{h}: flush with the readout's right edge");
+            let header = find(&texts, "Engine info").rect;
+            let reset = find(&texts, "Reset peaks").rect;
+            assert!(panel.shrink(8.0).contains_rect(header) && panel.shrink(8.0).contains_rect(reset), "{w}x{h}: header in the panel");
+            assert!((header.center().y - reset.center().y).abs() < 2.0, "{w}x{h}: title and button share a centre line");
+            // Rows: a label never runs into its value.
+            let rows: Vec<&Text> = texts.iter().filter(|t| t.panel && t.s.chars().count() > 1).collect();
+            assert!(rows.len() > 20, "{w}x{h}: the panel's rows are painted ({})", rows.len());
+            for a in &rows {
+                for b in &rows {
+                    if std::ptr::eq(*a, *b) || a.rect.left() >= b.rect.left() { continue; }
+                    assert!(!a.rect.intersects(b.rect.shrink(0.5)), "{w}x{h}: {:?} overlaps {:?}", a.s, b.s);
+                }
+            }
+        }
+    }
+
+
+    /// The readout and panel repaint changing numbers four times a second
+    /// for as long as the app runs. egui clears a font atlas past 80 % and
+    /// the app keeps galleys across frames (wordmark, knob captions), so a
+    /// growing glyph set would garble them (rule 17).
+    #[test]
+    fn changing_engine_numbers_never_grow_the_font_atlas() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let chip = app.dsp_chip_rect.center();
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |m: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % m };
+        let mut timer = NodeTimer::new();
+        let mut cycle = |app: &mut DemoApp, frames: usize| {
+            for _ in 0..frames {
+                let pct = next(10_000) as f64 / 100.0;
+                set_counters(app, EngineCounters {
+                    render_max_us: next(20_000) as u32, render_late: next(500) as u32, xruns: next(300) as u32,
+                    midi_latency_us: next(5_000) as u32, ..counters(pct)
+                });
+                timer.begin_block();
+                for u in &app.units { timer.record(u.node_id, Duration::from_nanos(next(3_000_000))); }
+                timer.end_block();
+                app.node_times = Some(timer.handle());
+                run_frame(app, &ctx, SIZE, vec![]);
+            }
+        };
+        let atlas = || ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.font_image_size()));
+        cycle(&mut app, 100);
+        let warm = atlas();
+        cycle(&mut app, 1_000);
+        let after = atlas();
+        eprintln!("font atlas after 100 frames {warm:?}, after 1100 frames {after:?}");
+        assert!(app.engine_info_open, "the panel stayed open");
+        assert_eq!(after, warm, "1000 more frames of new numbers added glyphs to the atlas");
+        assert!(after.0 < 0.5, "far from egui's 80 % clear: {}", after.0);
+    }
+
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat engine_info_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn engine_info_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (state, c) in [
+            ("normal", EngineCounters { render_max_us: 2310, midi_latency_us: 420, ..counters(22.0) }),
+            ("high", EngineCounters { render_max_us: 4790, render_late: 12, midi_latency_us: 420, ..counters(78.0) }),
+            ("critical", EngineCounters { render_max_us: 6120, render_late: 231, xruns: 3, midi_latency_us: 420, ..counters(94.0) }),
+        ] {
+            for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+                for panel in [false, true] {
+                    let mut app = DemoApp::new_with_sink(None);
+                    app.test_counters = Some(c);
+                    let share = c.render_avg_ns as f64 / 1000.0 / app.units.len() as f64;
+                    let mut timer = NodeTimer::new();
+                    timer.begin_block();
+                    for (i, u) in app.units.iter().enumerate() {
+                        if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { continue; }
+                        let us = share * [1.9, 0.12, 1.4, 0.08][i % 4];
+                        timer.record(u.node_id, Duration::from_nanos((us * 1000.0) as u64));
+                    }
+                    timer.end_block();
+                    app.node_times = Some(timer.handle());
+                    app.engine_info_open = panel;
+                    let name = if panel { "panel" } else { "bar" };
+                    super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-{state}-{w}x{h}.png")));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod voice_host_tests {
     use super::*;
@@ -22540,8 +28737,856 @@ mod voice_host_tests {
         assert_eq!(rig.app.clap_rigs()[0].1, second);
         assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
 
-        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0, wire: false });
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
+    }
+}
+
+/// Times loading saved session packages (args: package paths) on the
+/// offline-engine app with real plugins: the UI-thread `apply_session`, and
+/// the slowest of the frames that follow while plugins load.
+pub fn run_session_load_bench(paths: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "usage: kabelsalat session-load-bench <package.ksalat>...");
+    let mut rig = EvalRig::new(Assistant::new(), &(Vec::new(), crate::lv2::discover()))?;
+    rig.settle();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for round in 0..2 {
+        for p in paths {
+            let s = crate::session::Session::load(std::path::Path::new(p))?;
+            let t = std::time::Instant::now();
+            rig.app.apply_session(&s)?;
+            let apply = ms(t.elapsed());
+            let mut worst = 0.0f64;
+            for _ in 0..100 {
+                let f = std::time::Instant::now();
+                rig.frame();
+                worst = worst.max(ms(f.elapsed()));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("session-load-bench round {round} {p}: apply_session {apply:.1} ms, slowest next frame {worst:.1} ms");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod window_size_layout_tests {
+    use super::*;
+
+    /// Window sizes in points, as the compositor tiles a 1.6x laptop panel
+    /// (halves, quarters) plus the default and the minimum window.
+    pub(super) const SIZES: [(f32, f32); 6] =
+        [(1600.0, 1000.0), (1280.0, 800.0), (781.0, 950.0), (1576.0, 468.0), (781.0, 468.0), (760.0, 520.0)];
+
+    struct Text { s: String, rect: Rect, clip: Rect }
+
+    fn walk(shape: &Shape, clip: Rect, out: &mut Vec<Text>) {
+        match shape {
+            Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => out.push(Text {
+                s: t.galley.text().replace('\n', "⏎"),
+                rect: ink_rect(&t.galley).translate(t.pos.to_vec2()),
+                clip,
+            }),
+            Shape::Vec(v) => for s in v { walk(s, clip, out) },
+            _ => {}
+        }
+    }
+
+    /// The glyphs' extent: a galley's own rect also spans `leading_space`
+    /// and the empty part of a wrapped row.
+    fn ink_rect(g: &egui::Galley) -> Rect {
+        let mut r = Rect::NOTHING;
+        for row in &g.rows {
+            let ink: Vec<_> = row.glyphs.iter().filter(|gl| !gl.chr.is_whitespace()).collect();
+            let (Some(a), Some(b)) = (ink.first(), ink.last()) else { continue };
+            r = r.union(Rect::from_min_max(
+                row.pos + Vec2::new(a.pos.x, 0.0),
+                row.pos + Vec2::new(b.pos.x + b.advance_width, row.height()),
+            ));
+        }
+        if r.is_positive() { r } else { g.rect }
+    }
+
+    fn texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<Text> {
+        let mut out = Vec::new();
+        for i in 0..4 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64); // popups and panels past their fade-in (rule 101)
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut frame = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            frame.textures_delta.clear(); // rule 11
+            out.clear();
+            for cs in &frame.shapes { walk(&cs.shape, cs.clip_rect, &mut out); }
+        }
+        out
+    }
+
+    /// Text that leaves the window, is cut by its clip, or overlaps other
+    /// text. Text a scroll area clips at its edge is scrolled, not broken,
+    /// so a clip cut only counts outside `scrolled` regions.
+    fn audit(texts: &[Text], size: Vec2) -> Vec<String> {
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        let mut bad = Vec::new();
+        let vis: Vec<(&Text, Rect)> = texts.iter()
+            .map(|t| (t, t.rect.intersect(t.clip).intersect(screen)))
+            .filter(|(_, v)| v.width() > 0.5 && v.height() > 0.5)
+            .collect();
+        for (t, v) in &vis {
+            if !screen.expand(0.5).contains_rect(t.rect) {
+                bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
+            } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
+                bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
+            }
+        }
+        for i in 0..vis.len() {
+            for j in i + 1..vis.len() {
+                let o = vis[i].1.intersect(vis[j].1);
+                if o.width() > 1.0 && o.height() > 1.0 {
+                    bad.push(format!("{:?} {:?} overlaps {:?} {:?}", vis[i].0.s, vis[i].1, vis[j].0.s, vis[j].1));
+                }
+            }
+        }
+        bad
+    }
+
+    fn report(setup: &dyn Fn(&mut DemoApp)) -> Vec<String> {
+        let mut all = Vec::new();
+        for (w, h) in SIZES {
+            for (dock, dname) in [(DockView::None, "no dock"), (DockView::Keyboard, "keyboard"), (DockView::Assistant, "assistant")] {
+                let mut app = DemoApp::new_with_sink(None);
+                setup(&mut app);
+                app.dock = dock;
+                let ctx = egui::Context::default();
+                let size = Vec2::new(w, h);
+                let t = texts(&mut app, &ctx, size);
+                for v in audit(&t, size) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
+                    let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
+                    all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    #[ignore = "report: cargo test --bin kabelsalat window_size_report -- --ignored --nocapture"]
+    fn window_size_report() {
+        let mut n = 0;
+        for (name, setup) in VIEWS {
+            let r = report(setup);
+            n += r.len();
+            for l in r { println!("{name}: {l}"); }
+        }
+        println!("TOTAL {n}");
+    }
+
+    /// In every view, window size and dock: no text on other text, none
+    /// outside the window, and a rack as wide as the window (rule 124).
+    /// Scroll areas cutting text at their edge, and a rack that pans
+    /// vertically under a dock in the smallest windows, are allowed.
+    #[test]
+    fn every_view_fits_small_windows() {
+        let mut bad = Vec::new();
+        for (name, setup) in VIEWS {
+            for l in report(setup) {
+                if l.contains(" overlaps ") || l.contains("leaves the window") || l.contains("overflows sideways") {
+                    bad.push(format!("{name}: {l}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+            ("rack", &|_| {}),
+            ("rack back", &|a| a.side = Side::Back),
+            ("two rigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| a.stage_view = StageView::Mixer),
+            ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+        ];
+}
+
+/// Offline screenshots of the real frame: egui's tessellated triangles
+/// rasterized on the CPU (no window, no compositor, no GPU). Run with
+/// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`.
+#[cfg(test)]
+mod offline_shots {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Textures(HashMap<egui::TextureId, (usize, usize, Vec<Color32>)>);
+
+    impl Textures {
+        fn apply(&mut self, delta: &egui::TexturesDelta) {
+            for (id, d) in delta.set.iter().flat_map(|(id, ds)| ds.iter().map(move |d| (id, d))) {
+                let egui::ImageData::Color(img) = &d.image;
+                let [w, h] = img.size;
+                match d.pos {
+                    None => { self.0.insert(*id, (w, h, img.pixels.clone())); }
+                    Some([x0, y0]) => if let Some((tw, _, px)) = self.0.get_mut(id) {
+                        for y in 0..h { for x in 0..w { px[(y0 + y) * *tw + x0 + x] = img.pixels[y * w + x]; } }
+                    },
+                }
+            }
+            for id in &delta.free { self.0.remove(id); }
+        }
+
+        fn sample(&self, id: egui::TextureId, uv: Pos2) -> [f32; 4] {
+            let Some((w, h, px)) = self.0.get(&id) else { return [1.0; 4] };
+            let (fx, fy) = (uv.x * *w as f32 - 0.5, uv.y * *h as f32 - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let at = |x: f32, y: f32| {
+                let c = px[(y.clamp(0.0, *h as f32 - 1.0) as usize) * *w + x.clamp(0.0, *w as f32 - 1.0) as usize];
+                [c.r() as f32, c.g() as f32, c.b() as f32, c.a() as f32]
+            };
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+            std::array::from_fn(|i| {
+                let top = a[i] + (b[i] - a[i]) * tx;
+                let bot = c[i] + (d[i] - c[i]) * tx;
+                (top + (bot - top) * ty) / 255.0
+            })
+        }
+    }
+
+    fn rasterize(prims: &[egui::ClippedPrimitive], tex: &Textures, w: usize, h: usize, ppp: f32) -> Vec<[f32; 3]> {
+        let mut img = vec![[0.0f32; 3]; w * h];
+        for p in prims {
+            let egui::epaint::Primitive::Mesh(mesh) = &p.primitive else { continue };
+            let c = p.clip_rect;
+            let (cx0, cy0) = ((c.min.x * ppp).round().max(0.0) as i64, (c.min.y * ppp).round().max(0.0) as i64);
+            let (cx1, cy1) = ((c.max.x * ppp).round().min(w as f32) as i64, (c.max.y * ppp).round().min(h as f32) as i64);
+            for t in mesh.indices.chunks_exact(3) {
+                let v = [&mesh.vertices[t[0] as usize], &mesh.vertices[t[1] as usize], &mesh.vertices[t[2] as usize]];
+                let pt: [Vec2; 3] = std::array::from_fn(|i| v[i].pos.to_vec2() * ppp);
+                let area = (pt[1] - pt[0]).x * (pt[2] - pt[0]).y - (pt[1] - pt[0]).y * (pt[2] - pt[0]).x;
+                if area.abs() < 1e-6 { continue; }
+                let lo = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MAX, f32::min);
+                let hi = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MIN, f32::max);
+                let (x0, x1) = ((lo(|p| p.x).floor() as i64).max(cx0), (hi(|p| p.x).ceil() as i64).min(cx1));
+                let (y0, y1) = ((lo(|p| p.y).floor() as i64).max(cy0), (hi(|p| p.y).ceil() as i64).min(cy1));
+                let col: [[f32; 4]; 3] = std::array::from_fn(|i| {
+                    let c = v[i].color;
+                    [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0]
+                });
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let s = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                        let e = |a: Vec2, b: Vec2| (b - a).x * (s - a).y - (b - a).y * (s - a).x;
+                        let (w0, w1, w2) = (e(pt[1], pt[2]) / area, e(pt[2], pt[0]) / area, e(pt[0], pt[1]) / area);
+                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 { continue; }
+                        let uv = Pos2::new(
+                            w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x,
+                            w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y,
+                        );
+                        let t = tex.sample(mesh.texture_id, uv);
+                        let src: [f32; 4] = std::array::from_fn(|i| (w0 * col[0][i] + w1 * col[1][i] + w2 * col[2][i]) * t[i]);
+                        let d = &mut img[y as usize * w + x as usize];
+                        for i in 0..3 { d[i] = src[i] + d[i] * (1.0 - src[3]); }
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    /// Run frames of `app` at `size` points and write the last one as a PNG.
+    /// `app` must not have run a frame before: it keeps galleys laid out in
+    /// that frame's font atlas, and this fresh context draws them as glyph soup.
+    pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
+        let ctx = egui::Context::default();
+        let mut tex = Textures::default();
+        let mut last = None;
+        for i in 0..5 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            tex.apply(&out.textures_delta);
+            out.textures_delta.clear(); // rule 11
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        let ppp = out.pixels_per_point;
+        let prims = ctx.tessellate(out.shapes, ppp);
+        let (w, h) = ((size.x * ppp).round() as usize, (size.y * ppp).round() as usize);
+        let img = rasterize(&prims, &tex, w, h, ppp);
+        let bytes: Vec<u8> = img.iter().flat_map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)).collect();
+        let file = std::fs::File::create(path).expect("create png");
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&bytes).unwrap();
+    }
+
+    /// The rack with a MIDI strip (built-in transposer, +7) between the
+    /// keys and Surge, and the Plugins page with its MIDI FX cards.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat midifx_shots -- --ignored"]
+    fn midifx_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h) in [(1600.0, 1000.0), (1000.0, 700.0)] {
+            let mut app = DemoApp::new_with_sink(None);
+            let mut g = app.base_graph.clone();
+            let fx = g.add_node(
+                NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis: 7 } },
+                name_bytes("TRANSPOSE"),
+            );
+            g.set_rig(fx, 0);
+            g.wire_midi_fx(fx);
+            app.build_rack(&g, &[]);
+            shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-rack-midi-strip.png")));
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Plugins;
+            shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-plugins.png")));
+        }
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored"]
+    fn window_size_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 10] = [
+            ("rack", &|_| {}),
+            ("back", &|a| a.side = Side::Back),
+            ("tworigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("armed", &|a| {
+                a.load_multi_rig_demo();
+                a.stage_view = StageView::Mixer;
+                a.set_record_arm(Some(1), true);
+            }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+            ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("agent", &|a| a.stage_demo_agent(false)),
+        ];
+        let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
+        for (w, h) in super::window_size_layout_tests::SIZES {
+            for (name, setup) in &views {
+                for (dock, dn) in [(DockView::None, ""), (DockView::Keyboard, "-kbd"), (DockView::Assistant, "-chat")] {
+                    let file = format!("{w}x{h}-{name}{dn}.png");
+                    if only.as_ref().is_some_and(|o| !file.contains(o.as_str())) { continue; }
+                    let mut app = DemoApp::new_with_sink(None);
+                    setup(&mut app);
+                    app.dock = dock;
+                    shot(&mut app, Vec2::new(w, h), &dir.join(file));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod midi_strip_tests {
+    use super::*;
+
+    fn app_with_strip() -> (DemoApp, u32) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        let fx = g.add_node(
+            NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis: 0 } },
+            name_bytes("TRANSPOSE"),
+        );
+        g.set_rig(fx, 0);
+        g.wire_midi_fx(fx);
+        app.build_rack(&g, &[]);
+        (app, fx)
+    }
+
+    /// The strip's SEMIS knob (a non-default value, rule 59) survives a save and a load.
+    #[test]
+    fn a_midi_strips_knob_survives_save_and_load() {
+        let (mut app, fx) = app_with_strip();
+        let u = app.units.iter().position(|u| u.node_id == fx).expect("the strip is a unit");
+        assert!(matches!(app.units[u].node_kind, UnitKind::MidiFx));
+        let k = app.units[u].knob_index("SEMIS").expect("a SEMIS knob");
+        app.units[u].knobs[k].set_immediate(0.75);
+        let s = app.capture_session("strip").expect("capture");
+        let param = app.units[u].knobs[k].param.expect("SEMIS drives a param");
+        assert_eq!(s.param(fx, param), Some(0.75), "the knob is in the session");
+        // Wire the strip into the saved graph, as the cables did.
+        assert!(s.graph.edges.iter().any(|e| e.to.node == fx || e.from.node == fx), "the strip's cables are saved");
+        app.apply_session(&s).expect("load");
+        let u = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::MidiFx)).expect("strip after load");
+        let k = app.units[u].knob_index("SEMIS").expect("SEMIS after load");
+        assert!((app.units[u].knobs[k].value - 0.75).abs() < 1e-6, "SEMIS restored: {}", app.units[u].knobs[k].value);
+    }
+}
+
+/// Arp unit + Keys scale snap (issue #90): tools, sessions, undo.
+#[cfg(test)]
+mod arp_tests {
+    use super::*;
+    use crate::arp::{key_from_name, Scale, ScaleChoice};
+    use serde_json::json;
+
+    /// The demo rack with an arp wired between the rig's Keys and its synths.
+    fn arp_graph() -> (Graph, u32) {
+        let mut g = Graph::demo_patch();
+        let id = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+        assert!(g.wire_arp(id) >= 2, "the arp takes over a Keys → synth cable");
+        (g, id)
+    }
+
+    fn app_with_arp() -> (DemoApp, u32) {
+        let (g, id) = arp_graph();
+        let mut app = DemoApp::new_with_sink(None);
+        app.apply_session(&crate::session::Session::new("arp", g)).unwrap();
+        (app, id)
+    }
+
+    fn arp_unit(app: &DemoApp) -> usize {
+        app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Arp)).expect("an arp unit")
+    }
+
+    /// Step index of a stepped knob / value of a continuous one, by label.
+    fn knob(app: &DemoApp, label: &str) -> (usize, f32) {
+        let u = &app.units[arp_unit(app)];
+        let k = &u.knobs[u.knob_index(label).unwrap_or_else(|| panic!("knob {label}"))];
+        (k.step_index(), k.value)
+    }
+
+    fn d_dorian() -> ScaleChoice { ScaleChoice { scale: Scale::Dorian, key: key_from_name("D").unwrap() } }
+
+    #[test]
+    fn the_arp_unit_starts_on_the_engines_defaults() {
+        let (app, _) = app_with_arp();
+        // up, 1/16, 1 octave, gate .75, no swing, major
+        assert_eq!(knob(&app, "MODE").0, 0);
+        assert_eq!(knob(&app, "RATE").0, 3, "1/16");
+        assert_eq!(knob(&app, "OCT").0, 0, "1 octave");
+        assert!((knob(&app, "GATE").1 - 0.75).abs() < 1e-6);
+        assert_eq!(knob(&app, "SWING").1, 0.0);
+        assert_eq!(knob(&app, "CHORD").0, 0);
+    }
+
+    #[test]
+    fn set_arp_and_set_scale_move_the_knobs_and_the_keys_node() {
+        let (mut app, id) = app_with_arp();
+        let r = app.exec_tool("set_arp", &json!({"node": id, "mode": "up-down", "rate": "1/8T", "octaves": 3, "gate": 0.4, "swing": 0.5, "chord": "min7"}));
+        assert!(r.contains("set"), "{r}");
+        assert_eq!(knob(&app, "MODE").0, 2, "up-down");
+        assert_eq!(knob(&app, "RATE").0, 2, "1/8T");
+        assert_eq!(knob(&app, "OCT").0, 2, "3 octaves");
+        assert!((knob(&app, "GATE").1 - 0.4).abs() < 1e-6);
+        assert!((knob(&app, "SWING").1 - 0.5).abs() < 1e-6);
+        assert_eq!(knob(&app, "CHORD").0, 6, "min7");
+
+        let r = app.exec_tool("set_scale", &json!({"key": "D", "scale": "dorian"}));
+        assert!(r.contains("D DORIAN"), "{r}");
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        let r = app.exec_tool("set_scale", &json!({"off": true}));
+        assert!(r.contains("off"), "{r}");
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, None);
+    }
+
+    #[test]
+    fn arp_tools_refuse_bad_input_with_a_message_the_model_can_fix() {
+        let (mut app, id) = app_with_arp();
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "mode": "sideways"})).contains("not a mode"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "rate": "1/3"})).contains("not a rate"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "chord": "13th"})).contains("not a chord shape"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id})).contains("at least one"));
+        assert!(app.exec_tool("set_arp", &json!({"node": 0, "mode": "up"})).contains("not an arp"), "node 0 is the keyboard");
+        assert!(app.exec_tool("set_arp", &json!({"mode": "up"})).contains("needs 'node'"));
+        assert!(app.exec_tool("set_scale", &json!({"key": "H"})).contains("not a key"));
+        assert!(app.exec_tool("set_scale", &json!({"scale": "lydian-ish"})).contains("not a scale"));
+        assert!(app.exec_tool("set_scale", &json!({"node": id})).contains("needs a Keys node"), "the arp is not a keyboard");
+    }
+
+    #[test]
+    fn arp_settings_and_the_scale_survive_a_session() {
+        let (mut app, id) = app_with_arp();
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "random", "rate": "1/32", "octaves": 4, "gate": 0.3, "swing": 0.25, "chord": "power"}));
+        app.exec_tool("set_scale", &json!({"key": "D", "scale": "dorian"}));
+        let s = app.capture_session("arp").unwrap();
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.apply_session(&s).unwrap();
+        assert_eq!(knob(&fresh, "MODE").0, 4, "random");
+        assert_eq!(knob(&fresh, "RATE").0, 5, "1/32");
+        assert_eq!(knob(&fresh, "OCT").0, 3);
+        assert!((knob(&fresh, "GATE").1 - 0.3).abs() < 1e-6);
+        assert!((knob(&fresh, "SWING").1 - 0.25).abs() < 1e-6);
+        assert_eq!(knob(&fresh, "CHORD").0, 7, "power");
+        assert_eq!(fresh.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        // The graph is what a saved package holds: the scale survives its
+        // JSON, and a graph saved before scale snap existed (no field) loads
+        // unsnapped.
+        let json = serde_json::to_string(&s.graph).unwrap();
+        let back: Graph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for n in v["nodes"].as_array_mut().unwrap() { n.as_object_mut().unwrap().remove("scale"); }
+        let old: Graph = serde_json::from_value(v).unwrap();
+        assert!(old.nodes.iter().all(|n| n.scale.is_none()));
+    }
+
+    #[test]
+    fn undo_restores_the_arp_and_the_scale_from_non_default_values() {
+        let (mut app, id) = app_with_arp();
+        // Non-default BEFORE the job (rule 59: a default would pass anyway).
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "down", "octaves": 2}));
+        app.exec_tool("set_scale", &json!({"key": "A", "scale": "min penta"}));
+        app.undo_job = None; // a new job
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "chord", "octaves": 4, "chord": "sus4"}));
+        app.exec_tool("set_scale", &json!({"key": "F#", "scale": "blues"}));
+        assert_eq!(knob(&app, "MODE").0, 3);
+        let r = app.exec_tool("undo", &json!({}));
+        assert!(r.contains("undid"), "{r}");
+        assert_eq!(knob(&app, "MODE").0, 1, "down again");
+        assert_eq!(knob(&app, "OCT").0, 1, "2 octaves again");
+        assert_eq!(knob(&app, "CHORD").0, 0);
+        let want = ScaleChoice { scale: Scale::MinorPentatonic, key: key_from_name("A").unwrap() };
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(want));
+    }
+
+}
+
+/// Navigator side panel (issue #108): data projection, rig switching + rack/mixer
+/// jump, layout floor at 760x520, and `list_channels` agent parity.
+#[cfg(test)]
+mod navigator_tests {
+    use super::*;
+    use crate::control::{name_bytes, PortRef};
+
+    fn run_frame_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        out.shapes
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) {
+        let ptr = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        run_frame_at(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame_at(app, ctx, size, vec![ptr(true)]);
+        run_frame_at(app, ctx, size, vec![ptr(false)]);
+    }
+
+    fn key_ev(key: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// Two rigs with linear inserts (and optional bare Audio In on Rig A).
+    fn two_rigs_with_inserts(with_audio_in: bool) -> (DemoApp, [u32; 2]) {
+        let mut rig_a = Graph::default();
+        rig_a.reserve(8, 8);
+        let ka = rig_a.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let sa = rig_a.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let da = rig_a.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let va = rig_a.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+        let ma = rig_a.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        rig_a.connect_with_id(1, PortRef { node: ka, port: 0 }, PortRef { node: sa, port: 0 }, CPortKind::Midi);
+        rig_a.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: da, port: 0 }, CPortKind::Audio);
+        rig_a.connect_with_id(3, PortRef { node: da, port: 0 }, PortRef { node: va, port: 0 }, CPortKind::Audio);
+        rig_a.connect_with_id(4, PortRef { node: va, port: 0 }, PortRef { node: ma, port: 0 }, CPortKind::Audio);
+        if with_audio_in {
+            let ain = rig_a.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("AUDIO IN"));
+            rig_a.connect_with_id(5, PortRef { node: ain, port: 0 }, PortRef { node: ma, port: 0 }, CPortKind::Audio);
+        }
+
+        let mut rig_b = Graph::default();
+        rig_b.reserve(8, 8);
+        let kb = rig_b.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let sb = rig_b.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let sat = rig_b.add_node(NodeKind::Dsp(DspKind::Saturation), name_bytes("SATURATION"));
+        let mb = rig_b.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        rig_b.connect_with_id(1, PortRef { node: kb, port: 0 }, PortRef { node: sb, port: 0 }, CPortKind::Midi);
+        rig_b.connect_with_id(2, PortRef { node: sb, port: 0 }, PortRef { node: sat, port: 0 }, CPortKind::Audio);
+        rig_b.connect_with_id(3, PortRef { node: sat, port: 0 }, PortRef { node: mb, port: 0 }, CPortKind::Audio);
+
+        let rigs = vec![
+            crate::control::Rig::new("Lead", rig_a, None),
+            crate::control::Rig::new("Bass", rig_b, None),
+        ];
+        let merged = crate::control::merge_rigs(&rigs);
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&merged, &[]);
+        app.session_rig_names = vec!["Lead".into(), "Bass".into()];
+        if let Ok(mut s) = app.rig_snapshot.lock() {
+            s.rigs = vec![
+                crate::control::RigMeta { name: "Lead".into(), midi_device: None },
+                crate::control::RigMeta { name: "Bass".into(), midi_device: None },
+            ];
+            s.active = 0;
+        }
+        let claps: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        assert_eq!(claps.len(), 2);
+        app.apply_strip_name(claps[0], "Hammond").unwrap();
+        app.apply_strip_name(claps[1], "Sub bass").unwrap();
+        app.with_strip_row(claps[0], |row| row.color = Some(theme::CABLE_AMBER));
+        app.with_strip_row(claps[1], |row| row.color = Some(theme::CABLE_ROSE));
+        (app, [claps[0], claps[1]])
+    }
+
+    #[test]
+    fn nav_rows_for_two_rigs_with_inserts_under_each_filter() {
+        let (mut app, [na, nb]) = two_rigs_with_inserts(true);
+
+        // Channels: both rigs, all channels including Audio in (no plugins).
+        let ch = app.nav_rows(NavFilter::Channels);
+        assert_eq!(ch, vec![
+            NavRow::Rig { rig: 0, name: "Lead".into() },
+            NavRow::Channel { rig: 0, node: na, label: "Hammond".into(), color: Some(theme::CABLE_AMBER) },
+            NavRow::Channel { rig: 0, node: 5, label: "Audio in".into(), color: None },
+            NavRow::Rig { rig: 1, name: "Bass".into() },
+            NavRow::Channel { rig: 1, node: nb, label: "Sub bass".into(), color: Some(theme::CABLE_ROSE) },
+        ]);
+
+        // Plugins: skips Audio in (0 plugins), unfolds Hammond & Sub bass.
+        let pl = app.nav_rows(NavFilter::Plugins);
+        assert!(!pl.iter().any(|r| matches!(r, NavRow::Channel { label, .. } if label == "Audio in")), "Plugins skips plugin-less channels: {pl:?}");
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Surge XT" && *kind_label == "CLAP")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Delay" && *kind_label == "built-in")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, label, kind_label, .. } if *owner == na && label == "Reverb" && *kind_label == "built-in")));
+        assert!(pl.iter().any(|r| matches!(r, NavRow::Plugin { rig: 1, owner, label, kind_label, .. } if *owner == nb && label == "Saturation" && *kind_label == "built-in")));
+
+        // All: keeps Audio in AND unfolds plugins.
+        let all = app.nav_rows(NavFilter::All);
+        assert!(all.iter().any(|r| matches!(r, NavRow::Channel { label, .. } if label == "Audio in")));
+        assert!(all.iter().any(|r| matches!(r, NavRow::Plugin { rig: 0, owner, .. } if *owner == na)));
+        assert!(all.iter().any(|r| matches!(r, NavRow::Plugin { rig: 1, owner, .. } if *owner == nb)));
+
+        // A fold is the panel's: the agent still gets every row.
+        app.nav_folded.insert(na);
+        assert_eq!(app.nav_rows(NavFilter::Plugins), pl);
+
+        assert!(tool_is_read_only("list_channels"));
+        let json: serde_json::Value = serde_json::from_str(&app.exec_tool("list_channels", &serde_json::json!({"filter": "plugins"}))).unwrap();
+        assert_eq!(json["rows"].as_array().unwrap().len(), app.nav_rows(NavFilter::Plugins).len());
+    }
+
+    #[test]
+    fn clicking_channel_row_of_rig_b_switches_rig_and_selects_unit() {
+        let (mut app, [na, nb]) = two_rigs_with_inserts(false);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+
+        assert!(!app.nav_open, "Navigator is hidden by default");
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+
+        // Toggle open via Q shortcut.
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Q));
+        assert!(app.nav_open, "Q opens Navigator");
+        run_frame_at(&mut app, &ctx, size, vec![]);
+
+        // Click Rig B's channel row.
+        let rig_b_pos = app.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { rig: 1, node, .. } if *node == nb).then(|| rect.center()))
+            .expect("Rig B channel row in Navigator");
+        click_at(&mut app, &ctx, size, rig_b_pos);
+        assert_eq!(app.active_rig, 1, "clicking Rig B channel switches to Rig B");
+        assert_eq!(app.selected_unit, Some(nb), "clicking channel selects its unit");
+        assert_eq!(app.rig_snapshot.lock().unwrap().active, 1, "rig_snapshot stayed in sync");
+
+        // Switch to Plugins filter via UI click, fold Rig B via its chevron.
+        let plugins_pos = Pos2::new(app.nav_panel_rect.center().x, app.nav_panel_rect.top() + 50.0);
+        click_at(&mut app, &ctx, size, plugins_pos);
+        assert_eq!(app.nav_filter, NavFilter::Plugins);
+        let chev = app.nav_chevron_rects.iter().find_map(|&(n, r)| (n == nb).then(|| r.center())).expect("Rig B chevron");
+        assert!(app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Plugin { owner, .. } if *owner == nb)));
+        click_at(&mut app, &ctx, size, chev);
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        assert!(app.nav_folded.contains(&nb), "chevron folds channel");
+        assert!(!app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Plugin { owner, .. } if *owner == nb)),
+            "a folded channel draws no plugin rows");
+        assert!(app.nav_row_rects.iter().any(|(r, _)| matches!(r, NavRow::Channel { node, .. } if *node == nb)));
+        assert_eq!(app.selected_unit, Some(nb), "folding chevron does not clear selection");
+
+        // Rack shortcuts keep working while Navigator is open (rule 12).
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Num1));
+        assert_eq!(app.active_rig, 0);
+        let _ = na;
+
+        // Esc clears selection when in Rack view.
+        app.selected_unit = Some(na);
+        run_frame_at(&mut app, &ctx, size, key_ev(Key::Escape));
+        assert_eq!(app.selected_unit, None);
+    }
+
+    #[test]
+    fn clicking_in_mixer_view_scrolls_and_flashes_strip() {
+        // Build 1 rig with 6 sources so strips overflow horizontally at 760x520.
+        let mut g = Graph::default();
+        g.reserve(20, 20);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut eid = 1;
+        let mut srcs = Vec::new();
+        for i in 0..6 {
+            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(&format!("CH {}", i + 1)));
+            g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); eid += 1;
+            g.connect_with_id(eid, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); eid += 1;
+            srcs.push(s);
+        }
+        let mut app = DemoApp::new_with_sink(None);
+        app.build_rack(&g, &[]);
+        app.stage_view = StageView::Mixer;
+        app.nav_open = true;
+        app.nav_filter = NavFilter::Channels;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(760.0, 520.0);
+        for _ in 0..3 { run_frame_at(&mut app, &ctx, size, vec![]); }
+
+        let target = *srcs.last().unwrap();
+        let before = app.mixer_strip_rects.iter().find(|(_, n, _)| *n == target).unwrap().2;
+        assert!(before.left() > app.stage_rect.right(), "last strip starts offscreen right ({before:?} vs {:?})", app.stage_rect);
+
+        let nav_pos = app.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { node, .. } if *node == target).then(|| rect.center()))
+            .expect("target row in Navigator");
+        click_at(&mut app, &ctx, size, nav_pos);
+        // egui applies a scroll_to_rect on the pass after the request.
+        run_frame_at(&mut app, &ctx, size, vec![]);
+        let shapes = run_frame_at(&mut app, &ctx, size, vec![]);
+        let after = app.mixer_strip_rects.iter().find(|(_, n, _)| *n == target).unwrap().2;
+        assert!(after.center().x <= app.stage_rect.right(), "target strip scrolled into view ({after:?} vs {:?})", app.stage_rect);
+        assert!(app.mixer_flash.is_some_and(|(n, exp)| n == target && exp > app.ui_time), "strip flash armed");
+        let ring = after.expand(3.0);
+        fn is_flash(s: &egui::Shape, ring: Rect) -> bool {
+            match s {
+                egui::Shape::Rect(r) => r.rect == ring && r.stroke.width == 2.0 && r.stroke.color.a() > 0,
+                egui::Shape::Vec(v) => v.iter().any(|c| is_flash(c, ring)),
+                _ => false,
+            }
+        }
+        assert!(shapes.iter().any(|cs| is_flash(&cs.shape, ring)), "flash ring painted around the strip");
+    }
+
+    #[test]
+    fn opening_navigator_keeps_rack_floors_and_nothing_clips_at_760x520() {
+        fn collect_text(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                egui::Shape::Vec(v) => for c in v { collect_text(c, out); },
+                _ => {}
+            }
+        }
+        // At 760x520 the rack overflows beside the panel and pans (rule 22);
+        // a jump pans the clicked unit into the clip.
+        let (mut small, _) = two_rigs_with_inserts(true);
+        small.nav_open = true;
+        let ctx1 = egui::Context::default();
+        let size = Vec2::new(760.0, 520.0);
+        for _ in 0..3 { run_frame_at(&mut small, &ctx1, size, vec![]); }
+        assert!(small.rack_overflow.x > 0.0, "the rack pans rather than squishes at 760x520");
+        let audio_in = small.units.iter().position(|u| u.name == "AUDIO IN").unwrap();
+        let clip = small.rack_clip.expect("an overflowing rack is clipped");
+        let off_center = |app: &DemoApp| app.xf.rect(app.unit_rects[audio_in]).center().x - clip.center().x;
+        assert!(off_center(&small).abs() > 4.0, "Audio in starts off centre");
+        let row = small.nav_row_rects.iter()
+            .find_map(|(r, rect)| matches!(r, NavRow::Channel { label, .. } if label == "Audio in").then(|| rect.center()))
+            .expect("Audio in row");
+        click_at(&mut small, &ctx1, size, row);
+        run_frame_at(&mut small, &ctx1, size, vec![]);
+        assert_eq!(small.selected_unit, Some(small.units[audio_in].node_id));
+        let half = small.rack_overflow.x / 2.0;
+        assert!(off_center(&small).abs() < 1.0 || (small.rack_pan.x.abs() - half).abs() < 0.5,
+            "the jump centres Audio in as far as the pan allows (off {}, pan {:?})", off_center(&small), small.rack_pan);
+        assert!(small.rack_pan.x != 0.0, "the jump panned the rack");
+
+        // Multi-stack rigs keep FACE_MIN_W / MIN_UNIT_H floors and pan cleanly (rule 22).
+        let (mut app, [na, _nb]) = two_rigs_with_inserts(true);
+        // Long insert name to verify ellipsis truncation never overflows.
+        let delay_node = app.units.iter().find(|u| u.name == "DELAY").unwrap().node_id;
+        app.apply_strip_name(delay_node, "Very Long Custom Tape Delay Effect").unwrap();
+        app.nav_open = true;
+        app.selected_unit = Some(na);
+
+        let ctx = egui::Context::default();
+        for (w, h) in [(760.0, 520.0), (781.0, 950.0), (1600.0, 1000.0)] {
+            let size = Vec2::new(w, h);
+            for filter in [NavFilter::Channels, NavFilter::Plugins, NavFilter::All] {
+                app.nav_filter = filter;
+                app.stage_view = StageView::Rack;
+                let mut shapes = Vec::new();
+                for _ in 0..3 { shapes = run_frame_at(&mut app, &ctx, size, vec![]); }
+                for (ui, u) in app.units.iter().enumerate() {
+                    if !app.visible(ui) { continue; }
+                    let r = app.unit_rects[ui];
+                    assert!(r.width() >= FACE_MIN_W - 0.5, "{w}x{h} {filter:?} unit {} shrunk below FACE_MIN_W: {r:?}", u.name);
+                    assert!(r.height() >= MIN_UNIT_H - 0.5, "{w}x{h} {filter:?} unit {} shrunk below MIN_UNIT_H: {r:?}", u.name);
+                }
+                // Every row inside the Navigator stays within the panel's width.
+                for (_, rect) in &app.nav_row_rects {
+                    assert!(rect.left() >= app.nav_panel_rect.left() && rect.right() <= app.nav_panel_rect.right() + 0.5,
+                        "{w}x{h} {filter:?}: row {rect:?} escapes panel {:?}", app.nav_panel_rect);
+                }
+                assert!(app.nav_panel_rect.right() <= w + 0.5 && app.nav_panel_rect.left() >= 0.0);
+                // Navigator text stays in the panel; nothing else shows over it.
+                let panel = app.nav_panel_rect;
+                // An empty clip (a face under the panel) draws nothing.
+                for cs in shapes.iter().filter(|cs| cs.clip_rect.is_positive()) {
+                    let mut texts = Vec::new();
+                    collect_text(&cs.shape, &mut texts);
+                    let in_panel = panel.expand(0.5).contains_rect(cs.clip_rect);
+                    for (t, tr) in texts {
+                        let visible = tr.intersect(cs.clip_rect);
+                        if in_panel {
+                            assert!(tr.left() >= panel.left() - 0.5 && tr.right() <= panel.right() + 0.5,
+                                "{w}x{h} {filter:?}: Navigator text {t:?} {tr:?} escapes panel {panel:?}");
+                        } else if visible.is_positive() {
+                            assert!(!visible.intersects(panel.shrink(0.5)),
+                                "{w}x{h} {filter:?}: {t:?} {visible:?} shows over the Navigator {panel:?}");
+                        }
+                    }
+                }
+            }
+        }
+        app.show_help = true;
+        let shapes = run_frame_at(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]);
+        let mut texts = Vec::new();
+        for cs in &shapes { collect_text(&cs.shape, &mut texts); }
+        assert!(texts.iter().any(|(t, _)| t == "Q"), "help overlay documents Q");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat navigator_shots -- --ignored"]
+    fn navigator_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh app per image: `shot` builds a new egui context (and font
+        // atlas) each time, and the rack keeps galleys from the last one.
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            for mixer in [false, true] {
+                let (mut app, [na, nb]) = two_rigs_with_inserts(true);
+                app.nav_open = true;
+                app.nav_filter = NavFilter::Plugins;
+                let jump = if mixer {
+                    app.stage_view = StageView::Mixer;
+                    NavRow::Channel { rig: 1, node: nb, label: "Sub bass".into(), color: Some(theme::CABLE_ROSE) }
+                } else {
+                    NavRow::Channel { rig: 0, node: na, label: "Hammond".into(), color: Some(theme::CABLE_AMBER) }
+                };
+                app.nav_jump(&jump);
+                let name = if mixer { "mixer" } else { "rack" };
+                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-nav-{w}x{h}.png")));
+            }
+        }
     }
 }

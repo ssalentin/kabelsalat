@@ -803,8 +803,16 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
         lilv_node_free(atom);
         lilv_node_free(input);
         lilv_world_free(world);
+        instruments_first(&mut out);
         out
     }
+}
+
+/// lilv lists plugins by URI, so `urn:` instruments such as Vitalium came
+/// after hundreds of `http:` effects and fell off every truncated listing:
+/// the agent never saw Vitalium's URI and guessed ten wrong ones.
+pub fn instruments_first(plugins: &mut [Lv2PluginInfo]) {
+    plugins.sort_by_key(|p| (!p.is_instrument, !p.is_midi_fx));
 }
 
 /// CLI self-test: list installed LV2 plugins.

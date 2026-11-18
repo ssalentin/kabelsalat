@@ -6227,12 +6227,22 @@ impl DemoApp {
                     },
                     None => args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32),
                 };
-                self.set_cc_binding(src, node, cc, param, target);
+                let bound = |key: &str, default: f64| match args.get(key) {
+                    None | Some(serde_json::Value::Null) => Ok(default),
+                    Some(v) => v.as_f64().filter(|x| (0.0..=1.0).contains(x))
+                        .ok_or(format!("set_cc_map '{key}' must be a number 0..1")),
+                };
+                let (lo, hi) = match (bound("min", 0.0), bound("max", 1.0)) {
+                    (Ok(lo), Ok(hi)) if lo <= hi => (lo, hi),
+                    (Ok(_), Ok(_)) => return "set_cc_map needs min <= max".into(),
+                    (Err(e), _) | (_, Err(e)) => return e,
+                };
+                self.set_cc_scaled(src, node, cc, param, target, crate::matrix::CcScale::range(lo as f32, hi as f32));
                 if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                 self.agent_activity.touch_cell(src, node, now);
                 self.agent_activity.record(origin, format!("CC {cc} → {}", self.unit_display_name(node)), vec![node], now);
                 let map: Vec<_> = self.rule_edits.get(&(src, node))
-                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
+                    .map(|e| e.cc_map.iter().map(|m| serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect())
                     .unwrap_or_default();
                 serde_json::json!({"node": node, "source": source, "cc": cc, "param": param, "target": target.as_str(), "cc_map": map}).to_string()
             }
@@ -6315,7 +6325,7 @@ impl DemoApp {
                                 crate::matrix::CcTarget::Knob => self.knob_param_label(node, m.param),
                                 crate::matrix::CcTarget::PluginParam => choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.clone()),
                             };
-                            serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name})
+                            serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name, "range": m.scale.range_json()})
                         }).collect();
                         entries.push(serde_json::json!({
                             "source": Self::source_str(src),
@@ -6938,7 +6948,12 @@ impl DemoApp {
                         if !self.plugin_lists_ready() {
                             return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
                         }
-                        self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+                        let Some(p) = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()) else {
+                            let installed: Vec<String> = self.plugins_lv2.iter().filter(|p| p.is_instrument)
+                                .map(|p| format!("{} = {}", p.name, p.uri)).collect();
+                            return format!("'{}' is not an installed LV2 plugin. Installed LV2 instruments: {}", uri.as_str(), installed.join(", "));
+                        };
+                        p.is_instrument
                     }
                     Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
                         if !self.plugin_lists_ready() {
@@ -8345,13 +8360,17 @@ impl DemoApp {
 
     /// Active CC binding for a rack knob (if any): `(source, cc)`.
     fn knob_cc_binding(&self, node_id: u32, param: u32, target: crate::matrix::CcTarget) -> Option<(SourceId, u8)> {
-        let mut best: Option<(SourceId, u8)> = None;
+        self.knob_cc_mapping(node_id, param, target).map(|(src, m)| (src, m.cc))
+    }
+
+    fn knob_cc_mapping(&self, node_id: u32, param: u32, target: crate::matrix::CcTarget) -> Option<(SourceId, crate::matrix::CcMapping)> {
+        let mut best: Option<(SourceId, crate::matrix::CcMapping)> = None;
         for (&(src, dest), edit) in &self.rule_edits {
             if dest != node_id { continue; }
             for m in &edit.cc_map {
                 if self.binds_knob(node_id, m, param, target) {
-                    if best.map_or(true, |(bs, bc)| (Self::source_sort_key(bs), bc) > (Self::source_sort_key(src), m.cc)) {
-                        best = Some((src, m.cc));
+                    if best.map_or(true, |(bs, bm)| (Self::source_sort_key(bs), bm.cc) > (Self::source_sort_key(src), m.cc)) {
+                        best = Some((src, *m));
                     }
                 }
             }
@@ -18048,7 +18067,12 @@ impl DemoApp {
         let is_learning = target.is_some_and(|(p, t)| {
             self.cc_learn.as_ref().is_some_and(|l| l.dest == u.node_id && l.param == p && l.target == t)
         });
-        let bound = target.and_then(|(p, t)| self.knob_cc_binding(u.node_id, p, t));
+        let mapping = target.and_then(|(p, t)| self.knob_cc_mapping(u.node_id, p, t));
+        let bound = mapping.map(|(src, m)| (src, m.cc));
+        let range = mapping
+            .map(|(_, m)| m.scale)
+            .filter(|s| s.is_continuous() && !s.is_identity())
+            .map(|s| s.bounds());
         let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
         let learn_col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
 
@@ -18068,6 +18092,25 @@ impl DemoApp {
             4.5,
             2.2,
         );
+
+        // A ranged CC binding: the stretch of track its controller can still
+        // reach is tinted, between two end ticks.
+        if let Some((lo, hi)) = range {
+            let rr = rx.min(ry);
+            let arc_pt = |v: f32, rad: f32| {
+                let ang = 135.0f32.to_radians() + 270.0f32.to_radians() * v;
+                xf.p(c + Vec2::new(ang.cos(), ang.sin()) * rad)
+            };
+            let from = lo.max(k.display_value.clamp(0.0, 1.0));
+            if hi > from {
+                let segs = ((hi - from) * 40.0).ceil() as usize;
+                let pts: Vec<Pos2> = (0..=segs).map(|i| arc_pt(from + (hi - from) * i as f32 / segs as f32, rr + 4.5)).collect();
+                painter.add(egui::Shape::line(pts, Stroke::new(2.4, alpha(theme::MIDI_BLUE, 0.6))));
+            }
+            for v in [lo, hi] {
+                painter.line_segment([arc_pt(v, rr + 1.0), arc_pt(v, rr + 6.5)], Stroke::new(1.8, theme::MIDI_BLUE));
+            }
+        }
 
         // Pulsing non-tomato outline around the value arc while learning.
         if is_learning {
@@ -18141,7 +18184,8 @@ impl DemoApp {
         let Some((unit, idx)) = self.knob_menu_target(&menu) else { return close(self) };
         let (node_id, param, target) = (menu.node, menu.param, menu.target);
         let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node_id && l.param == param && l.target == target);
-        let binding = self.knob_cc_binding(node_id, param, target);
+        let mapping = self.knob_cc_mapping(node_id, param, target);
+        let binding = mapping.map(|(src, m)| (src, m.cc));
         if binding.is_none() && !learning {
             return close(self);
         }
@@ -18151,6 +18195,12 @@ impl DemoApp {
         let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
+        let ranged = mapping.filter(|(_, m)| m.scale.is_continuous() && !learning);
+        let (mut lo_pct, mut hi_pct) = ranged.map_or((0.0, 100.0), |(_, m)| {
+            let (lo, hi) = m.scale.bounds();
+            ((lo * 100.0).round(), (hi * 100.0).round())
+        });
+        let mut new_range: Option<(f32, f32)> = None;
         let area = egui::Area::new(egui::Id::new("knob_midi_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
@@ -18184,6 +18234,33 @@ impl DemoApp {
                         } else if theme::chip_button(ui, "MIDI learn again", false).clicked() {
                             relearn = true;
                         }
+                        if ranged.is_some() {
+                            ui.add_space(8.0);
+                            theme::tracked_label(ui, "CONTROLLER RANGE", 9.0, 0.12, theme::INK_2);
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                let field = |ui: &mut egui::Ui, label: &str, v: &mut f32, lo: f32, hi: f32, tip: &str| {
+                                    theme::tracked_label(ui, label, 9.0, 0.12, theme::INK_2);
+                                    let r = drag_only(ui.add(egui::DragValue::new(v).range(lo..=hi).speed(0.5)
+                                        .fixed_decimals(0).suffix(" %")));
+                                    r.on_hover_text(tip).changed()
+                                };
+                                let lo_changed = field(ui, "MIN", &mut lo_pct, 0.0, hi_pct,
+                                    "where the controller's lowest position puts the knob · drag");
+                                ui.add_space(6.0);
+                                let hi_changed = field(ui, "MAX", &mut hi_pct, lo_pct, 100.0,
+                                    "how far the controller can turn the knob · drag");
+                                if lo_changed || hi_changed {
+                                    new_range = Some((lo_pct / 100.0, hi_pct / 100.0));
+                                }
+                            });
+                            if lo_pct > 0.0 || hi_pct < 100.0 {
+                                ui.add_space(4.0);
+                                if theme::chip_button(ui, "Full range", false).clicked() {
+                                    new_range = Some((0.0, 1.0));
+                                }
+                            }
+                        }
                         if binding.is_some() {
                             ui.add_space(4.0);
                             if theme::chip_button(ui, "Clear MIDI map", false).clicked() {
@@ -18197,6 +18274,9 @@ impl DemoApp {
                     });
             });
         self.knob_menu_rect = area.response.rect;
+        if let (Some((lo, hi)), Some((src, m))) = (new_range, ranged) {
+            self.set_cc_scaled(src, node_id, m.cc, Some(param), target, crate::matrix::CcScale::range(lo, hi));
+        }
         if !(relearn || cancel_learn || clear || reset_val) {
             return;
         }
@@ -21809,7 +21889,7 @@ mod rig_switch_tests {
             }
             app.set_cc_binding(SourceId::Keys, 1, 74, Some(42), crate::matrix::CcTarget::PluginParam);
             app.set_cc_binding(dev, 1, 7, Some(43), crate::matrix::CcTarget::PluginParam); // learn on an unrouted device
-            app.set_cc_binding(dev, 1, 14, Some(P_LEVEL), crate::matrix::CcTarget::Knob);
+            app.set_cc_scaled(dev, 1, 14, Some(P_LEVEL), crate::matrix::CcTarget::Knob, crate::matrix::CcScale::range(0.1, 0.6));
         });
         let saved = app.capture_session("cc").unwrap();
         let json = serde_json::to_string(&saved.matrix()).unwrap();
@@ -21824,7 +21904,8 @@ mod rig_switch_tests {
         let learned = rules.iter().find(|r| r.source == dev && r.dest == 1).expect("learned rule restored");
         assert!(learned.cc_only, "a learn-only rule must stay CC-only after reload");
         assert_eq!(learned.param_for_cc(7), Some(43));
-        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::IDENTITY }));
+        assert_eq!(learned.mapping_for_cc(14), Some(crate::matrix::CcMapping { cc: 14, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, scale: crate::matrix::CcScale::range(0.1, 0.6) }),
+            "a knob's controller range survives save and load");
         assert!(fresh.rule_edits.contains_key(&(dev, 1)), "UI mirror shows the restored binding");
     }
 
@@ -24125,6 +24206,95 @@ mod split_bpm_tests {
         }
     }
 
+    /// A pedal bound to a knob can be held below a ceiling from the knob's
+    /// menu: MAX at 60 % makes the pedal's full travel stop there, the knob
+    /// shows the reachable stretch, and Full range lifts the limit.
+    #[test]
+    fn a_knob_menu_range_caps_what_the_bound_pedal_reaches() {
+        let (mut app, ctx) = demo();
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        frame(&mut app, &ctx, vec![]);
+        let m = app.master_idx().unwrap();
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let pos = app.xf.p(app.knob_center(m, wi));
+        rclick(&mut app, &ctx, pos);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 30));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.cc_learn.is_none(), "CC 11 completed the learn");
+
+        rclick(&mut app, &ctx, pos);
+        let texts = frame(&mut app, &ctx, vec![]);
+        let painted = texts.concat();
+        assert!(painted.contains("CONTROLLER RANGEMIN0 %MAX100 %"), "menu shows the range: {painted}");
+        assert!(!texts.iter().any(|x| x == "Full range"), "no reset while the range is full: {texts:?}");
+        let fields = range_fields(&ctx);
+        assert_eq!(fields.len(), 2, "MIN and MAX fields");
+        drain.drain(|_| {});
+        let max = fields[1].center();
+        drag(&mut app, &ctx, max, max - Vec2::new(80.0, 0.0));
+        assert!(app.knob_menu.is_some(), "dragging a field keeps the menu open");
+        let (_, mapping) = app.knob_cc_mapping(app.units[m].node_id, app.units[m].knobs[wi].param.unwrap(), crate::matrix::CcTarget::Knob).unwrap();
+        let (lo, hi) = mapping.scale.bounds();
+        assert!(lo == 0.0 && (hi - 0.6).abs() < 0.01, "MAX dragged to 60 %: {lo}..{hi}");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { cc: 11, scale, .. } if *scale == mapping.scale)),
+            "the engine gets the ranged binding: {cmds:?}");
+
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 127));
+        let texts = frame(&mut app, &ctx, vec![]);
+        let k = &app.units[m].knobs[wi];
+        assert!((k.display_value - hi).abs() < 1e-6, "toe down stops at MAX: {}", k.display_value);
+        assert!(texts.concat().contains("MAX60 %") && texts.iter().any(|x| x == "Full range"), "{texts:?}");
+
+        let full = knob_menu_buttons(&ctx).into_iter()
+            .find(|r| r.center().y > fields[1].bottom())
+            .expect("Full range button below the fields");
+        click(&mut app, &ctx, full.center());
+        let (_, mapping) = app.knob_cc_mapping(app.units[m].node_id, app.units[m].knobs[wi].param.unwrap(), crate::matrix::CcTarget::Knob).unwrap();
+        assert!(mapping.scale.is_identity(), "Full range restores the plain binding: {:?}", mapping.scale);
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 127));
+        frame(&mut app, &ctx, vec![]);
+        assert!((app.units[m].knobs[wi].display_value - 1.0).abs() < 1e-6);
+    }
+
+    /// The agent sets the same range through `set_cc_map` and reads it back.
+    #[test]
+    fn set_cc_map_takes_a_range_and_list_cc_maps_reports_it() {
+        let (mut app, ctx) = demo();
+        frame(&mut app, &ctx, vec![]);
+        let m = app.master_idx().unwrap();
+        let node = app.units[m].node_id;
+        let wi = app.units[m].knob_index("WARM").unwrap();
+        let out = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:1", "cc": 11, "knob": "WARM", "max": 0.6}));
+        assert!(out.contains("\"range\":[0.0,0.6]"), "{out}");
+        let listed = app.exec_tool("list_cc_maps", &serde_json::json!({"node": node}));
+        assert!(listed.contains("\"range\":[0.0,0.6]"), "{listed}");
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 127));
+        frame(&mut app, &ctx, vec![]);
+        assert!((app.units[m].knobs[wi].display_value - 76.0 / 127.0).abs() < 1e-6);
+        for bad in [serde_json::json!({"min": 0.7, "max": 0.2}), serde_json::json!({"max": 1.5})] {
+            let mut args = serde_json::json!({"node": node, "source": "hw:1", "cc": 11, "knob": "WARM"});
+            args.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+            let out = app.exec_tool("set_cc_map", &args);
+            assert!(out.starts_with("set_cc_map"), "rejected: {out}");
+        }
+    }
+
+    /// Drag fields (MIN, MAX) of the knob menu, left to right.
+    fn range_fields(ctx: &egui::Context) -> Vec<Rect> {
+        let menu_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        ctx.viewport(|v| {
+            let mut f: Vec<Rect> = v.prev_pass.widgets.get_layer(menu_layer)
+                .filter(|w| w.sense.senses_drag() && w.sense.is_focusable())
+                .map(|w| w.rect)
+                .collect();
+            f.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            f
+        })
+    }
+
     /// Buttons of the knob context menu, top to bottom (previous pass).
     /// Buttons = click + focusable, no drag; the Area move widget is not focusable.
     fn knob_menu_buttons(ctx: &egui::Context) -> Vec<Rect> {
@@ -25538,6 +25708,22 @@ mod ui_polish_agent_tests {
         assert_eq!(results[0].matches("new cable id").count(), 1, "{}", results[0]);
         assert_eq!(results[0].split("new cable id ").nth(1).unwrap().split(',').count(), 3, "the result names the three cables: {}", results[0]);
         assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
+    }
+
+    #[test]
+    fn the_agent_finds_an_lv2_instrument_behind_hundreds_of_effects() {
+        let lv2 = |uri: String, name: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri, name: name.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        let mut plugins: Vec<_> = (0..290).map(|i| lv2(format!("http://example.org/fx{i:03}"), "Fx", false)).collect();
+        plugins.push(lv2("urn:distrho:vitalium".into(), "Vitalium", true));
+        crate::lv2::instruments_first(&mut plugins);
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = plugins;
+        app.plugins_loaded = true;
+        let listed = app.exec_tool("list_plugins", &serde_json::json!({}));
+        assert!(listed.contains("Vitalium [instrument] — urn:distrho:vitalium"), "{listed}");
+        let guessed = app.exec_tool("add_node", &serde_json::json!({"kind": "lv2", "uri": "http://distrho.sf.net/plugins/Vitalium"}));
+        assert!(guessed.starts_with("'http://distrho.sf.net/plugins/Vitalium' is not an installed LV2 plugin"), "{guessed}");
+        assert!(guessed.contains("Vitalium = urn:distrho:vitalium"), "the refusal names the real uri: {guessed}");
     }
 
     #[test]
@@ -28208,6 +28394,35 @@ mod mixer_parity_tests {
         app.stage_view = StageView::Mixer;
         for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
             super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
+    }
+
+    /// A pedal (CC 11) on Master WARM with its knob menu open, at the full
+    /// range and held to 10..60 %, as PNGs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat knob_range_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn knob_range_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1600.0, 1000.0);
+        for (name, range) in [("knob-range-full", None), ("knob-range-limited", Some((0.1, 0.6)))] {
+            let mut app = DemoApp::new_with_sink(None);
+            let m = app.master_idx().unwrap();
+            let node = app.units[m].node_id;
+            let mut args = serde_json::json!({"node": node, "source": "hw:1", "cc": 11, "knob": "WARM"});
+            if let Some((lo, hi)) = range {
+                args["min"] = serde_json::json!(lo);
+                args["max"] = serde_json::json!(hi);
+            }
+            app.exec_tool("set_cc_map", &args);
+            app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(1), 0, 11, 40));
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}-closed.png")));
+            let wi = app.units[m].knob_index("WARM").unwrap();
+            let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
+            let pos = app.xf.p(app.knob_center(m, wi));
+            app.knob_menu = Some(KnobMenu { node, param, target, pos });
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
         }
     }
 

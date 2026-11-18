@@ -551,6 +551,10 @@ struct SetCcMapArgs {
     target: Option<String>,
     /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
     knob: Option<String>,
+    /// Lowest parameter value the controller reaches (0..1, default 0).
+    min: Option<f32>,
+    /// Highest parameter value the controller reaches (0..1, default 1), e.g. 0.6 so a pedal never pushes drive past 60 %.
+    max: Option<f32>,
 }
 
 /// Arguments for `clear_cc_map`.
@@ -1393,7 +1397,14 @@ impl McpServer {
         let rig = args.rig.unwrap_or(0);
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
-            NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            NodeKind::Lv2 { uri } => {
+                let lv2 = crate::lv2::discover();
+                let Some(p) = lv2.iter().find(|p| p.uri == uri.as_str()) else {
+                    let installed: Vec<String> = lv2.iter().filter(|p| p.is_instrument).map(|p| format!("{} = {}", p.name, p.uri)).collect();
+                    return tool_err(format!("'{}' is not an installed LV2 plugin. Installed LV2 instruments: {}", uri.as_str(), installed.join(", ")));
+                };
+                p.is_instrument
+            }
             // An arp and a MIDI strip are inserted between the rig's Keys and
             // its synth(s) like an instrument is wired into its rig.
             NodeKind::Arp | NodeKind::MidiFx { .. } => true,
@@ -1926,7 +1937,7 @@ impl McpServer {
     }
 
     /// Bind or unbind one CC on a matrix rule.
-    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL', or knob=<a main control's name from list_params>). Omit param/knob to unbind that CC.")]
+    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL', or knob=<a main control's name from list_params>). Optional min/max (0..1) limit how far the controller moves the parameter: its whole travel spans min..max (a pedal on organ drive that must stay below 60 %: max=0.6). Omit param/knob to unbind that CC.")]
     fn set_cc_map(&self, Parameters(args): Parameters<SetCcMapArgs>) -> Result<CallToolResult, McpError> {
         if args.cc > 127 {
             return tool_err("cc must be 0..=127");
@@ -1945,9 +1956,16 @@ impl McpServer {
                     "param": args.param,
                     "target": args.target,
                     "knob": args.knob,
+                    "min": args.min,
+                    "max": args.max,
                 }),
             );
         }
+        let (lo, hi) = (args.min.unwrap_or(0.0), args.max.unwrap_or(1.0));
+        if !(0.0..=1.0).contains(&lo) || !(0.0..=1.0).contains(&hi) || lo > hi {
+            return tool_err("min and max must be 0..1 with min <= max");
+        }
+        let scale = crate::matrix::CcScale::range(lo, hi);
         let source = match Self::parse_rule_source(&args.source) {
             Ok(s) => s,
             Err(e) => return tool_err(e),
@@ -1973,7 +1991,7 @@ impl McpServer {
             },
             None => args.param,
         };
-        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target, scale: Default::default() }) {
+        if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target, scale }) {
             return tool_err(e);
         }
         let entry = st.cc_maps.entry((source, args.node)).or_default();
@@ -1982,14 +2000,15 @@ impl McpServer {
                 if let Some(m) = entry.iter_mut().find(|m| m.cc == args.cc) {
                     m.param = p;
                     m.target = target;
+                    m.scale = scale;
                 } else {
-                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p, target, scale: crate::matrix::CcScale::IDENTITY });
+                    entry.push(crate::matrix::CcMapping { cc: args.cc, param: p, target, scale });
                 }
             }
             None => entry.retain(|m| m.cc != args.cc),
         }
         let map: Vec<Value> = st.cc_maps.get(&(source, args.node))
-            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect())
+            .map(|v| v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect())
             .unwrap_or_default();
         if map.is_empty() {
             st.cc_maps.remove(&(source, args.node));
@@ -2105,7 +2124,7 @@ impl McpServer {
                     other => format!("{other:?}"),
                 },
                 "node": node,
-                "bindings": v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str()})).collect::<Vec<_>>(),
+                "bindings": v.iter().map(|m| json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "range": m.scale.range_json()})).collect::<Vec<_>>(),
             }))
             .collect();
         ok_json(json!({"cc_maps": entries}))
@@ -3405,8 +3424,12 @@ mod tests {
         assert!(McpServer::resolve_headless_knob(&kind, "GAIN").is_err(), "no knob on port 0 by a made-up name");
 
         let (server, mut engine) = local_server();
-        let added: AddNodeArgs = serde_json::from_value(json!({"kind": "lv2", "uri": uri, "name": "Synth"})).unwrap();
-        let node = tool_json(&server.add_node(Parameters(added)))["id"].as_u64().unwrap() as u32;
+        // Not through add_node: it refuses a URI no installed plugin has.
+        let node = {
+            let mut st = server.state.lock().unwrap();
+            send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name: name_bytes("Synth"), rig: 0, wire: false }).unwrap();
+            st.graph.add_node(kind.clone(), name_bytes("Synth"))
+        };
         engine.render(&mut vec![0.0f32; 64 * 2], 64);
         let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node, query: None })));
         assert_eq!(out["main_controls_source"], json!("designation"), "{out}");
@@ -3688,6 +3711,8 @@ mod tests {
             param: Some(42),
             target: None,
             knob: None,
+            min: None,
+            max: None,
         })));
         assert_eq!(res["cc"], json!(74));
         assert_eq!(res["param"], json!(42));
@@ -3699,15 +3724,18 @@ mod tests {
             param: None,
             target: None,
             knob: Some("LEVEL".into()),
+            min: None,
+            max: Some(0.6),
         })));
         assert_eq!(res_knob["param"], json!(0));
+        assert_eq!(res_knob["cc_map"][0]["range"], json!([0.0, 0.6]), "{res_knob}");
         assert_eq!(res_knob["target"], json!("knob"));
         let listed = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: None, source: None })));
         let all_bindings: Vec<&Value> = listed["cc_maps"].as_array().unwrap().iter()
             .flat_map(|e| e["bindings"].as_array().unwrap().iter())
             .collect();
         assert!(all_bindings.iter().any(|b| b["cc"] == json!(74) && b["target"] == json!("plugin")));
-        assert!(all_bindings.iter().any(|b| b["cc"] == json!(7) && b["target"] == json!("knob")));
+        assert!(all_bindings.iter().any(|b| b["cc"] == json!(7) && b["target"] == json!("knob") && b["range"] == json!([0.0, 0.6])));
         let dsp = tool_json(&server.list_params(Parameters(ListParamsArgs { node: 2, query: Some("mix".into()) })));
         assert_eq!(dsp["params"][0]["name"], json!("Mix"));
         engine.render(&mut buf, 2);

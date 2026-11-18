@@ -9,8 +9,8 @@ releases may still change behaviour and session files.
 
 ### Added
 - **Quick knob per plugin in the mixer channel strip (#107):** every source
-  and insert slot in the mixer now carries a small assignable knob beside it
-  with its parameter caption above it, linked directly to the rack unit's
+  and insert slot in the mixer now carries a small assignable knob at its
+  right end with the parameter's caption beside it, linked directly to the rack unit's
   knob (and engine/plugin parameter). It defaults to a plugin's first main
   control or an effect's `MIX` knob, resets on double-click, and right-click
   opens a dropdown to choose any knob of that unit; assignments are saved

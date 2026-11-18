@@ -14855,14 +14855,40 @@ impl DemoApp {
             // Name: click renames, drag reorders (#77). A coloured strip
             // names itself in its colour; the spine under it is drawn once
             // the column rect is known (below).
-            let shown = truncate_chars(&name, if collapsed { 6 } else { 13 });
             // Keyed by node, not by position: a live reorder moves the strip
             // under the pointer, and a positional id would hand the drag to
             // whichever strip now sits in the old slot (it ping-ponged).
             let (nr, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
-            let name_resp = ui.interact(nr, egui::Id::new(("strip_name", node)), egui::Sense::click_and_drag());
-            ui.painter().text(nr.center(), egui::Align2::CENTER_CENTER, &shown,
-                egui::FontId::proportional(13.0), row.color.unwrap_or(theme::INK));
+            let name_col = row.color.unwrap_or(theme::INK);
+            let name_rect = if collapsed {
+                ui.painter().text(nr.center(), egui::Align2::CENTER_CENTER, truncate_chars(&name, 6),
+                    egui::FontId::proportional(13.0), name_col);
+                nr
+            } else {
+                // Colour dot left, collapse chevron right, the name between.
+                let inner_l = nr.left() + STRIP_SPINE_W + SLOT_PAD_L;
+                let inner_r = nr.right() - SLOT_PAD_R;
+                let dr = Rect::from_center_size(Pos2::new(inner_l + 6.0, nr.center().y), egui::vec2(12.0, 12.0));
+                let dresp = ui.interact(dr, egui::Id::new(("strip_color_dot", node)), egui::Sense::click());
+                if let Some(c) = row.color {
+                    ui.painter().circle_filled(dr.center(), 4.0, c);
+                } else {
+                    ui.painter().circle_stroke(dr.center(), 4.0, Stroke::new(1.2, theme::CREAM_DIM));
+                }
+                if dresp.clicked() { self.strip_color_pick = Some(node); }
+                dresp.on_hover_text("strip colour");
+                let cr = Rect::from_center_size(Pos2::new(inner_r - 9.0, nr.center().y), egui::vec2(18.0, 18.0));
+                if strip_collapse_chip(ui, cr, egui::Id::new(("strip_collapse", node)))
+                    .on_hover_text("collapse this strip").clicked()
+                {
+                    self.with_strip_row(node, |r| r.collapsed = true);
+                }
+                let between = Rect::from_min_max(Pos2::new(dr.right() + 4.0, nr.top()), Pos2::new(cr.left() - 4.0, nr.bottom()));
+                let g = fit_galley(ui.painter(), &name, egui::FontId::proportional, &[13.0], between.width(), name_col);
+                ui.painter().galley(between.center() - g.size() * 0.5, g, name_col);
+                between
+            };
+            let name_resp = ui.interact(name_rect, egui::Id::new(("strip_name", node)), egui::Sense::click_and_drag());
             if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::Grab); }
             if name_resp.clicked() { self.strip_rename = Some((node, name)); }
             if name_resp.dragged() {
@@ -14903,33 +14929,16 @@ impl DemoApp {
                     self.with_strip_row(node, |r| r.collapsed = false);
                 }
             } else {
-                // Meta row: colour dot + collapse chevron.
-                ui.horizontal(|ui| {
-                    ui.add_space(((w - 42.0) * 0.5).max(4.0));
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let (dr, dresp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::click());
-                    if let Some(c) = row.color {
-                        ui.painter().circle_filled(dr.center(), 4.0, c);
-                    } else {
-                        ui.painter().circle_stroke(dr.center(), 4.0, Stroke::new(1.2, theme::CREAM_DIM));
-                    }
-                    if dresp.clicked() { self.strip_color_pick = Some(node); }
-                    dresp.on_hover_text("strip colour");
-                    if theme::chip_button(ui, "▾", false).on_hover_text("collapse this strip").clicked() {
-                        self.with_strip_row(node, |r| r.collapsed = true);
-                    }
-                });
                 // Source slot (#107): quick knob + instrument/patch plate aligned
                 // in the same column grid as the insert slots below it.
                 let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
-                let (cap_rect, knob_rect, plate_rect) = strip_slot_rects(sr);
-                self.strip_quick_knob_ui(ui, cap_rect, knob_rect, unit, false);
+                let (knob_rect, plate_rect) = strip_slot_rects(sr);
                 ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
-                let plate_label = source_patch.as_deref()
-                    .map(|p| truncate_chars(p, 11))
-                    .unwrap_or_else(|| truncate_chars(&sentence_case(&sub), 11));
-                ui.painter().text(Pos2::new(plate_rect.left() + 8.0, plate_rect.center().y),
-                    egui::Align2::LEFT_CENTER, &plate_label, egui::FontId::proportional(11.0), theme::CREAM);
+                let plate_label = source_patch.clone().unwrap_or_else(|| sentence_case(&sub));
+                let caption = self.quick_knob_caption(unit);
+                paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + PLATE_PAD_X + 2.0, &plate_label,
+                    caption.as_deref(), theme::CREAM, theme::CREAM_MID);
+                self.strip_quick_knob_ui(ui, knob_rect, unit, false);
                 let tip = match &source_patch {
                     Some(p) => format!("{} · {p}", sentence_case(&sub)),
                     None => sentence_case(&sub),
@@ -14988,7 +14997,7 @@ impl DemoApp {
         let rect = strip.response.rect;
         // The colour spine (#77): a 3px stripe down the strip's left edge.
         if let Some(c) = row.color {
-            let spine = Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+            let spine = Rect::from_min_size(rect.min, egui::vec2(STRIP_SPINE_W, rect.height()));
             ui.painter().rect_filled(spine, 1.5, c);
         }
         if let (Some(k), Some(g)) = (knob, gain) {
@@ -15268,22 +15277,21 @@ impl DemoApp {
         resp.on_hover_text("peak hold · red = clipped (click the light to clear)");
     }
 
-    /// One mixer quick knob (#107) inside a source or insert slot: quantized
-    /// uppercase caption in `cap_rect`, dial painted via `paint_knob_dial` in
-    /// `knob_rect`, drag/double-click updates the underlying rack knob, and
-    /// right-click opens a `theme::Dropdown` listing the unit's knobs.
-    fn strip_quick_knob_ui(&mut self, ui: &mut egui::Ui, cap_rect: Rect, knob_rect: Rect, unit: usize, dimmed: bool) {
+    /// Caption of `unit`'s mixer quick knob (#107), shown beside the knob.
+    fn quick_knob_caption(&self, unit: usize) -> Option<String> {
+        self.quick_knob(unit).map(|ki| self.units[unit].knobs[ki].label.to_uppercase())
+    }
+
+    /// One mixer quick knob (#107) in a slot row's `knob_rect`: dial painted
+    /// via `paint_knob_dial`, drag/double-click updates the underlying rack
+    /// knob, and right-click opens a `theme::Dropdown` listing the unit's knobs.
+    fn strip_quick_knob_ui(&mut self, ui: &mut egui::Ui, knob_rect: Rect, unit: usize, dimmed: bool) {
         let Some(ki) = self.quick_knob(unit) else { return };
         let (node_id, label, full_name, val, default) = {
             let u = &self.units[unit];
             let k = &u.knobs[ki];
             (u.node_id, k.label.clone(), k.source.plugin_name().map(str::to_string), k.value, k.default)
         };
-        let caption = label.to_uppercase();
-        let cap_col = if dimmed { theme::CREAM_DIM } else { theme::CREAM_MID };
-        let cap_g = fit_quick_knob_caption(ui.painter(), &caption, cap_rect.width(), cap_col);
-        ui.painter().galley(Pos2::new(cap_rect.left(), cap_rect.center().y - cap_g.size().y * 0.5), cap_g, cap_col);
-
         let resp = ui.interact(knob_rect, egui::Id::new(("strip_quick_knob", node_id)), egui::Sense::click_and_drag());
         self.mixer_quick_knob_rects.push((node_id, knob_rect));
 
@@ -15324,7 +15332,7 @@ impl DemoApp {
             dragging,
             ring,
             accent,
-            2.5,
+            QUICK_KNOB_ARC_GAP,
             1.4,
         );
 
@@ -15377,14 +15385,15 @@ impl DemoApp {
             };
             let row = self.strip_row(node);
             let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
-            let (cap_rect, knob_rect, plate_rect) = strip_slot_rects(sr);
-            self.strip_quick_knob_ui(ui, cap_rect, knob_rect, fx, row.bypass);
-
+            let (knob_rect, plate_rect) = strip_slot_rects(sr);
             let resp = ui.interact(plate_rect, egui::Id::new(("insert_slot", node)), egui::Sense::click_and_drag());
+            let x = Rect::from_min_size(Pos2::new(plate_rect.right() - 17.0, plate_rect.center().y - 8.0), egui::vec2(16.0, 16.0));
+            let xresp = ui.interact(x, egui::Id::new(("insert_remove", node)), egui::Sense::click());
+            let row_hovered = resp.hovered() || xresp.hovered();
             let fill = if row.bypass { theme::MUTED } else { theme::DARK_PANEL_HI };
             ui.painter().rect_filled(plate_rect, 2.0, fill);
             // Bypass dot (#74): a click toggles pass-through.
-            let dot = Rect::from_min_size(Pos2::new(plate_rect.left() + 5.0, plate_rect.center().y - 4.0), egui::vec2(8.0, 8.0));
+            let dot = Rect::from_min_size(Pos2::new(plate_rect.left() + 4.0, plate_rect.center().y - 4.0), egui::vec2(8.0, 8.0));
             let dresp = ui.interact(dot, egui::Id::new(("insert_bypass", node)), egui::Sense::click());
             let dot_col = if row.bypass { theme::MUTED } else { theme::LIVE_TEAL };
             if row.bypass {
@@ -15397,10 +15406,13 @@ impl DemoApp {
                 self.send_strip_bypass(node);
             }
             dresp.on_hover_text(if row.bypass { "bypassed — click to enable" } else { "click to bypass (the effect passes its input through)" });
-            // Name.
-            let label = format!("{} {}", slot + 1, truncate_chars(&name, 8));
-            ui.painter().text(Pos2::new(plate_rect.left() + 17.0, plate_rect.center().y), egui::Align2::LEFT_CENTER,
-                &label, egui::FontId::proportional(11.0), if row.bypass { theme::CREAM_DIM } else { theme::CREAM });
+            // Name + quick-knob caption; the caption yields to × on hover.
+            let caption = if row_hovered { None } else { self.quick_knob_caption(fx) };
+            paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + 15.0, &format!("{} {name}", slot + 1),
+                caption.as_deref(),
+                if row.bypass { theme::CREAM_DIM } else { theme::CREAM },
+                if row.bypass { theme::CREAM_DIM } else { theme::CREAM_MID });
+            self.strip_quick_knob_ui(ui, knob_rect, fx, row.bypass);
             // Drag reorders (one edit when the drag ends — the rack reloads).
             if resp.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grab);
@@ -15415,9 +15427,6 @@ impl DemoApp {
                 }
             }
             // Remove (shown on hover).
-            let x = Rect::from_min_size(Pos2::new(plate_rect.right() - 17.0, plate_rect.center().y - 8.0), egui::vec2(16.0, 16.0));
-            let xresp = ui.interact(x, egui::Id::new(("insert_remove", node)), egui::Sense::click());
-            let row_hovered = resp.hovered() || xresp.hovered();
             if row_hovered {
                 ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
                 if xresp.clicked() {
@@ -17432,14 +17441,21 @@ fn parse_pan(s: &str) -> Option<f64> {
 const STRIP_W: f32 = 122.0;
 /// Width of a strip collapsed to its mini form (#77).
 const STRIP_COLLAPSED_W: f32 = 46.0;
-/// Quick-knob geometry inside a strip slot (#107).
-const QUICK_KNOB_R: f32 = 7.0;
-const QUICK_KNOB_COL_W: f32 = 24.0;
-const SLOT_PAD_X: f32 = 3.0;
-const SLOT_GAP: f32 = 4.0;
-const SLOT_CAPTION_H: f32 = 11.0;
-const SLOT_BODY_H: f32 = 24.0;
-const SLOT_H: f32 = SLOT_CAPTION_H + 1.0 + SLOT_BODY_H;
+/// Width of a coloured strip's spine (#77), drawn down its left edge.
+const STRIP_SPINE_W: f32 = 3.0;
+/// Slot rows (source + inserts, #74/#107) keep the insert rows' pitch from
+/// before quick knobs, so a strip is never taller than it was without them.
+const SLOT_H: f32 = 20.0;
+/// Clearance of slot content from the spine (left) and the strip's edge
+/// (right; the strip gap adds to it).
+const SLOT_PAD_L: f32 = 6.0;
+const SLOT_PAD_R: f32 = 3.0;
+const SLOT_GAP: f32 = 3.0;
+/// Text inset inside a slot plate (rule 7).
+const PLATE_PAD_X: f32 = 5.0;
+const QUICK_KNOB_R: f32 = 6.0;
+const QUICK_KNOB_ARC_GAP: f32 = 2.0;
+const QUICK_KNOB_COL_W: f32 = 19.0;
 
 /// Shared knob dial painter (rack face + mixer quick knobs): disc ring, flat
 /// value arc, active inset keyline, and pointer needle.
@@ -17480,24 +17496,26 @@ fn paint_knob_dial(
     painter.line_segment([sc, tip], Stroke::new(if r < 12.0 { 1.6 } else { 2.0 }, TEXT));
 }
 
-/// Grid rects of one mixer plugin slot: (caption row, quick-knob box, plate box).
-fn strip_slot_rects(sr: Rect) -> (Rect, Rect, Rect) {
-    let inner_w = (sr.width() - 2.0 * SLOT_PAD_X).max(40.0);
-    let cap_rect = Rect::from_min_size(Pos2::new(sr.left() + SLOT_PAD_X, sr.top()), egui::vec2(inner_w, SLOT_CAPTION_H));
-    let body_rect = Rect::from_min_size(Pos2::new(sr.left() + SLOT_PAD_X, sr.top() + SLOT_CAPTION_H + 1.0), egui::vec2(inner_w, SLOT_BODY_H));
-    let knob_rect = Rect::from_min_size(body_rect.min, egui::vec2(QUICK_KNOB_COL_W, SLOT_BODY_H));
+/// Grid rects of one mixer slot row: (quick-knob box at the right edge,
+/// plate left of it), inside `SLOT_PAD_L` from the spine and `SLOT_PAD_R`
+/// from the strip's right edge.
+fn strip_slot_rects(sr: Rect) -> (Rect, Rect) {
+    let left = sr.left() + STRIP_SPINE_W + SLOT_PAD_L;
+    let right = sr.right() - SLOT_PAD_R;
+    let knob_rect = Rect::from_min_max(Pos2::new(right - QUICK_KNOB_COL_W, sr.top()), Pos2::new(right, sr.bottom()));
     let plate_rect = Rect::from_min_max(
-        Pos2::new(knob_rect.right() + SLOT_GAP, body_rect.top() + 1.0),
-        Pos2::new(body_rect.right(), body_rect.bottom() - 1.0),
+        Pos2::new(left, sr.top() + 1.0),
+        Pos2::new(knob_rect.left() - SLOT_GAP, sr.bottom() - 1.0),
     );
-    (cap_rect, knob_rect, plate_rect)
+    (knob_rect, plate_rect)
 }
 
-/// Lay out a quick-knob caption in uppercase at a 0.5 px quantized font size
-/// (rule 17), fitting inside `max_w` with ellipsis fallback.
-fn fit_quick_knob_caption(painter: &egui::Painter, text: &str, max_w: f32, color: Color32) -> Arc<Galley> {
-    for size in [8.5f32, 8.0, 7.5] {
-        let g = painter.layout_no_wrap(text.to_string(), theme::medium_font(size), color);
+/// Lay out `text` at the first of `sizes` (0.5 px steps, rule 17) that fits
+/// `max_w`, else ellipsized at the last size.
+fn fit_galley(painter: &egui::Painter, text: &str, font: fn(f32) -> egui::FontId, sizes: &[f32], max_w: f32, color: Color32) -> Arc<Galley> {
+    let last = *sizes.last().expect("at least one size");
+    for &size in sizes {
+        let g = painter.layout_no_wrap(text.to_string(), font(size), color);
         if g.size().x <= max_w {
             return g;
         }
@@ -17505,12 +17523,50 @@ fn fit_quick_knob_caption(painter: &egui::Painter, text: &str, max_w: f32, color
     let chars: Vec<char> = text.chars().collect();
     for n in (1..chars.len()).rev() {
         let t = format!("{}\u{2026}", chars[..n].iter().collect::<String>());
-        let g = painter.layout_no_wrap(t, theme::medium_font(7.5), color);
+        let g = painter.layout_no_wrap(t, font(last), color);
         if g.size().x <= max_w {
             return g;
         }
     }
-    painter.layout_no_wrap(text.to_string(), theme::medium_font(7.5), color)
+    painter.layout_no_wrap("\u{2026}".into(), font(last), color)
+}
+
+const SLOT_NAME_SIZES: [f32; 2] = [11.0, 10.5];
+const SLOT_CAPTION_SIZES: [f32; 3] = [8.5, 8.0, 7.5];
+
+/// Paint a slot plate's name (from `name_x`) and, right-aligned beside the
+/// quick knob, its caption. They share the plate: the caption first steps
+/// down its sizes to leave the name whole; only if that fails does it keep
+/// at least 45 % and both ellipsize.
+fn paint_slot_texts(
+    painter: &egui::Painter,
+    plate: Rect,
+    name_x: f32,
+    name: &str,
+    caption: Option<&str>,
+    name_col: Color32,
+    cap_col: Color32,
+) {
+    const GAP: f32 = 4.0;
+    let right = plate.right() - PLATE_PAD_X;
+    let avail = (right - name_x).max(0.0);
+    let name_font: fn(f32) -> egui::FontId = egui::FontId::proportional;
+    let cap_g = caption.map(|c| {
+        let name_w = fit_galley(painter, name, name_font, &SLOT_NAME_SIZES, f32::INFINITY, name_col).size().x;
+        let beside_whole_name = fit_galley(painter, c, theme::medium_font, &SLOT_CAPTION_SIZES, avail - name_w - GAP, cap_col);
+        if beside_whole_name.text() == c {
+            beside_whole_name
+        } else {
+            fit_galley(painter, c, theme::medium_font, &SLOT_CAPTION_SIZES, (avail - name_w - GAP).max(avail * 0.45), cap_col)
+        }
+    });
+    let cap_w = cap_g.as_ref().map_or(0.0, |g| g.size().x + GAP);
+    let name_g = fit_galley(painter, name, name_font, &SLOT_NAME_SIZES, avail - cap_w, name_col);
+    let cy = plate.center().y;
+    painter.galley(Pos2::new(name_x, cy - name_g.size().y * 0.5), name_g, name_col);
+    if let Some(g) = cap_g {
+        painter.galley(Pos2::new(right - g.size().x, cy - g.size().y * 0.5), g, cap_col);
+    }
 }
 
 /// Knobs eligible for mixer quick-knob assignment (#107): built-in hidden
@@ -17722,6 +17778,21 @@ struct PendingInsertEdit {
 /// Truncate a label to `n` characters with an ellipsis.
 fn truncate_chars(s: &str, n: usize) -> String {
     if s.chars().count() > n { format!("{}\u{2026}", s.chars().take(n.saturating_sub(1)).collect::<String>()) } else { s.to_string() }
+}
+
+/// The strip's collapse chip (#77): `chip_button`'s fill and hairline at
+/// 18 px so it fits the 20 px name row; the chevron is drawn, not a glyph.
+fn strip_collapse_chip(ui: &mut egui::Ui, rect: Rect, id: egui::Id) -> egui::Response {
+    let resp = ui.interact(rect, id, egui::Sense::click());
+    let hot = resp.hovered();
+    let fill = if hot { mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07) } else { theme::DARK_PANEL_HI };
+    let p = ui.painter();
+    p.rect(rect, 2.0, fill, Stroke::new(1.0, if hot { theme::MUTED } else { theme::HAIRLINE }), egui::StrokeKind::Inside);
+    let c = rect.center();
+    let st = Stroke::new(1.5, theme::CREAM);
+    p.line_segment([c + Vec2::new(-3.5, -1.5), c + Vec2::new(0.0, 2.0)], st);
+    p.line_segment([c + Vec2::new(0.0, 2.0), c + Vec2::new(3.5, -1.5)], st);
+    resp
 }
 
 /// One small M/S button pair member (#73). `row` is the strip's current
@@ -26514,6 +26585,11 @@ mod mixer_parity_tests {
     // ---- #107: assignable quick knob per plugin in mixer strips -----------
 
     fn run_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        run_at_clipped(app, ctx, size, time, events).into_iter().map(|(t, r, _)| (t, r)).collect()
+    }
+
+    /// One frame's painted texts: (text, rect, the clip rect it is painted in).
+    fn run_at_clipped(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, time: f64, events: Vec<egui::Event>) -> Vec<(String, Rect, Rect)> {
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
         raw.time = Some(time);
@@ -26522,16 +26598,16 @@ mod mixer_parity_tests {
         let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear();
         let mut texts = Vec::new();
-        fn collect(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+        fn collect(s: &egui::Shape, clip: Rect, out: &mut Vec<(String, Rect, Rect)>) {
             match s {
                 egui::Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => {
-                    out.push((t.galley.text().to_string(), t.visual_bounding_rect()));
+                    out.push((t.galley.text().to_string(), t.visual_bounding_rect(), clip));
                 }
-                egui::Shape::Vec(v) => for x in v { collect(x, out); }
+                egui::Shape::Vec(v) => for x in v { collect(x, clip, out); }
                 _ => {}
             }
         }
-        for cs in &out.shapes { collect(&cs.shape, &mut texts); }
+        for cs in &out.shapes { collect(&cs.shape, cs.clip_rect, &mut texts); }
         texts
     }
 
@@ -26746,15 +26822,54 @@ mod mixer_parity_tests {
             super::main_control_tests::give_clap_units_main_knobs(&mut app);
             app.stage_view = StageView::Mixer;
             let size = Vec2::new(w, h);
-            let mut texts = Vec::new();
+            let mut clipped = Vec::new();
             for i in 0..4 {
-                texts = run_at(&mut app, &ctx, size, i as f64, vec![]);
+                clipped = run_at_clipped(&mut app, &ctx, size, i as f64, vec![]);
             }
             assert_eq!(app.mixer_quick_knob_rects.len(), 3, "{w}x{h}: source + 2 inserts draw quick knobs");
             let screen = Rect::from_min_size(Pos2::ZERO, size);
-            for (text, rect) in &texts {
+            for (text, rect, clip) in &clipped {
                 assert!(screen.expand(0.5).contains_rect(*rect), "{w}x{h}: '{text}' leaves window: {rect:?}");
+                assert!(clip.expand(0.5).contains_rect(*rect), "{w}x{h}: '{text}' {rect:?} is cut off by its clip {clip:?}");
             }
+            // Slot content keeps clear of the colour spine and the strip edge
+            // (rules 7, 52): knobs, captions and plate names alike.
+            let (_, src_node, strip) = *app.mixer_strip_rects.iter()
+                .find(|(_, n, _)| app.mixer_quick_knob_rects.iter().any(|(k, _)| k == n))
+                .expect("the source strip with a quick knob");
+            let inner = Rect::from_min_max(
+                Pos2::new(strip.left() + STRIP_SPINE_W + 6.0, strip.top()),
+                Pos2::new(strip.right(), strip.bottom()),
+            );
+            let knobs: Vec<Rect> = app.mixer_quick_knob_rects.iter().map(|(_, r)| *r)
+                .filter(|r| strip.intersects(*r)).collect();
+            assert_eq!(knobs.len(), 3, "{w}x{h}: the source and its 2 inserts have knobs in strip {src_node}");
+            for k in &knobs {
+                assert!(inner.contains_rect(*k), "{w}x{h}: quick knob {k:?} outside {inner:?}");
+                assert!(k.height() <= 20.0, "{w}x{h}: slot rows keep the 20 px insert pitch, knob box {k:?}");
+            }
+            let row_band = Rect::from_min_max(Pos2::new(strip.left(), knobs[0].top()), Pos2::new(strip.right(), knobs[2].bottom()));
+            let slot_texts: Vec<&(String, Rect, Rect)> = clipped.iter()
+                .filter(|(_, r, _)| row_band.contains(r.center())).collect();
+            for want in ["Surge xt", "CUTOFF", "1 Delay", "2 Reverb", "MIX"] {
+                assert!(slot_texts.iter().any(|(t, _, _)| t == want), "{w}x{h}: '{want}' shown in full in the slot rows: {slot_texts:?}");
+            }
+            // egui skips painting widgets outside the clip, so check the strips
+            // themselves against the sheet's scroll clip.
+            let sheet_clip = slot_texts.iter().find(|(t, _, _)| t == "Surge xt").unwrap().2;
+            for (_, n, r) in &app.mixer_strip_rects {
+                assert!(r.bottom() <= sheet_clip.bottom() + 0.5,
+                    "{w}x{h}: strip {n} {r:?} runs past the sheet {sheet_clip:?}; its M/S are cut off");
+            }
+            for (t, r, _) in &slot_texts {
+                assert!(inner.contains_rect(*r), "{w}x{h}: slot text '{t}' {r:?} touches the spine or edge of {inner:?}");
+            }
+            for (t, r, _) in slot_texts.iter().filter(|(t, _, _)| t == "CUTOFF" || t == "MIX") {
+                let k = knobs.iter().find(|k| k.y_range().contains(r.center().y)).expect("a knob in the caption's row");
+                assert!(r.right() <= k.left() && k.left() - r.right() < 12.0,
+                    "{w}x{h}: caption '{t}' {r:?} sits right beside its knob {k:?}");
+            }
+            let texts: Vec<(String, Rect)> = clipped.iter().map(|(t, r, _)| (t.clone(), *r)).collect();
             for i in 0..texts.len() {
                 for j in i + 1..texts.len() {
                     let o = texts[i].1.intersect(texts[j].1);

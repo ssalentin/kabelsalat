@@ -745,6 +745,18 @@ Learned so far (2026-11-15, UI polish pass):
     ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+128. **A feature PR ships its README entry, and fresh shots when users can
+    see the difference:** the plugin-editor windows (#71) merged without a
+    line in "What you can do", and the README's feature list quietly went
+    stale. A PR labelled `enhancement` updates `README.md` (its entry under
+    "What you can do", or "Install") in the same change, and when the feature
+    changes what the app shows or how it is played, re-captures the
+    screenshots that entry shows (`scripts/shot.sh` into `docs/shots/`,
+    rule 108 review). `.github/workflows/readme-check.yml`
+    (`scripts/ci/readme-check.sh`, self-tested on real `gh api` output with
+    `--selftest`) fails an `enhancement` PR without a README change and warns
+    when `src/ui.rs`/`src/theme.rs` changed without a screenshot — label
+    only real features, so the fail stays meaningful.
 
 ## Working on kabelsalat
 
@@ -759,6 +771,13 @@ Learned so far (2026-11-15, UI polish pass):
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
+- **New features (user, 2026-11-18):** a feature is an issue labelled
+  `enhancement`, and the PR that implements it carries the label too. That
+  PR updates `README.md` in the same change — the feature's entry under
+  "What you can do" (or "Install") — and, when it changes what users see,
+  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
+  The `readme-check` workflow (rule 128) fails it otherwise and warns when
+  UI code changed without a screenshot.
 - **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
   `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
   opens the release PR, its merge is tagged, and the tag builds every package

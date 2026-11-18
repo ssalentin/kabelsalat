@@ -8,6 +8,29 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **The assistant can listen (#35).** A new `listen` tool records a few
+  seconds of the master and sends them to an audio-capable model on
+  OpenRouter (Gemini 3.8 Flash by default; `agent_listen_model` in
+  config.json picks another). The model scores the sound 0-10 on the words
+  of your request ("8-bit", "heroic", "warm") and says what it heard and how
+  to move toward them. The agent plays notes, listens, changes one thing and
+  listens again. A listen takes the recording plus about 3 s. It needs an
+  OpenRouter key; without one the agent is pointed at `measure_mix`. MCP
+  agents get the same `listen` tool, headless and attached.
+  `kabelsalat listen-test` checks that the model ranks known reference clips
+  the right way round and prints its latency.
+- **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
+  Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
+  editor pane, in a window of its own, and closes from the same button or the
+  window's close button. kabelsalat now runs the plugin's timers and file
+  descriptor callbacks, which these editors paint from.
+  `kabelsalat editor-test` opens, checks and closes every installed editor.
+- **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
+  `.vital` patches, wavetables and modulation included. Its sound list in the
+  editor and the assistant's `list_sounds` / `load_sound` show every patch in
+  Vitalium's folder. Drop a `.vitalbank` or `.vital` file on the window to add
+  it (or run `kabelsalat vital-import <file>`). A loaded patch is kept in saved
+  sessions, through rig edits and through undo.
 - **Instrument profiles: map a whole hardware instrument at once.** Pick the
   instrument for a hardware port in the MIDI matrix (a port whose name names
   the instrument is matched by itself) and its knobs, drawbars and switches
@@ -21,12 +44,28 @@ releases may still change behaviour and session files.
   search and load them. Floe installs from its release on x86_64; it publishes
   no aarch64 Linux build, and its card says so there. Release downloads are
   checked against a pinned SHA-256.
+- **Aeolus in the instrument catalog:** a pipe organ with additive pipe
+  models, several divisions of stops and a convolution reverb. It installs
+  from its v0.3.0 release on x86_64 and builds from source on aarch64.
+  Aeolus starts with every stop off, so kabelsalat starts it with a
+  principal chorus drawn, and `list_sounds` / `load_sound` offer 12
+  registrations (principals, flutes, celeste, reeds, full organ). The
+  Aeolus unit has a stop panel like a console's stop jamb: Manual III, II,
+  I and Pedal down the left, and each stop of the shown division with an
+  indicator light; a click draws it or pushes it in. The panel reads the stops
+  back from the plugin, so it follows sound and session loads.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code
   and the project's website. `list_instruments` reports the same fields.
 - **GitHub stars on catalog cards:** each card shows its project's star count
   (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
   opens. Without internet access, or when GitHub refuses, cards show no stars.
+- **Sessions save themselves (#51):** with *Autosave sessions* on (Settings,
+  on by default) the open session is written every 20 s when it changed, and
+  on quit; a patch that was never saved goes to `Autosave`. Loading a session
+  or saving one makes it the open session; a starter template never replaces
+  it. Each saved session has an **Overwrite** action (with a confirm) that
+  saves the current patch over it, and the open session is marked in the list.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).
@@ -42,7 +81,19 @@ releases may still change behaviour and session files.
   the low keys it is played on; the assistant sets the LOW zone an octave up
   when it puts a bass there. Saved with the session.
 
+### Removed
+- **Image input for the assistant:** dropping or pasting an image into the
+  chat, the `look_at_rack` screenshot tool (in-app and MCP), the vision model
+  role (`agent_perceive_model` in Settings and config.json) and
+  `jev-test --image` are gone. The agent works from text and the rack's own
+  data. Dropped `.vital` / `.vitalbank` files are still imported.
+
 ### Changed
+- **Native Wayland:** the app no longer forces XWayland and needs no X
+  server. It renders at the compositor's fractional scale (sharp at 1.6x),
+  opens maximized as it asks to, and text input goes through the Wayland
+  input method instead of fcitx's X bridge. The Flatpak drops its X11
+  socket. `KABELSALAT_UI_SCALE` still overrides the scale.
 - **MIDI matrix sources read like devices:** hardware rows show the device name
   ("ESI MIDIMATE eX") instead of ALSA's "client:port 24:0" string, with a port
   chip only when a device has several ports and further ports joined to the
@@ -62,17 +113,24 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
-- **Organ face fits at the default window size (#58).** A stack column is
-  never narrower than its widest face needs, so the organ's LESLIE knob no
-  longer lands on the neighbouring unit and the drawbars stay visible; a narrow
-  window pans the rack instead.
-- **Dexed no longer crashes the test suite (#52).** Its destructor segfaults
-  while other plugin instances render, so a retired Dexed is parked and reused
-  by the next one (reset to fresh state), never destroyed.
-- **Plugins page header (#65):** the "New <plugin> rig" confirmation has its own
-  row under the subtitle instead of being painted over it.
-- **Flaky scan-cache test (#64):** only the deliberately hanging scanner gets
-  the short timeout.
+- **Small and tiled windows:** the rack fits windows down to the 760 px
+  minimum instead of panning with Keys and Master cut off; a short, wide
+  window lays each instrument chain out in one row; the Mixer, Matrix,
+  Plugins and Settings sheets give their margins to content, scroll instead
+  of painting into the keyboard or assistant dock, and the master meter no
+  longer stacks its dB marks. The rig strip hint is shown only where it fits.
+- **UI scale on a second monitor:** the scale follows the monitor the window
+  is on (it kept the laptop's 1.6x on a 1.0x external screen).
+- **An instrument the assistant adds plays at once:** `add_node` wires a
+  CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
+  rig's synth: the rig's Keys into it and it into the rig's Master. A
+  setBfree added to a rig was left with only its MIDI cable and stayed
+  silent. The assistant also no longer believes LV2 instruments are
+  "coming soon".
+- **MIDI matrix, LV2 instrument columns:** a click in a setBfree (or any LV2
+  instrument) column lit or cleared every cell of it, because all its rows
+  showed the MIDI cable. Each cell now routes its own source, with the same
+  keyboard switch and hardware radio group as a Surge column.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

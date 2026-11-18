@@ -946,6 +946,63 @@ unsafe fn query_worker_interface(desc: &Lv2Descriptor) -> Option<Lv2WorkerInterf
 }
 
 const LV2_MIDNAM_INTERFACE_URI: &[u8] = b"http://ardour.org/lv2/midnam#interface\0";
+const LV2_STATE_INTERFACE_URI: &[u8] = b"http://lv2plug.in/ns/ext/state#interface\0";
+const LV2_STATE_IS_POD: u32 = 1;
+const LV2_STATE_IS_PORTABLE: u32 = 2;
+
+type Lv2StateRetrieve = extern "C" fn(*mut c_void, u32, *mut usize, *mut u32, *mut u32) -> *const c_void;
+
+type Lv2StateStore = extern "C" fn(*mut c_void, u32, *const c_void, usize, u32, u32) -> i32;
+
+/// `LV2_State_Interface` (lv2/state/state.h).
+#[repr(C)]
+struct Lv2StateInterface {
+    save: Option<extern "C" fn(Lv2Handle, Lv2StateStore, *mut c_void, u32, *const *const Lv2Feature) -> i32>,
+    restore: Option<extern "C" fn(Lv2Handle, Lv2StateRetrieve, *mut c_void, u32, *const *const Lv2Feature) -> i32>,
+}
+
+/// How a plugin's state is handed over: the one property it restores from,
+/// and the check a value must pass before the plugin sees it.
+pub struct StateFormat {
+    pub key: &'static str,
+    pub kind: &'static str,
+    pub check: fn(&[u8]) -> Result<(), String>,
+}
+
+const ATOM_CHUNK: &str = "http://lv2plug.in/ns/ext/atom#Chunk";
+
+/// The state format of a plugin whose state the app hands over; None for
+/// every other plugin. JUCE's LV2 wrapper keeps the whole state in one
+/// chunk (`urn:juce:stateBinary`); for Vitalium that chunk is a Vital patch.
+pub fn state_format(uri: &str) -> Option<StateFormat> {
+    (uri == crate::vital::URI).then_some(StateFormat { key: "urn:juce:stateBinary", kind: ATOM_CHUNK, check: crate::vital::check_patch })
+}
+
+/// One property a restore hands the plugin: (key URID, type URID, value).
+struct StateProperty<'a> {
+    key: u32,
+    kind: u32,
+    value: &'a [u8],
+}
+
+extern "C" fn state_store(handle: *mut c_void, key: u32, value: *const c_void, size: usize, kind: u32, _flags: u32) -> i32 {
+    unsafe {
+        let saved = &mut *(handle as *mut Vec<(u32, u32, Vec<u8>)>);
+        saved.push((key, kind, std::slice::from_raw_parts(value as *const u8, size).to_vec()));
+    }
+    0
+}
+
+extern "C" fn state_retrieve(handle: *mut c_void, key: u32, size: *mut usize, kind: *mut u32, flags: *mut u32) -> *const c_void {
+    unsafe {
+        let props = &*(handle as *const Vec<StateProperty<'_>>);
+        let Some(p) = props.iter().find(|p| p.key == key) else { return std::ptr::null() };
+        if !size.is_null() { *size = p.value.len(); }
+        if !kind.is_null() { *kind = p.kind; }
+        if !flags.is_null() { *flags = LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE; }
+        p.value.as_ptr() as *const c_void
+    }
+}
 
 /// Ardour's MIDNAM interface (`extension_data(midnam#interface)`): the plugin
 /// hands out a MIDNAM XML document that names its MIDI programmes.
@@ -1339,6 +1396,14 @@ impl Lv2Plugin {
         self.queue_midi([0xB0, cc & 0x7F, value & 0x7F]);
     }
 
+    /// Queue a channel-pressure (aftertouch) message: how wind patches read
+    /// breath (allocation-free).
+    pub fn channel_pressure(&mut self, value: u8) {
+        if self.atom_in.is_some() && append_midi_event(&mut self.atom_buf, self.urid_midi, 0, &[0xD0, value & 0x7F]) {
+            self.last_event = Some([0xD0, value & 0x7F, 0]);
+        }
+    }
+
     /// Queue a MIDI programme change for the next run() (allocation-free).
     pub fn program_change(&mut self, program: u8) {
         let program = program.min(127);
@@ -1365,6 +1430,58 @@ impl Lv2Plugin {
                 free(text);
             }
             Some(xml)
+        }
+    }
+
+    /// Restore the plugin's state from `(key URI, atom type URI, value)`
+    /// properties through its `state#interface`. Blocks for as long as the
+    /// plugin takes (a Vital patch rebuilds its wavetables): call it on the
+    /// loader thread, before the instance goes to the audio thread.
+    pub fn restore_state(&mut self, properties: &[(&str, &str, &[u8])]) -> anyhow::Result<()> {
+        let restore = self.state_interface()?.restore.ok_or_else(|| anyhow::anyhow!("{} has no state restore", self.uri))?;
+        // The JUCE wrapper pushes a control port to the plugin only when it
+        // differs from the value it saw last; one block lets it see the
+        // ports as they are now (a reused instance comes back at defaults),
+        // so the first block after the restore overrides nothing.
+        let silence = vec![0.0f32; 2];
+        let mut out = vec![0.0f32; 2];
+        self.process(&silence, &mut out, 1);
+        let urid = &mut *self._urid as *mut UridMap as *mut c_void;
+        let map = |uri: &str| {
+            let c = std::ffi::CString::new(uri).unwrap_or_default();
+            urid_map_cb(urid, c.as_ptr())
+        };
+        let props: Vec<StateProperty<'_>> = properties.iter().map(|(k, t, v)| StateProperty { key: map(k), kind: map(t), value: v }).collect();
+        unsafe {
+            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let status = restore((*self.instance).lv2_handle, state_retrieve, &props as *const Vec<StateProperty<'_>> as *mut c_void, 0, features.as_ptr());
+            anyhow::ensure!(status == 0, "{} refused the state (status {status})", self.uri);
+        }
+        Ok(())
+    }
+
+    /// The state property stored under `key`, as the plugin saves it now.
+    /// Same thread rules as `restore_state`.
+    pub fn saved_state(&mut self, key: &str) -> anyhow::Result<Vec<u8>> {
+        let save = self.state_interface()?.save.ok_or_else(|| anyhow::anyhow!("{} has no state save", self.uri))?;
+        let mut saved: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+        let c = std::ffi::CString::new(key)?;
+        let key = urid_map_cb(&mut *self._urid as *mut UridMap as *mut c_void, c.as_ptr());
+        unsafe {
+            let features: [*const Lv2Feature; 1] = [std::ptr::null()];
+            let status = save((*self.instance).lv2_handle, state_store, &mut saved as *mut _ as *mut c_void, 0, features.as_ptr());
+            anyhow::ensure!(status == 0, "{} could not save its state (status {status})", self.uri);
+        }
+        saved.into_iter().find(|p| p.0 == key).map(|p| p.2).ok_or_else(|| anyhow::anyhow!("{} saved nothing under that key", self.uri))
+    }
+
+    fn state_interface(&self) -> anyhow::Result<&Lv2StateInterface> {
+        unsafe {
+            let desc = &*(*self.instance).lv2_descriptor;
+            let ext = desc.extension_data.ok_or_else(|| anyhow::anyhow!("{} has no extension data", self.uri))?;
+            let ptr = ext(LV2_STATE_INTERFACE_URI.as_ptr() as *const c_char);
+            anyhow::ensure!(!ptr.is_null(), "{} has no state interface", self.uri);
+            Ok(&*(ptr as *const Lv2StateInterface))
         }
     }
 
@@ -2185,6 +2302,40 @@ mod tests {
         }
         plugin.note_off(60);
         assert!(peak > 1e-4, "expected non-zero audio from Vitalium, got peak={peak}");
+        retire(plugin);
+    }
+
+    /// Rising zero crossings per second of the left channel.
+    fn pitch_hz(plugin: &mut Lv2Plugin, note: u8) -> f32 {
+        let input = vec![0.0f32; 256 * 2];
+        let mut output = vec![0.0f32; 256 * 2];
+        plugin.note_on(note, 100);
+        let mut left: Vec<f32> = Vec::new();
+        for _ in 0..80 {
+            plugin.process(&input, &mut output, 256);
+            left.extend(output.iter().step_by(2));
+        }
+        plugin.note_off(note);
+        for _ in 0..40 { plugin.process(&input, &mut output, 256); }
+        let tail = &left[left.len() / 2..];
+        let rising = tail.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        rising as f32 * 48000.0 / tail.len() as f32
+    }
+
+    #[test]
+    fn a_restored_vital_patch_is_what_vitalium_plays() {
+        let _one_at_a_time = VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(mut plugin) = Lv2Plugin::load("urn:distrho:vitalium", 48000.0, 256) else { return };
+        let init = pitch_hz(&mut plugin, 57);
+        assert!((init - 220.0).abs() < 15.0, "init patch plays A3 at 220 Hz, measured {init}");
+        let saved = plugin.saved_state("urn:juce:stateBinary").expect("save");
+        let text = String::from_utf8_lossy(&saved);
+        let mut patch: serde_json::Value = serde_json::from_str(text.trim_end_matches('\0')).expect("Vitalium saves JSON");
+        patch["settings"]["osc_1_transpose"] = serde_json::json!(12.0);
+        let patch = patch.to_string();
+        plugin.restore_state(&[("urn:juce:stateBinary", "http://lv2plug.in/ns/ext/atom#Chunk", patch.as_bytes())]).expect("restore");
+        let up = pitch_hz(&mut plugin, 57);
+        assert!((up - 440.0).abs() < 30.0, "the patch's +12 transpose plays A4 at 440 Hz, measured {up}");
         retire(plugin);
     }
 

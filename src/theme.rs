@@ -375,7 +375,7 @@ pub fn value_arc(
 /// Meter color, stepped — not a gradient (§4.8): cream → tomato → clip red.
 pub fn meter_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    if t < 0.6 { CREAM } else if t < 0.9 { ACCENT } else { CLIP_RED }
+    if t < 0.6 { CREAM } else if t < 0.95 { ACCENT } else { CLIP_RED }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +403,11 @@ pub fn layout_tracked(fonts: &mut egui::epaint::FontsView<'_>, text: &str, font:
     for ch in text.chars() {
         let g = fonts.layout_delayed_color(ch.to_string(), font.clone(), f32::INFINITY);
         h = h.max(g.size().y);
+        let gw = g.size().x;
         chars.push((g, x));
-        let w = fonts.glyph_width(&font, ch);
+        // The laid-out glyph is the fallback: glyph_width answered 0 for
+        // every letter in a busy test run, stacking the wordmark on one spot.
+        let w = Some(fonts.glyph_width(&font, ch)).filter(|w| *w > 0.0).unwrap_or(gw);
         let adv = if tracking_em < 0.0 { (w + tracking).max(w * 0.9) } else { w + tracking };
         x += adv;
     }

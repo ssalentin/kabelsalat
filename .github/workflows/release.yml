@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Nightly: every package from main as the rolling `nightly` pre-release, so
+  # broken packaging shows up within a day instead of on release day.
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       tag:
@@ -24,6 +28,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      skip: ${{ steps.version.outputs.skip }}
     env:
       BACKFILL_TAG: ${{ inputs.tag }}
     steps:
@@ -45,6 +50,14 @@ jobs:
             exit 0
           fi
           crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            # Nothing merged since the last nightly: keep it, build nothing.
+            last=$(git ls-remote origin refs/tags/nightly | cut -f1)
+            if [ "$last" = "$GITHUB_SHA" ]; then
+              echo "nightly is already at $GITHUB_SHA"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            fi
+          fi
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version=${GITHUB_REF_NAME#v}
             if [ "$version" != "$crate" ]; then
@@ -67,6 +80,7 @@ jobs:
   binaries:
     name: tarball + AppImage (${{ matrix.arch }})
     needs: version
+    if: needs.version.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +149,7 @@ jobs:
   flatpak:
     name: Flatpak (${{ matrix.arch }})
     needs: version
-    if: ${{ !inputs.tag }}
+    if: ${{ !inputs.tag && needs.version.outputs.skip != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -172,7 +186,7 @@ jobs:
   arch-package:
     name: Arch package (${{ matrix.arch }})
     needs: version
-    if: ${{ !inputs.tag }}
+    if: ${{ !inputs.tag && needs.version.outputs.skip != 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -237,3 +251,40 @@ jobs:
             gh release create "$TAG" dist/* --verify-tag \
               --title "kabelsalat $VERSION" --notes-file "$RUNNER_TEMP/notes.md"
           fi
+
+  nightly:
+    # Replaces the `nightly` pre-release (and its tag) with this build of main.
+    # A pre-release is never "latest", so releases/latest/download links and
+    # AppImage updates keep pointing at the last stable release.
+    if: >-
+      ${{ !cancelled() && github.event_name == 'schedule' && needs.binaries.result == 'success'
+      && needs.flatpak.result == 'success' && needs.arch-package.result == 'success' }}
+    needs: [version, binaries, flatpak, arch-package]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
+      - name: Move the nightly pre-release to this commit
+        run: |
+          {
+            echo "Automatic build of \`main\` at $GITHUB_SHA ($(date -u +%F))."
+            echo "Not a release: it may break; stable versions are the other releases."
+            echo
+            echo "## Changes since the last release"
+            echo
+            python3 scripts/release.py notes
+          } > "$RUNNER_TEMP/notes.md"
+          gh release delete nightly --yes --cleanup-tag 2>/dev/null || true
+          gh release create nightly dist/* --prerelease --latest=false \
+            --target "$GITHUB_SHA" --title "kabelsalat nightly $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md"

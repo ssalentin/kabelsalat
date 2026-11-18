@@ -383,6 +383,17 @@ struct MeasureMixArgs {
     reset: Option<bool>,
 }
 
+/// Arguments for `listen`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListenArgs {
+    /// Words the sound should match, each scored 0-10 (e.g. ["8-bit", "heroic"]).
+    attributes: Option<Vec<String>>,
+    /// Seconds of the master to record, 0.5-8 (default 4).
+    seconds: Option<f32>,
+    /// Anything else to ask about the sound.
+    question: Option<String>,
+}
+
 /// Arguments for `set_rig_device`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRigDeviceArgs {
@@ -1024,6 +1035,27 @@ impl McpServer {
         }))
     }
 
+    /// The audio judge (#35): record the master and ask a listening model.
+    #[tool(name = "listen", description = "Hear the master: record the next `seconds` of the master output and ask a listening model (audio-capable, OpenRouter) to score it 0-10 on each attribute and say what it heard; the answer adds the app's loudness/peak/band measurements. Only sound that plays during the recording is heard: send note_on first and note_off after. Takes about seconds + 3 s.")]
+    fn listen(&self, Parameters(args): Parameters<ListenArgs>) -> Result<CallToolResult, McpError> {
+        let args = json!({ "attributes": args.attributes, "seconds": args.seconds, "question": args.question });
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !remote {
+            // Off the async runtime: the HTTP client blocks and owns a runtime
+            // of its own, which may not be dropped inside this one.
+            return match std::thread::spawn(move || crate::listen::listen(&args)).join() {
+                Ok(text) => ok_json(json!(text)),
+                Err(_) => tool_err("listen: the listening thread panicked"),
+            };
+        }
+        let wait = Duration::from_secs_f32(crate::listen::MAX_SECS + 60.0);
+        match bridge::request_within(&json!({"op": "listen", "args": args}), wait) {
+            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => ok_json(reply.get("data").cloned().unwrap_or(Value::Null)),
+            Ok(reply) => tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("listen failed").to_string()),
+            Err(e) => tool_err(format!("listen needs the running app (attach): {e:#}")),
+        }
+    }
+
     /// Master-bus loudness/true-peak/band meter (Bravo 1 "measure loop").
     #[tool(name = "measure_mix", description = "Read the master-bus loudness/profile meter: momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation with a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness gate.")]
     fn measure_mix(&self, Parameters(args): Parameters<MeasureMixArgs>) -> Result<CallToolResult, McpError> {
@@ -1054,7 +1086,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -1082,12 +1114,22 @@ impl McpServer {
         // Send first, then mirror into the local model: both id counters
         // advance exactly once per accepted command and stay in sync.
         let rig = args.rig.unwrap_or(0);
-        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig }) {
+        let wire = match &kind {
+            NodeKind::Clap { .. } => true,
+            NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            _ => false,
+        };
+        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
             return tool_err(e);
         }
         let id = st.graph.add_node(kind, name);
         st.graph.set_rig(id, rig);
-        let mut result = json!({"id": id, "name": name_str(&name)});
+        let before = st.graph.edges.len();
+        if wire {
+            st.graph.wire_instrument(id);
+        }
+        let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
+        let mut result = json!({"id": id, "name": name_str(&name), "cables": cables});
         note_silent_claps(&st, &mut result);
         ok_json(result)
     }
@@ -1388,23 +1430,12 @@ impl McpServer {
         }
     }
 
-    /// See the app window (the in-app agent's look_at_rack).
-    #[tool(name = "look_at_rack", description = "See the app: a PNG screenshot of the whole kabelsalat window as the user sees it right now (rack side in view, units, cables, mixer, open panels). Needs the running app (kabelsalat mcp --attach) with its window visible. Use it for how something looks, what is selected or where something is; get_graph is the faster source for nodes and cables.")]
-    fn look_at_rack(&self) -> Result<CallToolResult, McpError> {
-        Self::ui_bridge_tool("look_at_rack", json!({}))
-    }
-
     fn ui_bridge_tool(tool: &str, args: Value) -> Result<CallToolResult, McpError> {
         match bridge::request(&json!({"op": "ui", "tool": tool, "args": args})) {
             Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => {
                 let data = reply.get("data").cloned().unwrap_or(Value::Null);
                 if let Some(s) = data.as_str() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                        // A tool that shows something answers with a picture.
-                        if let Some(png) = parsed.get("png_base64").and_then(Value::as_str) {
-                            let text = parsed.get("text").and_then(Value::as_str).unwrap_or("");
-                            return Ok(CallToolResult::success(vec![ContentBlock::text(text), ContentBlock::image(png, "image/png")]));
-                        }
                         return ok_json(parsed);
                     }
                 }
@@ -2373,6 +2404,9 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -2398,6 +2432,9 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())

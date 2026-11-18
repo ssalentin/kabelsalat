@@ -28,8 +28,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, ToolCall, ToolOutput, UserMessage};
-use crate::vision::Image;
+use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
@@ -68,6 +67,10 @@ const SUBTEXT: Color32 = theme::CREAM_MID;
 /// Knob radius on unit faces (labels and display captions share its baseline).
 const KNOB_R: f32 = 17.0;
 const METER_SEGS: usize = 14;
+/// Top of Master's meter in a face too short for its caption (under the subtitle).
+const METER_TOP_SHORT: f32 = 60.0;
+/// Width of a Master meter segment.
+const METER_SEG_W: f32 = 22.0;
 /// Face grid (rack-local px), shared by every unit face: content starts on
 /// the title's left edge, keeps FACE_PAD_R from the right border and
 /// FACE_PAD_B under the lowest label. The knob row sits on the bottom of
@@ -614,6 +617,29 @@ const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
 const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
 /// How often plugin knobs follow their plugin (values and renamed controls).
 const MAIN_POLL_SECS: f32 = 0.1;
+/// How often an Aeolus face re-reads which stops its plugin has drawn (the
+/// face's own clicks and sound loads update it at once).
+const AEOLUS_POLL_SECS: f32 = 1.0;
+
+/// An Aeolus unit's stop panel: what the plugin has drawn (None until read,
+/// or for an organ other than the default one) and the division shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AeolusFace {
+    drawn: Option<[u32; 4]>,
+    division: usize,
+}
+
+impl Default for AeolusFace {
+    /// Manual I, where the registration a fresh Aeolus starts with sits.
+    fn default() -> Self { AeolusFace { drawn: None, division: 2 } }
+}
+
+/// Where an Aeolus face lays out its division tabs and the stops of the
+/// division it shows (rack-local).
+struct AeolusRects {
+    tabs: [Rect; 4],
+    stops: Vec<Rect>,
+}
 /// Readback pause after the UI or a CC moved a plugin knob.
 const READBACK_HOLD_SECS: f32 = 0.3;
 /// The warm shift an instrument's audio cable carries (the former TONE
@@ -1081,7 +1107,7 @@ struct TranscriptRun {
 
 /// Maximum tool chips shown in a finished or long run before `"+N more"`.
 const COLLAPSED_RUN_CHIPS: usize = 3;
-/// Left indent of transcript message text, chips, Confirm/Cancel, and attachments
+/// Left indent of transcript message text, chips and Confirm/Cancel
 /// (6 px leading margin + 66 px role column + 6 px spacing).
 const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 
@@ -1091,7 +1117,7 @@ const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 /// sees what the calls before it really did.
 struct ToolBatch {
     todo: VecDeque<(ToolCall, Option<usize>)>,
-    results: Vec<ToolOutput>,
+    results: Vec<String>,
     waiting: Option<(Waiting, Option<usize>)>,
     user_idx: usize,
 }
@@ -1103,99 +1129,8 @@ enum Waiting {
     /// list_sounds / load_sound on an instrument whose library is still
     /// being scanned: the call runs once the scan is done.
     SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
-    /// look_at_rack: the screenshot of a coming frame. The tool's own
-    /// line is kept for the result.
-    RackShot { said: String, deadline: std::time::Instant },
-}
-
-/// Thumbnail height and row height for the chat's attached image chip.
-const ATTACH_THUMB_H: f32 = 32.0;
-const ATTACH_ROW_H: f32 = 40.0;
-
-/// Cached egui texture for the currently attached chat image (loaded once per
-/// attachment and dropped immediately when the attachment is cleared).
-struct ChatThumb {
-    bytes: Arc<[u8]>,
-    tex: Option<egui::TextureHandle>,
-    size: [usize; 2],
-}
-
-fn truncate_attachment_name(name: &str) -> String {
-    if name.chars().count() > 40 {
-        format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>())
-    } else {
-        name.to_string()
-    }
-}
-
-fn sync_chat_thumb(ctx: &egui::Context, chat_image: &Option<Image>, chat_thumb: &mut Option<ChatThumb>) {
-    let Some(img) = chat_image.as_ref() else {
-        *chat_thumb = None;
-        return;
-    };
-    if chat_thumb.as_ref().is_some_and(|t| Arc::ptr_eq(&t.bytes, &img.bytes)) {
-        return;
-    }
-    let (tex, size) = match img.thumbnail_rgba(64) {
-        Some((sz, rgba)) => {
-            let color = egui::ColorImage::from_rgba_unmultiplied(sz, &rgba);
-            let handle = ctx.load_texture("assistant_chat_thumb", color, egui::TextureOptions::LINEAR);
-            (Some(handle), sz)
-        }
-        None => (None, [32, 32]),
-    };
-    *chat_thumb = Some(ChatThumb {
-        bytes: Arc::clone(&img.bytes),
-        tex,
-        size,
-    });
-}
-
-/// The tool that shows an agent the app window.
-const LOOK_TOOL: &str = "look_at_rack";
-/// How long look_at_rack waits for the frame's pixels.
-const RACK_SHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// look_at_rack's screenshot of the app window. The tool only asks; the
-/// frame path sends the request (it has the egui context), the windowing
-/// integration answers after it painted, and a worker thread scales and
-/// encodes the pixels. Whoever waits takes the result on a later frame.
-#[derive(Default)]
-struct RackShot {
-    wanted: bool,
-    ready: Arc<Mutex<Option<Result<Image, String>>>>,
-    /// Bridge (MCP) callers waiting for it, each with its deadline.
-    remote: Vec<(std::sync::mpsc::Sender<String>, std::time::Instant)>,
-}
-
-impl RackShot {
-    /// Ask the integration for the next frame's pixels.
-    fn request(&mut self, ctx: &egui::Context) {
-        if !std::mem::take(&mut self.wanted) { return; }
-        // A frame that came after its caller gave up is not this look's.
-        if let Ok(mut slot) = self.ready.lock() { *slot = None; }
-        let (ready, repaint) = (self.ready.clone(), ctx.clone());
-        ctx.request_screenshot(move |frame: Arc<egui::ColorImage>| {
-            std::thread::spawn(move || {
-                let image = Image::from_rgba("kabelsalat window", frame.size, frame.as_raw());
-                if let Ok(mut slot) = ready.lock() { *slot = Some(image); }
-                repaint.request_repaint();
-            });
-        });
-    }
-
-    fn take(&self) -> Option<Result<Image, String>> {
-        self.ready.lock().ok().and_then(|mut slot| slot.take())
-    }
-}
-
-/// look_at_rack's result once the frame arrived, or why there is none.
-fn rack_shot_output(said: &str, shot: Option<Result<Image, String>>) -> ToolOutput {
-    match shot {
-        Some(Ok(image)) => ToolOutput { text: format!("{said}: {}", image.describe()), image: Some(image) },
-        Some(Err(why)) => format!("error: the screenshot could not be encoded: {why}").into(),
-        None => format!("error: no screenshot within {} s — the window is hidden or the app runs without one", RACK_SHOT_WAIT.as_secs()).into(),
-    }
+    /// listen: recording the master and asking the listening model.
+    Listen(std::sync::mpsc::Receiver<String>),
 }
 
 /// The tools that read an instrument's sound library.
@@ -1240,7 +1175,22 @@ fn note_name(n: u8) -> String {
     format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
 }
 
-/// Effective cell state for a CLAP rig: the MIDI cable gate AND the source
+/// One matrix click on an instrument's sources: keyboard is a switch,
+/// hardware a radio group (all devices, one device, or off).
+fn toggled_sources(src: (bool, bool), dev: Option<u32>, row: MatrixRow, on: bool) -> ((bool, bool), Option<u32>) {
+    let (mut src, mut dev) = (src, dev);
+    match row {
+        MatrixRow::Keys => src.0 = on,
+        MatrixRow::HwAll => { src.1 = on; if on { dev = None; } }
+        MatrixRow::HwDev(d) => {
+            if on { src.1 = true; dev = Some(d); }
+            else if dev == Some(d) { src.1 = false; }
+        }
+    }
+    (src, dev)
+}
+
+/// Effective cell state for an instrument column: the MIDI cable gate AND the source
 /// filter/device binding (mirrors engine::source_accepted + keys_gate).
 /// `src` = the rig's (keyboard, hardware) source pair.
 fn clap_cell(src: (bool, bool), dev: Option<u32>, gate: bool, row: MatrixRow) -> bool {
@@ -1268,6 +1218,46 @@ fn audio_in_sub(device: Option<&str>, ch: AudioInChannel) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Default input".to_string());
     format!("{dev} · {}", ch.label())
+}
+
+/// An Aeolus stop name ("Open Diapason\n8") on one line within `max_w`
+/// (screen px): the whole name, else organists' short forms ("Op. Diap.
+/// 16"), else letters off the end with "…". The footage always stays.
+fn fit_stop_label(painter: &egui::Painter, name: &str, font: FontId, max_w: f32) -> String {
+    // One line, footages as the drawbars print them (2⅔, not 2 2/3).
+    let full = name.replace('\n', " ").replace(" 2/3", "⅔").replace(" 1/3", "⅓").replace(" 3/5", "⅗");
+    let fits = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x <= max_w;
+    // Organists' own short forms, the gentler ones first; last, a double
+    // diapason loses its "open" ("Dbl. Diap. 16").
+    let shorten = |label: &str, words: &[(&str, &str)]| label.split(' ')
+        .filter_map(|w| match words.iter().find(|(long, _)| *long == w) {
+            Some((_, "")) => None,
+            Some((_, short)) => Some(*short),
+            None => Some(w),
+        })
+        .collect::<Vec<_>>().join(" ");
+    const SOFT: &[(&str, &str)] = &[
+        ("Diapason", "Diap."), ("Principal", "Princ."), ("Double", "Dbl."), ("Harmonic", "Harm."),
+        ("Chimney", "Chim."), ("Sesquialtera", "Sesq."), ("Fourniture", "Fourn."), ("Quintadena", "Quint."),
+        ("Violoncell", "Cello"), ("Cornopean", "Cornop."), ("Fifteenth", "15th"), ("Twelfth", "12th"),
+        ("Bombarde", "Bomb."), ("Trombone", "Tromb."), ("Larigot", "Lar."), ("Mixture", "Mixt."),
+    ];
+    const HARD: &[(&str, &str)] = &[("Open", "Op."), ("Flute", "Fl."), ("Stopt", "St."), ("Spitz", "Sp."),
+        ("Bassoon", "Bsn."), ("Trumpet", "Tpt."), ("Nazard", "Naz."), ("Humana", "Hum."), ("Gemshorn", "Gemsh.")];
+    let soft = shorten(&full, SOFT);
+    let hard = shorten(&soft, HARD);
+    let bare = shorten(&hard, &[("Op.", "")]);
+    for label in [full.as_str(), soft.as_str(), hard.as_str(), bare.as_str()] {
+        if fits(label) { return label.to_string(); }
+    }
+    // Letters off the name, never off the footage (the last word).
+    let (stem, foot) = bare.rsplit_once(' ').unwrap_or(("", bare.as_str()));
+    let chars: Vec<char> = stem.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t = format!("{}… {foot}", chars[..n].iter().collect::<String>().trim_end().trim_end_matches('.'));
+        if fits(&t) { return t; }
+    }
+    foot.to_string()
 }
 
 /// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
@@ -1667,6 +1657,30 @@ enum Hit {
     Background,
 }
 
+/// Which saved session a two-step confirm in the Sessions view is armed for.
+#[derive(Clone, Debug, PartialEq)]
+enum SessionConfirm {
+    Delete(String),
+    Overwrite(String),
+}
+
+/// Where autosave writes while no saved session is open.
+const AUTOSAVE_NAME: &str = "Autosave";
+/// Seconds between autosave checks.
+const AUTOSAVE_INTERVAL: f32 = 20.0;
+/// Seconds after a load before autosave records what was loaded.
+const AUTOSAVE_SETTLE: f32 = 2.0;
+
+/// Autosave of the open session (`session_autosave` in config.json).
+struct Autosave {
+    enabled: bool,
+    due: f32,
+    /// What is on disk under the open session's name, or what was loaded.
+    /// None: the next check records the rack without writing, so a fresh
+    /// start or a template never replaces a saved session unchanged.
+    saved: Option<crate::session::Session>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 enum StageView {
     #[default]
@@ -1736,6 +1750,35 @@ enum Drag {
 
 /// Rack-local → screen transform for the flip (squash around the horizontal
 /// axis). All rack drawing goes through this.
+/// The rack's margins and spacing (points). A small window drops to `TIGHT`
+/// before any face goes below its floor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RackChrome {
+    /// Stage edge to the rack, each side.
+    margin: f32,
+    /// Stage top to the rack's view.
+    top: f32,
+    /// Room for the hint line under the rack.
+    hint: f32,
+    /// Rack edge to the units.
+    pad: f32,
+    /// Width of the side rails.
+    rail: f32,
+    /// Between units.
+    gap: f32,
+    /// Corner radius of the rack panel.
+    radius: f32,
+}
+
+impl RackChrome {
+    const ROOMY: Self = Self { margin: 30.0, top: 40.0, hint: 36.0, pad: 20.0, rail: 14.0, gap: 12.0, radius: 36.0 };
+    const TIGHT: Self = Self { margin: 8.0, top: 8.0, hint: 30.0, pad: 10.0, rail: 8.0, gap: 8.0, radius: 22.0 };
+}
+
+/// Readable floors of a rack unit (points).
+const MIN_UNIT_H: f32 = 136.0;
+const FACE_MIN_W: f32 = 150.0;
+
 #[derive(Clone, Copy)]
 struct Xform {
     center: Pos2, // screen
@@ -1803,7 +1846,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
     "save_rig", "load_rig", "list_rig_presets",
-    "list_instruments", "install_instrument", "play_file", "stop_file", LOOK_TOOL,
+    "list_instruments", "install_instrument", "play_file", "stop_file",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -1814,7 +1857,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo" | LOOK_TOOL)
+        || matches!(name, "record_status" | "measure_mix" | "listen" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -2011,8 +2054,12 @@ struct DemoApp {
     show_help: bool,
     show_stats: bool,
     session_name: String,
+    /// The saved session the rack came from or was last saved as; autosave
+    /// writes there (`AUTOSAVE_NAME` while None).
+    open_session: Option<String>,
+    autosave: Autosave,
     session_msg: String,
-    confirm_delete_session: Option<String>,
+    confirm_session: Option<SessionConfirm>,
     /// Short on-stage patch notice (refused cable, …) + expiry in `ui_time`.
     patch_notice: Option<(String, f32)>,
     /// Last frame's rig-chip rects in the overview strip (points), per rig.
@@ -2061,6 +2108,10 @@ struct DemoApp {
     /// stage view, the current pan offset, and the rack's clip (Some only
     /// while overflowing).
     rack_overflow: Vec2,
+    /// Margins and spacing the last `layout` used (roomy, or tight in a small window).
+    rack_chrome: RackChrome,
+    /// The stacks are laid out in one row (a short, wide window).
+    rack_flat: bool,
     rack_pan: Vec2,
     rack_clip: Option<Rect>,
     /// Unsimulated time carried to the next frame (fixed rope step).
@@ -2122,7 +2173,6 @@ struct DemoApp {
     popup_open_at_start: bool,
     settings_decide_input: String,
     settings_act_input: String,
-    settings_perceive_input: String,
     settings_deepseek_key: String,
     settings_openrouter_key: String,
     settings_msg: String,
@@ -2132,6 +2182,8 @@ struct DemoApp {
     drop_ghost: Option<Rect>,
     /// Committed mid-column centers + stack height (drop-target geometry).
     col_x: Vec<f32>,
+    /// Each stack's committed (left x, width) in rack-local points.
+    col_span: Vec<(f32, f32)>,
     stack_tall_h: f32,
     /// Every instrument's sound library, scanned off this thread (rule 46).
     sounds: crate::sounds::Libraries,
@@ -2209,6 +2261,9 @@ struct DemoApp {
     last_meter_rev: u64,
     /// Mirrored master-bus meter snapshot (read by `measure_mix`, `get_status`).
     master_meter: crate::meter::MeterSnapshot,
+    /// A `listen` call in flight: its thread records the master and asks the
+    /// listening model, and the tool batch waits for this answer.
+    listening: Option<std::sync::mpsc::Receiver<String>>,
     /// Rig awaiting "Delete rig?" confirmation (overview strip × button).
     confirm_delete_rig: Option<usize>,
     /// A destructive assistant action waiting for the chat's Confirm /
@@ -2221,11 +2276,6 @@ struct DemoApp {
     transcript_runs: HashMap<usize, TranscriptRun>,
     /// Index in `assistant.history` of the `"user"` turn currently running.
     active_run_user_idx: Option<usize>,
-    rack_shot: RackShot,
-    /// The image attached to the chat message being written.
-    chat_image: Option<Image>,
-    /// Thumbnail texture handle for `chat_image`, freed when removed.
-    chat_thumb: Option<ChatThumb>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Save-rig-preset modal: (rig index, preset name being edited).
@@ -2378,6 +2428,11 @@ struct DemoApp {
     editor_params: Vec<ParamDesc>,
     /// `ui_time` of the last plugin poll for main-control knobs.
     main_poll_at: f32,
+    /// Aeolus faces by node id: the stops its plugin has drawn and the
+    /// division the face shows (aeolus.rs).
+    aeolus_faces: HashMap<u32, AeolusFace>,
+    /// `ui_time` of the last read of the Aeolus plugins' stops.
+    aeolus_poll_at: f32,
     /// LV2 main-control values waiting for their knobs, which appear only
     /// once the plugin's controls are resolved: a loaded session's values
     /// (sent to the engine) and the values carried over a rack rebuild (the
@@ -2393,8 +2448,14 @@ struct DemoApp {
     lv2_editor_controls: Vec<crate::lv2::Lv2ControlDesc>,
     lv2_editor_presets: Vec<crate::lv2::Lv2Preset>,
     lv2_preset_name: Option<String>,
+    /// Plugin state the app restored into an LV2 node (a Vital patch), by
+    /// node id. The engine builds new LV2 instances on every graph load, so
+    /// sessions, rig edits and undo carry it and restore it.
+    lv2_states: HashMap<u32, Vec<u8>>,
     lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
+    /// Why the open editor's plugin window did not open.
+    plugin_window_error: Option<String>,
     /// Last single click on a unit (unit, time) for double-click detection.
     last_unit_click: Option<(usize, std::time::Instant)>,
 }
@@ -2440,8 +2501,14 @@ impl DemoApp {
             show_help: false,
             show_stats: false,
             session_name: String::new(),
+            open_session: None,
+            autosave: Autosave {
+                enabled: crate::assistant::load_session_autosave(),
+                due: AUTOSAVE_SETTLE,
+                saved: None,
+            },
             session_msg: String::new(),
-            confirm_delete_session: None,
+            confirm_session: None,
             patch_notice: None,
             rig_chip_rects: Vec::new(),
             add_rig_rect: Rect::NOTHING,
@@ -2468,6 +2535,8 @@ impl DemoApp {
             stats_line: String::new(),
             rack_w: 640.0,
             rack_overflow: Vec2::ZERO,
+            rack_chrome: RackChrome::ROOMY,
+            rack_flat: false,
             rack_pan: Vec2::ZERO,
             rack_clip: None,
             rack_h: 560.0,
@@ -2505,13 +2574,13 @@ impl DemoApp {
             popup_open_at_start: false,
             settings_decide_input: String::new(),
             settings_act_input: String::new(),
-            settings_perceive_input: String::new(),
             settings_deepseek_key: String::new(),
             settings_openrouter_key: String::new(),
             settings_msg: String::new(),
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
+            col_span: Vec::new(),
             stack_tall_h: 0.0,
             // Tests never scan the machine's patch folders.
             sounds: if cfg!(test) { crate::sounds::Libraries::blocking(|_| Default::default()) } else { crate::sounds::Libraries::installed() },
@@ -2554,14 +2623,12 @@ impl DemoApp {
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
+            listening: None,
             confirm_delete_rig: None,
             pending_confirm: None,
             tool_batch: None,
             transcript_runs: HashMap::new(),
             active_run_user_idx: None,
-            rack_shot: RackShot::default(),
-            chat_image: None,
-            chat_thumb: None,
             rename_rig_dialog: None,
             save_rig_dialog: None,
             load_rig_dialog: None,
@@ -2638,6 +2705,8 @@ impl DemoApp {
             editor_rig: 0,
             editor_params: Vec::new(),
             main_poll_at: 0.0,
+            aeolus_faces: HashMap::new(),
+            aeolus_poll_at: f32::NEG_INFINITY,
             lv2_main_restore: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
@@ -2646,8 +2715,10 @@ impl DemoApp {
             lv2_editor_controls: Vec::new(),
             lv2_editor_presets: Vec::new(),
             lv2_preset_name: None,
+            lv2_states: HashMap::new(),
             lv2_editor_request: None,
             editor_status: String::new(),
+            plugin_window_error: None,
             last_unit_click: None,
         };
 
@@ -2676,23 +2747,20 @@ impl DemoApp {
         self.units.clear();
         self.cables.clear();
         self.base_graph = graph.clone();
+        self.lv2_states.retain(|node, _| matches!(graph.node(*node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. })));
         for node in &graph.nodes {
             self.units.push(make_unit(node));
         }
         self.fit_voice_tables(&old_clap_nodes);
-        // Classify LV2 instruments (hot-wire matrix sink columns). Rare
-        // structural op: the discovery scan runs only when LV2 nodes exist.
+        // Classify LV2 instruments (hot-wire matrix sink columns) from the
+        // background scan: a discovery here took 1.3 s on every agent edit
+        // adopted through build_rack. A scan still running reclassifies the
+        // units when it lands (poll_plugin_scan).
         if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
-            let infos = lv2_discover();
-            for u in &mut self.units {
-                if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
-                    u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-                    if u.lv2_inst {
-                        u.sub = "lv2 synth".into();
-                        u.sub_g = None;
-                    }
-                }
+            if !self.plugins_loaded {
+                self.start_plugin_scan(false);
             }
+            self.classify_lv2_units();
         }
         // Size the rect slots before adding cables (add_cable_id reads them to
         // seed the spring rest shape; layout() fills real rects on frame 1).
@@ -2901,9 +2969,15 @@ impl DemoApp {
             .min_by(|a, b| (drop.x - a.1).abs().total_cmp(&(drop.x - b.1).abs()))
             .map(|(j, _)| j)?;
         let others = self.stack_cols.get(tj)?.iter().filter(|&&u| u != unit).count();
-        let pad = 20.0;
-        let slot = self.stack_tall_h / (others + 1) as f32;
-        let tr = (((drop.y - pad) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
+        // A stack reads top to bottom, or left to right in a flat rack.
+        let (start, along, span) = if self.rack_flat {
+            let (x0, w) = self.col_span[tj];
+            (x0, drop.x, w)
+        } else {
+            (self.rack_chrome.pad, drop.y, self.stack_tall_h)
+        };
+        let slot = span / (others + 1) as f32;
+        let tr = (((along - start) / slot.max(1.0)).floor() as i32).clamp(0, others as i32) as usize;
         Some((tj, tr))
     }
 
@@ -3061,78 +3135,84 @@ impl DemoApp {
         self.toolbar_top = rect.top();
         // Adaptive rack: KEYS (left, full height) | one column per instrument
         // stack (instrument + its FX chain) | MASTER (right, full height).
-        let rows = self.layout_rows.max(1);
-        let n_mid = self.stack_cols.len();
-        // Readable floors: below them the rack grows past the stage and pans
-        // (wheel / trackpad) instead of squishing faces.
-        const MIN_UNIT_H: f32 = 140.0;
-        const MIN_MID_W: f32 = 200.0;
-        const MIN_SIDE_W: f32 = 220.0;
+        // A window too short for the stacks but wide enough lays each chain
+        // out in one row instead (instrument, then its FX, left to right).
+        let stacked_rows = self.layout_rows.max(1);
+        let floor = |u: usize| self.face_min_w(u);
+        let keys_floor = self.keys_unit.map_or(FACE_MIN_W, floor);
+        let master_floor = self.master_unit.map_or(FACE_MIN_W, floor);
+        let mid_floor = self.stack_cols.iter().flatten().map(|&u| floor(u)).fold(FACE_MIN_W, f32::max);
+        let n_stacks = self.stack_cols.len();
+        let n_flat: usize = self.stack_cols.iter().map(|c| c.len()).sum();
         // Caps sized for the 1.6x design scale (1600x1000 points): the rack
         // uses the stage instead of floating small in it.
-        let fit_w = (rect.width() - 60.0).clamp(560.0, 1480.0);
-        // No masthead any more (user 2026-11-15: Play button removed, brand in
-        // the top bar) — the stage overhead is just margins + the hint line.
-        self.unit_h = ((rect.height() - 150.0) / rows as f32).clamp(MIN_UNIT_H, 250.0);
-        let gap = 12.0;
-        let pad = 20.0;
-        let rail = 14.0;
-        self.rack_h = pad * 2.0 + rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
-        let n_cols = n_mid + 2; // keys + stacks + master
+        let usable = |c: &RackChrome, n_mid: usize| (rect.width() - 2.0 * c.margin).min(1480.0)
+            - 2.0 * (c.pad + c.rail) - (n_mid as f32 + 1.0) * c.gap;
+        let unit_room = |c: &RackChrome, rows: usize| {
+            let rf = rows as f32;
+            (rect.height() - c.top - c.hint - 2.0 * c.pad - (rf - 1.0) * c.gap) / rf
+        };
+        let floor_w = |n_mid: usize| keys_floor + master_floor + n_mid as f32 * mid_floor;
+        let fits = |c: &RackChrome, n_mid: usize, rows: usize| usable(c, n_mid) >= floor_w(n_mid) && unit_room(c, rows) >= MIN_UNIT_H;
+        let (ch, flat) = if fits(&RackChrome::ROOMY, n_stacks, stacked_rows) {
+            (RackChrome::ROOMY, false)
+        } else if stacked_rows > 1 && unit_room(&RackChrome::TIGHT, stacked_rows) < MIN_UNIT_H
+            && fits(&RackChrome::TIGHT, n_flat, 1) {
+            (RackChrome::TIGHT, true)
+        } else {
+            (RackChrome::TIGHT, false)
+        };
+        self.rack_chrome = ch;
+        self.rack_flat = flat;
+        let (rows, n_mid) = if flat { (1, n_flat) } else { (stacked_rows, n_stacks) };
+        let rf = rows as f32;
+        let n_cols = n_mid + 2; // keys + middle columns + master
+        self.unit_h = unit_room(&ch, rows).clamp(MIN_UNIT_H, 250.0);
+        let (gap, pad, rail) = (ch.gap, ch.pad, ch.rail);
+        self.rack_h = pad * 2.0 + rf * self.unit_h + (rf - 1.0) * gap;
         let gaps = (n_cols as f32 - 1.0) * gap;
-        let usable_fit = fit_w - 2.0 * (pad + rail) - gaps;
+        let usable_fit = usable(&ch, n_mid);
         let side_frac = if n_mid == 0 { 0.5 } else if n_mid <= 2 { 0.26 } else { 0.20 };
         let mid_frac = if n_mid == 0 { 0.0 } else { (1.0 - 2.0 * side_frac) / n_mid as f32 };
-        let (mut side_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
-        if n_mid > 0 && mid_w < MIN_MID_W {
-            mid_w = MIN_MID_W;
-            side_w = side_w.max(MIN_SIDE_W);
-        }
+        let (mut keys_w, mut mid_w) = (usable_fit * side_frac, usable_fit * mid_frac);
         // A lone stack must not stretch across half the stage (a one-synth
         // rig read as a mostly empty face): cap the column, the rack centers.
         const MAX_MID_W: f32 = 420.0;
         if n_mid > 0 && mid_w > MAX_MID_W {
             mid_w = MAX_MID_W;
-            side_w = side_w.min(MAX_MID_W * 1.1);
+            keys_w = keys_w.min(MAX_MID_W * 1.1);
         }
-        // A stack column is never narrower than its widest face needs (#58):
-        // an organ's knobs and drawbars do not fit the uniform mid width at
-        // small windows. The COMMITTED arrangement sizes the rack and the
-        // drop targets (no feedback, see col_x below); the arrangement being
-        // DRAWN (the Ctrl-drag preview) sizes what is drawn.
-        let unit_min_w: Vec<f32> = (0..self.units.len()).map(|u| self.face_min_width(u)).collect();
-        let col_w = |cols: &[Vec<usize>]| -> Vec<f32> {
-            (0..n_mid)
-                .map(|j| {
-                    let need = cols.get(j).map_or(0.0, |c| {
-                        c.iter().map(|&u| unit_min_w[u]).fold(0.0, f32::max)
-                    });
-                    mid_w.max(need)
-                })
-                .collect()
-        };
-        let mut widths: Vec<f32> = Vec::with_capacity(n_cols);
-        widths.push(side_w); // keys
-        widths.extend(col_w(&self.stack_cols));
-        widths.push(side_w); // master
-        self.rack_w = 2.0 * (pad + rail) + widths.iter().sum::<f32>() + gaps;
-        let mut xs: Vec<f32> = Vec::with_capacity(n_cols);
-        let mut x = pad + rail;
-        for w in &widths { xs.push(x); x += w + gap; }
-        let tall_h = rows as f32 * self.unit_h + (rows as f32 - 1.0) * gap;
+        let mut master_w = keys_w;
+        if keys_w < keys_floor.max(master_floor) || (n_mid > 0 && mid_w < mid_floor) {
+            // Floors first (Keys and Master each their own), the rest of the
+            // stage shared as before.
+            let extra = (usable_fit - floor_w(n_mid)).max(0.0);
+            keys_w = keys_floor + extra * side_frac;
+            master_w = master_floor + extra * side_frac;
+            mid_w = mid_floor + extra * mid_frac;
+        }
+        self.rack_w = 2.0 * (pad + rail) + keys_w + master_w + n_mid as f32 * mid_w + gaps;
+        let mid_x = |j: usize| pad + rail + keys_w + gap + j as f32 * (mid_w + gap);
+        let tall_h = rf * self.unit_h + (rf - 1.0) * gap;
         let mk = |x: f32, y: f32, w: f32, h: f32| Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
         if self.unit_rects.len() != self.units.len() {
             self.unit_rects = vec![Rect::NOTHING; self.units.len()];
         }
         if let Some(k) = self.keys_unit {
-            self.unit_rects[k] = mk(xs[0], pad, widths[0], tall_h);
+            self.unit_rects[k] = mk(pad + rail, pad, keys_w, tall_h);
         }
         if let Some(m) = self.master_unit {
-            self.unit_rects[m] = mk(xs[n_cols - 1], pad, widths[n_cols - 1], tall_h);
+            self.unit_rects[m] = mk(mid_x(n_mid), pad, master_w, tall_h);
         }
-        // Column centers of the COMMITTED layout: the drop target is judged
+        // Stack spans of the COMMITTED layout: the drop target is judged
         // from these, so the live preview below cannot feed back into it.
-        self.col_x = (0..n_mid).map(|j| xs[j + 1] + widths[j + 1] / 2.0).collect();
+        let mut first = 0;
+        self.col_span = self.stack_cols.iter().map(|c| {
+            let (x0, n) = if flat { (mid_x(first), c.len().max(1)) } else { (mid_x(first), 1) };
+            first += if flat { c.len() } else { 1 };
+            (x0, n as f32 * mid_w + (n as f32 - 1.0) * gap)
+        }).collect();
+        self.col_x = self.col_span.iter().map(|(x, w)| x + w / 2.0).collect();
         self.stack_tall_h = tall_h;
         // While Ctrl-dragging a unit, lay the others out AS IF it were
         // released here (user: show the layout before release); the ghost
@@ -3142,44 +3222,34 @@ impl DemoApp {
             _ => None,
         };
         let cols = preview.as_ref().map(|(_, c)| c.clone()).unwrap_or_else(|| self.stack_cols.clone());
-        // The preview gets the widths of the arrangement it shows (an organ
-        // dragged into another column widens that column in the preview
-        // exactly as the release will).
-        let (xs, widths) = if preview.is_some() {
-            let mut w = Vec::with_capacity(n_cols);
-            w.push(side_w);
-            w.extend(col_w(&cols));
-            w.push(side_w);
-            let mut x2 = pad + rail;
-            let mut xs2 = Vec::with_capacity(n_cols);
-            for ww in &w { xs2.push(x2); x2 += ww + gap; }
-            (xs2, w)
-        } else {
-            (xs, widths)
-        };
         self.drop_ghost = None;
-        for j in 0..n_mid.min(cols.len()) {
-            let cx = xs[j + 1];
-            let cw = widths[j + 1];
-            // A shorter stack stretches its units to the full column height
-            // (one rack size for every rig, no empty rows).
-            let len = cols[j].len().max(1);
-            let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
-            for r in 0..cols[j].len() {
-                let u = cols[j][r];
-                let y = pad + r as f32 * (uh + gap);
-                let rr = mk(cx, y, cw, uh);
-                if preview.as_ref().map_or(false, |(d, _)| *d == u) {
-                    self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
-                } else {
-                    self.unit_rects[u] = rr;
+        let mut place = |u: usize, rr: Rect| {
+            if preview.as_ref().map_or(false, |(d, _)| *d == u) {
+                self.drop_ghost = Some(rr); // the dragged box itself follows the cursor
+            } else {
+                self.unit_rects[u] = rr;
+            }
+        };
+        if flat {
+            for (i, &u) in cols.iter().flatten().enumerate().take(n_mid) {
+                place(u, mk(mid_x(i), pad, mid_w, tall_h));
+            }
+        } else {
+            for j in 0..n_mid.min(cols.len()) {
+                // A shorter stack stretches its units to the full column height
+                // (one rack size for every rig, no empty rows).
+                let len = cols[j].len().max(1);
+                let uh = (tall_h - (len as f32 - 1.0) * gap) / len as f32;
+                for r in 0..cols[j].len() {
+                    place(cols[j][r], mk(mid_x(j), pad + r as f32 * (uh + gap), mid_w, uh));
                 }
             }
         }
-        // Stage view for the rack: below the masthead, above the hint line.
+        // Stage view for the rack: above the hint line.
+        let side_m = ch.margin.min(16.0);
         let view = Rect::from_min_max(
-            Pos2::new(rect.left() + 16.0, rect.top() + 40.0),
-            Pos2::new(rect.right() - 16.0, rect.bottom() - 36.0),
+            Pos2::new(rect.left() + side_m, rect.top() + ch.top),
+            Pos2::new(rect.right() - side_m, rect.bottom() - ch.hint),
         );
         let ov = Vec2::new((self.rack_w - view.width()).max(0.0), (self.rack_h - view.height()).max(0.0));
         if ov != self.rack_overflow {
@@ -3191,11 +3261,12 @@ impl DemoApp {
             self.rack_pan.x.clamp(-ov.x / 2.0, ov.x / 2.0),
             self.rack_pan.y.clamp(-ov.y / 2.0, ov.y / 2.0),
         );
-        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0).then_some(view.expand(8.0));
+        // The clip keeps 8 px of air around the view, except into the hint line.
+        self.rack_clip = (ov.x > 0.0 || ov.y > 0.0)
+            .then_some(Rect::from_min_max(view.min - Vec2::splat(8.0), Pos2::new(view.max.x + 8.0, view.max.y)));
         let origin = Pos2::new(
             rect.center().x - self.rack_w / 2.0 + self.rack_pan.x,
-            if ov.y > 0.0 { view.center().y - self.rack_h / 2.0 + self.rack_pan.y }
-            else { rect.center().y - self.rack_h / 2.0 - 8.0 },
+            view.center().y - self.rack_h / 2.0 + self.rack_pan.y,
         );
         // Flip transform.
         let mut sy = 1.0f32;
@@ -4077,7 +4148,6 @@ impl DemoApp {
                     None => format!("Add {what}"),
                 }
             }
-            LOOK_TOOL => "Look at the rack".into(),
             "get_graph" => "Read rack graph".into(),
             "get_status" => "Check status".into(),
             "get_rigs" => "List rigs".into(),
@@ -4236,20 +4306,21 @@ impl DemoApp {
         if let Some(mut batch) = self.tool_batch.take() {
             if let Some((waiting, chip_idx)) = batch.waiting.take() {
                 let outcome = match &waiting {
-                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
-                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
-                        None if std::time::Instant::now() < *deadline => None,
-                        shot => Some(rack_shot_output(said, shot)),
-                    },
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit),
                     Waiting::SoundScan { call, deadline } => {
                         let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
-                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args).into())
+                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args))
                     }
+                    Waiting::Listen(answer) => match answer.try_recv() {
+                        Ok(text) => Some(text),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("listen: the listening thread ended without an answer".into()),
+                    },
                 };
                 match outcome {
                     Some(result) => {
                         if let Some(ci) = chip_idx {
-                            self.finish_chip(batch.user_idx, ci, &result.text);
+                            self.finish_chip(batch.user_idx, ci, &result);
                         }
                         batch.results.push(result);
                     }
@@ -4269,20 +4340,21 @@ impl DemoApp {
                 let engine_edit = self.graph_pub.is_some() && ENGINE_EDIT_TOOLS.contains(&call.name.as_str());
                 let before = engine_edit.then(|| self.rack_ids());
                 let result = self.run_assistant_tool(&call.name, &call.args);
+                if let Some(answer) = self.listening.take().filter(|_| call.name == "listen") {
+                    batch.waiting = Some((Waiting::Listen(answer), chip_idx));
+                    self.tool_batch = Some(batch);
+                    return;
+                }
                 batch.waiting = match before {
                     Some(before) => Some((
                         Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
-                        chip_idx,
-                    )),
-                    None if call.name == LOOK_TOOL => Some((
-                        Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT },
                         chip_idx,
                     )),
                     None => {
                         if let Some(ci) = chip_idx {
                             self.finish_chip(batch.user_idx, ci, &result);
                         }
-                        batch.results.push(result.into());
+                        batch.results.push(result);
                         continue;
                     }
                 };
@@ -4410,7 +4482,7 @@ impl DemoApp {
     fn toggle_stage(&mut self, view: StageView) {
         self.stage_view = if self.stage_view == view { StageView::Rack } else { view };
         if self.stage_view != StageView::Sessions {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
         }
         if self.stage_view != StageView::Settings {
             self.settings_msg.clear();
@@ -4546,13 +4618,18 @@ impl DemoApp {
     }
 
     fn stage_sheet_rects(&self, rect: Rect, min_h: f32) -> (Rect, Rect) {
-        let top = self.toolbar_top + 20.0;
-        let w = (rect.width() - 60.0).clamp(560.0, 1240.0).min((rect.width() - 16.0).max(200.0));
+        // A small stage gives its margins to the sheet's content; the sheet
+        // never reaches past the stage (its users clip to it, so a short
+        // stage scrolls instead of painting into a dock).
+        let tight = rect.width() < 1000.0 || rect.height() < 560.0;
+        let (margin, inner) = if tight { (8.0, Vec2::new(18.0, 14.0)) } else { (20.0, Vec2::new(32.0, 26.0)) };
+        let top = self.toolbar_top + margin;
+        let w = (rect.width() - 3.0 * margin).clamp(560.0, 1240.0).min((rect.width() - 2.0 * margin).max(200.0));
         let sheet = Rect::from_min_max(
             Pos2::new(rect.center().x - w / 2.0, top),
-            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - 20.0).max(top + min_h)),
+            Pos2::new(rect.center().x + w / 2.0, (rect.bottom() - margin).max(top + min_h).min(rect.bottom())),
         );
-        (sheet, sheet.shrink2(Vec2::new(32.0, 26.0)))
+        (sheet, sheet.shrink2(inner))
     }
 
     /// Snapshot the current patch + knobs + plugin state into a Session.
@@ -4597,6 +4674,11 @@ impl DemoApp {
                     }
                 }
                 rig += 1;
+            }
+        }
+        for (&node, state) in &self.lv2_states {
+            if let Some(NodeKind::Lv2 { uri }) = s.graph.node(node).map(|n| n.kind.clone()) {
+                s.set_plugin_state(node, uri.as_str(), state.clone());
             }
         }
         // Shaped matrix routes and CC/MIDI-learn bindings (rule 33 mirror).
@@ -4793,7 +4875,45 @@ impl DemoApp {
                 }
             }
         }
+        // After LoadGraph, so the loader builds each node's instance first and
+        // then the one with its state that replaces it.
+        self.lv2_states.clear();
+        let restored: Vec<(u32, Vec<u8>)> = s.graph.nodes.iter().filter_map(|n| match &n.kind {
+            NodeKind::Lv2 { uri } => s.plugin_state(n.id).filter(|st| st.plugin_id == uri.as_str()).map(|st| (n.id, st.data.clone())),
+            _ => None,
+        }).collect();
+        for (node, state) in restored {
+            if let Err(e) = self.restore_lv2_state(node, state.clone()) {
+                // Kept anyway: the next save or rig edit restores it.
+                self.lv2_states.insert(node, state);
+                self.session_msg = format!("plugin state of node {node} not restored: {e}");
+            }
+        }
         self.restore_session_rules(s);
+        Ok(())
+    }
+
+    /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
+    /// sessions. The node gets a fresh instance with its controls at their
+    /// defaults, so its plugin knobs go back to their defaults too.
+    fn restore_lv2_state(&mut self, node: u32, state: Vec<u8>) -> Result<(), String> {
+        if let Some(bus) = &self.bus {
+            if !bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::LoadLv2State { node, state: state.clone() }) {
+                return Err("command bus full, try again".into());
+            }
+        }
+        self.lv2_states.insert(node, state);
+        if let Some(u) = self.units.iter_mut().find(|u| u.node_id == node) {
+            for k in u.knobs.iter_mut().filter(|k| k.source != KnobSource::BuiltIn && k.param.is_some()) {
+                k.set_immediate(k.default);
+                k.sent = Some(k.default);
+            }
+        }
+        if self.lv2_editor_node == Some(node) {
+            if let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(node).map(|n| n.kind.clone()) {
+                self.lv2_editor_controls = crate::lv2::control_descs_for_uri(uri.as_str());
+            }
+        }
         Ok(())
     }
 
@@ -4844,6 +4964,8 @@ impl DemoApp {
     /// Load a starter template (playable pre-wired rack + default knobs).
     fn load_template(&mut self, t: Template) {
         let s = t.session();
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = format!("Loaded template '{}'", t.title()),
             Err(e) => self.session_msg = format!("Template failed: {e}"),
@@ -4853,6 +4975,8 @@ impl DemoApp {
     /// Reload the default two-stack demo patch.
     fn load_demo_patch(&mut self) {
         let s = crate::session::Session::new("Demo patch", Graph::demo_patch());
+        self.open_session = None;
+        self.autosave_rebase();
         match self.apply_session(&s) {
             Ok(_) => self.session_msg = "Loaded demo patch".into(),
             Err(e) => self.session_msg = format!("Demo failed: {e}"),
@@ -4864,6 +4988,8 @@ impl DemoApp {
     /// engine as LoadRigs. Rig A: Keys→Surge→Delay→Master; Rig B: Keys→Surge→
     /// Master. Both sound at once; the big view shows one (1–9 / ←→ switch).
     fn load_multi_rig_demo(&mut self) {
+        self.open_session = None;
+        self.autosave_rebase();
         fn mk_rig(name: &str, with_delay: bool) -> crate::control::Rig {
             let mut g = Graph::default();
             g.reserve(8, 8);
@@ -4946,6 +5072,20 @@ impl DemoApp {
                 })).collect::<Vec<_>>(),
             })
             .to_string(),
+            "listen" => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let args = args.clone();
+                let spawned = std::thread::Builder::new().name("listen".into()).spawn(move || {
+                    let _ = tx.send(crate::listen::listen(&args));
+                });
+                match spawned {
+                    Ok(_) => {
+                        self.listening = Some(rx);
+                        "listening".into()
+                    }
+                    Err(e) => format!("listen: {e}"),
+                }
+            }
             "measure_mix" => {
                 if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
                     if let Some(bus) = &self.bus {
@@ -5043,26 +5183,16 @@ impl DemoApp {
             }
             "save_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                match self.capture_session(name) {
-                    Ok(s) => {
-                        let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                        match path.and_then(|p| s.save(&p).map(|_| p)) {
-                            Ok(p) => format!("saved session '{}' to {}", name, p.display()),
-                            Err(e) => format!("save failed: {e}"),
-                        }
-                    }
-                    Err(e) => format!("capture failed: {e}"),
+                match self.save_session_as(&Self::sessions_dir(), name) {
+                    Ok(p) => format!("saved session '{}' to {}", name, p.display()),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "load_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
-                let path = crate::session::Session::package_path(&Self::sessions_dir(), name);
-                match path.and_then(|p| crate::session::Session::load(&p)) {
-                    Ok(s) => match self.apply_session(&s) {
-                        Ok(_) => format!("loaded session '{}' — knobs + plugin state restored", name),
-                        Err(e) => format!("apply failed: {e}"),
-                    },
-                    Err(e) => format!("load failed: {e}"),
+                match self.open_saved_session(&Self::sessions_dir(), name) {
+                    Ok(()) => format!("loaded session '{}' — knobs + plugin state restored", name),
+                    Err(e) => e.to_lowercase(),
                 }
             }
             "list_sessions" => {
@@ -5741,25 +5871,34 @@ impl DemoApp {
                 if rig >= n_rigs {
                     return format!("no rig {rig}: there are {n_rigs} (0..{}) — add one with add_rig", n_rigs - 1);
                 }
+                let wire = match &kind {
+                    Some(NodeKind::Clap { .. }) => true,
+                    Some(NodeKind::Lv2 { uri }) => {
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
+                        }
+                        self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+                    }
+                    _ => false,
+                };
                 match kind {
                     Some(k) => {
                         if let Some(bus) = &self.bus {
-                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 });
+                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8, wire });
                             if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                         }
                         self.agent_activity.touch_rig(rig, now);
                         self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
-                        format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        if wire {
+                            format!("added {kind_str} instrument to rig {rig} '{}', wired like a standard rig: the rig's Keys → it (MIDI) and it → the rig's Master L and R (audio); do not connect these again", self.rig_name(rig))
+                        } else {
+                            format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        }
                     }
                     None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
-            LOOK_TOOL => {
-                self.rack_shot.wanted = true;
-                self.agent_activity.record(origin, "Look at the rack", vec![], now);
-                "screenshot of the kabelsalat window".into()
-            }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
@@ -5994,6 +6133,7 @@ impl DemoApp {
         }
         self.lv2_editor_node = None;
         self.editor_rig = rig;
+        self.plugin_window_error = None;
         self.editor_filter.clear();
         let pool_idx = self.clap_pool_idx(rig);
         self.editor_params = pool_idx
@@ -6061,6 +6201,19 @@ impl DemoApp {
         if let Some(lv2_node) = self.lv2_editor_node {
             let mut open = self.editor_open;
             let mut chosen_preset: Option<crate::lv2::Lv2Preset> = None;
+            let mut chosen_patch: Option<crate::sounds::Sound> = None;
+            // Vital patches (`sounds::Source::VitalPatches`) list above the LV2
+            // presets; None while the library is scanned.
+            let patches: Option<Vec<crate::sounds::Sound>> = match self.base_graph.node(lv2_node).map(|n| &n.kind) {
+                Some(NodeKind::Lv2 { uri }) if uri.as_str() == crate::vital::URI => {
+                    match self.sounds.get(&crate::sounds::Instrument::Lv2(uri.as_str().to_string())) {
+                        crate::sounds::Lookup::Ready(library) => Some(library.sounds.iter()
+                            .filter(|s| matches!(s.load, crate::sounds::Load::VitalPatch(_))).cloned().collect()),
+                        _ => None,
+                    }
+                }
+                _ => Some(Vec::new()),
+            };
             let mut ctrl_changes: Vec<(usize, f32, f32)> = Vec::new();
             egui::Window::new(egui::RichText::new(format!("{} — presets & parameters", self.lv2_editor_name))
                     .font(theme::medium_font(16.0)).color(theme::INK))
@@ -6076,6 +6229,18 @@ impl DemoApp {
                     let words: Vec<String> = self.sound_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
                     egui::ScrollArea::vertical().id_salt("lv2_preset_list").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
                         let mut shown = 0usize;
+                        match &patches {
+                            None => { ui.label(egui::RichText::new("scanning Vital patches…").size(12.0).color(theme::INK_2)); }
+                            Some(patches) => for s in patches {
+                                let text = if s.category.is_empty() { s.name.clone() } else { format!("{} · {}", s.category, s.name) };
+                                if !words.iter().all(|w| text.to_lowercase().contains(w.as_str())) { continue; }
+                                shown += 1;
+                                let selected = self.lv2_preset_name.as_deref() == Some(s.name.as_str());
+                                if ui.selectable_label(selected, egui::RichText::new(text).size(12.5).color(theme::CREAM)).clicked() {
+                                    chosen_patch = Some(s.clone());
+                                }
+                            },
+                        }
                         for p in &self.lv2_editor_presets {
                             let hay = p.name.to_lowercase();
                             if !words.iter().all(|w| hay.contains(w.as_str())) {
@@ -6140,6 +6305,13 @@ impl DemoApp {
             if !open {
                 self.lv2_editor_node = None;
             }
+            if let Some(patch) = chosen_patch {
+                let unit = self.instrument_units().into_iter().find(|u| u.node == lv2_node);
+                self.editor_status = match unit.ok_or_else(|| "that unit is not an instrument".to_string()).and_then(|u| self.load_sound_into(&u, &patch)) {
+                    Ok(()) => format!("loaded {}", patch.label()),
+                    Err(e) => format!("sound failed: {e}"),
+                };
+            }
             if let Some(preset) = chosen_preset {
                 if let Some(bus) = &self.bus {
                     bus.lock().unwrap().send(Command::LoadLv2Preset { node: lv2_node, preset_uri: preset.uri.clone() });
@@ -6187,6 +6359,24 @@ impl DemoApp {
             .fixed_size([480.0, 700.0])
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
+                if let Some(main) = pool_idx.and_then(|i| self._surge_main.get_mut(i)) {
+                    if main.has_editor() {
+                        let open = main.editor_open();
+                        let label = if open { "Close plugin window" } else { "Open plugin window" };
+                        if theme::chip_button(ui, label, open).on_hover_text("the plugin's own editor, in a window of its own").clicked() {
+                            self.plugin_window_error = None;
+                            if open {
+                                main.close_editor();
+                            } else if let Err(e) = main.open_editor(&format!("{name} · kabelsalat")) {
+                                self.plugin_window_error = Some(format!("{e:#}"));
+                            }
+                        }
+                        if let Some(e) = &self.plugin_window_error {
+                            ui.label(egui::RichText::new(e).size(12.0).color(theme::CLIP_BRIGHT));
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
                 let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
                 // Sound: exchange the instrument (patch) of THIS synth.
                 let browser = match plugin_id {
@@ -6373,39 +6563,73 @@ impl DemoApp {
         }
     }
 
-    /// Toggle one matrix cell live. CLAP columns map to the engine's source
-    /// filters + device binding (SetRigSource/SetRigDevice); LV2 instrument
-    /// columns are gated by the MIDI cable alone. Turning a cell ON also
+    /// Toggle one matrix cell live. Every instrument column has the same
+    /// rows: the keyboard switch and a radio group of hardware (all / one
+    /// device / off). CLAP columns store them as the voice's source filter
+    /// (SetRigSource/SetRigDevice); LV2 instrument columns as the enabled
+    /// flag of each (source, node) matrix rule. Turning a cell ON also
     /// hot-wires the MIDI cable if it was unplugged.
     fn matrix_toggle(&mut self, inst: usize, row: MatrixRow, on: bool) {
-        let is_clap = matches!(self.units.get(inst).map(|u| &u.node_kind), Some(UnitKind::Clap));
+        let Some(unit) = self.units.get(inst) else { return };
+        let (is_clap, node) = (matches!(unit.node_kind, UnitKind::Clap), unit.node_id);
         if !is_clap {
-            // LV2 instrument: the cable IS the route.
             if on { self.ensure_midi_cable(inst); }
-            else if let Some(ci) = self.midi_cable_to(inst) { self.unplug_cable(ci, true); }
+            let (src, dev) = self.lv2_sources(node);
+            let (src, dev) = toggled_sources(src, dev, row, on);
+            self.set_lv2_sources(node, src, dev);
             return;
         }
         let Some(rig) = self.rig_of_unit(inst) else { return };
         if rig >= self.rig_sources.len() { return; }
         if on { self.ensure_midi_cable(inst); }
-        let node = self.units[inst].node_id;
-        {
-            let s = &mut self.rig_sources[rig];
-            let d = &mut self.rig_device[rig];
-            match row {
-                MatrixRow::Keys => s.0 = on,
-                MatrixRow::HwAll => { s.1 = on; if on { *d = None; } }
-                MatrixRow::HwDev(dev) => {
-                    if on { s.1 = true; *d = Some(dev); }
-                    else if *d == Some(dev) { s.1 = false; }
-                }
-            }
-        }
+        let (src, dev) = toggled_sources(self.rig_sources[rig], self.rig_device[rig], row, on);
+        self.rig_sources[rig] = src;
+        self.rig_device[rig] = dev;
         self.send_rig_source(node);
         if matches!(row, MatrixRow::HwAll | MatrixRow::HwDev(_)) {
-            let device = self.rig_device[rig];
             if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device: dev });
+            }
+        }
+    }
+
+    /// Whether one matrix cell routes (what the grid draws).
+    fn matrix_cell_on(&self, inst: usize, row: MatrixRow) -> bool {
+        let Some(u) = self.units.get(inst) else { return false };
+        let (src, dev) = if matches!(u.node_kind, UnitKind::Clap) {
+            let rig = self.rig_of_unit(inst).unwrap_or(0);
+            (self.rig_sources.get(rig).copied().unwrap_or((true, true)), self.rig_device.get(rig).copied().flatten())
+        } else {
+            self.lv2_sources(u.node_id)
+        };
+        clap_cell(src, dev, self.midi_cable_to(inst).is_some(), row)
+    }
+
+    /// An LV2 instrument's sources as the CLAP filter shape, read from its
+    /// matrix rules (a missing rule routes): keyboard, any hardware, and
+    /// the one device when not every hardware rule is on.
+    fn lv2_sources(&self, node: u32) -> ((bool, bool), Option<u32>) {
+        let routes = |src: SourceId| self.rule_edits.get(&(src, node)).is_none_or(|e| e.enabled);
+        let hw: Vec<u32> = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| routes(SourceId::Hardware(d))).collect();
+        let dev = (hw.len() < crate::engine::MAX_HW_DEVICES as usize).then(|| hw.first().copied()).flatten();
+        ((routes(SourceId::Keys), !hw.is_empty()), dev)
+    }
+
+    /// Write an LV2 instrument's sources as the enabled flags of its matrix
+    /// rules; a rule's shape (transpose, range, …) is kept.
+    fn set_lv2_sources(&mut self, node: u32, src: (bool, bool), dev: Option<u32>) {
+        let wanted = std::iter::once((SourceId::Keys, src.0)).chain((0..crate::engine::MAX_HW_DEVICES)
+            .map(|d| (SourceId::Hardware(d), src.1 && dev.is_none_or(|b| b == d))));
+        for (source, enabled) in wanted {
+            let mut edit = self.rule_edits.get(&(source, node)).cloned().unwrap_or_default();
+            if edit.enabled == enabled { continue; }
+            edit.enabled = enabled;
+            edit.cc_only = false;
+            let cmd = edit.to_command(source, node);
+            if edit.is_default() { self.rule_edits.remove(&(source, node)); }
+            else { self.rule_edits.insert((source, node), edit); }
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap().send(cmd);
             }
         }
     }
@@ -6646,17 +6870,7 @@ impl DemoApp {
                     _ => Self::matrix_source_head(ui, src),
                 }
                 for &s in &sinks {
-                    let u = &self.units[s];
-                    let is_clap = matches!(u.node_kind, UnitKind::Clap);
-                    let gate = self.midi_cable_to(s).is_some();
-                    let on = if is_clap {
-                        let rig = self.rig_of_unit(s).unwrap_or(0);
-                        let src = self.rig_sources.get(rig).copied().unwrap_or((true, true));
-                        let dev = self.rig_device.get(rig).copied().flatten();
-                        clap_cell(src, dev, gate, *row)
-                    } else {
-                        gate // LV2: the cable is the route (all sources)
-                    };
+                    let on = self.matrix_cell_on(s, *row);
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(68.0, 32.0), egui::Sense::click());
                     let p = ui.painter();
                     let cell = rect.shrink(3.0);
@@ -7333,12 +7547,6 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
-                LOOK_TOOL => {
-                    // Answered by `serve_rack_shots` once the frame arrived.
-                    self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote);
-                    self.rack_shot.remote.push((reply, std::time::Instant::now() + RACK_SHOT_WAIT));
-                    continue;
-                }
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
@@ -7423,12 +7631,19 @@ impl DemoApp {
     fn load_sound_into(&mut self, unit: &crate::sounds::Unit, sound: &crate::sounds::Sound) -> Result<(), String> {
         let pool = unit.slot.and_then(|s| self.clap_pool_idx(s));
         let clap = pool.and_then(|i| Some((self._surge_main.get_mut(i)?, self.surge_controllers.get(i)?)));
-        let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
-        crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
-        drop(bus);
+        if let crate::sounds::Load::VitalPatch(path) = &sound.load {
+            let state = std::fs::read(path).map_err(|e| format!("reading patch: {e}"))?;
+            crate::vital::check_patch(&state)?;
+            self.restore_lv2_state(unit.node, state)?;
+        } else {
+            let mut bus = self.bus.as_ref().map(|b| b.lock().unwrap_or_else(|e| e.into_inner()));
+            crate::sounds::load(sound, crate::sounds::Target { node: unit.node, clap, bus: bus.as_deref_mut() })?;
+        }
         if let crate::sounds::Load::MidiProgram(p) = sound.load {
             self.adopt_program_drawbars(unit.node, p);
         }
+        // An Aeolus registration changed the stops: the face reads them now.
+        if let crate::sounds::Load::AeolusRegistration(_) = sound.load { self.aeolus_poll_at = f32::NEG_INFINITY; }
         match unit.slot {
             Some(slot) => {
                 if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
@@ -7438,29 +7653,6 @@ impl DemoApp {
             None => {}
         }
         Ok(())
-    }
-
-    /// Answer the bridge callers that wait for look_at_rack: every one gets
-    /// the frame that arrived, or an error once its wait is over. The reply
-    /// is JSON: `{"text", "png_base64"}`.
-    fn serve_rack_shots(&mut self) {
-        if self.rack_shot.remote.is_empty() { return; }
-        let now = std::time::Instant::now();
-        let reply = |out: ToolOutput| match &out.image {
-            Some(image) => serde_json::json!({ "text": out.text, "png_base64": image.base64() }).to_string(),
-            None => out.text,
-        };
-        match self.rack_shot.take() {
-            Some(shot) => {
-                let out = reply(rack_shot_output("screenshot of the kabelsalat window", Some(shot)));
-                for (to, _) in self.rack_shot.remote.drain(..) { let _ = to.send(out.clone()); }
-            }
-            None => self.rack_shot.remote.retain(|(to, deadline)| {
-                if now < *deadline { return true; }
-                let _ = to.send(reply(rack_shot_output("", None)));
-                false
-            }),
-        }
     }
 
     /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
@@ -7499,60 +7691,42 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
-                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
+                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
         }
-        let image = self.chat_image.take();
-        self.chat_thumb = None;
-        let shown = match &image {
-            Some(image) => format!("{t} [image: {}]", image.name).trim_start().to_string(),
-            None => t.clone(),
-        };
-        let text = format!("{}\n{}", self.chat_context(), if t.is_empty() { "(see the attached image)" } else { &t });
+        let text = format!("{}\n{t}", self.chat_context());
         self.undo_job = None; // a new request = a new undo step
         self.pending_confirm = None; // a typed answer replaces the buttons
-        self.assistant.send_user_message(shown, UserMessage { text, image });
+        self.assistant.send_user_display(t, text);
         let user_idx = self.assistant.history.len().saturating_sub(1);
         self.active_run_user_idx = Some(user_idx);
         self.transcript_runs.entry(user_idx).or_default();
     }
 
-    /// Attach an image to the chat message being written and show the chat.
-    /// A file that is no image is named in the transcript.
-    fn attach_chat_image(&mut self, image: Result<Image, String>) {
-        match image {
-            Ok(image) => {
-                self.chat_image = Some(image);
-                self.chat_thumb = None;
+    /// A dropped Vital bank or patch is imported; other dropped files are
+    /// not for the app.
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        for file in dropped {
+            let name = file.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x)) {
+                self.import_vital(file.path());
             }
-            Err(why) => self.assistant.history.push(ChatLine { role: "error".into(), text: format!("not attached: {why}") }),
         }
-        if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
     }
 
-    /// Images the user handed over this frame: a file dropped on the window,
-    /// or an image pasted while the assistant is open.
-    fn take_chat_images(&mut self, ctx: &egui::Context) {
-        let (dropped, pasted) = ctx.input(|i| (
-            i.raw.dropped_files.clone(),
-            i.events.iter().find_map(|e| match e { egui::Event::PasteImage(image) => Some(image.clone()), _ => None }),
-        ));
-        for file in dropped {
-            let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-            let too_big = std::fs::metadata(file.path()).is_ok_and(|m| m.len() > crate::vision::MAX_FILE_BYTES);
-            let image = if too_big {
-                Err(format!("{name} is larger than {} MB", crate::vision::MAX_FILE_BYTES / 1_000_000))
-            } else {
-                file.bytes().and_then(|bytes| Image::from_file(&name, &bytes))
-            };
-            self.attach_chat_image(image);
-        }
-        if let Some(image) = pasted.filter(|_| self.assistant_open()) {
-            self.attach_chat_image(Image::from_rgba("pasted image", image.size, image.as_raw()));
-        }
+    /// Import a dropped Vital bank or patch where Vitalium reads presets,
+    /// and list it: the library is read again on its next use.
+    fn import_vital(&mut self, path: &std::path::Path) {
+        self.session_msg = match crate::vital::import(path, &crate::vital::data_dir()) {
+            Ok(added) => {
+                self.sounds.forget(&crate::sounds::Instrument::Lv2(crate::vital::URI.to_string()));
+                format!("{added}: Vitalium's sound list has them")
+            }
+            Err(e) => format!("not imported: {e}"),
+        };
     }
 
     fn switch_model(&mut self, m: &str) -> String {
@@ -8246,10 +8420,17 @@ impl DemoApp {
                                             self.load_rig_dialog = Some(None);
                                         }
                                         if n > 1 {
-                                            ui.add_space(8.0);
+                                            // The hint is the first thing to go: shown only where it fits whole.
                                             let keys = if n.min(9) == 2 { "keys 1–2".to_string() } else { format!("keys 1–{}", n.min(9)) };
-                                            ui.label(egui::RichText::new(format!("{keys} or arrow keys switch the view · all rigs keep sounding"))
-                                                .size(11.0).color(theme::INK_2));
+                                            let room = scroll_w - (ui.min_rect().width() + 8.0);
+                                            for hint in [format!("{keys} or arrow keys switch the view · all rigs keep sounding"), format!("{keys} or ←→ switch the view")] {
+                                                let g = ui.painter().layout_no_wrap(hint.clone(), FontId::proportional(11.0), theme::INK_2);
+                                                if g.size().x <= room {
+                                                    ui.add_space(8.0);
+                                                    ui.label(egui::RichText::new(hint).size(11.0).color(theme::INK_2));
+                                                    break;
+                                                }
+                                            }
                                         }
                                     },
                                 );
@@ -8484,18 +8665,79 @@ impl DemoApp {
         } else {
             self.session_name.trim().to_string()
         };
-        match self.capture_session(&name) {
-            Ok(s) => {
-                let path = crate::session::Session::package_path(dir, &name);
-                match path.and_then(|p| s.save(&p).map(|_| p)) {
-                    Ok(_) => {
-                        self.confirm_delete_session = None;
-                        self.session_msg = format!("Saved '{name}'");
+        self.confirm_session = None;
+        self.session_msg = match self.save_session_as(dir, &name) {
+            Ok(_) => format!("Saved '{name}'"),
+            Err(e) => e,
+        };
+    }
+
+    /// Save the rack as `name`, replacing a saved session of that name; it
+    /// becomes the open session, which autosave keeps writing.
+    fn save_session_as(&mut self, dir: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+        let s = self.capture_session(name).map_err(|e| format!("Capture failed: {e}"))?;
+        let path = crate::session::Session::package_path(dir, name)
+            .and_then(|p| s.save(&p).map(|_| p))
+            .map_err(|e| format!("Save failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave.saved = Some(s);
+        Ok(path)
+    }
+
+    /// Load the saved session `name`; it becomes the open session.
+    fn open_saved_session(&mut self, dir: &std::path::Path, name: &str) -> Result<(), String> {
+        let s = crate::session::Session::package_path(dir, name)
+            .and_then(|p| crate::session::Session::load(&p))
+            .map_err(|e| format!("Load failed: {e}"))?;
+        self.apply_session(&s).map_err(|e| format!("Apply failed: {e}"))?;
+        self.session_name = name.to_string();
+        self.open_session = Some(name.to_string());
+        self.autosave_rebase();
+        Ok(())
+    }
+
+    /// The rack now holds something autosave has not seen (a load, a
+    /// template): record it once it settled, before writing anything.
+    fn autosave_rebase(&mut self) {
+        self.autosave.saved = None;
+        self.autosave.due = AUTOSAVE_SETTLE;
+    }
+
+    fn autosave_target(&self) -> String {
+        self.open_session.clone().unwrap_or_else(|| AUTOSAVE_NAME.to_string())
+    }
+
+    /// Counts down to the next autosave check; true when one is due.
+    fn autosave_due(&mut self, dt: f32) -> bool {
+        if !self.autosave.enabled {
+            return false;
+        }
+        self.autosave.due -= dt;
+        if self.autosave.due > 0.0 {
+            return false;
+        }
+        self.autosave.due = AUTOSAVE_INTERVAL;
+        true
+    }
+
+    /// Write the open session if the rack changed since it was saved or
+    /// loaded. Plugin state is read here, so this runs on the UI thread.
+    fn autosave_now(&mut self, dir: &std::path::Path) {
+        let name = self.autosave_target();
+        let Ok(s) = self.capture_session(&name) else { return };
+        match &self.autosave.saved {
+            None => self.autosave.saved = Some(s),
+            Some(prev) if prev.same_content(&s) => {}
+            Some(_) => {
+                match crate::session::Session::package_path(dir, &name).and_then(|p| s.save(&p)) {
+                    Ok(()) => {
+                        self.session_msg = format!("Autosaved '{name}'");
+                        self.autosave.saved = Some(s);
                     }
-                    Err(e) => self.session_msg = format!("Save failed: {e}"),
+                    Err(e) => self.session_msg = format!("Autosave failed: {e}"),
                 }
             }
-            Err(e) => self.session_msg = format!("Capture failed: {e}"),
         }
     }
 
@@ -8516,6 +8758,7 @@ impl DemoApp {
         let names = Self::list_saved_sessions(dir);
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Sessions").font(theme::medium_font(18.0)).color(theme::INK));
@@ -8548,6 +8791,13 @@ impl DemoApp {
 
                 let mut load_session: Option<String> = None;
                 let mut delete_session: Option<String> = None;
+                let mut overwrite_session: Option<String> = None;
+                let open_session = self.open_session.clone();
+                let autosave_line = if self.autosave.enabled {
+                    format!("Autosave on: changes go to '{}' every {} s.", self.autosave_target(), AUTOSAVE_INTERVAL as u32)
+                } else {
+                    "Autosave off (Settings).".to_string()
+                };
                 let mut do_save = false;
                 let mut load_tpl: Option<Template> = None;
                 let mut load_demo = false;
@@ -8570,6 +8820,8 @@ impl DemoApp {
                     if theme::primary_button(ui, "Save current patch").clicked() {
                         *do_save = true;
                     }
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(&autosave_line).size(11.5).color(theme::INK_2));
                     ui.add_space(16.0);
                     Self::stage_hairline(ui);
                     ui.add_space(14.0);
@@ -8628,8 +8880,9 @@ impl DemoApp {
 
                 let draw_right = |ui: &mut egui::Ui,
                                   names: &[String],
-                                  confirm_delete: &mut Option<String>,
+                                  confirm: &mut Option<SessionConfirm>,
                                   load_session: &mut Option<String>,
+                                  overwrite_session: &mut Option<String>,
                                   delete_session: &mut Option<String>,
                                   list_h: f32| {
                     theme::section_label(ui, &format!("Saved sessions ({})", names.len()));
@@ -8661,33 +8914,81 @@ impl DemoApp {
                                             .color(theme::INK_2),
                                     );
                                     ui.add_space(8.0);
-                                    ui.label(
-                                        egui::RichText::new(name)
-                                            .font(theme::medium_font(14.5))
-                                            .color(theme::INK),
-                                    );
+                                    let is_open = open_session.as_deref() == Some(name.as_str());
+                                    // Buttons first, then the name in what is left of the row
+                                    // (rule 100): a long name truncates instead of running
+                                    // under Load in a narrow sheet.
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let confirming = confirm_delete.as_deref() == Some(name.as_str());
-                                        if confirming {
-                                            if theme::chip_button(ui, "Cancel", false).clicked() {
-                                                *confirm_delete = None;
+                                        match confirm.as_ref() {
+                                            Some(SessionConfirm::Delete(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm delete", true).clicked() {
+                                                    *delete_session = Some(name.clone());
+                                                }
                                             }
-                                            ui.add_space(6.0);
-                                            if theme::danger_button(ui, "Confirm delete", true).clicked() {
-                                                *delete_session = Some(name.clone());
+                                            Some(SessionConfirm::Overwrite(n)) if n == name => {
+                                                if theme::chip_button(ui, "Cancel", false).clicked() {
+                                                    *confirm = None;
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::danger_button(ui, "Confirm overwrite", true)
+                                                    .on_hover_text(format!("replace '{name}' with the current patch"))
+                                                    .clicked()
+                                                {
+                                                    *overwrite_session = Some(name.clone());
+                                                }
                                             }
-                                        } else {
-                                            if theme::danger_button(ui, "Delete", false)
-                                                .on_hover_text(format!("delete '{name}' from disk"))
-                                                .clicked()
-                                            {
-                                                *confirm_delete = Some(name.clone());
-                                            }
-                                            ui.add_space(6.0);
-                                            if theme::primary_button(ui, "Load").clicked() {
-                                                *load_session = Some(name.clone());
+                                            _ => {
+                                                if theme::danger_button(ui, "Delete", false)
+                                                    .on_hover_text(format!("delete '{name}' from disk"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Delete(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::chip_button(ui, "Overwrite", false)
+                                                    .on_hover_text(format!("save the current patch over '{name}'"))
+                                                    .clicked()
+                                                {
+                                                    *confirm = Some(SessionConfirm::Overwrite(name.clone()));
+                                                }
+                                                ui.add_space(6.0);
+                                                if theme::primary_button(ui, "Load").clicked() {
+                                                    *load_session = Some(name.clone());
+                                                }
                                             }
                                         }
+                                        ui.add_space(8.0);
+                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                            let open_tag = egui::RichText::new("open").size(11.5).color(theme::INK_2);
+                                            let open_w = if is_open {
+                                                ui.spacing().item_spacing.x
+                                                    + egui::WidgetText::from(open_tag.clone())
+                                                        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+                                                        .size()
+                                                        .x
+                                            } else {
+                                                0.0
+                                            };
+                                            let name_w = (ui.available_width() - open_w).max(0.0);
+                                            ui.scope(|ui| {
+                                                ui.set_max_width(name_w);
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        egui::RichText::new(name)
+                                                            .font(theme::medium_font(14.5))
+                                                            .color(if is_open { theme::LIVE_TEAL } else { theme::INK }),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                            if is_open {
+                                                ui.label(open_tag);
+                                            }
+                                        });
                                     });
                                 });
                                 ui.add_space(8.0);
@@ -8722,6 +9023,7 @@ impl DemoApp {
                         let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, h), egui::Sense::hover());
                         ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
                         ui.add_space(12.0);
+                        let right_w = ui.available_width().min(right_w);
                         ui.allocate_ui_with_layout(
                             egui::vec2(right_w, h),
                             egui::Layout::top_down(egui::Align::Min),
@@ -8730,8 +9032,9 @@ impl DemoApp {
                                 draw_right(
                                     ui,
                                     &names,
-                                    &mut self.confirm_delete_session,
+                                    &mut self.confirm_session,
                                     &mut load_session,
+                                    &mut overwrite_session,
                                     &mut delete_session,
                                     list_h,
                                 );
@@ -8759,8 +9062,9 @@ impl DemoApp {
                             draw_right(
                                 ui,
                                 &names,
-                                &mut self.confirm_delete_session,
+                                &mut self.confirm_session,
                                 &mut load_session,
+                                &mut overwrite_session,
                                 &mut delete_session,
                                 200.0,
                             );
@@ -8780,18 +9084,25 @@ impl DemoApp {
                     self.load_multi_rig_demo();
                 }
                 if let Some(name) = load_session {
-                    self.confirm_delete_session = None;
-                    let path = crate::session::Session::package_path(dir, &name);
-                    match path.and_then(|p| crate::session::Session::load(&p)) {
-                        Ok(s) => match self.apply_session(&s) {
-                            Ok(_) => self.session_msg = format!("Loaded '{name}'"),
-                            Err(e) => self.session_msg = format!("Apply failed: {e}"),
-                        },
-                        Err(e) => self.session_msg = format!("Load failed: {e}"),
-                    }
+                    self.confirm_session = None;
+                    self.session_msg = match self.open_saved_session(dir, &name) {
+                        Ok(()) => format!("Loaded '{name}'"),
+                        Err(e) => e,
+                    };
+                }
+                if let Some(name) = overwrite_session {
+                    self.confirm_session = None;
+                    self.session_msg = match self.save_session_as(dir, &name) {
+                        Ok(_) => format!("Overwrote '{name}'"),
+                        Err(e) => e,
+                    };
                 }
                 if let Some(name) = delete_session {
-                    self.confirm_delete_session = None;
+                    self.confirm_session = None;
+                    if self.open_session.as_deref() == Some(name.as_str()) {
+                        self.open_session = None;
+                        self.autosave_rebase();
+                    }
                     match Self::delete_saved_session(dir, &name) {
                         Ok(()) => self.session_msg = format!("Deleted '{name}'"),
                         Err(e) => self.session_msg = format!("Delete failed: {e}"),
@@ -8857,9 +9168,22 @@ impl DemoApp {
                 self.plugins_lv2 = lv2;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
+                self.classify_lv2_units();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.plugin_scan = None,
+        }
+    }
+
+    /// Mark the rack's LV2 units that the plugin scan calls instruments.
+    fn classify_lv2_units(&mut self) {
+        for u in &mut self.units {
+            let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { continue };
+            u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+            if u.lv2_inst {
+                u.sub = "lv2 synth".into();
+                u.sub_g = None;
+            }
         }
     }
 
@@ -9147,6 +9471,7 @@ impl DemoApp {
         let help = self.show_help;
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 // Title + subtitle in a plain row (a wrapped row's galleys start
                 // at its left edge and overlap, rule 100); the subtitle
@@ -9587,7 +9912,6 @@ impl DemoApp {
         match role {
             crate::llm::Role::Decide => &mut self.settings_decide_input,
             crate::llm::Role::Act => &mut self.settings_act_input,
-            crate::llm::Role::Perceive => &mut self.settings_perceive_input,
         }
     }
 
@@ -9608,6 +9932,7 @@ impl DemoApp {
             SaveKey(Endpoint, String),
             RemoveKey(Endpoint),
             ToggleReduceMotion,
+            ToggleAutosave,
             SetCountIn(bool, u8),
             SetAudioOutput(Option<String>),
         }
@@ -9624,7 +9949,6 @@ impl DemoApp {
         let decide_on = self.assistant.decide_enabled();
         let decide_route = self.assistant.route_for(Role::Decide);
         let act_route = self.assistant.route_for(Role::Act);
-        let perceive_route = self.assistant.route_for(Role::Perceive);
         let (outputs, out_current) = self
             .audio_out
             .lock()
@@ -9632,12 +9956,14 @@ impl DemoApp {
             .unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         let reduce_motion = self.reduce_motion;
+        let autosave_on = self.autosave.enabled;
         let count_in_enabled = self.count_in_enabled;
         let count_in_bars = self.count_in_bars;
-        let detected_scale = ui_scale_target();
+        let detected_scale = ui.ctx().pixels_per_point();
         let mut actions: Vec<SettingsAction> = Vec::new();
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
@@ -9657,6 +9983,11 @@ impl DemoApp {
                 ui.label(
                     egui::RichText::new("agent models · API keys · preferences · Tab / Esc: back to the rack")
                         .size(13.0)
+                        .color(theme::INK_2),
+                );
+                ui.label(
+                    egui::RichText::new(format!("kabelsalat {}", crate::VERSION))
+                        .size(12.5)
                         .color(theme::INK_2),
                 );
                 ui.add_space(12.0);
@@ -9679,13 +10010,11 @@ impl DemoApp {
                         let route = match role {
                             Role::Decide => &decide_route,
                             Role::Act => &act_route,
-                            Role::Perceive => &perceive_route,
                         };
                         let choices = crate::assistant::role_model_choices(role, keys, &route.model);
                         let desc = match role {
                             Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
                             Role::Act => "Handles conversation, questions, and multi-step rack edits.",
-                            Role::Perceive => "Reads attached screenshots and images for turns that carry one.",
                         };
 
                         ui.horizontal(|ui| {
@@ -9897,6 +10226,19 @@ impl DemoApp {
                     ui.add_space(10.0);
 
                     ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Autosave sessions").font(theme::medium_font(13.5)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, if autosave_on { "On" } else { "Off" }, autosave_on).clicked() {
+                                actions.push(SettingsAction::ToggleAutosave);
+                            }
+                        });
+                    });
+                    ui.label(egui::RichText::new("Saves changes to the open session every 20 s and on quit; unsaved patches go to 'Autosave' (session_autosave).").size(11.5).color(theme::INK_2));
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
@@ -9967,7 +10309,7 @@ impl DemoApp {
                             );
                         });
                     });
-                    ui.label(egui::RichText::new("Detected from display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
+                    ui.label(egui::RichText::new("From the display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
                 };
 
                 egui::ScrollArea::vertical()
@@ -10053,6 +10395,16 @@ impl DemoApp {
                         "Reduce motion enabled".into()
                     } else {
                         "Reduce motion disabled".into()
+                    };
+                }
+                SettingsAction::ToggleAutosave => {
+                    self.autosave.enabled = !self.autosave.enabled;
+                    self.autosave_rebase();
+                    let saved = crate::assistant::save_session_autosave(self.autosave.enabled);
+                    self.settings_msg = match (saved, self.autosave.enabled) {
+                        (Err(e), _) => format!("Saving the autosave setting failed: {e}"),
+                        (Ok(()), true) => "Autosave enabled".into(),
+                        (Ok(()), false) => "Autosave disabled".into(),
                     };
                 }
                 SettingsAction::SetCountIn(enabled, bars) => {
@@ -10311,8 +10663,6 @@ impl DemoApp {
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
                                  chat_input: &mut String,
-                                 chat_image: &mut Option<Image>,
-                                 chat_thumb: &mut Option<ChatThumb>,
                                  assistant: &mut Assistant,
                                  transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
@@ -10362,10 +10712,7 @@ impl DemoApp {
                     }
 
                     let col_h = ui.available_height().max(40.0);
-                    // The attachment chip has a fixed row, so the history
-                    // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 } else { 0.0 };
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + 4.0;
                     let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
@@ -10501,60 +10848,6 @@ impl DemoApp {
                                 }
                             }
                         });
-                    sync_chat_thumb(ui.ctx(), chat_image, chat_thumb);
-                    if let Some(img) = chat_image.as_ref() {
-                        let mut remove_image = false;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), ATTACH_ROW_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
-                                egui::Frame::new()
-                                    .fill(theme::DARK_PANEL_HI)
-                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                    .corner_radius(2.0)
-                                    .inner_margin(egui::Margin::symmetric(8, 4))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 8.0;
-                                            let thumb_info = chat_thumb.as_ref();
-                                            let [tw, th] = thumb_info.map_or([32, 32], |t| t.size);
-                                            let aspect = (tw as f32 / th.max(1) as f32).clamp(0.6, 2.0);
-                                            let thumb_sz = egui::vec2((ATTACH_THUMB_H * aspect).round(), ATTACH_THUMB_H);
-                                            let (rect, _) = ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
-                                            if let Some(tex) = thumb_info.and_then(|t| t.tex.as_ref()) {
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    rect,
-                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                                    Color32::WHITE,
-                                                );
-                                                ui.painter().rect_stroke(rect, 1.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                            } else {
-                                                ui.painter().rect_filled(rect, 2.0, theme::PAPER_SINK);
-                                                ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "IMG", theme::medium_font(9.5), theme::CREAM_META);
-                                            }
-                                            let name = truncate_attachment_name(&img.name);
-                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(theme::CREAM)).truncate());
-                                            let close = ui.add(
-                                                egui::Button::new(egui::RichText::new("×").font(theme::medium_font(13.0)).color(theme::CREAM))
-                                                    .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::NONE)
-                                                    .min_size(egui::vec2(22.0, 24.0)),
-                                            ).on_hover_text("remove the image");
-                                            if close.clicked() {
-                                                remove_image = true;
-                                            }
-                                        });
-                                    });
-                            },
-                        );
-                        if remove_image {
-                            *chat_image = None;
-                            *chat_thumb = None;
-                        }
-                    }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
                         let edit = egui::Frame::new()
@@ -10568,7 +10861,7 @@ impl DemoApp {
                                         .id_salt("assistant_chat_input")
                                         .frame(egui::Frame::NONE)
                                         .desired_width((ui.available_width() - 82.0).max(80.0))
-                                        .hint_text("Ask or instruct… (drop or paste an image to show it)"),
+                                        .hint_text("Ask or instruct…"),
                                 );
                                 if *focus_chat { edit_resp.request_focus(); *focus_chat = false; }
                                 edit_resp
@@ -10576,7 +10869,7 @@ impl DemoApp {
                             .inner;
                         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
-                            && (!chat_input.trim().is_empty() || chat_image.is_some())
+                            && !chat_input.trim().is_empty()
                             && !assistant.busy
                         {
                             *submit_text = Some(chat_input.trim().to_string());
@@ -10597,8 +10890,6 @@ impl DemoApp {
                                     ui,
                                     &mut self.key_input,
                                     &mut self.chat_input,
-                                    &mut self.chat_image,
-                                    &mut self.chat_thumb,
                                     &mut self.assistant,
                                     &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
@@ -10644,11 +10935,10 @@ impl DemoApp {
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
                                         if self.agent_activity.log.is_empty() {
-                                            ui.label(
-                                                egui::RichText::new("No agent edits yet — assistant & MCP/CLI changes appear here and highlight in the rack.")
-                                                    .size(11.5)
-                                                    .color(theme::INK_2),
-                                            );
+                                            // One line: a short dock leaves this list a single row.
+                                            ui.add(egui::Label::new(egui::RichText::new("No agent edits yet")
+                                                .size(11.5).color(theme::INK_2)).truncate())
+                                                .on_hover_text("assistant & MCP/CLI changes appear here and highlight in the rack");
                                             return;
                                         }
                                         for entry in &self.agent_activity.log {
@@ -10680,8 +10970,6 @@ impl DemoApp {
                         ui,
                         &mut self.key_input,
                         &mut self.chat_input,
-                        &mut self.chat_image,
-                        &mut self.chat_thumb,
                         &mut self.assistant,
                         &mut self.transcript_runs,
                         &mut self.assistant_input_h,
@@ -10746,7 +11034,7 @@ impl DemoApp {
     /// below the minimum playable size, and only what the rack can spare
     /// (rule 22). Whole pixels, so a resize does not jitter the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 140.0; // header + keys of at least 40 px
+        const MIN_H: f32 = 112.0; // header + keys of at least 60 px
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -11400,6 +11688,79 @@ impl DemoApp {
             .is_some_and(|n| crate::organ::is_organ(&n.kind))
     }
 
+    /// Is this unit Aeolus (a stop panel on its face)?
+    fn is_aeolus_unit(&self, unit: usize) -> bool {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .is_some_and(|n| matches!(&n.kind, NodeKind::Clap { plugin_id } if name_str(plugin_id) == crate::aeolus::AEOLUS_ID))
+    }
+
+    /// The division an Aeolus unit's face shows.
+    fn aeolus_division(&self, unit: usize) -> usize {
+        self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default().division
+    }
+
+    /// An Aeolus face, between the header and the knob row: a column of
+    /// division tabs on the left (III, II, I, P, top to bottom as on the
+    /// console), and the shown division's stops in columns right of it.
+    /// None when the stops do not fit at a readable size (never squeeze,
+    /// rule 22).
+    fn aeolus_rects(&self, unit: usize) -> Option<AeolusRects> {
+        if !self.is_aeolus_unit(unit) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let (left, right) = (r.left() + FACE_X, r.right() - FACE_PAD_R);
+        let (top, bottom) = (r.top() + 64.0, self.knob_row_y(unit) - KNOB_R - 14.0);
+        let (tab_w, cell_h, row_gap, col_gap, min_cell_w) = (28.0, 17.0, 3.0, 4.0, 52.0);
+        let fit_rows = ((bottom - top + row_gap) / (cell_h + row_gap)).floor().max(0.0) as usize;
+        if fit_rows < 4 { return None; }
+        let tabs: [Rect; 4] = std::array::from_fn(|i|
+            Rect::from_min_size(Pos2::new(left, top + i as f32 * (cell_h + row_gap)), Vec2::new(tab_w, cell_h)));
+        let n = crate::aeolus::DIVISIONS[self.aeolus_division(unit)].stops.len();
+        let rows = fit_rows.min(n);
+        let cols = n.div_ceil(rows);
+        let grid_left = left + tab_w + 2.0 * col_gap;
+        let cell_w = (right - grid_left - (cols - 1) as f32 * col_gap) / cols as f32;
+        if cell_w < min_cell_w { return None; }
+        // Fill column by column, like the stop jambs of a console.
+        let stops = (0..n).map(|i| {
+            let (c, row) = (i / rows, i % rows);
+            Rect::from_min_size(Pos2::new(grid_left + c as f32 * (cell_w + col_gap), top + row as f32 * (cell_h + row_gap)), Vec2::new(cell_w, cell_h))
+        }).collect();
+        Some(AeolusRects { tabs, stops })
+    }
+
+    /// Draw or push in stop `stop` of the division an Aeolus face shows: the
+    /// plugin's own state with that one stop changed goes back into it (its
+    /// stops are no parameters, aeolus.rs), and the face reads the result.
+    fn toggle_aeolus_stop(&mut self, node: u32, stop: usize) -> Result<(), String> {
+        let face = self.aeolus_faces.get(&node).copied().unwrap_or_default();
+        let on = face.drawn.map_or(true, |d| d[face.division] >> stop & 1 == 0);
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running: no stop to draw")?;
+        let state = main.save_state().map_err(|e| format!("Aeolus state: {e}"))?;
+        let next = crate::aeolus::with_stop(&state, face.division, stop, on)
+            .ok_or("this Aeolus has its own organ: its stops are not on the face")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus stop: {e}"))?;
+        self.aeolus_faces.entry(node).or_default().drawn = crate::aeolus::drawn(&next);
+        Ok(())
+    }
+
+    /// Keep each Aeolus face's stops in step with its plugin (a sound load,
+    /// a session load or a new voice changes them): read every
+    /// `AEOLUS_POLL_SECS`, and forget faces whose unit is gone.
+    fn sync_aeolus_faces(&mut self) {
+        let aeolus: Vec<(usize, u32)> = (0..self.units.len()).filter(|&u| self.is_aeolus_unit(u)).map(|u| (u, self.units[u].node_id)).collect();
+        self.aeolus_faces.retain(|n, _| aeolus.iter().any(|(_, a)| a == n));
+        if aeolus.is_empty() || self.ui_time - self.aeolus_poll_at < AEOLUS_POLL_SECS { return; }
+        self.aeolus_poll_at = self.ui_time;
+        for (_, node) in aeolus {
+            let Some(main) = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i)) else { continue };
+            let drawn = main.save_state().ok().and_then(|s| crate::aeolus::drawn(&s));
+            self.aeolus_faces.entry(node).or_default().drawn = drawn;
+        }
+    }
+
     /// An organ face's nine drawbar slots (rack-local), left to right from
     /// 16': each a footage label above a track the bar is pulled down in.
     /// Between the header and the knob row; None when there is not room for
@@ -11716,6 +12077,9 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        if self.autosave_due(dt) {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Audio In tuner: drain each open capture's tuner ring and run YIN.
         if !self.audio_in_tuners.is_empty() {
             self.pump_audio_in_tuners();
@@ -12046,26 +12410,6 @@ impl DemoApp {
         if leftmost < 0.0 { 1 } else { (leftmost / KNOB_PITCH) as usize + 1 }
     }
 
-    /// The narrowest width this unit's face stays legible at (#58): its
-    /// built-in knob row (the leftmost label inside the face grid) and, for
-    /// an organ, its nine drawbars. A stack column is never laid out
-    /// narrower — the organ column used to get the uniform mid width, which
-    /// put LESLIE over the neighbouring unit and hid the drawbars.
-    fn face_min_width(&self, unit: usize) -> f32 {
-        let Some(u) = self.units.get(unit) else { return 0.0 };
-        let knobs = u.knobs.iter().filter(|k| !k.hidden && k.source == KnobSource::BuiltIn).count();
-        let mut need = if knobs > 0 {
-            FACE_PAD_R + KNOB_SLOT_HALF + (knobs - 1) as f32 * KNOB_PITCH + KNOB_LABEL_W / 2.0 + FACE_X
-        } else {
-            0.0
-        };
-        if self.is_organ_unit(unit) {
-            // Nine drawbars at the width `drawbar_rects` demands (≥14 each).
-            need = need.max(FACE_X + crate::organ::DRAWBARS as f32 * 14.0 + 8.0 * 6.0 + FACE_PAD_R);
-        }
-        need
-    }
-
     /// Show as many plugin knobs as the unit is wide; the unit's own knobs
     /// always stay, the last plugin knobs give way first.
     fn fit_plugin_knobs(&mut self) {
@@ -12078,6 +12422,23 @@ impl DemoApp {
                 room = room.saturating_sub(1);
             }
         }
+    }
+
+    /// Narrowest face that still shows the unit's own knobs, header and LED
+    /// (plugin knobs give way first, `fit_plugin_knobs`).
+    fn face_min_w(&self, unit: usize) -> f32 {
+        let Some(u) = self.units.get(unit) else { return FACE_MIN_W };
+        let own = u.knobs.iter().filter(|k| k.source == KnobSource::BuiltIn && !k.hidden).count();
+        // Left of the knob row: Master's meter segments (a display just hides;
+        // the meter's caption sits above the knob row and may run over it).
+        let meter = if matches!(u.node_kind, UnitKind::Master) { METER_SEG_W + 8.0 } else { 0.0 };
+        let knobs = if own == 0 { 0.0 } else {
+            FACE_X + meter + KNOB_LABEL_W / 2.0 + KNOB_SLOT_HALF + (own - 1) as f32 * KNOB_PITCH + FACE_PAD_R
+        };
+        // The title clears the LED (top right); the subtitle row runs under it.
+        let title = FACE_X + u.name_g.as_ref().map_or(0.0, |g| g.size().x) + 30.0;
+        let sub = FACE_X + u.sub_g.as_ref().map_or(0.0, |g| g.size.x) + 10.5;
+        knobs.max(title).max(sub).max(FACE_MIN_W).ceil()
     }
 
     fn knob_center(&self, unit: usize, idx: usize) -> Vec2 {
@@ -12250,7 +12611,7 @@ impl DemoApp {
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
-                else if self.confirm_delete_session.is_some() { self.confirm_delete_session = None; }
+                else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
                 else { self.selected = None; }
             }
@@ -12660,6 +13021,17 @@ impl DemoApp {
                         && self.audio_in_device_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
                         self.cycle_audio_in_device(ui);
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.aeolus_rects(ui).is_some_and(|a| a.tabs.iter().chain(&a.stops).any(|r| r.contains(l.to_pos2()))) => {
+                        // Aeolus face: a division tab shows that division, a stop toggles.
+                        let a = self.aeolus_rects(ui).unwrap();
+                        let node = self.units[ui].node_id;
+                        if let Some(d) = a.tabs.iter().position(|r| r.contains(l.to_pos2())) {
+                            self.aeolus_faces.entry(node).or_default().division = d;
+                        } else if let Some(stop) = a.stops.iter().position(|r| r.contains(l.to_pos2())) {
+                            if let Err(e) = self.toggle_aeolus_stop(node, stop) { self.plugin_msg = e; }
+                        }
+                    }
                     Some(Hit::Unit(ui)) => {
                         // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
                         // A single click still pings the unit.
@@ -12741,7 +13113,7 @@ impl DemoApp {
         let mut rp = painter.clone();
         if let Some(clip) = self.rack_clip { rp.set_clip_rect(clip.intersect(rect)); }
         rp.set_opacity(self.load_fade);
-        rp.rect_filled(rack, 36.0, CHASSIS);
+        rp.rect_filled(rack, self.rack_chrome.radius, CHASSIS);
 
         if self.xf.sy > 0.04 {
             self.draw_rails(&rp);
@@ -12759,10 +13131,10 @@ impl DemoApp {
     /// Hairline pan indicators when the rack overflows the stage: a thumb
     /// showing the visible part on the bottom / right edge of the view.
     fn draw_pan_bars(&self, painter: &egui::Painter) {
-        let Some(view) = self.rack_clip.map(|c| c.shrink(8.0)) else { return };
+        let Some(view) = self.rack_clip.map(|c| Rect::from_min_max(c.min + Vec2::splat(8.0), Pos2::new(c.max.x - 8.0, c.max.y))) else { return };
         let ov = self.rack_overflow;
         if ov.x > 0.0 {
-            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 6.0), Pos2::new(view.right() - 40.0, view.bottom() + 9.0));
+            let track = Rect::from_min_max(Pos2::new(view.left() + 40.0, view.bottom() + 2.0), Pos2::new(view.right() - 40.0, view.bottom() + 5.0));
             let frac = view.width() / self.rack_w;
             let t = 0.5 - self.rack_pan.x / ov.x.max(1.0); // pan +ov/2 = left end
             let w = track.width() * frac;
@@ -12795,6 +13167,7 @@ impl DemoApp {
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
         let help = self.show_help;
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("MIDI Matrix").font(theme::medium_font(18.0)).color(theme::INK));
@@ -12905,6 +13278,7 @@ impl DemoApp {
             .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
@@ -12913,12 +13287,14 @@ impl DemoApp {
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(14.0);
-                let h = ui.available_height();
                 // Strip height: name + sub + fader + value + bus controls.
-                let fader_h = (h - 210.0).clamp(90.0, 480.0);
+                // A short sheet keeps a usable fader and scrolls the rest.
+                let view_h = ui.available_height().max(1.0);
+                let fader_h = (view_h - 210.0).clamp(64.0, 480.0);
+                let h = view_h.max(fader_h + 210.0);
                 ui.horizontal_top(|ui| {
                     let scroll_w = ui.available_width().max(200.0);
-                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    ui.allocate_ui_with_layout(egui::vec2(scroll_w, view_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         // Center the strips in the sheet while they fit (a left-
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
@@ -12926,7 +13302,7 @@ impl DemoApp {
                         let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
                         let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
-                        egui::ScrollArea::horizontal().id_salt("mixer_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                        egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(pad);
                                 for rig in 0..n {
@@ -13095,17 +13471,23 @@ impl DemoApp {
                                         ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
                                     }
                                     ui.add_space(4.0);
-                                    let rigs = if n == 1 { "1 rig · peak meter".to_string() } else { format!("sum of {n} rigs · peak meter") };
-                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2));
+                                    let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
+                                        .on_hover_text("peak meter of everything kabelsalat plays");
                                     ui.add_space(8.0);
                                     // Meter + dB scale: a labeled peak meter, not a missing fader.
                                     let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
                                     let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
                                     paint_meter(ui.painter(), mr, meter_db_pos(self.meter), meter_db_pos(self.meter_peak));
-                                    for db in [0.0f32, -6.0, -12.0, -24.0, -48.0] {
+                                    // The ends first; a mark too close to one already drawn is left out
+                                    // (a short meter put "0 dB", "−6" and "−12" on top of each other).
+                                    let mut drawn: Vec<f32> = Vec::new();
+                                    for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
                                         // Labels only (a tick hairline beside "0" read as "-0"),
                                         // with a real minus sign.
                                         let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
+                                        if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
+                                        drawn.push(y);
                                         let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
                                         ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
                                             label, FontId::monospace(9.5), theme::CREAM_DIM);
@@ -13131,7 +13513,7 @@ impl DemoApp {
     /// Tab: in any non-rack stage view it returns to the rack; otherwise it flips the rack.
     fn on_tab(&mut self) {
         if self.stage_view != StageView::Rack {
-            self.confirm_delete_session = None;
+            self.confirm_session = None;
             self.stage_view = StageView::Rack;
         } else {
             self.start_flip();
@@ -13140,8 +13522,10 @@ impl DemoApp {
 
     fn draw_rails(&self, painter: &egui::Painter) {
         let xf = &self.xf;
-        for side_x in [8.0, self.rack_w - 22.0] {
-            let rail = Rect::from_min_size(Pos2::new(side_x, 8.0), Vec2::new(14.0, self.rack_h - 16.0));
+        let RackChrome { pad, rail: w, .. } = self.rack_chrome;
+        let inset = pad * 0.4;
+        for side_x in [inset, self.rack_w - inset - w] {
+            let rail = Rect::from_min_size(Pos2::new(side_x, inset), Vec2::new(w, self.rack_h - 2.0 * inset));
             painter.rect_filled(xf.rect(rail), 4.0, RAIL);
         }
         // No screws — the editorial language has no hardware chrome (§4.2).
@@ -13262,7 +13646,10 @@ impl DemoApp {
                     self.draw_split_face(painter, ui);
                     self.draw_zone_octaves(painter, ui);
                 }
-                UnitKind::Clap => self.draw_surge_display(painter, ui),
+                UnitKind::Clap => {
+                    self.draw_surge_display(painter, ui);
+                    self.draw_aeolus_face(painter, ui);
+                }
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) if self.is_organ_unit(ui) => self.draw_organ_face(painter, ui),
@@ -13397,6 +13784,67 @@ impl DemoApp {
                 self.face_text(painter, Pos2::new(bar.center().x, bar.bottom() - 8.0), &pos.to_string(), theme::medium_font(11.0), ink);
             }
         }
+    }
+
+    /// Aeolus face, drawn like a console's stop jamb rather than a grid of
+    /// buttons: each stop is its name beside an indicator light (live teal
+    /// when drawn, an unlit ring when not), no box. The division tabs are
+    /// plain labels; the shown one is cream with an accent bar (selection),
+    /// and a small teal dot marks a division with stops drawn. A hairline
+    /// parts tabs from stops. Hover lifts a row onto a faint plate.
+    fn draw_aeolus_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some(a) = self.aeolus_rects(unit) else { return };
+        let face = self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default();
+        let hover_plate = |rect: Rect| painter.rect_filled(self.xf.rect(rect), 2.0, alpha(theme::CREAM, 0.06));
+        let tab_font = theme::medium_font(11.0);
+        for (d, tab) in a.tabs.iter().enumerate() {
+            let hov = self.face_hovered(painter, unit, *tab);
+            let shown = d == face.division;
+            if hov && !shown { hover_plate(*tab); }
+            if shown {
+                let bar = Rect::from_min_size(tab.min + Vec2::new(0.0, 2.0), Vec2::new(2.0, tab.height() - 4.0));
+                painter.rect_filled(self.xf.rect(bar), 1.0, theme::ACCENT);
+            }
+            let ink = if shown || hov { theme::CREAM } else { theme::CREAM_DIM };
+            self.face_text(painter, Pos2::new(tab.left() + 13.0, tab.center().y), crate::aeolus::division_tab(d), tab_font.clone(), ink);
+            if face.drawn.is_some_and(|b| b[d] != 0) {
+                self.ell(painter, Vec2::new(tab.right() - 3.5, tab.center().y), 2.0, theme::LIVE_TEAL, Stroke::NONE);
+            }
+        }
+        // The rule between the tab column and the stops.
+        let x = a.tabs[0].right() + 4.0;
+        painter.line_segment([self.xf.p(Vec2::new(x, a.tabs[0].top() + 1.0)), self.xf.p(Vec2::new(x, a.tabs[3].bottom() - 1.0))],
+            Stroke::new(1.0, theme::HAIRLINE));
+
+        let font = FontId::proportional(10.5);
+        let stops = crate::aeolus::DIVISIONS[face.division].stops;
+        for (i, (rect, name)) in a.stops.iter().zip(stops).enumerate() {
+            let on = face.drawn.is_some_and(|b| b[face.division] >> i & 1 == 1);
+            let hov = self.face_hovered(painter, unit, *rect);
+            if hov { hover_plate(*rect); }
+            let led = Vec2::new(rect.left() + 5.0, rect.center().y);
+            if on {
+                self.ell(painter, led, 6.0, alpha(theme::LIVE_TEAL, 0.18), Stroke::NONE);
+                self.ell(painter, led, 3.2, theme::LIVE_TEAL, Stroke::NONE);
+            } else {
+                self.ell(painter, led, 3.0, Color32::TRANSPARENT, Stroke::new(1.0, if hov { theme::CREAM_DIM } else { theme::MUTED }));
+            }
+            let ink = if on { theme::CREAM } else if hov { theme::CREAM_META } else { theme::CREAM_DIM };
+            let text_left = rect.left() + 12.0;
+            let label = fit_stop_label(painter, name, font.clone(), (rect.right() - text_left - 2.0) * self.xf.sx);
+            self.face_text_left(painter, Pos2::new(text_left, rect.center().y), &label, font.clone(), ink);
+        }
+    }
+
+    /// Single-line face text starting at rack-local `left_center` (its left
+    /// edge, vertically centred), faded with the flip like `face_text`.
+    fn face_text_left(&self, painter: &egui::Painter, left_center: Pos2, text: &str, font: FontId, color: Color32) {
+        if self.text_alpha <= 0.01 { return; }
+        let g = painter.layout_no_wrap(text.into(), font, color);
+        let pos = self.xf.p(Vec2::new(left_center.x, left_center.y - g.size().y / 2.0));
+        let mut tp = painter.clone();
+        tp.set_opacity(self.text_alpha);
+        tp.galley(pos, g, color);
     }
 
     /// Keys face, split: one octave stepper per zone ("LOW +1"), BPM style.
@@ -13627,8 +14075,16 @@ impl DemoApp {
         let r = self.unit_rects[unit];
         let x = r.left() + FACE_X;
         let bottom = self.knob_row_y(unit) + KNOB_R;
-        let pitch = ((bottom - (r.top() + 84.0)) / METER_SEGS as f32).clamp(4.0, 17.0);
+        let pitch = (bottom - (r.top() + 84.0)) / METER_SEGS as f32;
+        // A short face drops the OUTPUT caption and starts the meter under the header.
+        let pitch = if pitch >= 4.0 { pitch.min(17.0) } else { ((bottom - (r.top() + METER_TOP_SHORT)) / METER_SEGS as f32).max(2.0) };
         (x, bottom, pitch)
+    }
+
+    /// Whether Master's meter has room for its OUTPUT caption.
+    fn meter_caption_shown(&self, unit: usize) -> bool {
+        let (_, bottom, pitch) = self.meter_geom(unit);
+        bottom - METER_SEGS as f32 * pitch - 18.0 >= self.unit_rects[unit].top() + METER_TOP_SHORT
     }
 
     /// Vertical LED meter on the tall MASTER unit (bottom = quiet).
@@ -13640,7 +14096,7 @@ impl DemoApp {
         for i in 0..n {
             let seg = Rect::from_min_size(
                 Pos2::new(x, bottom - (i + 1) as f32 * pitch),
-                Vec2::new(22.0, pitch * 0.72),
+                Vec2::new(METER_SEG_W, pitch * 0.72),
             );
             let col = theme::meter_color(i as f32 / (n - 1) as f32);
             let fill = if i < lit { col } else { theme::METER_TRACK };
@@ -13660,7 +14116,9 @@ impl DemoApp {
         // the meter, not floating on the knob-label row (vision review).
         let top = bottom - n as f32 * pitch;
         // Left-aligned with the meter column and the title (face grid).
-        self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        if self.meter_caption_shown(unit) {
+            self.text_tracked(painter, Vec2::new(x, top - 18.0), &self.caption_output_g, SUBTEXT);
+        }
     }
 
     // -- Audio In face (issue #28) -------------------------------------------
@@ -13699,7 +14157,8 @@ impl DemoApp {
     fn audio_in_chips_y(&self, unit: usize) -> Option<f32> {
         let r = *self.unit_rects.get(unit)?;
         let y = (r.top() + 60.0).max(r.center().y - 8.0).min(r.bottom() - FACE_PAD_B - FACE_CTL_H - 8.0);
-        if y + FACE_CTL_H + 8.0 > self.knob_row_y(unit) {
+        // Clear of the input meter, which starts 20 px above the knob row.
+        if y + FACE_CTL_H + 4.0 > self.knob_row_y(unit) - 20.0 {
             return None;
         }
         Some(y)
@@ -14254,7 +14713,7 @@ impl DemoApp {
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
-            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 1.0) * 0.85)
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.75) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }
@@ -14741,21 +15200,18 @@ impl DemoApp {
         self.refresh_instrument_subs();
         self.ensure_galleys(&ctx);
 
-        // Fractional-HiDPI fix: winit reports scale 1.0 on Hyprland's 1.6x
-        // output, and eframe re-applies it AFTER the app creator runs — so the
-        // correction must live here, on the frame path, not in the creator.
-        // The target is the COMPOSITOR's monitor scale (ui_scale_target):
-        // winit-under-XWayland derives 2.33 from the panel's physical DPI on
-        // a 1.6x Hyprland output, which inflated every element by ~46% and
-        // squished the rack (user report 2026-11-15).
-        let target = ui_scale_target();
-        if (ctx.pixels_per_point() - target).abs() > 0.01 {
-            ctx.set_pixels_per_point(target);
-            eprintln!("ui scale: corrected to {target:.2} on frame path");
+        // eframe applies the window's scale after the app creator runs, so an
+        // override lives here, on the frame path.
+        let native = ctx.input(|i| i.viewport().native_pixels_per_point);
+        if let Some(target) = ui_scale_override(native) {
+            if (ctx.pixels_per_point() - target).abs() > 0.01 {
+                ctx.set_pixels_per_point(target);
+                eprintln!("ui scale: set to {target:.2} on frame path");
+            }
         }
         static SCALE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SCALE_LOGGED.swap(true, Ordering::Relaxed) {
-            eprintln!("ui scale: first-frame ppp={:.2}", ctx.pixels_per_point());
+            eprintln!("ui scale: first-frame ppp={:.2} native={native:?}", ctx.pixels_per_point());
         }
 
         if self.flip_requested {
@@ -14788,7 +15244,7 @@ impl DemoApp {
             }
         }
 
-        self.take_chat_images(&ctx);
+        self.take_dropped_files(&ctx);
 
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
@@ -14827,9 +15283,10 @@ impl DemoApp {
         }
         self.poll_assistant();
         self.serve_ui_inbox();
-        self.serve_rack_shots();
-        self.rack_shot.request(&ctx);
         self.sync_from_engine();
+        for main in &mut self._surge_main {
+            main.pump();
+        }
         self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
@@ -14894,6 +15351,7 @@ impl DemoApp {
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
         self.sync_main_knobs();
+        self.sync_aeolus_faces();
         self.layout(rect);
         self.fit_plugin_knobs();
         if !typing(&ctx) {
@@ -14924,6 +15382,9 @@ impl DemoApp {
         // animation / agent run is active; ~30 fps when unfocused and idle.
         if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
+        } else if self._surge_main.iter().any(|m| m.editor_open()) {
+            // Plugin editors paint from timers this frame loop runs.
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
@@ -14955,6 +15416,9 @@ impl eframe::App for DemoApp {
     }
 
     fn on_exit(&mut self) {
+        if self.autosave.enabled {
+            self.autosave_now(&Self::sessions_dir());
+        }
         // Native editor holds no plugin GUI; just drop its cached state.
         self.editor_open = false;
         self.editor_params.clear();
@@ -15138,8 +15602,6 @@ const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
 struct EvalTask {
     name: &'static str,
     start: EvalStart,
-    /// An image the user attaches to the request (a path in the repository).
-    image: Option<&'static str>,
     prompt: &'static str,
     /// Err says what is off. Gets the engine (what reached a plugin) and
     /// the agent's final reply for questions.
@@ -15230,25 +15692,25 @@ fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
 
 const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
-        name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
+        name: "tempo", start: EvalStart::Demo, prompt: "Set the tempo to 100 BPM.",
         check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
-        name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
+        name: "ask_tempo", start: EvalStart::Demo, prompt: "What tempo are we at?",
         check: |app, _, reply| {
             eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
             eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
         },
     },
     EvalTask {
-        name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
+        name: "split_c4", start: EvalStart::Demo, prompt: "Split the keyboard at C4.",
         check: |app, _, _| {
             let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
             eval_ensure(split == Some(60), || format!("split point is {split:?}"))
         },
     },
     EvalTask {
-        name: "split_zones", start: EvalStart::Demo, image: None,
+        name: "split_zones", start: EvalStart::Demo,
         prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
         check: |app, _, _| {
             let g = eval_graph(app);
@@ -15263,14 +15725,14 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
+        name: "warm_pad", start: EvalStart::OneRig, prompt: "Load a warm pad.",
         check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
         },
     },
     EvalTask {
-        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, prompt: "Load a bass sound on the YANES rig.",
         check: |app, _, _| {
             let preset = eval_preset_param(app, 1)?;
             eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
@@ -15278,7 +15740,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, prompt: "Give the organ rig a jazz drawbar preset.",
         check: |app, engine, _| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15288,7 +15750,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, prompt: "Load a warm pad on the organ rig.",
         check: |app, engine, reply| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15298,7 +15760,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
+        name: "add_reverb", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and wire it in.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
@@ -15306,11 +15768,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
+        name: "delay_after_synth", start: EvalStart::OneRig, prompt: "Put a delay after the synth.",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
     },
     EvalTask {
-        name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
+        name: "remove_delay", start: EvalStart::TwoRigs, prompt: "Remove the delay from rig 1.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
@@ -15322,7 +15784,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
+        name: "metronome", start: EvalStart::OneRig, prompt: "Add a metronome and start it.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -15332,25 +15794,25 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
+        name: "add_rig", start: EvalStart::Demo, prompt: "Add a new rig.",
         check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
     },
     EvalTask {
-        name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
+        name: "rig2_volume", start: EvalStart::TwoRigs, prompt: "Set rig 2 volume to 50 %.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
+        name: "mute_rig1", start: EvalStart::TwoRigs, prompt: "Mute rig 1.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
     },
     EvalTask {
-        name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
+        name: "delete_rig2", start: EvalStart::TwoRigs, prompt: "Delete rig 2.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
             let asked = app.pending_confirm.as_ref()
@@ -15359,7 +15821,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        name: "bass_rig", start: EvalStart::OneRig, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
             let patch = eval_patch(app, 1)?;
@@ -15369,21 +15831,21 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
+        name: "rig2_quieter", start: EvalStart::TwoRigs, prompt: "Make rig 2 a bit quieter.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
+        name: "rig1_pan_left", start: EvalStart::TwoRigs, prompt: "Pan rig 1 to the left.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
             eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
+        name: "rig2_reverb", start: EvalStart::TwoRigs, prompt: "Insert a reverb into rig 2.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
@@ -15391,11 +15853,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
+        name: "reverb_this_rig", start: EvalStart::OneRig, prompt: "Add a reverb to this rig",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
     },
     EvalTask {
-        name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
+        name: "rig2_bass", start: EvalStart::TwoRigs, prompt: "Load a bass sound into rig 2.",
         check: |app, _, _| {
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
@@ -15403,7 +15865,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
+        name: "start_metronome", start: EvalStart::OneRigMetronome, prompt: "Start the metronome.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -15411,57 +15873,24 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
+        name: "record", start: EvalStart::OneRig, prompt: "Start recording.",
         check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
-        name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
+        name: "listen_bright", start: EvalStart::OneRig, prompt: "Listen to the synth. Does it sound bright or dull?",
+        check: |_, _, reply| {
+            let reply = reply.to_lowercase();
+            eval_ensure(reply.contains("bright") && !reply.contains("silent") && !reply.contains("no listening model"), || format!("the reply does not say what it heard: {reply}"))
+        },
+    },
+    EvalTask {
+        name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
         check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
     },
-    EvalTask {
-        name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
-        prompt: "Do what the note says.",
-        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
-    },
-    EvalTask {
-        name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
-        prompt: "Do what the note says.",
-        check: |app, _, _| {
-            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
-            eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
-        },
-    },
-    EvalTask {
-        name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
-        prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
-            eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
-        },
-    },
-    EvalTask {
-        name: "look_at_rack", start: EvalStart::Demo, image: None,
-        prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
-        },
-    },
 ];
-
-/// The frame the eval rig hands look_at_rack: the rig has no window, so a
-/// stored screenshot of the app (mixer view) stands in for its pixels.
-const EVAL_WINDOW_SHOT: &str = "docs/shots/mixer.png";
-
-fn eval_image(path: &str) -> anyhow::Result<Image> {
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-    let bytes = std::fs::read(&file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-    Image::from_file(path.rsplit('/').next().unwrap_or(path), &bytes).map_err(anyhow::Error::msg)
-}
-
 
 /// A headless app on an offline engine: no window, no audio device, no
 /// hardware scan. Frames run the app's real frame path; each frame renders
@@ -15473,8 +15902,6 @@ struct EvalRig {
     ctx: egui::Context,
     buf: Vec<f32>,
     started: std::time::Instant,
-    /// What a screenshot request gets (`EVAL_WINDOW_SHOT`).
-    window_shot: Arc<egui::ColorImage>,
 }
 
 type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
@@ -15498,14 +15925,24 @@ impl EvalRig {
         let (tap, recorder) = crate::record::start(eval_takes_dir(), sample_rate as u32, 2);
         engine.set_recorder(tap);
         app.recorder = Some(recorder);
+        let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+        engine.set_listen_tap(listen_tap);
+        crate::listen::install(listen_capture);
         app.graph_pub = Some(graph_pub);
-        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
+        let bus = Arc::new(Mutex::new(bus));
+        let notes = bus.clone();
+        app.note_sink = Some(Box::new(move |ev: NoteEvent| {
+            let cmd = if ev.velocity > 0.0 {
+                Command::NoteOn { note: ev.note, velocity: ev.velocity, source: ev.source }
+            } else {
+                Command::NoteOff { note: ev.note, source: ev.source }
+            };
+            let _ = notes.lock().unwrap().send(cmd);
+        }));
+        app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, bus);
         (app.plugins_clap, app.plugins_lv2) = plugins.clone();
         app.plugins_loaded = true;
-        let shot = eval_image(EVAL_WINDOW_SHOT)?;
-        let (size, rgba) = crate::vision::decode_png(&shot.bytes).map_err(anyhow::Error::msg)?;
-        let window_shot = Arc::new(egui::ColorImage::from_rgba_unmultiplied(size, &rgba));
-        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now(), window_shot })
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
     }
 
     fn frame(&mut self) {
@@ -15515,11 +15952,6 @@ impl EvalRig {
         let app = &mut self.app;
         let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear(); // rule 11
-        for command in out.viewport_output.values().flat_map(|v| &v.commands) {
-            if let egui::ViewportCommand::Screenshot(wanted) = command {
-                wanted.clone().complete(self.window_shot.clone());
-            }
-        }
         self.engine.render(&mut self.buf, 2);
     }
 
@@ -15600,7 +16032,6 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
     anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
     rig.load(task.start)?;
-    rig.app.chat_image = task.image.map(eval_image).transpose()?;
     rig.app.submit_chat(task.prompt.to_string());
     let sent = std::time::Instant::now();
     while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
@@ -15661,8 +16092,6 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
     let tasks: Vec<&EvalTask> = EVAL_TASKS.iter().filter(|t| only.as_deref().is_none_or(|o| o == t.name)).collect();
     anyhow::ensure!(!tasks.is_empty(), "no task named {:?} (tasks: {})", only.unwrap_or_default(),
         EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
-    // The frame path asks the compositor for its scale otherwise.
-    if std::env::var_os("KABELSALAT_UI_SCALE").is_none() { std::env::set_var("KABELSALAT_UI_SCALE", "1.6"); }
     let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
 
     let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
@@ -15875,6 +16304,9 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
     let _ = crate::record::LIVE_RECORDER.set(recorder.clone());
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let (voice_tx, voice_rx) = rtrb::RingBuffer::<VoiceMsg>::new(VOICE_RING);
     let (voice_retire_tx, voice_retire_rx) = rtrb::RingBuffer::<VoiceBack>::new(VOICE_RING);
     engine.set_voice_channels(voice_rx, voice_retire_tx);
@@ -15939,36 +16371,21 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     })
 }
 
-/// UI scale (egui pixels_per_point): KABELSALAT_UI_SCALE overrides; else the
-/// focused Hyprland monitor's scale (what every native app on this output
-/// uses); else 1.6, the design target (1600x1000 points on a 2560x1600 panel).
-/// Computed once — the hyprctl query never runs on the frame path again.
 /// Width a recessed text field's frame adds around its text: 8px inner
 /// margin and a 1px stroke on each side.
 const RECESSED_INPUT_CHROME: f32 = 18.0;
 
-fn ui_scale_target() -> f32 {
-    static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-    *SCALE.get_or_init(|| {
-        let valid = |s: f32| (1.0..=3.0).contains(&s);
-        if let Some(s) = std::env::var("KABELSALAT_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).filter(|s| valid(*s)) {
-            return s;
-        }
-        if cfg!(test) { return 1.6; }
-        if std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
-            let out = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
-            if let Ok(out) = out {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    let mons = v.as_array().cloned().unwrap_or_default();
-                    let pick = mons.iter().find(|m| m["focused"].as_bool() == Some(true)).or(mons.first());
-                    if let Some(s) = pick.and_then(|m| m["scale"].as_f64()).map(|s| s as f32).filter(|s| valid(*s)) {
-                        return s;
-                    }
-                }
-            }
-        }
-        1.6
-    })
+/// UI scale (egui pixels_per_point) when the compositor's is not used:
+/// KABELSALAT_UI_SCALE, or 1.6 (the design target, 1600x1000 points on a
+/// 2560x1600 panel) without a window (tests, headless renders). A window
+/// keeps the scale the compositor gives it (fractional on Wayland).
+fn ui_scale_override(native: Option<f32>) -> Option<f32> {
+    let valid = |s: f32| (1.0..=3.0).contains(&s);
+    std::env::var("KABELSALAT_UI_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|s| valid(*s))
+        .or((cfg!(test) || native.is_none()).then_some(1.6))
 }
 
 impl DemoApp {
@@ -15993,7 +16410,7 @@ impl DemoApp {
     }
 
     /// Stage `--demo-agent` offline for visual screenshots: finished run,
-    /// live running run with animated phase, attached image chip, Confirm /
+    /// live running run with animated phase, Confirm /
     /// Cancel prompt, and optional mid-flight rack animations.
     fn stage_demo_agent(&mut self, animate_rack: bool) {
         self.assistant.key_set = true;
@@ -16048,26 +16465,7 @@ impl DemoApp {
         self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
             step: 2,
             model: "deepseek-chat".into(),
-            seeing: false,
         });
-        let mut sketch = vec![28u8; 24 * 16 * 4];
-        for y in 0..16usize {
-            for x in 0..24usize {
-                let i = (y * 24 + x) * 4;
-                sketch[i + 3] = 255;
-                if (y == 4 && (3..=19).contains(&x)) || (y == 11 && (3..=12).contains(&x)) {
-                    sketch[i] = theme::CREAM.r();
-                    sketch[i + 1] = theme::CREAM.g();
-                    sketch[i + 2] = theme::CREAM.b();
-                } else if (6..=9).contains(&y) && (15..=20).contains(&x) {
-                    sketch[i] = theme::ACCENT.r();
-                    sketch[i + 1] = theme::ACCENT.g();
-                    sketch[i + 2] = theme::ACCENT.b();
-                }
-            }
-        }
-        self.chat_image = Image::from_rgba("rack-sketch.png", [24, 16], &sketch).ok();
-        self.chat_thumb = None;
         self.pending_confirm = Some(PendingConfirm {
             tool: "delete_rig".into(),
             args: serde_json::json!({"rig": 1}),
@@ -16080,35 +16478,6 @@ impl DemoApp {
 }
 
 fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
-    // Run under XWayland, not native Wayland: (1) plugin editors are X11 and
-    // must reparent into our window; (2) winit has no fractional-scale support,
-    // so native Wayland on a 1.6x Hyprland output renders a logical-resolution
-    // buffer that the compositor upscales (blurry). With Omarchy's
-    // xwayland force_zero_scaling, X11 renders 1:1 at native pixels — sharp —
-    // and egui's pixels_per_point handles element sizing.
-    if std::env::var_os("WINIT_UNIX_BACKEND").is_none() {
-        std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-    }
-    // winit >= 0.29 REMOVED WINIT_UNIX_BACKEND: it picks Wayland whenever
-    // WAYLAND_DISPLAY is set, else X11 via DISPLAY. To actually force X11
-    // (required for editor embedding), hide the Wayland socket — but only
-    // when an X display is available, so we never strand the app backend-less.
-    let have_x = std::env::var_os("DISPLAY").map(|v| !v.is_empty()).unwrap_or(false)
-        || std::fs::read_dir("/tmp/.X11-unix").map(|mut d| d.next().is_some()).unwrap_or(false);
-    if have_x && std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        std::env::remove_var("WAYLAND_DISPLAY");
-        eprintln!("ui: forcing X11 backend (WAYLAND_DISPLAY hidden; embedding needs XWayland)");
-    }
-    // Text input without an input-method server (#30): with XMODIFIERS
-    // =@im=fcitx every typed character goes through fcitx5's XIM bridge, which
-    // under XWayland stopped delivering text after a while — every text field
-    // went dead while shortcuts (plain key events) kept working. The rack
-    // needs no IME (umlauts come straight from the XKB layout), so use X's
-    // local input method. KABELSALAT_IME=1 keeps the system IME.
-    if std::env::var_os("KABELSALAT_IME").is_none() && std::env::var_os("XMODIFIERS").is_some() {
-        std::env::remove_var("XMODIFIERS");
-        eprintln!("ui: text input via the local X input method (XMODIFIERS cleared; KABELSALAT_IME=1 keeps fcitx/ibus)");
-    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 750.0])
@@ -16129,15 +16498,6 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
         "kabelsalat",
         options,
         Box::new(move |cc| {
-            // Trust eframe's detected scale (1.6 on the fractional-HiDPI eDP-1).
-            // Only fall back to the native 1.6 if detection reports ~1.0 —
-            // forcing a higher value makes elements oversized.
-            let ppp = cc.egui_ctx.pixels_per_point();
-            cc.egui_ctx.set_pixels_per_point(ui_scale_target());
-            eprintln!(
-                "ui scale: detected={ppp:.2} used={:.2}",
-                cc.egui_ctx.pixels_per_point()
-            );
             cc.egui_ctx.set_visuals(theme::visuals());
             theme::install_spacing(&cc.egui_ctx);
             theme::install_fonts(&cc.egui_ctx);
@@ -16985,19 +17345,19 @@ mod rig_switch_tests {
             "the stage ends where the assistant begins: stage {:?} panel {:?}", app.stage_rect, app.assistant_rect);
     }
 
-    /// One rig with 6 instrument stacks of 4 units (Surge → 3 FX) — the
-    /// kind of patch an agent builds; it must not squish.
+    /// One rig with 8 instrument stacks of 7 units (Surge → 6 FX): more than
+    /// a 1600x1000 window holds even at the face floors; it must not squish.
     fn big_patch_app() -> (DemoApp, egui::Context) {
         let mut g = Graph::default();
         g.reserve(64, 64);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut eid = 1;
-        for _ in 0..6 {
+        for _ in 0..8 {
             let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
             g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi); eid += 1;
             let mut prev = synth;
-            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
+            for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb, DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
                 let fx = g.add_node(NodeKind::Dsp(k), name_bytes("FX"));
                 g.connect_with_id(eid, PortRef { node: prev, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio); eid += 1;
                 prev = fx;
@@ -17014,11 +17374,12 @@ mod rig_switch_tests {
     #[test]
     fn big_patch_keeps_readable_units_and_pans() {
         let (mut app, ctx) = big_patch_app();
-        assert_eq!(app.stack_cols.len(), 6);
-        assert_eq!(app.layout_rows, 4);
-        assert!(app.unit_h >= 140.0, "unit height floor, not squished: {}", app.unit_h);
+        assert_eq!(app.stack_cols.len(), 8);
+        assert_eq!(app.layout_rows, 7);
+        assert!(app.unit_h >= MIN_UNIT_H, "unit height floor, not squished: {}", app.unit_h);
         let mid_w = app.unit_rects[app.stack_cols[0][0]].width();
-        assert!(mid_w >= 200.0, "column width floor: {mid_w}");
+        let floor = app.stack_cols.iter().flatten().map(|&u| app.face_min_w(u)).fold(0.0, f32::max);
+        assert!(mid_w >= floor, "column width floor: {mid_w} < {floor}");
         let ov = app.rack_overflow;
         assert!(ov.x > 0.0 && ov.y > 0.0, "the rack overflows the stage instead: {ov:?}");
         assert!(app.rack_clip.is_some());
@@ -17113,7 +17474,7 @@ mod rig_switch_tests {
 
         // The agent adds a unit: the engine publishes, the app adopts it.
         assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::AddNode {
-            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0 }));
+            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0, wire: false }));
         pump(&mut app, &mut drain, 4);
         assert!(app.base_graph.nodes.iter().any(|n| n.name == name_bytes("DELAY C")), "the agent edit was adopted");
         assert!(bound(&app), "the binding survives the agent edit");
@@ -19052,6 +19413,35 @@ mod split_bpm_tests {
         }
     }
 
+    /// Vitalium's editor lists its Vital patches by bank above its LV2 presets.
+    #[test]
+    fn vitaliums_editor_lists_its_vital_patches() {
+        fn library(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+            use crate::sounds::{Load, Sound};
+            let patch = |bank: &str, name: &str| Sound { category: bank.into(), name: name.into(), preferred: false, load: Load::VitalPatch(format!("/nowhere/{name}.vital").into()) };
+            match instrument {
+                crate::sounds::Instrument::Lv2(uri) if uri == crate::vital::URI => crate::sounds::Library {
+                    kind: "Vital patches".into(),
+                    sounds: vec![patch("ElectrowindsVol1", "Woody"), patch("ElectrowindsVol1_Dry", "Woody_Dry")],
+                    params: vec![],
+                },
+                _ => Default::default(),
+            }
+        }
+        let mut g = Graph::default();
+        g.reserve(4, 4);
+        let vital = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, name_bytes("VITALIUM"));
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(library);
+        app.build_rack(&g, &[]);
+        app.toggle_lv2_editor(vital, crate::vital::URI, "VITALIUM");
+        let ctx = egui::Context::default();
+        let texts = (0..3).map(|_| frame(&mut app, &ctx, vec![])).last().unwrap();
+        for listed in ["ElectrowindsVol1 · Woody", "ElectrowindsVol1_Dry · Woody_Dry"] {
+            assert!(texts.iter().any(|t| t == listed), "{listed} is listed: {texts:?}");
+        }
+    }
+
     #[test]
     fn vitalium_and_dexed_editor_support() {
         let _one_at_a_time = crate::lv2::VITALIUM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -19073,6 +19463,30 @@ mod split_bpm_tests {
         assert!(!app.lv2_editor_presets.is_empty(), "Vitalium presets should populate");
         frame(&mut app, &ctx, vec![]);
         assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
+    }
+
+    /// Rule 127: a session load classifies LV2 units from the background
+    /// scan, never a scan of its own, and a scan that lands later fixes them.
+    #[test]
+    fn session_load_classifies_lv2_from_the_background_scan() {
+        let uri = "urn:test:organ";
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst };
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = vec![info(false)];
+        app.plugins_loaded = true;
+        let s = crate::session::Session::new("organ", DemoApp::build_lv2_instrument_graph(uri, "Organ"));
+        app.apply_session(&s).unwrap();
+        let node = s.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Lv2 { .. })).unwrap().id;
+        let organ = |app: &DemoApp| app.units.iter().position(|u| u.node_id == node).expect("organ unit");
+        assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((Vec::new(), vec![info(true)])).unwrap();
+        app.plugin_scan = Some(rx);
+        app.poll_plugin_scan();
+        let u = &app.units[organ(&app)];
+        assert!(u.lv2_inst, "a landing scan reclassifies the loaded rack");
+        assert_eq!(u.sub, "lv2 synth");
     }
 
     #[test]
@@ -19846,14 +20260,159 @@ mod stage_views_tests {
         assert!(texts.iter().any(|t| t == "Stage Jam"), "saved session rendered: {texts:?}");
         assert!(texts.iter().any(|t| t == "Delete"), "delete action rendered");
 
-        app.confirm_delete_session = Some("Stage Jam".into());
+        app.confirm_session = Some(SessionConfirm::Delete("Stage Jam".into()));
         run_frame(&mut app, &ctx, Vec2::new(1280.0, 800.0), key(Key::Escape));
-        assert!(app.confirm_delete_session.is_none());
+        assert!(app.confirm_session.is_none());
         assert_eq!(app.stage_view, StageView::Sessions, "first Esc cancels delete confirm");
 
         DemoApp::delete_saved_session(&dir, "Stage Jam").unwrap();
         assert!(DemoApp::list_saved_sessions(&dir).is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ksalat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn on_disk(dir: &std::path::Path, name: &str) -> crate::session::Session {
+        crate::session::Session::load(&crate::session::Session::package_path(dir, name).unwrap()).unwrap()
+    }
+
+    fn turn_a_knob(app: &mut DemoApp) {
+        let k = app.units.iter_mut().flat_map(|u| u.knobs.iter_mut()).find(|k| k.param.is_some()).unwrap();
+        k.value = if k.value > 0.5 { 0.2 } else { 0.8 };
+    }
+
+    #[test]
+    fn autosave_writes_the_open_session_only_after_a_change() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-change");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let saved = on_disk(&dir, "Jam");
+
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Saved 'Jam'", "an unchanged rack is not written again");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, "Autosaved 'Jam'");
+        let after = on_disk(&dir, "Jam");
+        assert!(!after.same_content(&saved), "the change reached the open session");
+        assert!(after.same_content(&app.capture_session("Jam").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "no second session appears");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autosave_never_writes_a_template_over_the_session_that_was_open() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-template");
+        app.session_name = "Jam".into();
+        app.save_current_session(&dir);
+        let jam = on_disk(&dir, "Jam");
+
+        app.load_template(Template::LeadReverb);
+        assert_eq!(app.open_session, None);
+        app.autosave_now(&dir);
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Jam".to_string()], "the first check after a load only records it");
+
+        turn_a_knob(&mut app);
+        app.autosave_now(&dir);
+        assert_eq!(app.session_msg, format!("Autosaved '{AUTOSAVE_NAME}'"));
+        assert!(on_disk(&dir, "Jam").same_content(&jam), "the session that was open is untouched");
+        assert!(on_disk(&dir, AUTOSAVE_NAME).same_content(&app.capture_session(AUTOSAVE_NAME).unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_loaded_session_becomes_the_autosave_target() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("autosave-load");
+        app.session_name = "Song".into();
+        app.save_current_session(&dir);
+        app.load_template(Template::AmbientPad);
+
+        app.open_saved_session(&dir, "Song").unwrap();
+        assert_eq!(app.open_session.as_deref(), Some("Song"));
+        assert_eq!(app.session_name, "Song", "the name field shows the open session");
+        assert!(app.autosave_target() == "Song");
+
+        app.autosave.enabled = true;
+        assert!(!app.autosave_due(AUTOSAVE_SETTLE / 2.0));
+        assert!(app.autosave_due(AUTOSAVE_SETTLE), "the first check comes once the load settled");
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL - 1.0));
+        assert!(app.autosave_due(1.0));
+        app.autosave.enabled = false;
+        assert!(!app.autosave_due(AUTOSAVE_INTERVAL * 2.0), "off means no checks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stage_frame(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        fn walk(shape: &Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                Shape::Text(t) => out.push((t.galley.text().to_owned(), t.galley.rect.translate(t.pos.to_vec2()))),
+                Shape::Vec(v) => for s in v { walk(s, out) },
+                _ => {}
+            }
+        }
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1280.0, 800.0)));
+        raw.events = events;
+        let mut out = ctx.run_ui(raw, |ui| app.sessions_stage_in(ui, dir));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn click_text(app: &mut DemoApp, ctx: &egui::Context, dir: &std::path::Path, label: &str) {
+        let texts = stage_frame(app, ctx, dir, vec![]);
+        let pos = texts.iter().find(|(t, _)| t == label).unwrap_or_else(|| panic!("'{label}' not drawn: {texts:?}")).1.center();
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        stage_frame(app, ctx, dir, vec![egui::Event::PointerMoved(pos)]);
+        stage_frame(app, ctx, dir, vec![b(true)]);
+        stage_frame(app, ctx, dir, vec![b(false)]);
+    }
+
+    #[test]
+    fn overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm() {
+        let mut app = DemoApp::new_with_sink(None);
+        let dir = session_dir("overwrite");
+        app.session_name = "Take one".into();
+        app.save_current_session(&dir);
+        let first = on_disk(&dir, "Take one");
+        app.load_template(Template::DrumsBass);
+        turn_a_knob(&mut app);
+        let ctx = egui::Context::default();
+
+        click_text(&mut app, &ctx, &dir, "Overwrite");
+        assert_eq!(app.confirm_session, Some(SessionConfirm::Overwrite("Take one".into())));
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Confirm overwrite"), "{texts:?}");
+        assert!(on_disk(&dir, "Take one").same_content(&first), "nothing is written before the confirm");
+
+        click_text(&mut app, &ctx, &dir, "Confirm overwrite");
+        assert_eq!(app.session_msg, "Overwrote 'Take one'");
+        assert_eq!(app.confirm_session, None);
+        assert_eq!(app.open_session.as_deref(), Some("Take one"));
+        let now = on_disk(&dir, "Take one");
+        assert!(!now.same_content(&first));
+        assert!(now.same_content(&app.capture_session("Take one").unwrap()));
+        assert_eq!(DemoApp::list_saved_sessions(&dir), vec!["Take one".to_string()]);
+
+        let texts = stage_frame(&mut app, &ctx, &dir, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "open"), "the open session is marked");
+        let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+        for (label, r) in texts.iter().filter(|(t, _)| ["Load", "Overwrite", "Delete"].contains(&t.as_str())) {
+            assert!(r.right() + 8.0 <= inner.right() + 0.5, "'{label}' at {r:?} leaves the sheet ({inner:?})");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -19950,183 +20509,12 @@ mod ui_polish_agent_tests {
             for _ in 0..400 {
                 self.frame();
                 match self.worker_rx.try_recv() {
-                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results.into_iter().map(|r| r.text).collect(),
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results,
                     Ok(_) => panic!("the app sent something other than tool results"),
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
                 }
             }
             panic!("the app never answered the batch");
-        }
-    }
-
-    /// One frame at `size`. Returns the screenshot requests the frame sent:
-    /// the windowing integration completes them after it painted.
-    fn frame_asking(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<egui::ScreenshotCallback> {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-        out.viewport_output.values().flat_map(|v| &v.commands)
-            .filter_map(|c| match c { egui::ViewportCommand::Screenshot(wanted) => Some(wanted.clone()), _ => None })
-            .collect()
-    }
-
-    #[test]
-    fn look_at_rack_holds_its_batch_until_the_frame_arrives_and_answers_with_the_picture() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
-            call("look_at_rack", serde_json::json!({})),
-            call("set_bpm", serde_json::json!({"bpm": 100})),
-        ])).unwrap();
-        // A frame that arrived after an earlier look gave up.
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("late", [4, 2], &[9; 32]));
-        let mut wanted = frame_asking(&mut app, &ctx, WINDOW);
-        assert_eq!(wanted.len(), 1, "the frame that runs the call asks for a screenshot");
-        for _ in 0..3 {
-            assert!(frame_asking(&mut app, &ctx, WINDOW).is_empty(), "one request per look");
-        }
-        assert!(worker_rx.try_recv().is_err(), "no answer before the frame arrived: frames keep running meanwhile");
-        assert_ne!(app.bpm, 100.0, "the call after it waits its turn");
-
-        wanted.remove(0).complete(Arc::new(egui::ColorImage::filled([2000, 1250], Color32::from_rgb(20, 22, 24))));
-        let results = (0..500).find_map(|_| {
-            frame_asking(&mut app, &ctx, WINDOW);
-            match worker_rx.try_recv() {
-                Ok(crate::assistant::ToWorker::ToolResults(results)) => Some(results),
-                _ => { std::thread::sleep(std::time::Duration::from_millis(4)); None }
-            }
-        }).expect("the batch is answered once the frame is encoded");
-        let shot = results[0].image.as_ref().expect("the first result carries the picture");
-        assert_eq!(shot.size, Some([1400, 875]), "scaled down for the model");
-        assert!(shot.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-        assert_eq!(results[0].text, "screenshot of the kabelsalat window: kabelsalat window (1400×875 px)");
-        assert!(results[1].text.contains("100 BPM") && results[1].image.is_none());
-        assert_eq!(app.bpm, 100.0);
-    }
-
-    #[test]
-    fn look_at_rack_says_so_when_no_frame_arrives() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        app.tool_batch = Some(ToolBatch {
-            todo: VecDeque::new(),
-            results: Vec::new(),
-            waiting: Some((Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }, None)),
-            user_idx: 0,
-        });
-        app.poll_assistant();
-        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
-        assert!(results[0].text.starts_with("error: no screenshot within 2 s") && results[0].image.is_none(), "{:?}", results[0].text);
-    }
-
-    #[test]
-    fn a_bridge_caller_gets_the_screenshot_as_base64_png_or_an_error_past_its_wait() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.rack_shot.remote.push((tx.clone(), std::time::Instant::now() + RACK_SHOT_WAIT));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().is_err(), "nothing to send yet");
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("kabelsalat window", [4, 2], &[9; 32]));
-        app.serve_rack_shots();
-        let reply: serde_json::Value = serde_json::from_str(&rx.try_recv().expect("answered with the frame")).unwrap();
-        assert_eq!(reply["text"], "screenshot of the kabelsalat window: kabelsalat window (4×2 px)");
-        assert!(reply["png_base64"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG file in base64");
-        assert!(app.rack_shot.remote.is_empty());
-
-        app.rack_shot.remote.push((tx, std::time::Instant::now()));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().unwrap().starts_with("error: no screenshot"));
-    }
-
-    #[test]
-    fn look_at_rack_is_a_tool_of_the_assistant_the_app_and_the_bridge() {
-        let tools = crate::assistant::tools();
-        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == LOOK_TOOL));
-        assert!(UI_BRIDGE_TOOLS.contains(&LOOK_TOOL));
-        assert!(include_str!("mcp.rs").contains("ui_bridge_tool(\"look_at_rack\""));
-        let mut app = DemoApp::new_with_sink(None);
-        assert_eq!(app.exec_tool(LOOK_TOOL, &serde_json::json!({})), "screenshot of the kabelsalat window");
-        assert!(app.rack_shot.wanted && app.undo_past.is_empty(), "looking asks for a frame and changes nothing");
-    }
-
-    #[derive(Debug)]
-    struct Dropped(std::path::PathBuf, Vec<u8>);
-
-    impl egui::DroppedFile for Dropped {
-        fn path(&self) -> &std::path::Path { &self.0 }
-        fn bytes(&self) -> Result<Vec<u8>, String> { Ok(self.1.clone()) }
-    }
-
-    fn drop_file(app: &mut DemoApp, ctx: &egui::Context, name: &str, bytes: Vec<u8>) {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, WINDOW));
-        raw.dropped_files = vec![Arc::new(Dropped(std::path::PathBuf::from("/nowhere").join(name), bytes))];
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-    }
-
-    #[test]
-    fn a_dropped_or_pasted_image_is_a_removable_chip_and_goes_out_with_the_next_message() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        let png = Image::from_rgba("x", [8, 4], &[200; 8 * 4 * 4]).unwrap();
-
-        // Pasting belongs to the open chat; a drop opens it.
-        let paste = || vec![egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([8, 4], Color32::RED)))];
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert!(app.chat_image.is_none() && !app.assistant_open(), "a paste with the assistant closed is not for the chat");
-        drop_file(&mut app, &ctx, "notes.txt", b"hello".to_vec());
-        assert!(app.chat_image.is_none());
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("not attached: notes.txt is neither a PNG nor a JPEG"));
-        drop_file(&mut app, &ctx, "rack.png", png.bytes.to_vec());
-        assert!(app.assistant_open(), "dropping an image opens the assistant");
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("rack.png (8×4 px)"));
-
-        let texts = run_frame(&mut app, &ctx, WINDOW, vec![]);
-        assert!(texts.iter().any(|(t, _)| t == "rack.png"), "the chip names the image: {texts:?}");
-        assert!(!texts.iter().any(|(t, _)| t.contains("px)")), "no debug pixel size in chip: {texts:?}");
-        let remove = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(_, r)| *r).expect("attachment remove button");
-        click_at(&mut app, &ctx, WINDOW, remove.center());
-        assert!(app.chat_image.is_none(), "clicking × removes the image");
-
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("pasted image (8×4 px)"));
-        app.submit_chat("what is this?".into());
-        let Ok(crate::assistant::ToWorker::User(sent)) = worker_rx.try_recv() else { panic!("nothing was sent") };
-        assert!(sent.text.starts_with("[context:") && sent.text.ends_with("\nwhat is this?"), "{}", sent.text);
-        assert_eq!(sent.image.map(|i| i.size), Some(Some([8, 4])));
-        assert!(app.chat_image.is_none(), "the image leaves with its message");
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("what is this? [image: pasted image]"));
-    }
-
-    #[test]
-    fn the_attachment_chip_and_the_input_row_fit_the_panel_at_its_minimum_size() {
-        let mut app = DemoApp::new_with_sink(None);
-        app.load_multi_rig_demo();
-        app.assistant.key_set = true;
-        app.dock = DockView::Assistant;
-        let ctx = egui::Context::default();
-        let min_size = Vec2::new(760.0, 520.0);
-        for _ in 0..4 { run_frame(&mut app, &ctx, min_size, vec![]); }
-        let long_name = format!("{}.png", "a-very-long-screenshot-name".repeat(6));
-        app.chat_image = Some(Image::from_rgba(&long_name, [8, 4], &[200; 8 * 4 * 4]).unwrap());
-        // The first frame with the chip counts: nothing may jump out of the panel.
-        for frame in 0..3 {
-            let texts = run_frame(&mut app, &ctx, min_size, vec![]);
-            let panel = app.assistant_rect;
-            let chip = texts.iter().find(|(t, _)| t.contains("screenshot-name")).map(|(_, r)| *r).expect("chip painted");
-            assert!(panel.contains_rect(chip), "frame {frame}: chip {chip:?} outside the panel {panel:?}");
-            assert!(panel.contains_rect(app.assistant_input_rect), "frame {frame}: input row {:?} outside the panel {panel:?}", app.assistant_input_rect);
-            assert!(chip.bottom() <= app.assistant_input_rect.top() + 0.5, "frame {frame}: the chip sits above the input row");
-            let send = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("Send painted");
-            assert!(panel.contains_rect(send), "frame {frame}: Send {send:?} outside the panel");
-            assert!(app.unit_h >= 140.0, "the rack keeps its height");
         }
     }
 
@@ -20170,6 +20558,93 @@ mod ui_polish_agent_tests {
         }
     }
 
+    fn vital_test_patch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ksalat-ui-vital-{}", std::process::id())).join("Woody.vital")
+    }
+
+    fn vital_sounds(instrument: &crate::sounds::Instrument) -> crate::sounds::Library {
+        use crate::sounds::{Instrument, Library, Load, Sound};
+        match instrument {
+            Instrument::Lv2(uri) if uri == crate::vital::URI => Library {
+                kind: "Vital patches".into(),
+                sounds: vec![Sound { category: "Winds".into(), name: "Woody".into(), preferred: false, load: Load::VitalPatch(vital_test_patch()) }],
+                params: vec![],
+            },
+            other => test_sounds(other),
+        }
+    }
+
+    /// A Vital patch is Vitalium's state: loading one sends it to the engine,
+    /// and it stays with its unit through a session save and load and a rig
+    /// edit that renumbers the unit, each of which loads new LV2 instances.
+    #[test]
+    fn a_loaded_vital_patch_survives_sessions_and_rig_edits() {
+        let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}}).to_string().into_bytes();
+        std::fs::create_dir_all(vital_test_patch().parent().unwrap()).unwrap();
+        std::fs::write(vital_test_patch(), &patch).unwrap();
+        let vital = (NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, "VITALIUM");
+        let rigs = vec![
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Winds", &[vital]),
+        ];
+        let mut app = DemoApp::new_with_sink(None);
+        app.sounds = crate::sounds::Libraries::blocking(vital_sounds);
+        app.build_rack(&crate::control::merge_rigs(&rigs), &[]);
+        for u in app.units.iter_mut().filter(|u| u.name == "VITALIUM") { u.lv2_inst = true; }
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let node = node_named(&app, 1, "VITALIUM");
+
+        let out = app.exec_tool("load_sound", &serde_json::json!({"query": "woody", "rig": 1}));
+        assert_eq!(out, format!("loaded 'Winds/Woody' into Vitalium (node {node}), rig 1 'Rig B'"));
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)), "{sent:?}");
+
+        let saved = app.capture_session("Winds").unwrap();
+        assert_eq!(saved.plugin_state(node).map(|s| (s.plugin_id.as_str(), &s.data)), Some((crate::vital::URI, &patch)));
+        let dir = vital_test_patch().parent().unwrap().join("session");
+        saved.save(&dir).expect("a session with a Vital patch saves");
+        let loaded = crate::session::Session::load(&dir).unwrap();
+        app.apply_session(&loaded).unwrap();
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        let load = sent.iter().position(|c| matches!(c, Command::LoadRigs { .. } | Command::LoadGraph { .. })).expect("the graph is loaded");
+        let state = sent.iter().position(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == node && *state == patch)).expect("the patch is restored");
+        assert!(load < state, "the patch follows the graph load that builds the node's instance: {sent:?}");
+
+        // Deleting rig A renumbers the Vitalium node.
+        app.edit_rigs(Some(0));
+        let moved = node_named(&app, 0, "VITALIUM");
+        assert_ne!(moved, node);
+        let sent: Vec<Command> = std::iter::from_fn(|| drain.pop()).collect();
+        assert!(sent.iter().any(|c| matches!(c, Command::LoadLv2State { node: n, state } if *n == moved && *state == patch)), "{sent:?}");
+        assert_eq!(app.capture_session("after").unwrap().plugin_state(moved).map(|s| &s.data), Some(&patch));
+        let _ = std::fs::remove_dir_all(vital_test_patch().parent().unwrap());
+    }
+
+    /// A Vital bank dropped on the window lands where Vitalium reads presets.
+    #[test]
+    fn a_dropped_vital_bank_is_imported_not_attached() {
+        let dir = std::env::temp_dir().join(format!("ksalat-ui-vitalbank-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bank = dir.join("Winds.vitalbank");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&bank).unwrap());
+            zip.start_file("Winds/Presets/Woody.vital", zip::write::SimpleFileOptions::default()).unwrap();
+            let patch = serde_json::json!({"synth_version": "1.0.7", "settings": {"modulations": [], "sample": {}, "wavetables": [], "lfos": []}});
+            std::io::Write::write_all(&mut zip, patch.to_string().as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        // SAFETY: only this test reads XDG_DATA_HOME (vital::data_dir).
+        unsafe { std::env::set_var("XDG_DATA_HOME", dir.join("data")) };
+        let mut app = DemoApp::new_with_sink(None);
+        app.import_vital(&bank);
+        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        assert_eq!(app.session_msg, "added 1 Vital patches (Winds): Vitalium's sound list has them");
+        assert!(dir.join("data/Vitalium/Winds/Presets/Woody.vital").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn instrument_rig(name: &str, instruments: &[(NodeKind, &str)]) -> crate::control::Rig {
         let mut g = Graph::default();
         g.reserve(8, 8);
@@ -20201,6 +20676,36 @@ mod ui_polish_agent_tests {
         let (bus, drain) = command_bus();
         app.bus = Some(Arc::new(Mutex::new(bus)));
         (app, drain)
+    }
+
+    /// User 2026-11-17: one click in an organ's matrix column selected
+    /// every cell of it, because all its rows showed the MIDI cable.
+    #[test]
+    fn an_lv2_column_toggles_one_cell_like_a_clap_column() {
+        let (mut app, drain) = app_of_instruments();
+        app.hw_devices = vec!["FM-1 24:0".into(), "MIDIMATE 28:0".into()];
+        let organ = app.units.iter().position(|u| u.rig == 1 && u.name == "ORGAN").expect("organ");
+        let node = app.units[organ].node_id;
+        let rows = [MatrixRow::Keys, MatrixRow::HwAll, MatrixRow::HwDev(0), MatrixRow::HwDev(1)];
+        let cells = |app: &DemoApp| rows.map(|r| app.matrix_cell_on(organ, r));
+        assert_eq!(cells(&app), [true, true, false, false], "keyboard and all hardware by default");
+
+        app.matrix_toggle(organ, MatrixRow::Keys, false);
+        assert_eq!(cells(&app), [false, true, false, false], "only the keyboard cell went off");
+        app.matrix_toggle(organ, MatrixRow::HwDev(1), true);
+        assert_eq!(cells(&app), [false, false, false, true], "one device replaces all hardware");
+        app.matrix_toggle(organ, MatrixRow::Keys, true);
+        assert_eq!(cells(&app), [true, false, false, true], "the keyboard is independent of hardware");
+        assert!(app.midi_cable_to(organ).is_some(), "the cable stays plugged");
+
+        let mut engine = GraphEngine::new(app.base_graph.clone(), drain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.render(&mut vec![0.0f32; 64 * 2], 2);
+        let rules = pub_.lock().unwrap().rules.clone();
+        let muted: Vec<SourceId> = rules.iter().filter(|r| r.dest == node && !r.enabled).map(|r| r.source).collect();
+        let others = (0..crate::engine::MAX_HW_DEVICES).filter(|&d| d != 1).map(SourceId::Hardware);
+        assert_eq!(muted, others.collect::<Vec<_>>(), "the engine mutes every source but the keyboard and device 1");
     }
 
     fn node_named(app: &DemoApp, rig: u8, name: &str) -> u32 {
@@ -20416,6 +20921,23 @@ mod ui_polish_agent_tests {
         assert_eq!(busy, "list_sounds failed: still scanning Surge A's sounds in the background: call again in a moment");
     }
 
+    /// listen runs on its own thread; the batch hands the model its answer,
+    /// in call order, never the "listening" placeholder.
+    #[test]
+    fn the_agents_listen_call_answers_with_what_the_listener_said() {
+        let mut live = Live::new();
+        let results = live.run_batch(vec![
+            call("play_note", serde_json::json!({"note": 60, "ms": 3000})),
+            call("listen", serde_json::json!({"attributes": "warm, 8-bit"})),
+            call("get_status", serde_json::json!({})),
+        ]);
+        assert_eq!(results.len(), 3);
+        assert!(results[0].starts_with("played note 60"), "{}", results[0]);
+        assert!(results[1].starts_with("listen: no listening model"), "{}", results[1]);
+        assert!(results[2].contains("\"meter\""), "{}", results[2]);
+        assert!(live.app.listening.is_none());
+    }
+
     /// The load_sound plan against the app's real answers, on a rig whose
     /// instrument is not Surge.
     #[test]
@@ -20496,7 +21018,6 @@ mod ui_polish_agent_tests {
         assert_eq!(app.rig_mix[0].vol, 0.5);
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
         assert_eq!(results.len(), 3, "one result per call, in call order");
-        let results: Vec<String> = results.into_iter().map(|r| r.text).collect();
         assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
         assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
     }
@@ -20524,6 +21045,34 @@ mod ui_polish_agent_tests {
         assert!(results.iter().all(|r| r.contains("new cable id")), "{results:?}");
         let wired = |from: u32, to: u32| live.app.cables.iter().any(|c| live.app.units[c.src].node_id == from && live.app.units[c.dst].node_id == to);
         assert!(wired(1, id as u32) && wired(id as u32, master), "both cables exist");
+    }
+
+    #[test]
+    fn an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master() {
+        let mut live = Live::new();
+        // As in the app: LV2 loads off the render path (other tests hold LILV_LOCK for seconds).
+        live.engine.spawn_lv2_loader();
+        live.run_batch(vec![call("load_template", serde_json::json!({"name": "multi_rig"}))]);
+        for _ in 0..6 { live.frame(); }
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument };
+        live.app.plugins_lv2 = vec![lv2(TEST_ORGAN, true), lv2("urn:test:fx", false)];
+        live.app.plugins_loaded = true;
+        let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
+        let g = engine_graph(&live);
+        let in_rig_a = |kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == 0 && kind(&n.kind)).map(|n| n.id).unwrap();
+        let (keys, master) = (in_rig_a(|k| matches!(k, NodeKind::Keys)), in_rig_a(|k| matches!(k, NodeKind::MasterOut)));
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": TEST_ORGAN, "name": "setBfree", "rig": 0})),
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": "urn:test:fx", "name": "fx", "rig": 0})),
+        ]);
+        let g = engine_graph(&live);
+        let node = |uri: &str| g.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Lv2 { uri: u } if u.as_str() == uri)).map(|n| n.id).unwrap();
+        let (organ, fx) = (node(TEST_ORGAN), node("urn:test:fx"));
+        assert!(g.has_route(keys, organ, CPortKind::Midi), "Keys -> organ: {:?}", g.edges);
+        assert!(g.has_route_port(organ, master, 0, CPortKind::Audio) && g.has_route_port(organ, master, 1, CPortKind::Audio), "organ -> Master L/R: {:?}", g.edges);
+        assert_eq!(results[0].matches("new cable id").count(), 1, "{}", results[0]);
+        assert_eq!(results[0].split("new cable id ").nth(1).unwrap().split(',').count(), 3, "the result names the three cables: {}", results[0]);
+        assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
     }
 
     #[test]
@@ -20845,7 +21394,7 @@ mod ui_polish_agent_tests {
         assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
         assert!(kb_big.height() > kb_small.height());
         let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
-        assert!(h_tiny >= 139.0, "minimum dock height: {h_tiny}");
+        assert!(h_tiny >= 111.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
     }
@@ -21026,8 +21575,7 @@ mod ui_polish_agent_tests {
 
         for (phase, expected) in [
             (RunPhase::Deciding, "Jev · deciding"),
-            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
-            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }, "DeepSeek · step 2"),
         ] {
             app.assistant.phase = Some(phase);
             let texts = run_frame(&mut app, &ctx, size, vec![]);
@@ -21304,8 +21852,7 @@ mod ui_polish_agent_tests {
         assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
-        // Attached image chip + Confirm / Cancel prompt + Replay chip.
-        assert!(texts.iter().any(|(t, _)| t == "rack-sketch.png"), "missing attached image chip: {texts:?}");
+        // Confirm / Cancel prompt + Replay chip.
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "debug size text must be gone: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
@@ -21444,8 +21991,6 @@ mod ui_polish_agent_tests {
         let chip_not_applied = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL);
         let chip_failed = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
         let cancel_btn = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_name = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_x = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
         let danger_confirm = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
 
         for (name, r) in [
@@ -21458,8 +22003,6 @@ mod ui_polish_agent_tests {
             ("chip NotApplied", chip_not_applied),
             ("chip Failed", chip_failed),
             ("Cancel", cancel_btn),
-            ("attachment name", attach_name),
-            ("attachment ×", attach_x),
             ("danger Confirm", danger_confirm),
         ] {
             assert!(r >= 4.5, "{name} contrast {r:.2}:1 < 4.5:1");
@@ -21468,39 +22011,27 @@ mod ui_polish_agent_tests {
     }
 
     #[test]
-    fn agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle() {
+    fn agent_panel_defect6_confirm_aligns_with_the_transcript_column() {
         let mut app = DemoApp::new_with_sink(None);
         app.stage_demo_agent(false);
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let size = Vec2::new(1280.0, 950.0);
 
-        let run_capture = |app: &mut DemoApp, events: Vec<egui::Event>| {
+        let run_capture = |app: &mut DemoApp| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-            raw.events = events;
             let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             let mut texts = Vec::new();
             let mut rects = Vec::new();
             for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
-            let set_ids: Vec<egui::TextureId> = out.textures_delta.set.iter().map(|(id, _)| *id).collect();
-            let free_ids = out.textures_delta.free.clone();
             out.textures_delta.clear();
-            (texts, rects, set_ids, free_ids)
+            (texts, rects)
         };
+        for _ in 0..2 { run_capture(&mut app); }
+        let (texts, rects) = run_capture(&mut app);
 
-        // Frame 1: thumbnail texture created once.
-        let (_, _, set1, _) = run_capture(&mut app, vec![]);
-        let tex_id = app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()).expect("thumbnail texture loaded");
-        assert!(set1.contains(&tex_id), "frame 1 uploads thumbnail texture {tex_id:?}");
-
-        // Settle layout and verify Frame N does NOT re-upload thumbnail texture.
-        let _ = run_capture(&mut app, vec![]);
-        let (texts, rects, set3, _) = run_capture(&mut app, vec![]);
-        assert!(!set3.contains(&tex_id), "thumbnail texture must not be recreated on subsequent frames");
-        assert_eq!(app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()), Some(tex_id));
-
-        // Alignment: Confirm/Cancel and attachment chip share the transcript text column left edge.
+        // Alignment: Confirm/Cancel share the transcript text column left edge.
         let msg_left = texts.iter().find(|(t, _)| t.contains("Brighten Surge A")).map(|(_, r)| r.left()).expect("msg text");
         let chip_text_r = texts.iter().find(|(t, _)| t.contains("Split keys → C4")).map(|(_, r)| *r).expect("chip text");
         let chip_box = rects.iter()
@@ -21512,43 +22043,13 @@ mod ui_polish_agent_tests {
             .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(confirm_text_r))
             .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
             .expect("confirm button box").0;
-        let attach_text_r = texts.iter().find(|(t, _)| t == "rack-sketch.png").map(|(_, r)| *r).expect("attach name");
-        let attach_box = rects.iter()
-            .filter(|(r, fill, _)| *fill == theme::DARK_PANEL_HI && r.contains_rect(attach_text_r))
-            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
-            .expect("attach chip box").0;
         assert!(
             (confirm_box.left() - chip_box.left()).abs() <= 0.5 && (confirm_box.left() - msg_left).abs() <= 2.0,
             "Confirm left ({}) != transcript column (chip {}, msg {msg_left})",
             confirm_box.left(),
             chip_box.left()
         );
-        assert!(
-            (attach_box.left() - chip_box.left()).abs() <= 0.5 && (attach_box.left() - msg_left).abs() <= 2.0,
-            "Attachment chip left ({}) != transcript column (chip {}, msg {msg_left})",
-            attach_box.left(),
-            chip_box.left()
-        );
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "no debug pixel dimensions: {texts:?}");
-
-        // Remove via × -> texture handle dropped and freed in textures_delta.free.
-        let x_pos = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).unwrap().1.center();
-        let mut freed = Vec::new();
-        for pressed in [true, false] {
-            let ev = vec![
-                egui::Event::PointerMoved(x_pos),
-                egui::Event::PointerButton {
-                    pos: x_pos,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: Modifiers::NONE,
-                },
-            ];
-            freed.extend(run_capture(&mut app, ev).3);
-        }
-        freed.extend(run_capture(&mut app, vec![]).3);
-        assert!(app.chat_image.is_none() && app.chat_thumb.is_none(), "attachment and thumb cleared");
-        assert!(freed.contains(&tex_id), "removed attachment must free thumbnail texture {tex_id:?}, freed: {freed:?}");
     }
 }
 
@@ -21576,10 +22077,9 @@ mod face_layout_tests {
         // title band and sits above the subtitle band, which a union box
         // would call an overlap (false positive at narrow keys units).
         let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
+        let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
         v.push(("title".to_string(), title));
-        if u.sub_g.is_some() {
-            v.push(("subtitle".to_string(), Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g))));
-        }
+        v.push(("subtitle".to_string(), sub));
         v.push(("led".into(), Rect::from_center_size(r.right_top() + Vec2::new(-20.0, 20.0), Vec2::splat(15.0))));
         for (ki, k) in u.knobs.iter().enumerate() {
             if k.hidden { continue; }
@@ -21607,13 +22107,19 @@ mod face_layout_tests {
         }
         if matches!(u.node_kind, UnitKind::Master) {
             let (x, bottom, pitch) = app.meter_geom(ui);
-            let top = bottom - METER_SEGS as f32 * pitch - 18.0;
-            let w = sz(&app.caption_output_g).x.max(22.0);
-            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + w, bottom))));
+            let top = bottom - METER_SEGS as f32 * pitch;
+            v.push(("meter".into(), Rect::from_min_max(Pos2::new(x, top), Pos2::new(x + METER_SEG_W, bottom))));
+            if app.meter_caption_shown(ui) {
+                v.push(("meter caption".into(), Rect::from_min_size(Pos2::new(x, top - 18.0), sz(&app.caption_output_g))));
+            }
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
         if let Some(b) = app.drawbar_rects(ui) {
             v.push(("drawbars".into(), b[0].union(b[crate::organ::DRAWBARS - 1])));
+        }
+        if let Some(a) = app.aeolus_rects(ui) {
+            v.push(("aeolus tabs".into(), a.tabs[0].union(a.tabs[3])));
+            v.push(("aeolus stops".into(), a.stops.iter().fold(Rect::NOTHING, |u, r| u.union(*r))));
         }
         if let Some(z) = app.zone_rects(ui) {
             v.push(("zone low".into(), z[0].all()));
@@ -21660,10 +22166,15 @@ mod face_layout_tests {
     fn check(mut app: DemoApp, what: &str) {
         let ctx = egui::Context::default();
         let mut all = Vec::new();
-        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
-            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
-            for v in audit(&app) { all.push(format!("[{what} {}x{}] {v}", size.x, size.y)); }
+        let small = super::window_size_layout_tests::SIZES.map(|(w, h)| Vec2::new(w, h));
+        for dock in [DockView::None, DockView::Keyboard, DockView::Assistant] {
+            app.dock = dock;
+            for size in [Vec2::new(2560.0, 1440.0)].into_iter().chain(small) {
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                for v in audit(&app) { all.push(format!("[{what} {}x{} {dock:?}] {v}", size.x, size.y)); }
+            }
         }
+        app.dock = DockView::None;
         assert!(all.is_empty(), "face layout violations:\n{}", all.join("\n"));
     }
 
@@ -21726,6 +22237,126 @@ mod face_layout_tests {
             assert!(app.drawbar_rects(organ_ui).is_some(),
                 "drawbars hidden at {}x{}", size.x, size.y);
         }
+    }
+
+    /// Keys → Aeolus → Master, its unit with the main knobs a real Aeolus has.
+    fn aeolus_rack() -> (DemoApp, usize) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let organ = g.add_node(NodeKind::Clap { plugin_id: name_bytes(crate::aeolus::AEOLUS_ID) }, name_bytes("AEOLUS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        (app, ui)
+    }
+
+    #[test]
+    fn aeolus_faces_with_stops_are_padded_and_clear() {
+        let (app, _) = aeolus_rack();
+        check(app, "aeolus");
+        // Every division fits, the longest (Manual III, 15 stops) too.
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let a = app.aeolus_rects(ui).unwrap_or_else(|| panic!("no stop panel at {size:?} for division {d}"));
+                assert_eq!(a.stops.len(), crate::aeolus::DIVISIONS[d].stops.len());
+                assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+            }
+        }
+        // The default rack with both Surges swapped for Aeolus: two short
+        // units stacked over their delays (the real app's first look).
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind {
+                *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID);
+                n.name = name_bytes(&format!("AEOLUS {}", n.id));
+            }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            for u in (0..app.units.len()).filter(|&u| app.is_aeolus_unit(u)) {
+                assert!(app.aeolus_rects(u).is_some(), "no stop panel on a stacked Aeolus at {size:?} ({:?})", app.unit_rects[u]);
+            }
+            assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+        }
+        // Other plugins have no stop panel.
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0)); }
+        assert!((0..app.units.len()).all(|u| app.aeolus_rects(u).is_none()));
+    }
+
+    /// In the stacked default rack at 1600x1000 (this laptop's window) every
+    /// stop of every division reads in whole words: short forms, never
+    /// letters cut off with "…". At 1280x800 the chips are ~38 px inside and
+    /// some names are cut; the panel still shows (see above).
+    #[test]
+    fn aeolus_stop_labels_fit_without_cutting_words() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind { *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID); }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ctx = egui::Context::default();
+        let ui = (0..app.units.len()).find(|&u| app.is_aeolus_unit(u)).unwrap();
+        for size in [Vec2::new(1600.0, 1000.0)] {
+            let mut all = Vec::new();
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let a = app.aeolus_rects(ui).unwrap();
+                for (r, name) in a.stops.iter().zip(crate::aeolus::DIVISIONS[d].stops) {
+                    // The width draw_aeolus_face gives the text.
+                    all.push(fit_stop_label(&painter, name, FontId::proportional(10.5), (r.width() - 14.0) * app.xf.sx));
+                }
+            }
+            println!("{size:?}: {all:?}");
+            assert!(all.iter().all(|l| !l.contains('…')), "{size:?}: {all:?}");
+        }
+    }
+
+    /// A division tab shows that division; a stop click with no plugin
+    /// running says so and changes nothing (the plugin's state is the truth).
+    #[test]
+    fn aeolus_tabs_switch_the_division_shown() {
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let click = |app: &mut DemoApp, local: Pos2| {
+            let pos = app.xf.p(local.to_vec2());
+            for ev in [egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }] {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                raw.events = vec![ev];
+                eframe::App::raw_input_hook(app, &ctx, &mut raw);
+                let mut out = ctx.run_ui(raw, |u| app.frame_ui(u));
+                out.textures_delta.clear();
+            }
+        };
+        for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+        assert_eq!(app.aeolus_division(ui), 2, "a fresh face shows Manual I");
+        let pedal = app.aeolus_rects(ui).unwrap().tabs[3];
+        click(&mut app, pedal.center());
+        assert_eq!(app.aeolus_division(ui), 3);
+        assert_eq!(app.aeolus_rects(ui).unwrap().stops.len(), 12, "the pedal's twelve stops");
+        let stop = app.aeolus_rects(ui).unwrap().stops[1];
+        click(&mut app, stop.center());
+        assert!(app.plugin_msg.contains("not running"), "{}", app.plugin_msg);
+        assert_eq!(app.aeolus_faces[&app.units[ui].node_id].drawn, None);
     }
 
     #[test]
@@ -22397,7 +23028,7 @@ mod settings_and_dropdown_tests {
             assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
             if size.y >= 800.0 {
                 assert!(texts.iter().any(|(t, _)| t == "Chat model"));
-                assert!(texts.iter().any(|(t, _)| t == "Vision model"));
+                assert!(texts.iter().all(|(t, _)| t != "Vision model"), "no vision role: {texts:?}");
                 assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
             }
             for (t, _) in &texts {
@@ -22417,20 +23048,20 @@ mod settings_and_dropdown_tests {
         assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
 
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
-        let vision_dd = texts.iter().find(|(t, _)| t == crate::llm::PERCEIVE_MODEL).expect("Perceive dropdown").1.center();
-        let _ = open_dropdown(&mut app, &ctx, size, vision_dd);
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("Act dropdown").1.center();
+        let _ = open_dropdown(&mut app, &ctx, size, act_dd);
         assert!(egui::Popup::is_any_open(&ctx));
         run_frame(&mut app, &ctx, size, key(Key::Escape));
         assert!(!egui::Popup::is_any_open(&ctx));
         assert_eq!(app.stage_view, StageView::Settings, "first Esc closes dropdown, keeps Settings open");
 
-        app.settings_perceive_input = "openai/gpt-5.4".into();
+        app.settings_act_input = "openai/gpt-5.4".into();
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
         applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        assert_eq!(applies.len(), 3);
-        click_at(&mut app, &ctx, size, applies[2].center());
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Perceive).model, "openai/gpt-5.4");
+        assert_eq!(applies.len(), 2);
+        click_at(&mut app, &ctx, size, applies[1].center());
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, "openai/gpt-5.4");
 
         assert!(app.assistant.decide_enabled());
         assert!(!app.reduce_motion);
@@ -22602,8 +23233,324 @@ mod voice_host_tests {
         assert_eq!(rig.app.clap_rigs()[0].1, second);
         assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
 
-        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0, wire: false });
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
 }
+
+/// Times loading saved session packages (args: package paths) on the
+/// offline-engine app with real plugins: the UI-thread `apply_session`, and
+/// the slowest of the frames that follow while plugins load.
+pub fn run_session_load_bench(paths: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "usage: kabelsalat session-load-bench <package.ksalat>...");
+    let mut rig = EvalRig::new(Assistant::new(), &(Vec::new(), crate::lv2::discover()))?;
+    rig.settle();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for round in 0..2 {
+        for p in paths {
+            let s = crate::session::Session::load(std::path::Path::new(p))?;
+            let t = std::time::Instant::now();
+            rig.app.apply_session(&s)?;
+            let apply = ms(t.elapsed());
+            let mut worst = 0.0f64;
+            for _ in 0..100 {
+                let f = std::time::Instant::now();
+                rig.frame();
+                worst = worst.max(ms(f.elapsed()));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("session-load-bench round {round} {p}: apply_session {apply:.1} ms, slowest next frame {worst:.1} ms");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod window_size_layout_tests {
+    use super::*;
+
+    /// Window sizes in points, as the compositor tiles a 1.6x laptop panel
+    /// (halves, quarters) plus the default and the minimum window.
+    pub(super) const SIZES: [(f32, f32); 6] =
+        [(1600.0, 1000.0), (1280.0, 800.0), (781.0, 950.0), (1576.0, 468.0), (781.0, 468.0), (760.0, 520.0)];
+
+    struct Text { s: String, rect: Rect, clip: Rect }
+
+    fn walk(shape: &Shape, clip: Rect, out: &mut Vec<Text>) {
+        match shape {
+            Shape::Text(t) if !t.galley.text().trim().is_empty() && t.opacity_factor > 0.05 => out.push(Text {
+                s: t.galley.text().replace('\n', "⏎"),
+                rect: ink_rect(&t.galley).translate(t.pos.to_vec2()),
+                clip,
+            }),
+            Shape::Vec(v) => for s in v { walk(s, clip, out) },
+            _ => {}
+        }
+    }
+
+    /// The glyphs' extent: a galley's own rect also spans `leading_space`
+    /// and the empty part of a wrapped row.
+    fn ink_rect(g: &egui::Galley) -> Rect {
+        let mut r = Rect::NOTHING;
+        for row in &g.rows {
+            let ink: Vec<_> = row.glyphs.iter().filter(|gl| !gl.chr.is_whitespace()).collect();
+            let (Some(a), Some(b)) = (ink.first(), ink.last()) else { continue };
+            r = r.union(Rect::from_min_max(
+                row.pos + Vec2::new(a.pos.x, 0.0),
+                row.pos + Vec2::new(b.pos.x + b.advance_width, row.height()),
+            ));
+        }
+        if r.is_positive() { r } else { g.rect }
+    }
+
+    fn texts(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<Text> {
+        let mut out = Vec::new();
+        for i in 0..4 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64); // popups and panels past their fade-in (rule 101)
+            eframe::App::raw_input_hook(app, ctx, &mut raw);
+            let mut frame = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            frame.textures_delta.clear(); // rule 11
+            out.clear();
+            for cs in &frame.shapes { walk(&cs.shape, cs.clip_rect, &mut out); }
+        }
+        out
+    }
+
+    /// Text that leaves the window, is cut by its clip, or overlaps other
+    /// text. Text a scroll area clips at its edge is scrolled, not broken,
+    /// so a clip cut only counts outside `scrolled` regions.
+    fn audit(texts: &[Text], size: Vec2) -> Vec<String> {
+        let screen = Rect::from_min_size(Pos2::ZERO, size);
+        let mut bad = Vec::new();
+        let vis: Vec<(&Text, Rect)> = texts.iter()
+            .map(|t| (t, t.rect.intersect(t.clip).intersect(screen)))
+            .filter(|(_, v)| v.width() > 0.5 && v.height() > 0.5)
+            .collect();
+        for (t, v) in &vis {
+            if !screen.expand(0.5).contains_rect(t.rect) {
+                bad.push(format!("{:?} {:?} leaves the window", t.s, t.rect));
+            } else if v.width() < t.rect.width() - 1.0 || v.height() < t.rect.height() - 1.0 {
+                bad.push(format!("{:?} {:?} cut by its clip {:?}", t.s, t.rect, t.clip));
+            }
+        }
+        for i in 0..vis.len() {
+            for j in i + 1..vis.len() {
+                let o = vis[i].1.intersect(vis[j].1);
+                if o.width() > 1.0 && o.height() > 1.0 {
+                    bad.push(format!("{:?} {:?} overlaps {:?} {:?}", vis[i].0.s, vis[i].1, vis[j].0.s, vis[j].1));
+                }
+            }
+        }
+        bad
+    }
+
+    fn report(setup: &dyn Fn(&mut DemoApp)) -> Vec<String> {
+        let mut all = Vec::new();
+        for (w, h) in SIZES {
+            for (dock, dname) in [(DockView::None, "no dock"), (DockView::Keyboard, "keyboard"), (DockView::Assistant, "assistant")] {
+                let mut app = DemoApp::new_with_sink(None);
+                setup(&mut app);
+                app.dock = dock;
+                let ctx = egui::Context::default();
+                let size = Vec2::new(w, h);
+                let t = texts(&mut app, &ctx, size);
+                for v in audit(&t, size) { all.push(format!("[{w}x{h} {dname}] {v}")); }
+                if app.stage_view == StageView::Rack && app.rack_overflow != Vec2::ZERO {
+                    let what = if app.rack_overflow.x > 0.0 { "rack overflows sideways" } else { "rack pans vertically" };
+                    all.push(format!("[{w}x{h} {dname}] {what}: {:?}", app.rack_overflow));
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    #[ignore = "report: cargo test --bin kabelsalat window_size_report -- --ignored --nocapture"]
+    fn window_size_report() {
+        let mut n = 0;
+        for (name, setup) in VIEWS {
+            let r = report(setup);
+            n += r.len();
+            for l in r { println!("{name}: {l}"); }
+        }
+        println!("TOTAL {n}");
+    }
+
+    /// In every view, window size and dock: no text on other text, none
+    /// outside the window, and a rack as wide as the window (rule 124).
+    /// Scroll areas cutting text at their edge, and a rack that pans
+    /// vertically under a dock in the smallest windows, are allowed.
+    #[test]
+    fn every_view_fits_small_windows() {
+        let mut bad = Vec::new();
+        for (name, setup) in VIEWS {
+            for l in report(setup) {
+                if l.contains(" overlaps ") || l.contains("leaves the window") || l.contains("overflows sideways") {
+                    bad.push(format!("{name}: {l}"));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+            ("rack", &|_| {}),
+            ("rack back", &|a| a.side = Side::Back),
+            ("two rigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| a.stage_view = StageView::Mixer),
+            ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+        ];
+}
+
+/// Offline screenshots of the real frame: egui's tessellated triangles
+/// rasterized on the CPU (no window, no compositor, no GPU). Run with
+/// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`.
+#[cfg(test)]
+mod offline_shots {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct Textures(HashMap<egui::TextureId, (usize, usize, Vec<Color32>)>);
+
+    impl Textures {
+        fn apply(&mut self, delta: &egui::TexturesDelta) {
+            for (id, d) in delta.set.iter().flat_map(|(id, ds)| ds.iter().map(move |d| (id, d))) {
+                let egui::ImageData::Color(img) = &d.image;
+                let [w, h] = img.size;
+                match d.pos {
+                    None => { self.0.insert(*id, (w, h, img.pixels.clone())); }
+                    Some([x0, y0]) => if let Some((tw, _, px)) = self.0.get_mut(id) {
+                        for y in 0..h { for x in 0..w { px[(y0 + y) * *tw + x0 + x] = img.pixels[y * w + x]; } }
+                    },
+                }
+            }
+            for id in &delta.free { self.0.remove(id); }
+        }
+
+        fn sample(&self, id: egui::TextureId, uv: Pos2) -> [f32; 4] {
+            let Some((w, h, px)) = self.0.get(&id) else { return [1.0; 4] };
+            let (fx, fy) = (uv.x * *w as f32 - 0.5, uv.y * *h as f32 - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (tx, ty) = (fx - x0, fy - y0);
+            let at = |x: f32, y: f32| {
+                let c = px[(y.clamp(0.0, *h as f32 - 1.0) as usize) * *w + x.clamp(0.0, *w as f32 - 1.0) as usize];
+                [c.r() as f32, c.g() as f32, c.b() as f32, c.a() as f32]
+            };
+            let (a, b, c, d) = (at(x0, y0), at(x0 + 1.0, y0), at(x0, y0 + 1.0), at(x0 + 1.0, y0 + 1.0));
+            std::array::from_fn(|i| {
+                let top = a[i] + (b[i] - a[i]) * tx;
+                let bot = c[i] + (d[i] - c[i]) * tx;
+                (top + (bot - top) * ty) / 255.0
+            })
+        }
+    }
+
+    fn rasterize(prims: &[egui::ClippedPrimitive], tex: &Textures, w: usize, h: usize, ppp: f32) -> Vec<[f32; 3]> {
+        let mut img = vec![[0.0f32; 3]; w * h];
+        for p in prims {
+            let egui::epaint::Primitive::Mesh(mesh) = &p.primitive else { continue };
+            let c = p.clip_rect;
+            let (cx0, cy0) = ((c.min.x * ppp).round().max(0.0) as i64, (c.min.y * ppp).round().max(0.0) as i64);
+            let (cx1, cy1) = ((c.max.x * ppp).round().min(w as f32) as i64, (c.max.y * ppp).round().min(h as f32) as i64);
+            for t in mesh.indices.chunks_exact(3) {
+                let v = [&mesh.vertices[t[0] as usize], &mesh.vertices[t[1] as usize], &mesh.vertices[t[2] as usize]];
+                let pt: [Vec2; 3] = std::array::from_fn(|i| v[i].pos.to_vec2() * ppp);
+                let area = (pt[1] - pt[0]).x * (pt[2] - pt[0]).y - (pt[1] - pt[0]).y * (pt[2] - pt[0]).x;
+                if area.abs() < 1e-6 { continue; }
+                let lo = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MAX, f32::min);
+                let hi = |f: fn(&Vec2) -> f32| pt.iter().map(f).fold(f32::MIN, f32::max);
+                let (x0, x1) = ((lo(|p| p.x).floor() as i64).max(cx0), (hi(|p| p.x).ceil() as i64).min(cx1));
+                let (y0, y1) = ((lo(|p| p.y).floor() as i64).max(cy0), (hi(|p| p.y).ceil() as i64).min(cy1));
+                let col: [[f32; 4]; 3] = std::array::from_fn(|i| {
+                    let c = v[i].color;
+                    [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, c.a() as f32 / 255.0]
+                });
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let s = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
+                        let e = |a: Vec2, b: Vec2| (b - a).x * (s - a).y - (b - a).y * (s - a).x;
+                        let (w0, w1, w2) = (e(pt[1], pt[2]) / area, e(pt[2], pt[0]) / area, e(pt[0], pt[1]) / area);
+                        if w0 < -1e-4 || w1 < -1e-4 || w2 < -1e-4 { continue; }
+                        let uv = Pos2::new(
+                            w0 * v[0].uv.x + w1 * v[1].uv.x + w2 * v[2].uv.x,
+                            w0 * v[0].uv.y + w1 * v[1].uv.y + w2 * v[2].uv.y,
+                        );
+                        let t = tex.sample(mesh.texture_id, uv);
+                        let src: [f32; 4] = std::array::from_fn(|i| (w0 * col[0][i] + w1 * col[1][i] + w2 * col[2][i]) * t[i]);
+                        let d = &mut img[y as usize * w + x as usize];
+                        for i in 0..3 { d[i] = src[i] + d[i] * (1.0 - src[3]); }
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    /// Run frames of `app` at `size` points and write the last one as a PNG.
+    pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
+        let ctx = egui::Context::default();
+        let mut tex = Textures::default();
+        let mut last = None;
+        for i in 0..5 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64);
+            eframe::App::raw_input_hook(app, &ctx, &mut raw);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            tex.apply(&out.textures_delta);
+            out.textures_delta.clear(); // rule 11
+            last = Some(out);
+        }
+        let out = last.unwrap();
+        let ppp = out.pixels_per_point;
+        let prims = ctx.tessellate(out.shapes, ppp);
+        let (w, h) = ((size.x * ppp).round() as usize, (size.y * ppp).round() as usize);
+        let img = rasterize(&prims, &tex, w, h, ppp);
+        let bytes: Vec<u8> = img.iter().flat_map(|p| p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)).collect();
+        let file = std::fs::File::create(path).expect("create png");
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&bytes).unwrap();
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored"]
+    fn window_size_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+            ("rack", &|_| {}),
+            ("back", &|a| a.side = Side::Back),
+            ("tworigs", &|a| a.load_multi_rig_demo()),
+            ("mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("matrix", &|a| a.stage_view = StageView::Matrix),
+            ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("settings", &|a| a.stage_view = StageView::Settings),
+            ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("agent", &|a| a.stage_demo_agent(false)),
+        ];
+        let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
+        for (w, h) in super::window_size_layout_tests::SIZES {
+            for (name, setup) in &views {
+                for (dock, dn) in [(DockView::None, ""), (DockView::Keyboard, "-kbd"), (DockView::Assistant, "-chat")] {
+                    let file = format!("{w}x{h}-{name}{dn}.png");
+                    if only.as_ref().is_some_and(|o| !file.contains(o.as_str())) { continue; }
+                    let mut app = DemoApp::new_with_sink(None);
+                    setup(&mut app);
+                    app.dock = dock;
+                    shot(&mut app, Vec2::new(w, h), &dir.join(file));
+                }
+            }
+        }
+    }
+}
+

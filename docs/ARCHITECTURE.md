@@ -40,7 +40,14 @@ agents are in [AGENTS.md](../AGENTS.md).
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge
   voices, an LV2 plugin's `pset:Preset` files plus the MIDI programmes its
   MIDNAM document names (setBfree), or a plugin's own stepped "Preset"
-  parameter (YANES). Each `Sound` carries its `Load` (plugin state, parameter
+  parameter (YANES). Aeolus has no presets and starts with every stop off:
+  `aeolus.rs` holds its organ's stop table and a set of registrations, each
+  written as the plugin's JSON state; a freshly instantiated Aeolus gets the
+  default registration in `ClapVoice::instantiate_entry`. Its stops are no
+  parameters, so the Aeolus face's stop panel (`aeolus_rects`) changes one
+  stop by taking the plugin's state, changing that stop (`aeolus::with_stop`)
+  and loading it back; it reads what is drawn (`aeolus::drawn`) once a
+  second and after each change. Each `Sound` carries its `Load` (plugin state, parameter
   value, LV2 preset, programme change), and `load` sends each along its own
   path. `Libraries` scans on a thread of its own and keeps the results;
   `search` / `find` are the one search for every library, and the
@@ -70,6 +77,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono
   check, 4-band summary; allocation-free, published via `GraphPub.meter`.
+- `listen.rs` — the audio judge behind the agent's `listen` tool (#35): an
+  armed master tap (pushes only while a listen records), the clip sent as mono
+  16 kHz WAV with the meter's numbers to an audio-capable OpenRouter model
+  (`agent_listen_model`, default Gemini 3.8 Flash, `reasoning: low`), which
+  answers in text (0-10 per attribute plus what it heard). The acting model
+  and Jev read that text, never the audio (rule 82). `listen-test` checks the
+  model ranks known reference clips (real Surge patches) the right way round.
 - `ui.rs` / `theme.rs` — eframe/egui app: rack with physics cables and flip,
   rigs strip, mixer, matrix, sessions, plugin browser, native plugin editors,
   bottom dock (keyboard or assistant); `theme.rs` is the single palette source
@@ -80,9 +94,8 @@ agents are in [AGENTS.md](../AGENTS.md).
   built-in assistant; both expose the same tools (AGENTS.md rule 6). The
   assistant's worker asks a decisions model first (`SHORTCUTS`: one row per
   request it settles, each a plan of tool calls) and hands the rest to a chat
-  model. `llm.rs` is the one client and the route per role (decide, act,
-  perceive); `vision.rs` sizes and encodes the images a model gets (attached
-  by the user, or the app window through `look_at_rack`).
+  model. `llm.rs` is the one client and the route per role (decide, act).
+  The agent takes text only: there is no image input.
 - `session.rs` — sessions (multi-rig), templates.
 
 ## 0. Decision log
@@ -120,7 +133,13 @@ agents are in [AGENTS.md](../AGENTS.md).
   1:1 through the same control plane the UI uses (§2c).
 - **2026-11-14** — **Embedded plugin editors required** (user): no scattered plugin
   windows — editors open inside the host window (§6). Host runs under XWayland so
-  X11 reparenting works.
+  X11 reparenting works. *Superseded 2026-11-17:* editors are native egui
+  parameter views, and the app runs as a native Wayland client.
+- **2026-11-17** — **Plugin GUIs in their own windows** (user): the plugin's
+  own editor opens on request ("Open plugin window" in the editor pane) as a
+  separate XWayland dialog window that kabelsalat creates and the plugin
+  embeds into. The main app stays a native Wayland client; the native egui
+  pane stays the default editor.
 - **2026-11-14** — **Reason's rack flip adopted as interaction model** (user):
   labeled rack units, Tab flips to the back panel where the cables live (§2a).
 - **2026-11-14** — **Built-in assistant requested** (user): DeepSeek-powered, BYOK,
@@ -408,9 +427,12 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **Frontends are siblings:** egui UI, MCP server, and CLI all call the same control
   plane (`kabelsalat-control`); every command flows through one lock-free ring into
   the engine. This is what guarantees 1:1 MCP coverage (§2c).
-- **Display:** the app runs under XWayland (X11) so plugin editors can be reparented
-  into the main window — CLAP/VST3/LV2 Linux GUIs are X11; native-Wayland plugin
-  GUIs don't exist in practice yet.
+- **Display:** native Wayland (winit), at the compositor's fractional scale.
+  The default editors are native egui parameter views. A plugin's own GUI is
+  X11 on Linux, so it opens in a host-owned XWayland toplevel
+  (`plugin_window.rs`, a `_NET_WM_WINDOW_TYPE_DIALOG` so window managers float
+  it); the UI frame drives the plugin's `timer-support` and
+  `posix-fd-support` callbacks, which JUCE editors paint from.
 - **Threads:** UI (egui) · audio callback (cpal, RT) · MIDI in (midir) · disk pool.
   UI→audio: `rtrb` command rings. Audio→UI: `triple_buffer` snapshots (meters,
   playhead, **per-edge levels for cable animation**) + event ring (notes, xruns).

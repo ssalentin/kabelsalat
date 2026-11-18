@@ -76,7 +76,7 @@ pub fn now_ms() -> u64 {
 fn refused_while_paused(req: &Value) -> bool {
     let op = req.get("op").and_then(Value::as_str);
     let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
-    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_") || tool == "look_at_rack";
+    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_");
     op == Some("cmd") || (op == Some("ui") && !reads)
 }
 
@@ -351,6 +351,9 @@ fn handle_line_with_pub(
                 Err(e) => err_reply(e),
             }
         }
+        // The audio judge records the master and waits for the listening
+        // model: seconds, on this connection's thread, never the UI's.
+        Some("listen") => json!({"ok": true, "data": crate::listen::listen(req.get("args").unwrap_or(&json!({})))}),
         Some("query") => match req.get("name").and_then(Value::as_str) {
             Some("get_graph") => {
                 // The engine's publication is authoritative; the UI's copy
@@ -473,8 +476,13 @@ pub fn connect() -> anyhow::Result<UnixStream> {
 /// Tool calls are sequential, so a fresh connection per request is simple
 /// and robust (the server handles connections sequentially).
 pub fn request(req: &Value) -> anyhow::Result<Value> {
+    request_within(req, Duration::from_secs(5))
+}
+
+/// `request` for a call that takes longer than a tool call usually does.
+pub fn request_within(req: &Value, wait: Duration) -> anyhow::Result<Value> {
     let stream = connect()?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_read_timeout(Some(wait))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut writer = stream.try_clone()?;
     writeln!(writer, "{}", serde_json::to_string(req)?)?;
@@ -548,7 +556,7 @@ mod tests {
         // add_node, as MCP does it: ids from a fresh get_graph.
         let mut g = get_graph();
         let gain = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
-        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 }})), json!({"ok": true}));
+        assert_eq!(call(json!({"op": "cmd", "cmd": Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false }})), json!({"ok": true}));
         assert!(get_graph().node(gain).is_some(), "the next call sees node {gain}");
 
         // Three auto-id connects in a row get three distinct ids.
@@ -630,6 +638,14 @@ mod tests {
         let reply = handle_line(r#"{"op":"query","name":"get_status"}"#, &bus, &graph, &level, 48000.0, &rigs);
         assert_eq!(reply["data"]["rigs"], json!(2));
         assert_eq!(reply["data"]["active_rig"], json!(1));
+    }
+
+    #[test]
+    fn listen_is_answered_on_the_bridge_thread() {
+        let (bus, _drain, graph, level, rigs) = fixtures();
+        let reply = handle_line(r#"{"op":"listen","args":{"attributes":"warm"}}"#, &bus, &graph, &level, 48000.0, &rigs);
+        assert_eq!(reply["ok"], json!(true));
+        assert!(reply["data"].as_str().unwrap().starts_with("listen: no listening model"), "{reply}");
     }
 
     #[test]

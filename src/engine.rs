@@ -140,7 +140,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
         // The plugin's main controls join LEVEL on the face (`main_controls`).
         NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
-        NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
+        NodeKind::MasterOut => knobs!(ks("VOLUME", 0.75, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
             DspKind::Reverb => knobs!(ks("MIX", 0.35, Some(0), &[]), ks("SIZE", 0.5, Some(1), &[])),
@@ -452,6 +452,8 @@ fn build_audio_in_slots(graph: &Graph) -> Vec<AudioInSlot> {
 enum Lv2Request {
     Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
     Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
+    /// A fresh instance with this state restored, to replace the node's.
+    State { node: NodeId, uri: crate::control::Lv2Uri, gen: u64, state: Vec<u8> },
     Retire(Lv2Slot),
     RetirePreset(crate::lv2::Lv2Preset),
 }
@@ -460,6 +462,7 @@ enum Lv2Request {
 enum Lv2Response {
     Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
     Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
+    Restored { node: NodeId, gen: u64, slot: Lv2Slot },
 }
 
 const LV2_RING: usize = 64;
@@ -470,6 +473,29 @@ fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
         Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2] }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
+            None
+        }
+    }
+}
+
+/// A new instance of `uri` with `state` restored: checked first, because a
+/// state the plugin cannot read can hang the thread restoring it
+/// (`vital::check_patch`).
+fn restored_lv2_slot(node: NodeId, uri: &str, state: &[u8], sample_rate: f64) -> Option<Lv2Slot> {
+    let Some(format) = crate::lv2::state_format(uri) else {
+        eprintln!("lv2 node {node}: no known state format for {uri}");
+        return None;
+    };
+    if let Err(e) = (format.check)(state) {
+        eprintln!("lv2 node {node}: {e}");
+        return None;
+    }
+    let mut slot = load_lv2_slot(node, uri, sample_rate)?;
+    match slot.plugin.restore_state(&[(format.key, format.kind, state)]) {
+        Ok(()) => Some(slot),
+        Err(e) => {
+            eprintln!("lv2 node {node}: {e}");
+            crate::lv2::retire(slot.plugin);
             None
         }
     }
@@ -493,6 +519,9 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
+            Lv2Request::State { node, uri, gen, state } => {
+                restored_lv2_slot(node, uri.as_str(), &state, sample_rate).map(|slot| Lv2Response::Restored { node, gen, slot })
+            }
             Lv2Request::Retire(slot) => {
                 crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
                 None
@@ -768,6 +797,8 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    /// The audio judge's master tap (#35): pushes only while a listen records.
+    listen: Option<crate::listen::Tap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
     record_sync: bool,
     // A synced take is armed but not started until the song clock reaches
@@ -833,7 +864,7 @@ impl GraphEngine {
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
             fx_done: Vec::with_capacity(256),
-            master_vol: 1.0,
+            master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             organ_pending: [None; 8],
@@ -878,6 +909,7 @@ impl GraphEngine {
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             recorder: None,
+            listen: None,
             record_sync: false,
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
@@ -952,6 +984,22 @@ impl GraphEngine {
         }
     }
 
+    /// Put an instance with restored state in place of the node's own.
+    fn adopt_restored_lv2(&mut self, node: NodeId, gen: u64, slot: Lv2Slot) {
+        let live = gen == self.lv2_gen && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
+        match self.lv2.iter().position(|s| s.node == node) {
+            Some(i) if live => {
+                let old = std::mem::replace(&mut self.lv2[i], slot);
+                self.retire_lv2(old);
+            }
+            None if live && self.lv2.len() < self.lv2.capacity() => {
+                self.attach_lv2(slot);
+                self.publish_graph();
+            }
+            _ => self.retire_lv2(slot),
+        }
+    }
+
     /// Free an LV2 slot off the audio thread when the loader runs.
     fn retire_lv2(&mut self, slot: Lv2Slot) {
         if let Some(tx) = self.lv2_req.as_mut() {
@@ -995,6 +1043,7 @@ impl GraphEngine {
                         self.retire_lv2(slot);
                     }
                 }
+                Lv2Response::Restored { node, gen, slot } => self.adopt_restored_lv2(node, gen, slot),
                 Lv2Response::Preset { node, preset } => {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
@@ -1169,6 +1218,10 @@ impl GraphEngine {
     /// Attach the master recording tap (writer thread started elsewhere).
     pub fn set_recorder(&mut self, tap: RecorderTap) {
         self.recorder = Some(tap);
+    }
+
+    pub fn set_listen_tap(&mut self, tap: crate::listen::Tap) {
+        self.listen = Some(tap);
     }
 
     /// Start recording the master output (idempotent). No-op without a tap.
@@ -1520,9 +1573,12 @@ impl GraphEngine {
             self.drain_voice_msgs();
         }
         match cmd {
-            Command::AddNode { kind, name, rig } => {
+            Command::AddNode { kind, name, rig, wire } => {
                 let id = self.graph.add_node(kind.clone(), name);
                 self.graph.set_rig(id, rig);
+                if wire {
+                    self.graph.wire_instrument(id);
+                }
                 let sr = self.sample_rate;
                 match &kind {
                     NodeKind::Dsp(dk) => {
@@ -1602,6 +1658,19 @@ impl GraphEngine {
                             s.plugin.apply_preset(preset);
                         }
                     }
+                }
+            }
+            Command::LoadLv2State { node, state } => {
+                let Some(NodeKind::Lv2 { uri }) = self.graph.node(node).map(|n| n.kind.clone()) else { return };
+                let gen = self.lv2_gen;
+                if let Some(tx) = self.lv2_req.as_mut() {
+                    if tx.push(Lv2Request::State { node, uri, gen, state }).is_err() {
+                        eprintln!("lv2 loader queue full: state for node {node} dropped");
+                    }
+                    return;
+                }
+                if let Some(slot) = restored_lv2_slot(node, uri.as_str(), &state, self.sample_rate) {
+                    self.adopt_restored_lv2(node, gen, slot);
                 }
             }
             Command::ProgramChange { node, program } => {
@@ -2488,6 +2557,9 @@ impl GraphEngine {
             if let Some(rec) = &mut self.recorder {
                 rec.push_stereo(data, ch);
             }
+            if let Some(listen) = &mut self.listen {
+                listen.push_stereo(data, ch);
+            }
             // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
             // output the user hears.
             self.meter.process(data, ch);
@@ -2518,7 +2590,6 @@ struct MasterLimiter {
     env: f32,
     gain: f32,
     rel: f32,
-    atk: f32,
     /// Mean square of the reference chain (`tanh` at `DRIVE_REF`, made up)
     /// and of the chain at the current WARM, over `LOUDNESS_SECS`.
     ms_ref: f32,
@@ -2569,7 +2640,7 @@ impl MasterLimiter {
     fn new(sample_rate: f64) -> Self {
         let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
         Self {
-            env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001),
+            env: 0.0, gain: 1.0, rel: coef(0.120),
             ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
             dc: [(0.0, 0.0); 2],
             dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
@@ -2622,8 +2693,11 @@ impl MasterLimiter {
         let peak = l.abs().max(r.abs());
         self.env = peak.max(self.env * self.rel);
         let target = if self.env > Self::CEILING { Self::CEILING / self.env } else { 1.0 };
-        let coef = if target < self.gain { self.atk } else { self.rel };
-        self.gain = coef * self.gain + (1.0 - coef) * target;
+        if target < self.gain {
+            self.gain = target;
+        } else {
+            self.gain = self.rel * self.gain + (1.0 - self.rel) * target;
+        }
         self.gain
     }
 }
@@ -2799,6 +2873,25 @@ mod master_limiter_tests {
             let (_, p) = run(amp);
             assert!((p - MasterLimiter::CEILING).abs() < 0.01, "amp {amp}: held at {p}");
         }
+    }
+
+    #[test]
+    fn sudden_chord_onset_never_overshoots_and_default_vol_stays_below_knee() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let default_vol = super::knob_specs(&crate::control::NodeKind::MasterOut)
+            .iter()
+            .find(|k| k.param == Some(super::P_VOL))
+            .unwrap()
+            .default;
+        let drive = 1.0 + 0.15 * 3.0;
+        let mut max_out = 0.0f32;
+        for i in 0..4800 {
+            let x = 4.0 * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin().max(0.001)
+                + if i == 0 { 4.0 } else { 0.0 };
+            let (l, _) = lim.process(x, x, drive, default_vol);
+            max_out = max_out.max(l.abs());
+        }
+        assert!(max_out <= MasterLimiter::KNEE, "default master_vol={default_vol} must keep chord onsets below knee ({max_out} > {})", MasterLimiter::KNEE);
     }
 }
 
@@ -3564,6 +3657,7 @@ mod tests {
             kind: NodeKind::Dsp(crate::control::DspKind::Gain),
             name: crate::control::name_bytes("G"),
             rig: 0,
+            wire: false,
         });
         engine.render(&mut buf, 2);
         assert_eq!(rev(), 1);
@@ -4321,7 +4415,7 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     // Through a built-in effect, like a live organ rig (setBfree → Drive →
     // Master): the effect must hear the LV2 instrument.
     let drive = master + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(crate::control::DspKind::Saturation), name: name_bytes("DRIVE"), rig: 0, wire: false });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: inst, port: 0 }, to: PortRef { node: drive, port: 0 }, kind: PortKind::Audio });
     bus.send(Command::Connect { id: 4, from: PortRef { node: drive, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
@@ -4356,7 +4450,7 @@ pub fn lv2_async_test() -> anyhow::Result<()> {
             engine.spawn_lv2_loader();
         }
         let inst = keys.max(master) + 1;
-        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0 });
+        bus.send(Command::AddNode { kind: NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name: name_bytes("VITALIUM"), rig: 0, wire: false });
         bus.send(Command::Connect { id: 1, from: PortRef { node: keys, port: 0 }, to: PortRef { node: inst, port: 0 }, kind: PortKind::Midi });
         bus.send(Command::Connect { id: 2, from: PortRef { node: inst, port: 0 }, to: PortRef { node: master, port: 0 }, kind: PortKind::Audio });
         let mut buf = vec![0.0f32; 256 * 2];
@@ -4510,12 +4604,13 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             anyhow::ensure!(last == Some([0xC0, *program, 0]), "the plugin's last MIDI event is {last:?}, expected programme change {program}");
             format!("programme change {program} reached the plugin")
         }
-        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) => {
+        Load::SurgePatch(_) | Load::DexedVoice { .. } | Load::ValueTreePatch(_) | Load::AeolusRegistration(_) => {
             let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
             let state = main.save_state()?;
             anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
             "plugin state changed".to_string()
         }
+        Load::VitalPatch(path) => vital_patch_readback(&mut engine, node, path)?,
         Load::Lv2Preset(uri) => {
             let preset = crate::lv2::discover_presets(instrument.id())
                 .into_iter().find(|p| p.uri == *uri).ok_or_else(|| anyhow::anyhow!("preset {uri} vanished"))?;
@@ -4535,20 +4630,62 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     anyhow::ensure!(after.rms > 1e-4, "'{label}' is silent (rms {:.5})", after.rms);
     let distance = before.distance(after);
     anyhow::ensure!(distance > 0.1, "'{label}' sounds like the sound before it (distance {distance:.3})");
-    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2})",
+    // Aeolus' face draws one stop the way the face does it (state out, one
+    // stop changed, state in): the pedal's Bourdon 16 must be heard and read back.
+    let mut stop = String::new();
+    if instrument.id() == crate::aeolus::AEOLUS_ID {
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let next = crate::aeolus::with_stop(&main.save_state()?, 3, 1, true).ok_or_else(|| anyhow::anyhow!("no Pedal Bourdon 16 in the state"))?;
+        main.load_state(&next)?;
+        for _ in 0..40 {
+            engine.render(&mut buf, 2);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let drawn = crate::aeolus::drawn(&main.save_state()?).ok_or_else(|| anyhow::anyhow!("the stops do not read back"))?;
+        anyhow::ensure!(drawn[3] == 0b10, "the pedal reads back {:#b}, expected only Bourdon 16", drawn[3]);
+        let bourdon = timbre_of_note(&mut engine, &mut bus, 60, sr);
+        let d = after.distance(bourdon);
+        anyhow::ensure!(d > 0.1, "drawing the Bourdon 16 changed nothing (distance {d:.3})");
+        stop = format!(" · stop Pedal Bourdon 16 drawn, reads back, rms {:.4} ~{:.0} Hz (distance {d:.2})", bourdon.rms, bourdon.zero_cross_hz);
+    }
+    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2}){stop}",
         library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
+}
+
+/// Does the node's Vitalium now hold `path`'s patch? Its saved state must
+/// carry the patch's settings: every number in it, wavetables aside, and
+/// the tempo, which follows the host's song clock.
+fn vital_patch_readback(engine: &mut GraphEngine, node: NodeId, path: &std::path::Path) -> anyhow::Result<String> {
+    let parse = |bytes: &[u8]| -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::from_str(String::from_utf8_lossy(bytes).trim_end_matches('\0'))?)
+    };
+    let patch = parse(&std::fs::read(path)?)?;
+    let slot = engine.lv2.iter_mut().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+    let saved = parse(&slot.plugin.saved_state("urn:juce:stateBinary")?)?;
+    let (want, have) = (&patch["settings"], &saved["settings"]);
+    let numbers: Vec<(&String, f64)> = want.as_object().into_iter().flatten().filter(|(k, _)| *k != "beats_per_minute").filter_map(|(k, v)| Some((k, v.as_f64()?))).collect();
+    let same = numbers.iter().filter(|(k, v)| have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0))).count();
+    let differ: Vec<String> = numbers.iter().filter(|(k, v)| !have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0)))
+        .map(|(k, v)| format!("{k} {v} → {}", have[k.as_str()])).collect();
+    anyhow::ensure!(!numbers.is_empty() && same == numbers.len(), "{same} of {} patch settings hold the patch's value ({})", numbers.len(), differ.join(", "));
+    Ok(format!("{same}/{} patch settings hold the patch's values", numbers.len()))
 }
 
 /// `sound-library-test`: every catalog instrument installed on this machine
 /// lists its sound library, answers a search and loads one sound through
 /// the real engine, proven by a readback and by the note sounding different.
-pub fn sound_library_test() -> anyhow::Result<()> {
+/// `queries` (`<catalog id>=<words>`) replace the built-in search per
+/// instrument, e.g. `vitalium=woody` to load an imported Vital patch.
+pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
     use crate::sounds::Instrument;
+    let asked = |id: &str| queries.iter().find_map(|q| q.strip_prefix(id).and_then(|r| r.strip_prefix('=')).map(str::to_string));
     // A search the instrument's library should answer.
-    let query = |id: &str| match id {
+    let builtin = |id: &str| match id {
         "setbfree" => "jazz",
         "dexed" => "brass",
         "vitalium" => "pad",
+        "aeolus" => "flute",
         _ => "bass",
     };
     let clap = crate::host::list_clap_plugins();
@@ -4569,7 +4706,8 @@ pub fn sound_library_test() -> anyhow::Result<()> {
             println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
                 if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
         }
-        match sound_library_check(&instrument, query(entry.id)) {
+        let query = asked(entry.id).unwrap_or_else(|| builtin(entry.id).to_string());
+        match sound_library_check(&instrument, &query) {
             Ok(line) => println!("  {:<9} {line}", entry.name),
             Err(e) => {
                 println!("  {:<9} FAILED: {e:#}", entry.name);
@@ -4602,7 +4740,7 @@ pub fn add_node_test() -> anyhow::Result<()> {
 
     // Insert a dynamically added gain node: surge -> gain -> master.
     let gain = keys.max(surge).max(master) + 1;
-    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0 });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false });
     bus.send(Command::SetParam { node: gain, param: 0, value: 1.0 });
     bus.send(Command::Disconnect(2));
     bus.send(Command::Connect { id: 3, from: PortRef { node: surge, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });

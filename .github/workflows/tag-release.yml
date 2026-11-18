@@ -1,0 +1,34 @@
+name: Tag release
+
+# When a merge to main sets a Cargo.toml version that has no tag yet (the
+# release PR from prepare-release.yml, or one made by hand), tag that commit
+# vX.Y.Z and start release.yml on it. A tag pushed with GITHUB_TOKEN starts
+# no workflow by itself, hence the dispatch.
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag a new version and start the release
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          tag=v$version
+          if git ls-remote --exit-code origin "refs/tags/$tag" > /dev/null; then
+            echo "$tag exists; nothing to release"
+            exit 0
+          fi
+          scripts/ci/release-notes.sh "$version" > /dev/null
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          gh workflow run release.yml --ref "$tag"
+          echo "tagged $GITHUB_SHA as $tag and started release.yml"

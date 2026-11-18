@@ -4,10 +4,13 @@ How kabelsalat is tested on GitHub, which packages a release ships and how to
 cut one. Workflows live in `.github/workflows/`, and every packaging step is a
 script that also runs on a developer machine (in docker).
 
-## CI on every push and pull request
+## CI on every pull request and on main
 
-`.github/workflows/ci.yml` runs on x86_64 (`ubuntu-24.04`) and aarch64
-(`ubuntu-24.04-arm`):
+`.github/workflows/ci.yml` runs once per pull request push (`pull_request`) and
+again on `main` after each merge, on x86_64 (`ubuntu-24.04`) and aarch64
+(`ubuntu-24.04-arm`). A PR waits about 4 minutes for it. CI is the technical
+sanity check that lets agents merge on their own: build, unit suite, images,
+changelog fragments. Packaging is checked by the nightly build, not per PR.
 
 - `cargo build --locked`, then `scripts/ci/test.sh`: `cargo test --bin
   kabelsalat`, green only when cargo exits 0 and prints `test result: ok`
@@ -26,15 +29,55 @@ script that also runs on a developer machine (in docker).
   `lv2::tests::reused_vitalium_starts_fresh_and_still_plays`,
   `ui::tests::vitalium_and_dexed_editor_support`. Run them, and the CLI
   self-tests listed in AGENTS.md, on a machine with those plugins.
-- `cargo fmt --check` is not run: the tree is not rustfmt-formatted.
-- A second job regenerates `packaging/flatpak/cargo-sources.json` from
-  `Cargo.lock` and fails when the committed file differs.
+- `scripts/check-images.sh` (AGENTS.md rule 108) and `scripts/release.py
+  check` (changelog fragments parse) run first; both take under a second.
+- `cargo fmt --check` is not run: the tree is not rustfmt-formatted, and a
+  one-off reformat would conflict with every open PR. Do it in a quiet moment,
+  then make it a required check.
+
+### Feature PRs update the README
+
+`.github/workflows/readme-check.yml` runs on every PR and on every label
+change. A PR labelled `enhancement` must also change `README.md`, or the
+check fails (AGENTS.md rule 132): the README is the shop window, and a feature that merges
+without its entry there (the plugin editor windows, #71) is invisible to
+anyone who only reads it. When such a PR changes `src/ui.rs` or
+`src/theme.rs` without touching a screenshot under `docs/shots/`, the check
+warns on the file instead — whether users can see the difference is the
+author's call, so labelling only real features keeps the fail meaningful.
+The logic is `scripts/ci/readme-check.sh`, self-tested on real `gh api`
+output (`--selftest`); like every check except the two test jobs it is
+advisory until someone makes it required.
+
+### Branch protection and a red main
+
+`main` requires `test (x86_64)` and `test (aarch64)`, but not that a branch
+is up to date: with several agents' PRs open, "up to date" made every merge
+re-run every other PR's CI, one after another. A PR merges as soon as its own run is green.
+
+The price is that two PRs, green on their own, can break `main` together.
+CI on `main` catches that within minutes, and `.github/workflows/main-health.yml`
+opens one issue labelled `main-red` with the failing run (and closes it when
+`main` is green again). Fix forward with a PR, or revert the breaking merge.
+
+### Conflicts between parallel PRs
+
+Parallel PRs append to the same lists, above all the AGENTS.md rules. After
+every merge to `main`, `.github/workflows/resolve-conflicts.yml` merges `main`
+into each open PR that now conflicts, when every conflict is an insertion on
+both sides of a Markdown file: `scripts/ci/resolve_appends.py` keeps both
+(two rules may then share a number; refer to rules by their test name too).
+It pushes the merge and dispatches CI. Any other conflict, including every
+conflict in code, gets the label `merge-conflict` and a comment; the branch's
+author resolves it (the script also works locally inside a conflicted
+`git merge`). Changelog entries are fragments (below), so they never conflict.
 
 ## Release packages
 
-`.github/workflows/release.yml` runs on a pushed `v*` tag, and by hand from the
-Actions tab (`workflow_dispatch`, version `<crate version>-dev.<sha>`, no
-release). Each package is built natively for x86_64 and aarch64:
+`.github/workflows/release.yml` runs on a `v*` tag (pushed, or created by
+`tag-release.yml`), every night at 03:17 UTC on `main` (the `nightly`
+pre-release, below), and by hand from the Actions tab (`workflow_dispatch`,
+version `<crate version>-dev.<sha>`, no release). Each package is built natively for x86_64 and aarch64:
 
 | Package | Built by | Built on | Notes |
 | --- | --- | --- | --- |
@@ -87,7 +130,7 @@ App id `io.github.ssalentin.kabelsalat`, runtime `org.freedesktop.Platform`
 26.08, Rust from `org.freedesktop.Sdk.Extension.rust-stable`. The manifest
 `packaging/flatpak/io.github.ssalentin.kabelsalat.yml` builds lv2, zix, serd,
 sord, sratom and lilv (the runtime has none of them), then kabelsalat offline
-from `cargo-sources.json`.
+from `cargo-sources.json` (generated from `Cargo.lock` by `build.sh`).
 
 Install and run a bundle:
 
@@ -98,8 +141,8 @@ flatpak run io.github.ssalentin.kabelsalat
 
 Sandbox permissions, and what they are for:
 
-- X11 and Wayland, `dri`: the window. The app prefers X11 (XWayland renders
-  it 1:1) and uses Wayland when no X server is reachable.
+- Wayland and `dri`: the window. The app is a native Wayland client; it
+  needs no X server.
 - `pulseaudio` socket and `xdg-run/pipewire-0`: the runtime's `pactl`, `parec`,
   `paplay` and `pw-record` (system-audio capture, audio inputs, app streams)
   run inside the sandbox and talk to the host's sound server. No
@@ -133,17 +176,6 @@ Known limits:
 - The instrument catalog's "is it installed" probe looks at `/usr/lib/clap`
   and `/usr/lib/lv2`, which are empty in the sandbox.
 
-### When Cargo.lock changes
-
-Regenerate the vendored crate list and commit it with the lock file:
-
-```sh
-packaging/flatpak/update-cargo-sources.sh
-```
-
-It runs `flatpak-cargo-generator` from the builder image (through docker when
-the tool is not installed). CI fails while the committed file is stale.
-
 ## Build a package locally
 
 Each script runs on the host it targets, as in CI. With docker:
@@ -163,19 +195,45 @@ The tarball and AppImage scripts take a built binary:
 `packaging/appimage.sh target/release/kabelsalat 0.1.0 dist`. Keep build
 output out of `/tmp` (AGENTS.md rule 79).
 
-## Cut a release
+## Nightly
 
-1. Move the CHANGELOG **Unreleased** block under `## [X.Y.Z] — <date>` and
-   add the compare links at the bottom.
-2. Bump `version` in `Cargo.toml` (and `Cargo.lock`, by building once).
-3. Add `<release version="X.Y.Z" date="...">` at the top of `<releases>` in
-   `packaging/flatpak/io.github.ssalentin.kabelsalat.metainfo.xml`.
-4. If `Cargo.lock` changed beyond the version, run
-   `packaging/flatpak/update-cargo-sources.sh`.
-5. Commit on a `release-X.Y.Z` branch and open a PR (`main` is protected;
-   the PR touches `Cargo.toml`, so it waits for `human-approved`). Once it
-   is merged, tag the merge commit on `main` `vX.Y.Z` and push the tag.
+Every night the release workflow builds all packages from `main` (skipped
+when `main` has not moved) and replaces the GitHub pre-release `nightly`, tag
+included, with them. Its notes are `scripts/release.py notes`: what the next
+release will say. A pre-release is never "latest", so the fixed
+`releases/latest/download/…` links and AppImage self-updates keep serving the
+last stable release. A failed nightly is a packaging bug to fix before the
+next release.
 
-The release workflow checks that the tag matches `Cargo.toml`, that the
-CHANGELOG has notes for it and that the metainfo lists it, then builds every
-package and publishes the release.
+## Releases
+
+Every PR with a user-visible change adds a changelog fragment,
+`changes/<branch>.md` (format in `changes/README.md`), instead of editing
+`CHANGELOG.md`: parallel PRs never conflict on it. Entries still under
+`## [Unreleased]` in `CHANGELOG.md` are folded in too.
+
+Cut a release with one action:
+
+```sh
+gh workflow run prepare-release.yml -f bump=minor   # patch | minor | major | X.Y.Z
+```
+
+1. `prepare-release.yml` runs `scripts/release.py prepare <bump>`: it bumps
+   `Cargo.toml` and `Cargo.lock`, folds the fragments and the Unreleased
+   block into `## [X.Y.Z] — <date>` (with compare links), adds the metainfo
+   `<release>` entry and deletes the fragments. It opens the PR
+   `release-X.Y.Z`, queues it for auto-merge and dispatches CI on it (a PR
+   opened with `GITHUB_TOKEN` starts no workflow by itself).
+2. When it merges, `tag-release.yml` sees a `Cargo.toml` version without a
+   tag, tags the merge commit `vX.Y.Z` and dispatches `release.yml` on it.
+3. `release.yml` checks that the tag matches `Cargo.toml`, that the CHANGELOG
+   has notes for it and that the metainfo lists it, then builds every package
+   and publishes the release. Check it with `gh release view vX.Y.Z --json
+   assets`.
+
+The same works without the workflow: run `scripts/release.py prepare minor`
+on a `release-X.Y.Z` branch, open the PR and queue it; step 2 follows on
+merge.
+
+While the version is `0.x`, a release with new features is a minor, one with
+only fixes a patch.

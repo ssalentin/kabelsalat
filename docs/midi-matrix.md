@@ -56,8 +56,11 @@ Per event, each matching rule applies, in order:
    **unchanged** (CC7 stays CC7). The cc→param binding is rule metadata
    (`rule.param_for_cc(cc)`) that the destination applies — see integration
    below. Key/velocity ranges never apply to CCs.
-5. **Everything else** (pitch bend, program change, aftertouch) passes after
-   the channel filter, untransformed.
+5. **Poly aftertouch** presses one played key, so it takes that key's path:
+   filtered by the key range and transposed like a note.
+6. **Everything else** (pitch bend, program change, channel aftertouch, which
+   is how wind controllers send breath) passes after the channel filter,
+   untransformed.
 
 **Stateless by design:** the matrix tracks no held notes. If rules change
 while notes are held (range/transpose edits), a release can be orphaned —

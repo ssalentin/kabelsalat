@@ -1022,6 +1022,14 @@ Learned so far (2026-11-15, UI polish pass):
     knob). Every "is this knob bound?" question goes through
     `DemoApp::binds_knob`
     (`an_agent_param_binding_on_a_built_in_unit_shows_like_a_learned_one`).
+156. **Decode a MIDI message by its type before its length:** the hardware
+    input dropped everything shorter than 3 bytes before looking at the
+    status, so channel aftertouch (2 bytes: how wind controllers send breath)
+    never reached an instrument. `hw_expression` reads the status first and
+    each type's own length; an LV2 plugin gets a message at its wire length
+    (`MidiMsg::wire`), never padded to 3 bytes
+    (`a_wind_controllers_breath_and_bend_become_engine_commands`,
+    `kabelsalat wind-test`).
 
 ## Working on kabelsalat
 

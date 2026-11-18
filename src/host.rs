@@ -399,7 +399,7 @@ impl ClapVoice {
         let n_out = out_chs.len();
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            plugin_id: id_str,
+            plugin_id: id_str.clone(),
             processor,
             cmds_tx: Arc::new(Mutex::new(cmds_tx)),
             cmds_rx,
@@ -426,6 +426,7 @@ impl ClapVoice {
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
         };
+        let main_id = id_str;
         let mut main = ClapVoiceMain {
             instance: plugin,
             exts,
@@ -434,6 +435,9 @@ impl ClapVoice {
             _entry: entry,
         };
         main.refresh_main_controls();
+        if let Some(state) = crate::aeolus::initial_state(&main_id) {
+            main.load_state(&state).with_context(|| format!("starting {main_id} with a registration"))?;
+        }
         Ok((voice, main))
     }
 

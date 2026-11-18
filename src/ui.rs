@@ -533,6 +533,9 @@ struct Knob {
     default: f32,
     /// Engine param id this knob publishes (None = visual-only knob).
     param: Option<u32>,
+    /// > 1 = a stepped picker (MODE, RATE, …): the value snaps to this many
+    /// evenly spaced positions — on drag, on load, and before publishing.
+    steps: u8,
     /// Hidden from the face (still settable/bindable — e.g. AudioIn MON, shown
     /// as a chip instead of a knob). Skipped by draw + face-layout audit.
     hidden: bool,
@@ -569,8 +572,25 @@ impl KnobSource {
 }
 
 impl Knob {
+    /// Snap to the knob's steps (a no-op on a continuous knob).
+    fn quantize(&self, v: f32) -> f32 {
+        if self.steps < 2 {
+            return v.clamp(0.0, 1.0);
+        }
+        let n = (self.steps - 1) as f32;
+        (v.clamp(0.0, 1.0) * n).round() / n
+    }
+
+    /// The knob's current value as a step index (0-based, for readouts).
+    fn step_index(&self) -> usize {
+        if self.steps < 2 {
+            return 0;
+        }
+        (self.value * (self.steps - 1) as f32).round().clamp(0.0, (self.steps - 1) as f32) as usize
+    }
+
     fn set_immediate(&mut self, v: f32) {
-        let v = v.clamp(0.0, 1.0);
+        let v = self.quantize(v);
         self.value = v;
         self.display_value = v;
         self.glide_from = v;
@@ -578,7 +598,7 @@ impl Knob {
     }
 
     fn glide_to(&mut self, v: f32, reduce_motion: bool) {
-        let v = v.clamp(0.0, 1.0);
+        let v = self.quantize(v);
         self.value = v;
         if reduce_motion || (self.display_value - v).abs() < 1e-4 {
             self.display_value = v;
@@ -664,6 +684,8 @@ enum UnitKind {
     Master,
     /// Live audio input (mic/guitar/interface): a source with an audio OUT.
     AudioIn,
+    /// The arpeggiator / chord unit (issue #90): one MIDI in, one MIDI out.
+    Arp,
 }
 
 struct Unit {
@@ -739,6 +761,7 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
         glide_t: 1.0,
         default,
         param,
+        steps: 0,
         hidden: false,
         sent: None,
         clap: None,
@@ -747,23 +770,20 @@ fn knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
     }
 }
 
+/// Build a stepped knob (a picker: MODE, RATE …): `steps` even positions.
+fn stepped_knob(label: &'static str, default: f32, param: Option<u32>, steps: u8) -> Knob {
+    let mut k = knob(label, default, param);
+    k.steps = steps.max(2);
+    k.set_immediate(default);
+    k
+}
+
 /// A hidden knob (drive-by chip/param, not drawn on the face). Still bindable
 /// and persisted; the face renders its state as a chip instead.
 fn hidden_knob(label: &'static str, default: f32, param: Option<u32>) -> Knob {
-    Knob {
-        label: label.to_string(),
-        value: default,
-        display_value: default,
-        glide_from: default,
-        glide_t: 1.0,
-        default,
-        param,
-        hidden: true,
-        sent: None,
-        clap: None,
-        source: KnobSource::BuiltIn,
-        label_g: None,
-    }
+    let mut k = knob(label, default, param);
+    k.hidden = true;
+    k
 }
 
 /// Which plugin moves a main-control knob.
@@ -786,6 +806,9 @@ fn main_knob(c: &crate::main_controls::MainControl, value: f64, target: MainTarg
         glide_t: 1.0,
         default: c.normalized(c.default),
         param: matches!(target, MainTarget::Lv2).then_some(c.id),
+        // Plugin parameters keep their own stepping (the plugin rounds);
+        // the rack's stepped knobs are the built-in ones (knob_specs).
+        steps: 0,
         hidden: false,
         sent: Some(norm),
         clap: matches!(target, MainTarget::Clap)
@@ -1157,6 +1180,14 @@ struct KnobMenu {
     pos: Pos2,
 }
 
+/// The Keys-face scale picker, opened from the SCALE chip's readout:
+/// which Keys unit, at which screen position.
+#[derive(Clone, Copy)]
+struct ScaleMenu {
+    unit: usize,
+    pos: Pos2,
+}
+
 /// One bit per note source for `notes_down`: the computer keyboard, each
 /// hardware device (indices past 29 share a bit), everything else.
 fn note_source_bit(src: SourceId) -> u32 {
@@ -1171,6 +1202,14 @@ fn note_source_bit(src: SourceId) -> u32 {
 fn note_name(n: u8) -> String {
     const NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
     format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
+}
+
+/// The Keys-face SCALE readout text: key + a scale short enough for the
+/// field ("C MIN", "F# H.MIN"). The menu spells the scale out.
+fn short_scale_label(c: crate::arp::ScaleChoice) -> String {
+    const SHORT: [&str; 8] = ["MAJ", "MIN", "DOR", "MIX", "H.MIN", "PENTA", "M.PEN", "BLUES"];
+    let i = crate::arp::Scale::ALL.into_iter().position(|s| s == c.scale).unwrap_or(0);
+    format!("{} {}", crate::arp::KEY_NAMES[c.key.min(11) as usize], SHORT[i])
 }
 
 /// One matrix click on an instrument's sources: keyboard is a switch,
@@ -1365,7 +1404,17 @@ fn make_unit(node: &Node) -> Unit {
     // Knobs come from the one table agents resolve names against (#19).
     let knobs: Vec<Knob> = crate::engine::knob_specs(&node.kind)
         .iter()
-        .map(|k| if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) })
+        .map(|k| {
+            let mut k2 = if k.hidden { hidden_knob(k.label, k.default, k.param) } else { knob(k.label, k.default, k.param) };
+            if k.steps > 1 && !k.hidden {
+                k2 = stepped_knob(k.label, k.default, k.param, k.steps);
+            } else if k.steps > 1 {
+                // A hidden stepped knob (organ drawbars): snaps without a face.
+                k2.steps = k.steps;
+                k2.set_immediate(k.default);
+            }
+            k2
+        })
         .collect();
     let (node_kind, sub, ins, outs, jacks): (
         UnitKind, String, Vec<PortKind>, Vec<PortKind>, Vec<(Dir, usize, f32, &'static str)>,
@@ -1421,6 +1470,11 @@ fn make_unit(node: &Node) -> Unit {
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
             vec![], vec![PortKind::Audio],
             vec![(Dir::Out, 0, 0.62, "OUT")],
+        ),
+        NodeKind::Arp => (
+            UnitKind::Arp, "midi arp · chord mode".into(),
+            vec![PortKind::Midi], vec![PortKind::Midi],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "MIDI OUT")],
         ),
         NodeKind::AudioIn { device, channels } => (
             UnitKind::AudioIn, audio_in_sub(device.as_deref(), *channels),
@@ -1585,6 +1639,13 @@ struct HelpRow {
 const FACE_CTL_H: f32 = 24.0;
 const SPLIT_CHIP_W: f32 = 58.0;
 const SPLIT_READOUT_W: f32 = 46.0;
+/// Keys-face SCALE readout width: "C MAJOR" in Medium 12 with ≥ 8px padding.
+const SCALE_READOUT_W: f32 = 64.0;
+/// Arp face status field (mode · rate · octaves) and the least it is drawn at.
+const ARP_STATUS_W: f32 = 168.0;
+/// The narrowest face width (past its margins) the stacked SCALE control takes.
+const SCALE_NARROW_MIN_W: f32 = 96.0;
+const ARP_STATUS_MIN_W: f32 = 120.0;
 const BPM_STEP_W: f32 = 22.0;
 const BPM_VALUE_W: f32 = 66.0;
 const METRO_TAP_W: f32 = 48.0;
@@ -1845,6 +1906,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
     "save_rig", "load_rig", "list_rig_presets",
     "list_instruments", "install_instrument", "play_file", "stop_file",
+    "set_scale", "set_arp",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2141,6 +2203,7 @@ struct DemoApp {
     caption_output_g: Option<Arc<theme::TrackedLabel>>,
     caption_echoes_g: Option<Arc<theme::TrackedLabel>>,
     caption_notes_g: Option<Arc<theme::TrackedLabel>>,
+    /// The arp face's caption (issue #90).
     state_pause_g: Option<Arc<theme::TrackedLabel>>,
     hint_front_g: Option<Arc<Galley>>,
     hint_back_g: Option<Arc<Galley>>,
@@ -2246,6 +2309,9 @@ struct DemoApp {
     cc_learn: Option<CcLearn>,
     knob_menu: Option<KnobMenu>,
     knob_menu_rect: Rect,
+    /// The Keys-face scale picker (issue #90), open on a SCALE readout.
+    scale_menu: Option<ScaleMenu>,
+    scale_menu_rect: Rect,
     rule_cc_num: u8,
     rule_param_id: u32,
     rule_param_filter: String,
@@ -2610,6 +2676,8 @@ impl DemoApp {
             cc_learn: None,
             knob_menu: None,
             knob_menu_rect: Rect::NOTHING,
+            scale_menu: None,
+            scale_menu_rect: Rect::NOTHING,
             rule_cc_num: 74,
             rule_param_id: 0,
             rule_param_filter: String::new(),
@@ -2877,7 +2945,7 @@ impl DemoApp {
             cols.push(col);
         }
         for i in 0..self.units.len() {
-            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_)) {
+            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::Dsp(_) | UnitKind::Arp) {
                 claimed[i] = true;
                 cols.push(vec![i]);
             }
@@ -3827,6 +3895,14 @@ impl DemoApp {
             }
             self.base_graph.set_split(n.id, n.split);
             if let Some(sg) = shared.as_mut() { sg.set_split(n.id, n.split); }
+            // Scale snap (a Keys property, issue #90): adopted in place like
+            // the split — a remote set_scale flips the face without a rebuild.
+            let was_scale = self.base_graph.node(n.id).map(|old| old.scale);
+            if was_scale.is_some_and(|w| w != n.scale) && now >= self.ui_node_grace.get(&n.id).copied().unwrap_or(-1.0) {
+                touched_nodes.push(n.id);
+            }
+            self.base_graph.set_scale(n.id, n.scale);
+            if let Some(sg) = shared.as_mut() { sg.set_scale(n.id, n.scale); }
             // Zone octaves ride along (set_split above reset them on unsplit).
             if n.split.is_some() {
                 let was_oct = self.base_graph.node(n.id).map(|o| o.zone_octave);
@@ -5151,6 +5227,74 @@ impl DemoApp {
                     None => format!("keys node {node} unsplit — one MIDI OUT (port 0), HIGH cables removed, octaves reset"),
                 }
             }
+            "set_scale" => {
+                // Keys scale snap (issue #90): key + scale, or off.
+                let unit = match args.get("node").and_then(|v| v.as_u64()) {
+                    Some(n) => self.units.iter().position(|u| u.node_id == n as u32),
+                    None => self.keys_unit,
+                };
+                let Some(unit) = unit.filter(|&u| matches!(self.units[u].node_kind, UnitKind::Keys)) else {
+                    return "set_scale needs a Keys node (get_graph kind Keys; omit = the one in view)".into();
+                };
+                let node = self.units[unit].node_id;
+                let choice = if args.get("off").and_then(|v| v.as_bool()) == Some(true) {
+                    None
+                } else {
+                    let key = match args.get("key").and_then(|v| v.as_str()) {
+                        Some(k) => match crate::arp::key_from_name(k) {
+                            Some(k) => k,
+                            None => return format!("set_scale: '{k}' is not a key (C, C#, D, … B, or 0..11)"),
+                        },
+                        None => args.get("key").and_then(|v| v.as_u64()).map(|k| (k.min(11)) as u8).unwrap_or(0),
+                    };
+                    let scale = match args.get("scale").and_then(|v| v.as_str()) {
+                        Some(s) => match crate::arp::Scale::from_name(s) {
+                            Some(s) => s,
+                            None => return format!("set_scale: '{s}' is not a scale (major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues)"),
+                        },
+                        None => crate::arp::Scale::Major,
+                    };
+                    Some(crate::arp::ScaleChoice { key, scale })
+                };
+                self.ui_node_grace.insert(node, self.ui_time + 0.6);
+                self.set_keys_scale(unit, choice);
+                if self.graph_pub.is_some() {
+                    self.pending_agent_origin = Some((origin, now + 1.0));
+                }
+                let summary = match choice {
+                    Some(c) => format!("Keys snap to {}", c.label()),
+                    None => "Keys scale snap off".into(),
+                };
+                self.agent_activity.record(origin, summary.clone(), vec![node], now);
+                match choice {
+                    Some(c) => format!("keys node {node}: out-of-scale keys now snap to the nearest in-scale note — {}", c.label()),
+                    None => format!("keys node {node}: scale snap off — every key plays as pressed"),
+                }
+            }
+            "set_arp" => {
+                // The arp unit's knobs by name (issue #90).
+                let Some(node) = args.get("node").and_then(|v| v.as_u64()) else {
+                    return "set_arp needs 'node' (an arp node id from get_graph)".into();
+                };
+                let Some(unit) = self.units.iter().position(|u| u.node_id == node as u32
+                    && matches!(u.node_kind, UnitKind::Arp)) else {
+                    return format!("node {node} is not an arp unit (get_graph kind arp)");
+                };
+                let wanted = match crate::arp::knob_values_from_args(args) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
+                let applied: Vec<&'static str> = wanted.iter()
+                    .filter_map(|&(label, _, v)| {
+                        let i = self.units[unit].knob_index(label)?;
+                        self.set_unit_knob(unit, i, v);
+                        Some(label)
+                    })
+                    .collect();
+                self.agent_activity.touch_rig(self.units[unit].rig as usize, now);
+                self.agent_activity.record(origin, format!("Arp → {}", applied.join(", ").to_lowercase()), vec![node as u32], now);
+                format!("arp node {node}: {} set", applied.join(", ").to_lowercase())
+            }
             "save_session" => {
                 let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("Untitled");
                 match self.save_session_as(&Self::sessions_dir(), name) {
@@ -5814,6 +5958,7 @@ impl DemoApp {
                 let kind = match kind_str.as_str() {
                     "keys" => Some(NodeKind::Keys),
                     "clap" => Some(NodeKind::Clap { plugin_id: name_bytes(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
+                    "arp" | "arpeggiator" => Some(NodeKind::Arp),
                     "dsp" => match args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().as_str() {
                         "gain" => Some(NodeKind::Dsp(DspKind::Gain)),
                         "pan" => Some(NodeKind::Dsp(DspKind::Pan)),
@@ -5849,17 +5994,22 @@ impl DemoApp {
                         }
                         self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
                     }
+                    // An arp inserts between the rig's Keys and its synth(s).
+                    Some(NodeKind::Arp) => true,
                     _ => false,
                 };
                 match kind {
                     Some(k) => {
+                        let is_arp = matches!(k, NodeKind::Arp);
                         if let Some(bus) = &self.bus {
                             let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8, wire });
                             if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                         }
                         self.agent_activity.touch_rig(rig, now);
                         self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
-                        if wire {
+                        if wire && is_arp {
+                            format!("added an arp to rig {rig} '{}', inserted like GarageBand's: the rig's Keys → arp (MIDI) and arp → the rig's synth(s) (MIDI); held keys now arpeggiate (MODE/RATE/OCT/GATE/SWING/CHORD are its face knobs)", self.rig_name(rig))
+                        } else if wire {
                             format!("added {kind_str} instrument to rig {rig} '{}', wired like a standard rig: the rig's Keys → it (MIDI) and it → the rig's Master L and R (audio); do not connect these again", self.rig_name(rig))
                         } else {
                             format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
@@ -6502,10 +6652,11 @@ impl DemoApp {
 
     // -- hot-wire MIDI matrix ------------------------------------
 
-    /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments).
+    /// Matrix sink columns: instrument units (CLAP voices + LV2 instruments),
+    /// plus arp units (a MIDI destination whose input routes by matrix rules).
     fn matrix_sinks(&self) -> Vec<usize> {
         self.units.iter().enumerate()
-            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst)
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Clap) || u.lv2_inst || matches!(u.node_kind, UnitKind::Arp))
             .map(|(i, _)| i)
             .collect()
     }
@@ -6962,6 +7113,14 @@ impl DemoApp {
             UnitKind::Master => vec![(P_VOL, "Volume".into()), (P_WARM, "Warmth".into())],
             UnitKind::Keys => Vec::new(),
             UnitKind::AudioIn => vec![(P_AUDIO_IN_GAIN, "Gain".into()), (P_AUDIO_IN_MONITOR, "Monitor".into())],
+            UnitKind::Arp => vec![
+                (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
+                (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
+                (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
+                (crate::arp::P_ARP_GATE, "Gate".into()),
+                (crate::arp::P_ARP_SWING, "Swing".into()),
+                (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
+            ],
         }
     }
 
@@ -11400,7 +11559,7 @@ impl DemoApp {
             label: crate::main_controls::knob_label(&p.name),
             value: norm, display_value: norm, glide_from: norm, glide_t: 1.0,
             default: (((p.default - p.min) / span) as f32).clamp(0.0, 1.0),
-            param: None, hidden: false, sent: Some(norm),
+            param: None, hidden: false, sent: Some(norm), steps: 0,
             clap: Some(ClapPin { id: p.id, min: p.min, max: p.max, sent: norm, hold_until: 0.0 }),
             source: KnobSource::Pinned(p.name.clone()), label_g: None,
         });
@@ -11893,6 +12052,23 @@ impl DemoApp {
         }
         self.base_graph.set_split(node, point);
         if let Ok(mut g) = self.shared_graph.lock() { g.set_split(node, point); }
+    }
+
+    /// Set or clear a Keys unit's scale snap (face picker, assistant). The
+    /// engine releases held notes on every instrument the node feeds and
+    /// publishes; headless applies locally. Returns false for a non-Keys unit.
+    fn set_keys_scale(&mut self, unit: usize, choice: Option<crate::arp::ScaleChoice>) -> bool {
+        let Some(u) = self.units.get(unit) else { return false };
+        if !matches!(u.node_kind, UnitKind::Keys) { return false; }
+        let node = u.node_id;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetKeysScale { node, scale: choice });
+        }
+        if self.graph_pub.is_none() {
+            self.base_graph.set_scale(node, choice);
+            if let Ok(mut g) = self.shared_graph.lock() { g.set_scale(node, choice); }
+        }
+        true
     }
 
     /// Unit names fed by a Keys unit's output `port` (living MIDI cables).
@@ -12401,6 +12577,8 @@ impl DemoApp {
             FACE_X + meter + KNOB_LABEL_W / 2.0 + KNOB_SLOT_HALF + (own - 1) as f32 * KNOB_PITCH + FACE_PAD_R
         };
         // The title clears the LED (top right); the subtitle row runs under it.
+        // Keys: the SCALE control (chip + readout) on its own row when narrow.
+        let keys_ctl = if matches!(u.node_kind, UnitKind::Keys) { FACE_X + SPLIT_CHIP_W + 1.0 + SCALE_READOUT_W + FACE_PAD_R } else { 0.0 };
         let title = FACE_X + u.name_g.as_ref().map_or(0.0, |g| g.size().x) + 30.0;
         let sub = FACE_X + u.sub_g.as_ref().map_or(0.0, |g| g.size.x) + 10.5;
         knobs.max(title).max(sub).max(FACE_MIN_W).ceil()
@@ -12573,6 +12751,7 @@ impl DemoApp {
             if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
+                else if self.scale_menu.is_some() { self.scale_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
@@ -12710,6 +12889,17 @@ impl DemoApp {
         }
         if pressed && self.knob_menu.is_some() {
             self.knob_menu = None;
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        // The scale picker owns its clicks the same way: a press on its Area
+        // is its own widget's; a press anywhere else closes it.
+        if self.scale_menu.is_some() && self.scale_menu_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
+        if pressed && self.scale_menu.is_some() {
+            self.scale_menu = None;
             self.hover = Some(Hit::Background);
             return;
         }
@@ -12941,6 +13131,20 @@ impl DemoApp {
                     Some(Hit::Unit(ui)) if self.side == Side::Front
                         && self.zone_rects(ui).map_or(false, |z| z.iter().any(|z| z.value.contains(l.to_pos2()))) => {
                         // A click on a zone readout is not a ping.
+                    }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.scale_rects(ui).map_or(false, |(chip, readout)|
+                            chip.contains(l.to_pos2()) || readout.contains(l.to_pos2())) => {
+                        // Keys-face SCALE (issue #90): the lit chip snaps off,
+                        // the readout (or the whole OFF control) opens the picker.
+                        let (chip, _) = self.scale_rects(ui).unwrap();
+                        if self.keys_scale(ui).is_some() && chip.contains(l.to_pos2()) {
+                            let nid = self.units[ui].node_id;
+                            self.ui_node_grace.insert(nid, self.ui_time + 0.6);
+                            self.set_keys_scale(ui, None);
+                        } else {
+                            self.scale_menu = Some(ScaleMenu { unit: ui, pos: s });
+                        }
                     }
                     Some(Hit::Unit(ui)) if self.side == Side::Front && self.on_face_field(ui, l.to_pos2()) => {
                         // A click on a drag readout (split point / BPM) is not a ping.
@@ -13199,7 +13403,7 @@ impl DemoApp {
             .filter(|(_, u)| match u.node_kind {
                 UnitKind::Clap => true,
                 UnitKind::AudioIn => true,
-                UnitKind::Keys | UnitKind::Master => false,
+                UnitKind::Keys | UnitKind::Master | UnitKind::Arp => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })
@@ -13609,6 +13813,7 @@ impl DemoApp {
                 UnitKind::Keys => {
                     self.draw_notes_display(painter, ui);
                     self.draw_split_face(painter, ui);
+                    self.draw_scale_face(painter, ui);
                     self.draw_zone_octaves(painter, ui);
                 }
                 UnitKind::Clap => {
@@ -13621,6 +13826,7 @@ impl DemoApp {
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, ui),
                 UnitKind::AudioIn => self.draw_audio_in_face(painter, ui),
+                UnitKind::Arp => self.draw_arp_display(painter, ui),
             }
 
             for ki in 0..u.knobs.len() {
@@ -13712,6 +13918,132 @@ impl DemoApp {
                 self.face_text(painter, readout.center(), "OFF", FontId::proportional(11.0), SUBTEXT);
             }
         }
+    }
+
+    /// Keys-face scale controls (rack-local): the SCALE chip +, right of it,
+    /// the key/scale readout (e.g. "C MAJOR"). One row BELOW the SPLIT
+    /// control (and below the zone steppers while split), right-aligned with
+    /// them. None when the unit is too small (never squeeze, rule 22).
+    fn scale_rects(&self, unit: usize) -> Option<(Rect, Rect)> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Keys) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        // Below the SPLIT row; while split, below the zone steppers.
+        let y = match self.split_rects(unit) {
+            Some((_, split_readout)) => {
+                let below_zones = self.zone_rects(unit)
+                    .map(|z| z.iter().map(|z| z.value.bottom()).fold(f32::MIN, f32::max) + 6.0);
+                below_zones.unwrap_or(split_readout.bottom() + 8.0)
+            }
+            None => r.top() + 14.0,
+        };
+        let readout = Rect::from_min_size(
+            Pos2::new(r.right() - 36.0 - SCALE_READOUT_W, y),
+            Vec2::new(SCALE_READOUT_W, FACE_CTL_H),
+        );
+        let chip = Rect::from_min_size(
+            Pos2::new(readout.left() - 1.0 - SPLIT_CHIP_W, y),
+            Vec2::new(SPLIT_CHIP_W, FACE_CTL_H),
+        );
+        let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
+        let (chip, readout) = if chip.left() >= r.left() + FACE_X + name_w + 8.0 {
+            if readout.right() > r.right() - FACE_PAD_R + 0.5 { return None; }
+            (chip, readout)
+        } else {
+            // A narrow Keys column: the control drops under the subtitle and
+            // stacks, SCALE on top of its readout, over the face's own
+            // width (a narrow rack must not hide it: the arp's six knobs
+            // squeeze the Keys column to its floor).
+            let avail = r.width() - FACE_X - FACE_PAD_R;
+            if avail < SCALE_NARROW_MIN_W { return None; }
+            let y = y.max(r.top() + 62.0);
+            let w = avail.min(SPLIT_CHIP_W + 1.0 + SCALE_READOUT_W);
+            let chip = Rect::from_min_size(Pos2::new(r.left() + FACE_X, y), Vec2::new(w, FACE_CTL_H));
+            let readout = if self.keys_scale(unit).is_some() {
+                Rect::from_min_size(Pos2::new(chip.left(), chip.bottom() + 4.0), Vec2::new(w, FACE_CTL_H))
+            } else {
+                Rect::from_min_size(chip.left_bottom(), Vec2::ZERO) // OFF is one control
+            };
+            (chip, readout)
+        };
+        // Room above the knob row (labels sit below the knobs).
+        if chip.bottom().max(readout.bottom()) + 4.0 > self.knob_row_y(unit) - KNOB_R - 10.0 { return None; }
+        Some((chip, readout))
+    }
+
+    /// The Keys node's scale as the engine published it (base graph mirror).
+    fn keys_scale(&self, unit: usize) -> Option<crate::arp::ScaleChoice> {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .and_then(|n| n.scale)
+    }
+
+    /// Keys face: the SCALE chip (snap on/off) + readout (key + scale), the
+    /// readout opening the scale picker.
+    fn draw_scale_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some((chip, readout)) = self.scale_rects(unit) else { return };
+        let choice = self.keys_scale(unit);
+        let menu_open = self.scale_menu.is_some_and(|m| m.unit == unit);
+        let hov_chip = self.face_hovered(painter, unit, chip) || menu_open;
+        match choice {
+            None => {
+                let whole = chip.union(readout);
+                let hov = hov_chip || self.face_hovered(painter, unit, readout);
+                self.paint_face_chip(painter, whole, "SCALE · OFF", false, hov);
+            }
+            Some(c) => {
+                self.paint_face_chip(painter, chip, "SCALE", true, hov_chip);
+                let frame = chip.union(readout).expand(2.0);
+                painter.rect_stroke(self.xf.rect(frame), 3.0, Stroke::new(1.0, theme::HAIRLINE_DARK), egui::StrokeKind::Inside);
+                let active = menu_open || self.face_hovered(painter, unit, readout);
+                self.paint_face_field(painter, readout, active);
+                let short = short_scale_label(c);
+                self.face_text(painter, readout.center(), &short, theme::medium_font(12.0), TEXT);
+            }
+        }
+    }
+
+    /// Arp face status field (rack-local): top right, right-aligned with the
+    /// Keys face's scale/split row and clear of the title. None when the unit
+    /// is too narrow for it (never squeeze, rule 22).
+    fn arp_status_rect(&self, unit: usize) -> Option<Rect> {
+        let u = self.units.get(unit)?;
+        if !matches!(u.node_kind, UnitKind::Arp) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let name_w = u.name_g.as_ref().map_or(40.0, |g| g.size().x);
+        let left = r.left() + FACE_X + name_w + 14.0;
+        let right = r.right() - 36.0;
+        let w = (right - left).min(ARP_STATUS_W);
+        if w < ARP_STATUS_MIN_W { return None; }
+        Some(Rect::from_min_size(Pos2::new(right - w, r.top() + 14.0), Vec2::new(w, FACE_CTL_H)))
+    }
+
+    /// The status line of what the knobs say: the mode, and for a stepping
+    /// mode the rate + octave span; for chord mode the chord shape.
+    fn arp_status_text(&self, unit: usize) -> Option<String> {
+        let u = self.units.get(unit)?;
+        let read = |label: &str| u.knob_index(label).map(|i| u.knobs[i].step_index());
+        let mode = crate::arp::ArpMode::ALL[read("MODE")?.min(4)];
+        Some(if mode == crate::arp::ArpMode::Chord {
+            format!("CHORD · {}", crate::arp::ChordShape::ALL[read("CHORD").unwrap_or(0).min(7)].label())
+        } else {
+            format!(
+                "{} · {} · {} OCT",
+                mode.label(),
+                crate::arp::ArpRate::ALL[read("RATE").unwrap_or(3).min(5)].label(),
+                read("OCT").unwrap_or(0).min(3) + 1
+            )
+        })
+    }
+
+    /// Arp face (issue #90): the status field above. The knobs are the
+    /// controls; what the arp plays is heard and seen on the keys.
+    fn draw_arp_display(&self, painter: &egui::Painter, unit: usize) {
+        let (Some(field), Some(text)) = (self.arp_status_rect(unit), self.arp_status_text(unit)) else { return };
+        self.paint_face_field(painter, field, false);
+        self.face_text(painter, field.center(), &text, theme::medium_font(11.5), TEXT);
     }
 
     /// Organ face: nine drawbars, pulled down out of their tracks like a
@@ -14547,6 +14879,96 @@ impl DemoApp {
         }
     }
 
+    /// The Keys-face scale picker (issue #90): one popup per Keys unit —
+    /// the 12 keys as a chip row, the scales under them, an Off chip, and
+    /// the current choice spelled out. Picking applies at once.
+    fn scale_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.scale_menu else {
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        };
+        if self.stage_view != StageView::Rack || self.side != Side::Front {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        }
+        let Some(u) = self.units.get(menu.unit) else {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        };
+        if !matches!(u.node_kind, UnitKind::Keys) {
+            self.scale_menu = None;
+            self.scale_menu_rect = Rect::NOTHING;
+            return;
+        }
+        let unit = menu.unit;
+        let current = self.keys_scale(unit);
+        let title = format!("Keys · scale snap");
+        // (unit, choice) picked this frame — applied after the Area closes.
+        let mut picked: Option<Option<crate::arp::ScaleChoice>> = None;
+        let area = egui::Area::new(egui::Id::new("keys_scale_menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.pos + Vec2::new(6.0, 6.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow {
+                        offset: [0, 6],
+                        blur: 16,
+                        spread: 0,
+                        color: Color32::from_black_alpha(130),
+                    })
+                    .show(ui, |ui| {
+                        ui.set_min_width(232.0);
+                        ui.label(egui::RichText::new(title).font(theme::medium_font(12.5)).color(theme::INK));
+                        let status = match current {
+                            Some(c) => c.label(),
+                            None => "out-of-scale keys play as pressed".into(),
+                        };
+                        ui.label(egui::RichText::new(status).size(11.0).color(theme::MIDI_BLUE));
+                        ui.add_space(7.0);
+                        // The key: one chip row of 12.
+                        ui.horizontal_wrapped(|ui| {
+                            for k in 0..12u8 {
+                                let on = current.is_some_and(|c| c.key == k);
+                                if theme::chip_button(ui, crate::arp::KEY_NAMES[k as usize], on).clicked() {
+                                    let scale = current.map_or(crate::arp::Scale::Major, |c| c.scale);
+                                    picked = Some(Some(crate::arp::ScaleChoice { key: k, scale }));
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
+                        // The scale: one chip per scale, wrapped (labels are
+                        // long enough that two rows read better than one).
+                        ui.horizontal_wrapped(|ui| {
+                            for s in crate::arp::Scale::ALL {
+                                let on = current.is_some_and(|c| c.scale == s);
+                                if theme::chip_button(ui, s.label(), on).clicked() {
+                                    let key = current.map_or(0, |c| c.key);
+                                    picked = Some(Some(crate::arp::ScaleChoice { key, scale: s }));
+                                }
+                            }
+                        });
+                        ui.add_space(5.0);
+                        if theme::chip_button(ui, "Scale snap off", current.is_none()).clicked() {
+                            picked = Some(None);
+                        }
+                    });
+            });
+        self.scale_menu_rect = area.response.rect;
+        if let Some(choice) = picked {
+            self.scale_menu = None;
+            let nid = self.units[unit].node_id;
+            self.ui_node_grace.insert(nid, self.ui_time + 0.6);
+            self.set_keys_scale(unit, choice);
+        }
+    }
+
     fn draw_back(&self, painter: &egui::Painter) {
         let xf = &self.xf;
         for (ui, u) in self.units.iter().enumerate() {
@@ -15337,6 +15759,7 @@ impl DemoApp {
             StageView::Settings => self.settings_stage(ui),
         }
         self.knob_menu_ui(&ctx);
+        self.scale_menu_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
         self.save_rig_modal(&ctx);
@@ -15840,6 +16263,34 @@ const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
         name: "record", start: EvalStart::OneRig, prompt: "Start recording.",
         check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
+    },
+    EvalTask {
+        name: "arp_updown", start: EvalStart::OneRig,
+        prompt: "Make the keys arpeggiate: an up-down arpeggio in eighth notes over two octaves.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let keys = eval_node(&g, 0, "keys", |k| matches!(k, NodeKind::Keys))?;
+            let arp = eval_node(&g, 0, "arp", |k| matches!(k, NodeKind::Arp))?;
+            let synth = eval_node(&g, 0, "synth", |k| matches!(k, NodeKind::Clap { .. }))?;
+            eval_ensure(eval_midi_cable(&g, keys, 0, arp), || "the keys do not feed the arp".into())?;
+            eval_ensure(eval_midi_cable(&g, arp, 0, synth), || "the arp does not feed the synth".into())?;
+            eval_ensure(!eval_midi_cable(&g, keys, 0, synth), || format!("the keys still play the synth directly, past the arp (midi cables {:?})", g.edges.iter().filter(|e| e.kind == CPortKind::Midi).map(|e| (e.id, e.from.node, e.to.node)).collect::<Vec<_>>()))?;
+            let u = app.units.iter().find(|u| u.node_id == arp).ok_or("no arp unit")?;
+            let at = |l: &str| u.knob_index(l).map(|i| u.knobs[i].step_index()).ok_or(format!("no {l} knob"));
+            eval_ensure(at("MODE")? == 2, || format!("MODE is step {}, up-down is 2", at("MODE").unwrap_or(9)))?;
+            eval_ensure(at("RATE")? == 1, || format!("RATE is step {}, 1/8 is 1", at("RATE").unwrap_or(9)))?;
+            eval_ensure(at("OCT")? == 1, || format!("OCT is step {}, 2 octaves is 1", at("OCT").unwrap_or(9)))
+        },
+    },
+    EvalTask {
+        name: "scale_keys", start: EvalStart::OneRig,
+        prompt: "Make the keyboard play only the A minor pentatonic scale, so I cannot hit a wrong note.",
+        check: |app, _, _| {
+            let g = eval_graph(app);
+            let keys = g.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).ok_or("no keys node")?;
+            let want = crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 };
+            eval_ensure(keys.scale == Some(want), || format!("the keys snap to {:?}, not A min penta", keys.scale.map(|c| c.label())))
+        },
     },
     EvalTask {
         name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
@@ -22036,6 +22487,8 @@ mod face_layout_tests {
             }
         }
         if let Some((chip, readout)) = app.split_rects(ui) { v.push(("split".into(), chip.union(readout))); }
+        if let Some((chip, readout)) = app.scale_rects(ui) { v.push(("scale".into(), chip.union(readout))); }
+        if let Some(f) = app.arp_status_rect(ui) { v.push(("arp status".into(), f)); }
         if let Some(b) = app.drawbar_rects(ui) {
             v.push(("drawbars".into(), b[0].union(b[crate::organ::DRAWBARS - 1])));
         }
@@ -22117,6 +22570,43 @@ mod face_layout_tests {
         let k = app.keys_unit.unwrap();
         app.set_keys_split(k, Some(60));
         check(app, "split keys, two rigs");
+    }
+
+    /// The demo rack with an arp wired between its Keys and its synths.
+    fn arp_rack() -> DemoApp {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::demo_patch();
+        let id = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+        g.wire_arp(id);
+        app.build_rack(&g, &[]);
+        app
+    }
+
+    #[test]
+    fn arp_and_scale_faces_are_padded_and_clear() {
+        check(arp_rack(), "arp");
+        let mut app = arp_rack();
+        let k = app.keys_unit.unwrap();
+        app.set_keys_scale(k, Some(crate::arp::ScaleChoice { scale: crate::arp::Scale::MinorPentatonic, key: 9 }));
+        app.set_keys_split(k, Some(60));
+        check(app, "arp, scaled split keys");
+    }
+
+    /// Rule 121: in the rack the app opens with, the elements ARE drawn.
+    #[test]
+    fn the_arp_and_scale_elements_are_shown_in_a_default_sized_rack() {
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            let mut app = arp_rack();
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            let arp = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Arp)).unwrap();
+            assert!(app.visible(arp), "arp unit visible at {size:?}");
+            assert!(app.arp_status_rect(arp).is_some(), "the arp status field is shown at {size:?}");
+            assert!(app.arp_status_text(arp).unwrap().starts_with("UP"), "default pattern reads UP · 1/16 · 1 OCT: {:?}", app.arp_status_text(arp));
+            assert_eq!(app.units[arp].knobs.iter().filter(|k| !k.hidden).count(), 6, "six arp knobs at {size:?}");
+            let keys = app.keys_unit.unwrap();
+            assert!(app.scale_rects(keys).is_some(), "the scale chip is shown on the Keys face at {size:?}");
+        }
     }
 
     #[test]
@@ -23417,4 +23907,133 @@ mod offline_shots {
             }
         }
     }
+}
+
+/// Arp unit + Keys scale snap (issue #90): tools, sessions, undo.
+#[cfg(test)]
+mod arp_tests {
+    use super::*;
+    use crate::arp::{key_from_name, Scale, ScaleChoice};
+    use serde_json::json;
+
+    /// The demo rack with an arp wired between the rig's Keys and its synths.
+    fn arp_graph() -> (Graph, u32) {
+        let mut g = Graph::demo_patch();
+        let id = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+        assert!(g.wire_arp(id) >= 2, "the arp takes over a Keys → synth cable");
+        (g, id)
+    }
+
+    fn app_with_arp() -> (DemoApp, u32) {
+        let (g, id) = arp_graph();
+        let mut app = DemoApp::new_with_sink(None);
+        app.apply_session(&crate::session::Session::new("arp", g)).unwrap();
+        (app, id)
+    }
+
+    fn arp_unit(app: &DemoApp) -> usize {
+        app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Arp)).expect("an arp unit")
+    }
+
+    /// Step index of a stepped knob / value of a continuous one, by label.
+    fn knob(app: &DemoApp, label: &str) -> (usize, f32) {
+        let u = &app.units[arp_unit(app)];
+        let k = &u.knobs[u.knob_index(label).unwrap_or_else(|| panic!("knob {label}"))];
+        (k.step_index(), k.value)
+    }
+
+    fn d_dorian() -> ScaleChoice { ScaleChoice { scale: Scale::Dorian, key: key_from_name("D").unwrap() } }
+
+    #[test]
+    fn the_arp_unit_starts_on_the_engines_defaults() {
+        let (app, _) = app_with_arp();
+        // up, 1/16, 1 octave, gate .75, no swing, major
+        assert_eq!(knob(&app, "MODE").0, 0);
+        assert_eq!(knob(&app, "RATE").0, 3, "1/16");
+        assert_eq!(knob(&app, "OCT").0, 0, "1 octave");
+        assert!((knob(&app, "GATE").1 - 0.75).abs() < 1e-6);
+        assert_eq!(knob(&app, "SWING").1, 0.0);
+        assert_eq!(knob(&app, "CHORD").0, 0);
+    }
+
+    #[test]
+    fn set_arp_and_set_scale_move_the_knobs_and_the_keys_node() {
+        let (mut app, id) = app_with_arp();
+        let r = app.exec_tool("set_arp", &json!({"node": id, "mode": "up-down", "rate": "1/8T", "octaves": 3, "gate": 0.4, "swing": 0.5, "chord": "min7"}));
+        assert!(r.contains("set"), "{r}");
+        assert_eq!(knob(&app, "MODE").0, 2, "up-down");
+        assert_eq!(knob(&app, "RATE").0, 2, "1/8T");
+        assert_eq!(knob(&app, "OCT").0, 2, "3 octaves");
+        assert!((knob(&app, "GATE").1 - 0.4).abs() < 1e-6);
+        assert!((knob(&app, "SWING").1 - 0.5).abs() < 1e-6);
+        assert_eq!(knob(&app, "CHORD").0, 6, "min7");
+
+        let r = app.exec_tool("set_scale", &json!({"key": "D", "scale": "dorian"}));
+        assert!(r.contains("D DORIAN"), "{r}");
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        let r = app.exec_tool("set_scale", &json!({"off": true}));
+        assert!(r.contains("off"), "{r}");
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, None);
+    }
+
+    #[test]
+    fn arp_tools_refuse_bad_input_with_a_message_the_model_can_fix() {
+        let (mut app, id) = app_with_arp();
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "mode": "sideways"})).contains("not a mode"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "rate": "1/3"})).contains("not a rate"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id, "chord": "13th"})).contains("not a chord shape"));
+        assert!(app.exec_tool("set_arp", &json!({"node": id})).contains("at least one"));
+        assert!(app.exec_tool("set_arp", &json!({"node": 0, "mode": "up"})).contains("not an arp"), "node 0 is the keyboard");
+        assert!(app.exec_tool("set_arp", &json!({"mode": "up"})).contains("needs 'node'"));
+        assert!(app.exec_tool("set_scale", &json!({"key": "H"})).contains("not a key"));
+        assert!(app.exec_tool("set_scale", &json!({"scale": "lydian-ish"})).contains("not a scale"));
+        assert!(app.exec_tool("set_scale", &json!({"node": id})).contains("needs a Keys node"), "the arp is not a keyboard");
+    }
+
+    #[test]
+    fn arp_settings_and_the_scale_survive_a_session() {
+        let (mut app, id) = app_with_arp();
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "random", "rate": "1/32", "octaves": 4, "gate": 0.3, "swing": 0.25, "chord": "power"}));
+        app.exec_tool("set_scale", &json!({"key": "D", "scale": "dorian"}));
+        let s = app.capture_session("arp").unwrap();
+        let mut fresh = DemoApp::new_with_sink(None);
+        fresh.apply_session(&s).unwrap();
+        assert_eq!(knob(&fresh, "MODE").0, 4, "random");
+        assert_eq!(knob(&fresh, "RATE").0, 5, "1/32");
+        assert_eq!(knob(&fresh, "OCT").0, 3);
+        assert!((knob(&fresh, "GATE").1 - 0.3).abs() < 1e-6);
+        assert!((knob(&fresh, "SWING").1 - 0.25).abs() < 1e-6);
+        assert_eq!(knob(&fresh, "CHORD").0, 7, "power");
+        assert_eq!(fresh.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        // The graph is what a saved package holds: the scale survives its
+        // JSON, and a graph saved before scale snap existed (no field) loads
+        // unsnapped.
+        let json = serde_json::to_string(&s.graph).unwrap();
+        let back: Graph = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(d_dorian()));
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for n in v["nodes"].as_array_mut().unwrap() { n.as_object_mut().unwrap().remove("scale"); }
+        let old: Graph = serde_json::from_value(v).unwrap();
+        assert!(old.nodes.iter().all(|n| n.scale.is_none()));
+    }
+
+    #[test]
+    fn undo_restores_the_arp_and_the_scale_from_non_default_values() {
+        let (mut app, id) = app_with_arp();
+        // Non-default BEFORE the job (rule 59: a default would pass anyway).
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "down", "octaves": 2}));
+        app.exec_tool("set_scale", &json!({"key": "A", "scale": "min penta"}));
+        app.undo_job = None; // a new job
+        app.exec_tool("set_arp", &json!({"node": id, "mode": "chord", "octaves": 4, "chord": "sus4"}));
+        app.exec_tool("set_scale", &json!({"key": "F#", "scale": "blues"}));
+        assert_eq!(knob(&app, "MODE").0, 3);
+        let r = app.exec_tool("undo", &json!({}));
+        assert!(r.contains("undid"), "{r}");
+        assert_eq!(knob(&app, "MODE").0, 1, "down again");
+        assert_eq!(knob(&app, "OCT").0, 1, "2 octaves again");
+        assert_eq!(knob(&app, "CHORD").0, 0);
+        let want = ScaleChoice { scale: Scale::MinorPentatonic, key: key_from_name("A").unwrap() };
+        assert_eq!(app.base_graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)).unwrap().scale, Some(want));
+    }
+
 }

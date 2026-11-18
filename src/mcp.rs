@@ -294,6 +294,40 @@ struct SetSplitArgs {
     high_octave: Option<i8>,
 }
 
+/// Arguments for `set_scale`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetScaleArgs {
+    /// Keys node id (see get_graph, kind keys). Omit = the first Keys node.
+    node: Option<NodeId>,
+    /// Key the scale starts on: "C", "F#", … or 0..=11. Default C.
+    key: Option<String>,
+    /// Scale: major, minor, dorian, mixolydian, harmonic minor, maj penta,
+    /// min penta, blues. Default major.
+    scale: Option<String>,
+    /// true = switch snapping off (every key plays as pressed).
+    off: Option<bool>,
+}
+
+/// Arguments for `set_arp`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetArpArgs {
+    /// Arp node id (see get_graph, kind arp).
+    node: NodeId,
+    /// up, down, up-down, chord, random.
+    mode: Option<String>,
+    /// Note value synced to the song clock: 1/4, 1/8, 1/8T, 1/16, 1/16T, 1/32.
+    rate: Option<String>,
+    /// How many octaves the pattern spans, 1..=4.
+    octaves: Option<u8>,
+    /// How much of a step each note sounds, 0.05..=1.
+    gate: Option<f64>,
+    /// 0..=1: every second step starts late.
+    swing: Option<f64>,
+    /// Chord shape one held key becomes in chord mode: maj, min, sus2, sus4,
+    /// 7, maj7, min7, power.
+    chord: Option<String>,
+}
+
 /// Arguments for `set_system_audio`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetSystemAudioArgs {
@@ -717,6 +751,9 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
             Ok(NodeKind::Dsp(parse_dsp_kind(dsp)?))
         }
         "system_audio" => Ok(NodeKind::SystemAudio),
+        // The arpeggiator / chord unit (issue #90): inserted between the
+        // rig's Keys and its synth(s) when wired.
+        "arp" | "arpeggiator" => Ok(NodeKind::Arp),
         "audio_in" => Ok(NodeKind::AudioIn {
             device: args.device.clone().filter(|d| !d.is_empty()),
             channels: parse_audio_ch(args.channels.as_deref()),
@@ -801,6 +838,7 @@ fn graph_json(g: &Graph) -> Value {
                     "device": device,
                     "channels": ch_kind_str(*channels),
                 }),
+                NodeKind::Arp => json!({"type": "arp"}),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
             };
             // `transport`: the node has its own Play/Stop (set_node_playing);
@@ -814,6 +852,8 @@ fn graph_json(g: &Graph) -> Value {
                 // Keys only: split point (null = unsplit, one MIDI OUT on
                 // port 0); when set, port 0 = LOW (< point), port 1 = HIGH.
                 "split": n.split,
+                // Keys only: key + scale its notes snap to (null = no snap).
+                "scale": n.scale.map(|c| json!({"key": c.key, "scale": c.scale})),
             })
         })
         .collect();
@@ -1072,6 +1112,7 @@ impl McpServer {
                 .unwrap_or("LV2")
                 .to_ascii_uppercase(),
             NodeKind::SystemAudio => "SYSTEM AUDIO".into(),
+            NodeKind::Arp => "ARP".into(),
             NodeKind::MasterOut => "MASTER OUT".into(),
         });
         let name = name_bytes(&label);
@@ -1085,6 +1126,9 @@ impl McpServer {
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
             NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            // An arp is inserted between the rig's Keys and its synth(s)
+            // like an instrument is wired into its rig.
+            NodeKind::Arp => true,
             _ => false,
         };
         if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
@@ -1094,7 +1138,14 @@ impl McpServer {
         st.graph.set_rig(id, rig);
         let before = st.graph.edges.len();
         if wire {
-            st.graph.wire_instrument(id);
+            match st.graph.node(id).map(|n| n.kind.clone()) {
+                Some(NodeKind::Arp) => {
+                    let _ = st.graph.wire_arp(id);
+                }
+                _ => {
+                    let _ = st.graph.wire_instrument(id);
+                }
+            }
         }
         let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
         let mut result = json!({"id": id, "name": name_str(&name), "cables": cables});
@@ -1237,6 +1288,97 @@ impl McpServer {
         }
         let oct = st.graph.node(node).map_or([0; 2], |n| n.zone_octave);
         ok_json(json!({"node": node, "point": point, "split": point.is_some(), "low_octave": oct[0], "high_octave": oct[1]}))
+    }
+
+    /// Scale snap on a Keys node (issue #90).
+    #[tool(name = "set_scale", description = "Make a Keys node's keyboard play only one scale (Command::SetKeysScale) — a property of the Keys node like set_split: out-of-scale keys snap to the nearest in-scale note (ties go down), so every key sounds 'right'. key: C, C#, … B (default C); scale: major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues (default major); off:true switches snapping off. node defaults to the first Keys node. Held notes are released. Example: {key:'A', scale:'min penta'} for an A minor pentatonic keyboard.")]
+    fn set_scale(&self, Parameters(args): Parameters<SetScaleArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("set_scale", json!({"node": args.node, "key": args.key, "scale": args.scale, "off": args.off}));
+        }
+        let choice = if args.off == Some(true) {
+            None
+        } else {
+            let key = match args.key.as_deref() {
+                Some(k) => match crate::arp::key_from_name(k) {
+                    Some(k) => k,
+                    None => return tool_err(format!("'{k}' is not a key (C, C#, D, … B, or 0..11)")),
+                },
+                None => 0,
+            };
+            let scale = match args.scale.as_deref() {
+                Some(s) => match crate::arp::Scale::from_name(s) {
+                    Some(s) => s,
+                    None => return tool_err(format!("'{s}' is not a scale (major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues)")),
+                },
+                None => crate::arp::Scale::Major,
+            };
+            Some(crate::arp::ScaleChoice { key, scale })
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        let node = match args.node {
+            Some(id) => match st.graph.node(id) {
+                None => return tool_err(format!("node {id} does not exist")),
+                Some(n) if !matches!(n.kind, NodeKind::Keys) => {
+                    return tool_err(format!("node {id} ({}) is not a Keys node — only keyboards snap to a scale", name_str(&n.name)))
+                }
+                Some(_) => id,
+            },
+            None => match st.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)) {
+                Some(n) => n.id,
+                None => return tool_err("the patch has no Keys node"),
+            },
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetKeysScale { node, scale: choice }) {
+            return tool_err(e);
+        }
+        st.graph.set_scale(node, choice);
+        ok_json(json!({"node": node, "scale": choice.map(|c| c.label())}))
+    }
+
+    /// The arp unit's settings by name (issue #90).
+    #[tool(name = "set_arp", description = "Set an Arp unit's settings by name (its rack knobs, Command::SetParam). Add the unit first with add_node {kind:'arp'} — it is inserted between the rig's Keys and its synth(s), so held keys become an arpeggio. mode: up | down | up-down | chord | random ('chord' = one held key sounds a whole chord, shape from chord); rate: 1/4 | 1/8 | 1/8T | 1/16 | 1/16T | 1/32 (synced to the song clock/tempo); octaves 1..4; gate 0.05..1 (how much of each step a note sounds); swing 0..1; chord: maj | min | sus2 | sus4 | 7 | maj7 | min7 | power. Give any subset. Changing the pattern releases what is sounding. Example: {node:7, mode:'up-down', rate:'1/16', octaves:2, gate:0.6}.")]
+    fn set_arp(&self, Parameters(args): Parameters<SetArpArgs>) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "node": args.node, "mode": args.mode, "rate": args.rate, "octaves": args.octaves,
+            "gate": args.gate, "swing": args.swing, "chord": args.chord,
+        });
+        // Null fields mean "not given" for the shared parser.
+        let mut given = body.clone();
+        if let Some(o) = given.as_object_mut() {
+            o.retain(|_, v| !v.is_null());
+        }
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("set_arp", given);
+        }
+        let values = match crate::arp::knob_values_from_args(&given) {
+            Ok(v) => v,
+            Err(e) => return tool_err(e),
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        match st.graph.node(args.node) {
+            None => return tool_err(format!("node {} does not exist", args.node)),
+            Some(n) if !matches!(n.kind, NodeKind::Arp) => {
+                return tool_err(format!("node {} ({}) is not an arp unit", args.node, name_str(&n.name)))
+            }
+            Some(_) => {}
+        }
+        let mut set = Vec::new();
+        for (label, param, v) in values {
+            if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value: v as f64 }) {
+                return tool_err(e);
+            }
+            set.push(label.to_lowercase());
+        }
+        ok_json(json!({"node": args.node, "set": set}))
     }
 
     /// Mix system audio into the master.
@@ -1688,6 +1830,17 @@ impl McpServer {
                 return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
             }
             NodeKind::SystemAudio => vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())],
+            // The arp's stepped knobs, spelled out so a model can pick one
+            // by name headless (the running app answers the same via
+            // ui_bridge_tool("list_params")).
+            NodeKind::Arp => vec![
+                (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
+                (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
+                (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
+                (crate::arp::P_ARP_GATE, "Gate".into()),
+                (crate::arp::P_ARP_SWING, "Swing".into()),
+                (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
+            ],
             NodeKind::Keys => Vec::new(),
         };
         let q = args.query.unwrap_or_default().to_lowercase();

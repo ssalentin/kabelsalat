@@ -131,6 +131,11 @@ pub enum NodeKind {
     /// (`None` = the default input); `channels` picks which device channels fill
     /// the stereo OUT.
     AudioIn { device: Option<String>, channels: AudioInChannel },
+    /// MIDI-generating unit (issue #90): sits between a keyboard source and a
+    /// synth like an effect — held notes become an arpeggio, or (chord mode)
+    /// one chord per key. One MIDI IN, one MIDI OUT; no audio. Settings are
+    /// its rack knobs (`engine::knob_specs`, params `arp::P_ARP_*`).
+    Arp,
     /// Stereo output bus.
     MasterOut,
 }
@@ -177,6 +182,12 @@ pub struct Node {
     /// many bass sounds are pitched down already. Older sessions load at 0.
     #[serde(default)]
     pub zone_octave: [i8; 2],
+    /// Key + scale this Keys node's notes snap to (issue #90, a property of
+    /// the Keys source like `split`): out-of-scale keys snap to the nearest
+    /// in-scale note on their way out. `None` = no snapping (the default and
+    /// what older sessions load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<crate::arp::ScaleChoice>,
 }
 
 /// Which Keys output port a PLAYED note leaves on: unsplit → 0; split at
@@ -232,7 +243,7 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None, zone_octave: [0; 2] });
+        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None, zone_octave: [0; 2], scale: None });
         id
     }
 
@@ -260,6 +271,59 @@ impl Graph {
         let changed = n.playing != playing;
         n.playing = playing;
         Some(changed)
+    }
+
+    /// Set (Some) or clear (None) a Keys node's key + scale snap. Returns
+    /// `Some(changed)` for a Keys node, `None` if the node is unknown or not
+    /// a Keys source (its scale stays None). Snapping is a pure function of
+    /// the played note, so a note-off always meets the pitch its note-on
+    /// snapped to — but an edit between them still releases first (engine).
+    pub fn set_scale(&mut self, id: NodeId, choice: Option<crate::arp::ScaleChoice>) -> Option<bool> {
+        let n = self.nodes.iter_mut().find(|n| n.id == id)?;
+        if !matches!(n.kind, NodeKind::Keys) {
+            return None;
+        }
+        let choice = choice.map(|c| crate::arp::ScaleChoice { key: c.key.min(11), ..c });
+        let changed = n.scale != choice;
+        n.scale = choice;
+        Some(changed)
+    }
+
+    /// Insert `node` (an Arp) into its rig's MIDI chain, GarageBand-style:
+    /// every MIDI cable from the rig's Keys node to an instrument is
+    /// REPLACED by Keys → arp, and the arp feeds each instrument that cable
+    /// carried (both split ports merge into the arp's one MIDI in). Fresh
+    /// cable ids above every existing one. Returns how many cables it added.
+    /// The engine releases held notes on every instrument the Keys node
+    /// feeds before this (rule 41).
+    pub fn wire_arp(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let keys = self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
+        let Some(keys) = keys else { return 0 };
+        // The rig's Keys→instrument MIDI cables this arp takes over.
+        let claps: Vec<NodeId> = self.nodes.iter()
+            .filter(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
+            .map(|n| n.id)
+            .collect();
+        let take_over: Vec<(u8, NodeId)> = self.edges.iter()
+            .filter(|e| e.kind == PortKind::Midi && e.from.node == keys && claps.contains(&e.to.node))
+            .map(|e| (e.from.port, e.to.node))
+            .collect();
+        self.edges.retain(|e| {
+            !(e.kind == PortKind::Midi && e.from.node == keys && claps.contains(&e.to.node))
+        });
+        let mut added = 0;
+        for &(port, inst) in &take_over {
+            let fresh = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(fresh, PortRef { node: keys, port }, PortRef { node, port: 0 }, PortKind::Midi) {
+                added += 1;
+            }
+            let fresh = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(fresh, PortRef { node, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) {
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Set (Some) or clear (None) a Keys node's split point. Clearing removes
@@ -703,6 +767,12 @@ pub enum Command {
     /// plain graph wiring — wire LOW/HIGH to rigs like any ports. The engine
     /// releases held notes on every instrument the node feeds.
     SetNodeSplit { node: NodeId, point: Option<u8> },
+    /// Key + scale a Keys node's notes snap to (issue #90): out-of-scale keys
+    /// snap to the nearest in-scale note on their way out. `None` = no
+    /// snapping. The engine releases held notes on every instrument the node
+    /// feeds first (rule 41: a scale change mid-hold would snap the release
+    /// to a different pitch than the note-on did).
+    SetKeysScale { node: NodeId, scale: Option<crate::arp::ScaleChoice> },
     /// Octave shift of one zone of a split Keys node (`zone` 0 = LOW, 1 =
     /// HIGH; `octave` clamped to ±`ZONE_OCTAVE_MAX`). The engine releases
     /// held notes on every instrument the node feeds first (rule 41).
@@ -826,7 +896,8 @@ impl Command {
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
-            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. })
+            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
+            | Command::SetKeysScale { .. })
     }
 }
 

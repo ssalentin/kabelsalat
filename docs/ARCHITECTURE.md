@@ -25,6 +25,24 @@ agents are in [AGENTS.md](../AGENTS.md).
   larger tables and retire requests through `VoiceMsg` and frees what comes
   back through `VoiceBack`, so the audio thread never allocates or frees
   for a voice.
+- `arp.rs` — the arpeggiator / chord unit and the Keys scale snap (issue #90).
+  `ArpState` is one fixed-size state per `NodeKind::Arp` node: held keys
+  (reference counted), the generated notes that are down, and a step clock in
+  SONG-CLOCK BEATS (the engine feeds `tick` the transport position while the
+  master plays, a free-running phase at the same BPM otherwise; rule 43). The
+  unit sits between a Keys source and the synths like an effect:
+  `Graph::wire_arp` replaces the rig's Keys → synth MIDI cables by Keys → arp
+  → synth. Modes up / down / up-down / random step the pattern (rate 1/4 …
+  1/32 incl. triplets, octaves 1–4, gate, swing); chord mode sounds one
+  triad / 7th / power chord per held key and holds it with the key. Every
+  routing edit that can change an arp note's off path releases through
+  `GraphEngine::release_all`, which cascades into what the arp feeds
+  (`engine/held_notes.rs` checks it). Scale snap is a property of the Keys node
+  (`Node::scale`, `Command::SetKeysScale`): `snap_note` is a pure function of
+  the played note, so a release meets the pitch its note-on snapped to.
+  Knobs live in `engine::knob_specs`; `knob_values_from_args` is the one
+  parser of the `set_arp` agent/MCP tool. `kabelsalat arp-test` renders two
+  bars through a real Surge voice.
 - `host.rs` — CLAP via clack-host: `ClapVoice` (audio side) + `ClapVoiceMain`
   (main thread), `VoiceController` (RT-safe notes/params), out-of-process
   plugin scan with a cache, Surge/Dexed patch files.

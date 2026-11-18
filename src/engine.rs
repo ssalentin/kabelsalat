@@ -108,6 +108,11 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
 /// as a SetParam on a SystemAudio node so its GAIN knob and CC bindings work.
 pub const P_SYSTEM_GAIN: ParamId = 66;
 
+/// The arp unit's knobs (issue #90): mode, rate, octaves, gate, swing and
+/// the chord shape of chord mode. Normalized 0..1 like every rack knob; the
+/// stepped ones quantize in `arp::ArpState::set_param` (and on the face).
+pub use crate::arp::{P_ARP_CHORD, P_ARP_GATE, P_ARP_MODE, P_ARP_OCTAVE, P_ARP_RATE, P_ARP_SWING};
+
 /// One rack-unit knob: the label on the face (canonical for agents too),
 /// its default, the engine param it drives (None = local-only), and the long
 /// names agents may use instead of the label.
@@ -117,11 +122,20 @@ pub struct KnobSpec {
     pub param: Option<ParamId>,
     /// Not drawn as a knob (the face renders it as a chip); still bindable.
     pub hidden: bool,
+    /// > 1 = a stepped knob: the face snaps the needle to this many evenly
+    /// spaced positions, and `CcScale::stepped` maps a controller onto them.
+    /// The engine quantizes defensively on apply.
+    pub steps: u8,
     pub aliases: &'static [&'static str],
 }
 
 const fn ks(label: &'static str, default: f32, param: Option<ParamId>, aliases: &'static [&'static str]) -> KnobSpec {
-    KnobSpec { label, default, param, hidden: false, aliases }
+    KnobSpec { label, default, param, hidden: false, steps: 0, aliases }
+}
+
+/// A stepped knob (mode/rate-style pickers): `steps` evenly spaced positions.
+const fn ks_steps(label: &'static str, default: f32, param: Option<ParamId>, steps: u8, aliases: &'static [&'static str]) -> KnobSpec {
+    KnobSpec { label, default, param, hidden: false, steps, aliases }
 }
 
 /// A `'static` knob table: `const` items are promoted, `const fn` calls are not.
@@ -156,7 +170,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         // Drawbars are hidden knobs, painted as faders.
         k @ NodeKind::Lv2 { .. } if crate::organ::is_organ(k) => {
             const fn bar(label: &'static str, i: usize, out: bool, aliases: &'static [&'static str]) -> KnobSpec {
-                KnobSpec { label, default: if out { 1.0 } else { 0.0 }, param: Some(crate::organ::drawbar_param(i)), hidden: true, aliases }
+                KnobSpec { label, default: if out { 1.0 } else { 0.0 }, param: Some(crate::organ::drawbar_param(i)), hidden: true, steps: 9, aliases }
             }
             knobs!(
                 bar("16'", 0, true, &["DRAWBAR 16", "DRAWBAR 1"]),
@@ -179,9 +193,19 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Lv2 { .. } => &[],
         // Starts at 0 like the engine's system_gain: a fresh unit stays muted.
         NodeKind::SystemAudio => knobs!(ks("GAIN", 0.0, Some(P_SYSTEM_GAIN), &[])),
+        // The arp's six knobs (issue #90). MODE/RATE/OCT/CHORD are stepped —
+        // the face snaps the needle, and `ArpState::set_param` quantizes.
+        NodeKind::Arp => knobs!(
+            ks_steps("MODE", 0.0, Some(P_ARP_MODE), 5, &["ORDER", "PATTERN"]),
+            ks_steps("RATE", 0.6, Some(P_ARP_RATE), 6, &["SPEED"]), // position 3 = 1/16
+            ks_steps("OCT", 0.0, Some(P_ARP_OCTAVE), 4, &["OCTAVES", "RANGE"]),
+            ks("GATE", 0.75, Some(P_ARP_GATE), &["LENGTH"]),
+            ks("SWING", 0.0, Some(P_ARP_SWING), &["SHUFFLE"]),
+            ks_steps("CHORD", 0.0, Some(P_ARP_CHORD), 8, &["SHAPE", "CHORD SHAPE"]),
+        ),
         NodeKind::AudioIn { .. } => knobs!(
             ks("GAIN", 0.5, Some(P_AUDIO_IN_GAIN), &[]),
-            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, aliases: &["MONITOR"] },
+            KnobSpec { label: "MON", default: 0.0, param: Some(P_AUDIO_IN_MONITOR), hidden: true, steps: 0, aliases: &["MONITOR"] },
         ),
     }
 }
@@ -446,6 +470,18 @@ fn build_audio_in_slots(graph: &Graph) -> Vec<AudioInSlot> {
         .collect()
 }
 
+/// One arp state per Arp node (rare structural op; capacity 8 pre-reserved
+/// so runtime `AddNode`s within it never allocate).
+fn build_arp_slots(graph: &Graph) -> Vec<crate::arp::ArpState> {
+    let mut v = Vec::with_capacity(8);
+    for n in &graph.nodes {
+        if matches!(n.kind, NodeKind::Arp) {
+            v.push(crate::arp::ArpState::new(n.id));
+        }
+    }
+    v
+}
+
 /// Work the audio thread hands to the LV2 loader thread: instantiating a
 /// plugin (~200 ms for Vitalium), parsing its presets and freeing an
 /// instance all block far longer than one audio buffer.
@@ -699,6 +735,14 @@ impl GraphPub {
     }
 }
 
+/// What a played note picks up between a Keys node and its destination: the
+/// zone's octave shift and the Keys node's scale snap (issue #90).
+#[derive(Clone, Copy)]
+struct KeysRoute {
+    shift: i16,
+    scale: Option<crate::arp::ScaleChoice>,
+}
+
 pub struct GraphEngine {
     graph: Graph,
     drain: CommandDrain,
@@ -773,6 +817,16 @@ pub struct GraphEngine {
     // by input callbacks off the audio thread (rule 46).
     audio_in: Vec<AudioInSlot>,
     audio_in_levels: Arc<AudioInLevels>,
+    // Arp nodes (issue #90): one state per node, stepped from render and
+    // fed by the note commands. Capacity 8 pre-reserved so an AddNode
+    // within it never allocates (rare op beyond, like the matrix).
+    arp: Vec<crate::arp::ArpState>,
+    /// Ids of the Keys → synth cables the last arps took over (fixed size, no
+    /// allocation). The UI's per-frame mirror re-sends every cable of ITS
+    /// rack until it adopts the new graph; a Connect of one of these ids
+    /// would plug the keys straight back past the arp (rule 80 class).
+    /// Cleared by a load.
+    arp_taken: [crate::control::EdgeId; 8],
     /// UI → audio: delivers a freshly-opened input ring's consumer to the slot.
     audio_in_rx: Option<rtrb::Consumer<(NodeId, rtrb::Consumer<f32>)>>,
     // Runtime CLAP voice delivery + retirement side channels (host <-> audio).
@@ -831,12 +885,14 @@ impl GraphEngine {
             .collect();
         let lv2 = build_lv2_slots(&graph, sample_rate);
         let audio_in = build_audio_in_slots(&graph);
+        let arp = build_arp_slots(&graph);
         // Default routing: every source class feeds every rig (full range).
         let mut matrix = Matrix::new();
         matrix.reserve(64);
         // Routes belong to the Clap node, not to the voice that plays it: a
         // voice hosted after startup finds its node already routed.
-        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. })) {
+        // An arp is a MIDI destination like an instrument (issue #90).
+        for n in graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Arp)) {
             matrix.connect(SourceId::Keys, n.id);
             // Cover hardware device ids 0..MAX so any connected device routes;
             // the per-rig `rig_device` filter then selects which one is heard.
@@ -897,6 +953,8 @@ impl GraphEngine {
             player_buf: vec![0.0; 8192 * 2],
             audio_in,
             audio_in_levels: Arc::new(AudioInLevels::new()),
+            arp,
+            arp_taken: [crate::control::EdgeId::MAX; 8],
             audio_in_rx: None,
             voice_rx: None,
             voice_back_tx: None,
@@ -1425,6 +1483,30 @@ impl GraphEngine {
         slot.plugin.control_descs().get(nth).map(|c| c.value)
     }
 
+    /// Arp verification hook (self-test): the notes this arp node has
+    /// generated and not released — chord mode holds 3 per key (a triad).
+    pub fn arp_sounding(&self, node: NodeId) -> Vec<u8> {
+        self.arp.iter().find(|a| a.node == node).map(|a| a.sounding()).unwrap_or_default()
+    }
+
+    /// Arp verification hook (self-test): the keys this arp node holds.
+    pub fn arp_held(&self, node: NodeId) -> Vec<u8> {
+        self.arp.iter().find(|a| a.node == node).map(|a| a.held_notes().collect()).unwrap_or_default()
+    }
+
+    /// One "time passed" step of every arp node: the held-notes check's
+    /// Tick — it drives the real note delivery the same way `render` does.
+    #[cfg(test)]
+    pub(crate) fn arp_test_step(&mut self) {
+        let mut arps = std::mem::take(&mut self.arp);
+        for a in &mut arps {
+            let (node, vel) = (a.node, a.velocity());
+            let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
+            a.test_step(&mut emit);
+        }
+        self.arp = arps;
+    }
+
     fn has_midi_cable(&self, dest: NodeId) -> bool {
         self.graph.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == dest)
     }
@@ -1513,6 +1595,17 @@ impl GraphEngine {
                 }
                 _ => false,
             }
+        } else if (crate::arp::P_ARP_MODE..=crate::arp::P_ARP_CHORD).contains(&param)
+            && self.arp.iter().any(|a| a.node == node)
+        {
+            // An arp unit's knobs (issue #90). Settings that shape the burst
+            // release what is sounding first (rule 41) — ArpState handles it.
+            self.with_arp_slot(node, |a, eng| {
+                let (nid, vel) = (a.node, a.velocity());
+                let mut emit = |n: u8, on: bool| eng.deliver_arp_note(nid, n, on, vel);
+                a.set_param(param, value, &mut emit)
+            })
+            .unwrap_or(false)
         } else {
             self.apply_dsp_or_master_param(node, param, v)
         }
@@ -1529,11 +1622,12 @@ impl GraphEngine {
         self.keys_route(dest, played).is_some()
     }
 
-    /// The Keys zone a played note reaches `dest` through: `Some(semitones)`
-    /// of that zone's octave shift, `None` if no Keys cable carries the note
-    /// there. Note-on and note-off take the same answer, so a release always
-    /// meets the pitch its note-on started (rule 41). Allocation-free.
-    fn keys_route(&self, dest: NodeId, played: u8) -> Option<i16> {
+    /// What a played note picks up on its way from a Keys node to `dest`:
+    /// that zone's octave shift, and the Keys node's scale snap (issue #90).
+    /// Note-on and note-off take the same answer — the snap is a pure
+    /// function of the note — so a release always meets the pitch its
+    /// note-on started (rule 41). Allocation-free.
+    fn keys_route(&self, dest: NodeId, played: u8) -> Option<KeysRoute> {
         self.graph.nodes.iter().find_map(|n| {
             if !matches!(n.kind, NodeKind::Keys) { return None; }
             let port = split_port(n.split, played);
@@ -1542,15 +1636,61 @@ impl GraphEngine {
                     && e.from.node == n.id
                     && e.from.port == port
                     && e.to.node == dest
-            }).then(|| crate::control::Graph::zone_shift(n, played))
+            }).then(|| KeysRoute {
+                shift: crate::control::Graph::zone_shift(n, played),
+                scale: n.scale,
+            })
         })
     }
 
-    /// Note-off for all 128 notes on one instrument. The matrix is stateless,
-    /// so every edit that can change a held note's note-off path (split, rule,
-    /// MIDI cable, source filter, node removal, graph load) calls this first.
-    /// Rare op, allocation-free. Checked by `held_notes` (verify-held-notes).
+    /// The note that reaches `dest`: the matrix-transformed note, the zone's
+    /// octave shift, and (Some scale) the Keys node's snap to the nearest
+    /// in-scale note. Pure: a note-off computes the same outgoing note its
+    /// note-on did.
+    fn routed_note(m: &MidiMsg, route: &KeysRoute) -> Option<u8> {
+        let out = shifted(m.note(), route.shift)?;
+        Some(match route.scale {
+            Some(sc) => crate::arp::snap_note(out, sc),
+            None => out,
+        })
+    }
+
+    /// Note-off for all 128 notes on one instrument node. The matrix is
+    /// stateless, so every edit that can change a held note's note-off path
+    /// (split, rule, MIDI cable, source filter, node removal, graph load)
+    /// calls this first. An Arp node CASCADES: its held keys and generated
+    /// notes die, and so does everything it feeds — an arp-generated note's
+    /// off path is the arp's own cable, which the edit may be about to move
+    /// (rule 41). Rare op, allocation-free (fixed 8-deep fan-out). Checked
+    /// by `held_notes` (verify-held-notes).
     fn release_all(&mut self, dest: NodeId) {
+        if self.arp.iter().any(|a| a.node == dest) {
+            let mut fed = [0u32; 8];
+            let mut n_fed = 0usize;
+            for i in 0..self.graph.edges.len() {
+                let e = &self.graph.edges[i];
+                if e.kind == PortKind::Midi && e.from.node == dest && n_fed < fed.len() {
+                    if !fed[..n_fed].contains(&e.to.node) {
+                        fed[n_fed] = e.to.node;
+                        n_fed += 1;
+                    }
+                }
+            }
+            self.with_arp_slot(dest, |a, eng| {
+                let (node, vel) = (a.node, a.velocity());
+                let mut emit = |note: u8, on: bool| eng.deliver_arp_note(node, note, on, vel);
+                a.release_all(&mut emit);
+            });
+            for i in 0..n_fed {
+                self.release_instrument(fed[i]);
+            }
+            return;
+        }
+        self.release_instrument(dest);
+    }
+
+    /// Note-off for all 128 notes on one instrument (voice or LV2).
+    fn release_instrument(&mut self, dest: NodeId) {
         if let Some(s) = self.voices.iter().find(|s| s.node == dest) {
             for n in 0..128u16 { s.voice.note_off(n); }
         }
@@ -1559,6 +1699,57 @@ impl GraphEngine {
         }
         #[cfg(test)]
         self.note_log.push((dest, 255, false)); // 255 = all-notes-off marker
+    }
+
+    /// Run `f` on the arp slot of `node` with the engine passable to its
+    /// emit path. `self.arp` is moved out for the call (pointer swap, no
+    /// allocation) so `deliver_arp_note` can borrow the engine freely.
+    fn with_arp_slot<R>(&mut self, node: NodeId, f: impl FnOnce(&mut crate::arp::ArpState, &mut Self) -> R) -> Option<R> {
+        let mut arps = std::mem::take(&mut self.arp);
+        let out = arps.iter_mut().find(|a| a.node == node).map(|a| f(a, self));
+        self.arp = arps;
+        out
+    }
+
+    /// Deliver one note the arp generated to every instrument the arp node
+    /// feeds by MIDI cable — plain graph wiring (the matrix routes sources,
+    /// and the arp is not a source; its level/scale are its own knobs).
+    /// Block-boundary timing, the timing of every other note here.
+    fn deliver_arp_note(&mut self, arp_node: NodeId, note: u8, on: bool, vel: f32) {
+        for i in 0..self.graph.edges.len() {
+            let e = &self.graph.edges[i];
+            if e.kind != PortKind::Midi || e.from.node != arp_node { continue; }
+            let dest = e.to.node;
+            #[cfg(test)]
+            self.note_log.push((dest, note, on));
+            if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                if on {
+                    s.voice.note_on(note as u16, vel as f64);
+                } else {
+                    s.voice.note_off(note as u16);
+                }
+            }
+            if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                if s.plugin.is_instrument() {
+                    if on {
+                        s.plugin.note_on(note, 127);
+                    } else {
+                        s.plugin.note_off(note);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The arp's own beat clock at this moment: the song position while the
+    /// master transport plays (rule 43 — the pattern sits on the music's
+    /// grid), else the slot's free-running phase (a live arp keeps arping
+    /// between songs at the transport's BPM).
+    fn arp_clock(&self, node: NodeId) -> f64 {
+        let playing = self.transport.playing;
+        self.arp.iter().find(|a| a.node == node)
+            .map(|a| if playing { self.transport.beats } else { a.phase })
+            .unwrap_or(0.0)
     }
 
     fn apply(&mut self, cmd: Command) {
@@ -1570,7 +1761,33 @@ impl GraphEngine {
                 let id = self.graph.add_node(kind.clone(), name);
                 self.graph.set_rig(id, rig);
                 if wire {
-                    self.graph.wire_instrument(id);
+                    if matches!(kind, NodeKind::Arp) {
+                        // The arp takes over the rig's Keys→synth MIDI cables:
+                        // every note held on those synths loses its off path
+                        // (rule 41). Release them BEFORE rewiring.
+                        let mut taken = 0usize;
+                        for i in 0..self.graph.edges.len() {
+                            let e = &self.graph.edges[i];
+                            if e.kind != PortKind::Midi || e.to.node == id { continue; }
+                            if self.graph.node(e.from.node)
+                                .is_some_and(|n| matches!(n.kind, NodeKind::Keys) && n.rig == rig)
+                            {
+                                let (dest, eid) = (e.to.node, e.id);
+                                self.release_all(dest);
+                                let synth = self.graph.node(dest).is_some_and(|d| matches!(d.kind, NodeKind::Clap { .. }));
+                                if synth && taken < self.arp_taken.len() {
+                                    self.arp_taken[taken] = eid;
+                                    taken += 1;
+                                }
+                            }
+                        }
+                        for slot in &mut self.arp_taken[taken..] {
+                            *slot = crate::control::EdgeId::MAX;
+                        }
+                        self.graph.wire_arp(id);
+                    } else {
+                        self.graph.wire_instrument(id);
+                    }
                 }
                 let sr = self.sample_rate;
                 match &kind {
@@ -1592,16 +1809,28 @@ impl GraphEngine {
                         self.fit_route_out();
                         self.bind_free_voices();
                     }
+                    // A MIDI destination like an instrument: its input rules
+                    // come with the node so the keys route to it at once.
+                    NodeKind::Arp => {
+                        self.arp.push(crate::arp::ArpState::new(id));
+                        self.matrix.connect(SourceId::Keys, id);
+                        for dev in 0..MAX_HW_DEVICES {
+                            self.matrix.connect(SourceId::Hardware(dev), id);
+                        }
+                        self.fit_route_out();
+                    }
                     _ => {}
                 }
                 self.publish_graph();
             }
             Command::RemoveNode(id) => {
                 // An idle voice keeps a held note and replays it when rebound.
+                // (An Arp node cascades: its generated notes die with it.)
                 self.release_all(id);
                 self.graph.remove_node(id);
                 self.dsp.retain(|s| s.node != id);
                 self.audio_in.retain(|s| s.node != id);
+                self.arp.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
                     let slot = self.lv2.remove(i);
                     self.retire_lv2(slot);
@@ -1616,16 +1845,26 @@ impl GraphEngine {
             Command::Connect { id, from, to, kind } => {
                 // Publish only on a real change: the UI's per-frame mirror
                 // re-sends duplicate Connects, which must not bump the rev.
+                // No release: a cable plugged after a note-on only ever
+                // delivers a stray note-off to a dest that never sounded
+                // (and the arp ignores offs for keys it never held) — the
+                // held-notes check proves this path safe.
+                if self.arp_taken.contains(&id) {
+                    return;
+                }
                 if self.graph.connect_with_id(id, from, to, kind) {
                     self.publish_graph();
                 }
             }
             Command::Disconnect(id) => {
-                // keys_gate drops a note-off whose Keys cable is gone.
+                // keys_gate drops a note-off whose Keys cable is gone; an
+                // arp-generated note's off path is the arp's own cable.
                 let fed = self.graph.edges.iter().find(|e| {
                     e.id == id
                         && e.kind == PortKind::Midi
-                        && self.graph.node(e.from.node).map_or(false, |n| matches!(n.kind, NodeKind::Keys))
+                        && self.graph.node(e.from.node).map_or(false, |n| {
+                            matches!(n.kind, NodeKind::Keys | NodeKind::Arp)
+                        })
                 });
                 if let Some(dest) = fed.map(|e| e.to.node) {
                     self.release_all(dest);
@@ -1675,6 +1914,7 @@ impl GraphEngine {
                 }
             }
             Command::LoadGraph { graph } => {
+                self.arp_taken = [crate::control::EdgeId::MAX; 8];
                 // Rare structural op (template load): rebuild graph, DSP, voice
                 // mapping, and MIDI matrix. Allocates — acceptable off the hot
                 // path; a future version can rebuild off-thread and swap.
@@ -1695,6 +1935,10 @@ impl GraphEngine {
                     })
                     .collect();
                 self.audio_in = build_audio_in_slots(&self.graph);
+                // Arp nodes of the new graph start fresh (the loop above
+                // released every old node — an old arp cascaded to what it
+                // fed, and the slots themselves die with the old graph).
+                self.arp = build_arp_slots(&self.graph);
                 // Old instances are freed (on the loader thread when it runs);
                 // new ones load below, after the matrix is rebuilt.
                 while let Some(slot) = self.lv2.pop() {
@@ -1714,9 +1958,23 @@ impl GraphEngine {
                     .filter(|n| matches!(n.kind, NodeKind::Clap { .. }))
                     .map(|n| n.id)
                     .collect();
+                let arp_ids: Vec<NodeId> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, NodeKind::Arp))
+                    .map(|n| n.id)
+                    .collect();
                 self.matrix = Matrix::new();
                 self.matrix.reserve(64);
                 for &id in &clap_ids {
+                    self.matrix.connect(SourceId::Keys, id);
+                    for dev in 0..MAX_HW_DEVICES {
+                        self.matrix.connect(SourceId::Hardware(dev), id);
+                    }
+                }
+                // Arp nodes are MIDI destinations like instruments.
+                for &id in &arp_ids {
                     self.matrix.connect(SourceId::Keys, id);
                     for dev in 0..MAX_HW_DEVICES {
                         self.matrix.connect(SourceId::Hardware(dev), id);
@@ -1746,6 +2004,7 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::LoadRigs { rigs, active } => {
+                self.arp_taken = [crate::control::EdgeId::MAX; 8];
                 // Rare structural op: merge the rig graphs into one patch and
                 // reuse the LoadGraph rebuild (DSP, LV2, CLAP voice remap in
                 // node-id order, matrix), then bind each rig's
@@ -1803,8 +2062,21 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(shift) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = shifted(m.note(), shift) else { continue };
+                    let Some(route) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = Self::routed_note(&m, &route) else { continue };
+                    // An arp destination: the note joins its hold (or, chord
+                    // mode, sounds its chord at once); the arp generates its
+                    // own notes downstream from here.
+                    if self.arp.iter().any(|a| a.node == dest) {
+                        let now = self.arp_clock(dest);
+                        let vel = velocity as f32;
+                        self.with_arp_slot(dest, |a, eng| {
+                            let (node, v) = (a.node, a.velocity());
+                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
+                            a.note_in(out, vel, now, &mut emit);
+                        });
+                        continue;
+                    }
                     #[cfg(test)]
                     self.note_log.push((dest, out, true));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
@@ -1824,8 +2096,18 @@ impl GraphEngine {
                 self.matrix.route_into(source, msg, &mut self.route_out);
                 for i in 0..self.route_out.len() {
                     let (dest, m) = self.route_out[i];
-                    let Some(shift) = self.keys_route(dest, note) else { continue };
-                    let Some(out) = shifted(m.note(), shift) else { continue };
+                    let Some(route) = self.keys_route(dest, note) else { continue };
+                    let Some(out) = Self::routed_note(&m, &route) else { continue };
+                    // The release meets the arp at the same snapped pitch its
+                    // note-on did; the arp stops what it had going.
+                    if self.arp.iter().any(|a| a.node == dest) {
+                        self.with_arp_slot(dest, |a, eng| {
+                            let (node, v) = (a.node, a.velocity());
+                            let mut emit = |n: u8, on: bool| eng.deliver_arp_note(node, n, on, v);
+                            a.note_out(out, &mut emit);
+                        });
+                        continue;
+                    }
                     #[cfg(test)]
                     self.note_log.push((dest, out, false));
                     if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
@@ -1911,6 +2193,27 @@ impl GraphEngine {
                         }
                     }
                     self.graph.set_zone_octave(node, zone, octave);
+                    self.publish_graph();
+                }
+            }
+            Command::SetKeysScale { node, scale } => {
+                // A Keys-node property (like a split move): a scale change
+                // mid-hold would snap the release to a different pitch than
+                // its note-on snapped to — release everything this Keys node
+                // feeds, from all ports, BEFORE the snap moves (rule 41).
+                let choice = scale.map(|c| crate::arp::ScaleChoice { key: c.key.min(11), ..c });
+                let is_change = self.graph.node(node).is_some_and(|n| {
+                    matches!(n.kind, NodeKind::Keys) && n.scale != choice
+                });
+                if is_change {
+                    for i in 0..self.graph.edges.len() {
+                        let e = &self.graph.edges[i];
+                        if e.kind == PortKind::Midi && e.from.node == node {
+                            let dest = e.to.node;
+                            self.release_all(dest);
+                        }
+                    }
+                    self.graph.set_scale(node, choice);
                     self.publish_graph();
                 }
             }
@@ -2312,6 +2615,29 @@ impl GraphEngine {
         }
         if counting_in_this_block {
             render_metronome(&mut self.count_in_slot, &mut self.count_in_buf[..n2], frames, sr, bpm, suppress_wrap_click);
+        }
+        // 2a-arp. Arpeggiator units step on the SONG CLOCK while the master
+        // transport plays (rule 43: the pattern sits on the music's grid, and
+        // a tempo change retempoes it mid-beat), and on their own free-run
+        // beat phase at the same BPM when it does not — a live arp keeps
+        // arping between songs. Mirroring the song position into the phase
+        // while playing makes the stop seamless; a rewind (Play) is caught
+        // by the tick's retime instead of machine-gunning missed steps.
+        {
+            let mut arps = std::mem::take(&mut self.arp);
+            for a in &mut arps {
+                if self.transport.playing {
+                    a.phase = self.transport.beats;
+                }
+                let (t0, t1) = (a.phase, a.phase + block_beats);
+                let (node, vel) = (a.node, a.velocity());
+                let mut emit = |note: u8, on: bool| self.deliver_arp_note(node, note, on, vel);
+                a.tick(t0, t1, &mut emit);
+                if !self.transport.playing {
+                    a.phase = t1;
+                }
+            }
+            self.arp = arps;
         }
         match self.master_clock {
             MasterClock::Stopped => {}
@@ -2984,6 +3310,98 @@ mod tests {
         // Non-Keys nodes ignore the command.
         assert!(play(&mut e, &mut bus, Command::SetNodeSplit { node: 1, point: Some(60) }).is_empty());
         assert_eq!(e.graph().node(1).unwrap().split, None);
+    }
+
+    fn add_arp(engine: &mut super::GraphEngine, bus: &mut crate::control::CommandBus) -> u32 {
+        use crate::control::{name_bytes, Command, NodeKind};
+        play(engine, bus, Command::AddNode { kind: NodeKind::Arp, name: name_bytes("ARP"), rig: 0, wire: true });
+        engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::Arp)).expect("the arp was added").id
+    }
+
+    #[test]
+    fn an_arp_takes_over_the_keys_cables_and_a_stale_reconnect_cannot_undo_it() {
+        use crate::control::{Command, PortKind, PortRef};
+        let (mut e, mut bus) = split_engine(None, false);
+        play(&mut e, &mut bus, on(60));
+        let log = play(&mut e, &mut bus, Command::AddNode {
+            kind: crate::control::NodeKind::Arp, name: crate::control::name_bytes("ARP"), rig: 0, wire: true });
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "held notes on both synths are released before the rewire: {log:?}");
+        let arp = e.graph().nodes.iter().find(|n| matches!(n.kind, crate::control::NodeKind::Arp)).unwrap().id;
+        let midi = |e: &super::GraphEngine| e.graph().edges.iter().filter(|x| x.kind == PortKind::Midi).map(|x| (x.from.node, x.to.node)).collect::<Vec<_>>();
+        assert!(midi(&e).contains(&(0, arp)) && midi(&e).contains(&(arp, 1)) && midi(&e).contains(&(arp, 4)), "keys → arp → both synths: {:?}", midi(&e));
+        assert!(!midi(&e).contains(&(0, 1)) && !midi(&e).contains(&(0, 4)), "no direct keys → synth cable is left: {:?}", midi(&e));
+        // The UI's per-frame mirror still holds the old cables until it adopts the new graph.
+        play(&mut e, &mut bus, Command::Connect { id: 1, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi });
+        play(&mut e, &mut bus, Command::Connect { id: 6, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 4, port: 0 }, kind: PortKind::Midi });
+        assert!(!midi(&e).contains(&(0, 1)) && !midi(&e).contains(&(0, 4)), "the stale cables stayed out: {:?}", midi(&e));
+        // A load starts over: the id is free again.
+        let g = crate::control::Graph::demo_patch();
+        play(&mut e, &mut bus, Command::LoadGraph { graph: g });
+        assert!(midi(&e).contains(&(0, 1)));
+    }
+
+    #[test]
+    fn the_arp_arpeggiates_the_held_keys_into_its_synths_and_every_release_silences_it() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        // Held keys reach the arp, not the synths.
+        assert!(play(&mut e, &mut bus, on(60)).is_empty(), "a held key plays nothing by itself");
+        assert!(play(&mut e, &mut bus, on(64)).is_empty());
+        assert_eq!(e.arp_held(arp), vec![60, 64]);
+        // Time passes: the arp starts its pattern on both synths.
+        e.note_log.clear();
+        e.arp_test_step();
+        let ons: Vec<(u32, u8)> = e.note_log.iter().filter(|x| x.2).map(|x| (x.0, x.1)).collect();
+        assert!(ons.contains(&(1, 60)) && ons.contains(&(4, 60)), "the first note goes to both synths: {ons:?}");
+        // Releasing every key silences the arp's notes on both.
+        let mut log = play(&mut e, &mut bus, off(60));
+        log.extend(play(&mut e, &mut bus, off(64)));
+        assert!(e.arp_sounding(arp).is_empty() && e.arp_held(arp).is_empty());
+        let downs: Vec<(u32, u8)> = log.iter().filter(|x| !x.2).map(|x| (x.0, x.1)).collect();
+        let sounding_at_tick: Vec<u8> = ons.iter().filter(|x| x.0 == 1).map(|x| x.1).collect();
+        assert!(downs.contains(&(1, *sounding_at_tick.last().unwrap())) && downs.contains(&(4, *sounding_at_tick.last().unwrap())),
+            "the burst the tick left down went off on both synths: {log:?}");
+        // Removing the arp while keys are held silences what it fed.
+        play(&mut e, &mut bus, on(60));
+        e.arp_test_step();
+        let log = play(&mut e, &mut bus, Command::RemoveNode(arp));
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "RemoveNode releases the synths it fed: {log:?}");
+    }
+
+    #[test]
+    fn chord_mode_sounds_three_voices_per_key_through_the_engine() {
+        use crate::control::Command;
+        let (mut e, mut bus) = split_engine(None, false);
+        let arp = add_arp(&mut e, &mut bus);
+        play(&mut e, &mut bus, Command::SetParam { node: arp, param: crate::arp::P_ARP_MODE, value: crate::arp::step_value(3, 5) as f64 });
+        let log = play(&mut e, &mut bus, on(60));
+        let on_a: Vec<u8> = log.iter().filter(|x| x.0 == 1 && x.2).map(|x| x.1).collect();
+        assert_eq!(on_a, vec![60, 64, 67], "one key, a triad on synth A: {log:?}");
+        let log = play(&mut e, &mut bus, off(60));
+        let off_a: Vec<u8> = log.iter().filter(|x| x.0 == 1 && !x.2).map(|x| x.1).collect();
+        assert_eq!(off_a, vec![60, 64, 67], "the key's release takes the whole chord off: {log:?}");
+        assert!(e.arp_sounding(arp).is_empty());
+    }
+
+    #[test]
+    fn scale_snap_moves_a_key_and_its_release_to_the_same_note() {
+        use crate::control::Command;
+        use crate::arp::{Scale, ScaleChoice};
+        let (mut e, mut bus) = split_engine(None, false);
+        let cmaj = ScaleChoice { scale: Scale::Major, key: 0 };
+        play(&mut e, &mut bus, Command::SetKeysScale { node: 0, scale: Some(cmaj) });
+        assert_eq!(e.graph().node(0).unwrap().scale, Some(cmaj));
+        assert_eq!(play(&mut e, &mut bus, on(61)), vec![(1, 60, true), (4, 60, true)], "C# plays as C on both synths");
+        assert_eq!(play(&mut e, &mut bus, off(61)), vec![(1, 60, false), (4, 60, false)], "its release meets the C");
+        assert_eq!(play(&mut e, &mut bus, on(62)), vec![(1, 62, true), (4, 62, true)], "an in-scale key is untouched");
+        // Changing the scale while a key is held releases first (rule 41).
+        let log = play(&mut e, &mut bus, Command::SetKeysScale { node: 0, scale: None });
+        assert!(log.contains(&(1, 255, false)) && log.contains(&(4, 255, false)), "{log:?}");
+        assert_eq!(play(&mut e, &mut bus, on(61)), vec![(1, 61, true), (4, 61, true)], "snapping off: the key plays as pressed");
+        // Only Keys nodes snap.
+        play(&mut e, &mut bus, Command::SetKeysScale { node: 1, scale: Some(cmaj) });
+        assert_eq!(e.graph().node(1).unwrap().scale, None);
     }
 
     #[test]
@@ -5112,6 +5530,125 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         units.len(),
         table_cap * 2
     );
+    Ok(())
+}
+
+/// `kabelsalat arp-test` (issue #90): Keys → Arp → a real Surge XT voice →
+/// Master through the real engine. Two bars at 120 BPM of an up pattern over
+/// a held triad must be C E G repeating on the 1/16 grid (125 ms apart, to
+/// the block) and audible; chord mode must sound three voices per held key
+/// and release them with the key; the Keys scale snap must move a C# to C
+/// before the arp sees it.
+pub fn arp_test() -> anyhow::Result<()> {
+    use crate::arp::{step_value, ArpMode, ChordShape, Scale, ScaleChoice, P_ARP_CHORD, P_ARP_MODE};
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef, SURGE_PLUGIN_ID};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+    const BPM: f64 = 120.0;
+
+    let mut g = Graph::default();
+    g.reserve(16, 16);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    let arp = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+    let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_PLUGIN_ID) }, name_bytes("SURGE"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: arp, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: arp, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+    g.connect_with_id(3, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    g.connect_with_id(4, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 1 }, PortKind::Audio);
+
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g.clone(), drain, SR, vec![]);
+    let graph_pub = Arc::new(Mutex::new(GraphPub { graph: g, ..Default::default() }));
+    engine.set_graph_pub(graph_pub.clone());
+    let (mut tx, rx) = rtrb::RingBuffer::<VoiceMsg>::new(16);
+    let (back_tx, _back) = rtrb::RingBuffer::<VoiceBack>::new(16);
+    engine.set_voice_channels(rx, back_tx);
+    let (voice, _main) = ClapVoice::new_plugin(SR, SURGE_PLUGIN_ID)?;
+    tx.push(VoiceMsg::Add(VoiceSlot::new(voice))).map_err(|_| anyhow::anyhow!("voice ring full"))?;
+    let mut buf = vec![0.0f32; BLOCK * 2];
+    bus.send(Command::SetBpm { bpm: BPM as f32 });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_held(arp).is_empty() && engine.arp_sounding(arp).is_empty(), "a fresh arp is not silent");
+
+    // 1. Up pattern, two bars.
+    for note in [60u8, 64, 67] {
+        bus.send(Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys });
+    }
+    let blocks = (SR * 60.0 / BPM * 8.0 / BLOCK as f64).ceil() as usize; // 8 beats
+    let mut onsets: Vec<(usize, u8)> = Vec::new();
+    let mut last: Vec<u8> = Vec::new();
+    let mut peak = 0.0f32;
+    for b in 0..blocks {
+        engine.render(&mut buf, 2);
+        peak = peak.max(buf.iter().fold(0.0f32, |m, x| m.max(x.abs())));
+        let now = engine.arp_sounding(arp);
+        for n in &now {
+            if !last.contains(n) {
+                onsets.push((b, *n));
+            }
+        }
+        last = now;
+    }
+    let notes: Vec<u8> = onsets.iter().map(|o| o.1).collect();
+    println!("  up, 1/16 @ {BPM} BPM, 2 bars: {} steps, first 9: {:?}", notes.len(), &notes[..notes.len().min(9)]);
+    anyhow::ensure!((31..=33).contains(&notes.len()), "expected 32 sixteenth steps in 2 bars, got {}", notes.len());
+    for (i, n) in notes.iter().enumerate() {
+        let want = [60u8, 64, 67][i % 3];
+        anyhow::ensure!(*n == want, "step {i}: played {n}, the up pattern wants {want} ({notes:?})");
+    }
+    let step_blocks = SR * 60.0 / BPM / 4.0 / BLOCK as f64; // 125 ms in blocks
+    for w in onsets.windows(2) {
+        let gap = (w[1].0 - w[0].0) as f64;
+        anyhow::ensure!((gap - step_blocks).abs() <= 1.01, "steps {gap} blocks apart, the 1/16 grid is {step_blocks:.2}");
+    }
+    anyhow::ensure!(peak > 1e-3, "the arpeggio is silent: peak {peak}");
+    println!("    audible (peak {peak:.3}); steps {:.1} ms apart on the grid", step_blocks * BLOCK as f64 / SR * 1000.0);
+
+    // Releasing every key silences the arp at once.
+    for note in [60u8, 64, 67] {
+        bus.send(Command::NoteOff { note, source: SourceId::Keys });
+    }
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty() && engine.arp_held(arp).is_empty(), "arp still holds notes after the release");
+
+    // 2. Chord mode: three voices per held key.
+    let knob = |bus: &mut crate::control::CommandBus, param: u32, pos: usize, n: usize| {
+        bus.send(Command::SetParam { node: arp, param, value: step_value(pos, n) as f64 });
+    };
+    knob(&mut bus, P_ARP_MODE, ArpMode::ALL.iter().position(|m| *m == ArpMode::Chord).unwrap(), ArpMode::ALL.len());
+    bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "one key must sound a triad, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 65, 67, 69, 72], "two keys, two triads, got {:?}", engine.arp_sounding(arp));
+    let sevenths = ChordShape::ALL.iter().position(|c| *c == ChordShape::Dominant7).unwrap();
+    knob(&mut bus, P_ARP_CHORD, sevenths, ChordShape::ALL.len());
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).len() == 8, "dominant 7ths on two keys = 8 voices, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![65, 69, 72, 75], "releasing C leaves F7, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 65, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "chords left sounding after both releases");
+    println!("  chord mode: 1 key → 3 voices, 2 keys → 6, 7th shape → 4 per key, release clears them");
+
+    // 3. Scale snap on the Keys node: C# in C major sounds as C.
+    bus.send(Command::SetKeysScale { node: keys, scale: Some(ScaleChoice { scale: Scale::Major, key: 0 }) });
+    knob(&mut bus, P_ARP_CHORD, 0, ChordShape::ALL.len());
+    bus.send(Command::NoteOn { note: 61, velocity: 0.9, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp) == vec![60, 64, 67], "C# in C major must snap to C, got {:?}", engine.arp_sounding(arp));
+    bus.send(Command::NoteOff { note: 61, source: SourceId::Keys });
+    engine.render(&mut buf, 2);
+    anyhow::ensure!(engine.arp_sounding(arp).is_empty(), "the snapped note's release did not meet its pitch");
+    println!("  scale snap: C# in C major → C (triad 60 64 67), released cleanly");
+
+    println!("arp-test: OK");
     Ok(())
 }
 

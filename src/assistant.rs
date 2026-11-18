@@ -646,7 +646,7 @@ fn system_prompt() -> String {
      from_port 0/1 — there is no automatic rig split; low_octave/high_octave shift a zone by \
      octaves. The keys below a split are low already and many bass sounds are pitched down: \
      when you put a bass on the LOW zone, set low_octave 1 unless the user asked for a deep \
-     bass, and tell the user; if they say it is too deep or too high, step it), flip_rack.\n\
+     bass, and tell the user; if they say it is too deep or too high, step it), set_scale (keys play only one scale: out-of-scale keys snap to the nearest in-scale note), flip_rack. For arpeggios or one-key chords: add_node kind arp into the rig (it sits between the rig's Keys and its synth, already wired), then set_arp (mode up/down/up-down/chord/random, rate 1/4..1/32 synced to the tempo, octaves, gate, swing, chord shape).\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
@@ -749,6 +749,16 @@ pub(crate) fn tools() -> Value {
             "name":"set_split",
             "description":"Split a Keys node's keyboard at a MIDI note (a property of the Keys node) and set each zone's octave. Played notes below the point leave on its port 0 (LOW), notes at/above on port 1 (HIGH). Routing is plain wiring: after splitting, connect from_port 1 of the Keys node to the rig that should play the high zone (existing cables stay on LOW). low_octave/high_octave shift what a zone plays by whole octaves (-3..3); the keys that pick the zone stay the same. A call with only octaves keeps the current split; a call with neither point nor octaves unsplits (one MIDI OUT; HIGH cables are removed, octaves reset). Examples: {point: 60} splits at C4; {low_octave: 1} raises the low zone an octave.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit with no octaves = unsplit"},"low_octave":{"type":"integer","description":"octave shift of the LOW zone, -3..3"},"high_octave":{"type":"integer","description":"octave shift of the HIGH zone, -3..3"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_scale",
+            "description":"Make a Keys node's keyboard play only one scale (a property of the Keys node): out-of-scale keys snap to the nearest in-scale note, so every key sounds right (GarageBand's scale-limited keys). key: C, C#, D … B (default C); scale: major | minor | dorian | mixolydian | harmonic minor | maj penta | min penta | blues (default major); off true switches snapping off. Example: {key:'A', scale:'min penta'}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"key":{"type":"string"},"scale":{"type":"string"},"off":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_arp",
+            "description":"Set an Arp unit's settings by name. Add the unit first with add_node {kind:'arp'} (it is inserted between the rig's Keys and its synth(s); held keys then arpeggiate). mode: up | down | up-down | chord | random ('chord' = each held key sounds a whole chord, shape from chord); rate: 1/4 | 1/8 | 1/8T | 1/16 | 1/16T | 1/32, synced to the tempo; octaves 1-4; gate 0.05-1 (how much of each step a note sounds); swing 0-1; chord: maj | min | sus2 | sus4 | 7 | maj7 | min7 | power. Give any subset. Example: {node:7, mode:'up-down', rate:'1/16', octaves:2}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"arp node id (get_graph, kind arp)"},"mode":{"type":"string"},"rate":{"type":"string"},"octaves":{"type":"integer"},"gate":{"type":"number"},"swing":{"type":"number"},"chord":{"type":"string"}},"required":["node"]}
         }},
         {"type":"function","function":{
             "name":"save_session",
@@ -902,7 +912,7 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out. dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
             "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
         }},
         {"type":"function","function":{

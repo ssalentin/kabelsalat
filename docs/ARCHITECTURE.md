@@ -87,9 +87,8 @@ agents are in [AGENTS.md](../AGENTS.md).
   built-in assistant; both expose the same tools (AGENTS.md rule 6). The
   assistant's worker asks a decisions model first (`SHORTCUTS`: one row per
   request it settles, each a plan of tool calls) and hands the rest to a chat
-  model. `llm.rs` is the one client and the route per role (decide, act,
-  perceive); `vision.rs` sizes and encodes the images a model gets (attached
-  by the user, or the app window through `look_at_rack`).
+  model. `llm.rs` is the one client and the route per role (decide, act).
+  The agent takes text only: there is no image input.
 - `session.rs` — sessions (multi-rig), templates.
 
 ## 0. Decision log

@@ -1,7 +1,5 @@
 # Reviewed images (AGENTS.md rule 108): each shows only kabelsalat or a
 # design reference. Checked by scripts/check-images.sh in the pre-commit hook and CI.
-ef238382437a2859129ceb23487ce3ad98b8adfd6d0e78f136f444dd2081e6fc  assets/agent-eval/note-mute-rig-2.png
-22cf03aee8fc615fd6da14bd66adca3914ded93f151cf2370901269d3fe85b7d  assets/agent-eval/note-tempo-90.jpg
 1c18db4582a9bb5d557417d42cea16d6831dd12a5e70b5062f8811cbee7f83e4  assets/logo.png
 0fe34d604255b36fb9c8c8aadbac80af995a85875f457a0d686b9a583b9d9d50  docs/design-ref/hurricane-1-api.jpg
 9a6b05791dcb267cdcb39342a736ed9200bd400417e5a136ba66faca77677ad1  docs/design-ref/hurricane-1.png

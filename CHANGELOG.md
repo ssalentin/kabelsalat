@@ -70,6 +70,13 @@ releases may still change behaviour and session files.
   the low keys it is played on; the assistant sets the LOW zone an octave up
   when it puts a bass there. Saved with the session.
 
+### Removed
+- **Image input for the assistant:** dropping or pasting an image into the
+  chat, the `look_at_rack` screenshot tool (in-app and MCP), the vision model
+  role (`agent_perceive_model` in Settings and config.json) and
+  `jev-test --image` are gone. The agent works from text and the rack's own
+  data. Dropped `.vital` / `.vitalbank` files are still imported.
+
 ### Changed
 - **Native Wayland:** the app no longer forces XWayland and needs no X
   server. It renders at the compositor's fractional scale (sharp at 1.6x),

@@ -76,7 +76,7 @@ pub fn now_ms() -> u64 {
 fn refused_while_paused(req: &Value) -> bool {
     let op = req.get("op").and_then(Value::as_str);
     let tool = req.get("tool").and_then(Value::as_str).unwrap_or("");
-    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_") || tool == "look_at_rack";
+    let reads = tool.starts_with("get_") || tool.starts_with("list_") || tool.starts_with("search_");
     op == Some("cmd") || (op == Some("ui") && !reads)
 }
 

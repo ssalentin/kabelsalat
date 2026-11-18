@@ -28,8 +28,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, FontId, Galley, Key, Modifiers, Pos2, Rect, Shape, Stroke, Vec2,
 };
 
-use crate::assistant::{Assistant, ChatLine, ToolCall, ToolOutput, UserMessage};
-use crate::vision::Image;
+use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
     name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
@@ -1108,7 +1107,7 @@ struct TranscriptRun {
 
 /// Maximum tool chips shown in a finished or long run before `"+N more"`.
 const COLLAPSED_RUN_CHIPS: usize = 3;
-/// Left indent of transcript message text, chips, Confirm/Cancel, and attachments
+/// Left indent of transcript message text, chips and Confirm/Cancel
 /// (6 px leading margin + 66 px role column + 6 px spacing).
 const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 
@@ -1118,7 +1117,7 @@ const TRANSCRIPT_TEXT_INDENT: f32 = 78.0;
 /// sees what the calls before it really did.
 struct ToolBatch {
     todo: VecDeque<(ToolCall, Option<usize>)>,
-    results: Vec<ToolOutput>,
+    results: Vec<String>,
     waiting: Option<(Waiting, Option<usize>)>,
     user_idx: usize,
 }
@@ -1130,99 +1129,6 @@ enum Waiting {
     /// list_sounds / load_sound on an instrument whose library is still
     /// being scanned: the call runs once the scan is done.
     SoundScan { call: crate::assistant::ToolCall, deadline: std::time::Instant },
-    /// look_at_rack: the screenshot of a coming frame. The tool's own
-    /// line is kept for the result.
-    RackShot { said: String, deadline: std::time::Instant },
-}
-
-/// Thumbnail height and row height for the chat's attached image chip.
-const ATTACH_THUMB_H: f32 = 32.0;
-const ATTACH_ROW_H: f32 = 40.0;
-
-/// Cached egui texture for the currently attached chat image (loaded once per
-/// attachment and dropped immediately when the attachment is cleared).
-struct ChatThumb {
-    bytes: Arc<[u8]>,
-    tex: Option<egui::TextureHandle>,
-    size: [usize; 2],
-}
-
-fn truncate_attachment_name(name: &str) -> String {
-    if name.chars().count() > 40 {
-        format!("…{}", name.chars().rev().take(39).collect::<Vec<_>>().into_iter().rev().collect::<String>())
-    } else {
-        name.to_string()
-    }
-}
-
-fn sync_chat_thumb(ctx: &egui::Context, chat_image: &Option<Image>, chat_thumb: &mut Option<ChatThumb>) {
-    let Some(img) = chat_image.as_ref() else {
-        *chat_thumb = None;
-        return;
-    };
-    if chat_thumb.as_ref().is_some_and(|t| Arc::ptr_eq(&t.bytes, &img.bytes)) {
-        return;
-    }
-    let (tex, size) = match img.thumbnail_rgba(64) {
-        Some((sz, rgba)) => {
-            let color = egui::ColorImage::from_rgba_unmultiplied(sz, &rgba);
-            let handle = ctx.load_texture("assistant_chat_thumb", color, egui::TextureOptions::LINEAR);
-            (Some(handle), sz)
-        }
-        None => (None, [32, 32]),
-    };
-    *chat_thumb = Some(ChatThumb {
-        bytes: Arc::clone(&img.bytes),
-        tex,
-        size,
-    });
-}
-
-/// The tool that shows an agent the app window.
-const LOOK_TOOL: &str = "look_at_rack";
-/// How long look_at_rack waits for the frame's pixels.
-const RACK_SHOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// look_at_rack's screenshot of the app window. The tool only asks; the
-/// frame path sends the request (it has the egui context), the windowing
-/// integration answers after it painted, and a worker thread scales and
-/// encodes the pixels. Whoever waits takes the result on a later frame.
-#[derive(Default)]
-struct RackShot {
-    wanted: bool,
-    ready: Arc<Mutex<Option<Result<Image, String>>>>,
-    /// Bridge (MCP) callers waiting for it, each with its deadline.
-    remote: Vec<(std::sync::mpsc::Sender<String>, std::time::Instant)>,
-}
-
-impl RackShot {
-    /// Ask the integration for the next frame's pixels.
-    fn request(&mut self, ctx: &egui::Context) {
-        if !std::mem::take(&mut self.wanted) { return; }
-        // A frame that came after its caller gave up is not this look's.
-        if let Ok(mut slot) = self.ready.lock() { *slot = None; }
-        let (ready, repaint) = (self.ready.clone(), ctx.clone());
-        ctx.request_screenshot(move |frame: Arc<egui::ColorImage>| {
-            std::thread::spawn(move || {
-                let image = Image::from_rgba("kabelsalat window", frame.size, frame.as_raw());
-                if let Ok(mut slot) = ready.lock() { *slot = Some(image); }
-                repaint.request_repaint();
-            });
-        });
-    }
-
-    fn take(&self) -> Option<Result<Image, String>> {
-        self.ready.lock().ok().and_then(|mut slot| slot.take())
-    }
-}
-
-/// look_at_rack's result once the frame arrived, or why there is none.
-fn rack_shot_output(said: &str, shot: Option<Result<Image, String>>) -> ToolOutput {
-    match shot {
-        Some(Ok(image)) => ToolOutput { text: format!("{said}: {}", image.describe()), image: Some(image) },
-        Some(Err(why)) => format!("error: the screenshot could not be encoded: {why}").into(),
-        None => format!("error: no screenshot within {} s — the window is hidden or the app runs without one", RACK_SHOT_WAIT.as_secs()).into(),
-    }
 }
 
 /// The tools that read an instrument's sound library.
@@ -1938,7 +1844,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "learn_cc", "get_matrix", "undo", "redo", "rename_rig", "list_audio_outputs",
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
     "save_rig", "load_rig", "list_rig_presets",
-    "list_instruments", "install_instrument", "play_file", "stop_file", LOOK_TOOL,
+    "list_instruments", "install_instrument", "play_file", "stop_file",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -1949,7 +1855,7 @@ const REMOTE_JOB_GAP: f32 = 3.0;
 /// Tools that only read: they never open an undo step.
 fn tool_is_read_only(name: &str) -> bool {
     name.starts_with("get_") || name.starts_with("list_") || name.starts_with("search_")
-        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo" | LOOK_TOOL)
+        || matches!(name, "record_status" | "measure_mix" | "undo" | "redo")
 }
 
 /// Tools that change the machine, not the patch: no agent undo snapshot (an
@@ -2265,7 +2171,6 @@ struct DemoApp {
     popup_open_at_start: bool,
     settings_decide_input: String,
     settings_act_input: String,
-    settings_perceive_input: String,
     settings_deepseek_key: String,
     settings_openrouter_key: String,
     settings_msg: String,
@@ -2366,11 +2271,6 @@ struct DemoApp {
     transcript_runs: HashMap<usize, TranscriptRun>,
     /// Index in `assistant.history` of the `"user"` turn currently running.
     active_run_user_idx: Option<usize>,
-    rack_shot: RackShot,
-    /// The image attached to the chat message being written.
-    chat_image: Option<Image>,
-    /// Thumbnail texture handle for `chat_image`, freed when removed.
-    chat_thumb: Option<ChatThumb>,
     /// Rename dialog: (rig, the name being edited). Double-click a rig chip.
     rename_rig_dialog: Option<(usize, String)>,
     /// Save-rig-preset modal: (rig index, preset name being edited).
@@ -2669,7 +2569,6 @@ impl DemoApp {
             popup_open_at_start: false,
             settings_decide_input: String::new(),
             settings_act_input: String::new(),
-            settings_perceive_input: String::new(),
             settings_deepseek_key: String::new(),
             settings_openrouter_key: String::new(),
             settings_msg: String::new(),
@@ -2724,9 +2623,6 @@ impl DemoApp {
             tool_batch: None,
             transcript_runs: HashMap::new(),
             active_run_user_idx: None,
-            rack_shot: RackShot::default(),
-            chat_image: None,
-            chat_thumb: None,
             rename_rig_dialog: None,
             save_rig_dialog: None,
             load_rig_dialog: None,
@@ -4246,7 +4142,6 @@ impl DemoApp {
                     None => format!("Add {what}"),
                 }
             }
-            LOOK_TOOL => "Look at the rack".into(),
             "get_graph" => "Read rack graph".into(),
             "get_status" => "Check status".into(),
             "get_rigs" => "List rigs".into(),
@@ -4405,20 +4300,16 @@ impl DemoApp {
         if let Some(mut batch) = self.tool_batch.take() {
             if let Some((waiting, chip_idx)) = batch.waiting.take() {
                 let outcome = match &waiting {
-                    Waiting::Engine(edit) => self.engine_edit_outcome(edit).map(ToolOutput::from),
-                    Waiting::RackShot { said, deadline } => match self.rack_shot.take() {
-                        None if std::time::Instant::now() < *deadline => None,
-                        shot => Some(rack_shot_output(said, shot)),
-                    },
+                    Waiting::Engine(edit) => self.engine_edit_outcome(edit),
                     Waiting::SoundScan { call, deadline } => {
                         let scanning = self.sound_scan_running(&call.args) && std::time::Instant::now() < *deadline;
-                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args).into())
+                        (!scanning).then(|| self.run_assistant_tool(&call.name, &call.args))
                     }
                 };
                 match outcome {
                     Some(result) => {
                         if let Some(ci) = chip_idx {
-                            self.finish_chip(batch.user_idx, ci, &result.text);
+                            self.finish_chip(batch.user_idx, ci, &result);
                         }
                         batch.results.push(result);
                     }
@@ -4443,15 +4334,11 @@ impl DemoApp {
                         Waiting::Engine(EngineEdit { result, before, rev: self.last_graph_rev, deadline: std::time::Instant::now() + ENGINE_EDIT_WAIT }),
                         chip_idx,
                     )),
-                    None if call.name == LOOK_TOOL => Some((
-                        Waiting::RackShot { said: result, deadline: std::time::Instant::now() + RACK_SHOT_WAIT },
-                        chip_idx,
-                    )),
                     None => {
                         if let Some(ci) = chip_idx {
                             self.finish_chip(batch.user_idx, ci, &result);
                         }
-                        batch.results.push(result.into());
+                        batch.results.push(result);
                         continue;
                     }
                 };
@@ -5982,11 +5869,6 @@ impl DemoApp {
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
-            LOOK_TOOL => {
-                self.rack_shot.wanted = true;
-                self.agent_activity.record(origin, "Look at the rack", vec![], now);
-                "screenshot of the kabelsalat window".into()
-            }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
@@ -7635,12 +7517,6 @@ impl DemoApp {
         let reqs: Vec<crate::bridge::UiRequest> = crate::bridge::UI_INBOX.lock().map(|mut q| q.drain(..).collect()).unwrap_or_default();
         for (tool, args, reply) in reqs {
             let out = match tool.as_str() {
-                LOOK_TOOL => {
-                    // Answered by `serve_rack_shots` once the frame arrived.
-                    self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote);
-                    self.rack_shot.remote.push((reply, std::time::Instant::now() + RACK_SHOT_WAIT));
-                    continue;
-                }
                 t if UI_BRIDGE_TOOLS.contains(&t) => self.exec_tool_with_origin(&tool, &args, AgentOrigin::Remote),
                 t if t == crate::bridge::BEFORE_REMOTE_EDIT => {
                     self.note_agent_change(AgentOrigin::Remote);
@@ -7749,29 +7625,6 @@ impl DemoApp {
         Ok(())
     }
 
-    /// Answer the bridge callers that wait for look_at_rack: every one gets
-    /// the frame that arrived, or an error once its wait is over. The reply
-    /// is JSON: `{"text", "png_base64"}`.
-    fn serve_rack_shots(&mut self) {
-        if self.rack_shot.remote.is_empty() { return; }
-        let now = std::time::Instant::now();
-        let reply = |out: ToolOutput| match &out.image {
-            Some(image) => serde_json::json!({ "text": out.text, "png_base64": image.base64() }).to_string(),
-            None => out.text,
-        };
-        match self.rack_shot.take() {
-            Some(shot) => {
-                let out = reply(rack_shot_output("screenshot of the kabelsalat window", Some(shot)));
-                for (to, _) in self.rack_shot.remote.drain(..) { let _ = to.send(out.clone()); }
-            }
-            None => self.rack_shot.remote.retain(|(to, deadline)| {
-                if now < *deadline { return true; }
-                let _ = to.send(reply(rack_shot_output("", None)));
-                false
-            }),
-        }
-    }
-
     /// Names worth highlighting in chat replies: rigs ("Rig A", "Rig 1",
     /// "Rack 1"), units ("Surge B", "Delay"), and effect kinds.
     fn chat_entities(&self) -> Vec<String> {
@@ -7808,67 +7661,29 @@ impl DemoApp {
         if let Some(rest) = t.strip_prefix("/model") {
             let m = rest.trim();
             let line = if m.is_empty() {
-                let perceive = crate::llm::Route::configured(crate::llm::Role::Perceive).model;
-                format!("model: {} · available: {} · perception model: {perceive}", self.assistant.model(), self.assistant.models.join(", "))
+                format!("model: {} · available: {}", self.assistant.model(), self.assistant.models.join(", "))
             } else { self.switch_model(m) };
             self.assistant.history.push(ChatLine { role: "system".into(), text: line });
             return;
         }
-        let image = self.chat_image.take();
-        self.chat_thumb = None;
-        let shown = match &image {
-            Some(image) => format!("{t} [image: {}]", image.name).trim_start().to_string(),
-            None => t.clone(),
-        };
-        let text = format!("{}\n{}", self.chat_context(), if t.is_empty() { "(see the attached image)" } else { &t });
+        let text = format!("{}\n{t}", self.chat_context());
         self.undo_job = None; // a new request = a new undo step
         self.pending_confirm = None; // a typed answer replaces the buttons
-        self.assistant.send_user_message(shown, UserMessage { text, image });
+        self.assistant.send_user_display(t, text);
         let user_idx = self.assistant.history.len().saturating_sub(1);
         self.active_run_user_idx = Some(user_idx);
         self.transcript_runs.entry(user_idx).or_default();
     }
 
-    /// Attach an image to the chat message being written and show the chat.
-    /// A file that is no image is named in the transcript.
-    fn attach_chat_image(&mut self, image: Result<Image, String>) {
-        match image {
-            Ok(image) => {
-                self.chat_image = Some(image);
-                self.chat_thumb = None;
-            }
-            Err(why) => self.assistant.history.push(ChatLine { role: "error".into(), text: format!("not attached: {why}") }),
-        }
-        if !self.assistant_open() { self.toggle_dock(DockView::Assistant); }
-    }
-
-    /// Files the user handed over this frame: a dropped Vital bank or patch
-    /// is imported; any other dropped file, or an image pasted while the
-    /// assistant is open, is attached to the chat.
-    fn take_chat_images(&mut self, ctx: &egui::Context) {
-        let (dropped, pasted) = ctx.input(|i| (
-            i.raw.dropped_files.clone(),
-            i.events.iter().find_map(|e| match e { egui::Event::PasteImage(image) => Some(image.clone()), _ => None }),
-        ));
-        let (vital, dropped): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|f| {
-            let name = f.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-            [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x))
-        });
-        for file in vital {
-            self.import_vital(file.path());
-        }
+    /// A dropped Vital bank or patch is imported; other dropped files are
+    /// not for the app.
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
         for file in dropped {
-            let name = file.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "image".into());
-            let too_big = std::fs::metadata(file.path()).is_ok_and(|m| m.len() > crate::vision::MAX_FILE_BYTES);
-            let image = if too_big {
-                Err(format!("{name} is larger than {} MB", crate::vision::MAX_FILE_BYTES / 1_000_000))
-            } else {
-                file.bytes().and_then(|bytes| Image::from_file(&name, &bytes))
-            };
-            self.attach_chat_image(image);
-        }
-        if let Some(image) = pasted.filter(|_| self.assistant_open()) {
-            self.attach_chat_image(Image::from_rgba("pasted image", image.size, image.as_raw()));
+            let name = file.path().file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if [".vital", ".vitalbank", ".vitalbank.zip"].iter().any(|x| name.ends_with(x)) {
+                self.import_vital(file.path());
+            }
         }
     }
 
@@ -10062,7 +9877,6 @@ impl DemoApp {
         match role {
             crate::llm::Role::Decide => &mut self.settings_decide_input,
             crate::llm::Role::Act => &mut self.settings_act_input,
-            crate::llm::Role::Perceive => &mut self.settings_perceive_input,
         }
     }
 
@@ -10100,7 +9914,6 @@ impl DemoApp {
         let decide_on = self.assistant.decide_enabled();
         let decide_route = self.assistant.route_for(Role::Decide);
         let act_route = self.assistant.route_for(Role::Act);
-        let perceive_route = self.assistant.route_for(Role::Perceive);
         let (outputs, out_current) = self
             .audio_out
             .lock()
@@ -10162,13 +9975,11 @@ impl DemoApp {
                         let route = match role {
                             Role::Decide => &decide_route,
                             Role::Act => &act_route,
-                            Role::Perceive => &perceive_route,
                         };
                         let choices = crate::assistant::role_model_choices(role, keys, &route.model);
                         let desc = match role {
                             Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
                             Role::Act => "Handles conversation, questions, and multi-step rack edits.",
-                            Role::Perceive => "Reads attached screenshots and images for turns that carry one.",
                         };
 
                         ui.horizontal(|ui| {
@@ -10817,8 +10628,6 @@ impl DemoApp {
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
                                  chat_input: &mut String,
-                                 chat_image: &mut Option<Image>,
-                                 chat_thumb: &mut Option<ChatThumb>,
                                  assistant: &mut Assistant,
                                  transcript_runs: &mut HashMap<usize, TranscriptRun>,
                                  assistant_input_h: &mut f32,
@@ -10868,10 +10677,7 @@ impl DemoApp {
                     }
 
                     let col_h = ui.available_height().max(40.0);
-                    // The attachment chip has a fixed row, so the history
-                    // makes room for it in the frame the image arrives.
-                    let attach_h = if chat_image.is_some() { ATTACH_ROW_H + 4.0 } else { 0.0 };
-                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + attach_h + 4.0;
+                    let reserve = assistant_input_h.clamp(34.0, (col_h - 24.0).max(34.0)) + 4.0;
                     let hist_h = (col_h - reserve).max(24.0);
                     egui::ScrollArea::vertical()
                         .id_salt("assistant_chat_scroll")
@@ -11007,60 +10813,6 @@ impl DemoApp {
                                 }
                             }
                         });
-                    sync_chat_thumb(ui.ctx(), chat_image, chat_thumb);
-                    if let Some(img) = chat_image.as_ref() {
-                        let mut remove_image = false;
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), ATTACH_ROW_H),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(TRANSCRIPT_TEXT_INDENT);
-                                egui::Frame::new()
-                                    .fill(theme::DARK_PANEL_HI)
-                                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                    .corner_radius(2.0)
-                                    .inner_margin(egui::Margin::symmetric(8, 4))
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.spacing_mut().item_spacing.x = 8.0;
-                                            let thumb_info = chat_thumb.as_ref();
-                                            let [tw, th] = thumb_info.map_or([32, 32], |t| t.size);
-                                            let aspect = (tw as f32 / th.max(1) as f32).clamp(0.6, 2.0);
-                                            let thumb_sz = egui::vec2((ATTACH_THUMB_H * aspect).round(), ATTACH_THUMB_H);
-                                            let (rect, _) = ui.allocate_exact_size(thumb_sz, egui::Sense::hover());
-                                            if let Some(tex) = thumb_info.and_then(|t| t.tex.as_ref()) {
-                                                ui.painter().image(
-                                                    tex.id(),
-                                                    rect,
-                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                                    Color32::WHITE,
-                                                );
-                                                ui.painter().rect_stroke(rect, 1.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                            } else {
-                                                ui.painter().rect_filled(rect, 2.0, theme::PAPER_SINK);
-                                                ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "IMG", theme::medium_font(9.5), theme::CREAM_META);
-                                            }
-                                            let name = truncate_attachment_name(&img.name);
-                                            ui.add(egui::Label::new(egui::RichText::new(name).size(12.0).color(theme::CREAM)).truncate());
-                                            let close = ui.add(
-                                                egui::Button::new(egui::RichText::new("×").font(theme::medium_font(13.0)).color(theme::CREAM))
-                                                    .fill(Color32::TRANSPARENT)
-                                                    .stroke(Stroke::NONE)
-                                                    .min_size(egui::vec2(22.0, 24.0)),
-                                            ).on_hover_text("remove the image");
-                                            if close.clicked() {
-                                                remove_image = true;
-                                            }
-                                        });
-                                    });
-                            },
-                        );
-                        if remove_image {
-                            *chat_image = None;
-                            *chat_thumb = None;
-                        }
-                    }
                     let row_top = ui.cursor().top();
                     let row = ui.horizontal(|ui| {
                         let edit = egui::Frame::new()
@@ -11074,7 +10826,7 @@ impl DemoApp {
                                         .id_salt("assistant_chat_input")
                                         .frame(egui::Frame::NONE)
                                         .desired_width((ui.available_width() - 82.0).max(80.0))
-                                        .hint_text("Ask or instruct… (drop or paste an image to show it)"),
+                                        .hint_text("Ask or instruct…"),
                                 );
                                 if *focus_chat { edit_resp.request_focus(); *focus_chat = false; }
                                 edit_resp
@@ -11082,7 +10834,7 @@ impl DemoApp {
                             .inner;
                         let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                         if (theme::primary_button(ui, "Send").clicked() || enter)
-                            && (!chat_input.trim().is_empty() || chat_image.is_some())
+                            && !chat_input.trim().is_empty()
                             && !assistant.busy
                         {
                             *submit_text = Some(chat_input.trim().to_string());
@@ -11103,8 +10855,6 @@ impl DemoApp {
                                     ui,
                                     &mut self.key_input,
                                     &mut self.chat_input,
-                                    &mut self.chat_image,
-                                    &mut self.chat_thumb,
                                     &mut self.assistant,
                                     &mut self.transcript_runs,
                                     &mut self.assistant_input_h,
@@ -11185,8 +10935,6 @@ impl DemoApp {
                         ui,
                         &mut self.key_input,
                         &mut self.chat_input,
-                        &mut self.chat_image,
-                        &mut self.chat_thumb,
                         &mut self.assistant,
                         &mut self.transcript_runs,
                         &mut self.assistant_input_h,
@@ -15461,7 +15209,7 @@ impl DemoApp {
             }
         }
 
-        self.take_chat_images(&ctx);
+        self.take_dropped_files(&ctx);
 
         // Per-rig input selection strip (top, includes the transport row), then
         // assistant (right), then rack.
@@ -15500,8 +15248,6 @@ impl DemoApp {
         }
         self.poll_assistant();
         self.serve_ui_inbox();
-        self.serve_rack_shots();
-        self.rack_shot.request(&ctx);
         self.sync_from_engine();
         for main in &mut self._surge_main {
             main.pump();
@@ -15821,8 +15567,6 @@ const EVAL_JAZZ_PROGRAMS: [u8; 3] = [0, 103, 104];
 struct EvalTask {
     name: &'static str,
     start: EvalStart,
-    /// An image the user attaches to the request (a path in the repository).
-    image: Option<&'static str>,
     prompt: &'static str,
     /// Err says what is off. Gets the engine (what reached a plugin) and
     /// the agent's final reply for questions.
@@ -15913,25 +15657,25 @@ fn eval_preset_param(app: &mut DemoApp, rig: usize) -> Result<String, String> {
 
 const EVAL_TASKS: &[EvalTask] = &[
     EvalTask {
-        name: "tempo", start: EvalStart::Demo, image: None, prompt: "Set the tempo to 100 BPM.",
+        name: "tempo", start: EvalStart::Demo, prompt: "Set the tempo to 100 BPM.",
         check: |app, _, _| eval_ensure((app.bpm - 100.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
     },
     EvalTask {
-        name: "ask_tempo", start: EvalStart::Demo, image: None, prompt: "What tempo are we at?",
+        name: "ask_tempo", start: EvalStart::Demo, prompt: "What tempo are we at?",
         check: |app, _, reply| {
             eval_ensure(reply.contains("96"), || "the reply does not name 96 BPM".into())?;
             eval_ensure(app.undo_past.is_empty() && (app.bpm - 96.0).abs() < 0.01, || "a question changed the patch".into())
         },
     },
     EvalTask {
-        name: "split_c4", start: EvalStart::Demo, image: None, prompt: "Split the keyboard at C4.",
+        name: "split_c4", start: EvalStart::Demo, prompt: "Split the keyboard at C4.",
         check: |app, _, _| {
             let split = app.keys_unit.and_then(|k| app.units.get(k)).and_then(|u| u.split);
             eval_ensure(split == Some(60), || format!("split point is {split:?}"))
         },
     },
     EvalTask {
-        name: "split_zones", start: EvalStart::Demo, image: None,
+        name: "split_zones", start: EvalStart::Demo,
         prompt: "Split the keyboard at C4: Surge A plays the low half, Surge B the high half.",
         check: |app, _, _| {
             let g = eval_graph(app);
@@ -15946,14 +15690,14 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "warm_pad", start: EvalStart::OneRig, image: None, prompt: "Load a warm pad.",
+        name: "warm_pad", start: EvalStart::OneRig, prompt: "Load a warm pad.",
         check: |app, _, _| {
             let patch = eval_patch(app, 0)?;
             eval_ensure(patch.contains("pad"), || format!("loaded {patch}, not a pad"))
         },
     },
     EvalTask {
-        name: "yanes_bass", start: EvalStart::SurgeAndYanes, image: None, prompt: "Load a bass sound on the YANES rig.",
+        name: "yanes_bass", start: EvalStart::SurgeAndYanes, prompt: "Load a bass sound on the YANES rig.",
         check: |app, _, _| {
             let preset = eval_preset_param(app, 1)?;
             eval_ensure(preset.to_lowercase().contains("bass"), || format!("YANES plays its preset '{preset}', not a bass"))?;
@@ -15961,7 +15705,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Give the organ rig a jazz drawbar preset.",
+        name: "organ_jazz", start: EvalStart::SurgeAndOrgan, prompt: "Give the organ rig a jazz drawbar preset.",
         check: |app, engine, _| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15971,7 +15715,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, image: None, prompt: "Load a warm pad on the organ rig.",
+        name: "organ_no_pad", start: EvalStart::SurgeAndOrgan, prompt: "Load a warm pad on the organ rig.",
         check: |app, engine, reply| {
             let organ = eval_node(&eval_graph(app), 1, "organ", |k| matches!(k, NodeKind::Lv2 { .. }))?;
             let last = engine.lv2_last_note(organ);
@@ -15981,7 +15725,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and wire it in.",
+        name: "add_reverb", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and wire it in.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 0, DspKind::Reverb)?;
@@ -15989,11 +15733,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "delay_after_synth", start: EvalStart::OneRig, image: None, prompt: "Put a delay after the synth.",
+        name: "delay_after_synth", start: EvalStart::OneRig, prompt: "Put a delay after the synth.",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Delay),
     },
     EvalTask {
-        name: "remove_delay", start: EvalStart::TwoRigs, image: None, prompt: "Remove the delay from rig 1.",
+        name: "remove_delay", start: EvalStart::TwoRigs, prompt: "Remove the delay from rig 1.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_ensure(!g.nodes.iter().any(|n| n.rig == 0 && n.kind == NodeKind::Dsp(DspKind::Delay)), || "rig 1 still has its delay".into())?;
@@ -16005,7 +15749,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "metronome", start: EvalStart::OneRig, image: None, prompt: "Add a metronome and start it.",
+        name: "metronome", start: EvalStart::OneRig, prompt: "Add a metronome and start it.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -16015,25 +15759,25 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "add_rig", start: EvalStart::Demo, image: None, prompt: "Add a new rig.",
+        name: "add_rig", start: EvalStart::Demo, prompt: "Add a new rig.",
         check: |app, _, _| eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count())),
     },
     EvalTask {
-        name: "rig2_volume", start: EvalStart::TwoRigs, image: None, prompt: "Set rig 2 volume to 50 %.",
+        name: "rig2_volume", start: EvalStart::TwoRigs, prompt: "Set rig 2 volume to 50 %.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((b - 0.5).abs() < 0.011 && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "mute_rig1", start: EvalStart::TwoRigs, image: None, prompt: "Mute rig 1.",
+        name: "mute_rig1", start: EvalStart::TwoRigs, prompt: "Mute rig 1.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
             eval_ensure(a && !b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
         },
     },
     EvalTask {
-        name: "delete_rig2", start: EvalStart::TwoRigs, image: None, prompt: "Delete rig 2.",
+        name: "delete_rig2", start: EvalStart::TwoRigs, prompt: "Delete rig 2.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || "the rig was deleted without the user's Confirm".into())?;
             let asked = app.pending_confirm.as_ref()
@@ -16042,7 +15786,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "bass_rig", start: EvalStart::OneRig, image: None, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
+        name: "bass_rig", start: EvalStart::OneRig, prompt: "Make a new rig with a bass sound, quieter than rig 1.",
         check: |app, _, _| {
             eval_ensure(app.rig_count() == 2, || format!("{} rig(s)", app.rig_count()))?;
             let patch = eval_patch(app, 1)?;
@@ -16052,21 +15796,21 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "rig2_quieter", start: EvalStart::TwoRigs, image: None, prompt: "Make rig 2 a bit quieter.",
+        name: "rig2_quieter", start: EvalStart::TwoRigs, prompt: "Make rig 2 a bit quieter.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].vol, app.rig_mix[1].vol);
             eval_ensure((0.4..=0.95).contains(&b) && a == 1.0, || format!("rig 1 vol {a:.2}, rig 2 vol {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig1_pan_left", start: EvalStart::TwoRigs, image: None, prompt: "Pan rig 1 to the left.",
+        name: "rig1_pan_left", start: EvalStart::TwoRigs, prompt: "Pan rig 1 to the left.",
         check: |app, _, _| {
             let (a, b) = (app.rig_mix[0].pan, app.rig_mix[1].pan);
             eval_ensure(a < -0.2 && b == 0.0, || format!("rig 1 pan {a:.2}, rig 2 pan {b:.2}"))
         },
     },
     EvalTask {
-        name: "rig2_reverb", start: EvalStart::TwoRigs, image: None, prompt: "Insert a reverb into rig 2.",
+        name: "rig2_reverb", start: EvalStart::TwoRigs, prompt: "Insert a reverb into rig 2.",
         check: |app, _, _| {
             let g = eval_graph(app);
             eval_effect_in_chain(&g, 1, DspKind::Reverb)?;
@@ -16074,11 +15818,11 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "reverb_this_rig", start: EvalStart::OneRig, image: None, prompt: "Add a reverb to this rig",
+        name: "reverb_this_rig", start: EvalStart::OneRig, prompt: "Add a reverb to this rig",
         check: |app, _, _| eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb),
     },
     EvalTask {
-        name: "rig2_bass", start: EvalStart::TwoRigs, image: None, prompt: "Load a bass sound into rig 2.",
+        name: "rig2_bass", start: EvalStart::TwoRigs, prompt: "Load a bass sound into rig 2.",
         check: |app, _, _| {
             let patch = eval_patch(app, 1)?;
             eval_ensure(patch.contains("bass"), || format!("rig 2 plays {patch}, not a bass"))?;
@@ -16086,7 +15830,7 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "start_metronome", start: EvalStart::OneRigMetronome, image: None, prompt: "Start the metronome.",
+        name: "start_metronome", start: EvalStart::OneRigMetronome, prompt: "Start the metronome.",
         check: |app, _, _| {
             let g = eval_graph(app);
             let metro = eval_one_dsp(&g, 0, &DspKind::Metronome)?;
@@ -16094,57 +15838,17 @@ const EVAL_TASKS: &[EvalTask] = &[
         },
     },
     EvalTask {
-        name: "record", start: EvalStart::OneRig, image: None, prompt: "Start recording.",
+        name: "record", start: EvalStart::OneRig, prompt: "Start recording.",
         check: |app, _, _| eval_ensure(app.recorder.as_ref().is_some_and(|r| r.is_recording()), || "no recording is running".into()),
     },
     EvalTask {
-        name: "reverb_and_tempo", start: EvalStart::TwoRigs, image: None, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
+        name: "reverb_and_tempo", start: EvalStart::TwoRigs, prompt: "Add a reverb to rig 1 and set the tempo to 120 BPM.",
         check: |app, _, _| {
             eval_effect_in_chain(&eval_graph(app), 0, DspKind::Reverb)?;
             eval_ensure((app.bpm - 120.0).abs() < 0.01, || format!("tempo is {}", app.bpm))
         },
     },
-    EvalTask {
-        name: "image_note_tempo", start: EvalStart::Demo, image: Some("assets/agent-eval/note-tempo-90.jpg"),
-        prompt: "Do what the note says.",
-        check: |app, _, _| eval_ensure((app.bpm - 90.0).abs() < 0.01, || format!("tempo is {}", app.bpm)),
-    },
-    EvalTask {
-        name: "image_note_mute", start: EvalStart::TwoRigs, image: Some("assets/agent-eval/note-mute-rig-2.png"),
-        prompt: "Do what the note says.",
-        check: |app, _, _| {
-            let (a, b) = (app.rig_mix[0].mute, app.rig_mix[1].mute);
-            eval_ensure(!a && b, || format!("rig 1 mute {a}, rig 2 mute {b}"))
-        },
-    },
-    EvalTask {
-        name: "image_which_view", start: EvalStart::Demo, image: Some(EVAL_WINDOW_SHOT),
-        prompt: "Which view is selected in this screenshot: the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())?;
-            eval_ensure(app.undo_past.is_empty(), || "a question changed the patch".into())
-        },
-    },
-    EvalTask {
-        name: "look_at_rack", start: EvalStart::Demo, image: None,
-        prompt: "Look at the app window: which view is open, the rack, the matrix or the mixer?",
-        check: |app, _, reply| {
-            eval_ensure(app.agent_activity.log.iter().any(|a| a.summary == "Look at the rack"), || "the agent did not look".into())?;
-            eval_ensure(reply.to_lowercase().contains("mixer"), || "the reply does not name the mixer".into())
-        },
-    },
 ];
-
-/// The frame the eval rig hands look_at_rack: the rig has no window, so a
-/// stored screenshot of the app (mixer view) stands in for its pixels.
-const EVAL_WINDOW_SHOT: &str = "docs/shots/mixer.png";
-
-fn eval_image(path: &str) -> anyhow::Result<Image> {
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-    let bytes = std::fs::read(&file).map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-    Image::from_file(path.rsplit('/').next().unwrap_or(path), &bytes).map_err(anyhow::Error::msg)
-}
-
 
 /// A headless app on an offline engine: no window, no audio device, no
 /// hardware scan. Frames run the app's real frame path; each frame renders
@@ -16156,8 +15860,6 @@ struct EvalRig {
     ctx: egui::Context,
     buf: Vec<f32>,
     started: std::time::Instant,
-    /// What a screenshot request gets (`EVAL_WINDOW_SHOT`).
-    window_shot: Arc<egui::ColorImage>,
 }
 
 type EvalPlugins = (Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>);
@@ -16185,10 +15887,7 @@ impl EvalRig {
         app.attach_engine(mains, controllers, voice_ids, sample_rate, voice_tx, retire_rx, Arc::new(Mutex::new(bus)));
         (app.plugins_clap, app.plugins_lv2) = plugins.clone();
         app.plugins_loaded = true;
-        let shot = eval_image(EVAL_WINDOW_SHOT)?;
-        let (size, rgba) = crate::vision::decode_png(&shot.bytes).map_err(anyhow::Error::msg)?;
-        let window_shot = Arc::new(egui::ColorImage::from_rgba_unmultiplied(size, &rgba));
-        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now(), window_shot })
+        Ok(Self { engine, app, ctx: egui::Context::default(), buf: vec![0.0; 256 * 2], started: std::time::Instant::now() })
     }
 
     fn frame(&mut self) {
@@ -16198,11 +15897,6 @@ impl EvalRig {
         let app = &mut self.app;
         let mut out = self.ctx.run_ui(raw, |ui| app.frame_ui(ui));
         out.textures_delta.clear(); // rule 11
-        for command in out.viewport_output.values().flat_map(|v| &v.commands) {
-            if let egui::ViewportCommand::Screenshot(wanted) = command {
-                wanted.clone().complete(self.window_shot.clone());
-            }
-        }
         self.engine.render(&mut self.buf, 2);
     }
 
@@ -16283,7 +15977,6 @@ fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins)
     let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
     anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
     rig.load(task.start)?;
-    rig.app.chat_image = task.image.map(eval_image).transpose()?;
     rig.app.submit_chat(task.prompt.to_string());
     let sent = std::time::Instant::now();
     while rig.app.assistant.busy && sent.elapsed() < EVAL_TURN_TIMEOUT {
@@ -16659,7 +16352,7 @@ impl DemoApp {
     }
 
     /// Stage `--demo-agent` offline for visual screenshots: finished run,
-    /// live running run with animated phase, attached image chip, Confirm /
+    /// live running run with animated phase, Confirm /
     /// Cancel prompt, and optional mid-flight rack animations.
     fn stage_demo_agent(&mut self, animate_rack: bool) {
         self.assistant.key_set = true;
@@ -16714,26 +16407,7 @@ impl DemoApp {
         self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
             step: 2,
             model: "deepseek-chat".into(),
-            seeing: false,
         });
-        let mut sketch = vec![28u8; 24 * 16 * 4];
-        for y in 0..16usize {
-            for x in 0..24usize {
-                let i = (y * 24 + x) * 4;
-                sketch[i + 3] = 255;
-                if (y == 4 && (3..=19).contains(&x)) || (y == 11 && (3..=12).contains(&x)) {
-                    sketch[i] = theme::CREAM.r();
-                    sketch[i + 1] = theme::CREAM.g();
-                    sketch[i + 2] = theme::CREAM.b();
-                } else if (6..=9).contains(&y) && (15..=20).contains(&x) {
-                    sketch[i] = theme::ACCENT.r();
-                    sketch[i + 1] = theme::ACCENT.g();
-                    sketch[i + 2] = theme::ACCENT.b();
-                }
-            }
-        }
-        self.chat_image = Image::from_rgba("rack-sketch.png", [24, 16], &sketch).ok();
-        self.chat_thumb = None;
         self.pending_confirm = Some(PendingConfirm {
             tool: "delete_rig".into(),
             args: serde_json::json!({"rig": 1}),
@@ -20777,183 +20451,12 @@ mod ui_polish_agent_tests {
             for _ in 0..400 {
                 self.frame();
                 match self.worker_rx.try_recv() {
-                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results.into_iter().map(|r| r.text).collect(),
+                    Ok(crate::assistant::ToWorker::ToolResults(results)) => return results,
                     Ok(_) => panic!("the app sent something other than tool results"),
                     Err(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
                 }
             }
             panic!("the app never answered the batch");
-        }
-    }
-
-    /// One frame at `size`. Returns the screenshot requests the frame sent:
-    /// the windowing integration completes them after it painted.
-    fn frame_asking(app: &mut DemoApp, ctx: &egui::Context, size: Vec2) -> Vec<egui::ScreenshotCallback> {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-        out.viewport_output.values().flat_map(|v| &v.commands)
-            .filter_map(|c| match c { egui::ViewportCommand::Screenshot(wanted) => Some(wanted.clone()), _ => None })
-            .collect()
-    }
-
-    #[test]
-    fn look_at_rack_holds_its_batch_until_the_frame_arrives_and_answers_with_the_picture() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        worker_tx.send(crate::assistant::FromWorker::ToolCalls(vec![
-            call("look_at_rack", serde_json::json!({})),
-            call("set_bpm", serde_json::json!({"bpm": 100})),
-        ])).unwrap();
-        // A frame that arrived after an earlier look gave up.
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("late", [4, 2], &[9; 32]));
-        let mut wanted = frame_asking(&mut app, &ctx, WINDOW);
-        assert_eq!(wanted.len(), 1, "the frame that runs the call asks for a screenshot");
-        for _ in 0..3 {
-            assert!(frame_asking(&mut app, &ctx, WINDOW).is_empty(), "one request per look");
-        }
-        assert!(worker_rx.try_recv().is_err(), "no answer before the frame arrived: frames keep running meanwhile");
-        assert_ne!(app.bpm, 100.0, "the call after it waits its turn");
-
-        wanted.remove(0).complete(Arc::new(egui::ColorImage::filled([2000, 1250], Color32::from_rgb(20, 22, 24))));
-        let results = (0..500).find_map(|_| {
-            frame_asking(&mut app, &ctx, WINDOW);
-            match worker_rx.try_recv() {
-                Ok(crate::assistant::ToWorker::ToolResults(results)) => Some(results),
-                _ => { std::thread::sleep(std::time::Duration::from_millis(4)); None }
-            }
-        }).expect("the batch is answered once the frame is encoded");
-        let shot = results[0].image.as_ref().expect("the first result carries the picture");
-        assert_eq!(shot.size, Some([1400, 875]), "scaled down for the model");
-        assert!(shot.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-        assert_eq!(results[0].text, "screenshot of the kabelsalat window: kabelsalat window (1400×875 px)");
-        assert!(results[1].text.contains("100 BPM") && results[1].image.is_none());
-        assert_eq!(app.bpm, 100.0);
-    }
-
-    #[test]
-    fn look_at_rack_says_so_when_no_frame_arrives() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        app.tool_batch = Some(ToolBatch {
-            todo: VecDeque::new(),
-            results: Vec::new(),
-            waiting: Some((Waiting::RackShot { said: "screenshot".into(), deadline: std::time::Instant::now() }, None)),
-            user_idx: 0,
-        });
-        app.poll_assistant();
-        let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no answer past the deadline") };
-        assert!(results[0].text.starts_with("error: no screenshot within 2 s") && results[0].image.is_none(), "{:?}", results[0].text);
-    }
-
-    #[test]
-    fn a_bridge_caller_gets_the_screenshot_as_base64_png_or_an_error_past_its_wait() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (tx, rx) = std::sync::mpsc::channel();
-        app.rack_shot.remote.push((tx.clone(), std::time::Instant::now() + RACK_SHOT_WAIT));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().is_err(), "nothing to send yet");
-        *app.rack_shot.ready.lock().unwrap() = Some(Image::from_rgba("kabelsalat window", [4, 2], &[9; 32]));
-        app.serve_rack_shots();
-        let reply: serde_json::Value = serde_json::from_str(&rx.try_recv().expect("answered with the frame")).unwrap();
-        assert_eq!(reply["text"], "screenshot of the kabelsalat window: kabelsalat window (4×2 px)");
-        assert!(reply["png_base64"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG file in base64");
-        assert!(app.rack_shot.remote.is_empty());
-
-        app.rack_shot.remote.push((tx, std::time::Instant::now()));
-        app.serve_rack_shots();
-        assert!(rx.try_recv().unwrap().starts_with("error: no screenshot"));
-    }
-
-    #[test]
-    fn look_at_rack_is_a_tool_of_the_assistant_the_app_and_the_bridge() {
-        let tools = crate::assistant::tools();
-        assert!(tools.as_array().unwrap().iter().any(|t| t["function"]["name"] == LOOK_TOOL));
-        assert!(UI_BRIDGE_TOOLS.contains(&LOOK_TOOL));
-        assert!(include_str!("mcp.rs").contains("ui_bridge_tool(\"look_at_rack\""));
-        let mut app = DemoApp::new_with_sink(None);
-        assert_eq!(app.exec_tool(LOOK_TOOL, &serde_json::json!({})), "screenshot of the kabelsalat window");
-        assert!(app.rack_shot.wanted && app.undo_past.is_empty(), "looking asks for a frame and changes nothing");
-    }
-
-    #[derive(Debug)]
-    struct Dropped(std::path::PathBuf, Vec<u8>);
-
-    impl egui::DroppedFile for Dropped {
-        fn path(&self) -> &std::path::Path { &self.0 }
-        fn bytes(&self) -> Result<Vec<u8>, String> { Ok(self.1.clone()) }
-    }
-
-    fn drop_file(app: &mut DemoApp, ctx: &egui::Context, name: &str, bytes: Vec<u8>) {
-        let mut raw = egui::RawInput::default();
-        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, WINDOW));
-        raw.dropped_files = vec![Arc::new(Dropped(std::path::PathBuf::from("/nowhere").join(name), bytes))];
-        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-        out.textures_delta.clear();
-    }
-
-    #[test]
-    fn a_dropped_or_pasted_image_is_a_removable_chip_and_goes_out_with_the_next_message() {
-        let mut app = DemoApp::new_with_sink(None);
-        let (assistant, _worker_tx, worker_rx) = Assistant::with_test_worker();
-        app.assistant = assistant;
-        let ctx = egui::Context::default();
-        let png = Image::from_rgba("x", [8, 4], &[200; 8 * 4 * 4]).unwrap();
-
-        // Pasting belongs to the open chat; a drop opens it.
-        let paste = || vec![egui::Event::PasteImage(Arc::new(egui::ColorImage::filled([8, 4], Color32::RED)))];
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert!(app.chat_image.is_none() && !app.assistant_open(), "a paste with the assistant closed is not for the chat");
-        drop_file(&mut app, &ctx, "notes.txt", b"hello".to_vec());
-        assert!(app.chat_image.is_none());
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("not attached: notes.txt is neither a PNG nor a JPEG"));
-        drop_file(&mut app, &ctx, "rack.png", png.bytes.to_vec());
-        assert!(app.assistant_open(), "dropping an image opens the assistant");
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("rack.png (8×4 px)"));
-
-        let texts = run_frame(&mut app, &ctx, WINDOW, vec![]);
-        assert!(texts.iter().any(|(t, _)| t == "rack.png"), "the chip names the image: {texts:?}");
-        assert!(!texts.iter().any(|(t, _)| t.contains("px)")), "no debug pixel size in chip: {texts:?}");
-        let remove = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).map(|(_, r)| *r).expect("attachment remove button");
-        click_at(&mut app, &ctx, WINDOW, remove.center());
-        assert!(app.chat_image.is_none(), "clicking × removes the image");
-
-        run_frame(&mut app, &ctx, WINDOW, paste());
-        assert_eq!(app.chat_image.as_ref().map(Image::describe).as_deref(), Some("pasted image (8×4 px)"));
-        app.submit_chat("what is this?".into());
-        let Ok(crate::assistant::ToWorker::User(sent)) = worker_rx.try_recv() else { panic!("nothing was sent") };
-        assert!(sent.text.starts_with("[context:") && sent.text.ends_with("\nwhat is this?"), "{}", sent.text);
-        assert_eq!(sent.image.map(|i| i.size), Some(Some([8, 4])));
-        assert!(app.chat_image.is_none(), "the image leaves with its message");
-        assert_eq!(app.assistant.history.last().map(|l| l.text.as_str()), Some("what is this? [image: pasted image]"));
-    }
-
-    #[test]
-    fn the_attachment_chip_and_the_input_row_fit_the_panel_at_its_minimum_size() {
-        let mut app = DemoApp::new_with_sink(None);
-        app.load_multi_rig_demo();
-        app.assistant.key_set = true;
-        app.dock = DockView::Assistant;
-        let ctx = egui::Context::default();
-        let min_size = Vec2::new(760.0, 520.0);
-        for _ in 0..4 { run_frame(&mut app, &ctx, min_size, vec![]); }
-        let long_name = format!("{}.png", "a-very-long-screenshot-name".repeat(6));
-        app.chat_image = Some(Image::from_rgba(&long_name, [8, 4], &[200; 8 * 4 * 4]).unwrap());
-        // The first frame with the chip counts: nothing may jump out of the panel.
-        for frame in 0..3 {
-            let texts = run_frame(&mut app, &ctx, min_size, vec![]);
-            let panel = app.assistant_rect;
-            let chip = texts.iter().find(|(t, _)| t.contains("screenshot-name")).map(|(_, r)| *r).expect("chip painted");
-            assert!(panel.contains_rect(chip), "frame {frame}: chip {chip:?} outside the panel {panel:?}");
-            assert!(panel.contains_rect(app.assistant_input_rect), "frame {frame}: input row {:?} outside the panel {panel:?}", app.assistant_input_rect);
-            assert!(chip.bottom() <= app.assistant_input_rect.top() + 0.5, "frame {frame}: the chip sits above the input row");
-            let send = texts.iter().find(|(t, _)| t == "Send").map(|(_, r)| *r).expect("Send painted");
-            assert!(panel.contains_rect(send), "frame {frame}: Send {send:?} outside the panel");
-            assert!(app.unit_h >= 140.0, "the rack keeps its height");
         }
     }
 
@@ -21081,7 +20584,6 @@ mod ui_polish_agent_tests {
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         assert_eq!(app.session_msg, "added 1 Vital patches (Winds): Vitalium's sound list has them");
         assert!(dir.join("data/Vitalium/Winds/Presets/Woody.vital").exists());
-        assert!(app.chat_image.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -21441,7 +20943,6 @@ mod ui_polish_agent_tests {
         assert_eq!(app.rig_mix[0].vol, 0.5);
         let Ok(crate::assistant::ToWorker::ToolResults(results)) = worker_rx.try_recv() else { panic!("no results after one frame") };
         assert_eq!(results.len(), 3, "one result per call, in call order");
-        let results: Vec<String> = results.into_iter().map(|r| r.text).collect();
         assert!(results[0].contains("100 BPM") && results[1].contains("vol 0.50") && results[2].contains("unknown tool"), "{results:?}");
         assert!(worker_rx.try_recv().is_err(), "one answer for the batch");
     }
@@ -21999,8 +21500,7 @@ mod ui_polish_agent_tests {
 
         for (phase, expected) in [
             (RunPhase::Deciding, "Jev · deciding"),
-            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into(), seeing: false }, "DeepSeek · step 2"),
-            (RunPhase::Thinking { step: 1, model: "google/gemini-2.5-flash".into(), seeing: true }, "Gemini · looking at the image"),
+            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }, "DeepSeek · step 2"),
         ] {
             app.assistant.phase = Some(phase);
             let texts = run_frame(&mut app, &ctx, size, vec![]);
@@ -22277,8 +21777,7 @@ mod ui_polish_agent_tests {
         assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
-        // Attached image chip + Confirm / Cancel prompt + Replay chip.
-        assert!(texts.iter().any(|(t, _)| t == "rack-sketch.png"), "missing attached image chip: {texts:?}");
+        // Confirm / Cancel prompt + Replay chip.
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "debug size text must be gone: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Confirm · Delete rig 2 · Rig B")), "missing confirm btn: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "Cancel"), "missing cancel btn: {texts:?}");
@@ -22417,8 +21916,6 @@ mod ui_polish_agent_tests {
         let chip_not_applied = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL);
         let chip_failed = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
         let cancel_btn = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_name = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
-        let attach_x = theme::contrast_ratio(theme::CREAM, theme::DARK_PANEL_HI);
         let danger_confirm = theme::contrast_ratio(theme::CLIP_BRIGHT, theme::DANGER_BG);
 
         for (name, r) in [
@@ -22431,8 +21928,6 @@ mod ui_polish_agent_tests {
             ("chip NotApplied", chip_not_applied),
             ("chip Failed", chip_failed),
             ("Cancel", cancel_btn),
-            ("attachment name", attach_name),
-            ("attachment ×", attach_x),
             ("danger Confirm", danger_confirm),
         ] {
             assert!(r >= 4.5, "{name} contrast {r:.2}:1 < 4.5:1");
@@ -22441,39 +21936,27 @@ mod ui_polish_agent_tests {
     }
 
     #[test]
-    fn agent_panel_defect6_alignment_and_thumbnail_texture_lifecycle() {
+    fn agent_panel_defect6_confirm_aligns_with_the_transcript_column() {
         let mut app = DemoApp::new_with_sink(None);
         app.stage_demo_agent(false);
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let size = Vec2::new(1280.0, 950.0);
 
-        let run_capture = |app: &mut DemoApp, events: Vec<egui::Event>| {
+        let run_capture = |app: &mut DemoApp| {
             let mut raw = egui::RawInput::default();
             raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
-            raw.events = events;
             let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
             let mut texts = Vec::new();
             let mut rects = Vec::new();
             for cs in &out.shapes { collect_painted(&cs.shape, &mut texts, &mut rects); }
-            let set_ids: Vec<egui::TextureId> = out.textures_delta.set.iter().map(|(id, _)| *id).collect();
-            let free_ids = out.textures_delta.free.clone();
             out.textures_delta.clear();
-            (texts, rects, set_ids, free_ids)
+            (texts, rects)
         };
+        for _ in 0..2 { run_capture(&mut app); }
+        let (texts, rects) = run_capture(&mut app);
 
-        // Frame 1: thumbnail texture created once.
-        let (_, _, set1, _) = run_capture(&mut app, vec![]);
-        let tex_id = app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()).expect("thumbnail texture loaded");
-        assert!(set1.contains(&tex_id), "frame 1 uploads thumbnail texture {tex_id:?}");
-
-        // Settle layout and verify Frame N does NOT re-upload thumbnail texture.
-        let _ = run_capture(&mut app, vec![]);
-        let (texts, rects, set3, _) = run_capture(&mut app, vec![]);
-        assert!(!set3.contains(&tex_id), "thumbnail texture must not be recreated on subsequent frames");
-        assert_eq!(app.chat_thumb.as_ref().and_then(|t| t.tex.as_ref()).map(|t| t.id()), Some(tex_id));
-
-        // Alignment: Confirm/Cancel and attachment chip share the transcript text column left edge.
+        // Alignment: Confirm/Cancel share the transcript text column left edge.
         let msg_left = texts.iter().find(|(t, _)| t.contains("Brighten Surge A")).map(|(_, r)| r.left()).expect("msg text");
         let chip_text_r = texts.iter().find(|(t, _)| t.contains("Split keys → C4")).map(|(_, r)| *r).expect("chip text");
         let chip_box = rects.iter()
@@ -22485,43 +21968,13 @@ mod ui_polish_agent_tests {
             .filter(|(r, fill, _)| *fill != Color32::TRANSPARENT && r.contains_rect(confirm_text_r))
             .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
             .expect("confirm button box").0;
-        let attach_text_r = texts.iter().find(|(t, _)| t == "rack-sketch.png").map(|(_, r)| *r).expect("attach name");
-        let attach_box = rects.iter()
-            .filter(|(r, fill, _)| *fill == theme::DARK_PANEL_HI && r.contains_rect(attach_text_r))
-            .min_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())))
-            .expect("attach chip box").0;
         assert!(
             (confirm_box.left() - chip_box.left()).abs() <= 0.5 && (confirm_box.left() - msg_left).abs() <= 2.0,
             "Confirm left ({}) != transcript column (chip {}, msg {msg_left})",
             confirm_box.left(),
             chip_box.left()
         );
-        assert!(
-            (attach_box.left() - chip_box.left()).abs() <= 0.5 && (attach_box.left() - msg_left).abs() <= 2.0,
-            "Attachment chip left ({}) != transcript column (chip {}, msg {msg_left})",
-            attach_box.left(),
-            chip_box.left()
-        );
         assert!(texts.iter().all(|(t, _)| !t.contains("px)")), "no debug pixel dimensions: {texts:?}");
-
-        // Remove via × -> texture handle dropped and freed in textures_delta.free.
-        let x_pos = texts.iter().filter(|(t, _)| t == "×").max_by(|a, b| a.1.top().total_cmp(&b.1.top())).unwrap().1.center();
-        let mut freed = Vec::new();
-        for pressed in [true, false] {
-            let ev = vec![
-                egui::Event::PointerMoved(x_pos),
-                egui::Event::PointerButton {
-                    pos: x_pos,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: Modifiers::NONE,
-                },
-            ];
-            freed.extend(run_capture(&mut app, ev).3);
-        }
-        freed.extend(run_capture(&mut app, vec![]).3);
-        assert!(app.chat_image.is_none() && app.chat_thumb.is_none(), "attachment and thumb cleared");
-        assert!(freed.contains(&tex_id), "removed attachment must free thumbnail texture {tex_id:?}, freed: {freed:?}");
     }
 }
 
@@ -23440,7 +22893,7 @@ mod settings_and_dropdown_tests {
             assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
             if size.y >= 800.0 {
                 assert!(texts.iter().any(|(t, _)| t == "Chat model"));
-                assert!(texts.iter().any(|(t, _)| t == "Vision model"));
+                assert!(texts.iter().all(|(t, _)| t != "Vision model"), "no vision role: {texts:?}");
                 assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
             }
             for (t, _) in &texts {
@@ -23460,20 +22913,20 @@ mod settings_and_dropdown_tests {
         assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
 
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
-        let vision_dd = texts.iter().find(|(t, _)| t == crate::llm::PERCEIVE_MODEL).expect("Perceive dropdown").1.center();
-        let _ = open_dropdown(&mut app, &ctx, size, vision_dd);
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("Act dropdown").1.center();
+        let _ = open_dropdown(&mut app, &ctx, size, act_dd);
         assert!(egui::Popup::is_any_open(&ctx));
         run_frame(&mut app, &ctx, size, key(Key::Escape));
         assert!(!egui::Popup::is_any_open(&ctx));
         assert_eq!(app.stage_view, StageView::Settings, "first Esc closes dropdown, keeps Settings open");
 
-        app.settings_perceive_input = "openai/gpt-5.4".into();
+        app.settings_act_input = "openai/gpt-5.4".into();
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
         applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        assert_eq!(applies.len(), 3);
-        click_at(&mut app, &ctx, size, applies[2].center());
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Perceive).model, "openai/gpt-5.4");
+        assert_eq!(applies.len(), 2);
+        click_at(&mut app, &ctx, size, applies[1].center());
+        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, "openai/gpt-5.4");
 
         assert!(app.assistant.decide_enabled());
         assert!(!app.reduce_motion);
@@ -23939,7 +23392,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 8] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -23948,6 +23401,7 @@ mod offline_shots {
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("settings", &|a| a.stage_view = StageView::Settings),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
+            ("agent", &|a| a.stage_demo_agent(false)),
         ];
         let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
         for (w, h) in super::window_size_layout_tests::SIZES {

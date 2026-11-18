@@ -2799,19 +2799,15 @@ impl DemoApp {
             self.units.push(make_unit(node));
         }
         self.fit_voice_tables(&old_clap_nodes);
-        // Classify LV2 instruments (hot-wire matrix sink columns). Rare
-        // structural op: the discovery scan runs only when LV2 nodes exist.
+        // Classify LV2 instruments (hot-wire matrix sink columns) from the
+        // background scan: a discovery here took 1.3 s on every agent edit
+        // adopted through build_rack. A scan still running reclassifies the
+        // units when it lands (poll_plugin_scan).
         if graph.nodes.iter().any(|n| matches!(n.kind, NodeKind::Lv2 { .. })) {
-            let infos = lv2_discover();
-            for u in &mut self.units {
-                if let Some(NodeKind::Lv2 { uri }) = graph.nodes.iter().find(|n| n.id == u.node_id).map(|n| &n.kind) {
-                    u.lv2_inst = infos.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
-                    if u.lv2_inst {
-                        u.sub = "lv2 synth".into();
-                        u.sub_g = None;
-                    }
-                }
+            if !self.plugins_loaded {
+                self.start_plugin_scan(false);
             }
+            self.classify_lv2_units();
         }
         // Size the rect slots before adding cables (add_cable_id reads them to
         // seed the spring rest shape; layout() fills real rects on frame 1).
@@ -5825,15 +5821,29 @@ impl DemoApp {
                 if rig >= n_rigs {
                     return format!("no rig {rig}: there are {n_rigs} (0..{}) — add one with add_rig", n_rigs - 1);
                 }
+                let wire = match &kind {
+                    Some(NodeKind::Clap { .. }) => true,
+                    Some(NodeKind::Lv2 { uri }) => {
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
+                        }
+                        self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+                    }
+                    _ => false,
+                };
                 match kind {
                     Some(k) => {
                         if let Some(bus) = &self.bus {
-                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8 });
+                            let _ = bus.lock().unwrap().send(Command::AddNode { kind: k, name, rig: rig as u8, wire });
                             if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
                         }
                         self.agent_activity.touch_rig(rig, now);
                         self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
-                        format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        if wire {
+                            format!("added {kind_str} instrument to rig {rig} '{}', wired like a standard rig: the rig's Keys → it (MIDI) and it → the rig's Master L and R (audio); do not connect these again", self.rig_name(rig))
+                        } else {
+                            format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
+                        }
                     }
                     None => format!("invalid node kind/dsp/uri for '{kind_str}'"),
                 }
@@ -9073,9 +9083,22 @@ impl DemoApp {
                 self.plugins_lv2 = lv2;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
+                self.classify_lv2_units();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.plugin_scan = None,
+        }
+    }
+
+    /// Mark the rack's LV2 units that the plugin scan calls instruments.
+    fn classify_lv2_units(&mut self) {
+        for u in &mut self.units {
+            let Some(NodeKind::Lv2 { uri }) = self.base_graph.node(u.node_id).map(|n| &n.kind) else { continue };
+            u.lv2_inst = self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument);
+            if u.lv2_inst {
+                u.sub = "lv2 synth".into();
+                u.sub_g = None;
+            }
         }
     }
 
@@ -17484,7 +17507,7 @@ mod rig_switch_tests {
 
         // The agent adds a unit: the engine publishes, the app adopts it.
         assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::AddNode {
-            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0 }));
+            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY C"), rig: 0, wire: false }));
         pump(&mut app, &mut drain, 4);
         assert!(app.base_graph.nodes.iter().any(|n| n.name == name_bytes("DELAY C")), "the agent edit was adopted");
         assert!(bound(&app), "the binding survives the agent edit");
@@ -21073,6 +21096,34 @@ mod ui_polish_agent_tests {
     }
 
     #[test]
+    fn an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master() {
+        let mut live = Live::new();
+        // As in the app: LV2 loads off the render path (other tests hold LILV_LOCK for seconds).
+        live.engine.spawn_lv2_loader();
+        live.run_batch(vec![call("load_template", serde_json::json!({"name": "multi_rig"}))]);
+        for _ in 0..6 { live.frame(); }
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument };
+        live.app.plugins_lv2 = vec![lv2(TEST_ORGAN, true), lv2("urn:test:fx", false)];
+        live.app.plugins_loaded = true;
+        let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
+        let g = engine_graph(&live);
+        let in_rig_a = |kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == 0 && kind(&n.kind)).map(|n| n.id).unwrap();
+        let (keys, master) = (in_rig_a(|k| matches!(k, NodeKind::Keys)), in_rig_a(|k| matches!(k, NodeKind::MasterOut)));
+        let results = live.run_batch(vec![
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": TEST_ORGAN, "name": "setBfree", "rig": 0})),
+            call("add_node", serde_json::json!({"kind": "lv2", "uri": "urn:test:fx", "name": "fx", "rig": 0})),
+        ]);
+        let g = engine_graph(&live);
+        let node = |uri: &str| g.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Lv2 { uri: u } if u.as_str() == uri)).map(|n| n.id).unwrap();
+        let (organ, fx) = (node(TEST_ORGAN), node("urn:test:fx"));
+        assert!(g.has_route(keys, organ, CPortKind::Midi), "Keys -> organ: {:?}", g.edges);
+        assert!(g.has_route_port(organ, master, 0, CPortKind::Audio) && g.has_route_port(organ, master, 1, CPortKind::Audio), "organ -> Master L/R: {:?}", g.edges);
+        assert_eq!(results[0].matches("new cable id").count(), 1, "{}", results[0]);
+        assert_eq!(results[0].split("new cable id ").nth(1).unwrap().split(',').count(), 3, "the result names the three cables: {}", results[0]);
+        assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
+    }
+
+    #[test]
     fn the_disconnect_tool_removes_the_cable_for_good() {
         let mut live = Live::new();
         let id = live.app.cables[0].id;
@@ -23210,7 +23261,7 @@ mod voice_host_tests {
         assert_eq!(rig.app.clap_rigs()[0].1, second);
         assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
 
-        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0 });
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0, wire: false });
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }

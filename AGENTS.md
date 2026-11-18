@@ -642,6 +642,15 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **An instrument a tool adds is wired like a rig's synth:** the agent
+    put setBfree into rig A with `add_node` and connected only its MIDI
+    cable, so the organ rendered into nothing (its strip LED moved, the rig
+    bus stayed dark). `AddNode { wire: true }` (Clap always; LV2 when the
+    scan says `is_instrument`) runs `Graph::wire_instrument` in the engine
+    and in headless MCP's mirror alike. Keep prompts in step with what the
+    app hosts: "LV2 instruments are coming soon" made the model give up on a
+    working organ
+    (`an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master`).
 120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
     a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
     `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below

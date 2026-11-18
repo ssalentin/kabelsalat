@@ -836,6 +836,30 @@ Learned so far (2026-11-15, UI polish pass):
     ones `rem_euclid` (`beat_offset_shifts_the_start_point`). A synced start
     armed in the block the transport starts waits for the NEXT bar by design:
     arm it before `TransportPlay` to land on beat 0.
+137. **One knob-value ↔ position mapping for stepped knobs:** the face
+    snaps to `round(v * (n-1))`, but the engine floored `v * n` and the
+    agent tool divided by `n`, so a MODE/RATE/OCT value the tool wrote could
+    land one step off (OCT 2 became 1, the default RATE was no position at
+    all). `arp::step_index` / `step_value` are the only mapping, and a
+    stepped knob's default is an exact position (`arp-test`, `arp::tests`).
+138. **A rewire the engine does itself outlives the UI's stale mirror:**
+    `AddNode` of an arp removes the rig's Keys → synth cables, but the UI
+    re-sends every cable of ITS rack each frame until it adopts the new
+    graph, and that `Connect` plugged the keys back past the arp
+    (`agent-eval --task arp_updown` 0/3). The engine remembers the ids it took
+    over (`arp_taken`, fixed size, cleared by a load) and ignores their
+    Connect (`an_arp_takes_over_the_keys_cables_and_a_stale_reconnect_cannot_undo_it`).
+139. **Every MIDI destination kind is routed in the constructor, in
+    LoadGraph and in AddNode:** `GraphEngine::new` built Keys/hardware rules
+    for CLAP and LV2 nodes only, so a rack that STARTS with an arp had no
+    route into it (0 steps in `arp-test`). Add a new destination kind to all
+    three, and test it by starting an engine with that graph.
+140. **A pattern starts at its first note, not at the grid index:** the arp
+    began at `grid_step % len`, so a chord pressed mid-bar began on its
+    second or third note. Keep the grid index (onset, swing parity) and the
+    pattern position apart (`a_press_mid_bar_starts_the_pattern_on_its_first_note`).
+    In the held-notes check, judge arps by "the last release silences
+    everything", never per key: chords of two held keys can share a pitch.
 
 ## Working on kabelsalat
 

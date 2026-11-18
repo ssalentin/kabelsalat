@@ -12,16 +12,29 @@
 //! covered at every length. Sounding notes are observed through the
 //! test-only `note_log` (delivered note-on / note-off / all-notes-off).
 //!
+//! Two scenarios share the machinery. The routing scenario is the plain rack
+//! (Keys → two synths). The arp scenario (issue #90) starts from the same rack
+//! and adds time (`Tick`), the arp unit (inserted, tuned, unplugged, removed)
+//! and the Keys scale snap to the alphabet; there a generated note belongs to
+//! no key, so the property is stronger: when the LAST key is released nothing
+//! sounds at all.
+//!
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
+use crate::arp::{Scale, ScaleChoice};
 use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
 use crate::matrix::SourceId;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 
 const KEYS: u32 = 0;
 const SURGE_A: u32 = 1;
 const SURGE_B: u32 = 3;
+/// The arp node the scenario's `AddArp` creates (the next free id).
+const ARP: u32 = 4;
+/// Marks a note the arp generated (no key owns it).
+const GENERATED: u8 = 255;
 /// Played keys: either side of the C4 split point, and both ≥ 48.
 const NOTES: [u8; 2] = [59, 60];
 
@@ -33,6 +46,8 @@ pub(super) enum Kind {
     Cable,
     Node,
     Load,
+    Scale,
+    Arp,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +55,8 @@ enum Step {
     On(u8),
     Off(u8),
     Edit(Edit),
+    /// Time passes: every arp steps through a window that holds its next onset.
+    Tick,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +75,21 @@ enum Edit {
     Remove(u32),
     /// LoadGraph of the start patch (template load).
     LoadStart,
+    /// SetKeysScale on the Keys node.
+    Scale(Option<ScaleChoice>),
+    /// AddNode of an arp, wired like the app's `add_node` (takes over the
+    /// rig's Keys → synth cables). Once per load (see `Run::arp_added`).
+    AddArp,
+    /// SetParam on the arp node; `pct` = knob value in percent.
+    ArpParam { param: u32, pct: u8 },
+    /// Connect a MIDI cable `from` → `to` (port 0 both) with this edge id.
+    Wire { id: u32, from: u32, to: u32 },
 }
+
+/// C# major pentatonic: B (59) snaps down to A#, C (60) up to C#. Two keys
+/// that snapped to ONE pitch would share its note (releasing one rightly
+/// leaves the other's sounding), which the observer cannot attribute.
+const PENTATONIC: ScaleChoice = ScaleChoice { scale: Scale::MajorPentatonic, key: 1 };
 
 const EDITS: [Edit; 15] = [
     Edit::Split(None),
@@ -79,6 +110,19 @@ const EDITS: [Edit; 15] = [
 ];
 // LoadStart is appended separately so the edit list stays readable.
 
+/// Edits of the arp scenario. Knob percents land on the stepped knobs'
+/// positions: MODE 0 = up, 75 = chord.
+const ARP_EDITS: [Edit; 7] = [
+    Edit::Scale(Some(PENTATONIC)),
+    Edit::AddArp,
+    Edit::ArpParam { param: crate::arp::P_ARP_MODE, pct: 0 },
+    Edit::ArpParam { param: crate::arp::P_ARP_MODE, pct: 75 },
+    Edit::Remove(ARP),
+    Edit::Unplug(9),
+    // The UI's stale mirror re-sending the cable the arp took over.
+    Edit::Wire { id: 1, from: KEYS, to: SURGE_A },
+];
+
 impl Edit {
     fn kind(self) -> Kind {
         match self {
@@ -87,6 +131,9 @@ impl Edit {
             Edit::Unplug(_) | Edit::Plug { .. } => Kind::Cable,
             Edit::Remove(_) => Kind::Node,
             Edit::LoadStart => Kind::Load,
+            Edit::Scale(_) => Kind::Scale,
+            Edit::AddArp | Edit::ArpParam { .. } => Kind::Arp,
+            Edit::Wire { .. } => Kind::Cable,
         }
     }
 
@@ -114,6 +161,15 @@ impl Edit {
                 kind: PortKind::Midi,
             },
             Edit::LoadStart => Command::LoadGraph { graph: start_graph() },
+            Edit::Scale(scale) => Command::SetKeysScale { node: KEYS, scale },
+            Edit::AddArp => Command::AddNode { kind: NodeKind::Arp, name: name_bytes("ARP"), rig: 0, wire: true },
+            Edit::ArpParam { param, pct } => Command::SetParam { node: ARP, param, value: pct as f64 / 100.0 },
+            Edit::Wire { id, from, to } => Command::Connect {
+                id,
+                from: PortRef { node: from, port: 0 },
+                to: PortRef { node: to, port: 0 },
+                kind: PortKind::Midi,
+            },
         }
     }
 }
@@ -144,6 +200,12 @@ struct Run {
     held: BTreeMap<u8, BTreeSet<Kind>>,
     /// (instrument, sounding pitch, key that started it).
     sounding: BTreeSet<(u32, u8, u8)>,
+    /// Arp scenario: chords of two held keys can share a pitch (ref-counted
+    /// by the arp), so a release is judged only when the LAST key goes up.
+    arp_scenario: bool,
+    /// An arp was added since the last load: each AddArp would otherwise mint
+    /// a fresh node id (an unbounded state space), so there is one per load.
+    arp_added: bool,
 }
 
 /// A key whose release left notes sounding.
@@ -165,19 +227,20 @@ pub(super) struct Report {
 }
 
 impl Run {
-    fn new() -> Self {
+    fn new(arp_scenario: bool) -> Self {
         let (_bus, drain) = command_bus();
         let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
         engine.apply(Command::LoadGraph { graph: start_graph() });
         engine.note_log.clear();
-        Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new() }
+        Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new(), arp_scenario, arp_added: false }
     }
 
     fn enabled(&self, step: Step) -> bool {
         match step {
             Step::On(k) => !self.held.contains_key(&k),
             Step::Off(k) => self.held.contains_key(&k),
-            Step::Edit(_) => true,
+            Step::Edit(Edit::AddArp) => !self.arp_added,
+            Step::Edit(_) | Step::Tick => true,
         }
     }
 
@@ -185,15 +248,21 @@ impl Run {
     /// key left sounding (empty = fine).
     fn step(&mut self, step: Step) -> Vec<(u32, u8)> {
         let (cmd, key) = match step {
-            Step::On(k) => (Command::NoteOn { note: k, velocity: 0.8, source: SourceId::Keys }, Some(k)),
-            Step::Off(k) => (Command::NoteOff { note: k, source: SourceId::Keys }, Some(k)),
-            Step::Edit(e) => (e.command(), None),
+            Step::On(k) => (Some(Command::NoteOn { note: k, velocity: 0.8, source: SourceId::Keys }), Some(k)),
+            Step::Off(k) => (Some(Command::NoteOff { note: k, source: SourceId::Keys }), Some(k)),
+            Step::Edit(e) => (Some(e.command()), None),
+            Step::Tick => (None, None),
         };
         self.engine.note_log.clear();
-        self.engine.apply(cmd);
+        match cmd {
+            Some(cmd) => self.engine.apply(cmd),
+            None => self.engine.arp_test_step(),
+        }
         for &(dest, note, on) in &self.engine.note_log {
             if on {
-                self.sounding.insert((dest, note, key.expect("note-on only from a key")));
+                // A note-on from an edit or a tick is generated (chord
+                // re-sound, arp step): no key owns it.
+                self.sounding.insert((dest, note, key.unwrap_or(GENERATED)));
             } else if note == 255 {
                 self.sounding.retain(|s| s.0 != dest); // release_all marker
             } else {
@@ -207,28 +276,43 @@ impl Run {
             }
             Step::Off(k) => {
                 self.held.remove(&k);
-                let left: Vec<(u32, u8)> =
-                    self.sounding.iter().filter(|s| s.2 == k).map(|s| (s.0, s.1)).collect();
+                // The released key's own notes must be gone; when it was the
+                // last key held, so must everything the arp generated.
+                let last = self.held.is_empty();
+                let left: Vec<(u32, u8)> = self.sounding.iter()
+                    .filter(|s| if self.arp_scenario { last } else { s.2 == k })
+                    .map(|s| (s.0, s.1)).collect();
                 left
             }
             Step::Edit(e) => {
+                match e {
+                    Edit::AddArp => self.arp_added = true,
+                    Edit::LoadStart => self.arp_added = false,
+                    _ => {}
+                }
                 for kinds in self.held.values_mut() {
                     kinds.insert(e.kind());
                 }
                 Vec::new()
             }
+            Step::Tick => Vec::new(),
         }
     }
 
     /// Everything that decides future behaviour, as a comparable key.
-    fn fingerprint(&self) -> String {
+    fn fingerprint(&self) -> u64 {
         let routing = serde_json::to_string(&(
             &self.engine.graph.nodes,
             &self.engine.graph.edges,
             &self.engine.matrix.rules,
         ))
         .expect("serialize state");
-        format!("{routing}|{:?}|{:?}", self.held, self.sounding)
+        let arps: Vec<String> = self.engine.arp.iter().map(|a| a.fingerprint()).collect();
+        // Hashed: 100k states of a kilobyte of JSON each is memory the check
+        // does not need to keep.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{routing}|{:?}|{:?}|{arps:?}|{}", self.held, self.sounding, self.arp_added).hash(&mut h);
+        h.finish()
     }
 }
 
@@ -248,13 +332,23 @@ fn describe(step: Step) -> String {
             let port = if port == 0 { "LOW/main" } else { "HIGH" };
             format!("Connect cable {id} Keys {port} → {name}")
         }
-        Step::Edit(Edit::Remove(_)) => "RemoveNode Surge B".to_string(),
+        Step::Edit(Edit::Remove(id)) => match id {
+            ARP => "RemoveNode Arp".to_string(),
+            SURGE_A => "RemoveNode Surge A".to_string(),
+            _ => "RemoveNode Surge B".to_string(),
+        },
         Step::Edit(Edit::LoadStart) => "LoadGraph start patch".to_string(),
+        Step::Edit(Edit::Scale(None)) => "SetKeysScale off".to_string(),
+        Step::Edit(Edit::Scale(Some(c))) => format!("SetKeysScale {}", c.label()),
+        Step::Edit(Edit::AddArp) => "AddNode Arp (wired into the rig)".to_string(),
+        Step::Edit(Edit::ArpParam { param, pct }) => format!("SetParam arp {param} = {pct}%"),
+        Step::Edit(Edit::Wire { id, from, to }) => format!("Connect cable {id} node {from} → node {to}"),
+        Step::Tick => "Tick (time passes)".to_string(),
     }
 }
 
-fn replay(path: &[Step]) -> Run {
-    let mut run = Run::new();
+fn replay(path: &[Step], arp_scenario: bool) -> Run {
+    let mut run = Run::new(arp_scenario);
     for &s in path {
         run.step(s);
     }
@@ -267,16 +361,30 @@ pub(super) fn explore(max_states: usize) -> Report {
     let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
     alphabet.extend(EDITS.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, false)
+}
 
-    let start = Run::new();
-    let mut seen: HashSet<String> = HashSet::from([start.fingerprint()]);
+/// The arp scenario (issue #90): the plain rack plus time, the arp unit and
+/// the scale snap. Smaller routing edit set than `EDITS` (the routing
+/// scenario already covers those exhaustively) so the product stays finite.
+pub(super) fn explore_arp(max_states: usize) -> Report {
+    let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
+    alphabet.push(Step::Tick);
+    alphabet.extend(ARP_EDITS.iter().map(|&e| Step::Edit(e)));
+    alphabet.push(Step::Edit(Edit::LoadStart));
+    explore_with(&alphabet, max_states, true)
+}
+
+fn explore_with(alphabet: &[Step], max_states: usize, arp_scenario: bool) -> Report {
+    let start = Run::new(arp_scenario);
+    let mut seen: HashSet<u64> = HashSet::from([start.fingerprint()]);
     let mut queue: VecDeque<Vec<Step>> = VecDeque::from([Vec::new()]);
     let mut stuck: Vec<Stuck> = Vec::new();
 
     let mut complete = true;
     'search: while let Some(path) = queue.pop_front() {
-        let here = replay(&path);
-        for &step in &alphabet {
+        let here = replay(&path, arp_scenario);
+        for &step in alphabet {
             if !here.enabled(step) {
                 continue;
             }
@@ -284,7 +392,7 @@ pub(super) fn explore(max_states: usize) -> Report {
                 Step::Off(k) => here.held[&k].clone(),
                 _ => BTreeSet::new(),
             };
-            let mut next = replay(&path);
+            let mut next = replay(&path, arp_scenario);
             let left = next.step(step);
             let mut trace = path.clone();
             trace.push(step);
@@ -311,6 +419,21 @@ pub(super) fn explore(max_states: usize) -> Report {
 /// Any stuck note whose kinds contain a KNOWN set is attributed to it; every
 /// other stuck note fails the check. A fix must remove its entry.
 pub(super) const KNOWN: &[&[Kind]] = &[];
+
+#[test]
+fn held_notes_are_released_with_the_arp_and_the_scale_snap() {
+    let report = explore_arp(20_000);
+    let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
+    eprintln!("held-notes (arp): {} reachable states {reach}", report.states);
+    for s in &report.stuck {
+        eprintln!("VIOLATION {:?}: still sounding (instrument, pitch) {:?}", s.kinds, s.left);
+        for (i, line) in s.trace.iter().enumerate() {
+            eprintln!("  {}. {line}", i + 1);
+        }
+    }
+    assert!(report.stuck.is_empty(), "stuck notes with the arp (traces above)");
+    assert!(report.complete, "state bound hit before fixpoint: the arp alphabet's state space grew");
+}
 
 #[test]
 fn held_notes_are_released_under_every_routing_edit() {

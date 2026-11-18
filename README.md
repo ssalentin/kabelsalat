@@ -31,6 +31,11 @@ USB MIDI keyboard — devices are found while the app runs, just plug them in.
 Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
 ambient pad with one key.
 
+The on-screen keyboard carries the controls a real keyboard has: a pitch-bend
+wheel that springs back to centre, a modulation wheel, a sustain pedal and a
+velocity slider. They reach every rig the keys feed, and hardware pitch bend,
+modulation and sustain reach your instruments the same way.
+
 <p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The rack with the full-width software keyboard opened at the bottom"/></p>
 
 ### Patch with real cables

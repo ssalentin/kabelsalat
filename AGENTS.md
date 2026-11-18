@@ -775,6 +775,11 @@ Learned so far (2026-11-15, UI polish pass):
     when `src/ui.rs`/`src/theme.rs` changed without a screenshot — label
     only real features, so the fail stays meaningful.
 
+128. **Dock controls are painted from the theme, never stock `egui::Slider`:**
+    the VEL slider's rail has the panel's own fill on the dark dock, so only a
+    tiny handle showed. Use a `PAPER_SINK` track + `CREAM` fill like the strip's
+    wheels (`kb_strip_sends_the_standard_midi_signals` drives it by pointer),
+    and look at the screenshot before calling a control done.
 133. **A plugin whose destructor crashes is parked, never freed (CLAP too):**
     Dexed's destructor segfaulted while other instances rendered (#52, the rule
     56 class for LV2). `CLAP_NEVER_FREE` ids are deactivated and parked on

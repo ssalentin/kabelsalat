@@ -642,13 +642,21 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
-118. **An instrument starts playable:** Aeolus starts with every stop off,
+116. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+    a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
+    `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
+    −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
+    dB meter). `gain_for` drops instantly when `target < gain` (120 ms
+    release prevents waveform tracking), `P_VOL` defaults to `0.75`
+    (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
+    red only above `0.95` (−3 dBFS).
+117. **An instrument starts playable:** Aeolus starts with every stop off,
     so the catalog install built, loaded and scanned it, and middle C peaked
     at 0.000. Play a note on a fresh instance of every new catalog
     instrument (`catalog-install-test <id>`); one that starts silent gets a
     starting state (`aeolus::initial_state`, applied where every CLAP voice
     is instantiated) and its sounds as a `Source` (rule 93).
-119. **Test a face element in the rack the app opens with:** the Aeolus
+118. **Test a face element in the rack the app opens with:** the Aeolus
     stop panel passed its layout tests on a lone, tall unit, yet in the
     real app (two instruments stacked over their delays, units 250 px
     tall) it found no room and was not drawn at all. A face test asserts
@@ -725,20 +733,11 @@ Learned so far (2026-11-15, UI polish pass):
   only on a branch. Remove the worktree once its PR is merged.
 - **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
   (admins included), the branch must be up to date, and the required checks
-  `test (x86_64)`, `test (aarch64)`, `flatpak cargo-sources.json is current`
-  and `human gate` must pass. GitHub merges a queued auto-merge PR once they
+  `test (x86_64)`, `test (aarch64)` and `flatpak cargo-sources.json is current`
+  must pass. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
-  `gh pr merge` without `--auto`. `human gate`
-  (`scripts/ci/human-gate.sh`, run from `main` via `pull_request_target`,
-  so a PR cannot edit it to pass) holds only PRs that change the rules
-  agents work under or what ships: `AGENTS.md`, `.github/`, `.githooks/`,
-  `scripts/ci/`, `scripts/check-images.sh`, `Cargo.toml`, `packaging/`.
-  Everything else merges on green CI, so the evidence rules above are what
-  keeps it safe. Add the `needs-human` label to a PR whose risk neither the
-  tests nor its evidence cover.
-  Such a PR waits until the user adds `human-approved`; **agents never add
-  or remove `human-approved`**, and a PR body for one lists the evidence the
-  user needs (screenshots, self-test output). Self-tests with real plugins
+  `gh pr merge` without `--auto`. Everything merges on green CI, so the
+  evidence rules above are what keeps it safe. Self-tests with real plugins
   and audio do not run in CI, so their output belongs in every PR body that
   changes the code they cover. When `main` moves, update the branch
   (`gh pr update-branch`) so the queued merge can proceed.

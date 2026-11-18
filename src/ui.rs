@@ -14418,7 +14418,7 @@ impl DemoApp {
     fn draw_cables(&self, painter: &egui::Painter, hl: &[bool; MAX_CABLES], has_sel: bool) {
         let xf = &self.xf;
         let volume = self.master_idx()
-            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 1.0) * 0.85)
+            .map(|m| 0.15 + knob_val(&self.units[m], P_VOL, 0.75) * 0.85)
             .unwrap_or(0.83);
         for (ci, c) in self.cables.iter().enumerate() {
             if !self.visible(c.src) || !self.visible(c.dst) { continue; }

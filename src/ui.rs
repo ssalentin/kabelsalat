@@ -664,6 +664,8 @@ enum UnitKind {
     Master,
     /// Live audio input (mic/guitar/interface): a source with an audio OUT.
     AudioIn,
+    /// Hosted MIDI effect (AUM MIDI strip): MIDI in, MIDI out.
+    MidiFx,
 }
 
 struct Unit {
@@ -1416,6 +1418,15 @@ fn make_unit(node: &Node) -> Unit {
             UnitKind::Dsp(DspKind::Gain), "lv2 effect".into(),
             vec![PortKind::Audio], vec![PortKind::Audio],
             vec![(Dir::In, 0, 0.30, "IN"), (Dir::Out, 0, 0.70, "OUT")],
+        ),
+        NodeKind::MidiFx { plugin } => (
+            UnitKind::MidiFx,
+            match plugin {
+                crate::control::MidiFxPlugin::Builtin { .. } => "midi fx · transpose".into(),
+                crate::control::MidiFxPlugin::Lv2 { .. } => "midi fx · lv2".into(),
+            },
+            vec![PortKind::Midi], vec![PortKind::Midi],
+            vec![(Dir::In, 0, 0.30, "MIDI IN"), (Dir::Out, 0, 0.70, "MIDI OUT")],
         ),
         NodeKind::SystemAudio => (
             UnitKind::Dsp(DspKind::Gain), "system audio".into(),
@@ -2856,6 +2867,14 @@ impl DemoApp {
             if !in_rig(u) || matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { claimed[i] = true; }
         }
         let mut cols: Vec<Vec<usize>> = Vec::new();
+        // MIDI strips sit in front of the instruments they feed, in chain
+        // (node) order: one single-unit column each.
+        for i in 0..self.units.len() {
+            if !claimed[i] && matches!(self.units[i].node_kind, UnitKind::MidiFx) {
+                claimed[i] = true;
+                cols.push(vec![i]);
+            }
+        }
         for i in 0..self.units.len() {
             // Skip claimed units: another rig's synth must not open an
             // (invisible) column in this rig's view.
@@ -5833,6 +5852,15 @@ impl DemoApp {
                     }),
                     "system_audio" => Some(NodeKind::SystemAudio),
                     "master_out" => Some(NodeKind::MasterOut),
+                    "midi_fx" | "midi-fx" => match (args.get("uri").and_then(|v| v.as_str()), args.get("plugin_id").and_then(|v| v.as_str())) {
+                        (Some(uri), _) => Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri: Lv2Uri::new(uri) } }),
+                        (None, Some(_)) => return "CLAP note effects are listed by list_midi_fx but cannot be hosted yet: use an LV2 MIDI plugin (uri) or the built-in transposer (no uri)".into(),
+                        (None, None) => {
+                            let semis = args.get("semis").and_then(|v| v.as_i64()).unwrap_or(0)
+                                .clamp(-(crate::engine::MIDIFX_SEMI_MAX as i64), crate::engine::MIDIFX_SEMI_MAX as i64) as i8;
+                            Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis } })
+                        }
+                    },
                     _ => None,
                 };
                 // Global: any rig by index; default = the rig in view.
@@ -5849,8 +5877,19 @@ impl DemoApp {
                         }
                         self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
                     }
+                    Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
+                        }
+                        if !self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_midi_fx) {
+                            return format!("'{}' is not an installed LV2 MIDI plugin (see list_midi_fx)", uri.as_str());
+                        }
+                        true
+                    }
+                    Some(NodeKind::MidiFx { .. }) => true,
                     _ => false,
                 };
+                let is_midi_fx = matches!(kind, Some(NodeKind::MidiFx { .. }));
                 match kind {
                     Some(k) => {
                         if let Some(bus) = &self.bus {
@@ -5859,7 +5898,9 @@ impl DemoApp {
                         }
                         self.agent_activity.touch_rig(rig, now);
                         self.agent_activity.record(origin, format!("Add {} → {}", name_str(&name), self.rig_name(rig)), vec![], now);
-                        if wire {
+                        if is_midi_fx {
+                            format!("added MIDI effect to rig {rig} '{}': inserted between the rig's Keys and its instruments (Keys → it → instruments, MIDI); do not connect these again", self.rig_name(rig))
+                        } else if wire {
                             format!("added {kind_str} instrument to rig {rig} '{}', wired like a standard rig: the rig's Keys → it (MIDI) and it → the rig's Master L and R (audio); do not connect these again", self.rig_name(rig))
                         } else {
                             format!("added {kind_str} node to rig {rig} '{}' (wire it with connect)", self.rig_name(rig))
@@ -5869,6 +5910,20 @@ impl DemoApp {
                 }
             }
             "get_rigs" => self.rigs_json().to_string(),
+            "list_midi_fx" => {
+                if !self.plugin_lists_ready() {
+                    return "scanning installed plugins in the background (first run) — try list_midi_fx again in a few seconds".into();
+                }
+                let lv2: Vec<_> = self.plugins_lv2.iter().filter(|p| p.is_midi_fx)
+                    .map(|p| serde_json::json!({"uri": p.uri, "name": p.name})).collect();
+                let clap: Vec<_> = self.plugins_clap.iter().filter(|p| crate::host::is_note_effect(p))
+                    .map(|p| serde_json::json!({"plugin_id": p.id, "name": p.name})).collect();
+                serde_json::json!({
+                    "builtin": [{"name": "Transpose", "add_with": "add_node kind=midi_fx (optionally semis)"}],
+                    "lv2": lv2,
+                    "clap_not_hostable_yet": clap,
+                }).to_string()
+            }
             "list_sounds" => {
                 let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
                 match self.sound_target(args).and_then(|unit| Ok((self.sound_library(&unit)?, unit))) {
@@ -6520,7 +6575,7 @@ impl DemoApp {
     fn midi_cable_to(&self, inst: usize) -> Option<usize> {
         self.cables.iter().position(|c| {
             c.dying < 0.0 && c.kind == PortKind::Midi && c.dst == inst
-                && matches!(self.units.get(c.src).map(|u| &u.node_kind), Some(UnitKind::Keys))
+                && matches!(self.units.get(c.src).map(|u| &u.node_kind), Some(UnitKind::Keys | UnitKind::MidiFx))
         })
     }
 
@@ -6962,6 +7017,18 @@ impl DemoApp {
             UnitKind::Master => vec![(P_VOL, "Volume".into()), (P_WARM, "Warmth".into())],
             UnitKind::Keys => Vec::new(),
             UnitKind::AudioIn => vec![(P_AUDIO_IN_GAIN, "Gain".into()), (P_AUDIO_IN_MONITOR, "Monitor".into())],
+            UnitKind::MidiFx => match self.base_graph.node(node_id).map(|n| &n.kind) {
+                Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                    crate::lv2::control_descs_for_uri(uri.as_str())
+                        .into_iter()
+                        .map(|c| (c.index as u32, c.name))
+                        .collect()
+                }
+                Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { .. } }) => {
+                    vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())]
+                }
+                _ => Vec::new(),
+            },
         }
     }
 
@@ -7049,6 +7116,7 @@ impl DemoApp {
             SourceId::Keys => (1, 0),
             SourceId::Virtual(v) => (2, v),
             SourceId::FilePlayer(f) => (3, f),
+            SourceId::MidiFx(n) => (4, n),
         }
     }
 
@@ -9323,6 +9391,27 @@ impl DemoApp {
         }
     }
 
+    /// Add a MIDI strip (LV2 MIDI plugin, or the built-in transposer when
+    /// `uri` is None) to the active rig: the engine inserts it between the
+    /// rig's Keys and its instruments (`Graph::wire_midi_fx`).
+    fn add_midi_fx_to_active_rig(&mut self, uri: Option<&str>, name: &str) {
+        let plugin = match uri {
+            Some(u) => crate::control::MidiFxPlugin::Lv2 { uri: Lv2Uri::new(u) },
+            None => crate::control::MidiFxPlugin::Builtin { semis: 0 },
+        };
+        let Some(bus) = &self.bus else {
+            self.plugin_msg = "No engine attached".into();
+            return;
+        };
+        let _ = bus.lock().unwrap().send(Command::AddNode {
+            kind: NodeKind::MidiFx { plugin },
+            name: name_bytes(name),
+            rig: self.active_rig as u8,
+            wire: true,
+        });
+        self.plugin_msg = format!("Added MIDI strip '{name}' — Keys → {name} → instruments");
+    }
+
     /// Add a Metronome node to the active rig and wire it to that rig's MasterOut.
     fn add_metronome_to_active_rig(&mut self) {
         let rig = self.active_rig as u8;
@@ -9498,7 +9587,7 @@ impl DemoApp {
 
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome adds to the active rig")
+                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome and MIDI strips add to the active rig")
                         .size(12.0)
                         .color(theme::INK_2),
                 );
@@ -9515,6 +9604,7 @@ impl DemoApp {
                 let mut add_metro = false;
                 let mut add_clap: Option<(String, String)> = None;
                 let mut add_lv2: Option<(String, String, bool)> = None;
+                let mut add_midi_fx: Option<(Option<String>, String)> = None;
                 let mut install_request: Option<String> = None;
 
                 egui::ScrollArea::vertical()
@@ -9734,15 +9824,41 @@ impl DemoApp {
                         if show_builtin {
                             theme::section_label(ui, "Built-in");
                             ui.add_space(8.0);
-                            Self::plugin_card(ui, card_w, |ui, iw| {
-                                card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
-                                ui.add_space(12.0);
-                                if theme::primary_button(ui, "Add to rig").clicked() {
-                                    add_metro = true;
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = gap;
+                                Self::plugin_card(ui, card_w, |ui, iw| {
+                                    card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
+                                    ui.add_space(12.0);
+                                    if theme::primary_button(ui, "Add to rig").clicked() {
+                                        add_metro = true;
+                                    }
+                                });
+                                if cols > 1 {
+                                    Self::plugin_card(ui, card_w, |ui, iw| {
+                                        card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
+                                        ui.add_space(4.0);
+                                        ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
+                                        ui.add_space(12.0);
+                                        if theme::primary_button(ui, "Add MIDI strip").clicked() {
+                                            add_midi_fx = Some((None, "Transpose".to_string()));
+                                        }
+                                    });
                                 }
                             });
+                            if cols == 1 {
+                                ui.add_space(gap);
+                                Self::plugin_card(ui, card_w, |ui, iw| {
+                                    card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
+                                    ui.add_space(12.0);
+                                    if theme::primary_button(ui, "Add MIDI strip").clicked() {
+                                        add_midi_fx = Some((None, "Transpose".to_string()));
+                                    }
+                                });
+                            }
                             need_divider = true;
                         }
 
@@ -9809,7 +9925,9 @@ impl DemoApp {
                                         ui.spacing_mut().item_spacing.x = gap;
                                         for p in row {
                                             Self::plugin_card(ui, card_w, |ui, iw| {
-                                                let (badge, bcol) = if p.is_instrument {
+                                                let (badge, bcol) = if p.is_midi_fx {
+                                                    ("MIDI FX", theme::LIVE_TEAL)
+                                                } else if p.is_instrument {
                                                     ("INST", theme::LIVE_TEAL)
                                                 } else {
                                                     ("FX", theme::INK_2)
@@ -9821,6 +9939,12 @@ impl DemoApp {
                                                         .truncate(),
                                                 );
                                                 ui.add_space(12.0);
+                                                if p.is_midi_fx {
+                                                    if theme::primary_button(ui, "Add MIDI strip").on_hover_text(&p.uri).clicked() {
+                                                        add_midi_fx = Some((Some(p.uri.clone()), p.name.clone()));
+                                                    }
+                                                    return;
+                                                }
                                                 ui.horizontal(|ui| {
                                                     ui.spacing_mut().item_spacing.x = 6.0;
                                                     let inst_resp = if p.is_instrument {
@@ -9851,6 +9975,9 @@ impl DemoApp {
 
                 if add_metro {
                     self.add_metronome_to_active_rig();
+                }
+                if let Some((uri, name)) = add_midi_fx {
+                    self.add_midi_fx_to_active_rig(uri.as_deref(), &name);
                 }
                 if let Some((id, name)) = add_clap {
                     self.add_clap_rig(&id, &name);
@@ -11284,7 +11411,10 @@ impl DemoApp {
                 self._surge_main.get(idx).map(|m| m.main_controls().clone())
             }
             _ => match self.base_graph.node(u.node_id).map(|n| &n.kind) {
-                Some(NodeKind::Lv2 { uri }) => crate::lv2::main_controls_cached(uri.as_str()),
+                Some(NodeKind::Lv2 { uri })
+                | Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
+                    crate::lv2::main_controls_cached(uri.as_str())
+                }
                 _ => None,
             },
         }
@@ -11329,7 +11459,7 @@ impl DemoApp {
                     }
                 }
                 // An LV2 unit, once its plugin's controls are resolved.
-                UnitKind::Dsp(_) if self.units[ui].main_from.is_none() => {
+                UnitKind::Dsp(_) | UnitKind::MidiFx if self.units[ui].main_from.is_none() => {
                     let Some(found) = self.unit_main_controls(ui) else { continue };
                     let u = &mut self.units[ui];
                     set_main_knobs(u, found.face(), MainTarget::Lv2, |c| c.default);
@@ -13199,7 +13329,7 @@ impl DemoApp {
             .filter(|(_, u)| match u.node_kind {
                 UnitKind::Clap => true,
                 UnitKind::AudioIn => true,
-                UnitKind::Keys | UnitKind::Master => false,
+                UnitKind::Keys | UnitKind::Master | UnitKind::MidiFx => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })
@@ -13621,6 +13751,7 @@ impl DemoApp {
                 UnitKind::Dsp(_) => self.draw_dsp_display(painter, ui),
                 UnitKind::Master => self.draw_meter(painter, ui),
                 UnitKind::AudioIn => self.draw_audio_in_face(painter, ui),
+                UnitKind::MidiFx => self.draw_dsp_display(painter, ui),
             }
 
             for ki in 0..u.knobs.len() {
@@ -19412,7 +19543,7 @@ mod split_bpm_tests {
     #[test]
     fn session_load_classifies_lv2_from_the_background_scan() {
         let uri = "urn:test:organ";
-        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst };
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst, is_midi_fx: false };
         let mut app = DemoApp::new_with_sink(None);
         app.plugins_lv2 = vec![info(false)];
         app.plugins_loaded = true;
@@ -20062,6 +20193,7 @@ mod stage_views_tests {
             name: "Lush Verb".into(),
             num_ports: 4,
             is_instrument: false,
+            is_midi_fx: false,
         }];
         let ctx = egui::Context::default();
         let size = Vec2::new(1600.0, 1000.0);
@@ -20158,6 +20290,7 @@ mod stage_views_tests {
             name: "Room Reverb".into(),
             num_ports: 4,
             is_instrument: false,
+            is_midi_fx: false,
         }];
         app.stage_view = StageView::Plugins;
         let ctx = egui::Context::default();
@@ -20979,7 +21112,7 @@ mod ui_polish_agent_tests {
         live.engine.spawn_lv2_loader();
         live.run_batch(vec![call("load_template", serde_json::json!({"name": "multi_rig"}))]);
         for _ in 0..6 { live.frame(); }
-        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument };
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, is_midi_fx: false };
         live.app.plugins_lv2 = vec![lv2(TEST_ORGAN, true), lv2("urn:test:fx", false)];
         live.app.plugins_loaded = true;
         let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
@@ -23387,6 +23520,30 @@ mod offline_shots {
         enc.write_header().unwrap().write_image_data(&bytes).unwrap();
     }
 
+    /// The rack with a MIDI strip (built-in transposer, +7) between the
+    /// keys and Surge, and the Plugins page with its MIDI FX cards.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat midifx_shots -- --ignored"]
+    fn midifx_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h) in [(1600.0, 1000.0), (1000.0, 700.0)] {
+            let mut app = DemoApp::new_with_sink(None);
+            let mut g = app.base_graph.clone();
+            let fx = g.add_node(
+                NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis: 7 } },
+                name_bytes("TRANSPOSE"),
+            );
+            g.set_rig(fx, 0);
+            g.wire_midi_fx(fx);
+            app.build_rack(&g, &[]);
+            shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-rack-midi-strip.png")));
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Plugins;
+            shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-plugins.png")));
+        }
+    }
+
     #[test]
     #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored"]
     fn window_size_shots() {
@@ -23416,5 +23573,42 @@ mod offline_shots {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod midi_strip_tests {
+    use super::*;
+
+    fn app_with_strip() -> (DemoApp, u32) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        let fx = g.add_node(
+            NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Builtin { semis: 0 } },
+            name_bytes("TRANSPOSE"),
+        );
+        g.set_rig(fx, 0);
+        g.wire_midi_fx(fx);
+        app.build_rack(&g, &[]);
+        (app, fx)
+    }
+
+    /// The strip's SEMIS knob (a non-default value, rule 59) survives a save and a load.
+    #[test]
+    fn a_midi_strips_knob_survives_save_and_load() {
+        let (mut app, fx) = app_with_strip();
+        let u = app.units.iter().position(|u| u.node_id == fx).expect("the strip is a unit");
+        assert!(matches!(app.units[u].node_kind, UnitKind::MidiFx));
+        let k = app.units[u].knob_index("SEMIS").expect("a SEMIS knob");
+        app.units[u].knobs[k].set_immediate(0.75);
+        let s = app.capture_session("strip").expect("capture");
+        let param = app.units[u].knobs[k].param.expect("SEMIS drives a param");
+        assert_eq!(s.param(fx, param), Some(0.75), "the knob is in the session");
+        // Wire the strip into the saved graph, as the cables did.
+        assert!(s.graph.edges.iter().any(|e| e.to.node == fx || e.from.node == fx), "the strip's cables are saved");
+        app.apply_session(&s).expect("load");
+        let u = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::MidiFx)).expect("strip after load");
+        let k = app.units[u].knob_index("SEMIS").expect("SEMIS after load");
+        assert!((app.units[u].knobs[k].value - 0.75).abs() < 1e-6, "SEMIS restored: {}", app.units[u].knobs[k].value);
     }
 }

@@ -93,6 +93,21 @@ agents are in [AGENTS.md](../AGENTS.md).
 
 ## 0. Decision log
 
+- **2026-11-18** — **MIDI strips (AUM parity, #86).** A MIDI effect is a graph
+  node (`NodeKind::MidiFx`: a built-in transposer, or an LV2 plugin that has a
+  MIDI atom in and out and no audio port) whose output is a matrix source
+  (`SourceId::MidiFx(node)`). Notes travel source → unit → instrument: the
+  engine's `pump_midi_fx` feeds each unit's bounded queue into its plugin
+  before the voices render and routes what it emits through the matrix, with
+  no allocation on the audio thread (LV2 instances load on the loader thread
+  like any LV2 unit). Adding a unit re-points the rig's Keys → instrument MIDI
+  cables through it; removing one heals them. Because a unit can change what
+  its own note-off means (a transposer's knob), every edit of a unit's path
+  releases what is held through it first (rule 41; checked by the
+  `Alphabet::Fx` held-notes search and, with a real plugin, by
+  `kabelsalat midifx-test`). CLAP note effects are discovered
+  (`list_midi_fx`, `clap_not_hostable_yet`) but not hosted yet.
+
 - **2026-11-17** — **Instrument profiles, not per-knob learn** (user: map a whole
   Nord Electro 2, drawbars included). Other hosts do this with a per-device
   definition: Logic's Vintage B3 ships controller presets per organ (one is

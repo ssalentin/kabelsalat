@@ -15,13 +15,15 @@
 //! Run + interpret: `.claude/skills/verify-held-notes/SKILL.md`.
 
 use super::GraphEngine;
-use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+use crate::control::{command_bus, name_bytes, Command, Graph, MidiFxPlugin, NodeKind, PortKind, PortRef};
 use crate::matrix::SourceId;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 const KEYS: u32 = 0;
 const SURGE_A: u32 = 1;
 const SURGE_B: u32 = 3;
+/// The MIDI-FX unit (built-in transposer) between Keys and Surge A.
+const FX: u32 = 4;
 /// Played keys: either side of the C4 split point, and both ≥ 48.
 const NOTES: [u8; 2] = [59, 60];
 
@@ -33,6 +35,10 @@ pub(super) enum Kind {
     Cable,
     Node,
     Load,
+    /// A MIDI-FX unit's own edit (knob, rule, cable, removal).
+    Fx,
+    /// A rig source switch (keyboard / hardware) of an instrument.
+    Source,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,11 +62,36 @@ enum Edit {
     Plug { id: u32, port: u8, dest: u32 },
     /// RemoveNode of an instrument.
     Remove(u32),
+    /// The transposer's TRANSPOSE knob (SetParam), in semitones.
+    FxSemis(i8),
+    /// MatrixRule Keys → FX (the unit's input leg).
+    RuleFxIn { enabled: bool },
+    /// MatrixRule FX → Surge A (the unit's output leg), with a transpose.
+    RuleFxOut { transpose: i8, enabled: bool },
+    /// Connect cable 8 (Keys → FX) or 9 (FX → Surge A).
+    PlugFx(u32),
+    /// RemoveNode of the MIDI-FX unit (the chain heals).
+    RemoveFx,
+    /// SetRigSource on Surge A: keyboard on/off.
+    Source { keyboard: bool },
     /// LoadGraph of the start patch (template load).
     LoadStart,
 }
 
-const EDITS: [Edit; 15] = [
+/// Which part of the alphabet a search covers. The whole product of both
+/// halves has no fixpoint a test can reach (millions of states), so each half
+/// runs to ITS fixpoint with the other half's edits left out; the MIDI-FX
+/// unit is in the start patch of both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Alphabet {
+    /// Split, zones, matrix rules, instrument cables, node removal, load.
+    Routing,
+    /// The MIDI-FX unit's knob, rules, cables, removal and source switches,
+    /// with the few routing edits that change what reaches it.
+    Fx,
+}
+
+const ROUTING_EDITS: [Edit; 14] = [
     Edit::Split(None),
     Edit::Split(Some(60)),
     Edit::Split(Some(48)),
@@ -74,8 +105,28 @@ const EDITS: [Edit; 15] = [
     Edit::Unplug(6),
     Edit::Plug { id: 1, port: 0, dest: SURGE_A },
     Edit::Plug { id: 6, port: 0, dest: SURGE_B },
-    Edit::Plug { id: 6, port: 1, dest: SURGE_B },
     Edit::Remove(SURGE_B),
+];
+
+const FX_EDITS: [Edit; 18] = [
+    Edit::Split(None),
+    Edit::Split(Some(60)),
+    Edit::Rule { dest: SURGE_A, transpose: 0, enabled: false },
+    Edit::Rule { dest: SURGE_A, transpose: 0, enabled: true },
+    Edit::Unplug(1),
+    Edit::Unplug(8),
+    Edit::Unplug(9),
+    Edit::Plug { id: 1, port: 0, dest: SURGE_A },
+    Edit::FxSemis(12),
+    Edit::FxSemis(0),
+    Edit::RuleFxIn { enabled: false },
+    Edit::RuleFxIn { enabled: true },
+    Edit::RuleFxOut { transpose: 12, enabled: true },
+    Edit::RuleFxOut { transpose: 0, enabled: false },
+    Edit::PlugFx(8),
+    Edit::PlugFx(9),
+    Edit::RemoveFx,
+    Edit::Source { keyboard: false },
 ];
 // LoadStart is appended separately so the edit list stays readable.
 
@@ -84,6 +135,8 @@ impl Edit {
         match self {
             Edit::Split(_) | Edit::ZoneOctave { .. } => Kind::Split,
             Edit::Rule { .. } => Kind::Matrix,
+            Edit::FxSemis(_) | Edit::RuleFxIn { .. } | Edit::RuleFxOut { .. } | Edit::PlugFx(_) | Edit::RemoveFx => Kind::Fx,
+            Edit::Source { .. } => Kind::Source,
             Edit::Unplug(_) | Edit::Plug { .. } => Kind::Cable,
             Edit::Remove(_) => Kind::Node,
             Edit::LoadStart => Kind::Load,
@@ -107,6 +160,47 @@ impl Edit {
             },
             Edit::Unplug(id) => Command::Disconnect(id),
             Edit::Remove(id) => Command::RemoveNode(id),
+            Edit::FxSemis(semis) => Command::SetParam {
+                node: FX,
+                param: super::P_MIDIFX_SEMI,
+                value: 0.5 + semis as f64 / (2.0 * super::MIDIFX_SEMI_MAX as f64),
+            },
+            Edit::RuleFxIn { enabled } => Command::MatrixRule {
+                source: SourceId::Keys,
+                dest: FX,
+                channel: None,
+                transpose: 0,
+                key_lo: 0,
+                key_hi: 127,
+                vel_lo: 0,
+                vel_hi: 127,
+                enabled,
+            },
+            Edit::RuleFxOut { transpose, enabled } => Command::MatrixRule {
+                source: SourceId::MidiFx(FX),
+                dest: SURGE_A,
+                channel: None,
+                transpose,
+                key_lo: 0,
+                key_hi: 127,
+                vel_lo: 0,
+                vel_hi: 127,
+                enabled,
+            },
+            Edit::PlugFx(8) => Command::Connect {
+                id: 8,
+                from: PortRef { node: KEYS, port: 0 },
+                to: PortRef { node: FX, port: 0 },
+                kind: PortKind::Midi,
+            },
+            Edit::PlugFx(id) => Command::Connect {
+                id,
+                from: PortRef { node: FX, port: 0 },
+                to: PortRef { node: SURGE_A, port: 0 },
+                kind: PortKind::Midi,
+            },
+            Edit::RemoveFx => Command::RemoveNode(FX),
+            Edit::Source { keyboard } => Command::SetRigSource { node: SURGE_A, keyboard, hardware: true },
             Edit::Plug { id, port, dest } => Command::Connect {
                 id,
                 from: PortRef { node: KEYS, port },
@@ -118,9 +212,11 @@ impl Edit {
     }
 }
 
-/// Keys(0) → Surge A(1) and Surge B(3) over MIDI cables 1 and 6, both into
-/// Master(2). The demo patch's MIDI topology without its Delay nodes (audio
-/// effects do not take part in note routing).
+/// Keys(0) → MIDI-FX transposer(4) → Surge A(1), and Keys → Surge B(3) over
+/// MIDI cables 8+9 and 6, both synths into Master(2). The demo patch's MIDI
+/// topology without its Delay nodes (audio effects do not take part in note
+/// routing), with a MIDI strip in Surge A's chain. Cable 1 (Keys → A) is
+/// absent: the unit replaced it, and the alphabet can plug it back.
 fn start_graph() -> Graph {
     let mut g = Graph::default();
     g.reserve(16, 16);
@@ -129,8 +225,10 @@ fn start_graph() -> Graph {
     let a = g.add_node(clap(), name_bytes("SURGE A"));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
     let b = g.add_node(clap(), name_bytes("SURGE B"));
-    assert_eq!((keys, a, master, b), (KEYS, SURGE_A, 2, SURGE_B));
-    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: a, port: 0 }, PortKind::Midi);
+    let fx = g.add_node(NodeKind::MidiFx { plugin: MidiFxPlugin::Builtin { semis: 0 } }, name_bytes("TRANSPOSE"));
+    assert_eq!((keys, a, master, b, fx), (KEYS, SURGE_A, 2, SURGE_B, FX));
+    g.connect_with_id(8, PortRef { node: keys, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Midi);
+    g.connect_with_id(9, PortRef { node: fx, port: 0 }, PortRef { node: a, port: 0 }, PortKind::Midi);
     g.connect_with_id(6, PortRef { node: keys, port: 0 }, PortRef { node: b, port: 0 }, PortKind::Midi);
     g.connect_with_id(3, PortRef { node: a, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
     g.connect_with_id(7, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
@@ -144,6 +242,10 @@ struct Run {
     held: BTreeMap<u8, BTreeSet<Kind>>,
     /// (instrument, sounding pitch, key that started it).
     sounding: BTreeSet<(u32, u8, u8)>,
+    /// The MIDI-FX search records every edit as `Kind::Fx`: which kinds of
+    /// edit a key saw is part of the state, and six kinds multiplied the
+    /// space past what a test can exhaust.
+    coarse: bool,
 }
 
 /// A key whose release left notes sounding.
@@ -165,12 +267,12 @@ pub(super) struct Report {
 }
 
 impl Run {
-    fn new() -> Self {
+    fn new(which: Alphabet) -> Self {
         let (_bus, drain) = command_bus();
         let mut engine = GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
         engine.apply(Command::LoadGraph { graph: start_graph() });
         engine.note_log.clear();
-        Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new() }
+        Run { engine, held: BTreeMap::new(), sounding: BTreeSet::new(), coarse: which == Alphabet::Fx }
     }
 
     fn enabled(&self, step: Step) -> bool {
@@ -191,6 +293,9 @@ impl Run {
         };
         self.engine.note_log.clear();
         self.engine.apply(cmd);
+        // The unit's queue is processed at the next block: pump it, like
+        // `render` does, so what the unit emits reaches the log.
+        self.engine.pump_midi_fx(64);
         for &(dest, note, on) in &self.engine.note_log {
             if on {
                 self.sounding.insert((dest, note, key.expect("note-on only from a key")));
@@ -213,22 +318,36 @@ impl Run {
             }
             Step::Edit(e) => {
                 for kinds in self.held.values_mut() {
-                    kinds.insert(e.kind());
+                    kinds.insert(if self.coarse { Kind::Fx } else { e.kind() });
                 }
                 Vec::new()
             }
         }
     }
 
-    /// Everything that decides future behaviour, as a comparable key.
-    fn fingerprint(&self) -> String {
+    /// Everything that decides future behaviour, as a comparable key: a
+    /// 128-bit hash of the state text (the text itself, kept for ~10^6
+    /// states, ran the search out of memory).
+    fn fingerprint(&self) -> u128 {
+        use std::hash::{Hash, Hasher};
+        let text = self.fingerprint_text();
+        let mut a = std::collections::hash_map::DefaultHasher::new();
+        let mut b = std::collections::hash_map::DefaultHasher::new();
+        0xA5u8.hash(&mut b);
+        text.hash(&mut a);
+        text.hash(&mut b);
+        (u128::from(a.finish()) << 64) | u128::from(b.finish())
+    }
+
+    fn fingerprint_text(&self) -> String {
         let routing = serde_json::to_string(&(
             &self.engine.graph.nodes,
             &self.engine.graph.edges,
             &self.engine.matrix.rules,
         ))
         .expect("serialize state");
-        format!("{routing}|{:?}|{:?}", self.held, self.sounding)
+        let fx: Vec<i8> = self.engine.midi_fx.iter().map(|s| s.semis).collect();
+        format!("{routing}|{fx:?}|{:?}|{:?}", self.held, self.sounding)
     }
 }
 
@@ -249,12 +368,21 @@ fn describe(step: Step) -> String {
             format!("Connect cable {id} Keys {port} → {name}")
         }
         Step::Edit(Edit::Remove(_)) => "RemoveNode Surge B".to_string(),
+        Step::Edit(Edit::FxSemis(n)) => format!("SetParam MIDI-FX transpose {n:+}"),
+        Step::Edit(Edit::RuleFxIn { enabled }) => format!("MatrixRule Keys→MIDI-FX enabled {enabled}"),
+        Step::Edit(Edit::RuleFxOut { transpose, enabled }) => {
+            format!("MatrixRule MIDI-FX→Surge A transpose {transpose:+} enabled {enabled}")
+        }
+        Step::Edit(Edit::PlugFx(8)) => "Connect cable 8 Keys → MIDI-FX".to_string(),
+        Step::Edit(Edit::PlugFx(_)) => "Connect cable 9 MIDI-FX → Surge A".to_string(),
+        Step::Edit(Edit::RemoveFx) => "RemoveNode MIDI-FX".to_string(),
+        Step::Edit(Edit::Source { keyboard }) => format!("SetRigSource Surge A keyboard {keyboard}"),
         Step::Edit(Edit::LoadStart) => "LoadGraph start patch".to_string(),
     }
 }
 
-fn replay(path: &[Step]) -> Run {
-    let mut run = Run::new();
+fn replay(path: &[Step], which: Alphabet) -> Run {
+    let mut run = Run::new(which);
     for &s in path {
         run.step(s);
     }
@@ -263,19 +391,23 @@ fn replay(path: &[Step]) -> Run {
 
 /// Breadth-first search to a fixpoint, or until `max_states` (then
 /// `complete` is false and the caller must fail — a bound never passes).
-pub(super) fn explore(max_states: usize) -> Report {
+pub(super) fn explore(max_states: usize, which: Alphabet) -> Report {
     let mut alphabet: Vec<Step> = NOTES.iter().flat_map(|&k| [Step::On(k), Step::Off(k)]).collect();
-    alphabet.extend(EDITS.iter().map(|&e| Step::Edit(e)));
+    let edits: &[Edit] = match which {
+        Alphabet::Routing => &ROUTING_EDITS,
+        Alphabet::Fx => &FX_EDITS,
+    };
+    alphabet.extend(edits.iter().map(|&e| Step::Edit(e)));
     alphabet.push(Step::Edit(Edit::LoadStart));
 
-    let start = Run::new();
-    let mut seen: HashSet<String> = HashSet::from([start.fingerprint()]);
+    let start = Run::new(which);
+    let mut seen: HashSet<u128> = HashSet::from([start.fingerprint()]);
     let mut queue: VecDeque<Vec<Step>> = VecDeque::from([Vec::new()]);
     let mut stuck: Vec<Stuck> = Vec::new();
 
     let mut complete = true;
     'search: while let Some(path) = queue.pop_front() {
-        let here = replay(&path);
+        let here = replay(&path, which);
         for &step in &alphabet {
             if !here.enabled(step) {
                 continue;
@@ -284,7 +416,7 @@ pub(super) fn explore(max_states: usize) -> Report {
                 Step::Off(k) => here.held[&k].clone(),
                 _ => BTreeSet::new(),
             };
-            let mut next = replay(&path);
+            let mut next = replay(&path, which);
             let left = next.step(step);
             let mut trace = path.clone();
             trace.push(step);
@@ -300,6 +432,9 @@ pub(super) fn explore(max_states: usize) -> Report {
                     complete = false;
                     break 'search;
                 }
+                if seen.len() % 50_000 == 0 {
+                    eprintln!("held-notes: {} states, queue {}", seen.len(), queue.len());
+                }
                 queue.push_back(trace);
             }
         }
@@ -314,9 +449,18 @@ pub(super) const KNOWN: &[&[Kind]] = &[];
 
 #[test]
 fn held_notes_are_released_under_every_routing_edit() {
-    let report = explore(200_000);
+    check(Alphabet::Routing);
+}
+
+#[test]
+fn held_notes_are_released_under_every_midi_fx_edit() {
+    check(Alphabet::Fx);
+}
+
+fn check(which: Alphabet) {
+    let report = explore(400_000, which);
     let reach = if report.complete { "explored to fixpoint" } else { "explored, STOPPED AT BOUND" };
-    eprintln!("held-notes: {} reachable states {reach}", report.states);
+    eprintln!("held-notes ({which:?}): {} reachable states {reach}", report.states);
     let known: Vec<BTreeSet<Kind>> = KNOWN.iter().map(|k| k.iter().copied().collect()).collect();
     let found: Vec<&BTreeSet<Kind>> = report.stuck.iter().map(|s| &s.kinds).collect();
     let mut new = Vec::new();

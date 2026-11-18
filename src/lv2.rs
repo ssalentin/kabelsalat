@@ -331,12 +331,23 @@ extern "C" {
     fn lilv_instance_free(instance: *mut LilvInstance);
 }
 
+/// One MIDI event a MIDI-FX plugin wrote to its output port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FxOutEvent {
+    NoteOn { channel: u8, note: u8, velocity: u8 },
+    NoteOff { channel: u8, note: u8 },
+    /// Raw 3-byte channel-voice MIDI (CC, pitch bend, aftertouch).
+    Midi([u8; 3]),
+}
+
 #[derive(Debug, Clone)]
 pub struct Lv2PluginInfo {
     pub uri: String,
     pub name: String,
     pub num_ports: u32,
     pub is_instrument: bool,
+    /// A MIDI-only unit: events in, events out, no audio port at all.
+    pub is_midi_fx: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -633,6 +644,41 @@ unsafe fn classify_instrument(world: *mut LilvWorld, plugin: *const LilvPlugin) 
     })
 }
 
+/// Is the plugin a MIDI effect (AUM "MIDI strips"): a MIDI atom input AND a
+/// MIDI atom output and no audio port. Never an instrument (that class
+/// verdict, rule 72, wins) — the port shape decides only among the
+/// non-instrument classes, where it is a fact (no audio port, so it can never
+/// be an audio effect), not a guess. Carla's MIDI Transpose/Gain/Channel
+/// Filter are `lv2:UtilityPlugin`s of this shape.
+unsafe fn classify_midi_fx(world: *mut LilvWorld, plugin: *const LilvPlugin) -> bool {
+    if classify_instrument(world, plugin) {
+        return false;
+    }
+    let (atom_in, atom_out, audio) = midi_shape(world, plugin);
+    atom_in && atom_out && audio == 0
+}
+
+/// (has an atom input, has an atom output, audio port count).
+unsafe fn midi_shape(world: *mut LilvWorld, plugin: *const LilvPlugin) -> (bool, bool, u32) {
+    let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
+    let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
+    let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
+    let (mut atom_in, mut atom_out, mut n_audio) = (false, false, 0u32);
+    for i in 0..lilv_plugin_get_num_ports(plugin) {
+        let port = lilv_plugin_get_port_by_index(plugin, i);
+        if lilv_port_is_a(plugin, port, audio) {
+            n_audio += 1;
+        }
+        if lilv_port_is_a(plugin, port, atom) {
+            if lilv_port_is_a(plugin, port, input) { atom_in = true } else { atom_out = true }
+        }
+    }
+    lilv_node_free(audio);
+    lilv_node_free(atom);
+    lilv_node_free(input);
+    (atom_in, atom_out, n_audio)
+}
+
 /// The class verdict: Some(true) for an instrument, Some(false) for any other
 /// specific LV2 class, None when only generic types (lv2:Plugin, doap:Project)
 /// are declared.
@@ -747,6 +793,7 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
                         name: node_owned(lilv_plugin_get_name(plugin)),
                         num_ports: lilv_plugin_get_num_ports(plugin),
                         is_instrument: classify_instrument(world, plugin),
+                        is_midi_fx: classify_midi_fx(world, plugin),
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
@@ -1088,6 +1135,7 @@ pub struct Lv2Plugin {
     urid_sequence: u32,
     urid_midi: u32,
     is_inst: bool,
+    is_midi_fx: bool,
     _urid: Box<UridMap>,
     _map_data: Box<Lv2UridMap>,
     // Worker extension: the schedule feature handed to instantiate, the shared
@@ -1287,12 +1335,13 @@ impl Lv2Plugin {
             lilv_node_free(control);
             lilv_node_free(input);
             lilv_node_free(atom_class);
-            anyhow::ensure!(!audio_out.is_empty(), "{uri} has no audio output");
+            let is_midi_fx = classify_midi_fx(world, plugin);
+            anyhow::ensure!(!audio_out.is_empty() || is_midi_fx, "{uri} has no audio output");
             anyhow::ensure!(!audio_in.is_empty() || atom_in.is_some(), "{uri} has no audio/atom input");
             if let Some(activate) = desc.activate {
                 activate(h);
             }
-            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
+            Ok(Self { world, instance, buffers, audio_in, audio_out, control_in, control_ranges, control_meta, control_by_symbol, atom_in, atom_buf, last_event: None, atom_out, urid_chunk, urid_sequence, urid_midi, is_inst: classify_instrument(world, plugin), is_midi_fx, _urid: urid, _map_data: map_data, _worker_schedule: Some(worker_schedule), _worker_shared: Some(worker_shared), worker, block, uri, sample_rate })
         }
     }
 
@@ -1349,6 +1398,14 @@ impl Lv2Plugin {
         }
     }
 
+    /// The nth control input as a normalized 0..1 knob value (allocation-free).
+    pub fn control_normalized(&self, nth: usize) -> Option<f32> {
+        let &port = self.control_in.get(nth)?;
+        let &(lo, hi) = self.control_ranges.get(nth)?;
+        let v = self.buffers[port][0];
+        Some(if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.0 })
+    }
+
     /// Describe all control-input ports with their current buffer values.
     pub fn control_descs(&self) -> Vec<Lv2ControlDesc> {
         self.control_meta
@@ -1378,6 +1435,56 @@ impl Lv2Plugin {
     /// True if this is an instrument (atom/MIDI input + audio output).
     pub fn is_instrument(&self) -> bool {
         self.is_inst
+    }
+
+    /// True for a MIDI-only unit (MIDI in, MIDI out, no audio port).
+    pub fn is_midi_fx(&self) -> bool {
+        self.is_midi_fx
+    }
+
+    /// Queue one raw 3-byte channel-voice message (channel kept) for the
+    /// next run(). Allocation-free; a full buffer drops the event.
+    pub fn send_midi(&mut self, ev: [u8; 3]) {
+        self.queue_midi(ev);
+    }
+
+    /// Append the MIDI events the plugin wrote to its first atom output in
+    /// the last run() into `out` (bounded by `out`'s capacity, so a
+    /// preallocated vector never allocates). Note-on/off arrive as such,
+    /// other channel-voice messages as raw bytes.
+    pub fn read_midi_out(&self, out: &mut Vec<FxOutEvent>) {
+        let Some((_, buf)) = self.atom_out.first() else { return };
+        // The chunk header was rewritten by the plugin into a sequence atom.
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
+        let size = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let ty = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if ty != self.urid_sequence {
+            return;
+        }
+        let end = (8 + size).min(bytes.len());
+        let mut at = 16; // atom header (8) + sequence unit/pad (8)
+        while at + 16 <= end && out.len() < out.capacity() {
+            let n = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap()) as usize;
+            let ety = u32::from_le_bytes(bytes[at + 12..at + 16].try_into().unwrap());
+            let body = at + 16;
+            if body + n > end {
+                break;
+            }
+            if ety == self.urid_midi && n >= 3 {
+                let d = [bytes[body], bytes[body + 1], bytes[body + 2]];
+                let (status, ch) = (d[0] & 0xF0, d[0] & 0x0F);
+                out.push(match status {
+                    0x90 if d[2] > 0 => FxOutEvent::NoteOn { channel: ch, note: d[1], velocity: d[2] },
+                    0x80 | 0x90 => FxOutEvent::NoteOff { channel: ch, note: d[1] },
+                    0xB0 | 0xE0 | 0xA0 => FxOutEvent::Midi(d),
+                    _ => {
+                        at = body + ((n + 7) & !7);
+                        continue;
+                    }
+                });
+            }
+            at = body + ((n + 7) & !7);
+        }
     }
 
     /// Queue a MIDI note-on for the next run() (frame 0). Events queue up

@@ -745,6 +745,19 @@ Learned so far (2026-11-15, UI polish pass):
     ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+128. **A hosted MIDI effect's knob move releases what is held through it:**
+    Carla's MIDI Transpose maps a note-off with the CURRENT semitones, so
+    moving the knob between a key's note-on (+7 → 67) and note-off (−5 → 55)
+    left the instrument's 67 sounding. `apply_midi_fx_param` calls
+    `release_all` when a hosted plugin's value really changes
+    (`kabelsalat midifx-test` runs the real plugin through the engine).
+129. **An exhaustive search stores hashes, never state text, and splits
+    its alphabet:** the held-notes search kept each state's JSON (6.7 GB at
+    800 k states), the OOM killer ended the session's shells again and
+    again, and the full product of routing × MIDI-FX edits has no reachable
+    fixpoint. States are 128-bit hashes, the two halves run separately
+    (`Alphabet::Routing` 78 k states, `Alphabet::Fx` 29 k), and a long run
+    goes in `systemd-run --user -p MemoryMax=3G`.
 
 ## Working on kabelsalat
 
@@ -776,7 +789,7 @@ Learned so far (2026-11-15, UI polish pass):
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
-  `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
+  `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
   `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).

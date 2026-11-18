@@ -127,6 +127,12 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **Effects can be inserted from the mixer again:** "+ insert" opened its
+  effect picker and closed it in the same click, and a picked effect was
+  dropped. The picker now stays open and the chosen effect joins the
+  strip's or the master's insert chain. Clicking a strip's name opens a
+  rename dialog that stays open until Rename or Cancel (it vanished after
+  one frame).
 - **The assistant can add Vitalium (and any LV2 instrument):** the plugin
   list it reads stopped after the first 30 of about 300 LV2 plugins, and
   Vitalium was not among them, so it guessed addresses that do not exist and

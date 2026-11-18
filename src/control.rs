@@ -686,6 +686,26 @@ pub enum Command {
         mute: Option<bool>,
         solo: Option<bool>,
     },
+    /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
+    /// audio-in / generator node, applied to the node's own output (post its
+    /// LEVEL knob — the strip fader) before anything downstream hears it, so
+    /// its FX chain and the rig bus follow. Solo scope is WITHIN the node's
+    /// rig: a soloed source silences only the other sources of that rig; rig
+    /// buses keep their own global solo (`SetRigMix`). Omitted fields keep
+    /// their value; resets on graph loads.
+    SetStripMix {
+        node: NodeId,
+        pan: Option<f32>,
+        mute: Option<bool>,
+        solo: Option<bool>,
+    },
+    /// Bypass one effect node (#74): a bypassed FX passes its input through
+    /// unchanged (its knob values are kept). Resets on graph loads.
+    SetStripBypass { node: NodeId, bypass: bool },
+    /// Rename one node (#77): the name its rack unit and mixer strip show.
+    /// Metadata only — routing and sound are untouched; the engine publishes
+    /// the graph (node names live in it).
+    RenameNode { node: NodeId, name: Name },
     /// Replace the whole graph (template load). The engine rebuilds DSP, remaps
     /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
     /// matrix. Rare structural op: allocates (bends RT discipline by design).
@@ -825,6 +845,7 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
+            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
             | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. })
     }

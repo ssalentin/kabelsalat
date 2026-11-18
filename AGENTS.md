@@ -745,6 +745,29 @@ Learned so far (2026-11-15, UI polish pass):
     ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+128. **A silence check flushes the master's tails first:** the master's DC
+    blocker and limiter ring on for ~100 ms after a cut, and effects slew their
+    gain over ~10 ms, so `rig-mix-test`'s "vol 0 is silent" failed on `main`
+    (0.003 residual, peak over the first blocks). Render and discard ~30
+    blocks before measuring what must be silent; compare levels of a decaying
+    note only after retriggering it (`shot` in the strip-mix section).
+129. **Solo silences sources that have no strip entry:** `strip_gains_of`
+    returned "untouched" for a source without an entry, so soloing source B
+    left source A playing at full level (0.36 vs 0.22 peak). Treat a missing
+    entry as the default mix and let the rig's solo flag decide
+    (`another_sources_solo_silences_an_untouched_source`).
+130. **A draggable widget's id is keyed by what it is, never by where it is:**
+    a live strip reorder moved the strip under the pointer, and the
+    position-derived id handed the drag to whichever strip now sat in the old
+    slot, so two strips swapped back and forth. Use
+    `Id::new(("strip_name", node))` with `ui.interact`, and hit-test the
+    previous frame's rects (`mixer_strip_rects_prev`): the current frame's
+    list only holds the strips already drawn
+    (`dragging_a_strip_name_reorders_it_live`).
+131. **A 1-based slot is 1-based everywhere:** `Move { to }` was documented
+    and tested as the slot shown on the strip (1 = first) but inserted at a
+    0-based index, so "move to slot 1" landed second. Convert once, at the
+    edit (`to.clamp(1, len) - 1`), and send the shown number from the UI.
 
 ## Working on kabelsalat
 

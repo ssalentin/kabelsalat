@@ -607,6 +607,31 @@ fn block_peak(buf: &[f32]) -> f32 {
     buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
 }
 
+/// One source node's strip output gains (L, R), or None when the node has no
+/// strip state (unity — the common case, no work at all). Free function on
+/// field references: the render loops hold a mutable borrow of the slot while
+/// the strip table and graph are read. Constant-power pan like the rig bus:
+/// gl = sqrt(1-pan), gr = sqrt(1+pan).
+fn strip_gains_of(
+    strips: &[(NodeId, StripMix)],
+    graph: &Graph,
+    node: NodeId,
+    solo_rigs: &[bool; 8],
+) -> Option<(f32, f32)> {
+    // A source nobody touched has no entry but is still silenced by another
+    // source's solo in its rig (rule 129).
+    let m = strips.iter().find(|(n, _)| *n == node).map(|(_, m)| *m).unwrap_or(StripMix::DEFAULT);
+    let rig = graph.node(node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+    if m.is_default() && !solo_rigs[rig] { return None; }
+    let g = if m.mute || (solo_rigs[rig] && !m.solo) { 0.0 } else { 1.0 };
+    Some((g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt()))
+}
+
+/// Is this FX node bypassed (#74)? Allocation-free linear scan.
+fn strip_bypassed(strips: &[(NodeId, StripMix)], node: NodeId) -> bool {
+    strips.iter().any(|(n, m)| *n == node && m.bypass)
+}
+
 /// Per-rig mixer state (AUM overview strip). Unity by default.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -623,6 +648,78 @@ impl RigMix {
 
 impl Default for RigMix {
     fn default() -> Self { Self::DEFAULT }
+}
+
+/// How many per-node strip states the engine tracks (and publishes). The
+/// architecture's fixed RT limit is 64 nodes; the table is allocated once in
+/// the constructor and never grows — an entry past it is dropped.
+pub const MAX_STRIP_MIXES: usize = 64;
+
+/// How many master-insert FX the render path walks per block (#77). A longer
+/// chain than this keeps playing but its tail is ignored.
+pub const MAX_MASTER_INSERTS: usize = 8;
+
+/// One source strip's engine state (#73): pan and mute/solo applied to the
+/// node's own output (post LEVEL — the strip fader), plus the insert bypass
+/// flag (#74) an FX node carries in the same table. Solo scope is WITHIN the
+/// node's rig. Unity by default.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct StripMix {
+    pub pan: f32,
+    pub mute: bool,
+    pub solo: bool,
+    pub bypass: bool,
+}
+
+impl StripMix {
+    pub const DEFAULT: Self = Self { pan: 0.0, mute: false, solo: false, bypass: false };
+    /// True when nothing differs from a node the table never heard of.
+    pub fn is_default(&self) -> bool {
+        *self == Self::DEFAULT
+    }
+}
+
+impl Default for StripMix {
+    fn default() -> Self { Self::DEFAULT }
+}
+
+/// One entry of the published strip table (`GraphPub::strips`). An empty slot
+/// carries `node == NodeId::MAX`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StripPub {
+    pub node: u32,
+    pub mix: StripMix,
+}
+
+impl Default for StripPub {
+    fn default() -> Self { Self { node: u32::MAX, mix: StripMix::DEFAULT } }
+}
+
+impl StripPub {
+    pub const EMPTY: Self = Self { node: u32::MAX, mix: StripMix::DEFAULT };
+}
+
+impl Default for GraphPub {
+    /// `strips` needs a manual impl: derived `Default` only covers arrays
+    /// up to 32 elements.
+    fn default() -> Self {
+        Self {
+            rev: 0,
+            graph: Graph::default(),
+            rules: Vec::new(),
+            mix: [RigMix::DEFAULT; 8],
+            strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
+            system_gain: 0.0,
+            mix_rev: 0,
+            voices: Vec::new(),
+            voices_rev: 0,
+            transport: TransportPub::default(),
+            transport_rev: 0,
+            meter: MeterSnapshot::default(),
+            meter_rev: 0,
+        }
+    }
 }
 
 /// Published engine transport + count-in state (copied under `try_lock`, zero allocation).
@@ -657,7 +754,7 @@ impl Default for TransportPub {
 /// the steady render path never locks it. `rev` lets the UI skip unchanged
 /// snapshots cheaply; duplicate Connects (the UI's per-frame mirror) do NOT
 /// bump it, so UI-originated edits never trigger a rebuild feedback loop.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GraphPub {
     pub rev: u64,
     pub graph: Graph,
@@ -668,6 +765,9 @@ pub struct GraphPub {
     /// array copy — never a graph clone on the audio thread). Lets the UI
     /// mixer mirror remote (MCP/CLI/agent) mix changes.
     pub mix: [RigMix; 8],
+    /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
+    /// FX nodes — same publication discipline as `mix` (fixed-size copy).
+    pub strips: [StripPub; MAX_STRIP_MIXES],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     pub mix_rev: u64,
@@ -689,6 +789,17 @@ fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
     g.voices.clear();
     g.voices.extend(voices.iter().map(|v| (v.voice.voice_id(), v.node)));
     g.voices_rev = g.voices_rev.wrapping_add(1);
+}
+
+/// The strip table as `GraphPub` publishes it: a fixed array (default =
+/// empty slots), so the audio thread never allocates for a strip edit.
+/// Public for tests that need to fake an engine publication.
+pub fn strips_pub_table(strips: &[(NodeId, StripMix)]) -> [StripPub; MAX_STRIP_MIXES] {
+    let mut out = [StripPub::EMPTY; MAX_STRIP_MIXES];
+    for (i, (node, mix)) in strips.iter().take(MAX_STRIP_MIXES).enumerate() {
+        out[i] = StripPub { node: *node, mix: *mix };
+    }
+    out
 }
 
 impl GraphPub {
@@ -751,6 +862,10 @@ pub struct GraphEngine {
     // Per-rig mixer (SetRigMix): vol/pan/mute/solo applied at each rig's
     // MasterOut when summing. Fixed 8 slots — no allocation on the audio path.
     rig_mix: [RigMix; 8],
+    /// Per-node strip state (SetStripMix/SetStripBypass): pan/mute/solo on
+    /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
+    /// node past it keeps playing at unity. Linear scans, like the rest.
+    strips: Vec<(NodeId, StripMix)>,
     /// A SetRigMix awaits publication to `graph_pub` (retried each block:
     /// the audio thread only ever `try_lock`s the publication).
     mix_dirty: bool,
@@ -886,6 +1001,7 @@ impl GraphEngine {
             rig_meta: Vec::new(),
             active_rig: 0,
             rig_mix: [RigMix::DEFAULT; 8],
+            strips: Vec::with_capacity(MAX_STRIP_MIXES),
             mix_dirty: false,
             rig_snapshot: None,
             graph_pub: None,
@@ -1349,8 +1465,12 @@ impl GraphEngine {
     }
 
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
-    pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {
-        self.edge_levels.clone()
+    pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {        self.edge_levels.clone()
+    }
+
+    /// The strip table as it goes into `GraphPub::strips`.
+    fn strips_pub(&self) -> [StripPub; MAX_STRIP_MIXES] {
+        strips_pub_table(&self.strips)
     }
 
     /// Publish every audio edge's level = its source node's output peak this
@@ -1363,6 +1483,17 @@ impl GraphEngine {
                 continue;
             }
             let src = e.from.node;
+            // A master-insert cable (Master OUT → FX) carries the mix bus the
+            // FX ran on: its level is the FX's own output peak, so the cable
+            // glows with what actually flows through it.
+            if self.graph.node(src).is_some_and(|n| matches!(n.kind, NodeKind::MasterOut)) {
+                let peak = self.dsp.iter().find(|d| d.node == e.to.node).map(|d| block_peak(&d.buf[..n2]))
+                    .or_else(|| self.lv2.iter().find(|l| l.node == e.to.node).map(|l| block_peak(&l.buf[..n2])));
+                if let Some(p) = peak {
+                    self.edge_levels.store(e.id, p);
+                }
+                continue;
+            }
             let peak = if let Some(v) = self.voices.iter().find(|v| v.node == src) {
                 block_peak(&v.scratch[..n2])
             } else if let Some(d) = self.dsp.iter().find(|d| d.node == src) {
@@ -1412,6 +1543,19 @@ impl GraphEngine {
         for a in &self.audio_in { add(a.node, &a.buf); }
         for d in &self.dsp { add(d.node, &d.buf); }
         for l in &self.lv2 { add(l.node, &l.buf); }
+    }
+
+    /// Which rigs have a soloed source (#73): solo scope is WITHIN a rig — a
+    /// soloed source silences only the other sources of its own rig, while
+    /// rig buses keep their own global solo. Allocation-free.
+    fn rigs_with_solo_source(&self) -> [bool; 8] {
+        let mut solo = [false; 8];
+        for (node, m) in &self.strips {
+            if !m.solo { continue; }
+            let rig = self.graph.node(*node).map(|n| n.rig as usize).unwrap_or(0).min(7);
+            solo[rig] = true;
+        }
+        solo
     }
 
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
@@ -1734,6 +1878,7 @@ impl GraphEngine {
                 }
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
+                self.strips.clear();
                 if self.master_clock.is_counting_in() {
                     self.master_clock = MasterClock::Stopped;
                     self.transport.set_playing(false);
@@ -1871,6 +2016,54 @@ impl GraphEngine {
                 if let Some(b) = mute { m.mute = b; }
                 if let Some(b) = solo { m.solo = b; }
                 self.mix_dirty = true;
+            }
+            Command::SetStripMix { node, pan, mute, solo } => {
+                let e = self.strips.iter_mut().find(|(n, _)| *n == node);
+                match e {
+                    Some((_, m)) => {
+                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
+                        if let Some(b) = mute { m.mute = b; }
+                        if let Some(b) = solo { m.solo = b; }
+                    }
+                    None => {
+                        if self.strips.len() >= MAX_STRIP_MIXES { return; }
+                        let mut m = StripMix::DEFAULT;
+                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
+                        if let Some(b) = mute { m.mute = b; }
+                        if let Some(b) = solo { m.solo = b; }
+                        if m.is_default() { return; }
+                        self.strips.push((node, m));
+                    }
+                }
+                self.strips.retain(|(_, m)| !m.is_default());
+                self.mix_dirty = true;
+            }
+            Command::SetStripBypass { node, bypass } => {
+                if bypass {
+                    match self.strips.iter_mut().find(|(n, _)| *n == node) {
+                        Some((_, m)) => m.bypass = true,
+                        None => {
+                            if self.strips.len() < MAX_STRIP_MIXES {
+                                self.strips.push((node, StripMix { bypass: true, ..StripMix::DEFAULT }));
+                            }
+                        }
+                    }
+                } else if let Some((_, m)) = self.strips.iter_mut().find(|(n, _)| *n == node) {
+                    m.bypass = false;
+                    self.strips.retain(|(_, m)| !m.is_default());
+                }
+                self.mix_dirty = true;
+            }
+            Command::RenameNode { node, name } => {
+                // Metadata in the graph (sessions carry it with the patch);
+                // the graph publication makes every frontend see it.
+                let n = crate::control::name_str(&name).trim();
+                if !n.is_empty() {
+                    if let Some(m) = self.graph.nodes.iter_mut().find(|m| m.id == node) {
+                        m.name = crate::control::name_bytes(n);
+                        self.publish_graph();
+                    }
+                }
             }
             Command::SetNodeSplit { node, point } => {
                 // A Keys-node property: only a real change on a Keys node acts.
@@ -2262,6 +2455,7 @@ impl GraphEngine {
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
+                    g.strips = self.strips_pub();
                     g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
@@ -2279,6 +2473,9 @@ impl GraphEngine {
             return;
         }
         let n2 = frames * 2;
+        // Per-source strip state (#73), once per block: which rigs have a
+        // soloed source decides every source's mute/solo gain below.
+        let solo_rigs = self.rigs_with_solo_source();
 
         // 1. Every instrument renders and applies its level.
         for s in &mut self.voices {
@@ -2288,11 +2485,39 @@ impl GraphEngine {
             for x in s.scratch[..n2].iter_mut() {
                 *x *= s.level;
             }
+            // Strip mix (mute/solo/pan) at the source's own output: the edge
+            // levels published from this buffer stay post-fader (rule 53).
+            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, s.node, &solo_rigs) {
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in s.scratch[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for f in s.scratch[..n2].chunks_exact_mut(2) {
+                        f[0] *= gl;
+                        f[1] *= gr;
+                    }
+                }
+            }
         }
 
         // 1a. Audio In nodes: pull the input ring into each node's stereo
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
+        for a in &mut self.audio_in {
+            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, a.node, &solo_rigs) {
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in a.buf[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for f in a.buf[..n2].chunks_exact_mut(2) {
+                        f[0] *= gl;
+                        f[1] *= gr;
+                    }
+                }
+            }
+        }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
         // flag (per-instrument transport). Output reaches the master via
@@ -2308,6 +2533,18 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
+                if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, d.node, &solo_rigs) {
+                    if gl == gr {
+                        if gl != 1.0 {
+                            for x in d.buf[..n2].iter_mut() { *x *= gl; }
+                        }
+                    } else {
+                        for f in d.buf[..n2].chunks_exact_mut(2) {
+                            f[0] *= gl;
+                            f[1] *= gr;
+                        }
+                    }
+                }
             }
         }
         if counting_in_this_block {
@@ -2373,13 +2610,38 @@ impl GraphEngine {
             self.fx_done[f] = true;
             let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
             self.sum_audio_into(node, &mut bus[..n2]);
+            // Bypass (#74): the slot passes its summed input through
+            // unchanged; its knobs keep their values for when it returns.
+            let bypassed = strip_bypassed(&self.strips, node);
+            let strip_gain = strip_gains_of(&self.strips, &self.graph, node, &solo_rigs);
             if f < n_dsp {
                 let d = &mut self.dsp[f];
                 d.buf[..n2].copy_from_slice(&bus[..n2]);
-                d.proc.process(&mut d.buf[..n2], frames);
+                if !bypassed {
+                    d.proc.process(&mut d.buf[..n2], frames);
+                }
             } else {
                 let slot = &mut self.lv2[f - n_dsp];
-                slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                if bypassed {
+                    slot.buf[..n2].copy_from_slice(&bus[..n2]);
+                } else {
+                    slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                }
+            }
+            // An LV2 node that is a SOURCE (an instrument) carries strip
+            // state; effects do not (their strip row is the bypass flag).
+            if let Some((gl, gr)) = strip_gain {
+                let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
+                if gl == gr {
+                    if gl != 1.0 {
+                        for x in buf[..n2].iter_mut() { *x *= gl; }
+                    }
+                } else {
+                    for fr in buf[..n2].chunks_exact_mut(2) {
+                        fr[0] *= gl;
+                        fr[1] *= gr;
+                    }
+                }
             }
         }
         self.lv2_in = bus;
@@ -2529,6 +2791,49 @@ impl GraphEngine {
                 let g = self.player_gain;
                 for i in 0..n2 {
                     acc[i] += self.player_buf[i] * g;
+                }
+            }
+            // Master inserts (#77): FX nodes wired FROM a MasterOut node
+            // (Master OUT → FX → FX → …) run on the summed mix bus, in chain
+            // order, BEFORE the fixed limiter + warmth. The cables stay the
+            // truth — an insert is exactly an audio edge out of a master.
+            // Allocation-free: a fixed stack table, linear scans.
+            let mut inserts = [(NodeId::MAX, false); MAX_MASTER_INSERTS];
+            let mut n_ins = 0usize;
+            loop {
+                if n_ins >= MAX_MASTER_INSERTS { break; }
+                let mut next = None;
+                for f in 0..(self.dsp.len() + self.lv2.len()) {
+                    let (node, is_dsp) = if f < self.dsp.len() {
+                        (self.dsp[f].node, true)
+                    } else {
+                        (self.lv2[f - self.dsp.len()].node, false)
+                    };
+                    if inserts[..n_ins].iter().any(|(n, _)| *n == node) { continue; }
+                    let fed = if n_ins == 0 {
+                        masters[..n_masters].iter().any(|&m| self.graph.has_route(m, node, PortKind::Audio))
+                    } else {
+                        self.graph.has_route(inserts[n_ins - 1].0, node, PortKind::Audio)
+                    };
+                    if fed { next = Some((node, is_dsp)); break; }
+                }
+                match next {
+                    Some(x) => inserts[n_ins] = x,
+                    None => break,
+                }
+                n_ins += 1;
+            }
+            for &(node, is_dsp) in inserts.iter().take(n_ins) {
+                if strip_bypassed(&self.strips, node) { continue; }
+                if is_dsp {
+                    let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) else { continue };
+                    d.buf[..n2].copy_from_slice(&acc[..n2]);
+                    d.proc.process(&mut d.buf[..n2], frames);
+                    acc.copy_from_slice(&d.buf[..n2]);
+                } else {
+                    let Some(slot) = self.lv2.iter_mut().find(|s| s.node == node) else { continue };
+                    slot.plugin.process(&acc[..n2], &mut slot.buf[..n2], frames);
+                    acc.copy_from_slice(&slot.buf[..n2]);
                 }
             }
             let drive = 1.0 + self.master_warm * 3.0;
@@ -2887,6 +3192,24 @@ mod master_limiter_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Rule 129: a source nobody touched has no strip entry, yet another
+    /// source's solo in its rig must still silence it.
+    #[test]
+    fn another_sources_solo_silences_an_untouched_source() {
+        use crate::control::{name_bytes, Graph, NodeKind};
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("A"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes("x") }, name_bytes("B"));
+        let strips = [(b, super::StripMix { solo: true, ..super::StripMix::DEFAULT })];
+        let mut solo = [false; 8];
+        solo[0] = true;
+        assert_eq!(super::strip_gains_of(&strips, &g, a, &solo), Some((0.0, 0.0)), "untouched A is silenced by B's solo");
+        let b_gain = super::strip_gains_of(&strips, &g, b, &solo).expect("the soloed source has a gain");
+        assert!(b_gain.0 > 0.99 && b_gain.1 > 0.99, "the soloed source plays: {b_gain:?}");
+        assert_eq!(super::strip_gains_of(&[], &g, a, &[false; 8]), None, "no solo, no entry: untouched path");
+    }
+
     use crate::matrix::{CcTarget, Matrix, MidiMsg, SourceId};
 
     fn dests(m: &Matrix, src: SourceId, msg: MidiMsg) -> Vec<u32> {
@@ -4887,9 +5210,149 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     // Volume 0 on both rigs → silence.
     bus.send(Command::SetRigMix { rig: 0, vol: Some(0.0), pan: Some(0.0), mute: None, solo: None });
     bus.send(Command::SetRigMix { rig: 1, vol: Some(0.0), pan: None, mute: None, solo: None });
+    // The master's DC blocker and limiter ring on for ~100 ms after a cut
+    // (rule 128): flush that tail, then measure what stays.
+    for _ in 0..30 { engine.render(&mut buf, 2); }
     let (zero_l, zero_r) = measure(&mut engine, &mut buf);
     anyhow::ensure!(zero_l < 1e-4 && zero_r < 1e-4, "vol 0 not silent ({zero_l}, {zero_r})");
     println!("rig-mix-test: OK — mute/solo/vol/pan shape the rig sum (both {both_l:.4}, muted {muted_l:.4}, solo {solo_l:.4}, pan R {pan_r:.4})");
+
+    // ---- #73: per-SOURCE strip mix in a two-source rig ------------------
+    // One rig, TWO synths into the SAME master: muting/soloing one source
+    // must change only that source (#73 acceptance). LoadGraph remaps the
+    // two hosted voices onto the new Clap nodes in node-id order.
+    let (sa, sb) = (1u32, 2u32);
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let s1 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: s1, port: 0 }, PortKind::Midi);
+        g.connect_with_id(4, PortRef { node: s1, port: 0 }, PortRef { node: m, port: 1 }, PortKind::Audio);
+        let _ = (s0, s1);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    // Every measurement retriggers the note: Surge's envelope decays, so a
+    // measurement taken later would read lower for no mixing reason.
+    let shot = |bus: &mut crate::control::CommandBus, e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
+        bus.send(Command::NoteOff { note: 62, source: SourceId::Keys });
+        for _ in 0..40 { e.render(buf, 2); }
+        bus.send(Command::NoteOn { note: 62, velocity: 0.9, source: SourceId::Keys });
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for _ in 0..12 {
+            e.render(buf, 2);
+            for f in buf.chunks(2) {
+                pl = pl.max(f[0].abs());
+                pr = pr.max(f[1].abs());
+            }
+        }
+        (pl, pr)
+    };
+    let (src_both_l, src_both_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(src_both_l > 1e-3 && src_both_r > 1e-3, "two sources produced no output ({src_both_l}, {src_both_r})");
+    // Mute source A → only source B sounds.
+    bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(true), solo: None });
+    let (b_only_l, _b_only_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(b_only_l > 1e-3, "muted source A killed source B too ({b_only_l})");
+    anyhow::ensure!(src_both_l > b_only_l * 1.1, "muting one source changed nothing (both {src_both_l} vs b-only {b_only_l})");
+    // Unmute, then solo source B ≈ the same "B only" picture.
+    bus.send(Command::SetStripMix { node: sa, pan: None, mute: Some(false), solo: None });
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(true) });
+    let (solo_b_l, _solo_b_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!((solo_b_l - b_only_l).abs() < b_only_l * 0.25, "source solo != source mute-other (solo {solo_b_l} vs b-only {b_only_l})");
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: None, solo: Some(false) });
+    // Pan source A hard left: source B stays on both channels.
+    bus.send(Command::SetStripMix { node: sa, pan: Some(-1.0), mute: None, solo: None });
+    let (pan_src_l, pan_src_r) = shot(&mut bus, &mut engine, &mut buf);
+    anyhow::ensure!(pan_src_r < src_both_r * 0.8, "hard-left pan did not reduce right (both {src_both_r} vs {pan_src_r})");
+    anyhow::ensure!(pan_src_l > 1e-3 && pan_src_r > 1e-3, "source pan killed a channel (L {pan_src_l}, R {pan_src_r})");
+    bus.send(Command::SetStripMix { node: sa, pan: Some(0.0), mute: None, solo: None });
+    // Strip state is published back (rule 33): attach a publication, change
+    // one strip, and read the entry the UI mirror adopts.
+    let pub_: std::sync::Arc<std::sync::Mutex<GraphPub>> = Default::default();
+    engine.set_graph_pub(pub_.clone());
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: Some(true), solo: None });
+    engine.render(&mut buf, 2);
+    let strips = pub_.lock().unwrap().strips;
+    let sb_entry = strips.iter().find(|s| s.node == sb).map(|s| s.mix);
+    anyhow::ensure!(sb_entry == Some(StripMix { pan: 0.0, mute: true, solo: false, bypass: false }),
+        "strip state not published back: {strips:?}");
+    bus.send(Command::SetStripMix { node: sb, pan: None, mute: Some(false), solo: None });
+
+    // ---- #74: bypass passes the input through --------------------------
+    // Source A → GAIN(0) → master: silent while the gain is 0, audible the
+    // moment the unit is bypassed (its knobs untouched).
+    // Effects slew their gain over ~10 ms: let the change settle, then measure.
+    let settled = |e: &mut GraphEngine, buf: &mut [f32]| -> (f32, f32) {
+        for _ in 0..8 { e.render(buf, 2); }
+        let (mut pl, mut pr) = (0.0f32, 0.0f32);
+        for _ in 0..8 {
+            e.render(buf, 2);
+            for f in buf.chunks(2) {
+                pl = pl.max(f[0].abs());
+                pr = pr.max(f[1].abs());
+            }
+        }
+        (pl, pr)
+    };
+    let gain = 2u32;
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    bus.send(Command::NoteOn { note: 64, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::SetParam { node: gain, param: 0, value: 0.0 });
+    let silent = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(silent < 1e-3, "gain 0 did not silence the chain ({silent})");
+    bus.send(Command::SetStripBypass { node: gain, bypass: true });
+    let bypassed = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(bypassed > 1e-3, "bypass did not pass the input through ({bypassed})");
+    bus.send(Command::SetStripBypass { node: gain, bypass: false });
+    let again = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(again < 1e-3, "un-bypassing did not restore the effect ({again})");
+
+    // ---- #77: master inserts run on the summed bus, pre-limiter ---------
+    // Master OUT → GAIN: the whole mix passes through the insert, and its
+    // gain scales the summed output.
+    let mfx = 3u32;
+    {
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let s0 = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+        let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let fx = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("INSERT"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: s0, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: s0, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+        g.connect_with_id(3, PortRef { node: m, port: 0 }, PortRef { node: fx, port: 0 }, PortKind::Audio);
+        let _ = (s0, keys);
+        bus.send(Command::LoadGraph { graph: g });
+    }
+    bus.send(Command::NoteOn { note: 65, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::SetParam { node: mfx, param: 0, value: 1.0 });
+    let with_insert = settled(&mut engine, &mut buf).0;
+    bus.send(Command::SetParam { node: mfx, param: 0, value: 0.25 });
+    let insert_quiet = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(with_insert > 1e-3, "master insert chain produced no output ({with_insert})");
+    anyhow::ensure!(insert_quiet < with_insert * 0.6 && insert_quiet > with_insert * 0.05,
+        "master insert gain did not scale the summed mix (1.0 → {with_insert:.4}, 0.25 → {insert_quiet:.4})");
+    bus.send(Command::SetStripBypass { node: mfx, bypass: true });
+    let insert_bypassed = settled(&mut engine, &mut buf).0;
+    anyhow::ensure!(insert_bypassed > insert_quiet * 1.8, "bypassing the master insert did not pass the mix ({insert_bypassed} vs {insert_quiet})");
+    println!("strip-mix: OK — source mute/solo/pan only touch their source, bypass passes through, master inserts shape the sum");
+    println!("  source both {src_both_l:.4} → B-only {b_only_l:.4}, solo B {solo_b_l:.4}; gain-0 {silent:.4} → bypass {bypassed:.4}; insert 1.0 {with_insert:.4} → 0.25 {insert_quiet:.4} → bypass {insert_bypassed:.4}");
     Ok(())
 }
 

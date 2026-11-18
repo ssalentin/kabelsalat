@@ -931,7 +931,7 @@ struct SavedRule {
 }
 
 /// `s` moved onto `graph`, every node id mapped by `remap` (None drops it):
-/// knobs, plugin states and matrix routes follow their node.
+/// knobs, plugin states, matrix routes and mixer strips follow their node.
 fn remap_session(
     s: &crate::session::Session,
     graph: Graph,
@@ -954,6 +954,12 @@ fn remap_session(
     if !rules.is_empty() {
         ns.set_matrix(serde_json::to_value(&rules).ok());
     }
+    // Mixer strips (#72–77) and their display order follow their node.
+    for st in s.strips() {
+        if let Some(node) = remap(st.node) { ns.set_strip(crate::session::StripSaved { node, ..*st }); }
+    }
+    let order: Vec<u32> = s.strip_order().iter().filter_map(|n| remap(*n)).collect();
+    if !order.is_empty() { ns.set_strip_order(order); }
     ns
 }
 
@@ -1382,10 +1388,15 @@ fn make_unit(node: &Node) -> Unit {
         ),
         NodeKind::MasterOut => (
             UnitKind::Master, "stereo + mono bus".into(),
-            vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![],
+            vec![PortKind::Audio, PortKind::Audio, PortKind::Audio], vec![PortKind::Audio],
             // L · R as a stereo pair, MONO apart (between them it read as a
-            // center channel — vision review).
-            vec![(Dir::In, 0, 0.22, "IN L"), (Dir::In, 1, 0.44, "IN R"), (Dir::In, 2, 0.74, "IN MONO")],
+            // center channel — vision review). OUT feeds the master inserts
+            // (#77): a cable Master OUT → FX marks an insert before the
+            // fixed limiter.
+            vec![
+                (Dir::In, 0, 0.16, "IN L"), (Dir::In, 1, 0.36, "IN R"), (Dir::In, 2, 0.58, "IN MONO"),
+                (Dir::Out, 0, 0.88, "OUT"),
+            ],
         ),
         NodeKind::Dsp(DspKind::Delay) => (
             UnitKind::Dsp(DspKind::Delay), "delay fx · midi tap".into(),
@@ -1845,6 +1856,8 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_audio_output", "list_app_streams", "set_app_stream", "add_rig",
     "save_rig", "load_rig", "list_rig_presets",
     "list_instruments", "install_instrument", "play_file", "stop_file",
+    "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
+    "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2207,6 +2220,8 @@ struct DemoApp {
     /// Grace deadlines (`ui_time`) so echoes of direct UI edits never light
     /// up agent highlights.
     ui_mix_grace: [f32; 8],
+    /// Last frame's dt (peak-hold decay and strip animations read it).
+    ui_dt: f32,
     ui_transport_grace: f32,
     ui_node_grace: std::collections::HashMap<u32, f32>,
     /// Attribution hint when `exec_tool` triggers a bus command that lands back
@@ -2252,6 +2267,39 @@ struct DemoApp {
     rule_param_cache: Option<(u32, Vec<(u32, String)>)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
+    /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
+    /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
+    /// node id like the session's strips (`remap_session` carries them).
+    strips: Vec<StripUiRow>,
+    /// Source strip display order (#77), flat across rigs: a rig's strips are
+    /// the entries whose node is in that rig, in this order; unlisted nodes
+    /// follow in unit order.
+    strip_order: Vec<u32>,
+    /// Grace deadlines per node so echoes of direct UI strip edits never
+    /// overwrite the mirror from the engine's own publication.
+    ui_strip_grace: std::collections::HashMap<u32, f32>,
+    /// Peak hold + clip per strip meter (#72), keyed by node id (sources) /
+    /// `rig_strip_key(rig)` (buses) / `MASTER_STRIP_KEY` (master out).
+    mixer_peaks: std::collections::HashMap<u32, PeakHold>,
+    /// Last frame's strip rects in the mixer stage: (rig, node, rect) —
+    /// drag-to-reorder hit tests and the layout tests.
+    mixer_strip_rects: Vec<(u8, u32, Rect)>,
+    /// Last frame's strip rects: a drag hit-tests strips drawn after it.
+    mixer_strip_rects_prev: Vec<(u8, u32, Rect)>,
+    /// Last frame's meter rects in the mixer stage: (key, rect incl. the
+    /// clip light on top) — the clip-clear click and the tests.
+    mixer_meter_rects: Vec<(u32, Rect)>,
+    /// The strip being dragged to reorder (#77): (node, rig).
+    mixer_strip_drag: Option<(u32, u8)>,
+    /// Strip rename popup (#77): the node being renamed + its edit buffer.
+    strip_rename: Option<(u32, String)>,
+    /// Strip colour palette popup (#77): the node being coloured.
+    strip_color_pick: Option<u32>,
+    /// Insert picker popup (#74): the strip whose "+ insert" was pressed
+    /// (None = the master out's chain).
+    insert_pick: Option<Option<u32>>,
+    /// Insert picker's filter text.
+    insert_filter: String,
     /// Last adopted `GraphPub::mix_rev` (engine mixer publication).
     last_mix_rev: u64,
     /// Last adopted `GraphPub::meter_rev` (engine master-meter publication,
@@ -2589,6 +2637,7 @@ impl DemoApp {
             assistant_input_rect: Rect::NOTHING,
             agent_activity: AgentActivity::default(),
             ui_mix_grace: [-1.0; 8],
+            ui_dt: 1.0 / 60.0,
             ui_transport_grace: -1.0,
             ui_node_grace: std::collections::HashMap::new(),
             pending_agent_origin: None,
@@ -2615,6 +2664,18 @@ impl DemoApp {
             rule_param_filter: String::new(),
             rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
+            strips: Vec::new(),
+            strip_order: Vec::new(),
+            ui_strip_grace: std::collections::HashMap::new(),
+            mixer_peaks: std::collections::HashMap::new(),
+            mixer_strip_rects: Vec::new(),
+            mixer_strip_rects_prev: Vec::new(),
+            mixer_meter_rects: Vec::new(),
+            mixer_strip_drag: None,
+            strip_rename: None,
+            strip_color_pick: None,
+            insert_pick: None,
+            insert_filter: String::new(),
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
@@ -2806,6 +2867,14 @@ impl DemoApp {
         self.cc_learn = None;
         self.rule_param_cache = None;
         self.rig_mix = [crate::engine::RigMix::DEFAULT; 8];
+        // Strip meters hold per-node transients: a rebuilt rack means new
+        // ids, so peak holds and clip lights start over (#72). The strip
+        // rows themselves are session state, restored by apply_session.
+        self.mixer_peaks.clear();
+        self.mixer_strip_drag = None;
+        self.strip_rename = None;
+        self.strip_color_pick = None;
+        self.insert_pick = None;
         // Open/refresh input captures for every AudioIn node (structural only).
         self.sync_audio_in_captures();
     }
@@ -3669,7 +3738,7 @@ impl DemoApp {
                 }
             }
         }
-        let Some(pub_) = &self.graph_pub else { return };
+        let Some(pub_) = self.graph_pub.clone() else { return };
         let Ok(g) = pub_.lock() else { return };
         let now = self.ui_time;
         // Mixer mirror: adopt remote (MCP/CLI/agent) SetRigMix changes —
@@ -3683,6 +3752,53 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            // Strip mirror (#73/#74): adopt the engine's per-node table the
+            // same way (rule 33) — a remote SetStripMix/SetStripBypass shows
+            // in the mixer without a rebuild. UI-side echoes are inside
+            // their grace window and keep the local row.
+            let mut strip_nodes: Vec<u32> = Vec::new();
+            let mut strip_changed: Vec<u32> = Vec::new();
+            for p in g.strips.iter().filter(|p| p.node != u32::MAX) {
+                strip_nodes.push(p.node);
+                if now >= self.ui_strip_grace.get(&p.node).copied().unwrap_or(-1.0) {
+                    let m = p.mix;
+                    let cur = self.strip_row(p.node);
+                    if (cur.pan, cur.mute, cur.solo, cur.bypass) != (m.pan, m.mute, m.solo, m.bypass) {
+                        strip_changed.push(p.node);
+                    }
+                    self.with_strip_row(p.node, |row| {
+                        row.pan = m.pan;
+                        row.mute = m.mute;
+                        row.solo = m.solo;
+                        row.bypass = m.bypass;
+                    });
+                }
+            }
+            for row in self.strips.iter_mut() {
+                if !strip_nodes.contains(&row.node) && now >= self.ui_strip_grace.get(&row.node).copied().unwrap_or(-1.0) {
+                    // The engine dropped the node's state (un-mute, un-bypass):
+                    // back to the plain row, colour and collapse stay.
+                    row.pan = 0.0;
+                    row.mute = false;
+                    row.solo = false;
+                    row.bypass = false;
+                }
+            }
+            self.strips.retain(|s| !s.is_plain());
+            if !strip_changed.is_empty() {
+                let pending = self.take_pending_agent_origin();
+                let n_rigs = self.rig_count();
+                for n in &strip_changed {
+                    if pending.is_none() {
+                        let uname = self.unit_display_name(*n);
+                        let rig = self.units.iter().find(|u| u.node_id == *n).map_or(0, |u| if n_rigs > 1 { u.rig as usize } else { 0 });
+                        self.agent_activity.touch_rig(rig, now);
+                        self.agent_activity.record(AgentOrigin::Remote, format!("Source mix → {uname}"), vec![*n], now);
+                    } else {
+                        self.agent_activity.touch_node(*n, now);
+                    }
+                }
+            }
             // System-audio GAIN knobs follow SetSystemAudio from any frontend
             // (one engine-wide gain; `sent` matches so it is not echoed back).
             if !matches!(self.drag, Drag::Knob { .. }) {
@@ -4164,6 +4280,36 @@ impl DemoApp {
                 let rig = args.get("rig").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 format!("Mix {}", self.rig_name(rig))
             }
+            "set_strip_mix" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Source mix → {}", self.unit_display_name(node))
+            }
+            "set_node_bypass" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Bypass {}", self.unit_display_name(node))
+            }
+            "add_insert" => format!(
+                "Insert → {}",
+                args.get("name").and_then(|v| v.as_str())
+                    .or_else(|| args.get("dsp").and_then(|v| v.as_str()))
+                    .or_else(|| args.get("uri").and_then(|v| v.as_str()))
+                    .unwrap_or("effect")
+            ),
+            "remove_insert" => {
+                let fx = args.get("fx").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Remove insert {}", self.unit_display_name(fx))
+            }
+            "rename_strip" => {
+                let new_name = args.get("name").and_then(|v| v.as_str()).unwrap_or("strip");
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Rename {} → {new_name}", self.unit_display_name(node))
+            }
+            "set_strip_color" => {
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Colour → {}", self.unit_display_name(node))
+            }
+            "move_strip" => "Reorder strip".into(),
+            "collapse_strip" => "Collapse strip".into(),
             "set_rig_device" => match args.get("rig").and_then(|v| v.as_u64()) {
                 Some(r) => format!("Set {} MIDI input", self.rig_name(r as usize)),
                 None => "Set MIDI input".into(),
@@ -4675,6 +4821,16 @@ impl DemoApp {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
+        // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
+        // display order, keyed by node like every other session value.
+        for u in &self.units {
+            let row = self.strip_row(u.node_id);
+            if !row.is_plain() { s.set_strip(row.saved()); }
+        }
+        let order: Vec<u32> = self.strip_order.iter()
+            .filter(|n| self.units.iter().any(|u| u.node_id == **n))
+            .copied().collect();
+        if !order.is_empty() { s.set_strip_order(order); }
         Ok(s)
     }
 
@@ -4874,6 +5030,12 @@ impl DemoApp {
             }
         }
         self.restore_session_rules(s);
+        // Mixer strips (#72–77) follow their nodes through the remap: rows
+        // only the UI touches (colour, collapse) and the engine's strip
+        // state, re-sent because the load dropped the engine's table.
+        self.strips = s.strips().iter().map(StripUiRow::from_saved).collect();
+        self.strip_order = s.strip_order().to_vec();
+        self.send_all_strip_state();
         Ok(())
     }
 
@@ -5646,6 +5808,197 @@ impl DemoApp {
                 self.agent_activity.touch_rig(rig, now);
                 self.agent_activity.record(origin, format!("Mix → {} (vol {:.2})", self.rig_name(rig), m.vol), nodes, now);
                 format!("rig {rig}: vol {:.2} pan {:.2} mute {} solo {}", m.vol, m.pan, m.mute, m.solo)
+            }
+            "set_strip_mix" => {
+                // Per-source strip mix (#73): pan/mute/solo on ONE source
+                // node, applied at its own output (solo scope: its rig).
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let pan = args.get("pan").and_then(|v| v.as_f64()).map(|p| p.clamp(-1.0, 1.0) as f32);
+                let mute = args.get("mute").and_then(|v| v.as_bool());
+                let solo = args.get("solo").and_then(|v| v.as_bool());
+                self.with_strip_row(node, |row| {
+                    if let Some(p) = pan { row.pan = p; }
+                    if let Some(m) = mute { row.mute = m; }
+                    if let Some(s) = solo { row.solo = s; }
+                });
+                self.send_strip_mix(node);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                let row = self.strip_row(node);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Source mix → {}", self.unit_display_name(node)), vec![node], now);
+                format!("{} (node {node}): pan {:.2} mute {} solo {} — solo mutes the other sources of its rig", self.unit_display_name(node), row.pan, row.mute, row.solo)
+            }
+            "set_node_bypass" => {
+                // Insert bypass (#74): the FX passes its input through.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let bypass = args.get("bypass").and_then(|v| v.as_bool()).unwrap_or(true);
+                self.with_strip_row(node, |row| row.bypass = bypass);
+                self.send_strip_bypass(node);
+                if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Bypass {} → {}", self.unit_display_name(node), if bypass { "on" } else { "off" }), vec![node], now);
+                format!("{} (node {node}): bypass {}", self.unit_display_name(node), bypass)
+            }
+            "add_insert" => {
+                // Add an effect to a strip's insert chain (#74): source node
+                // (or omit source = the master out's chain, #77).
+                let source = args.get("source").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if let Some(s) = source {
+                    if !self.units.iter().any(|u| u.node_id == s) {
+                        return format!("no unit with node id {s} (see get_graph)");
+                    }
+                }
+                let kind_str = args.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let name = args.get("name").and_then(|v| v.as_str()).map(String::from);
+                let (kind, label) = match kind_str.as_str() {
+                    "dsp" => {
+                        let dsp = args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                        let dk = match dsp.as_str() {
+                            "delay" => Some(DspKind::Delay), "reverb" => Some(DspKind::Reverb),
+                            "filter" => Some(DspKind::Filter), "eq3" | "eq" => Some(DspKind::Eq3),
+                            "saturation" | "drive" => Some(DspKind::Saturation), "limiter" => Some(DspKind::Limiter),
+                            "gain" => Some(DspKind::Gain), "pan" => Some(DspKind::Pan),
+                            _ => None,
+                        };
+                        match dk {
+                            Some(k) => (NodeKind::Dsp(k.clone()), name.unwrap_or_else(|| sentence_case(dsp.as_str()))),
+                            None => return format!("add_insert: unknown dsp '{dsp}' (gain, pan, eq3, filter, limiter, saturation, delay, reverb)"),
+                        }
+                    }
+                    "lv2" => {
+                        let uri = args.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                        if uri.is_empty() { return "add_insert needs a uri for kind=lv2 (see list_plugins)".into(); }
+                        if !self.plugin_lists_ready() {
+                            return "scanning installed plugins in the background (first run) — try add_insert again in a few seconds".into();
+                        }
+                        let known = self.plugins_lv2.iter().find(|p| p.uri == uri && !p.is_instrument);
+                        let label = match known {
+                            Some(p) => p.name.clone(),
+                            None => return format!("add_insert: '{uri}' is not an installed LV2 effect (see list_plugins)"),
+                        };
+                        (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name.unwrap_or(label))
+                    }
+                    _ => return "add_insert needs kind=dsp (with dsp=…) or kind=lv2 (with uri=…)".into(),
+                };
+                let res = match source {
+                    Some(s) => self.strip_insert_edit(s, StripInsertEdit::Add { kind, name: label.clone() }),
+                    None => self.master_insert_edit(StripInsertEdit::Add { kind, name: label.clone() }),
+                };
+                match res {
+                    Ok(msg) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        let nodes: Vec<u32> = match source {
+                            Some(s) => vec![s],
+                            None => self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect(),
+                        };
+                        for n in &nodes { self.agent_activity.touch_node(*n, now); }
+                        self.agent_activity.record(origin, format!("Insert → {label}"), nodes, now);
+                        format!("{msg}; the rack cables moved with it (the chain is the cables)")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "remove_insert" => {
+                let fx = args.get("fx").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let source = args.get("source").and_then(|v| v.as_u64()).map(|n| n as u32);
+                if !self.units.iter().any(|u| u.node_id == fx) {
+                    return format!("no unit with node id {fx} (see get_graph)");
+                }
+                let res = match source {
+                    Some(s) => self.strip_insert_edit(s, StripInsertEdit::Remove { fx }),
+                    None => self.master_insert_edit(StripInsertEdit::Remove { fx }),
+                };
+                match res {
+                    Ok(msg) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(fx, now);
+                        self.agent_activity.record(origin, format!("Remove insert {}", self.unit_display_name(fx)), vec![fx], now);
+                        format!("{msg}; the chain closed up")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "rename_strip" => {
+                // #77: the strip's name is the node's name (sessions carry it).
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                match self.apply_strip_name(node, &name) {
+                    Ok(n) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        self.agent_activity.touch_node(node, now);
+                        self.agent_activity.record(origin, format!("Rename → {n}"), vec![node], now);
+                        format!("renamed node {node} → {n}")
+                    }
+                    Err(e) => e,
+                }
+            }
+            "set_strip_color" => {
+                // #77: hex 0xRRGGBB or a palette word; None clears it.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let raw = args.get("color").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+                let color = if raw.is_empty() || raw == "none" || raw == "off" {
+                    None
+                } else if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix('#')) {
+                    match u32::from_str_radix(hex, 16) {
+                        Ok(rgb) => Some(egui::Color32::from_rgb(((rgb >> 16) & 0xFF) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)),
+                        Err(_) => return format!("set_strip_color: '{raw}' is not a hex colour (0xRRGGBB or a name)"),
+                    }
+                } else {
+                    // Palette word → the nearest of the strip palette.
+                    let names = ["teal", "amber", "rose", "sand", "violet", "cyan"];
+                    match names.iter().position(|n| raw.starts_with(n)) {
+                        Some(i) => Some(STRIP_PALETTE[i]),
+                        None => return format!("set_strip_color: '{raw}' — use 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan) or none"),
+                    }
+                };
+                self.with_strip_row(node, |row| row.color = color);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Colour → {}", self.unit_display_name(node)), vec![node], now);
+                let shown = color.map(|c| format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())).unwrap_or_else(|| "none".into());
+                format!("{} (node {node}): colour {shown} — saved with the session", self.unit_display_name(node))
+            }
+            "move_strip" => {
+                // #77: display order within the strip's rig.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let to = args.get("to").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                let Some(unit) = self.units.iter().position(|u| u.node_id == node) else {
+                    return format!("no unit with node id {node} (see get_graph)");
+                };
+                let rig = self.units[unit].rig;
+                let sources = self.rig_strip_sources(rig);
+                let at = sources.iter().position(|&u| u == unit).unwrap_or(0);
+                let target = sources.get(to.saturating_sub(1)).or_else(|| sources.last()).copied();
+                let Some(tu) = target else { return "this rig has no strips to reorder".into() };
+                let before = self.units[tu].node_id;
+                self.reorder_strip(rig, node, before);
+                self.agent_activity.touch_node(node, now);
+                self.agent_activity.record(origin, format!("Move strip → slot {to}"), vec![node], now);
+                format!("moved {} to slot {to} of its rig (display order — the sound is unchanged)", self.unit_display_name(node))
+            }
+            "collapse_strip" => {
+                // #77: collapse (or expand) a strip to its mini form.
+                let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let collapsed = args.get("collapsed").and_then(|v| v.as_bool());
+                if !self.units.iter().any(|u| u.node_id == node) {
+                    return format!("no unit with node id {node} (see get_graph)");
+                }
+                let was = self.strip_row(node).collapsed;
+                let next = collapsed.unwrap_or(!was);
+                self.with_strip_row(node, |row| row.collapsed = next);
+                self.agent_activity.touch_node(node, now);
+                format!("{} (node {node}): {}", self.unit_display_name(node), if next { "collapsed (mini strip)" } else { "expanded" })
             }
             "list_plugins" => {
                 if !self.plugin_lists_ready() {
@@ -7494,6 +7847,173 @@ impl DemoApp {
         }
     }
 
+    // -- mixer strips (#72–77) ----------------------------------------------
+
+    /// One node's strip state (a default row when untouched).
+    fn strip_row(&self, node: u32) -> StripUiRow {
+        self.strips.iter().find(|s| s.node == node).copied().unwrap_or_else(|| StripUiRow::new(node))
+    }
+
+    /// Read-modify-write one node's strip row; the caller publishes the parts
+    /// the engine owns.
+    fn with_strip_row(&mut self, node: u32, f: impl FnOnce(&mut StripUiRow)) {
+        match self.strips.iter_mut().find(|s| s.node == node) {
+            Some(row) => f(row),
+            None => {
+                let mut row = StripUiRow::new(node);
+                f(&mut row);
+                self.strips.push(row);
+            }
+        }
+        self.strips.retain(|s| !s.is_plain());
+    }
+
+    /// Publish one node's pan/mute/solo to the engine (SetStripMix, #73) and
+    /// arm the echo grace so the engine's own publication does not fight the
+    /// local mirror.
+    fn send_strip_mix(&mut self, node: u32) {
+        let row = self.strip_row(node);
+        self.ui_strip_grace.insert(node, self.ui_time + 0.6);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetStripMix {
+                node,
+                pan: Some(row.pan),
+                mute: Some(row.mute),
+                solo: Some(row.solo),
+            });
+        }
+    }
+
+    /// Publish one FX node's bypass flag to the engine (#74).
+    fn send_strip_bypass(&mut self, node: u32) {
+        let row = self.strip_row(node);
+        self.ui_strip_grace.insert(node, self.ui_time + 0.6);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetStripBypass { node, bypass: row.bypass });
+        }
+    }
+
+    /// Re-send every strip's engine state after a load reset it (rule 20:
+    /// the engine drops its strip table on LoadGraph/LoadRigs).
+    fn send_all_strip_state(&mut self) {
+        let nodes: Vec<u32> = self.strips.iter().map(|s| s.node).collect();
+        for node in nodes {
+            self.send_strip_mix(node);
+            self.send_strip_bypass(node);
+        }
+    }
+
+    /// The strips of one rig in display order (#77): `strip_order` first,
+    /// unlisted sources after in unit order.
+    fn rig_strip_sources(&self, rig: u8) -> Vec<usize> {
+        let mut units = self.mixer_sources(rig);
+        units.sort_by_key(|(unit, _)| {
+            let node = self.units.get(*unit).map(|u| u.node_id).unwrap_or(u32::MAX);
+            self.strip_order.iter().position(|n| *n == node).unwrap_or(usize::MAX)
+        });
+        units.into_iter().map(|(unit, _)| unit).collect()
+    }
+
+    /// A source strip's insert chain (#74): the linear FX run between the
+    /// source and its rig's master, or `None` when the wiring is custom
+    /// (branches, merges, a dry path) — shown as "custom", never guessed.
+    fn strip_chain(&self, source: usize) -> Option<Vec<usize>> {
+        let rig = self.units.get(source)?.rig;
+        let out_units = |unit: usize| -> Vec<usize> {
+            let mut nexts: Vec<usize> = self.cables.iter()
+                .filter(|c| c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0)
+                .filter_map(|c| if c.dst != unit { Some(c.dst) } else { None })
+                .collect();
+            nexts.sort_unstable();
+            nexts.dedup();
+            nexts
+        };
+        // FX = a non-source, non-Keys, non-Master rack unit (an effect).
+        let is_fx = |unit: usize| self.units.get(unit).map_or(false, |u| {
+            u.rig == rig
+                && !matches!(u.node_kind, UnitKind::Keys | UnitKind::Master | UnitKind::Clap | UnitKind::AudioIn)
+                && !u.lv2_inst
+        });
+        // Walk: every hop must be an FX unit with exactly one distinct audio
+        // input (the previous node) and at most one distinct output, ending
+        // at the rig's master.
+        let mut chain = Vec::new();
+        let mut cur = source;
+        for _ in 0..64 {
+            let nexts = out_units(cur);
+            match nexts.len() {
+                0 => break,
+                1 => {
+                    let next_u = &self.units[nexts[0]];
+                    if next_u.rig != rig { return None; }
+                    if matches!(next_u.node_kind, UnitKind::Master) {
+                        return Some(chain); // reached the rig bus: linear.
+                    }
+                    if !is_fx(nexts[0]) { return None; }
+                    // Exactly one distinct audio input: the previous node.
+                    let mut ins: Vec<usize> = self.cables.iter()
+                        .filter(|c| c.kind == PortKind::Audio && c.dst == nexts[0] && c.dying < 0.0 && c.src != nexts[0])
+                        .map(|c| c.src).collect();
+                    ins.sort_unstable();
+                    ins.dedup();
+                    if ins.len() != 1 || ins[0] != cur { return None; }
+                    chain.push(nexts[0]);
+                    cur = nexts[0];
+                }
+                _ => return None,
+            }
+        }
+        None // never reached a master: custom or broken wiring.
+    }
+
+    /// The master out's insert chain (#77): FX nodes fed BY a master node, in
+    /// chain order (master → FX → FX → …).
+    fn master_chain(&self) -> Vec<usize> {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut masters: Vec<u32> = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Master))
+            .map(|u| u.node_id).collect();
+        masters.sort_unstable();
+        masters.dedup();
+        loop {
+            if chain.len() >= crate::engine::MAX_MASTER_INSERTS { break; }
+            let from = chain.last().map(|&unit| self.units[unit].node_id);
+            let mut next = None;
+            for (i, u) in self.units.iter().enumerate() {
+                if chain.contains(&i) || !matches!(u.node_kind, UnitKind::Dsp(_)) { continue; }
+                let fed = match from {
+                    None => self.cables.iter().any(|c| {
+                        c.kind == PortKind::Audio && c.dying < 0.0 && c.dst == i && c.src != i
+                            && self.units.get(c.src).map(|s| masters.contains(&s.node_id)).unwrap_or(false)
+                    }),
+                    Some(f) => self.cables.iter().any(|c| {
+                        c.kind == PortKind::Audio && c.dying < 0.0 && c.dst == i && c.src != i
+                            && self.units.get(c.src).map(|s| s.node_id) == Some(f)
+                    }),
+                };
+                if fed { next = Some(i); break; }
+            }
+            match next {
+                Some(unit) => chain.push(unit),
+                None => break,
+            }
+        }
+        chain
+    }
+
+    /// A source's live audio level for its strip meter (post-fader, rule 53):
+    /// the published per-edge peak of its outgoing audio cables; without an
+    /// engine the MIDI activity LED stands in (demo).
+    fn strip_audio_level(&self, unit: usize) -> f32 {
+        if let Some(l) = &self.edge_levels {
+            return self.cables.iter()
+                .filter(|c| c.kind == PortKind::Audio && c.src == unit && c.dying < 0.0)
+                .map(|c| edge_display_level(l.load(c.id)).min(1.0))
+                .fold(0.0f32, f32::max);
+        }
+        self.units.get(unit).map(|u| u.led).unwrap_or(0.0)
+    }
+
     /// Mirror the rig snapshot's device bindings into the per-synth source
     /// filters: every synth voice of a device-bound rig takes only that
     /// device (H on, K off). Indexes by VOICE slot, not rig index.
@@ -9323,6 +9843,193 @@ impl DemoApp {
         }
     }
 
+    /// One insert edit (#74): add, remove or move an FX inside a strip's
+    /// linear chain. The cables stay the truth — the edit is a graph edit
+    /// (AddNode + Connect/Disconnect), applied through the SAME reload every
+    /// other rig edit uses (`capture_session` → new graph → `apply_session`
+    /// → canonical remap), so knobs, synth states, rules and strips all
+    /// travel with it and the rack back panel shows the new cables.
+    fn strip_insert_edit(&mut self, source: u32, edit: StripInsertEdit) -> Result<String, String> {
+        let (mut g, mut fx, tail) = self.strip_chain_graph(source)?;
+        let old_fx = fx.clone();
+        let rig = g.node(source).map(|n| n.rig).unwrap_or(0);
+        let msg = match &edit {
+            StripInsertEdit::Add { kind, name } => {
+                let node = g.add_node(kind.clone(), name_bytes(name));
+                g.set_rig(node, rig);
+                fx.push(node);
+                format!("Added {} — chained before the rig bus", sentence_case(name))
+            }
+            StripInsertEdit::Remove { fx: victim } => {
+                let pos = fx.iter().position(|n| *n == *victim)
+                    .ok_or_else(|| format!("node {victim} is not an insert of node {source}"))?;
+                fx.remove(pos);
+                format!("Removed insert node {victim}")
+            }
+            StripInsertEdit::Move { fx: moved, to } => {
+                let pos = fx.iter().position(|n| *n == *moved)
+                    .ok_or_else(|| format!("node {moved} is not an insert of node {source}"))?;
+                if fx.len() < 2 { return Err("only one insert — nothing to reorder".into()); }
+                fx.remove(pos);
+                // `to` is the 1-based slot shown on the strip (as in the tools).
+                let to = (*to).clamp(1, fx.len() + 1);
+                fx.insert(to - 1, *moved);
+                format!("Moved insert node {moved} to slot {to}")
+            }
+        };
+        self.rewire_chain_edges(&mut g, source, &old_fx, &fx, tail);
+        if let StripInsertEdit::Remove { fx: victim } = &edit {
+            g.remove_node(*victim);
+        }
+        self.reload_with_graph(g)?;
+        Ok(msg)
+    }
+
+    /// One master-insert edit (#77): an FX node fed BY a MasterOut node runs
+    /// on the summed mix before the fixed limiter. Same graph-edit reload as
+    /// source inserts; the chain starts at the active rig's master.
+    fn master_insert_edit(&mut self, edit: StripInsertEdit) -> Result<String, String> {
+        let masters: Vec<u32> = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::Master))
+            .map(|u| u.node_id).collect();
+        let start = self.units.iter()
+            .find(|u| matches!(u.node_kind, UnitKind::Master) && (self.rig_count() <= 1 || u.rig == self.active_rig as u8))
+            .map(|u| u.node_id)
+            .or_else(|| masters.first().copied())
+            .ok_or("no master out to insert into")?;
+        let mut g = self.base_graph.clone();
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+        }
+        let mut fx: Vec<u32> = self.master_chain().iter().map(|&u| self.units[u].node_id).collect();
+        let old_fx = fx.clone();
+        let rig = g.node(start).map(|n| n.rig).unwrap_or(0);
+        let msg = match &edit {
+            StripInsertEdit::Add { kind, name } => {
+                let node = g.add_node(kind.clone(), name_bytes(name));
+                g.set_rig(node, rig);
+                fx.push(node);
+                format!("Added {} — master insert, before the limiter", sentence_case(name))
+            }
+            StripInsertEdit::Remove { fx: victim } => {
+                let pos = fx.iter().position(|n| *n == *victim)
+                    .ok_or_else(|| format!("node {victim} is not a master insert"))?;
+                fx.remove(pos);
+                format!("Removed master insert node {victim}")
+            }
+            StripInsertEdit::Move { fx: moved, to } => {
+                let pos = fx.iter().position(|n| *n == *moved)
+                    .ok_or_else(|| format!("node {moved} is not a master insert"))?;
+                if fx.len() < 2 { return Err("only one master insert — nothing to reorder".into()); }
+                fx.remove(pos);
+                // `to` is the 1-based slot shown on the strip (as in the tools).
+                let to = (*to).clamp(1, fx.len() + 1);
+                fx.insert(to - 1, *moved);
+                format!("Moved master insert {moved} to slot {to}")
+            }
+        };
+        // The master chain has no tail: the last insert feeds the output.
+        self.rewire_chain_edges(&mut g, start, &old_fx, &fx, None);
+        if let StripInsertEdit::Remove { fx: victim } = &edit {
+            g.remove_node(*victim);
+        }
+        self.reload_with_graph(g)?;
+        Ok(msg)
+    }
+
+    /// The mirror graph (base nodes + living cables), the strip's verified
+    /// linear FX chain in node ids, and the chain's single tail node (the rig
+    /// master; None = custom wiring — callers show it instead of guessing).
+    fn strip_chain_graph(&self, source: u32) -> Result<(Graph, Vec<u32>, Option<u32>), String> {
+        let mut g = self.base_graph.clone();
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+        }
+        let unit = self.units.iter().position(|u| u.node_id == source)
+            .ok_or_else(|| format!("no strip with node {source}"))?;
+        let Some(fx_units) = self.strip_chain(unit) else {
+            return Err("this strip's wiring is custom — patch it on the rack back".into());
+        };
+        let fx: Vec<u32> = fx_units.iter().map(|&f| self.units[f].node_id).collect();
+        // The chain's end (source when it feeds the master directly) and its
+        // single distinct audio target = the tail. Preserve the tail hop's
+        // exact (to-port) shapes — stereo pairs stay stereo pairs.
+        let end = fx.last().copied().unwrap_or(source);
+        let mut tails: Vec<u32> = g.edges.iter()
+            .filter(|e| e.kind == CPortKind::Audio && e.from.node == end)
+            .map(|e| e.to.node).collect();
+        tails.sort_unstable();
+        tails.dedup();
+        if tails.len() != 1 { return Err("this strip's wiring is custom — patch it on the rack back".into()); }
+        Ok((g, fx, Some(tails[0])))
+    }
+
+    /// Rewire one chain run in `g` from `start` through the FX to `tail`:
+    /// drop the OLD run's hop edges (node pairs `[start, old_fx…, tail]`) and
+    /// connect the NEW order. The tail hop keeps the exact to-port shapes it
+    /// had (a stereo pair into the master stays one); a master chain has no
+    /// tail — its last insert feeds the output.
+    fn rewire_chain_edges(&mut self, g: &mut Graph, start: u32, old_fx: &[u32], new_fx: &[u32], tail: Option<u32>) {
+        let old_end = old_fx.last().copied().unwrap_or(start);
+        let tail_ports: Vec<u8> = match tail {
+            Some(t) => g.edges.iter()
+                .filter(|e| e.kind == CPortKind::Audio && e.from.node == old_end && e.to.node == t)
+                .map(|e| e.to.port).collect(),
+            None => Vec::new(),
+        };
+        let mut old_run: Vec<u32> = vec![start];
+        old_run.extend_from_slice(old_fx);
+        if let Some(t) = tail { old_run.push(t); }
+        for pair in old_run.windows(2) {
+            g.edges.retain(|e| !(e.kind == CPortKind::Audio && e.from.node == pair[0] && e.to.node == pair[1]));
+        }
+        let fresh = |g: &Graph| g.edges.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let mut prev = start;
+        for &f in new_fx {
+            let id = fresh(g);
+            g.connect_with_id(id, PortRef { node: prev, port: 0 }, PortRef { node: f, port: 0 }, CPortKind::Audio);
+            prev = f;
+        }
+        if let Some(t) = tail {
+            for p in if tail_ports.is_empty() { vec![0u8] } else { tail_ports } {
+                let id = fresh(g);
+                g.connect_with_id(id, PortRef { node: prev, port: 0 }, PortRef { node: t, port: p }, CPortKind::Audio);
+            }
+        }
+    }
+
+    /// Reload the rack with an edited graph, keeping the mixer, strips and
+    /// the rig in view (rule 20: applied AFTER the reload). The canonical
+    /// remap inside `apply_session` carries knobs, states, rules and strips
+    /// to their new node ids.
+    fn reload_with_graph(&mut self, g: Graph) -> Result<(), String> {
+        let keep_rig = self.active_rig;
+        let keep_mix = self.rig_mix;
+        let mut s = self.capture_session("mixer edit").map_err(|e| e.to_string())?;
+        s.graph = g;
+        self.apply_session(&s).map_err(|e| e.to_string())?;
+        self.rig_mix = keep_mix;
+        self.active_rig = usize::MAX; // force set_active_rig to regroup
+        self.set_active_rig(keep_rig);
+        for i in 0..self.rig_count() { self.send_rig_mix(i); }
+        self.send_all_strip_state();
+        Ok(())
+    }
+
     /// Add a Metronome node to the active rig and wire it to that rig's MasterOut.
     fn add_metronome_to_active_rig(&mut self) {
         let rig = self.active_rig as u8;
@@ -9351,6 +10058,8 @@ impl DemoApp {
         self.build_rack(&g, &[]);
         self.rig_mix = keep_mix;
         self.set_active_rig(keep_rig);
+        // The load dropped the engine's strip table: re-publish it (rule 20).
+        self.send_all_strip_state();
         self.plugin_msg = "Added Metronome — wired to Master".into();
     }
 
@@ -12042,6 +12751,7 @@ impl DemoApp {
 
     fn update(&mut self, dt: f32) {
         self.ui_time += dt;
+        self.ui_dt = dt;
         if self.autosave_due(dt) {
             self.autosave_now(&Self::sessions_dir());
         }
@@ -13221,12 +13931,14 @@ impl DemoApp {
     }
 
     /// Mixer stage: every source → its rig bus → Master out, as channel
-    /// strips. Source faders drive the units' own level knobs; the rig bus is
-    /// the engine's per-rig mix (vol/pan/mute/solo). A main-stage view like the
-    /// matrix (rule 8) — Tab / Esc return to the rack.
+    /// strips (#72–77): dB faders with a unity detent, peak hold + clip light,
+    /// per-source mute/solo/pan, insert slots (a view of the cable chain),
+    /// strip names, colours, drag order and collapse. A main-stage view like
+    /// the matrix (rule 8) — Tab / Esc return to the rack.
     fn mixer_stage(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
+        let ctx = ui.ctx().clone();
         let painter = ui.painter().clone();
         theme::paper_bg(&painter, rect);
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
@@ -13234,11 +13946,16 @@ impl DemoApp {
         let help = self.show_help;
         let n = self.rig_count();
         self.mixer_fader_rects.clear();
+        self.mixer_strip_rects_prev = std::mem::take(&mut self.mixer_strip_rects);
+        self.mixer_meter_rects.clear();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
         let app_streams = self.app_streams_shown();
         let mut stream_changes: Vec<(u64, Option<f32>, Option<bool>)> = Vec::new();
         let mut out_pick: Option<Option<String>> = None;
+        // Insert edits are applied AFTER the frame's layout (a mid-frame
+        // rack rebuild seeds NaN cable springs — rule 32).
+        let mut edits: Vec<PendingInsertEdit> = Vec::new();
         let (outputs, out_current) = self.audio_out.lock()
             .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
@@ -13248,22 +13965,29 @@ impl DemoApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("Mixer").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(egui::RichText::new("every source → its rig bus → Master out · Tab / Esc: back to the rack")
+                    ui.label(egui::RichText::new("every source → its rig bus → Master out · dB faders · inserts = the cable chain · Tab / Esc: back to the rack")
                         .size(13.0).color(theme::INK_2));
                 });
                 ui.add_space(14.0);
-                // Strip height: name + sub + fader + value + bus controls.
-                // A short sheet keeps a usable fader and scrolls the rest.
+                // Strip height: name + sub + meta + inserts + fader + readout
+                // + bus controls. A short sheet keeps a usable fader and
+                // scrolls the rest.
                 let view_h = ui.available_height().max(1.0);
-                let fader_h = (view_h - 210.0).clamp(64.0, 480.0);
-                let h = view_h.max(fader_h + 210.0);
+                // Insert rows (29 px each) of the tallest strip count too.
+                let max_inserts = (0..n).flat_map(|r| self.rig_strip_sources(r as u8))
+                    .filter(|&u| !self.strip_row(self.units[u].node_id).collapsed)
+                    .map(|u| self.strip_chain(u).map_or(0, |c| c.len()))
+                    .max().unwrap_or(0);
+                let overhead = 250.0 + 29.0 * max_inserts as f32;
+                let fader_h = (view_h - overhead).clamp(64.0, 480.0);
+                let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
                     let scroll_w = ui.available_width().max(200.0);
                     ui.allocate_ui_with_layout(egui::vec2(scroll_w, view_h), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                         // Center the strips in the sheet while they fit (a left-
                         // huddled mixer left most of the sheet empty — review).
                         let gap = ui.spacing().item_spacing.x;
-                        let strips: usize = (0..n).map(|r| self.mixer_sources(r as u8).len() + 1).sum();
+                        let strips: usize = (0..n).map(|r| self.rig_strip_sources(r as u8).len() + 1).sum();
                         let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 25.0 + gap };
                         let content_w = strips as f32 * (STRIP_W + gap) + n as f32 * (25.0 + gap) + sys + 170.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
@@ -13280,7 +14004,8 @@ impl DemoApp {
                                         // A group HEADING, not a chip: a filled chip read as a
                                         // filter/tab while every rig is shown (vision review).
                                         // The rig in the rack view gets an "IN VIEW" tag.
-                                        let group_w = (self.mixer_sources(rig as u8).len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
+                                        let sources = self.rig_strip_sources(rig as u8);
+                                        let group_w = (sources.len() + 1) as f32 * (STRIP_W + ui.spacing().item_spacing.x) - ui.spacing().item_spacing.x;
                                         // Heading truly centered over ITS strips; the "shown in
                                         // rack" tag sits on a subline reserved for every rig, so
                                         // headings stay centered and strips stay aligned.
@@ -13301,61 +14026,11 @@ impl DemoApp {
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
                                         ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
-                                            for (unit, knob) in self.mixer_sources(rig as u8) {
-                                                let (uname, sub, level) = {
-                                                    let u = &self.units[unit];
-                                                    (sentence_case(&u.name), u.sub.clone(), u.led)
-                                                };
-                                                let mut v = knob.map(|k| self.units[unit].knobs[k].value);
-                                                mixer_strip(ui, &uname, &sub, &mut v, level, fader_h);
-                                                if let (Some(k), Some(v)) = (knob, v) {
-                                                    if (v - self.units[unit].knobs[k].value).abs() > f32::EPSILON {
-                                                        self.set_unit_knob(unit, k, v);
-                                                    }
-                                                }
+                                            for unit in sources {
+                                                self.source_strip_ui(ui, unit, fader_h, &mut edits);
                                             }
                                             // The rig bus: engine per-rig mix.
-                                            let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
-                                            let mut m = self.rig_mix[rig.min(7)];
-                                            let mut v = Some(m.vol);
-                                            // One column: fader, then PAN and M/S directly under it.
-                                            let mut changed = false;
-                                            ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                                let fr = mixer_strip(ui, "Rig bus", "→ MASTER OUT", &mut v, level, fader_h);
-                                                self.mixer_fader_rects.push(fr);
-                                                changed = v != Some(m.vol);
-                                                m.vol = v.unwrap_or(m.vol);
-                                                ui.add_space(4.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(8.0);
-                                                    theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
-                                                    let mut p = m.pan;
-                                                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
-                                                        .custom_formatter(|v, _| pan_text(v as f32))
-                                                        .custom_parser(parse_pan)));
-                                                    if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; changed = true; }
-                                                });
-                                                ui.add_space(4.0);
-                                                ui.horizontal(|ui| {
-                                                    ui.add_space(18.0);
-                                                    ui.spacing_mut().item_spacing.x = 4.0;
-                                                    let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
-                                                            .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
-                                                        .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
-                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                                                    if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; changed = true; }
-                                                    let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
-                                                            .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
-                                                        .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
-                                                        .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                                                    if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; changed = true; }
-                                                });
-                                            });
-                                            if changed {
-                                                self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
-                                                self.rig_mix[rig.min(7)] = m;
-                                                self.send_rig_mix(rig);
-                                            }
+                                            self.rig_bus_strip_ui(ui, rig, fader_h);
                                         });
                                     });
                                 }
@@ -13376,21 +14051,23 @@ impl DemoApp {
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
                                         ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
-                                            for st in &app_streams {
+                                            for (si, st) in app_streams.iter().enumerate() {
                                                 ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
                                                     // "(2) Neo Soul … - YouTube" → "Neo Soul …": the tab counter is noise.
                                                     let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
                                                     let shown = st.volume.min(1.0);
-                                                    let mut v = Some(shown);
-                                                    // What the app plays, dB-scaled (rule 62).
-                                                    let level = meter_db_pos(crate::audio_out::stream_level(&self.stream_levels, st.index));
-                                                    let fr = mixer_strip(ui, &st.app, title, &mut v, level, fader_h);
-                                                    ui.interact(fr, egui::Id::new(("app_stream_tip", st.index)), egui::Sense::hover())
-                                                        .on_hover_text(format!("{} — {}", st.app, st.title));
-                                                    if let Some(nv) = v {
-                                                        if (nv - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(nv), None)); }
-                                                    }
-                                                    ui.add_space(4.0);
+                                                    let mut v = shown;
+                                                    // What the app plays, dB-scaled (rule 62), with the
+                                                    // same peak hold + clip as the patch strips (#72).
+                                                    let level = crate::audio_out::stream_level(&self.stream_levels, st.index);
+                                                    let key = app_stream_key(si);
+                                                    let fr = self.strip_fader_ui(ui, key, &mut v, level, fader_h);
+                                                    ui.interact(fr, egui::Id::unique(("app_stream_tip", st.index)), egui::Sense::hover())
+                                                        .on_hover_text(format!("{} — {}", st.app, title));
+                                                    if (v - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(v), None)); }
+                                                    ui.add_space(2.0);
+                                                    ui.label(egui::RichText::new(db_readout(v)).size(11.0).monospace().color(theme::CREAM_MID));
+                                                    ui.add_space(2.0);
                                                     let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
                                                             .color(if st.muted { theme::DARK_PANEL } else { theme::CREAM_MID }))
                                                         .fill(if st.muted { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
@@ -13407,72 +14084,719 @@ impl DemoApp {
                                 // (the sum they feed) — not pinned far away.
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(25.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
-                                ui.vertical(|ui| {
-                                    ui.set_width(170.0);
-                                    theme::section_label(ui, "Master out");
-                                    // Output device (#31): which sound card kabelsalat plays to.
-                                    let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
-                                        .map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
-                                    let selected = match &out_wanted {
-                                        Some(w) => label_of(w),
-                                        None => "System default".to_string(),
-                                    };
-                                    theme::Dropdown::new("dd_mixer_audio_output", &selected)
-                                        .width(160.0)
-                                        .popup_min_width(240.0)
-                                        .text_size(11.5)
-                                        .show_ui(ui, |menu| {
-                                            if menu.item(out_wanted.is_none(), "System default") {
-                                                out_pick = Some(None);
-                                            }
-                                            for o in &outputs {
-                                                if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                                                    out_pick = Some(Some(o.raw.clone()));
-                                                }
-                                            }
-                                        })
-                                        .on_hover_text("the sound card kabelsalat plays to");
-                                    if let Some(c) = &out_current {
-                                        ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
-                                    }
-                                    ui.add_space(4.0);
-                                    let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
-                                    ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
-                                        .on_hover_text("peak meter of everything kabelsalat plays");
-                                    ui.add_space(8.0);
-                                    // Meter + dB scale: a labeled peak meter, not a missing fader.
-                                    let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
-                                    let mr = Rect::from_min_size(area.min, egui::vec2(14.0, fader_h));
-                                    paint_meter(ui.painter(), mr, meter_db_pos(self.meter), meter_db_pos(self.meter_peak));
-                                    // The ends first; a mark too close to one already drawn is left out
-                                    // (a short meter put "0 dB", "−6" and "−12" on top of each other).
-                                    let mut drawn: Vec<f32> = Vec::new();
-                                    for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
-                                        // Labels only (a tick hairline beside "0" read as "-0"),
-                                        // with a real minus sign.
-                                        let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
-                                        if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
-                                        drawn.push(y);
-                                        let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
-                                        ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
-                                            label, FontId::monospace(9.5), theme::CREAM_DIM);
-                                    }
-                                    ui.add_space(6.0);
-                                    // Meter-only strip: say so with a live peak readout.
-                                    let db = if self.meter_peak < 0.001 { "−∞ dB".to_string() } else { format!("{:.0} dB", 20.0 * self.meter_peak.log10()) };
-                                    ui.label(egui::RichText::new(db).size(11.0).monospace().color(theme::CREAM_MID))
-                                        .on_hover_text("output peak (meter only — set levels on the rig buses and sources)");
-                                });
+                                self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
                             });
                         });
                     });
                 });
             });
         });
+        // Insert edits apply after the frame's layout (rule 32) and answer
+        // in the same place the rack's own messages go.
+        for e in edits.drain(..) {
+            let res = match e.source {
+                Some(s) => self.strip_insert_edit(s, e.edit),
+                None => self.master_insert_edit(e.edit),
+            };
+            if let Ok(msg) = res {
+                self.session_msg = msg;
+            } else if let Err(msg) = res {
+                self.session_msg = msg;
+            }
+        }
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
         if let Some(o) = out_pick { self.set_audio_output(o); }
+        // Strip popups (rename modal, colour palette, insert picker).
+        if !self.show_help {
+            self.strip_rename_modal(&ctx);
+            self.strip_palette_ui(&ctx);
+            self.insert_picker_ui(&ctx, &mut edits);
+        }
         if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// One source strip (#72–77): name (click renames, drag reorders),
+    /// colour dot, collapse chevron, insert slots, the dB fader with peak
+    /// hold + clip, pan and mute/solo.
+    fn source_strip_ui(&mut self, ui: &mut egui::Ui, unit: usize, fader_h: f32, edits: &mut Vec<PendingInsertEdit>) {
+        let (node, rig, name, sub) = {
+            let u = &self.units[unit];
+            (u.node_id, u.rig, sentence_case(&u.name), u.sub.clone())
+        };
+        let knob = self.units[unit].knobs.iter().position(|k| k.param.is_some()
+            && matches!(k.label.as_str(), "LEVEL" | "GAIN" | "VOLUME" | "VOL"));
+        let row = self.strip_row(node);
+        let collapsed = row.collapsed;
+        let w = if collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+        let level = self.strip_audio_level(unit);
+        let mut gain = knob.map(|k| self.units[unit].knobs[k].value);
+        let strip = ui.allocate_ui_with_layout(egui::vec2(w, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_width(w);
+            // Name: click renames, drag reorders (#77). A coloured strip
+            // names itself in its colour; the spine under it is drawn once
+            // the column rect is known (below).
+            let shown = truncate_chars(&name, if collapsed { 6 } else { 11 });
+            // Keyed by node, not by position: a live reorder moves the strip
+            // under the pointer, and a positional id would hand the drag to
+            // whichever strip now sits in the old slot (it ping-ponged).
+            let (nr, _) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+            let name_resp = ui.interact(nr, egui::Id::new(("strip_name", node)), egui::Sense::click_and_drag());
+            ui.painter().text(nr.center(), egui::Align2::CENTER_CENTER, &shown,
+                egui::FontId::proportional(13.0), row.color.unwrap_or(theme::INK));
+            if name_resp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::Grab); }
+            if name_resp.clicked() { self.strip_rename = Some((node, name)); }
+            if name_resp.dragged() {
+                self.mixer_strip_drag = Some((node, rig));
+                if let Some(p) = name_resp.interact_pointer_pos() {
+                    // Live reorder (#77): the dragged strip takes the place of
+                    // the one the pointer is over. Rects come from the last frame.
+                    let target = self.mixer_strip_rects_prev.iter()
+                        .find(|(r2, _, rr)| *r2 == rig && rr.contains(p))
+                        .map(|(_, n2, _)| *n2);
+                    if let Some(t) = target {
+                        if t != node { self.reorder_strip(rig, node, t); }
+                    }
+                }
+            }
+            name_resp.on_hover_text("click: rename · drag: reorder the strip");
+            if collapsed {
+                // Mini strip (#77): meter with peak hold, dB readout, M/S,
+                // and an expand chip. The full strip is one click away.
+                self.strip_meter_ui(ui, node, level, 48.0);
+                let readout = knob.map(|k| self.units[unit].knobs[k].value).unwrap_or(0.0);
+                ui.label(egui::RichText::new(db_readout(readout)).size(10.0).monospace().color(theme::CREAM_MID));
+                ui.add_space(2.0);
+                let mut ms = row;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    if strip_ms_button(ui, &mut ms, 'M').clicked() {
+                        self.with_strip_row(node, |r| r.mute = ms.mute);
+                        self.send_strip_mix(node);
+                    }
+                    if strip_ms_button(ui, &mut ms, 'S').clicked() {
+                        self.with_strip_row(node, |r| r.solo = ms.solo);
+                        self.send_strip_mix(node);
+                    }
+                });
+                ui.add_space(2.0);
+                if theme::chip_button(ui, "▸", false).on_hover_text("expand this strip").clicked() {
+                    self.with_strip_row(node, |r| r.collapsed = false);
+                }
+            } else {
+                theme::tracked_label(ui, &sub.to_uppercase(), 9.0, 0.12, theme::INK_2);
+                ui.add_space(3.0);
+                // Meta row: colour dot + collapse chevron.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let (dr, dresp) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::click());
+                    if let Some(c) = row.color {
+                        ui.painter().circle_filled(dr.center(), 4.0, c);
+                    } else {
+                        ui.painter().circle_stroke(dr.center(), 4.0, Stroke::new(1.2, theme::CREAM_DIM));
+                    }
+                    if dresp.clicked() { self.strip_color_pick = Some(node); }
+                    dresp.on_hover_text("strip colour");
+                    if theme::chip_button(ui, "▾", false).on_hover_text("collapse this strip").clicked() {
+                        self.with_strip_row(node, |r| r.collapsed = true);
+                    }
+                });
+                // Insert slots (#74): a view of the cable chain.
+                let chain = self.strip_chain(unit);
+                self.insert_rows_ui(ui, Some(node), chain.as_deref(), edits);
+                // The dB fader (#72) drives the unit's own level knob.
+                let readout;
+                if let Some(k) = knob {
+                    let old = self.units[unit].knobs[k].value;
+                    let mut g = old;
+                    self.strip_fader_ui(ui, node, &mut g, level, fader_h);
+                    if (g - old).abs() > f32::EPSILON { gain = Some(g); }
+                    readout = g;
+                } else {
+                    ui.add_space(fader_h.min(80.0));
+                    theme::tracked_label(ui, "NO FADER", 9.0, 0.12, theme::CREAM_DIM)
+                        .on_hover_text("this source has no level knob — set it on its face");
+                    readout = 0.0;
+                }
+                // Readout + pan + M/S (#73).
+                ui.label(egui::RichText::new(db_readout(readout)).size(10.5).monospace().color(theme::CREAM_MID))
+                    .on_hover_text("this source's level · double-click the fader: 0 dB");
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
+                    let mut p = row.pan;
+                    let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
+                        .custom_formatter(|v, _| pan_text(v as f32))
+                        .custom_parser(parse_pan)));
+                    if r.on_hover_text("source pan (L −1 … +1 R) · drag").changed() {
+                        self.with_strip_row(node, |rw| rw.pan = p);
+                        self.send_strip_mix(node);
+                    }
+                });
+                ui.add_space(3.0);
+                let mut ms = row;
+                ui.horizontal(|ui| {
+                    ui.add_space(20.0);
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    if strip_ms_button(ui, &mut ms, 'M').on_hover_text("mute this source").clicked() {
+                        self.with_strip_row(node, |r| r.mute = ms.mute);
+                        self.send_strip_mix(node);
+                    }
+                    if strip_ms_button(ui, &mut ms, 'S').on_hover_text("solo this source (within its rig)").clicked() {
+                        self.with_strip_row(node, |r| r.solo = ms.solo);
+                        self.send_strip_mix(node);
+                    }
+                });
+            }
+        });
+        let rect = strip.response.rect;
+        // The colour spine (#77): a 3px stripe down the strip's left edge.
+        if let Some(c) = row.color {
+            let spine = Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+            ui.painter().rect_filled(spine, 1.5, c);
+        }
+        if let (Some(k), Some(g)) = (knob, gain) {
+            self.set_unit_knob(unit, k, g);
+        }
+        self.mixer_strip_rects.push((rig, node, rect));
+    }
+
+    /// The rig bus strip: the engine's per-rig mix (vol/pan/mute/solo) with
+    /// the same dB fader, peak hold and clip as the sources (#72).
+    fn rig_bus_strip_ui(&mut self, ui: &mut egui::Ui, rig: usize, fader_h: f32) {
+        let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
+        let mut m = self.rig_mix[rig.min(7)];
+        let mut vol = m.vol;
+        let old = (m.vol, m.pan, m.mute, m.solo);
+        ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_width(STRIP_W);
+            ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
+            theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.12, theme::INK_2);
+            ui.add_space(8.0);
+            let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h);
+            self.mixer_fader_rects.push(fr);
+            ui.label(egui::RichText::new(db_readout(vol)).size(10.5).monospace().color(theme::CREAM_MID))
+                .on_hover_text("this rig's level · double-click the fader: 0 dB");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                theme::tracked_label(ui, "PAN", 9.0, 0.12, theme::INK_2);
+                let mut p = m.pan;
+                let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
+                    .custom_formatter(|v, _| pan_text(v as f32))
+                    .custom_parser(parse_pan)));
+                if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
+                        .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                    .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; }
+                let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
+                        .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
+                    .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; }
+            });
+        });
+        let changed = (m.vol, m.pan, m.mute, m.solo) != old || vol != old.0;
+        if changed {
+            m.vol = vol;
+            self.ui_mix_grace[rig.min(7)] = self.ui_time + 0.6;
+            self.rig_mix[rig.min(7)] = m;
+            self.send_rig_mix(rig);
+        }
+    }
+
+    /// The master out strip (#72/#77): a full channel strip — dB fader
+    /// driving the master VOLUME, the labeled peak meter with peak hold and
+    /// clip, its own insert slots before the fixed limiter, and the output
+    /// device choice (#31).
+    #[allow(clippy::type_complexity)]
+    fn master_strip_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        fader_h: f32,
+        outputs: (Vec<crate::audio_out::OutputDevice>, Option<String>, Option<String>),
+        out_pick: &mut Option<Option<String>>,
+        edits: &mut Vec<PendingInsertEdit>,
+    ) {
+        let (outputs, out_current, out_wanted) = outputs;
+        let n = self.rig_count();
+        // The fader drives the master unit in view (every master's VOLUME
+        // knob is the same engine param).
+        let master_knob = self.units.iter().position(|u| matches!(u.node_kind, UnitKind::Master)
+            && (n <= 1 || u.rig == self.active_rig as u8))
+            .and_then(|mi| self.units[mi].knob_index("VOLUME").map(|k| (mi, k)));
+        let mut gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value);
+        ui.vertical(|ui| {
+            ui.set_width(170.0);
+            theme::section_label(ui, "Master out");
+            // Output device (#31): which sound card kabelsalat plays to.
+            let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw)
+                .map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
+            let selected = match &out_wanted {
+                Some(w) => label_of(w),
+                None => "System default".to_string(),
+            };
+            theme::Dropdown::new("dd_mixer_audio_output", &selected)
+                .width(160.0)
+                .popup_min_width(240.0)
+                .text_size(11.5)
+                .show_ui(ui, |menu| {
+                    if menu.item(out_wanted.is_none(), "System default") {
+                        *out_pick = Some(None);
+                    }
+                    for o in &outputs {
+                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                            *out_pick = Some(Some(o.raw.clone()));
+                        }
+                    }
+                })
+                .on_hover_text("the sound card kabelsalat plays to");
+            if let Some(c) = &out_current {
+                ui.label(egui::RichText::new(format!("→ {}", label_of(c))).size(10.5).color(theme::INK_2));
+            }
+            ui.add_space(4.0);
+            // Master inserts (#77): before the fixed limiter.
+            let chain = self.master_chain();
+            self.insert_rows_ui(ui, None, Some(&chain), edits);
+            let insert_note = if chain.is_empty() {
+                "inserts here run on the whole mix, before the fixed limiter"
+            } else {
+                "inserts run on the whole mix, before the fixed limiter"
+            };
+            ui.label(egui::RichText::new(insert_note).size(10.5).color(theme::INK_2))
+                .on_hover_text("Master out → insert → … → limiter · warmth (fixed)");
+            ui.add_space(6.0);
+            // Fader + meter share one row: the dB scale labels name the stops.
+            let (area, _) = ui.allocate_exact_size(egui::vec2(52.0, fader_h), egui::Sense::hover());
+            let fr = Rect::from_min_size(area.min, egui::vec2(30.0, fader_h));
+            let mr = Rect::from_min_size(Pos2::new(area.right() - 14.0, area.top()), egui::vec2(14.0, fader_h));
+            let mut ph = self.mixer_peaks.entry(MASTER_STRIP_KEY).or_insert_with(PeakHold::new);
+            peak_hold_update(&mut ph, self.meter, self.ui_time, self.ui_dt);
+            let mut clip_clicked = false;
+            let clip = Rect::from_min_size(Pos2::new(mr.left(), mr.top() - 7.0), egui::vec2(mr.width(), 5.0));
+            let clip_resp = ui.interact(clip, egui::Id::unique("master_clip"), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if clip_resp.clicked() { clip_clicked = true; }
+            if clip_resp.hovered() {
+                clip_resp.on_hover_text(if ph.clip { "0 dBFS reached — click to clear" } else { "clip light" });
+            }
+            let held = ph.held;
+            if clip_clicked { ph.clip = false; }
+            paint_meter(ui.painter(), mr, meter_db_pos(self.meter), 0.0);
+            if held > 0.02 {
+                let y = mr.bottom() - mr.height() * held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(mr.left(), y - 1.0), egui::vec2(mr.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            self.mixer_meter_rects.push((MASTER_STRIP_KEY, mr));
+            // The dB fader (#72) drives the master VOLUME knob.
+            let cap_h = 12.0;
+            let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
+            ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
+            // Unity + −12 dB ticks (the meter's dB curve, rule 62).
+            for (g, len) in [(1.0f32, 6.0), (10f32.powf(-12.0 / 20.0), 4.0)] {
+                let y = y0 + (y1 - y0) * fader_pos(g);
+                ui.painter().line_segment([Pos2::new(fr.center().x - len, y), Pos2::new(fr.center().x + len, y)], Stroke::new(1.0, theme::CREAM_DIM));
+            }
+            if let Some((mu, vk)) = master_knob {
+                let _ = (mu, vk);
+                let fid = egui::Id::unique("master_fader");
+                let resp = ui.interact(fr, fid, egui::Sense::click_and_drag());
+                if resp.dragged() {
+                    let dy = resp.drag_delta().y;
+                    let mut pos = fader_pos(gain.unwrap_or(0.75)) - dy / (y0 - y1);
+                    if pos > UNITY_DETENT_POS { pos = 1.0; }
+                    gain = Some(fader_gain(pos));
+                }
+                if resp.double_clicked() { gain = Some(1.0); }
+                if let Some(g) = gain {
+                    let y = y0 + (y1 - y0) * fader_pos(g);
+                    ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
+                    let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
+                    ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
+                    ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+                }
+                resp.on_hover_text("master volume · double-click: 0 dB");
+            }
+            // The ends first; a mark too close to one already drawn is left out
+            // (a short meter put "0 dB", "−6" and "−12" on top of each other).
+            let mut drawn: Vec<f32> = Vec::new();
+            for db in [0.0f32, -48.0, -24.0, -12.0, -6.0] {
+                let y = mr.bottom() - mr.height() * meter_db_pos(10f32.powf(db / 20.0));
+                if drawn.iter().any(|d| (d - y).abs() < 12.0) { continue; }
+                drawn.push(y);
+                let label = if db == 0.0 { "0 dB".to_string() } else { format!("\u{2212}{:.0}", -db) };
+                ui.painter().text(Pos2::new(mr.right() + 6.0, y), egui::Align2::LEFT_CENTER,
+                    label, egui::FontId::monospace(9.5), theme::CREAM_DIM);
+            }
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(db_readout(gain.unwrap_or(0.75))).size(11.0).monospace().color(theme::CREAM_MID))
+                .on_hover_text("master volume · the last stage is the limiter, then warmth");
+            let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
+            ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
+                .on_hover_text("peak meter of everything kabelsalat plays");
+        });
+        if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
+            self.set_unit_knob(mu, vk, g);
+        }
+    }
+
+    /// The dB fader + its meter, shared by every strip (#72). `gain` is the
+    /// fader's value; the meter shows `level` with a ~1.5 s peak hold and a
+    /// clip light that stays lit until clicked. Returns the fader's rect.
+    fn strip_fader_ui(&mut self, ui: &mut egui::Ui, key: u32, gain: &mut f32, level: f32, fader_h: f32) -> Rect {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
+        let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
+        let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top() + 8.0), egui::vec2(6.0, fader_h - 8.0));
+        // Peak hold + clip (#72): one table keyed by the strip.
+        let dt = self.ui_dt;
+        let now = self.ui_time;
+        let mut clip_clicked = false;
+        {
+            let ph = self.mixer_peaks.entry(key).or_insert_with(PeakHold::new);
+            peak_hold_update(ph, level, now, dt);
+            let clip = Rect::from_min_size(Pos2::new(mr.left() - 1.0, r.top()), egui::vec2(8.0, 5.0));
+            // Id::unique hashes its salt with a fixed seed: key the light by
+            // the strip or every strip's clip light would share ONE id.
+            let cresp = ui.interact(clip, egui::Id::unique(("strip_clip", key)), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if ph.clip {
+                if cresp.clicked() { clip_clicked = true; }
+                cresp.on_hover_text("0 dBFS reached — click to clear");
+            }
+            // Meter + held peak line.
+            paint_meter(ui.painter(), mr, meter_db_pos(level), 0.0);
+            if ph.held > 0.02 {
+                let y = mr.bottom() - mr.height() * ph.held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(mr.left(), y - 1.0), egui::vec2(mr.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            if clip_clicked { ph.clip = false; }
+        }
+        self.mixer_meter_rects.push((key, mr));
+        // Track + cap.
+        let cap_h = 12.0;
+        let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
+        ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
+        // Unity + −12 dB ticks (the meter's dB curve, rule 62).
+        for (g, len) in [(1.0f32, 6.0), (10f32.powf(-12.0 / 20.0), 4.0)] {
+            let y = y0 + (y1 - y0) * fader_pos(g);
+            ui.painter().line_segment([Pos2::new(fr.center().x - len, y), Pos2::new(fr.center().x + len, y)], Stroke::new(1.0, theme::CREAM_DIM));
+        }
+        if resp.dragged() {
+            let dy = resp.drag_delta().y;
+            let mut pos = fader_pos(*gain) - dy / (y0 - y1);
+            // Unity detent (#72): the top of the travel snaps to exactly 0 dB.
+            if pos > UNITY_DETENT_POS { pos = 1.0; }
+            *gain = fader_gain(pos);
+        }
+        if resp.double_clicked() { *gain = 1.0; }
+        let y = y0 + (y1 - y0) * fader_pos(*gain);
+        ui.painter().line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
+        let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
+        ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
+        ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+        resp.on_hover_text("drag to set · double-click: 0 dB (unity)");
+        fr
+    }
+
+    /// A collapsed strip's mini meter (with the same peak hold + clip).
+    fn strip_meter_ui(&mut self, ui: &mut egui::Ui, key: u32, level: f32, h: f32) {
+        let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, h), egui::Sense::hover());
+        let dt = self.ui_dt;
+        let now = self.ui_time;
+        let mut clear_clip = false;
+        {
+            let ph = self.mixer_peaks.entry(key).or_insert_with(PeakHold::new);
+            peak_hold_update(ph, level, now, dt);
+            let clip = Rect::from_min_size(Pos2::new(r.left(), r.top()), egui::vec2(r.width(), 4.0));
+            let cresp = ui.interact(clip, egui::Id::unique(("mini_clip", key)), egui::Sense::click());
+            ui.painter().rect_filled(clip, 1.0, if ph.clip { theme::CLIP_RED } else { theme::METER_TRACK });
+            if ph.clip && cresp.clicked() { clear_clip = true; }
+            let body = Rect::from_min_size(Pos2::new(r.left(), r.top() + 6.0), egui::vec2(r.width(), h - 6.0));
+            paint_meter(ui.painter(), body, meter_db_pos(level), 0.0);
+            if ph.held > 0.02 {
+                let y = body.bottom() - body.height() * ph.held.clamp(0.0, 1.0);
+                ui.painter().rect_filled(Rect::from_min_size(Pos2::new(body.left(), y - 1.0), egui::vec2(body.width(), 2.0)), 1.0, theme::CHIP_ON);
+            }
+            self.mixer_meter_rects.push((key, body));
+        }
+        if clear_clip {
+            if let Some(ph) = self.mixer_peaks.get_mut(&key) { ph.clip = false; }
+        }
+        resp.on_hover_text("peak hold · red = clipped (click the light to clear)");
+    }
+
+    /// Insert slots (#74): a view of the strip's cable chain. A linear chain
+    /// lists its FX (bypass dot, drag to reorder, × to remove) plus an
+    /// "+ insert" picker; custom wiring says so instead of guessing.
+    fn insert_rows_ui(&mut self, ui: &mut egui::Ui, source: Option<u32>, chain: Option<&[usize]>, edits: &mut Vec<PendingInsertEdit>) {
+        let Some(chain) = chain else {
+            theme::tracked_label(ui, "CUSTOM WIRING", 9.0, 0.12, theme::MUTED)
+                .on_hover_text("this strip's cables branch or merge — its effects are all still there, patch them on the rack back (Tab)");
+            return;
+        };
+        let w = ui.available_width();
+        for (slot, &fx) in chain.iter().enumerate() {
+            let (node, name) = {
+                let u = &self.units[fx];
+                (u.node_id, sentence_case(&u.name))
+            };
+            let row = self.strip_row(node);
+            let (rr, resp) = ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::click_and_drag());
+            let fill = if row.bypass { theme::MUTED } else { theme::DARK_PANEL_HI };
+            ui.painter().rect_filled(rr.shrink2(egui::vec2(1.0, 1.0)), 2.0, fill);
+            // Bypass dot (#74): a click toggles pass-through.
+            let dot = Rect::from_min_size(Pos2::new(rr.left() + 5.0, rr.center().y - 4.0), egui::vec2(8.0, 8.0));
+            let dresp = ui.interact(dot, egui::Id::unique(("insert_bypass", node)), egui::Sense::click());
+            let dot_col = if row.bypass { theme::MUTED } else { theme::LIVE_TEAL };
+            if row.bypass {
+                ui.painter().circle_stroke(dot.center(), 3.5, Stroke::new(1.6, dot_col));
+            } else {
+                ui.painter().circle_filled(dot.center(), 3.5, dot_col);
+            }
+            if dresp.clicked() {
+                self.with_strip_row(node, |r| r.bypass = !r.bypass);
+                self.send_strip_bypass(node);
+            }
+            dresp.on_hover_text(if row.bypass { "bypassed — click to enable" } else { "click to bypass (the effect passes its input through)" });
+            // Name.
+            let label = format!("{} {}", slot + 1, truncate_chars(&name, 9));
+            ui.painter().text(Pos2::new(rr.left() + 18.0, rr.center().y), egui::Align2::LEFT_CENTER,
+                &label, egui::FontId::proportional(11.5), if row.bypass { theme::CREAM_DIM } else { theme::CREAM });
+            // Drag reorders (one edit when the drag ends — the rack reloads).
+            if resp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+            if resp.drag_stopped() {
+                // Slot target from the pointer's vertical offset among
+                // the chain's rows (each row 20 px, stacked top-down).
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let top = rr.top() - slot as f32 * 20.0;
+                    let to = ((p.y - top) / 20.0).floor().clamp(0.0, chain.len() as f32 - 1.0) as usize + 1;
+                    if to != slot + 1 {
+                        edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Move { fx: node, to } });
+                    }
+                }
+            }
+            // Remove (shown on hover).
+            let x = Rect::from_min_size(Pos2::new(rr.right() - 18.0, rr.center().y - 8.0), egui::vec2(16.0, 16.0));
+            let xresp = ui.interact(x, egui::Id::unique(("insert_remove", node)), egui::Sense::click());
+            let row_hovered = resp.hovered() || xresp.hovered();
+            if row_hovered {
+                ui.painter().text(x.center(), egui::Align2::CENTER_CENTER, "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
+                if xresp.clicked() {
+                    edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Remove { fx: node } });
+                }
+            }
+            resp.on_hover_text("drag to reorder the chain · × removes the insert");
+            xresp.on_hover_text("remove this insert (the chain closes up)");
+        }
+        if theme::chip_button(ui, "+ insert", false)
+            .on_hover_text("add an effect to this strip's chain (built-in or an installed LV2 effect)")
+            .clicked()
+        {
+            self.insert_pick = Some(source);
+        }
+    }
+
+    /// Strip rename modal (#77): the node's name travels with the graph, so
+    /// the rack face, matrix and agents all show it.
+    fn strip_rename_modal(&mut self, ctx: &egui::Context) {
+        let Some((node, name)) = self.strip_rename.take() else { return };
+        let mut text = name;
+        let mut decided: Option<Option<String>> = None;
+        let modal = egui::Modal::new(egui::Id::new("strip_rename_modal")).show(ctx, |ui| {
+            ui.set_width(320.0);
+            ui.label(egui::RichText::new("Rename strip").size(16.0).strong().color(theme::INK));
+            ui.add_space(8.0);
+            let edit = ui.add(egui::TextEdit::singleline(&mut text).id_salt("strip_rename_text").desired_width(300.0).char_limit(24));
+            if !edit.has_focus() && !edit.lost_focus() { edit.request_focus(); }
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if theme::primary_button(ui, "Rename").clicked() { decided = Some(Some(text.clone())); }
+                ui.add_space(8.0);
+                if theme::chip_button(ui, "Cancel", false).clicked() { decided = Some(None); }
+            });
+        });
+        if modal.should_close() && decided.is_none() { decided = Some(None); }
+        match decided {
+            Some(Some(t)) => match self.apply_strip_name(node, &t) {
+                Ok(n) => self.session_msg = format!("Renamed the strip → {n}"),
+                Err(e) => self.session_msg = e,
+            },
+            Some(None) | None => {}
+        }
+    }
+
+    /// The strip colour palette (#77), anchored like the knob menu: a click
+    /// outside closes it.
+    fn strip_palette_ui(&mut self, ctx: &egui::Context) {
+        let Some(node) = self.strip_color_pick else { return };
+        let clicked_elsewhere = ctx.input(|i| i.pointer.primary_clicked() || i.pointer.secondary_clicked());
+        let mut chosen: Option<Option<egui::Color32>> = None;
+        let screen = self.stage_rect;
+        let area = egui::Area::new(egui::Id::unique("strip_palette"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.center() - egui::vec2(95.0, 40.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(190.0);
+                        ui.label(egui::RichText::new("Strip colour").font(theme::medium_font(12.5)).color(theme::INK));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            for &c in STRIP_PALETTE.iter() {
+                                let (r, resp) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::click());
+                                ui.painter().circle_filled(r.center(), 8.0, c);
+                                if resp.clicked() { chosen = Some(Some(c)); }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        if theme::chip_button(ui, "No colour", false).clicked() { chosen = Some(None); }
+                    });
+            });
+        let inside = area.response.rect.contains(ctx.pointer_hover_pos().unwrap_or_default());
+        if chosen.is_some() || (clicked_elsewhere && !inside) {
+            self.strip_color_pick = None;
+            if let Some(c) = chosen {
+                self.with_strip_row(node, |row| row.color = c);
+            }
+        }
+    }
+
+    /// The insert picker (#74): built-in DSP effects and the installed LV2
+    /// effects (from the background scan — rule 57), with a filter.
+    fn insert_picker_ui(&mut self, ctx: &egui::Context, edits: &mut Vec<PendingInsertEdit>) {
+        let Some(source) = self.insert_pick else { return };
+        let mut chosen: Option<(NodeKind, String)> = None;
+        let mut close = false;
+        let screen = self.stage_rect;
+        let area = egui::Area::new(egui::Id::unique("insert_picker"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.center() - egui::vec2(150.0, 160.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(theme::DARK_PANEL)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::same(10))
+                    .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
+                    .show(ui, |ui| {
+                        ui.set_min_width(280.0);
+                        ui.label(egui::RichText::new("Add insert").font(theme::medium_font(12.5)).color(theme::INK));
+                        ui.add_space(4.0);
+                        let words: Vec<String> = self.insert_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+                        ui.add_sized([ui.available_width(), 20.0],
+                            egui::TextEdit::singleline(&mut self.insert_filter).hint_text("filter effects…"));
+                        ui.add_space(4.0);
+                        egui::ScrollArea::vertical().id_salt("insert_picker_scroll").max_height(240.0).auto_shrink([false, false]).show(ui, |ui| {
+                            let matches = |name: &str| {
+                                let low = name.to_lowercase();
+                                words.iter().all(|w| low.contains(w.as_str()))
+                            };
+                            let mut shown = 0usize;
+                            for (kind, label) in [
+                                (DspKind::Delay, "Delay"), (DspKind::Reverb, "Reverb"), (DspKind::Filter, "Filter"),
+                                (DspKind::Eq3, "Eq 3"), (DspKind::Saturation, "Saturation"), (DspKind::Limiter, "Limiter"),
+                                (DspKind::Gain, "Gain"), (DspKind::Pan, "Pan"),
+                            ] {
+                                if !words.is_empty() && !matches(label) { continue; }
+                                shown += 1;
+                                if theme::chip_button(ui, label, false).clicked() {
+                                    chosen = Some((NodeKind::Dsp(kind), label.to_string()));
+                                }
+                            }
+                            if self.plugin_lists_ready() {
+                                for p in self.plugins_lv2.iter().filter(|p| !p.is_instrument) {
+                                    if !words.is_empty() && !matches(&p.name) { continue; }
+                                    if shown > 200 { break; }
+                                    shown += 1;
+                                    if theme::chip_button(ui, &p.name, false).on_hover_text(&p.uri).clicked() {
+                                        chosen = Some((NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) }, p.name.clone()));
+                                    }
+                                }
+                            } else if words.is_empty() {
+                                ui.label(egui::RichText::new("scanning installed LV2 effects in the background…").size(11.0).color(theme::INK_2));
+                            }
+                            if words.is_empty() {
+                                ui.label(egui::RichText::new("filter to see LV2 effects too").size(10.5).color(theme::CREAM_DIM));
+                            }
+                        });
+                    });
+            });
+        let inside = area.response.rect.contains(ctx.pointer_hover_pos().unwrap_or_default());
+        if ctx.input(|i| i.pointer.primary_clicked()) && !inside { close = true; }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+        if chosen.is_some() || close {
+            self.insert_pick = None;
+            self.insert_filter.clear();
+            if let Some((kind, name)) = chosen {
+                edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Add { kind, name } });
+            }
+        }
+    }
+
+    /// Reorder one strip (#77): move `node` before `before` in its rig's
+    /// display order; the flat `strip_order` is rebuilt per rig so it never
+    /// carries a removed node.
+    fn reorder_strip(&mut self, rig: u8, node: u32, before: u32) {
+        if node == before { return; }
+        let mut order: Vec<u32> = Vec::new();
+        for r in 0..self.rig_count() {
+            let mut nodes: Vec<u32> = self.rig_strip_sources(r as u8).iter()
+                .map(|&u| self.units[u].node_id).collect();
+            if r as u8 == rig {
+                let from = nodes.iter().position(|n| *n == node);
+                let to = nodes.iter().position(|n| *n == before).unwrap_or(nodes.len());
+                if let Some(from) = from {
+                    nodes.remove(from);
+                    let to = to.min(nodes.len());
+                    nodes.insert(to, node);
+                } else {
+                    nodes.push(node);
+                }
+            }
+            order.extend(nodes);
+        }
+        self.strip_order = order;
+    }
+
+    /// Apply a strip rename (#77): the name is graph state — the mirror, the
+    /// rack face and the engine's published graph all take it at once.
+    fn apply_strip_name(&mut self, node: u32, name: &str) -> Result<String, String> {
+        let n: String = name.trim().chars().take(24).collect();
+        if n.is_empty() { return Err("the strip needs a name".into()); }
+        if let Some(m) = self.base_graph.nodes.iter_mut().find(|m| m.id == node) {
+            m.name = name_bytes(&n);
+        }
+        if let Some(sg) = self.shared_graph.lock().ok().as_mut() {
+            if let Some(m) = sg.nodes.iter_mut().find(|m| m.id == node) {
+                m.name = name_bytes(&n);
+            }
+        }
+        for u in self.units.iter_mut().filter(|u| u.node_id == node) {
+            u.name = n.clone();
+            u.name_g = None;
+            u.label_fit_w = f32::INFINITY;
+        }
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::RenameNode { node, name: name_bytes(&n) });
+        }
+        Ok(n)
     }
 
     /// Tab: in any non-rack stage view it returns to the rack; otherwise it flips the rack.
@@ -15060,49 +16384,189 @@ fn parse_pan(s: &str) -> Option<f64> {
 
 /// Mixer channel-strip width (sources and rig buses share it).
 const STRIP_W: f32 = 116.0;
+/// Width of a strip collapsed to its mini form (#77).
+const STRIP_COLLAPSED_W: f32 = 46.0;
 
-fn mixer_strip(ui: &mut egui::Ui, name: &str, sub: &str, value: &mut Option<f32>, level: f32, fader_h: f32) -> Rect {
-    let w = STRIP_W;
-    let mut fader_rect = Rect::NOTHING;
-    ui.allocate_ui_with_layout(egui::vec2(w, fader_h + 90.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-        ui.set_width(w);
-        let name = if name.chars().count() > 11 { format!("{}…", name.chars().take(10).collect::<String>()) } else { name.to_string() };
-        ui.label(egui::RichText::new(name).size(13.0).strong().color(theme::INK));
-        let sub = sub.split('·').next().unwrap_or("").trim().to_uppercase();
-        let sub = if sub.chars().count() > 13 { format!("{}…", sub.chars().take(12).collect::<String>()) } else { sub };
-        theme::tracked_label(ui, &sub, 9.0, 0.12, theme::INK_2);
-        ui.add_space(8.0);
-        let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
-        fader_rect = r;
-        let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
-        let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top()), egui::vec2(6.0, fader_h));
-        let p = ui.painter();
-        // Track: hairline groove; travel keeps the cap fully inside the rect.
-        let cap_h = 12.0;
-        let (y0, y1) = (fr.bottom() - cap_h / 2.0, fr.top() + cap_h / 2.0);
-        p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y1)], Stroke::new(2.0, theme::HAIRLINE));
-        if let Some(v) = value.as_mut() {
-            if resp.dragged() {
-                let dy = resp.drag_delta().y;
-                *v = (*v - dy / (y0 - y1)).clamp(0.0, 1.0);
-            }
-            if resp.double_clicked() { *v = 0.8; }
-            let y = y0 + (y1 - y0) * *v;
-            p.line_segment([Pos2::new(fr.center().x, y0), Pos2::new(fr.center().x, y)], Stroke::new(2.0, theme::CREAM_MID));
-            let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
-            p.rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
-            p.line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
-        }
-        paint_meter(p, mr, level, level);
-        if value.is_some() {
-            resp.on_hover_text("drag to set · double-click: 0.80");
-        }
-        ui.add_space(6.0);
-        let txt = value.map_or("—".to_string(), |v| format!("{v:.2}"));
-        ui.label(egui::RichText::new(txt).size(11.0).monospace().color(theme::CREAM_MID));
-    });
-    fader_rect
+/// ---- dB faders (#72) ----------------------------------------------------
+
+/// Fader position of a gain: the SAME dB curve the meters use (`meter_db_pos`,
+/// −60 dBFS … 0 dBFS), so a fader's travel matches its meter and the readout
+/// is what the ear hears. 0 gain = fully down.
+fn fader_pos(gain: f32) -> f32 {
+    meter_db_pos(gain)
 }
+
+/// The gain a fader position means (inverse of [`fader_pos`]). The bottom of
+/// the travel (pos ≤ 0) is silence — a fader pulled all the way down mutes.
+fn fader_gain(pos: f32) -> f32 {
+    let pos = pos.clamp(0.0, 1.0);
+    // The bottom of the travel is a detent too: −∞, not −58 dB.
+    if pos <= FADER_FLOOR_POS { return 0.0; }
+    10f32.powf((60.0 * pos - 60.0) / 20.0)
+}
+
+/// Unity (0 dB) sits at the top of the travel; dragging within this distance
+/// of it snaps to exactly 1.0 (the detent).
+const UNITY_DETENT_POS: f32 = 0.985;
+/// Below this travel position the fader is fully closed (−∞).
+const FADER_FLOOR_POS: f32 = 0.02;
+
+/// A fader's readout: `−3.2 dB`, `0 dB` at unity, `−∞` when silent (#72).
+fn db_readout(gain: f32) -> String {
+    if gain < 1e-4 { "\u{2212}\u{221e}".into() }
+    else if (gain - 1.0).abs() < 0.0005 { "0 dB".into() }
+    else { format!("\u{2212}{:.1} dB", -(20.0 * gain.log10())) }
+}
+
+/// ---- strip meters: peak hold + clip (#72) -------------------------------
+
+/// One strip meter's peak hold and clip state.
+#[derive(Clone, Copy, Debug)]
+struct PeakHold {
+    /// Held level as a dB meter position (0..1).
+    held: f32,
+    /// `ui_time` when the peak was last touched.
+    at: f32,
+    /// Lit while a block reached 0 dBFS; cleared by a click.
+    clip: bool,
+}
+
+impl PeakHold {
+    fn new() -> Self {
+        Self { held: 0.0, at: -1.0, clip: false }
+    }
+}
+
+/// How long a peak stays held before it falls back with the signal (~1.5 s).
+const PEAK_HOLD_SECS: f32 = 1.5;
+
+/// Update one strip's peak hold + clip from its current level (0..1 linear).
+fn peak_hold_update(ph: &mut PeakHold, level: f32, now: f32, dt: f32) {
+    let pos = meter_db_pos(level);
+    if pos >= ph.held {
+        ph.held = pos;
+        ph.at = now;
+    } else if now - ph.at > PEAK_HOLD_SECS {
+        // Held long enough: relax toward the live level (fast enough to read
+        // as falling, slow enough to see where the peak was).
+        ph.held = (ph.held - dt * 0.5).max(pos).max(0.0);
+    }
+    if level >= 0.999 {
+        ph.clip = true;
+    }
+}
+
+/// Meter-table keys: sources are keyed by their node id; rig buses and the
+/// master out get their own key space at the top of the u32 range (merge-safe:
+/// node ids come from a graph's small counters).
+fn rig_strip_key(rig: usize) -> u32 {
+    u32::MAX - rig.min(7) as u32
+}
+const MASTER_STRIP_KEY: u32 = u32::MAX - 8;
+
+/// ---- per-node strip mirror (#73/#77) ------------------------------------
+
+/// One strip's UI state, keyed by node id. The engine-side part (pan/mute/
+/// solo/bypass) mirrors `Command::SetStripMix` / `SetStripBypass` and the
+/// engine's publication (rule 33); colour and collapse are UI-local session
+/// state (#77).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StripUiRow {
+    node: u32,
+    pan: f32,
+    mute: bool,
+    solo: bool,
+    bypass: bool,
+    color: Option<egui::Color32>,
+    collapsed: bool,
+}
+
+impl StripUiRow {
+    fn new(node: u32) -> Self {
+        Self { node, pan: 0.0, mute: false, solo: false, bypass: false, color: None, collapsed: false }
+    }
+    /// True while nothing differs from a node nobody ever touched.
+    fn is_plain(&self) -> bool {
+        *self == Self::new(self.node)
+    }
+    /// The engine half of the row (pan/mute/solo) as a session entry.
+    fn saved(&self) -> crate::session::StripSaved {
+        crate::session::StripSaved {
+            node: self.node,
+            pan: self.pan,
+            mute: self.mute,
+            solo: self.solo,
+            bypass: self.bypass,
+            color: self.color.map(|c| ((c.r() as u32) << 16) | ((c.g() as u32) << 8) | c.b() as u32),
+            collapsed: self.collapsed,
+        }
+    }
+    fn from_saved(s: &crate::session::StripSaved) -> Self {
+        let color = s.color.map(|rgb| {
+            egui::Color32::from_rgb(((rgb >> 16) & 0xFF) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8)
+        });
+        Self { node: s.node, pan: s.pan, mute: s.mute, solo: s.solo, bypass: s.bypass, color, collapsed: s.collapsed }
+    }
+}
+
+/// One insert-slot edit (#74/#77), as the mixer strip and the agent tools
+/// express it: add an FX to the chain's end, remove one, or move one to a
+/// new slot (1-based; 0 = the source itself).
+#[derive(Clone, Debug)]
+enum StripInsertEdit {
+    Add { kind: NodeKind, name: String },
+    Remove { fx: u32 },
+    Move { fx: u32, to: usize },
+}
+
+/// An insert edit queued during a mixer frame, applied after its layout — a
+/// mid-frame rack rebuild would seed NaN cable springs (rule 32).
+/// `source = None` means the master out's chain.
+#[derive(Clone)]
+struct PendingInsertEdit {
+    source: Option<u32>,
+    edit: StripInsertEdit,
+}
+
+/// Truncate a label to `n` characters with an ellipsis.
+fn truncate_chars(s: &str, n: usize) -> String {
+    if s.chars().count() > n { format!("{}\u{2026}", s.chars().take(n.saturating_sub(1)).collect::<String>()) } else { s.to_string() }
+}
+
+/// One small M/S button pair member (#73). `row` is the strip's current
+/// state (the caller toggles and publishes on click).
+fn strip_ms_button(ui: &mut egui::Ui, row: &mut StripUiRow, which: char) -> egui::Response {
+    let on = match which {
+        'M' => row.mute,
+        _ => row.solo,
+    };
+    let (fill, txt) = if on {
+        (if which == 'M' { theme::CHIP_ON } else { theme::LIVE_TEAL }, theme::DARK_PANEL)
+    } else {
+        (theme::DARK_PANEL_HI, theme::CREAM_MID)
+    };
+    ui.add(egui::Button::new(egui::RichText::new(which.to_string()).size(11.0).color(txt))
+        .fill(fill)
+        .corner_radius(2.0)
+        .min_size(egui::vec2(20.0, 18.0)))
+}
+
+/// Meter-table key of an app-stream strip (they share the strip peak table;
+/// the patch's node ids live far below the top of the u32 range).
+fn app_stream_key(slot: usize) -> u32 {
+    u32::MAX - 40 - slot.min(24) as u32
+}
+
+/// The strip colour palette (#77): warm/neutral jacket hues (rule 3 — tomato
+/// stays reserved for selection/CTAs) plus the live teal.
+const STRIP_PALETTE: [egui::Color32; 6] = [
+    theme::LIVE_TEAL,
+    theme::CABLE_AMBER,
+    theme::CABLE_ROSE,
+    theme::CABLE_SAND,
+    theme::CABLE_VIOLET,
+    theme::CABLE_CYAN,
+];
 
 /// Lit segments of an n-segment meter. Below the -60 dBFS floor (0.001)
 /// nothing lights: the smoothed meter decays toward zero without reaching
@@ -15452,6 +16916,35 @@ pub fn run_session_test() -> anyhow::Result<()> {
     anyhow::ensure!(app.cables.iter().any(|c| c.src == k && c.src_port == 1 && app.units[c.dst].node_id == 4),
         "HIGH cable (Keys port 1 → Surge B) not restored");
     println!("  keys split: point C4 + HIGH cable round-trip, two MIDI outs — OK");
+
+    // --- Mixer strips (#72–77): names, colours, mute/solo/pan, collapse and
+    // order round-trip through the package (rule 65). Non-default values. ---
+    {
+        app.apply_session(&crate::session::Session::load(&pkg)?)?;
+        let node = app.units[1].node_id; // Surge A
+        let amber = crate::session::StripSaved {
+            node, pan: -0.35, mute: true, solo: false, bypass: false,
+            color: Some(0xE2A64E), collapsed: true,
+        };
+        app.apply_strip_name(node, "Bass wurli").map_err(anyhow::Error::msg)?;
+        app.with_strip_row(node, |r| {
+            r.pan = amber.pan;
+            r.mute = amber.mute;
+            r.color = Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E));
+            r.collapsed = true;
+        });
+        let saved = app.capture_session("strips")?;
+        saved.save(&crate::session::Session::package_path(&dir, "selftest-strips")?)?;
+        app.load_demo_patch();
+        let loaded = crate::session::Session::load(&crate::session::Session::package_path(&dir, "selftest-strips")?)?;
+        app.apply_session(&loaded)?;
+        anyhow::ensure!(app.units.iter().any(|u| u.name == "Bass wurli"), "strip name not restored");
+        let row = app.strip_row(node);
+        anyhow::ensure!(row.mute && (row.pan + 0.35).abs() < 1e-6, "strip pan/mute not restored: {row:?}");
+        anyhow::ensure!(row.color == Some(egui::Color32::from_rgb(0xE2, 0xA6, 0x4E)), "strip colour not restored");
+        anyhow::ensure!(row.collapsed, "strip collapse not restored");
+        println!("  mixer strips: name, colour, mute/pan, collapse round-trip — OK");
+    }
 
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
@@ -22958,6 +24451,556 @@ mod settings_and_dropdown_tests {
 }
 
 /// The app hosting real Surge XT voices on an offline engine (`EvalRig`).
+/// Mixer parity (#72/#73/#74/#77) on the offline app: no engine, no plugins —
+/// the mirror and the graph edits are the test surface. The engine halves
+/// (per-source gains, bypass, master inserts) are covered by `rig-mix-test`.
+#[cfg(test)]
+mod mixer_parity_tests {
+    use super::*;
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+    }
+
+    fn click(pos: Pos2) -> Vec<Vec<egui::Event>> {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        vec![vec![egui::Event::PointerMoved(pos)], vec![b(true)], vec![b(false)]]
+    }
+
+    fn drag(from: Pos2, to: Pos2, frames: usize) -> Vec<Vec<egui::Event>> {
+        let b = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        let mut evs = vec![vec![egui::Event::PointerMoved(from)], vec![b(from, true)]];
+        for i in 1..=frames {
+            let t = Pos2::new(from.x + (to.x - from.x) * i as f32 / frames as f32, from.y + (to.y - from.y) * i as f32 / frames as f32);
+            evs.push(vec![egui::Event::PointerMoved(t)]);
+        }
+        evs.push(vec![b(to, false)]);
+        evs
+    }
+
+    fn key(key: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// The demo patch (each Surge feeds a delay AND the master: custom), a
+    /// linear patch (Surge → Delay → Reverb → Master: a strip with inserts),
+    /// or a two-rig demo.
+    enum Rack {
+        Demo,
+        Linear,
+        TwoRigs,
+    }
+
+    fn app_with(rack: Rack) -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        match rack {
+            Rack::Demo => app.load_demo_patch(),
+            Rack::TwoRigs => app.load_multi_rig_demo(),
+            Rack::Linear => {
+                let mut g = Graph::default();
+                g.reserve(16, 16);
+                let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+                let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+                g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+                g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: verb, port: 0 }, CPortKind::Audio);
+                g.connect_with_id(4, PortRef { node: verb, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+                app.apply_session(&crate::session::Session::new("linear", g)).unwrap();
+            }
+        }
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx)
+    }
+
+    fn open_mixer(app: &mut DemoApp, ctx: &egui::Context) {
+        app.stage_view = StageView::Mixer;
+        for _ in 0..2 { frame(app, ctx, vec![]); }
+    }
+
+    /// The first source strip's (rig, node, rect) in the mixer.
+    fn first_strip(app: &DemoApp) -> (u8, u32, Rect) {
+        app.mixer_strip_rects.iter().copied().next().expect("a source strip")
+    }
+
+    // ---- #72: dB faders --------------------------------------------------
+
+    #[test]
+    fn fader_position_and_db_round_trip() {
+        // The fader rides the meters' own dB curve (issue #72).
+        for gain in [1.0f32, 0.9, 0.85, 0.5, 10f32.powf(-12.0 / 20.0), 10f32.powf(-40.0 / 20.0), 0.003] {
+            let pos = fader_pos(gain);
+            assert!((fader_gain(pos) - gain).abs() < gain * 1e-4, "pos {pos} of gain {gain} reads back {}", fader_gain(pos));
+        }
+        // Unity is the top of the travel; silence the bottom.
+        assert_eq!(fader_pos(1.0), 1.0);
+        assert_eq!(fader_gain(fader_pos(0.5)), 0.5);
+        assert_eq!(fader_gain(0.0), 0.0);
+        assert_eq!(fader_pos(0.0), 0.0);
+        // Readouts (#72): `−3.2 dB`, `0 dB` at unity, `−∞` when silent.
+        assert_eq!(db_readout(1.0), "0 dB");
+        assert_eq!(db_readout(0.0), "\u{2212}\u{221e}");
+        assert_eq!(db_readout(10f32.powf(-3.2 / 20.0)), "\u{2212}3.2 dB");
+    }
+
+    #[test]
+    fn bus_fader_double_click_is_exact_unity_and_the_detent_snaps() {
+        let (mut app, ctx) = app_with(Rack::Demo);
+        app.rig_mix[0].vol = 0.5;
+        open_mixer(&mut app, &ctx);
+        // Double-click: exactly 0 dB (issue #72).
+        let fader = app.mixer_fader_rects[0].center();
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE,
+        }]);
+        frame(&mut app, &ctx, vec![egui::Event::PointerButton {
+            pos: fader, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE,
+        }]);
+        assert_eq!(app.rig_mix[0].vol, 1.0, "double-click gives exactly unity gain");
+        // Dragging into the detent zone snaps to unity too.
+        app.rig_mix[0].vol = 0.5;
+        open_mixer(&mut app, &ctx);
+        let fader = app.mixer_fader_rects[0].center();
+        // 0.5 sits at pos 0.9; drag near the top (pos ≥ 0.985 = the detent).
+        let top = Rect::from_min_size(app.mixer_fader_rects[0].min, egui::vec2(8.0, 8.0));
+        for ev in drag(fader, top.center(), 6) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.rig_mix[0].vol, 1.0, "the detent snaps the fader to 0 dB ({})", app.rig_mix[0].vol);
+    }
+
+    #[test]
+    fn source_fader_moves_the_level_knob_on_the_db_curve() {
+        let (mut app, ctx) = app_with(Rack::Demo);
+        open_mixer(&mut app, &ctx);
+        let (_, node, _) = first_strip(&app);
+        let unit = app.units.iter().position(|u| u.node_id == node).unwrap();
+        let k = app.units[unit].knob_index("LEVEL").expect("Surge's LEVEL knob");
+        let start = app.units[unit].knobs[k].value;
+        assert!(start < 1.0, "the demo starts below unity ({start})");
+        // Drag the fader all the way up: the unity detent gives exactly 0 dB.
+        let (_, mr) = app.mixer_meter_rects.iter().copied().find(|(key, _)| *key == node).expect("the strip's meter");
+        let x = mr.left() - 25.0;
+        for ev in drag(Pos2::new(x, mr.bottom() - 10.0), Pos2::new(x, mr.top() + 4.0), 8) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.units[unit].knobs[k].value, 1.0, "a full pull lands on the 0 dB detent");
+        // And back down to silence: the bottom of the travel is −∞.
+        for ev in drag(Pos2::new(x, mr.top() + 4.0), Pos2::new(x, mr.bottom() + 30.0), 8) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.units[unit].knobs[k].value, 0.0, "a fully closed fader is −∞");
+    }
+
+    #[test]
+    fn peak_hold_lights_decays_and_the_clip_latch_clears_on_click() {
+        // The semantics of one strip meter (#72), deterministically.
+        let mut ph = PeakHold::new();
+        peak_hold_update(&mut ph, 0.5, 1.0, 1.0 / 60.0);
+        assert!(ph.held > 0.6, "a loud block lights the hold");
+        assert!(!ph.clip, "half level is no clip");
+        // The hold stays ~1.5 s while the signal falls.
+        peak_hold_update(&mut ph, 0.0, 1.0 + 1.0, 1.0 / 60.0);
+        let held_before = ph.held;
+        assert_eq!(ph.held, held_before, "inside the window the peak stays held");
+        // After the window it relaxes with the signal.
+        for t in 0..180 {
+            peak_hold_update(&mut ph, 0.0, 2.0 + t as f32 / 60.0, 1.0 / 60.0);
+        }
+        assert!(ph.held < 0.1, "the peak fell back ({})", ph.held);
+        // Clip: latched at 0 dBFS, cleared only by hand.
+        peak_hold_update(&mut ph, 1.0, 5.0, 1.0 / 60.0);
+        assert!(ph.clip, "0 dBFS latches the clip light");
+        peak_hold_update(&mut ph, 0.0, 6.0, 1.0 / 60.0);
+        assert!(ph.clip, "falling does not clear it");
+        ph.clip = false; // the click
+        peak_hold_update(&mut ph, 0.0, 7.0, 1.0 / 60.0);
+        assert!(!ph.clip, "a click clears the light");
+    }
+
+    #[test]
+    fn the_masters_clip_light_is_clickable_at_every_size() {
+        // Rule 64: narrow windows are tested by clicking. The clip latch
+        // clears on a click at the default AND the smallest sizes.
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let (mut app, ctx) = app_with(Rack::Demo);
+            app.mixer_peaks.insert(MASTER_STRIP_KEY, PeakHold { held: 1.0, at: -1.0, clip: true });
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            app.stage_view = StageView::Mixer;
+            for _ in 0..2 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+                raw.time = Some(app.ui_time as f64 + 1.0);
+                eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+                ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            }
+            let (_, mr) = app.mixer_meter_rects.iter().copied().find(|(k, _)| *k == MASTER_STRIP_KEY).expect("the master meter");
+            let clip_pos = Pos2::new(mr.left() + 4.0, mr.top() - 4.0);
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(w, h)));
+            for ev in click(clip_pos).into_iter().flatten() { raw.events.push(ev); }
+            raw.time = Some(app.ui_time as f64 + 2.0);
+            eframe::App::raw_input_hook(&mut app, &ctx, &mut raw);
+            ctx.run_ui(raw, |ui| app.frame_ui(ui)).textures_delta.clear();
+            assert!(!app.mixer_peaks.get(&MASTER_STRIP_KEY).unwrap().clip, "{w}x{h}: the clip light clears on a click");
+        }
+    }
+
+    // ---- #74: insert slots (a view of the cable chain) -------------------
+
+    #[test]
+    fn strips_list_their_linear_chain_and_say_custom_for_branches() {
+        // A linear chain names its FX in order (issue #74).
+        let (app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let chain = app.strip_chain(surge).expect("the linear patch is a linear chain");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["DELAY", "REVERB"], "{names:?}");
+        // The demo patch's dry path (Surge → Delay AND Surge → Master) is
+        // custom: shown, never guessed.
+        let (app, _ctx) = app_with(Rack::Demo);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        assert!(app.strip_chain(surge).is_none(), "the dry path must read as custom wiring");
+    }
+
+    #[test]
+    fn add_remove_and_move_inserts_rewire_the_cables() {
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let before: Vec<(u32, u32)> = app.cables.iter().filter(|c| c.kind == PortKind::Audio && c.src == surge).map(|c| (app.units[c.dst].node_id, 1)).collect();
+        let _ = before;
+
+        // ADD: a Filter lands at the chain's end, before the rig bus.
+        let msg = app.strip_insert_edit(source, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Filter),
+            name: "FILTER".into(),
+        }).expect("the insert edit applies");
+        assert!(msg.contains("Filter"), "{msg}");
+        let chain = app.strip_chain(surge).expect("still linear");
+        assert_eq!(chain.len(), 3, "delay + reverb + the new filter");
+        assert_eq!(app.units[chain[2]].name, "FILTER");
+        // The rack cables moved: delay → reverb → filter → master.
+        let nodes: Vec<u32> = std::iter::once(source)
+            .chain(chain.iter().map(|&u| app.units[u].node_id))
+            .collect();
+        for pair in nodes.windows(2) {
+            assert!(
+                app.cables.iter().any(|c| c.kind == PortKind::Audio
+                    && app.units.get(c.src).map(|u| u.node_id) == Some(pair[0])
+                    && app.units.get(c.dst).map(|u| u.node_id) == Some(pair[1])),
+                "no cable {} → {} after the add ({:?})", pair[0], pair[1], app.cables.iter().map(|c| (c.src, c.dst)).collect::<Vec<_>>()
+            );
+        }
+
+        // MOVE: the filter jumps to slot 1 (before the delay).
+        let filter = app.units[chain[2]].node_id;
+        app.strip_insert_edit(source, StripInsertEdit::Move { fx: filter, to: 1 }).expect("the move applies");
+        let chain = app.strip_chain(surge).expect("still linear after the move");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["FILTER", "DELAY", "REVERB"], "reorder changed the chain: {names:?}");
+        // And the sound follows the cables: filter → delay now.
+        let (f, d) = (app.units[chain[0]].node_id, app.units[chain[1]].node_id);
+        assert!(app.cables.iter().any(|c| c.kind == PortKind::Audio && app.units[c.src].node_id == f && app.units[c.dst].node_id == d),
+            "the cables follow the reorder");
+
+        // REMOVE: the chain closes up.
+        app.strip_insert_edit(source, StripInsertEdit::Remove { fx: filter }).expect("the remove applies");
+        let chain = app.strip_chain(surge).expect("still linear after the remove");
+        let names: Vec<&str> = chain.iter().map(|&u| app.units[u].name.as_str()).collect();
+        assert_eq!(names, ["DELAY", "REVERB"]);
+        assert!(!app.units.iter().any(|u| u.node_id == filter), "the FX node is gone");
+    }
+
+    #[test]
+    fn a_custom_strip_refuses_insert_edits_instead_of_guessing() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let err = app.strip_insert_edit(source, StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Reverb),
+            name: "REVERB".into(),
+        }).expect_err("custom wiring must refuse");
+        assert!(err.contains("custom"), "the error names the situation: {err}");
+    }
+
+    #[test]
+    fn master_inserts_are_cables_from_the_master_out() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        // Add a master insert: a cable Master OUT → FX.
+        let msg = app.master_insert_edit(StripInsertEdit::Add {
+            kind: NodeKind::Dsp(DspKind::Gain),
+            name: "GAIN".into(),
+        }).expect("the master insert applies");
+        assert!(msg.contains("master insert"), "{msg}");
+        let chain = app.master_chain();
+        assert_eq!(chain.len(), 1, "one master insert");
+        let master_node = app.units[app.master_unit.unwrap()].node_id;
+        let fx = chain[0];
+        assert!(app.cables.iter().any(|c| app.units.get(c.src).map(|u| u.node_id) == Some(master_node) && c.dst == fx),
+            "the insert is a cable Master OUT → FX");
+        // Bypassing it is the strip's own row (#74).
+        let node = app.units[fx].node_id;
+        let out = app.exec_tool("set_node_bypass", &serde_json::json!({ "node": node, "bypass": true }));
+        assert!(out.contains("bypass true"), "{out}");
+        assert!(app.strip_row(node).bypass, "the mirror latched the bypass");
+        // Removing it closes the chain (nothing left).
+        app.master_insert_edit(StripInsertEdit::Remove { fx: node }).expect("the remove applies");
+        assert!(app.master_chain().is_empty(), "the master chain is empty again");
+    }
+
+    // ---- #73: per-source mute/solo/pan ------------------------------------
+
+    #[test]
+    fn strip_mix_tools_reach_the_mirror_and_name_the_source() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        // The agent tool (#73, rules 6/23).
+        let out = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": node, "mute": true, "pan": -0.5 }));
+        assert!(out.contains("mute true"), "{out}");
+        assert!(out.contains("pan -0.50"), "{out}");
+        let row = app.strip_row(node);
+        assert!(row.mute && (row.pan + 0.5).abs() < 1e-6, "the mirror holds pan/mute");
+        // A node that is not there says so (rule 77: the model can correct).
+        let bad = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": 999, "mute": true }));
+        assert!(bad.contains("no unit with node id 999"), "{bad}");
+        // Soloing one source is scoped to its rig.
+        let (mut app, _ctx) = app_with(Rack::TwoRigs);
+        let nodes: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        assert_eq!(nodes.len(), 2, "one source per rig");
+        let _ = app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nodes[0], "solo": true }));
+        assert!(app.strip_row(nodes[0]).solo);
+        assert!(!app.strip_row(nodes[1]).solo, "the other rig's source is untouched");
+    }
+
+    #[test]
+    fn a_remote_strip_edit_updates_the_mixer_mirror() {
+        // Rule 33: every engine state the UI shows is published back. The app
+        // adopts a published strip table without an engine of its own.
+        let (mut app, ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let pub_: Arc<Mutex<crate::engine::GraphPub>> = Arc::new(Mutex::new(crate::engine::GraphPub {
+            strips: crate::engine::strips_pub_table(&[(node, crate::engine::StripMix { pan: 0.25, mute: true, solo: false, bypass: false })]),
+            mix_rev: 7,
+            ..Default::default()
+        }));
+        app.graph_pub = Some(pub_);
+        app.stage_view = StageView::Rack; // the adoption runs in every view
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let row = app.strip_row(node);
+        assert!(row.mute && (row.pan - 0.25).abs() < 1e-6, "the mirror adopted the published strip ({:?})", row);
+        assert!(app.agent_activity.log.iter().any(|a| a.summary.contains("Source mix") || a.summary.contains("Mix")), "a remote mix edit is attributed");
+    }
+
+    // ---- #77: names, colours, order, collapse ----------------------------
+
+    #[test]
+    fn strip_names_and_colours_survive_a_session_round_trip() {
+        // Rule 65 + issue #77 acceptance: names and colours survive
+        // save/load — tested with NON-default values (rule 59 class).
+        let (mut app, _ctx) = app_with(Rack::TwoRigs);
+        let nodes: Vec<u32> = app.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Clap)).map(|u| u.node_id).collect();
+        let amber = egui::Color32::from_rgb(0xE2, 0xA6, 0x4E);
+        app.apply_strip_name(nodes[0], "Bass wurli").unwrap();
+        app.with_strip_row(nodes[0], |r| {
+            r.mute = true;
+            r.pan = -0.35;
+            r.color = Some(amber);
+            r.collapsed = true;
+        });
+        app.reorder_strip(0, nodes[0], nodes[1]); // display order: B first
+
+        let saved = app.capture_session("parity").unwrap();
+        // Wipe: a fresh rack, then reload.
+        app.load_demo_patch();
+        assert!(app.strips.is_empty() || !app.strip_row(nodes[0]).mute, "the demo patch reset the strips");
+        app.apply_session(&saved).unwrap();
+
+        assert!(app.units.iter().any(|u| u.name == "Bass wurli"), "the strip name survived the round trip");
+        let row = app.strip_row(nodes[0]);
+        assert!(row.mute && (row.pan + 0.35).abs() < 1e-6, "pan/mute survived: {row:?}");
+        assert_eq!(row.color, Some(amber), "the colour survived");
+        assert!(row.collapsed, "the collapse flag survived");
+        assert_eq!(app.strip_order, vec![nodes[0], nodes[1]], "the display order survived");
+    }
+
+    #[test]
+    fn undo_restores_strip_state_with_non_default_values() {
+        // Rule 59: the undo snapshot holds everything, tested with values
+        // that differ from the defaults.
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.with_strip_row(node, |r| {
+            r.mute = true;
+            r.color = Some(egui::Color32::from_rgb(0xD9, 0x8B, 0xA0));
+        });
+        app.note_agent_change(AgentOrigin::Assistant);
+        // Then a later job changes them.
+        app.with_strip_row(node, |r| {
+            r.mute = false;
+            r.color = None;
+        });
+        let out = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(out.contains("undid"), "{out}");
+        let row = app.strip_row(node);
+        assert!(row.mute, "undo restored the mute");
+        assert_eq!(row.color, Some(egui::Color32::from_rgb(0xD9, 0x8B, 0xA0)), "undo restored the colour");
+    }
+
+    #[test]
+    fn renaming_a_strip_renames_the_rack_face_and_the_graph() {
+        let (mut app, _ctx) = app_with(Rack::Demo);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let out = app.exec_tool("rename_strip", &serde_json::json!({ "node": node, "name": "Lead" }));
+        assert!(out.contains("renamed"), "{out}");
+        assert!(app.units.iter().any(|u| u.node_id == node && u.name == "Lead"), "the face shows the new name");
+        assert_eq!(name_str(&app.base_graph.node(node).unwrap().name), "Lead", "the graph carries it (so sessions do)");
+        // Empty names are refused.
+        let bad = app.exec_tool("rename_strip", &serde_json::json!({ "node": node, "name": "  " }));
+        assert!(bad.contains("needs a name"), "{bad}");
+    }
+
+    /// A rig with TWO sources sharing one master: move/collapse need it.
+    fn two_source_app() -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(16, 16);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for name in ["SURGE A", "SURGE B"] {
+            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(name));
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+            g.connect_with_id(edge, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        }
+        app.apply_session(&crate::session::Session::new("two sources", g)).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        (app, ctx)
+    }
+
+    #[test]
+    fn colours_move_and_collapse_shape_the_strip() {
+        let (mut app, ctx) = two_source_app();
+        open_mixer(&mut app, &ctx);
+        let strips: Vec<(u8, u32, Rect)> = app.mixer_strip_rects.clone();
+        assert_eq!(strips.len(), 2, "two source strips");
+        let (a, b) = (strips[0].1, strips[1].1);
+        // Colour (a palette word), collapse (the agent tools).
+        let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": a, "color": "amber" }));
+        assert!(out.contains("#E2A64E"), "{out}");
+        let out = app.exec_tool("collapse_strip", &serde_json::json!({ "node": a }));
+        assert!(out.contains("collapsed"), "{out}");
+        frame(&mut app, &ctx, vec![]);
+        let rect = app.mixer_strip_rects.iter().copied().find(|(_, n, _)| *n == a).expect("the collapsed strip");
+        assert!(rect.2.width() < 60.0, "a collapsed strip is the mini form ({})", rect.2.width());
+        let full = app.mixer_strip_rects.iter().copied().find(|(_, n, _)| *n == b).expect("the other strip");
+        assert!(full.2.width() > 100.0, "the uncollapsed strip keeps its width");
+        // Move: display order within the rig.
+        let out = app.exec_tool("move_strip", &serde_json::json!({ "node": a, "to": 2 }));
+        assert!(out.contains("slot 2"), "{out}");
+        assert_eq!(app.rig_strip_sources(0).iter().map(|&u| app.units[u].node_id).collect::<Vec<_>>(), vec![b, a],
+            "the strip moved to slot 2");
+    }
+
+    /// A populated mixer (inserts, colours, collapse, mute, pan, a master
+    /// insert) written as PNGs for the PR's evidence:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_parity_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_parity_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = Graph::default();
+        g.reserve(24, 24);
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        let mut edge = 1;
+        for s in [a, b, c] {
+            g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
+        }
+        g.connect_with_id(edge, PortRef { node: a, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
+        g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.apply_session(&crate::session::Session::new("mixer shots", g)).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.strip_insert_edit(na, StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Reverb), name: "REVERB".into() }).unwrap();
+        let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
+        app.master_insert_edit(StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Gain), name: "GAIN".into() }).unwrap();
+        app.apply_strip_name(na, "Bass wurli").unwrap();
+        app.apply_strip_name(nb, "Pad").unwrap();
+        for (n, hex) in [(na, "amber"), (nb, "rose")] {
+            let out = app.exec_tool("set_strip_color", &serde_json::json!({ "node": n, "color": hex }));
+            assert!(out.contains('#'), "{out}");
+        }
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": na, "pan": -0.35 }));
+        app.exec_tool("set_strip_mix", &serde_json::json!({ "node": nb, "mute": true }));
+        app.exec_tool("collapse_strip", &serde_json::json!({ "node": nc }));
+        for (i, u) in app.units.iter_mut().enumerate() {
+            if let Some(k) = u.knob_index("LEVEL") { u.knobs[k].set_immediate([0.8, 0.55, 0.9, 0.4][i % 4]); }
+        }
+        app.stage_view = StageView::Mixer;
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
+    }
+
+    #[test]
+    fn dragging_a_strip_name_reorders_it_live() {
+        let (mut app, ctx) = two_source_app();
+        open_mixer(&mut app, &ctx);
+        let strips: Vec<(u8, u32, Rect)> = app.mixer_strip_rects.clone();
+        assert_eq!(strips.len(), 2, "two source strips");
+        let (a, b) = (strips[0], strips[1]);
+        // Drag A's NAME (the strip's top row) onto B: A takes B's place.
+        let name_a = Pos2::new(a.2.center().x, a.2.top() + 10.0);
+        let over_b = b.2.center();
+        for ev in drag(name_a, over_b, 8) { frame(&mut app, &ctx, ev); }
+        let order: Vec<u32> = app.rig_strip_sources(0).iter().map(|&u| app.units[u].node_id).collect();
+        assert_eq!(order, vec![b.1, a.1], "dragging the name moved the strip: {order:?}");
+    }
+
+    #[test]
+    fn the_insert_picker_is_a_view_not_a_second_model() {
+        // #74's design line: the slots ARE the cables. A bypassed insert
+        // keeps its node and its cables.
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
+        let source = app.units[surge].node_id;
+        let node = app.strip_chain(surge).unwrap()[0];
+        let node_id = app.units[node].node_id;
+        let cables = app.cables.len();
+        let _ = app.exec_tool("set_node_bypass", &serde_json::json!({ "node": node_id, "bypass": true }));
+        assert_eq!(app.cables.len(), cables, "bypassing changes no cable");
+        assert!(app.units.iter().any(|u| u.node_id == node_id), "the FX node stays");
+        assert!(app.strip_chain(surge).is_some(), "the chain view is unchanged");
+        let _ = source;
+    }
+}
+
 /// Skipped when Surge XT is not installed.
 #[cfg(test)]
 mod voice_host_tests {

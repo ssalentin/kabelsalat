@@ -639,6 +639,12 @@ fn system_prompt() -> String {
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
+     - Hear: listen records the next seconds of the master and a listening model scores \
+     it 0-10 on the words you pass as attributes (take them from the user's request: \
+     \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
+     It hears only what plays during the recording: call play_note for the notes first, \
+     in the same step. Use it to check a sound you made against what the user asked for, \
+     change one thing, then listen again to compare; stop after 3 rounds.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -729,6 +735,15 @@ pub(crate) fn tools() -> Value {
             "name":"measure_mix",
             "description":"Read the master-bus loudness/profile meter (Bravo measure loop): momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation + a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness measurement now (this resets the integration, not the signal).",
             "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
+        }},
+        {"type":"function","function":{
+            "name":"listen",
+            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note first in the same step. Takes about seconds + 3 s.",
+            "parameters":{"type":"object","properties":{
+                "attributes":{"type":"string","description":"Comma-separated words from the user's request the sound should match, e.g. \"8-bit, heroic\""},
+                "seconds":{"type":"number","description":"How long to record, 0.5-8 (default 4)"},
+                "question":{"type":"string","description":"Anything else to ask about the sound"}
+            }}
         }},
         {"type":"function","function":{
             "name":"play_note",

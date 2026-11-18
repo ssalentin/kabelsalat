@@ -745,18 +745,47 @@ Learned so far (2026-11-15, UI polish pass):
     ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
-128. **A silence check flushes the master's tails first:** the master's DC
+128. **`max_tokens` counts a thinking model's hidden reasoning:** the
+    listening model got 400 and spent 242 to 326 of them reasoning, so
+    answers stopped mid-line ("SCORES\n8-bit: 0\nsoft") and read as missing
+    scores. Give reasoning models ≥ 4000 and cap the thinking with
+    `reasoning.effort` instead; check `usage.completion_tokens_details`.
+129. **Blocking HTTP never runs on the MCP server's async runtime:** the
+    headless MCP `listen` built a `reqwest::blocking` client inside an rmcp
+    tool and the process panicked ("Cannot drop a runtime in a context where
+    blocking is not allowed"). Run it on a `std::thread` and join.
+130. **A reference the model judges must be the thing it names:** synthetic
+    naive saws alias, so every model heard the "fanfare" as chiptune and
+    `listen-test` failed for the reference, not the model. Reference clips
+    are real instrument patches rendered through the engine.
+131. **An eval harness wires every path the live app wires:** `EvalRig` had
+    no `note_sink`, so the agent's `play_note` reached nothing and every
+    agent-eval master was silent (`listen` heard −120 dBFS). Before trusting
+    an eval of a new tool, check that what it observes is live there.
+132. **A feature PR ships its README entry, and fresh shots when users can
+    see the difference:** the plugin-editor windows (#71) merged without a
+    line in "What you can do", and the README's feature list quietly went
+    stale. A PR labelled `enhancement` updates `README.md` (its entry under
+    "What you can do", or "Install") in the same change, and when the feature
+    changes what the app shows or how it is played, re-captures the
+    screenshots that entry shows (`scripts/shot.sh` into `docs/shots/`,
+    rule 108 review). `.github/workflows/readme-check.yml`
+    (`scripts/ci/readme-check.sh`, self-tested on real `gh api` output with
+    `--selftest`) fails an `enhancement` PR without a README change and warns
+    when `src/ui.rs`/`src/theme.rs` changed without a screenshot — label
+    only real features, so the fail stays meaningful.
+133. **A silence check flushes the master's tails first:** the master's DC
     blocker and limiter ring on for ~100 ms after a cut, and effects slew their
     gain over ~10 ms, so `rig-mix-test`'s "vol 0 is silent" failed on `main`
     (0.003 residual, peak over the first blocks). Render and discard ~30
     blocks before measuring what must be silent; compare levels of a decaying
     note only after retriggering it (`shot` in the strip-mix section).
-129. **Solo silences sources that have no strip entry:** `strip_gains_of`
+134. **Solo silences sources that have no strip entry:** `strip_gains_of`
     returned "untouched" for a source without an entry, so soloing source B
     left source A playing at full level (0.36 vs 0.22 peak). Treat a missing
     entry as the default mix and let the rig's solo flag decide
     (`another_sources_solo_silences_an_untouched_source`).
-130. **A draggable widget's id is keyed by what it is, never by where it is:**
+135. **A draggable widget's id is keyed by what it is, never by where it is:**
     a live strip reorder moved the strip under the pointer, and the
     position-derived id handed the drag to whichever strip now sat in the old
     slot, so two strips swapped back and forth. Use
@@ -764,7 +793,7 @@ Learned so far (2026-11-15, UI polish pass):
     previous frame's rects (`mixer_strip_rects_prev`): the current frame's
     list only holds the strips already drawn
     (`dragging_a_strip_name_reorders_it_live`).
-131. **A 1-based slot is 1-based everywhere:** `Move { to }` was documented
+136. **A 1-based slot is 1-based everywhere:** `Move { to }` was documented
     and tested as the slot shown on the strip (1 = first) but inserted at a
     0-based index, so "move to slot 1" landed second. Convert once, at the
     edit (`to.clamp(1, len) - 1`), and send the shown number from the UI.
@@ -782,6 +811,13 @@ Learned so far (2026-11-15, UI polish pass):
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
+- **New features (user, 2026-11-18):** a feature is an issue labelled
+  `enhancement`, and the PR that implements it carries the label too. That
+  PR updates `README.md` in the same change — the feature's entry under
+  "What you can do" (or "Install") — and, when it changes what users see,
+  fresh screenshots for that entry (`scripts/shot.sh`, rule 108 review).
+  The `readme-check` workflow (rule 132) fails it otherwise and warns when
+  UI code changed without a screenshot.
 - **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
   `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
   opens the release PR, its merge is tagged, and the tag builds every package
@@ -801,13 +837,16 @@ Learned so far (2026-11-15, UI polish pass):
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
+  (calls the listening model; prints rankings and latency),
   `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
-  [--task <name>] [--no-jev]` runs the in-app agent over 25 scripted requests
+  [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree
   for `yanes_bass` / `organ_jazz` / `organ_no_pad`; it calls the configured
-  model APIs and costs a few cents) and `kabelsalat jev-test` shows Jev's
+  model APIs and costs a few cents; `listen_bright` also calls the listening
+  model) and `kabelsalat jev-test` shows Jev's
   decisions. A new shortcut row
   needs an eval task and a `JEV_SAMPLES` line. Surge logs to stdout: filter
   with

@@ -619,7 +619,7 @@ fn strip_gains_of(
     solo_rigs: &[bool; 8],
 ) -> Option<(f32, f32)> {
     // A source nobody touched has no entry but is still silenced by another
-    // source's solo in its rig (rule 129).
+    // source's solo in its rig (rule 134).
     let m = strips.iter().find(|(n, _)| *n == node).map(|(_, m)| *m).unwrap_or(StripMix::DEFAULT);
     let rig = graph.node(node).map(|n| n.rig as usize).unwrap_or(0).min(7);
     if m.is_default() && !solo_rigs[rig] { return None; }
@@ -912,6 +912,8 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    /// The audio judge's master tap (#35): pushes only while a listen records.
+    listen: Option<crate::listen::Tap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
     record_sync: bool,
     // A synced take is armed but not started until the song clock reaches
@@ -1023,6 +1025,7 @@ impl GraphEngine {
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             recorder: None,
+            listen: None,
             record_sync: false,
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
@@ -1331,6 +1334,10 @@ impl GraphEngine {
     /// Attach the master recording tap (writer thread started elsewhere).
     pub fn set_recorder(&mut self, tap: RecorderTap) {
         self.recorder = Some(tap);
+    }
+
+    pub fn set_listen_tap(&mut self, tap: crate::listen::Tap) {
+        self.listen = Some(tap);
     }
 
     /// Start recording the master output (idempotent). No-op without a tap.
@@ -2854,6 +2861,9 @@ impl GraphEngine {
             // user hears. RT-safe — push never blocks; a full ring drops frames.
             if let Some(rec) = &mut self.recorder {
                 rec.push_stereo(data, ch);
+            }
+            if let Some(listen) = &mut self.listen {
+                listen.push_stereo(data, ch);
             }
             // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
             // output the user hears.
@@ -5211,7 +5221,7 @@ pub fn rig_mix_test() -> anyhow::Result<()> {
     bus.send(Command::SetRigMix { rig: 0, vol: Some(0.0), pan: Some(0.0), mute: None, solo: None });
     bus.send(Command::SetRigMix { rig: 1, vol: Some(0.0), pan: None, mute: None, solo: None });
     // The master's DC blocker and limiter ring on for ~100 ms after a cut
-    // (rule 128): flush that tail, then measure what stays.
+    // (rule 133): flush that tail, then measure what stays.
     for _ in 0..30 { engine.render(&mut buf, 2); }
     let (zero_l, zero_r) = measure(&mut engine, &mut buf);
     anyhow::ensure!(zero_l < 1e-4 && zero_r < 1e-4, "vol 0 not silent ({zero_l}, {zero_r})");

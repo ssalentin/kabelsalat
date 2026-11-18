@@ -78,6 +78,15 @@ shows its CC number and follows your hardware from then on.
 After stopping you can play the take back or open its folder; **SYNC** starts
 and stops the recording with the transport.
 
+### Play along with a backing track
+Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the
+master like AUM's FilePlayer: **loop** restarts it seamlessly, **sync** plays it
+at the transport tempo from its original BPM (a "120 bpm" in the file name is
+picked up; speed changes, pitch follows, no time-stretch), **beats** sets the loop
+length in beats so an aligned loop never drifts off the metronome, and **offset**
+shifts the start. With sync on and the transport rolling, it starts on the next
+bar line.
+
 ### Ask the assistant — or your own AI agent
 The built-in assistant (bring your own DeepSeek key) can set things up for you:
 "add a reverb to this rig", "split the keys at C4", "load a warm pad". Everything

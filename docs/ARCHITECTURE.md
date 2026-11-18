@@ -98,6 +98,11 @@ agents are in [AGENTS.md](../AGENTS.md).
   windows — editors open inside the host window (§6). Host runs under XWayland so
   X11 reparenting works. *Superseded 2026-11-17:* editors are native egui
   parameter views, and the app runs as a native Wayland client.
+- **2026-11-17** — **Plugin GUIs in their own windows** (user): the plugin's
+  own editor opens on request ("Open plugin window" in the editor pane) as a
+  separate XWayland dialog window that kabelsalat creates and the plugin
+  embeds into. The main app stays a native Wayland client; the native egui
+  pane stays the default editor.
 - **2026-11-14** — **Reason's rack flip adopted as interaction model** (user):
   labeled rack units, Tab flips to the back panel where the cables live (§2a).
 - **2026-11-14** — **Built-in assistant requested** (user): DeepSeek-powered, BYOK,
@@ -386,8 +391,11 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
   plane (`kabelsalat-control`); every command flows through one lock-free ring into
   the engine. This is what guarantees 1:1 MCP coverage (§2c).
 - **Display:** native Wayland (winit), at the compositor's fractional scale.
-  Plugin editors are native egui parameter views, never the plugin's own
-  window, so no X server or XWayland is needed.
+  The default editors are native egui parameter views. A plugin's own GUI is
+  X11 on Linux, so it opens in a host-owned XWayland toplevel
+  (`plugin_window.rs`, a `_NET_WM_WINDOW_TYPE_DIALOG` so window managers float
+  it); the UI frame drives the plugin's `timer-support` and
+  `posix-fd-support` callbacks, which JUCE editors paint from.
 - **Threads:** UI (egui) · audio callback (cpal, RT) · MIDI in (midir) · disk pool.
   UI→audio: `rtrb` command rings. Audio→UI: `triple_buffer` snapshots (meters,
   playhead, **per-edge levels for cable animation**) + event ring (notes, xruns).

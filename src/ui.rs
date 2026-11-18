@@ -2384,6 +2384,8 @@ struct DemoApp {
     lv2_preset_name: Option<String>,
     lv2_editor_request: Option<(u32, String, String)>,
     editor_status: String,
+    /// Why the open editor's plugin window did not open.
+    plugin_window_error: Option<String>,
     /// Last single click on a unit (unit, time) for double-click detection.
     last_unit_click: Option<(usize, std::time::Instant)>,
 }
@@ -2626,6 +2628,7 @@ impl DemoApp {
             lv2_preset_name: None,
             lv2_editor_request: None,
             editor_status: String::new(),
+            plugin_window_error: None,
             last_unit_click: None,
         };
 
@@ -5941,6 +5944,7 @@ impl DemoApp {
         }
         self.lv2_editor_node = None;
         self.editor_rig = rig;
+        self.plugin_window_error = None;
         self.editor_filter.clear();
         let pool_idx = self.clap_pool_idx(rig);
         self.editor_params = pool_idx
@@ -6134,6 +6138,24 @@ impl DemoApp {
             .fixed_size([480.0, 700.0])
             .show(ctx, |ui| {
                 let pool_idx = self.clap_pool_idx(rig);
+                if let Some(main) = pool_idx.and_then(|i| self._surge_main.get_mut(i)) {
+                    if main.has_editor() {
+                        let open = main.editor_open();
+                        let label = if open { "Close plugin window" } else { "Open plugin window" };
+                        if theme::chip_button(ui, label, open).on_hover_text("the plugin's own editor, in a window of its own").clicked() {
+                            self.plugin_window_error = None;
+                            if open {
+                                main.close_editor();
+                            } else if let Err(e) = main.open_editor(&format!("{name} · kabelsalat")) {
+                                self.plugin_window_error = Some(format!("{e:#}"));
+                            }
+                        }
+                        if let Some(e) = &self.plugin_window_error {
+                            ui.label(egui::RichText::new(e).size(12.0).color(theme::CLIP_BRIGHT));
+                        }
+                        ui.add_space(6.0);
+                    }
+                }
                 let plugin_id = pool_idx.and_then(|i| self.clap_plugin_ids.get(i)).map(|s| s.as_str());
                 // Sound: exchange the instrument (patch) of THIS synth.
                 let browser = match plugin_id {
@@ -14592,6 +14614,9 @@ impl DemoApp {
         self.serve_rack_shots();
         self.rack_shot.request(&ctx);
         self.sync_from_engine();
+        for main in &mut self._surge_main {
+            main.pump();
+        }
         self.poll_plugin_scan();
         self.poll_install();
         if self.plugin_scan.is_some() || self.install.as_ref().is_some_and(|i| i.running) {
@@ -14685,6 +14710,9 @@ impl DemoApp {
         // animation / agent run is active; ~30 fps when unfocused and idle.
         if ctx.input(|i| i.focused) || self.has_active_animations() {
             ctx.request_repaint();
+        } else if self._surge_main.iter().any(|m| m.editor_open()) {
+            // Plugin editors paint from timers this frame loop runs.
+            ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }

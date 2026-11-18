@@ -637,6 +637,7 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
@@ -915,6 +916,11 @@ pub(crate) fn tools() -> Value {
             "name":"set_strip_knob",
             "description":"Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id (from get_strip_knobs or list_params), or empty string \"\" to reset to default. Saved with the session.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"knob":{"type":"string","description":"Knob label/name, or empty string for default"}},"required":["node","knob"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_channels",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugins",

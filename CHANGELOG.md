@@ -8,14 +8,6 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
-- **Quick knob per plugin in the mixer channel strip (#107):** every source
-  and insert slot in the mixer now carries a small assignable knob at its
-  right end with the parameter's caption beside it, linked directly to the rack unit's
-  knob (and engine/plugin parameter). It defaults to a plugin's first main
-  control or an effect's `MIX` knob, resets on double-click, and right-click
-  opens a dropdown to choose any knob of that unit; assignments are saved
-  with the session and exposed to agents via `get_strip_knobs` /
-  `set_strip_knob`.
 - **MIDI strip on the software keyboard:** the keyboard dock now carries a
   pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
   its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's

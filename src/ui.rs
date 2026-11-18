@@ -16183,6 +16183,7 @@ struct BuiltAudio {
     edge_levels: Arc<EdgeLevels>,
     audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
     audio_in_levels: Arc<AudioInLevels>,
+    clock_pos: Arc<crate::clocksend::ClockPos>,
 }
 
 fn build_audio() -> anyhow::Result<BuiltAudio> {
@@ -16230,6 +16231,11 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // structural changes; the UI adopts it when it diverges from its mirror.
     let graph_pub = Arc::new(Mutex::new(crate::engine::GraphPub { rev: 0, graph: Graph::demo_patch(), rules: Vec::new(), ..Default::default() }));
     engine.set_graph_pub(graph_pub.clone());
+    // MIDI clock send (#85): the engine publishes its song position every
+    // block; the clock thread schedules ticks from it (never per UI frame).
+    let clock_pos = crate::clocksend::ClockPos::new();
+    engine.set_clock_pos(clock_pos.clone());
+    let clock_pos_cb = clock_pos.clone();
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
     if let Some(source) = crate::capture::SystemCapture::default_monitor() {
@@ -16262,7 +16268,13 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
     let stream = device.build_output_stream(
         config,
-        move |data: &mut [f32], _| {
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // Device output latency for the clock's "Output" compensation.
+            let ts = info.timestamp();
+            let d = ts.playback.duration_since(ts.callback);
+            if !d.is_zero() {
+                clock_pos_cb.publish_out_latency(d.as_nanos() as u64);
+            }
             // One-time realtime promotion via rtkit (first callback only; the
             // D-Bus round trip happens once, never in the steady state).
             // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
@@ -16310,6 +16322,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         edge_levels,
         audio_in_tx,
         audio_in_levels,
+        clock_pos,
     })
 }
 
@@ -16466,8 +16479,14 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             edge_levels,
                             audio_in_tx,
                             audio_in_levels,
+                            clock_pos,
                         } = ba;
                         let bus = Arc::new(Mutex::new(bus));
+                        // MIDI clock send: attach the engine and start the
+                        // thread (it owns the ALSA sequencer client).
+                        let clock = crate::clocksend::global();
+                        clock.set_engine(clock_pos, bus.clone());
+                        crate::clocksend::spawn_clock_thread(clock);
                         // Control bridge (task-16): MCP/CLI drive THIS app via
                         // the same bus + a live graph mirror. Additive — if the
                         // socket is unavailable the app just runs without it.

@@ -27,8 +27,6 @@ script that also runs on a developer machine (in docker).
   `ui::tests::vitalium_and_dexed_editor_support`. Run them, and the CLI
   self-tests listed in AGENTS.md, on a machine with those plugins.
 - `cargo fmt --check` is not run: the tree is not rustfmt-formatted.
-- A second job regenerates `packaging/flatpak/cargo-sources.json` from
-  `Cargo.lock` and fails when the committed file differs.
 
 ## Release packages
 
@@ -87,7 +85,7 @@ App id `io.github.ssalentin.kabelsalat`, runtime `org.freedesktop.Platform`
 26.08, Rust from `org.freedesktop.Sdk.Extension.rust-stable`. The manifest
 `packaging/flatpak/io.github.ssalentin.kabelsalat.yml` builds lv2, zix, serd,
 sord, sratom and lilv (the runtime has none of them), then kabelsalat offline
-from `cargo-sources.json`.
+from `cargo-sources.json` (generated from `Cargo.lock` by `build.sh`).
 
 Install and run a bundle:
 
@@ -133,17 +131,6 @@ Known limits:
 - The instrument catalog's "is it installed" probe looks at `/usr/lib/clap`
   and `/usr/lib/lv2`, which are empty in the sandbox.
 
-### When Cargo.lock changes
-
-Regenerate the vendored crate list and commit it with the lock file:
-
-```sh
-packaging/flatpak/update-cargo-sources.sh
-```
-
-It runs `flatpak-cargo-generator` from the builder image (through docker when
-the tool is not installed). CI fails while the committed file is stale.
-
 ## Build a package locally
 
 Each script runs on the host it targets, as in CI. With docker:
@@ -170,9 +157,7 @@ output out of `/tmp` (AGENTS.md rule 79).
 2. Bump `version` in `Cargo.toml` (and `Cargo.lock`, by building once).
 3. Add `<release version="X.Y.Z" date="...">` at the top of `<releases>` in
    `packaging/flatpak/io.github.ssalentin.kabelsalat.metainfo.xml`.
-4. If `Cargo.lock` changed beyond the version, run
-   `packaging/flatpak/update-cargo-sources.sh`.
-5. Commit on `main`, tag `vX.Y.Z`, push the tag.
+4. Commit on `main`, tag `vX.Y.Z`, push the tag.
 
 The release workflow checks that the tag matches `Cargo.toml`, that the
 CHANGELOG has notes for it and that the metainfo lists it, then builds every

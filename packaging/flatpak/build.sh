@@ -8,11 +8,13 @@
 set -euo pipefail
 version=$1 out=$(realpath -m "$2") state=$(realpath -m "${3:-.flatpak-builder}")
 here=$(cd "$(dirname "$0")" && pwd)
+root=$(cd "$here/../.." && pwd)
 app=io.github.ssalentin.kabelsalat
 arch=$(flatpak --default-arch)
 flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 flatpak install --user -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//26.08
 mkdir -p "$out" "$state"
+flatpak-cargo-generator "$root/Cargo.lock" -o "$here/cargo-sources.json"
 flatpak-builder --disable-rofiles-fuse --force-clean --state-dir="$state" \
   --repo="$state/repo" "$state/build" "$here/$app.yml"
 flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \

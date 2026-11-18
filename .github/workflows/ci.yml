@@ -41,18 +41,3 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: scripts/ci/test.sh
-
-  flatpak-sources:
-    name: flatpak cargo-sources.json is current
-    runs-on: ubuntu-24.04
-    container: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
-    steps:
-      - uses: actions/checkout@v7
-      - name: Regenerate from Cargo.lock
-        run: flatpak-cargo-generator Cargo.lock -o "$RUNNER_TEMP/cargo-sources.json"
-      - name: Compare
-        run: |
-          if ! diff -q packaging/flatpak/cargo-sources.json "$RUNNER_TEMP/cargo-sources.json"; then
-            echo "::error file=packaging/flatpak/cargo-sources.json::stale; run packaging/flatpak/update-cargo-sources.sh and commit the result"
-            exit 1
-          fi

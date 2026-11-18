@@ -989,6 +989,14 @@ Learned so far (2026-11-15, UI polish pass):
     played a rig bound to another keyboard. Default routes go through
     `connect`, which keeps an existing rule with its shape and enabled flag
     (`a_device_turned_off_before_the_lv2_instance_loads_stays_off`).
+154. **One binding has one identity, whatever its spelling:** off a CLAP
+    unit, CC target `plugin` and `knob` with the same param reach the same
+    engine param, but the knob tag and the knob menu matched the target
+    strictly. The assistant's `set_cc_map {param: 0}` (target plugin) on a
+    Filter drove CUTOFF without a `CC 11` tag, unlike MIDI learn (target
+    knob). Every "is this knob bound?" question goes through
+    `DemoApp::binds_knob`
+    (`an_agent_param_binding_on_a_built_in_unit_shows_like_a_learned_one`).
 
 ## Working on kabelsalat
 

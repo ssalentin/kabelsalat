@@ -341,6 +341,34 @@ impl Graph {
         true
     }
 
+    /// Plug an instrument into its rig the way a standard rig's synth is:
+    /// the rig's Keys → it (MIDI), it → the rig's Master L and R. Cables
+    /// take fresh ids above every existing one. Returns how many it added
+    /// (fewer when the rig has no Keys or Master, or a cable already exists).
+    pub fn wire_instrument(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let find = |g: &Self, kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == rig && kind(&n.kind)).map(|n| n.id);
+        let keys = find(self, |k| matches!(k, NodeKind::Keys));
+        let master = find(self, |k| matches!(k, NodeKind::MasterOut));
+        let mut cables = [None; 3];
+        if let Some(keys) = keys {
+            cables[0] = Some((PortRef { node: keys, port: 0 }, PortRef { node, port: 0 }, PortKind::Midi));
+        }
+        if let Some(master) = master {
+            for port in 0..2u8 {
+                cables[1 + port as usize] = Some((PortRef { node, port: 0 }, PortRef { node: master, port }, PortKind::Audio));
+            }
+        }
+        let mut added = 0;
+        for (from, to, kind) in cables.into_iter().flatten() {
+            let id = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(id, from, to, kind) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     pub fn disconnect(&mut self, id: EdgeId) {
         self.edges.retain(|e| e.id != id);
     }
@@ -624,7 +652,9 @@ fn de_rig_source<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(NodeId, bool
 pub enum Command {
     /// `rig`: which rig the node joins (multi-rig; 0 = the first / only rig).
     /// Older wire bodies without it load as rig 0.
-    AddNode { kind: NodeKind, name: Name, #[serde(default)] rig: u8 },
+    /// `wire`: the node is an instrument; plug it into its rig like a
+    /// standard rig's synth ([`Graph::wire_instrument`]).
+    AddNode { kind: NodeKind, name: Name, #[serde(default)] rig: u8, #[serde(default)] wire: bool },
     RemoveNode(NodeId),
     Connect { id: EdgeId, from: PortRef, to: PortRef, kind: PortKind },
     Disconnect(EdgeId),
@@ -820,6 +850,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_instrument_is_wired_into_its_own_rig_with_fresh_ids() {
+        let rigs = [Rig::new("A", standard_rig_graph(false), None), Rig::new("B", standard_rig_graph(true), None)];
+        let mut g = merge_rigs(&rigs);
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new("urn:organ") }, name_bytes("ORGAN"));
+        g.set_rig(organ, 0);
+        let before: Vec<EdgeId> = g.edges.iter().map(|e| e.id).collect();
+        assert_eq!(g.wire_instrument(organ), 3);
+        let rig_a = |kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == 0 && kind(&n.kind)).unwrap().id;
+        let (keys, master) = (rig_a(|k| matches!(k, NodeKind::Keys)), rig_a(|k| matches!(k, NodeKind::MasterOut)));
+        assert!(g.has_route(keys, organ, PortKind::Midi));
+        assert!(g.has_route_port(organ, master, 0, PortKind::Audio) && g.has_route_port(organ, master, 1, PortKind::Audio));
+        let new: Vec<EdgeId> = g.edges.iter().map(|e| e.id).filter(|id| !before.contains(id)).collect();
+        assert!(new.iter().all(|id| before.iter().all(|b| id > b)), "fresh ids {new:?} above {before:?}");
+        assert_eq!(g.wire_instrument(organ), 0, "wiring twice adds nothing");
+    }
+
+    #[test]
     fn voices_bind_in_graph_order_lowest_free_id_of_the_nodes_plugin() {
         let mut g = Graph::default();
         let clap = |id: &str| NodeKind::Clap { plugin_id: name_bytes(id) };
@@ -886,7 +933,7 @@ mod tests {
     fn command_json_roundtrip() {
         // The bridge wire format: externally tagged JSON, one line per command.
         let cmds = vec![
-            Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X"), rig: 0 },
+            Command::AddNode { kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X"), rig: 0, wire: false },
             Command::RemoveNode(3),
             Command::Connect { id: 12, from: PortRef { node: 0, port: 0 }, to: PortRef { node: 1, port: 0 }, kind: PortKind::Midi },
             Command::Disconnect(12),

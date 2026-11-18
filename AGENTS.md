@@ -642,6 +642,15 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **An instrument a tool adds is wired like a rig's synth:** the agent
+    put setBfree into rig A with `add_node` and connected only its MIDI
+    cable, so the organ rendered into nothing (its strip LED moved, the rig
+    bus stayed dark). `AddNode { wire: true }` (Clap always; LV2 when the
+    scan says `is_instrument`) runs `Graph::wire_instrument` in the engine
+    and in headless MCP's mirror alike. Keep prompts in step with what the
+    app hosts: "LV2 instruments are coming soon" made the model give up on a
+    working organ
+    (`an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master`).
 120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
     a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
     `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
@@ -665,6 +674,18 @@ Learned so far (2026-11-15, UI polish pass):
     sheet. Size the last column from `ui.available_width()` at the point you
     allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
     checks the row buttons stay inside the sheet).
+120. **An instrument starts playable:** Aeolus starts with every stop off,
+    so the catalog install built, loaded and scanned it, and middle C peaked
+    at 0.000. Play a note on a fresh instance of every new catalog
+    instrument (`catalog-install-test <id>`); one that starts silent gets a
+    starting state (`aeolus::initial_state`, applied where every CLAP voice
+    is instantiated) and its sounds as a `Source` (rule 93).
+121. **Test a face element in the rack the app opens with:** the Aeolus
+    stop panel passed its layout tests on a lone, tall unit, yet in the
+    real app (two instruments stacked over their delays, units 250 px
+    tall) it found no room and was not drawn at all. A face test asserts
+    the element IS shown in a stacked default rack at 1280x800 and
+    1600x1000, not only that what is shown does not overlap.
 
 123. **Every instrument column of the matrix has one route per cell:** an
     LV2 instrument column drew every row from its MIDI cable, so one click

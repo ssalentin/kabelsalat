@@ -989,14 +989,6 @@ Learned so far (2026-11-15, UI polish pass):
     played a rig bound to another keyboard. Default routes go through
     `connect`, which keeps an existing rule with its shape and enabled flag
     (`a_device_turned_off_before_the_lv2_instance_loads_stays_off`).
-156. **Decode a MIDI message by its type before its length:** the hardware
-    input dropped everything shorter than 3 bytes before looking at the
-    status, so channel aftertouch (2 bytes: how wind controllers send breath)
-    never reached an instrument. `hw_expression` reads the status first and
-    each type's own length; an LV2 plugin gets a message at its wire length
-    (`MidiMsg::wire`), never padded to 3 bytes
-    (`a_wind_controllers_breath_and_bend_become_engine_commands`,
-    `kabelsalat wind-test`).
 154. **A truncated plugin list shows instruments first, and an unknown URI
     is refused with the real ones:** lilv sorts by URI, so Vitalium
     (`urn:distrho:vitalium`) came after 296 `http:` effects and fell off
@@ -1011,6 +1003,14 @@ Learned so far (2026-11-15, UI polish pass):
     tests and pushed; CI then failed on an `mcp::tests` test that adds a
     made-up LV2 URI (`cargo test --bin kabelsalat -- mcp::` would have
     shown it). Filter by module path, not by test name.
+156. **Decode a MIDI message by its type before its length:** the hardware
+    input dropped everything shorter than 3 bytes before looking at the
+    status, so channel aftertouch (2 bytes: how wind controllers send breath)
+    never reached an instrument. `hw_expression` reads the status first and
+    each type's own length; an LV2 plugin gets a message at its wire length
+    (`MidiMsg::wire`), never padded to 3 bytes
+    (`a_wind_controllers_breath_and_bend_become_engine_commands`,
+    `kabelsalat wind-test`).
 
 ## Working on kabelsalat
 

@@ -5962,7 +5962,7 @@ mod tests {
             let at = l.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
             at as f32 / sr as f32 * 1000.0
         };
-        for knob in [default, 0.0, 0.2] {
+        for knob in [0.0, 0.2, default] {
             let ms = echo_ms(knob);
             assert!(ms >= 50.0, "TIME {knob} echoes after {ms:.1} ms: a comb filter, heard as distortion");
         }

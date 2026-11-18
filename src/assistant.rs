@@ -678,7 +678,8 @@ fn system_prompt() -> String {
      the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
      rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
      before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
-     shape the strip itself; faders are dB with double-click at 0 dB. \
+     shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
+     quick knob; faders are dB with double-click at 0 dB. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -905,6 +906,16 @@ pub(crate) fn tools() -> Value {
             "name":"collapse_strip",
             "description":"Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_strip_knobs",
+            "description":"List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), whether it is custom-assigned, and available knob choices. Filter optionally with node.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Optional node id to inspect one unit"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_knob",
+            "description":"Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id (from get_strip_knobs or list_params), or empty string \"\" to reset to default. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"knob":{"type":"string","description":"Knob label/name, or empty string for default"}},"required":["node","knob"]}
         }},
         {"type":"function","function":{
             "name":"list_channels",

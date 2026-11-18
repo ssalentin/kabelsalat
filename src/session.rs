@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // public API lands in the UI/CLI with task-10 integration
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -108,6 +108,9 @@ pub struct Session {
     /// the entries whose node is in that rig; nodes missing from the list
     /// sort last in unit order). Keyed by node id, remapped with the strips.
     strip_order: Vec<NodeId>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id (knob
+    /// label or parameter name/id). Unlisted nodes use their default quick knob.
+    strip_knobs: BTreeMap<NodeId, String>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -160,6 +163,7 @@ impl Session {
             rig_names: Vec::new(),
             strips: Vec::new(),
             strip_order: Vec::new(),
+            strip_knobs: BTreeMap::new(),
         }
     }
 
@@ -172,6 +176,7 @@ impl Session {
             && self.rig_names == other.rig_names
             && self.strips == other.strips
             && self.strip_order == other.strip_order
+            && self.strip_knobs == other.strip_knobs
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -289,6 +294,26 @@ impl Session {
         self.strip_order = order.into_iter().filter(|n| self.graph.node(*n).is_some()).collect();
     }
 
+    /// Explicit mixer quick-knob assignment (#107) for one node, if any.
+    pub fn strip_knob(&self, node: NodeId) -> Option<&str> {
+        self.strip_knobs.get(&node).map(String::as_str)
+    }
+
+    /// All explicit mixer quick-knob assignments (#107), keyed by node id.
+    pub fn strip_knobs(&self) -> &BTreeMap<NodeId, String> {
+        &self.strip_knobs
+    }
+
+    /// Set (or clear when empty) one node's mixer quick-knob assignment (#107).
+    pub fn set_strip_knob(&mut self, node: NodeId, knob: String) {
+        let trimmed = knob.trim();
+        if trimmed.is_empty() {
+            self.strip_knobs.remove(&node);
+        } else {
+            self.strip_knobs.insert(node, trimmed.to_string());
+        }
+    }
+
     // -- integrity -------------------------------------------------------------
 
     /// Drop params/blobs whose node no longer exists (call after `RemoveNode`).
@@ -297,6 +322,7 @@ impl Session {
         self.states.retain(|s| self.graph.node(s.node).is_some());
         self.strips.retain(|s| self.graph.node(s.node).is_some());
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
+        self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -393,6 +419,14 @@ impl Session {
                 );
             }
         }
+        for n in self.strip_knobs.keys() {
+            if self.graph.node(*n).is_none() {
+                bail!(
+                    "The strip quick-knob assignment references node {} which is no longer in the patch.",
+                    n
+                );
+            }
+        }
         Ok(())
     }
 
@@ -426,6 +460,7 @@ impl Session {
             rig_names: self.rig_names.clone(),
             strips: self.strips.clone(),
             strip_order: self.strip_order.clone(),
+            strip_knobs: self.strip_knobs.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -463,6 +498,7 @@ impl Session {
             rig_names: manifest.rig_names,
             strips: manifest.strips,
             strip_order: manifest.strip_order,
+            strip_knobs: manifest.strip_knobs,
         };
         session.validate()?;
         Ok(session)
@@ -570,6 +606,9 @@ struct SessionFile {
     /// Strip display order (older sessions have none → unit order).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     strip_order: Vec<NodeId>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    strip_knobs: BTreeMap<NodeId, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -899,6 +938,7 @@ impl RigPreset {
                 mix: self.mix,
                 midi_device: self.midi_device,
                 clap_meta: self.clap_meta.clone(),
+                strip_knobs: self.session.strip_knobs().clone(),
             };
             let json = serde_json::to_vec_pretty(&manifest)?;
             write_atomic(&staging.join(RIG_PRESET_FILE), &json)
@@ -932,6 +972,9 @@ impl RigPreset {
             session.set_plugin_state(s.node, s.plugin_id, s.data);
         }
         session.set_matrix(manifest.matrix);
+        for (node, knob) in manifest.strip_knobs {
+            session.set_strip_knob(node, knob);
+        }
         let preset = RigPreset {
             name: manifest.name,
             rig_name: manifest.rig_name,
@@ -964,6 +1007,8 @@ struct RigPresetFile {
     midi_device: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clap_meta: Vec<RigClapMeta>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    strip_knobs: BTreeMap<NodeId, String>,
 }
 
 /// Default directory for saved rig presets (sibling to `~/kabelsalat-sessions`).
@@ -1840,6 +1885,32 @@ mod tests {
         delete_rig_preset(&dir, "Lead Preset").unwrap();
         delete_rig_preset(&dir, "Evil").unwrap();
         assert!(list_rig_presets(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_knobs_round_trip_and_prune() {
+        let dir = test_dir("strip-knobs");
+        let mut s = sample_session();
+        s.set_strip_knob(1, "OSC 1 VOL".into());
+        s.set_strip_knob(2, "MIX".into());
+        s.set_strip_knob(2, "   ".into()); // empty clears
+        assert_eq!(s.strip_knob(1), Some("OSC 1 VOL"));
+        assert_eq!(s.strip_knob(2), None);
+
+        let pkg = Session::package_path(&dir, "Quick Knobs").unwrap();
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.strip_knob(1), Some("OSC 1 VOL"));
+        assert!(loaded.same_content(&s));
+
+        // Removing the node makes validate fail until pruned.
+        let mut orphaned = loaded.clone();
+        orphaned.graph.remove_node(1);
+        assert!(orphaned.validate().is_err());
+        orphaned.prune_to_graph();
+        orphaned.validate().unwrap();
+        assert!(orphaned.strip_knobs().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

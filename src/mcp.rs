@@ -666,6 +666,22 @@ struct CollapseStripArgs {
     collapsed: Option<bool>,
 }
 
+/// Arguments for `get_strip_knobs` (#107).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetStripKnobsArgs {
+    /// Optional node id to inspect one slot.
+    node: Option<NodeId>,
+}
+
+/// Arguments for `set_strip_knob` (#107).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripKnobArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// Knob label or parameter name/id; empty string resets to default.
+    knob: String,
+}
+
 /// Arguments for `list_channels` (#108).
 #[derive(Debug, Deserialize, JsonSchema)]
 struct ListChannelsArgs {
@@ -2311,6 +2327,26 @@ impl McpServer {
         Self::ui_bridge_tool("collapse_strip", json!({"node": args.node, "collapsed": args.collapsed}))
     }
 
+    /// Query quick knobs on mixer strips (#107).
+    #[tool(name = "get_strip_knobs", description = "List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), custom flag, and available choices. Needs the running app (kabelsalat mcp --attach).")]
+    fn get_strip_knobs(&self, Parameters(args): Parameters<GetStripKnobsArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("get_strip_knobs needs the running app (kabelsalat mcp --attach): quick knob assignments are session state the app owns");
+        }
+        let mut a = json!({});
+        if let Some(node) = args.node { a["node"] = json!(node); }
+        Self::ui_bridge_tool("get_strip_knobs", a)
+    }
+
+    /// Assign a mixer strip slot's quick knob (#107).
+    #[tool(name = "set_strip_knob", description = "Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id, or empty string \"\" to reset to default. Saved with the session. Needs the running app (kabelsalat mcp --attach).")]
+    fn set_strip_knob(&self, Parameters(args): Parameters<SetStripKnobArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("set_strip_knob needs the running app (kabelsalat mcp --attach): quick knob assignments are session state the app owns");
+        }
+        Self::ui_bridge_tool("set_strip_knob", json!({"node": args.node, "knob": args.knob}))
+    }
+
     /// Delete one rig.
     #[tool(name = "delete_rig", description = "Delete rig `rig` (index from get_rigs) with everything in it. DESTRUCTIVE: requires confirm=true; the last rig cannot be deleted. Returns {rigs, active}.")]
     fn delete_rig(&self, Parameters(args): Parameters<DeleteRigArgs>) -> Result<CallToolResult, McpError> {
@@ -3538,6 +3574,17 @@ mod tests {
         assert_eq!(r, json!({"record_sync": true}));
         engine.render(&mut buf, 2); // drain SetRecordSync into the engine
         assert!(engine.transport_pub().record_sync, "engine adopted record_sync");
+    }
+
+    #[test]
+    fn strip_knob_tools_require_attached_app_when_headless() {
+        let (server, _engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        assert!(is_err(server.get_strip_knobs(Parameters(GetStripKnobsArgs { node: None }))));
+        assert!(is_err(server.set_strip_knob(Parameters(SetStripKnobArgs { node: 1, knob: "LEVEL".into() }))));
     }
 
     #[test]

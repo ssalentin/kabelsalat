@@ -657,6 +657,11 @@ Learned so far (2026-11-15, UI polish pass):
     150 ms timeout shared by a "fixed" scanner flaked under full-suite load
     (#64, `dexed_is_parked_and_reused_not_destroyed`). Stress a new test with
     a busy CPU (`nproc` spin loops) before shipping it.
+121. **A transient message never shares a row with a title:** a
+    right-to-left layout inside `horizontal_wrapped` paints over the previous
+    labels at 781 px (#65). Title and subtitle go in a plain `horizontal` row
+    (subtitle truncated), status text gets its own wrapped row
+    (`plugins_header_message_never_overlaps_the_subtitle`).
 
 ## Working on kabelsalat
 

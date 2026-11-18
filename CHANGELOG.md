@@ -69,6 +69,8 @@ releases may still change behaviour and session files.
 - **Dexed no longer crashes the test suite (#52).** Its destructor segfaults
   while other plugin instances render, so a retired Dexed is parked and reused
   by the next one (reset to fresh state), never destroyed.
+- **Plugins page header (#65):** the "New <plugin> rig" confirmation has its own
+  row under the subtitle instead of being painted over it.
 - **Flaky scan-cache test (#64):** only the deliberately hanging scanner gets
   the short timeout.
 - **A failed catalog install could not be retried:** the next attempt found

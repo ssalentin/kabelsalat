@@ -9148,25 +9148,30 @@ impl DemoApp {
 
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                // Title + subtitle in a plain row (a wrapped row's galleys start
+                // at its left edge and overlap, rule 100); the subtitle
+                // truncates. The confirmation gets a row of its own (#65).
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
-                            .size(13.0)
-                            .color(theme::INK_2),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
+                                .size(13.0)
+                                .color(theme::INK_2),
+                        )
+                        .truncate(),
                     );
-                    if !self.plugin_msg.is_empty() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let col = if self.plugin_msg.contains("failed") {
-                                theme::CLIP_BRIGHT
-                            } else {
-                                theme::LIVE_TEAL
-                            };
-                            ui.label(egui::RichText::new(&self.plugin_msg).size(12.5).color(col));
-                        });
-                    }
                 });
+                if !self.plugin_msg.is_empty() {
+                    let col = if self.plugin_msg.contains("failed") {
+                        theme::CLIP_BRIGHT
+                    } else {
+                        theme::LIVE_TEAL
+                    };
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
+                }
                 ui.add_space(12.0);
 
                 let mut do_refresh = false;
@@ -22350,6 +22355,34 @@ mod settings_and_dropdown_tests {
             assert!(!t.contains("9942") && !t.contains("7731"), "key leaked after save: {t}");
         }
         assert!(texts.iter().any(|(t, _)| t == "set"));
+    }
+
+    /// #65: the "New <plugin> rig" confirmation shared the header row with
+    /// the subtitle (right-to-left layout) and was painted over it at 781 px.
+    #[test]
+    fn plugins_header_message_never_overlaps_the_subtitle() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Plugins;
+        app.plugins_loaded = true;
+        app.plugin_msg = "New Aeolus rig \u{2014} Keys\u{2192}Aeolus\u{2192}Master".into();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+            let header: Vec<&(String, Rect)> = texts
+                .iter()
+                .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0 && r.bottom() <= inner.top() + 110.0)
+                .collect();
+            assert!(header.iter().any(|(t, _)| t == "Plugins"), "{size:?}: title painted");
+            assert!(header.iter().any(|(t, _)| t.starts_with("New Aeolus rig")), "{size:?}: message painted: {header:?}");
+            for (i, (a, ra)) in header.iter().enumerate() {
+                assert!(ra.right() <= inner.right() + 1.0, "{size:?}: {a:?} {ra:?} leaves the sheet {inner:?}");
+                for (b, rb) in &header[i + 1..] {
+                    let o = ra.intersect(*rb);
+                    assert!(!(o.width() > 0.5 && o.height() > 0.5), "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}");
+                }
+            }
+        }
     }
 
     #[test]

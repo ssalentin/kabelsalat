@@ -1397,7 +1397,14 @@ impl McpServer {
         let rig = args.rig.unwrap_or(0);
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
-            NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            NodeKind::Lv2 { uri } => {
+                let lv2 = crate::lv2::discover();
+                let Some(p) = lv2.iter().find(|p| p.uri == uri.as_str()) else {
+                    let installed: Vec<String> = lv2.iter().filter(|p| p.is_instrument).map(|p| format!("{} = {}", p.name, p.uri)).collect();
+                    return tool_err(format!("'{}' is not an installed LV2 plugin. Installed LV2 instruments: {}", uri.as_str(), installed.join(", ")));
+                };
+                p.is_instrument
+            }
             // An arp and a MIDI strip are inserted between the rig's Keys and
             // its synth(s) like an instrument is wired into its rig.
             NodeKind::Arp | NodeKind::MidiFx { .. } => true,

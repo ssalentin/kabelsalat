@@ -127,6 +127,11 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **The assistant can add Vitalium (and any LV2 instrument):** the plugin
+  list it reads stopped after the first 30 of about 300 LV2 plugins, and
+  Vitalium was not among them, so it guessed addresses that do not exist and
+  no Vitalium patch could be loaded. Instruments now come first in that
+  list, and a wrong address is refused with the right ones.
 - **A MIDI device turned off for an LV2 instrument stays off:** with two rigs
   on two keyboards, the keyboard of the CLAP rig also played an LV2
   instrument such as setBfree, when its cells were set while the plugin was

@@ -6948,7 +6948,12 @@ impl DemoApp {
                         if !self.plugin_lists_ready() {
                             return "scanning installed plugins in the background (first run) — try add_node again in a few seconds".into();
                         }
-                        self.plugins_lv2.iter().any(|p| p.uri == uri.as_str() && p.is_instrument)
+                        let Some(p) = self.plugins_lv2.iter().find(|p| p.uri == uri.as_str()) else {
+                            let installed: Vec<String> = self.plugins_lv2.iter().filter(|p| p.is_instrument)
+                                .map(|p| format!("{} = {}", p.name, p.uri)).collect();
+                            return format!("'{}' is not an installed LV2 plugin. Installed LV2 instruments: {}", uri.as_str(), installed.join(", "));
+                        };
+                        p.is_instrument
                     }
                     Some(NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } }) => {
                         if !self.plugin_lists_ready() {
@@ -25655,6 +25660,22 @@ mod ui_polish_agent_tests {
         assert_eq!(results[0].matches("new cable id").count(), 1, "{}", results[0]);
         assert_eq!(results[0].split("new cable id ").nth(1).unwrap().split(',').count(), 3, "the result names the three cables: {}", results[0]);
         assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
+    }
+
+    #[test]
+    fn the_agent_finds_an_lv2_instrument_behind_hundreds_of_effects() {
+        let lv2 = |uri: String, name: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri, name: name.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        let mut plugins: Vec<_> = (0..290).map(|i| lv2(format!("http://example.org/fx{i:03}"), "Fx", false)).collect();
+        plugins.push(lv2("urn:distrho:vitalium".into(), "Vitalium", true));
+        crate::lv2::instruments_first(&mut plugins);
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = plugins;
+        app.plugins_loaded = true;
+        let listed = app.exec_tool("list_plugins", &serde_json::json!({}));
+        assert!(listed.contains("Vitalium [instrument] — urn:distrho:vitalium"), "{listed}");
+        let guessed = app.exec_tool("add_node", &serde_json::json!({"kind": "lv2", "uri": "http://distrho.sf.net/plugins/Vitalium"}));
+        assert!(guessed.starts_with("'http://distrho.sf.net/plugins/Vitalium' is not an installed LV2 plugin"), "{guessed}");
+        assert!(guessed.contains("Vitalium = urn:distrho:vitalium"), "the refusal names the real uri: {guessed}");
     }
 
     #[test]

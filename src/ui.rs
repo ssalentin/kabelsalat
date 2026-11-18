@@ -1293,34 +1293,49 @@ fn audio_in_sub(device: Option<&str>, ch: AudioInChannel) -> String {
     format!("{dev} · {}", ch.label())
 }
 
-/// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
-/// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
-/// Runs once per unit at galley-build time, never on the frame path.
 /// An Aeolus stop name ("Open Diapason\n8") on one line within `max_w`
-/// (screen px): the whole name, else the name cut short with "…" before its
-/// footage, which always stays.
+/// (screen px): the whole name, else organists' short forms ("Op. Diap.
+/// 16"), else letters off the end with "…". The footage always stays.
 fn fit_stop_label(painter: &egui::Painter, name: &str, font: FontId, max_w: f32) -> String {
-    let (stem, foot) = name.split_once('\n').unwrap_or((name, ""));
+    // One line, footages as the drawbars print them (2⅔, not 2 2/3).
+    let full = name.replace('\n', " ").replace(" 2/3", "⅔").replace(" 1/3", "⅓").replace(" 3/5", "⅗");
     let fits = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x <= max_w;
-    let full = format!("{stem} {foot}").trim().to_string();
-    if fits(&full) { return full; }
-    // Organists' own short forms first, then letters off the end.
-    let short = stem.split(' ').map(|w| match w {
-        "Diapason" => "Diap.", "Principal" => "Princ.", "Double" => "Dbl.", "Harmonic" => "Harm.",
-        "Chimney" => "Chim.", "Sesquialtera" => "Sesq.", "Fourniture" => "Fourn.", "Quintadena" => "Quint.",
-        "Violoncell" => "Cello", "Cornopean" => "Cornop.", "Fifteenth" => "15th", "Twelfth" => "12th",
-        w => w,
-    }).collect::<Vec<_>>().join(" ");
-    let short_full = format!("{short} {foot}").trim().to_string();
-    if fits(&short_full) { return short_full; }
-    let chars: Vec<char> = short.chars().collect();
+    // Organists' own short forms, the gentler ones first; last, a double
+    // diapason loses its "open" ("Dbl. Diap. 16").
+    let shorten = |label: &str, words: &[(&str, &str)]| label.split(' ')
+        .filter_map(|w| match words.iter().find(|(long, _)| *long == w) {
+            Some((_, "")) => None,
+            Some((_, short)) => Some(*short),
+            None => Some(w),
+        })
+        .collect::<Vec<_>>().join(" ");
+    const SOFT: &[(&str, &str)] = &[
+        ("Diapason", "Diap."), ("Principal", "Princ."), ("Double", "Dbl."), ("Harmonic", "Harm."),
+        ("Chimney", "Chim."), ("Sesquialtera", "Sesq."), ("Fourniture", "Fourn."), ("Quintadena", "Quint."),
+        ("Violoncell", "Cello"), ("Cornopean", "Cornop."), ("Fifteenth", "15th"), ("Twelfth", "12th"),
+        ("Bombarde", "Bomb."), ("Trombone", "Tromb."), ("Larigot", "Lar."), ("Mixture", "Mixt."),
+    ];
+    const HARD: &[(&str, &str)] = &[("Open", "Op."), ("Flute", "Fl."), ("Stopt", "St."), ("Spitz", "Sp."),
+        ("Bassoon", "Bsn."), ("Trumpet", "Tpt."), ("Nazard", "Naz."), ("Humana", "Hum."), ("Gemshorn", "Gemsh.")];
+    let soft = shorten(&full, SOFT);
+    let hard = shorten(&soft, HARD);
+    let bare = shorten(&hard, &[("Op.", "")]);
+    for label in [full.as_str(), soft.as_str(), hard.as_str(), bare.as_str()] {
+        if fits(label) { return label.to_string(); }
+    }
+    // Letters off the name, never off the footage (the last word).
+    let (stem, foot) = bare.rsplit_once(' ').unwrap_or(("", bare.as_str()));
+    let chars: Vec<char> = stem.chars().collect();
     for n in (1..chars.len()).rev() {
-        let t = format!("{}… {foot}", chars[..n].iter().collect::<String>().trim_end());
+        let t = format!("{}… {foot}", chars[..n].iter().collect::<String>().trim_end().trim_end_matches('.'));
         if fits(&t) { return t; }
     }
     foot.to_string()
 }
 
+/// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
+/// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
+/// Runs once per unit at galley-build time, never on the frame path.
 fn sentence_case(s: &str) -> String {
     s.split_whitespace()
         .enumerate()
@@ -13487,35 +13502,65 @@ impl DemoApp {
         }
     }
 
-    /// Aeolus face: division tabs, then the shown division's stops as
-    /// chips, lit when drawn. A stop name too long for its chip keeps its
-    /// footage and loses letters from the name.
+    /// Aeolus face, drawn like a console's stop jamb rather than a grid of
+    /// buttons: each stop is its name beside an indicator light (live teal
+    /// when drawn, an unlit ring when not), no box. The division tabs are
+    /// plain labels; the shown one is cream with an accent bar (selection),
+    /// and a small teal dot marks a division with stops drawn. A hairline
+    /// parts tabs from stops. Hover lifts a row onto a faint plate.
     fn draw_aeolus_face(&self, painter: &egui::Painter, unit: usize) {
         let Some(a) = self.aeolus_rects(unit) else { return };
         let face = self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default();
+        let hover_plate = |rect: Rect| painter.rect_filled(self.xf.rect(rect), 2.0, alpha(theme::CREAM, 0.06));
+        let tab_font = theme::medium_font(11.0);
         for (d, tab) in a.tabs.iter().enumerate() {
             let hov = self.face_hovered(painter, unit, *tab);
-            let any = face.drawn.is_some_and(|b| b[d] != 0);
             let shown = d == face.division;
-            let label = format!("{}{}", crate::aeolus::division_tab(d), if any && !shown { "•" } else { "" });
-            self.paint_face_chip(painter, *tab, &label, shown, hov);
+            if hov && !shown { hover_plate(*tab); }
+            if shown {
+                let bar = Rect::from_min_size(tab.min + Vec2::new(0.0, 2.0), Vec2::new(2.0, tab.height() - 4.0));
+                painter.rect_filled(self.xf.rect(bar), 1.0, theme::ACCENT);
+            }
+            let ink = if shown || hov { theme::CREAM } else { theme::CREAM_DIM };
+            self.face_text(painter, Pos2::new(tab.left() + 13.0, tab.center().y), crate::aeolus::division_tab(d), tab_font.clone(), ink);
+            if face.drawn.is_some_and(|b| b[d] != 0) {
+                self.ell(painter, Vec2::new(tab.right() - 3.5, tab.center().y), 2.0, theme::LIVE_TEAL, Stroke::NONE);
+            }
         }
-        let font = FontId::proportional(10.0);
+        // The rule between the tab column and the stops.
+        let x = a.tabs[0].right() + 4.0;
+        painter.line_segment([self.xf.p(Vec2::new(x, a.tabs[0].top() + 1.0)), self.xf.p(Vec2::new(x, a.tabs[3].bottom() - 1.0))],
+            Stroke::new(1.0, theme::HAIRLINE));
+
+        let font = FontId::proportional(10.5);
         let stops = crate::aeolus::DIVISIONS[face.division].stops;
         for (i, (rect, name)) in a.stops.iter().zip(stops).enumerate() {
             let on = face.drawn.is_some_and(|b| b[face.division] >> i & 1 == 1);
             let hov = self.face_hovered(painter, unit, *rect);
-            let (fill, stroke, ink) = match (on, hov) {
-                (true, _) => (theme::CREAM, theme::CREAM, theme::DARK_PANEL),
-                (false, true) => (mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM),
-                (false, false) => (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID),
-            };
-            let sc = self.xf.rect(*rect);
-            painter.rect_filled(sc, 2.0, fill);
-            painter.rect_stroke(sc, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
-            let label = fit_stop_label(painter, name, font.clone(), (rect.width() - 6.0) * self.xf.sx);
-            self.face_text(painter, rect.center(), &label, font.clone(), ink);
+            if hov { hover_plate(*rect); }
+            let led = Vec2::new(rect.left() + 5.0, rect.center().y);
+            if on {
+                self.ell(painter, led, 6.0, alpha(theme::LIVE_TEAL, 0.18), Stroke::NONE);
+                self.ell(painter, led, 3.2, theme::LIVE_TEAL, Stroke::NONE);
+            } else {
+                self.ell(painter, led, 3.0, Color32::TRANSPARENT, Stroke::new(1.0, if hov { theme::CREAM_DIM } else { theme::MUTED }));
+            }
+            let ink = if on { theme::CREAM } else if hov { theme::CREAM_META } else { theme::CREAM_DIM };
+            let text_left = rect.left() + 12.0;
+            let label = fit_stop_label(painter, name, font.clone(), (rect.right() - text_left - 2.0) * self.xf.sx);
+            self.face_text_left(painter, Pos2::new(text_left, rect.center().y), &label, font.clone(), ink);
         }
+    }
+
+    /// Single-line face text starting at rack-local `left_center` (its left
+    /// edge, vertically centred), faded with the flip like `face_text`.
+    fn face_text_left(&self, painter: &egui::Painter, left_center: Pos2, text: &str, font: FontId, color: Color32) {
+        if self.text_alpha <= 0.01 { return; }
+        let g = painter.layout_no_wrap(text.into(), font, color);
+        let pos = self.xf.p(Vec2::new(left_center.x, left_center.y - g.size().y / 2.0));
+        let mut tp = painter.clone();
+        tp.set_opacity(self.text_alpha);
+        tp.galley(pos, g, color);
     }
 
     /// Keys face, split: one octave stepper per zone ("LOW +1"), BPM style.
@@ -21872,6 +21917,38 @@ mod face_layout_tests {
         let mut app = DemoApp::new_with_sink(None);
         for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0)); }
         assert!((0..app.units.len()).all(|u| app.aeolus_rects(u).is_none()));
+    }
+
+    /// In the stacked default rack at 1600x1000 (this laptop's window) every
+    /// stop of every division reads in whole words: short forms, never
+    /// letters cut off with "…". At 1280x800 the chips are ~38 px inside and
+    /// some names are cut; the panel still shows (see above).
+    #[test]
+    fn aeolus_stop_labels_fit_without_cutting_words() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind { *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID); }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ctx = egui::Context::default();
+        let ui = (0..app.units.len()).find(|&u| app.is_aeolus_unit(u)).unwrap();
+        for size in [Vec2::new(1600.0, 1000.0)] {
+            let mut all = Vec::new();
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let painter = egui::Painter::new(ctx.clone(), egui::LayerId::background(), Rect::EVERYTHING);
+                let a = app.aeolus_rects(ui).unwrap();
+                for (r, name) in a.stops.iter().zip(crate::aeolus::DIVISIONS[d].stops) {
+                    // The width draw_aeolus_face gives the text.
+                    all.push(fit_stop_label(&painter, name, FontId::proportional(10.5), (r.width() - 14.0) * app.xf.sx));
+                }
+            }
+            println!("{size:?}: {all:?}");
+            assert!(all.iter().all(|l| !l.contains('…')), "{size:?}: {all:?}");
+        }
     }
 
     /// A division tab shows that division; a stop click with no plugin

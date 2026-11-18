@@ -27,8 +27,9 @@ releases may still change behaviour and session files.
   Aeolus starts with every stop off, so kabelsalat starts it with a
   principal chorus drawn, and `list_sounds` / `load_sound` offer 12
   registrations (principals, flutes, celeste, reeds, full organ). The
-  Aeolus unit has a stop panel: tabs for Manual III, II, I and Pedal, and a
-  chip per stop that draws it or pushes it in. The panel reads the stops
+  Aeolus unit has a stop panel like a console's stop jamb: Manual III, II,
+  I and Pedal down the left, and each stop of the shown division with an
+  indicator light; a click draws it or pushes it in. The panel reads the stops
   back from the plugin, so it follows sound and session loads.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code

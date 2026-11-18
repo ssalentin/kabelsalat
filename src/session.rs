@@ -28,7 +28,7 @@
 
 #![allow(dead_code)] // public API lands in the UI/CLI with task-10 integration
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::control::{
-    name_bytes, name_str, DspKind, EdgeId, Graph, NodeId, NodeKind, ParamId, PortKind, PortRef, Rig,
+    name_bytes, name_str, AudioInChannel, DspKind, EdgeId, Graph, Lv2Uri, NodeId, NodeKind,
+    ParamId, PortKind, PortRef, Rig,
 };
 // Param ids are per-node; these mirror the engine's current knob table
 // (task-10 generalizes it — the session stores opaque (node, param, value)
@@ -98,6 +99,51 @@ pub struct Session {
     matrix: Option<Value>,
     /// Rig names in rig order (#33); empty = the default "Rig A/B/…".
     pub rig_names: Vec<String>,
+    /// Mixer strip state keyed by node (#72–77): a source's pan/mute/solo,
+    /// an FX node's bypass, the strip's colour and collapse flag. Node-keyed
+    /// like `params` — `remap_session` carries each entry to its node's new
+    /// id across rig edits and reloads (rule 44).
+    strips: Vec<StripSaved>,
+    /// Source strips in display order, flat across rigs (a rig's strips are
+    /// the entries whose node is in that rig; nodes missing from the list
+    /// sort last in unit order). Keyed by node id, remapped with the strips.
+    strip_order: Vec<NodeId>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id (knob
+    /// label or parameter name/id). Unlisted nodes use their default quick knob.
+    strip_knobs: BTreeMap<NodeId, String>,
+}
+
+/// One strip's persisted state (#72–77). Defaults mirror the engine's
+/// `StripMix::DEFAULT` plus UI-local colour/collapse.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StripSaved {
+    pub node: NodeId,
+    /// Pan −1 (L) … 1 (R).
+    pub pan: f32,
+    pub mute: bool,
+    /// Solo scope: within the node's rig (#73).
+    pub solo: bool,
+    /// Insert bypass (#74) — an FX node's flag.
+    pub bypass: bool,
+    /// Strip colour as 0xRRGGBB (#77); None = the plain chrome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    /// Strip collapsed to its mini form (#77).
+    pub collapsed: bool,
+}
+
+impl Default for StripSaved {
+    fn default() -> Self {
+        Self { node: 0, pan: 0.0, mute: false, solo: false, bypass: false, color: None, collapsed: false }
+    }
+}
+
+impl StripSaved {
+    /// True while nothing differs from a node nobody ever touched.
+    pub fn is_plain(&self) -> bool {
+        *self == Self { node: self.node, ..Self::default() }
+    }
 }
 
 impl Default for Session {
@@ -115,16 +161,22 @@ impl Session {
             states: Vec::new(),
             matrix: None,
             rig_names: Vec::new(),
+            strips: Vec::new(),
+            strip_order: Vec::new(),
+            strip_knobs: BTreeMap::new(),
         }
     }
 
-    /// True when both hold the same patch, knobs, plugin states, routes and
-    /// rig names; the session name is not compared.
+    /// True when both hold the same patch, knobs, plugin states, routes, rig
+    /// names and mixer strips; the session name is not compared.
     pub fn same_content(&self, other: &Session) -> bool {
         self.params == other.params
             && self.states == other.states
             && self.matrix == other.matrix
             && self.rig_names == other.rig_names
+            && self.strips == other.strips
+            && self.strip_order == other.strip_order
+            && self.strip_knobs == other.strip_knobs
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -203,12 +255,74 @@ impl Session {
         self.matrix = matrix;
     }
 
+    // -- mixer strips (#72–77) ----------------------------------------------
+
+    /// One node's persisted strip state, if any.
+    pub fn strip(&self, node: NodeId) -> Option<&StripSaved> {
+        self.strips.iter().find(|s| s.node == node)
+    }
+
+    /// Upsert one node's strip state (the persisted form of
+    /// `Command::SetStripMix` / `SetStripBypass` plus the UI-local colour and
+    /// collapse flag). A plain (all-default) entry is dropped: an untouched
+    /// node has no row.
+    pub fn set_strip(&mut self, strip: StripSaved) {
+        match self.strips.iter_mut().find(|s| s.node == strip.node) {
+            Some(s) => *s = strip,
+            None => {
+                if !strip.is_plain() {
+                    self.strips.push(strip);
+                    self.strips.sort_by_key(|s| s.node);
+                }
+            }
+        }
+        self.strips.retain(|s| !s.is_plain());
+    }
+
+    /// All strip rows (sorted by node).
+    pub fn strips(&self) -> &[StripSaved] {
+        &self.strips
+    }
+
+    /// Source strips' display order (flat; per-rig sections derive from it).
+    pub fn strip_order(&self) -> &[NodeId] {
+        &self.strip_order
+    }
+
+    /// Set the strips' display order; unknown node ids are dropped.
+    pub fn set_strip_order(&mut self, order: Vec<NodeId>) {
+        self.strip_order = order.into_iter().filter(|n| self.graph.node(*n).is_some()).collect();
+    }
+
+    /// Explicit mixer quick-knob assignment (#107) for one node, if any.
+    pub fn strip_knob(&self, node: NodeId) -> Option<&str> {
+        self.strip_knobs.get(&node).map(String::as_str)
+    }
+
+    /// All explicit mixer quick-knob assignments (#107), keyed by node id.
+    pub fn strip_knobs(&self) -> &BTreeMap<NodeId, String> {
+        &self.strip_knobs
+    }
+
+    /// Set (or clear when empty) one node's mixer quick-knob assignment (#107).
+    pub fn set_strip_knob(&mut self, node: NodeId, knob: String) {
+        let trimmed = knob.trim();
+        if trimmed.is_empty() {
+            self.strip_knobs.remove(&node);
+        } else {
+            self.strip_knobs.insert(node, trimmed.to_string());
+        }
+    }
+
     // -- integrity -------------------------------------------------------------
 
     /// Drop params/blobs whose node no longer exists (call after `RemoveNode`).
     pub fn prune_to_graph(&mut self) {
         self.params.retain(|p| self.graph.node(p.node).is_some());
         self.states.retain(|s| self.graph.node(s.node).is_some());
+        self.strips.retain(|s| self.graph.node(s.node).is_some());
+        self.strip_order.retain(|n| self.graph.node(*n).is_some());
+        self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -285,6 +399,34 @@ impl Session {
                 bail!("The state blob for node {} has no plugin id.", s.node);
             }
         }
+        for s in &self.strips {
+            if self.graph.node(s.node).is_none() {
+                bail!(
+                    "A mixer strip belongs to node {} which is no longer in the patch. \
+                     Call prune_to_graph() after removing nodes.",
+                    s.node
+                );
+            }
+            if !s.pan.is_finite() || !(-1.0..=1.0).contains(&s.pan) {
+                bail!("The mixer strip of node {} has a pan outside -1..1.", s.node);
+            }
+        }
+        for n in &self.strip_order {
+            if self.graph.node(*n).is_none() {
+                bail!(
+                    "The strip order lists node {} which is no longer in the patch.",
+                    n
+                );
+            }
+        }
+        for n in self.strip_knobs.keys() {
+            if self.graph.node(*n).is_none() {
+                bail!(
+                    "The strip quick-knob assignment references node {} which is no longer in the patch.",
+                    n
+                );
+            }
+        }
         Ok(())
     }
 
@@ -316,6 +458,9 @@ impl Session {
             matrix: self.matrix.clone(),
             states: refs,
             rig_names: self.rig_names.clone(),
+            strips: self.strips.clone(),
+            strip_order: self.strip_order.clone(),
+            strip_knobs: self.strip_knobs.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -351,6 +496,9 @@ impl Session {
             states,
             matrix: manifest.matrix,
             rig_names: manifest.rig_names,
+            strips: manifest.strips,
+            strip_order: manifest.strip_order,
+            strip_knobs: manifest.strip_knobs,
         };
         session.validate()?;
         Ok(session)
@@ -451,6 +599,16 @@ struct SessionFile {
     /// Rig names (older sessions have none → default names).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rig_names: Vec<String>,
+    /// Mixer strips (#72–77): a source's pan/mute/solo, an FX's bypass, the
+    /// strip colour/collapse. Older sessions have none → engine defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strips: Vec<StripSaved>,
+    /// Strip display order (older sessions have none → unit order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strip_order: Vec<NodeId>,
+    /// Explicit mixer quick-knob overrides (#107), keyed by node id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    strip_knobs: BTreeMap<NodeId, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -780,6 +938,7 @@ impl RigPreset {
                 mix: self.mix,
                 midi_device: self.midi_device,
                 clap_meta: self.clap_meta.clone(),
+                strip_knobs: self.session.strip_knobs().clone(),
             };
             let json = serde_json::to_vec_pretty(&manifest)?;
             write_atomic(&staging.join(RIG_PRESET_FILE), &json)
@@ -813,6 +972,9 @@ impl RigPreset {
             session.set_plugin_state(s.node, s.plugin_id, s.data);
         }
         session.set_matrix(manifest.matrix);
+        for (node, knob) in manifest.strip_knobs {
+            session.set_strip_knob(node, knob);
+        }
         let preset = RigPreset {
             name: manifest.name,
             rig_name: manifest.rig_name,
@@ -845,6 +1007,8 @@ struct RigPresetFile {
     midi_device: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     clap_meta: Vec<RigClapMeta>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    strip_knobs: BTreeMap<NodeId, String>,
 }
 
 /// Default directory for saved rig presets (sibling to `~/kabelsalat-sessions`).
@@ -1007,20 +1171,33 @@ pub enum Template {
     DrumsBass,
     /// Slow pad into long delay and big reverb — instant atmosphere.
     AmbientPad,
+    /// GarageBand's guitar story (issue #92): a live input through stomps
+    /// into an amp and cabinet. Audio In picks the input device on its face
+    /// (default = PipeWire's default source) and carries the tuner.
+    GuitarRig,
 }
 
 impl Template {
-    pub const ALL: [Template; 3] = [
+    pub const ALL: [Template; 4] = [
         Template::LeadReverb,
         Template::DrumsBass,
         Template::AmbientPad,
+        Template::GuitarRig,
     ];
+
+    /// A template whose instrument is a live input, not the keyboard: the
+    /// validity test asks for Audio In → effects → Master instead of
+    /// Keys → synth → Master.
+    pub fn is_guitar(self) -> bool {
+        matches!(self, Template::GuitarRig)
+    }
 
     pub fn title(self) -> &'static str {
         match self {
             Template::LeadReverb => "Lead + Reverb",
             Template::DrumsBass => "Drums + Bass",
             Template::AmbientPad => "Ambient Pad",
+            Template::GuitarRig => "Guitar Rig",
         }
     }
 
@@ -1118,6 +1295,53 @@ impl Template {
                     (verb, 0, 0.6), // reverb mix (param table: task-7)
                     (master, P_VOL, 0.75),
                     (master, P_WARM, 0.05),
+                ]);
+            }
+            // Audio In → screamer → delay → reverb (stomps) → amp → cabinet →
+            // Master. The guitarix LV2s come with the catalog's Guitarix card;
+            // until it is installed the three units say so on their faces and
+            // the rest of the rig (Audio In, Delay, Reverb) already works.
+            Template::GuitarRig => {
+                let ain = g.add_node(
+                    NodeKind::AudioIn { device: None, channels: AudioInChannel::MonoL },
+                    name_bytes("AUDIO IN"),
+                );
+                let scream = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::SCREAM) },
+                    name_bytes("SCREAM"),
+                );
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
+                let amp = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::AMP) },
+                    name_bytes("AMP"),
+                );
+                let cab = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::CABINET) },
+                    name_bytes("CABINET"),
+                );
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+                link(&mut g, ain, scream, 0, PortKind::Audio);
+                link(&mut g, scream, delay, 0, PortKind::Audio);
+                link(&mut g, delay, verb, 0, PortKind::Audio);
+                link(&mut g, verb, amp, 0, PortKind::Audio);
+                link(&mut g, amp, cab, 0, PortKind::Audio);
+                link(&mut g, cab, master, 0, PortKind::Audio);
+                defaults.extend([
+                    // The amp's tube stage driven to its crunch (guitar.rs:
+                    // Drive is the one control that turns the modelled clean
+                    // channel into an amp — the plugin's default 0.25 is
+                    // nearly clean).
+                    (amp, crate::guitar::AMP_DRIVE_CTRL as ParamId, 1.0),
+                    (amp, crate::guitar::AMP_PREGAIN_CTRL as ParamId, 0.8),
+                    // The screamer at full drive pushes the amp into its
+                    // crunch (its one control, port 0).
+                    (scream, 0, 1.0),
+                    (delay, P_TIME, 0.42), // ~1/8th at 96 BPM
+                    (delay, P_MIX, 0.35),
+                    (verb, 0, 0.3), // reverb mix (param table: task-7)
+                    (master, P_VOL, 0.75),
+                    (master, P_WARM, 0.1),
                 ]);
             }
         }
@@ -1395,17 +1619,27 @@ mod tests {
             ids.sort_unstable();
             assert!(ids.windows(2).all(|w| w[0] != w[1]));
 
-            // Playable shape: keys → at least one Clap synth → audio → master.
+            // Playable shape: every template makes sound into a master —
+            // keyboard templates Keys → Clap synth → master (MIDI + audio),
+            // the guitar rig Audio In → effects → master (audio only).
             let keys: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::Keys)).map(|n| n.id).collect();
+            let inputs: Vec<NodeId> = g.nodes.iter()
+                .filter(|n| matches!(n.kind, NodeKind::AudioIn { .. })).map(|n| n.id).collect();
             let synths: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::Clap { .. })).map(|n| n.id).collect();
             let masters: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
-            assert!(!keys.is_empty() && !synths.is_empty() && !masters.is_empty());
-            assert!(synths.iter().any(|&syn| keys.iter().any(|&k| g.has_route(k, syn, PortKind::Midi))));
+            assert!(!masters.is_empty());
+            if t.is_guitar() {
+                assert!(!inputs.is_empty(), "{}: no Audio In", t.title());
+            } else {
+                assert!(!keys.is_empty() && !synths.is_empty(), "{}: no keys/synth", t.title());
+                assert!(synths.iter().any(|&syn| keys.iter().any(|&k| g.has_route(k, syn, PortKind::Midi))));
+            }
 
-            // Audio reachability: some synth reaches some master over audio edges.
+            // Audio reachability: the template's sound source reaches a
+            // master over audio edges.
             let reaches_master = |syn: NodeId| -> bool {
                 let mut seen = vec![syn];
                 let mut stack = vec![syn];
@@ -1422,7 +1656,8 @@ mod tests {
                 }
                 false
             };
-            assert!(synths.iter().any(|&syn| reaches_master(syn)), "{}: no audio path to master", t.title());
+            let sources: Vec<NodeId> = if t.is_guitar() { inputs } else { synths };
+            assert!(sources.iter().any(|&syn| reaches_master(syn)), "{}: no audio path to master", t.title());
 
             // Default knobs reference real nodes and are finite.
             for p in s.params() {
@@ -1650,6 +1885,32 @@ mod tests {
         delete_rig_preset(&dir, "Lead Preset").unwrap();
         delete_rig_preset(&dir, "Evil").unwrap();
         assert!(list_rig_presets(&dir).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_knobs_round_trip_and_prune() {
+        let dir = test_dir("strip-knobs");
+        let mut s = sample_session();
+        s.set_strip_knob(1, "OSC 1 VOL".into());
+        s.set_strip_knob(2, "MIX".into());
+        s.set_strip_knob(2, "   ".into()); // empty clears
+        assert_eq!(s.strip_knob(1), Some("OSC 1 VOL"));
+        assert_eq!(s.strip_knob(2), None);
+
+        let pkg = Session::package_path(&dir, "Quick Knobs").unwrap();
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.strip_knob(1), Some("OSC 1 VOL"));
+        assert!(loaded.same_content(&s));
+
+        // Removing the node makes validate fail until pruned.
+        let mut orphaned = loaded.clone();
+        orphaned.graph.remove_node(1);
+        assert!(orphaned.validate().is_err());
+        orphaned.prune_to_graph();
+        orphaned.validate().unwrap();
+        assert!(orphaned.strip_knobs().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

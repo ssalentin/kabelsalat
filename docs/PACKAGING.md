@@ -35,6 +35,20 @@ changelog fragments. Packaging is checked by the nightly build, not per PR.
   one-off reformat would conflict with every open PR. Do it in a quiet moment,
   then make it a required check.
 
+### Feature PRs update the README
+
+`.github/workflows/readme-check.yml` runs on every PR and on every label
+change. A PR labelled `enhancement` must also change `README.md`, or the
+check fails (AGENTS.md rule 132): the README is the shop window, and a feature that merges
+without its entry there (the plugin editor windows, #71) is invisible to
+anyone who only reads it. When such a PR changes `src/ui.rs` or
+`src/theme.rs` without touching a screenshot under `docs/shots/`, the check
+warns on the file instead — whether users can see the difference is the
+author's call, so labelling only real features keeps the fail meaningful.
+The logic is `scripts/ci/readme-check.sh`, self-tested on real `gh api`
+output (`--selftest`); like every check except the two test jobs it is
+advisory until someone makes it required.
+
 ### Branch protection and a red main
 
 `main` requires `test (x86_64)` and `test (aarch64)`, but not that a branch

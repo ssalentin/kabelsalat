@@ -313,6 +313,22 @@ pub static CATALOG: &[CatalogEntry] = &[
         bundles: &["Aeolus.clap"],
         data: None,
     },
+    CatalogEntry {
+        id: "guitarix",
+        name: "Guitarix",
+        format: Format::Lv2,
+        description: "Guitar amp, cabinets and stompbox effects",
+        about: "A mono guitar amplifier with a tube-modelled preamp, tone stack and power amp, matched cabinet impulses and a pedalboard of stomps (overdrive, fuzz, delay, reverb, wah, tremolo). kabelsalat's Guitar rig template wires an Audio In through the screamer, the amp and a cabinet — the tuner is on the Audio In unit's face.",
+        license: "GPL-2.0-or-later",
+        homepage: Some("https://guitarix.org"),
+        repo: "brummer10/guitarix",
+        routes: &[InstallRoute::DistroPackage { pkg: "guitarix" }],
+        home: Home::Lv2,
+        clap_id: None,
+        lv2_uris: crate::guitar::ALL,
+        bundles: &["gx_amp.lv2", "gx_cabinet.lv2", "gx_scream.lv2"],
+        data: None,
+    },
 ];
 
 impl InstallRoute {
@@ -655,25 +671,87 @@ pub fn run_install(entry: &CatalogEntry, cache: &Path, home: &Path, log: &mut dy
     Ok(())
 }
 
+/// First URI of `entry` that loads as an LV2 *effect* (feed it audio, listen
+/// to the output). An instrument card is played by `lv2-instrument-engine-test`.
+fn lv2_effect_uri(entry: &CatalogEntry) -> Option<&'static str> {
+    entry.lv2_uris.iter().copied()
+        .find(|u| crate::lv2::Lv2Plugin::load(u, 48_000.0, 512).map_or(false, |p| !p.is_instrument()))
+}
+
+/// Feed a loaded LV2 effect a 220 Hz test signal for half a second and
+/// return the output peak (rule 116's spirit: verify the *installed* bundle
+/// by its own URI, never another copy elsewhere on the search paths).
+fn play_lv2_card(uri: &str) -> anyhow::Result<f32> {
+    let (rate, block) = (48_000.0, 512usize);
+    let mut p = crate::lv2::Lv2Plugin::load(uri, rate, block)?;
+    anyhow::ensure!(!p.is_instrument(), "{uri} is an instrument, not an effect");
+    let mut inp = vec![0.0f32; block * 2];
+    let mut out = vec![0.0f32; block * 2];
+    let mut peak = 0.0f32;
+    for b in 0..(rate as usize / block) {
+        for i in 0..block {
+            let s = (2.0 * std::f32::consts::PI * 220.0 * ((b * block + i) as f32 / rate as f32)).sin() * 0.5;
+            inp[i * 2] = s;
+            inp[i * 2 + 1] = s;
+        }
+        p.process(&inp, &mut out, block);
+        if b > 20 { // let any attack settle in
+            peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+        }
+    }
+    crate::lv2::retire(p); // rule 56: retire, never free
+    Ok(peak)
+}
+
 /// `kabelsalat catalog-install-test [id...]`: installs each named entry
 /// (default: Odin 2 and Floe) through the route this machine takes, into a
 /// scratch home under `~/.cache` (rule 79), then loads the bundle in the CLAP
 /// host, checks its plugin id and plays a note. Downloads from GitHub; a
-/// source route builds, which takes minutes.
+/// source route builds, which takes minutes. An LV2 card whose distro package
+/// is already installed is verified by its URI instead (no system change).
 pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
     let ids: Vec<&str> = if ids.is_empty() { vec!["odin2", "floe"] } else { ids.iter().map(String::as_str).collect() };
     let root = home_dir().join(".cache").join("ksalat-catalog-install-test");
     let _ = std::fs::remove_dir_all(&root);
     let (cache, home) = (root.join("build"), root.join("home"));
-    let (mut tested, mut failed) = (0, Vec::new());
+    let (mut tested, mut failed, mut considered) = (0, Vec::new(), 0);
     for id in ids {
         let entry = find(id).ok_or_else(|| anyhow::anyhow!("no catalog entry '{id}'"))?;
         let Some(route) = local_route(entry) else {
             println!("  {}: no route for {}, skipped", entry.name, std::env::consts::ARCH);
             continue;
         };
+        considered += 1;
         let Some(clap_id) = entry.clap_id else {
-            println!("  {}: not a CLAP plugin, skipped", entry.name);
+            // An LV2 card. Nothing to build into the scratch home: when the
+            // distro package is on disk the plugin is verified by URI; when
+            // it is not, installing it changes the system and stays with the
+            // user (the card names the exact command).
+            let root_paths = plugin_roots(&home);
+            let roots: Vec<&Path> = root_paths.iter().map(|p| p.as_path()).collect();
+            if !bundle_installed(entry, &roots) {
+                println!("  {}: LV2 bundle not installed here, skipped (the card installs it: {})", entry.name, route.summary());
+                continue;
+            }
+            if let Some(uri) = lv2_effect_uri(entry) {
+                tested += 1;
+                println!("  {}: installed LV2, verifying {uri}", entry.name);
+                match play_lv2_card(uri) {
+                    Ok(peak) => {
+                        println!("  {}: {uri} renders the test signal, peak {peak:.3}", entry.name);
+                        if peak < 1e-3 {
+                            println!("  {}: FAILED: silent", entry.name);
+                            failed.push(entry.name);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  {}: FAILED: {e}", entry.name);
+                        failed.push(entry.name);
+                    }
+                }
+            } else {
+                println!("  {}: LV2 instrument card, play it via KABELSALAT_LV2_URI={} lv2-instrument-engine-test", entry.name, entry.lv2_uris.first().unwrap_or(&""));
+            }
             continue;
         };
         if let InstallRoute::DistroPackage { .. } = route {
@@ -714,9 +792,15 @@ pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
             failed.push(entry.name);
         }
     }
-    anyhow::ensure!(tested > 0, "catalog-install-test: nothing installable here");
+    anyhow::ensure!(considered > 0, "catalog-install-test: nothing installable here");
     anyhow::ensure!(failed.is_empty(), "catalog-install-test failed: {}", failed.join(", "));
-    println!("catalog-install-test: OK ({tested} installed, found by the scan and heard)");
+    if tested > 0 {
+        println!("catalog-install-test: OK ({tested} installed, found by the scan and heard)");
+    } else {
+        // Only distro LV2 cards named, none installed yet: verified nothing,
+        // but the named entries all exist and have a route.
+        println!("catalog-install-test: OK (no bundle to verify here; the distro card's install stays with the user)");
+    }
     Ok(())
 }
 
@@ -784,8 +868,29 @@ mod tests {
                 e.id
             );
         }
-        assert_eq!(CATALOG.len(), 8);
+        assert_eq!(CATALOG.len(), 9);
         assert_eq!(CATALOG[0].id, "setbfree", "setBfree is first per the spec");
+    }
+
+    #[test]
+    fn guitarix_is_a_distro_lv2_card_detected_by_uri() {
+        let gx = find("guitarix").unwrap();
+        // The Arch package is native on both CPUs this project ships for
+        // (rule 114: routes best first, a distro package runs everywhere
+        // pacman does).
+        assert_eq!(route_for(gx, "aarch64").unwrap().kind(), "distro");
+        assert_eq!(route_for(gx, "x86_64").unwrap().kind(), "distro");
+        assert!(gx.lv2_uris.contains(&crate::guitar::AMP), "the card detects the amp");
+        assert!(!gx.lv2_uris.iter().any(|u| u.contains(".monitor")), "a card never points at a monitor");
+        let scan = ScanSet { clap_ids: vec![], lv2_uris: vec![crate::guitar::AMP.into()] };
+        assert!(scan_installed(gx, &scan), "the background scan marks the card installed");
+        let roots: Vec<&Path> = vec![Path::new("/usr/lib/lv2")];
+        let present = bundle_installed(gx, &roots);
+        if present {
+            // On a machine with guitarix actually installed (verified with
+            // `file`: aarch64 ELF), the install test checks the URI.
+            println!("guitarix bundle present: {}", std::fs::read_dir("/usr/lib/lv2/gx_amp.lv2").is_ok());
+        }
     }
 
     #[test]

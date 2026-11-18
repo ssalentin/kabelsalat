@@ -112,6 +112,27 @@ impl AudioInChannel {
             AudioInChannel::Stereo => "ST",
         }
     }
+
+    /// Device channels the selection reads.
+    pub fn count(&self) -> u32 {
+        match self {
+            AudioInChannel::MonoL | AudioInChannel::MonoR => 1,
+            AudioInChannel::Stereo => 2,
+        }
+    }
+}
+
+/// A hosted MIDI-effect plugin (AUM "MIDI strips"): events in, processed
+/// events out — a rack unit that sits IN the MIDI path (arpeggiators,
+/// chord tools, MIDI filters, transposers). `NodeKind::MidiFx` carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiFxPlugin {
+    /// LV2 MIDI plugin, by URI: MIDI in, MIDI out, no audio port (a plugin
+    /// that is no instrument, rule 72, and could never be an audio effect).
+    Lv2 { uri: Lv2Uri },
+    /// Built-in transposer — always available, no plugin to load. Also the
+    /// portable engine-test path (rule 37: unit tests never host a plugin).
+    Builtin { semis: i8 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +145,10 @@ pub enum NodeKind {
     Dsp(DspKind),
     /// Hosted LV2 plugin (audio effect), identified by URI.
     Lv2 { uri: Lv2Uri },
+    /// Hosted MIDI-effect plugin (AUM MIDI strips): the unit's MIDI OUT is a
+    /// routable matrix source (`SourceId::MidiFx(node)`), so it chains
+    /// source → MIDI-FX → rig input through the matrix.
+    MidiFx { plugin: MidiFxPlugin },
     /// Desktop playback capture (P2).
     SystemAudio,
     /// Live audio input (microphone / guitar / interface) — a rack-able source
@@ -131,6 +156,11 @@ pub enum NodeKind {
     /// (`None` = the default input); `channels` picks which device channels fill
     /// the stereo OUT.
     AudioIn { device: Option<String>, channels: AudioInChannel },
+    /// MIDI-generating unit (issue #90): sits between a keyboard source and a
+    /// synth like an effect — held notes become an arpeggio, or (chord mode)
+    /// one chord per key. One MIDI IN, one MIDI OUT; no audio. Settings are
+    /// its rack knobs (`engine::knob_specs`, params `arp::P_ARP_*`).
+    Arp,
     /// Stereo output bus.
     MasterOut,
 }
@@ -177,6 +207,12 @@ pub struct Node {
     /// many bass sounds are pitched down already. Older sessions load at 0.
     #[serde(default)]
     pub zone_octave: [i8; 2],
+    /// Key + scale this Keys node's notes snap to (issue #90, a property of
+    /// the Keys source like `split`): out-of-scale keys snap to the nearest
+    /// in-scale note on their way out. `None` = no snapping (the default and
+    /// what older sessions load).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<crate::arp::ScaleChoice>,
 }
 
 /// Which Keys output port a PLAYED note leaves on: unsplit → 0; split at
@@ -232,7 +268,7 @@ impl Graph {
     pub fn add_node(&mut self, kind: NodeKind, name: Name) -> NodeId {
         let id = self.next_node;
         self.next_node += 1;
-        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None, zone_octave: [0; 2] });
+        self.nodes.push(Node { id, kind, name, rig: 0, playing: false, split: None, zone_octave: [0; 2], scale: None });
         id
     }
 
@@ -260,6 +296,59 @@ impl Graph {
         let changed = n.playing != playing;
         n.playing = playing;
         Some(changed)
+    }
+
+    /// Set (Some) or clear (None) a Keys node's key + scale snap. Returns
+    /// `Some(changed)` for a Keys node, `None` if the node is unknown or not
+    /// a Keys source (its scale stays None). Snapping is a pure function of
+    /// the played note, so a note-off always meets the pitch its note-on
+    /// snapped to — but an edit between them still releases first (engine).
+    pub fn set_scale(&mut self, id: NodeId, choice: Option<crate::arp::ScaleChoice>) -> Option<bool> {
+        let n = self.nodes.iter_mut().find(|n| n.id == id)?;
+        if !matches!(n.kind, NodeKind::Keys) {
+            return None;
+        }
+        let choice = choice.map(|c| crate::arp::ScaleChoice { key: c.key.min(11), ..c });
+        let changed = n.scale != choice;
+        n.scale = choice;
+        Some(changed)
+    }
+
+    /// Insert `node` (an Arp) into its rig's MIDI chain, GarageBand-style:
+    /// every MIDI cable from the rig's Keys node to an instrument is
+    /// REPLACED by Keys → arp, and the arp feeds each instrument that cable
+    /// carried (both split ports merge into the arp's one MIDI in). Fresh
+    /// cable ids above every existing one. Returns how many cables it added.
+    /// The engine releases held notes on every instrument the Keys node
+    /// feeds before this (rule 41).
+    pub fn wire_arp(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let keys = self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
+        let Some(keys) = keys else { return 0 };
+        // The rig's Keys→instrument MIDI cables this arp takes over.
+        let claps: Vec<NodeId> = self.nodes.iter()
+            .filter(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
+            .map(|n| n.id)
+            .collect();
+        let take_over: Vec<(u8, NodeId)> = self.edges.iter()
+            .filter(|e| e.kind == PortKind::Midi && e.from.node == keys && claps.contains(&e.to.node))
+            .map(|e| (e.from.port, e.to.node))
+            .collect();
+        self.edges.retain(|e| {
+            !(e.kind == PortKind::Midi && e.from.node == keys && claps.contains(&e.to.node))
+        });
+        let mut added = 0;
+        for &(port, inst) in &take_over {
+            let fresh = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(fresh, PortRef { node: keys, port }, PortRef { node, port: 0 }, PortKind::Midi) {
+                added += 1;
+            }
+            let fresh = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(fresh, PortRef { node, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) {
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Set (Some) or clear (None) a Keys node's split point. Clearing removes
@@ -371,6 +460,107 @@ impl Graph {
 
     pub fn disconnect(&mut self, id: EdgeId) {
         self.edges.retain(|e| e.id != id);
+    }
+
+    /// The instruments of a rig's MIDI chain: every node a MIDI cable from
+    /// the rig's Keys or a MIDI-FX unit ends at. Judged by the cables (the
+    /// graph's own facts), so an LV2 audio effect is never one.
+    pub fn midi_sinks(&self, rig: u8) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        for e in self.edges.iter().filter(|e| e.kind == PortKind::Midi) {
+            let from_chain = self.node(e.from.node).is_some_and(|n| {
+                n.rig == rig && matches!(n.kind, NodeKind::Keys | NodeKind::MidiFx { .. })
+            });
+            let to = self.node(e.to.node);
+            let to_inst = to.is_some_and(|n| n.rig == rig && !matches!(n.kind, NodeKind::MidiFx { .. }));
+            if from_chain && to_inst && !out.contains(&e.to.node) {
+                out.push(e.to.node);
+            }
+        }
+        out
+    }
+
+    /// Insert a MIDI-FX unit into its rig's MIDI chain (AUM "MIDI strips"):
+    /// every MIDI cable that fed an instrument from the rig's Keys (or from
+    /// an earlier unit) is re-pointed at the new unit, and the unit feeds
+    /// each of those instruments — so the chain order is the order units
+    /// were added, and notes reach an instrument once, through the units.
+    /// The cables are what gate the two routing legs (the engine's
+    /// `keys_route` for the unit's input, `fx_cable` for its output). A rig
+    /// without instruments just gets Keys → unit. Returns the cables added.
+    pub fn wire_midi_fx(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let sinks = self.midi_sinks(rig);
+        let keys = self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
+        let fresh = |g: &Self| g.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+        let mut added = 0;
+        let mut feeders: Vec<PortRef> = Vec::new();
+        let mut gone: Vec<EdgeId> = Vec::new();
+        for e in self.edges.iter().filter(|e| e.kind == PortKind::Midi && sinks.contains(&e.to.node)) {
+            let from_chain = self.node(e.from.node).is_some_and(|n| {
+                n.rig == rig && matches!(n.kind, NodeKind::Keys | NodeKind::MidiFx { .. }) && n.id != node
+            });
+            if from_chain {
+                gone.push(e.id);
+                if !feeders.contains(&e.from) {
+                    feeders.push(e.from);
+                }
+            }
+        }
+        self.edges.retain(|e| !gone.contains(&e.id));
+        if feeders.is_empty() {
+            if let Some(keys) = keys {
+                feeders.push(PortRef { node: keys, port: 0 });
+            }
+        }
+        for from in feeders {
+            let id = fresh(self);
+            added += self.connect_with_id(id, from, PortRef { node, port: 0 }, PortKind::Midi) as usize;
+        }
+        for inst in sinks {
+            let id = fresh(self);
+            added += self.connect_with_id(id, PortRef { node, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) as usize;
+        }
+        added
+    }
+
+    /// After a MIDI-FX unit left `rig`: give the instruments that lost their
+    /// MIDI input a cable again — from the chain's remaining tail unit (one
+    /// that feeds nothing) or else from the rig's Keys. Returns the cables added.
+    pub fn heal_midi_after_fx(&mut self, rig: u8) -> usize {
+        let has_in = |g: &Self, id: NodeId| g.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == id);
+        let tail = self
+            .nodes
+            .iter()
+            .find(|n| {
+                n.rig == rig
+                    && matches!(n.kind, NodeKind::MidiFx { .. })
+                    && !self.edges.iter().any(|e| e.kind == PortKind::Midi && e.from.node == n.id)
+            })
+            .map(|n| n.id);
+        let source = tail.or_else(|| {
+            self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id)
+        });
+        let Some(source) = source else { return 0 };
+        // Instruments by their own audio cables: a node of the rig that
+        // sounds (an audio cable leaves it for the rig's Master) but lost MIDI.
+        let orphans: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.rig == rig
+                    && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. })
+                    && !has_in(self, n.id)
+                    && self.edges.iter().any(|e| e.kind == PortKind::Audio && e.from.node == n.id)
+            })
+            .map(|n| n.id)
+            .collect();
+        let mut added = 0;
+        for inst in orphans {
+            let id = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            added += self.connect_with_id(id, PortRef { node: source, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) as usize;
+        }
+        added
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {
@@ -686,6 +876,26 @@ pub enum Command {
         mute: Option<bool>,
         solo: Option<bool>,
     },
+    /// Per-SOURCE strip mix (#73): pan and mute/solo on one instrument /
+    /// audio-in / generator node, applied to the node's own output (post its
+    /// LEVEL knob — the strip fader) before anything downstream hears it, so
+    /// its FX chain and the rig bus follow. Solo scope is WITHIN the node's
+    /// rig: a soloed source silences only the other sources of that rig; rig
+    /// buses keep their own global solo (`SetRigMix`). Omitted fields keep
+    /// their value; resets on graph loads.
+    SetStripMix {
+        node: NodeId,
+        pan: Option<f32>,
+        mute: Option<bool>,
+        solo: Option<bool>,
+    },
+    /// Bypass one effect node (#74): a bypassed FX passes its input through
+    /// unchanged (its knob values are kept). Resets on graph loads.
+    SetStripBypass { node: NodeId, bypass: bool },
+    /// Rename one node (#77): the name its rack unit and mixer strip show.
+    /// Metadata only — routing and sound are untouched; the engine publishes
+    /// the graph (node names live in it).
+    RenameNode { node: NodeId, name: Name },
     /// Replace the whole graph (template load). The engine rebuilds DSP, remaps
     /// the existing CLAP voices onto the new Clap nodes, and rebuilds the MIDI
     /// matrix. Rare structural op: allocates (bends RT discipline by design).
@@ -703,6 +913,12 @@ pub enum Command {
     /// plain graph wiring — wire LOW/HIGH to rigs like any ports. The engine
     /// releases held notes on every instrument the node feeds.
     SetNodeSplit { node: NodeId, point: Option<u8> },
+    /// Key + scale a Keys node's notes snap to (issue #90): out-of-scale keys
+    /// snap to the nearest in-scale note on their way out. `None` = no
+    /// snapping. The engine releases held notes on every instrument the node
+    /// feeds first (rule 41: a scale change mid-hold would snap the release
+    /// to a different pitch than the note-on did).
+    SetKeysScale { node: NodeId, scale: Option<crate::arp::ScaleChoice> },
     /// Octave shift of one zone of a split Keys node (`zone` 0 = LOW, 1 =
     /// HIGH; `octave` clamped to ±`ZONE_OCTAVE_MAX`). The engine releases
     /// held notes on every instrument the node feeds first (rule 41).
@@ -730,6 +946,14 @@ pub enum Command {
         channel: u8,
         cc: u8,
         value: u8,
+    },
+    /// Incoming MIDI pitch bend (0xE0) routed through the matrix like
+    /// [`Command::Cc`]: `value` is the signed 14-bit bend (-8192..=8191,
+    /// 0 = center). Instruments bend what they play; nothing is edited.
+    PitchBend {
+        source: SourceId,
+        channel: u8,
+        value: i16,
     },
     /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
     /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
@@ -759,6 +983,23 @@ pub enum Command {
     /// Mix the file player (backing track) into the master at `gain` (0..1).
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
+    /// Configure the file player's playback settings (AUM FilePlayer, issue
+    /// #84): `loop_on` restarts the file seamlessly, `sync` follows the
+    /// transport tempo (varispeed), `beats` is the loop's length in beats
+    /// (0 = derive the tempo from `bpm` instead), `offset` shifts the start
+    /// point in beats (±), `bpm` is the file's original tempo. Omitted
+    /// fields keep their current value; settings apply to the loaded file.
+    SetPlayerCfg {
+        loop_on: Option<bool>,
+        sync: Option<bool>,
+        beats: Option<f32>,
+        offset: Option<f32>,
+        bpm: Option<f32>,
+    },
+    /// File-player play-enable (AUM's circular toggle): with sync on and the
+    /// master transport rolling (or counting in), sounding starts at the
+    /// next bar boundary; otherwise it starts now. `on: false` stops.
+    SetPlayerEnable { on: bool },
     /// Master transport: start EVERY transport-capable node (sets
     /// `Node::playing` on all of them) and run the song clock hosted CLAP
     /// plugins follow, from beat 0. Per-node SetNodePlaying overrides
@@ -796,6 +1037,10 @@ pub enum Command {
     /// "Sync to transport": while on, master TransportPlay starts a recording
     /// and TransportStop stops it (recording follows the master transport).
     SetRecordSync { on: bool },
+    /// Arm or disarm a recording target (`rig: None` = master mix, `Some(r)` =
+    /// rig `r`'s post-fader stem). Armed targets are captured together in the
+    /// next take.
+    SetRecordArm { rig: Option<u8>, armed: bool },
     /// Reset the master-bus loudness meter (Bravo 1 "measure loop"): clears
     /// the integrated-loudness gate, windows, true-peak hold and band/LFE
     /// accumulators so a fresh integrated measurement starts now.
@@ -825,8 +1070,10 @@ impl Command {
             Command::AddNode { .. } | Command::RemoveNode { .. } | Command::Connect { .. }
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
+            | Command::SetStripMix { .. } | Command::SetStripBypass { .. } | Command::RenameNode { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
-            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. })
+            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. }
+            | Command::SetKeysScale { .. })
     }
 }
 
@@ -963,6 +1210,8 @@ mod tests {
             Command::RecordStart,
             Command::RecordStop,
             Command::SetRecordSync { on: true },
+            Command::SetRecordArm { rig: None, armed: true },
+            Command::SetRecordArm { rig: Some(1), armed: true },
             Command::ResetMeter,
             Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },

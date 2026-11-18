@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Instrument profiles: map a whole hardware instrument at once.** Pick the
+  instrument for a hardware port in the MIDI matrix (a port whose name names
+  the instrument is matched by itself) and its knobs, drawbars and switches
+  drive the rack, with no MIDI learn per control. The first profile is the
+  **Nord Electro 2**: its nine upper drawbars, rotary slow/fast, percussion and
+  overdrive drive the setBfree organ face. Profiles are MIDI Guide CSV files
+  with a `role` column; more go in `~/.config/kabelsalat/instruments/`.
 - **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
   installs from its prebuilt release on x86_64 and builds from source on
   aarch64; its 260 factory patches are fetched too, so the assistant can list,

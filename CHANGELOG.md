@@ -130,6 +130,10 @@ releases may still change behaviour and session files.
 - **The Load rig preset dialog has a clean layout.** "Load into" lists the new
   rig and every rig to replace as one row each with a radio mark; long rig
   names no longer wrap letter by letter into tall columns.
+- **A new delay echoes instead of distorting:** the TIME knob started at
+  21 ms with feedback, a metallic comb that sounded like distortion. Its
+  range is now 50 ms to 2 s, so a new delay starts at about 220 ms. Saved
+  delays keep their knob position and land on a longer time.
 - **Effects can be inserted from the mixer again:** "+ insert" opened its
   effect picker and closed it in the same click, and a picked effect was
   dropped. The picker now stays open and the chosen effect joins the

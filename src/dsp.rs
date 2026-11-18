@@ -690,7 +690,7 @@ impl Processor for Saturation {
 // ---------------------------------------------------------------------------
 
 /// Stereo delay (max 2 s, preallocated). Params:
-/// - 0 `time`: 1..2000 ms (log).
+/// - 0 `time`: `DELAY_MIN_S`..`DELAY_MAX_S` (log).
 /// - 1 `feedback`: 0..0.95 (never reaches unity — always decays).
 /// - 2 `mix`: dry/wet (0 = dry passthrough, 1 = echoes only).
 /// - 3 `pingpong`: <0.5 = parallel stereo, ≥0.5 = cross-channel ping-pong.
@@ -698,6 +698,12 @@ impl Processor for Saturation {
 ///
 /// Delay time is slewed and read with linear interpolation, so live sweeps
 /// glide instead of clicking.
+/// Shortest echo the TIME knob reaches. Below ~50 ms a fed-back delay is a
+/// resonant comb filter, not an echo: the old 1 ms floor put the face's
+/// default (0.4) at 21 ms, and every new delay sounded distorted.
+pub const DELAY_MIN_S: f32 = 0.05;
+pub const DELAY_MAX_S: f32 = 2.0;
+
 pub struct Delay {
     sr: f32,
     buf: Vec<f32>, // stereo interleaved
@@ -781,7 +787,7 @@ impl Processor for Delay {
         let v = clamp01(value);
         match id {
             0 => {
-                let secs = log_map(v, 0.001, 2.0);
+                let secs = log_map(v, DELAY_MIN_S, DELAY_MAX_S);
                 self.delay.set(self.sr * secs);
             }
             1 => self.fb.set(0.95 * v),
@@ -1278,7 +1284,7 @@ mod tests {
     /// Settle a delay at 100 ms, feedback 0, fully wet.
     fn delay_100ms() -> Delay {
         let mut d = Delay::new(SR);
-        d.set_param(0, log_norm(100.0, 1.0, 2000.0));
+        d.set_param(0, log_norm(0.100, DELAY_MIN_S, DELAY_MAX_S));
         d.set_param(1, 0.0);
         d.set_param(2, 1.0);
         silence(&mut d, 48000);
@@ -1302,7 +1308,7 @@ mod tests {
     #[test]
     fn delay_feedback_decay() {
         let mut d = Delay::new(SR);
-        d.set_param(0, log_norm(100.0, 1.0, 2000.0));
+        d.set_param(0, log_norm(0.100, DELAY_MIN_S, DELAY_MAX_S));
         d.set_param(1, 0.5); // fb = 0.475
         d.set_param(2, 1.0);
         d.set_param(4, 0.0); // bright
@@ -1344,7 +1350,7 @@ mod tests {
     #[test]
     fn delay_pingpong_alternates() {
         let mut d = Delay::new(SR);
-        d.set_param(0, log_norm(50.0, 1.0, 2000.0));
+        d.set_param(0, log_norm(0.050, DELAY_MIN_S, DELAY_MAX_S));
         d.set_param(1, 0.6);
         d.set_param(2, 1.0);
         d.set_param(3, 1.0); // pingpong
@@ -1371,7 +1377,7 @@ mod tests {
     #[test]
     fn delay_tail_rings_out() {
         let mut d = Delay::new(SR);
-        d.set_param(0, log_norm(100.0, 1.0, 2000.0));
+        d.set_param(0, log_norm(0.100, DELAY_MIN_S, DELAY_MAX_S));
         d.set_param(1, 0.5);
         d.set_param(2, 1.0);
         silence(&mut d, 48000);

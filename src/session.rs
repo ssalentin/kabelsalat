@@ -1337,7 +1337,7 @@ impl Template {
                     // The screamer at full drive pushes the amp into its
                     // crunch (its one control, port 0).
                     (scream, 0, 1.0),
-                    (delay, P_TIME, 0.42), // ~1/8th at 96 BPM
+                    (delay, P_TIME, 0.5), // ~1/8th at 96 BPM (316 ms)
                     (delay, P_MIX, 0.35),
                     (verb, 0, 0.3), // reverb mix (param table: task-7)
                     (master, P_VOL, 0.75),

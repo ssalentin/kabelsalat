@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Controller range on a MIDI-mapped knob:** right-click a bound knob and
+  set MIN / MAX under *Controller range*. The controller's whole travel then
+  spans only that stretch, so an expression pedal on organ drive can be held
+  below 60 % and still use its full sweep. The knob shows the reachable
+  stretch in blue between two ticks, *Full range* lifts the limit, and the
+  range is saved with the session. Agents set it with `set_cc_map`
+  `min`/`max`, and `list_cc_maps` reports it.
 - **MIDI strip on the software keyboard:** the keyboard dock now carries a
   pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
   its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's
@@ -126,6 +133,10 @@ releases may still change behaviour and session files.
   strip's or the master's insert chain. Clicking a strip's name opens a
   rename dialog that stays open until Rename or Cancel (it vanished after
   one frame).
+- **A MIDI device turned off for an LV2 instrument stays off:** with two rigs
+  on two keyboards, the keyboard of the CLAP rig also played an LV2
+  instrument such as setBfree, when its cells were set while the plugin was
+  still loading (session load, new rig) (#123).
 - **Meters no longer read hot at normal levels:** the meters' colour zones
   were left on the old linear scale, so anything above −24 dBFS showed
   tomato and anything above −3 dBFS red. Tomato now starts at −6 dBFS and

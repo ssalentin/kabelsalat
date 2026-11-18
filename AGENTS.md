@@ -992,6 +992,15 @@ Learned so far (2026-11-15, UI polish pass):
     (`an_effect_picked_in_the_insert_picker_lands_in_the_strip_chain`,
     `a_clicked_strip_name_opens_a_rename_that_stays_until_decided`).
 
+153. **One matrix rule per (source, destination), and a connect keeps it:**
+    `Matrix::connect` appended a rule every time. An LV2 instrument attaches
+    after its loader thread finishes (rule 46), and `attach_lv2` connected
+    every source again after the UI had already turned one device off for it.
+    The new, enabled rule sat next to the disabled one, so the U6MIDI Pro
+    played a rig bound to another keyboard. Default routes go through
+    `connect`, which keeps an existing rule with its shape and enabled flag
+    (`a_device_turned_off_before_the_lv2_instance_loads_stays_off`).
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

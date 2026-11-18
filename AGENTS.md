@@ -393,7 +393,8 @@ Learned so far (2026-11-15, UI polish pass):
     measure.
 79. **Build output never goes to tmpfs, also not as a copy:** a 690 MB debug
     binary copied into a scratch directory under `/tmp` filled the volume
-    and every command lost its output. Keep binaries and eval output under
+    and every command lost its output. Downloads too: 220 MB of plugin
+    archives in the session scratchpad (`/tmp/claude-*`) filled it again. Keep binaries and eval output under
     `~/.cache/ksalat-*` and strip copies.
 80. **An engine barrier opens on the engine's answer, never on the rack's
     own move:** `disconnect` unplugs its cable in the rack at once, so the
@@ -611,6 +612,24 @@ Learned so far (2026-11-15, UI polish pass):
     `organ_pending` (fixed size, no allocation) holds them and `attach_lv2`
     replays them; `LoadGraph` clears it. Check with `kabelsalat organ-test`,
     which sends the registration before the instance exists.
+114. **A catalog route names the CPU it runs on:** this machine is aarch64,
+    and upstream Linux releases (Odin 2, Floe) are x86_64 only, so an entry
+    lists routes best first (`routes`) and `local_route` takes the first that
+    `runs_on` this CPU; with none, the card says so and offers no Install.
+    Check `uname -m` and `file` a bundle before trusting a prebuilt one.
+115. **An install step that clones starts from a fresh folder:** a retry
+    after a failed install found the earlier clone in the build cache and
+    `git clone` refused it. `plan` puts `rm -rf` of its own cache folder
+    before every clone or download (`fresh_dir`).
+116. **A test of an installed bundle loads that bundle by path:** the
+    catalog test played the user's `~/.clap/Odin2.clap` instead of the one it
+    had just installed, because the host searches `~/.clap` before
+    `$CLAP_PATH`. Use `ClapVoice::new_from_bundle`, never a search by id.
+117. **A row that starts with a label sets its height first:** egui centres
+    each widget on the row as tall as it is so far, so an "Installed" label
+    before 26 px buttons sat 3 to 6 px high (and a wrapping layout ignores
+    the cross alignment altogether). `ui.set_min_height(26.0)` before the
+    label (`a_catalog_source_code_button_opens_the_repo` compares centres).
 
 114. **A release has its packages, or the workflow says why:** v0.1.0 was
     tagged before `release.yml` existed, so its release shipped without one
@@ -667,7 +686,8 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test` (`./target/debug/kabelsalat <name>`).
+  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree
@@ -703,8 +723,28 @@ Learned so far (2026-11-15, UI polish pass):
   `pwd` before editing. When the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
-  and shows the evidence. Never leave finished work only on the local
-  machine or only on a branch. Remove the worktree once its PR is merged.
+  and shows the evidence, then queue it with `gh pr merge --auto --squash`
+  (see "Merging"). Never leave finished work only on the local machine or
+  only on a branch. Remove the worktree once its PR is merged.
+- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
+  (admins included), the branch must be up to date, and the required checks
+  `test (x86_64)`, `test (aarch64)`, `flatpak cargo-sources.json is current`
+  and `human gate` must pass. GitHub merges a queued auto-merge PR once they
+  do; never merge by hand around a red or pending check, and never
+  `gh pr merge` without `--auto`. `human gate`
+  (`scripts/ci/human-gate.sh`, run from `main` via `pull_request_target`,
+  so a PR cannot edit it to pass) holds only PRs that change the rules
+  agents work under or what ships: `AGENTS.md`, `.github/`, `.githooks/`,
+  `scripts/ci/`, `scripts/check-images.sh`, `Cargo.toml`, `packaging/`.
+  Everything else merges on green CI, so the evidence rules above are what
+  keeps it safe. Add the `needs-human` label to a PR whose risk neither the
+  tests nor its evidence cover.
+  Such a PR waits until the user adds `human-approved`; **agents never add
+  or remove `human-approved`**, and a PR body for one lists the evidence the
+  user needs (screenshots, self-test output). Self-tests with real plugins
+  and audio do not run in CI, so their output belongs in every PR body that
+  changes the code they cover. When `main` moves, update the branch
+  (`gh pr update-branch`) so the queued merge can proceed.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

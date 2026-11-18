@@ -16,12 +16,14 @@ mod control;
 mod dsp;
 mod engine;
 mod host;
+mod juce;
 mod llm;
 mod lv2;
 mod main_controls;
 mod matrix;
 mod mcp;
 mod organ;
+mod instruments;
 mod meter;
 mod midi;
 mod player;
@@ -35,7 +37,7 @@ mod transport;
 mod ui;
 mod vision;
 
-const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test";
+const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -72,6 +74,7 @@ fn main() -> anyhow::Result<()> {
             host::run_scan_clap(std::path::Path::new(&path))
         }
         "clap-scan-test" => host::run_clap_scan_test(),
+        "catalog-install-test" => catalog::install_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "session-test" => ui::run_session_test(),
         "agent-eval" => ui::run_agent_eval(),
         "jev-test" => assistant::run_jev_test(),

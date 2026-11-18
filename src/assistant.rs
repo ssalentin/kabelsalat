@@ -35,6 +35,20 @@ pub fn load_config_str(field: &str) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// Any JSON field of config.json (None in tests, rule 37).
+pub fn load_config_value(field: &str) -> Option<Value> {
+    if cfg!(test) { return None; }
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|mut v| v.get_mut(field).map(Value::take))
+}
+
+/// Merge one JSON field into config.json (no-op in tests, rule 37).
+pub fn save_config_value(field: &str, value: Value) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_config_values_to(&config_path(), &[(field, value)])
+}
+
 /// Merge key/value pairs into a config JSON file (mode 0600), preserving
 /// unrelated fields.
 fn save_config_values_to(path: &std::path::Path, pairs: &[(&str, Value)]) -> std::io::Result<()> {
@@ -895,13 +909,13 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_instruments",
-            "description":"List the built-in instrument catalog (setBfree, Surge XT, Dexed, Vitalium, YANES): each entry's id, format (CLAP/LV2), description, GitHub repo, install route (distro package or build-from-source), whether it is currently installed, and whether an install is running. Use install_instrument to install one.",
+            "description":"List the built-in instrument catalog: each entry's id, name, format (CLAP/LV2), description, about text, licence, homepage, source code URL, install route (distro package, build from source, or prebuilt GitHub release), whether it is currently installed, and whether an install is running. Use install_instrument to install one.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"install_instrument",
-            "description":"Install a catalog instrument (from list_instruments) onto this system: a distro package (via sudo pacman) or a build from GitHub source into ~/.clap / ~/.lv2. DESTRUCTIVE (it changes the user's system): requires confirm=true after asking the user. Runs in the background with a live log in the Plugins view and rescans plugins when done.",
-            "parameters":{"type":"object","properties":{"id":{"type":"string","description":"Catalog instrument id from list_instruments (e.g. 'setbfree', 'surge-xt', 'dexed', 'vitalium', 'yanes')"},"confirm":{"type":"boolean","description":"Must be true after asking the user"}},"required":["id"]}
+            "description":"Install a catalog instrument (from list_instruments) onto this system: a distro package (via sudo pacman), a build from GitHub source, or a checksum-verified prebuilt GitHub release, into ~/.clap / ~/.lv2. DESTRUCTIVE (it changes the user's system): requires confirm=true after asking the user. Runs in the background with a live log in the Plugins view and rescans plugins when done.",
+            "parameters":{"type":"object","properties":{"id":{"type":"string","description":"Catalog instrument id from list_instruments (e.g. 'setbfree', 'surge-xt', 'odin2')"},"confirm":{"type":"boolean","description":"Must be true after asking the user"}},"required":["id"]}
         }},
         {"type":"function","function":{
             "name":"transport_play",

@@ -8,6 +8,25 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Instrument profiles: map a whole hardware instrument at once.** Pick the
+  instrument for a hardware port in the MIDI matrix (a port whose name names
+  the instrument is matched by itself) and its knobs, drawbars and switches
+  drive the rack, with no MIDI learn per control. The first profile is the
+  **Nord Electro 2**: its nine upper drawbars, rotary slow/fast, percussion and
+  overdrive drive the setBfree organ face. Profiles are MIDI Guide CSV files
+  with a `role` column; more go in `~/.config/kabelsalat/instruments/`.
+- **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
+  installs from its prebuilt release on x86_64 and builds from source on
+  aarch64; its 260 factory patches are fetched too, so the assistant can list,
+  search and load them. Floe installs from its release on x86_64; it publishes
+  no aarch64 Linux build, and its card says so there. Release downloads are
+  checked against a pinned SHA-256.
+- **Catalog cards say what you install:** a short description, the licence,
+  how it is installed on this machine, and buttons that open the source code
+  and the project's website. `list_instruments` reports the same fields.
+- **GitHub stars on catalog cards:** each card shows its project's star count
+  (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
+  opens. Without internet access, or when GitHub refuses, cards show no stars.
 - **Sessions save themselves (#51):** with *Autosave sessions* on (Settings,
   on by default) the open session is written every 20 s when it changed, and
   on quit; a patch that was never saved goes to `Autosave`. Loading a session
@@ -49,6 +68,9 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **A failed catalog install could not be retried:** the next attempt found
+  the earlier clone in the build cache and `git clone` refused it. Every
+  install now starts from a fresh cache folder.
 - **A stuck source could silence everything:** an instrument outputting a
   constant (DC) filled the master meter while every rig went quiet, and sent
   the offset to the speakers. The master now blocks DC.

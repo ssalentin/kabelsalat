@@ -1394,6 +1394,84 @@ fn nav_separator(ui: &mut egui::Ui) {
 /// The REC chip: tomato fill + a filled dot only while recording (Hurricane:
 /// tomato is reserved for the active record state); a calm dark chip with a
 /// dim open dot when idle. `secs` shows elapsed time while recording.
+/// Microseconds for Engine Info: a decimal below 10, where it still says something.
+fn fmt_us(us: f64) -> String {
+    if us < 10.0 { format!("{us:.1} µs") } else { format!("{us:.0} µs") }
+}
+
+const ENGINE_INFO_ROW_H: f32 = 21.0;
+/// Right-aligned number columns of the node table (avg, max, share).
+const ENGINE_INFO_COLS: [f32; 3] = [66.0, 66.0, 52.0];
+
+/// Section caption of Engine Info, with right-aligned column captions over
+/// the node table's numbers: tracked micro-caps like `theme::section_label`.
+fn engine_info_section(ui: &mut egui::Ui, w: f32, title: &str, cols: &[&str]) {
+    ui.add_space(10.0);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::hover());
+    let (title_l, col_ls) = ui.fonts_mut(|f| {
+        let mut caps = |t: &str| theme::layout_tracked(f, &t.to_uppercase(), FontId::proportional(10.0), 0.14);
+        (caps(title), cols.iter().map(|c| caps(c)).collect::<Vec<_>>())
+    });
+    let p = ui.painter();
+    let top = |l: &theme::TrackedLabel| rect.center().y - l.size.y * 0.5;
+    theme::paint_tracked(p, Pos2::new(rect.left(), top(&title_l)), &title_l, theme::INK_2);
+    let mut x = rect.right();
+    for (l, cw) in col_ls.iter().zip(ENGINE_INFO_COLS).rev() {
+        // The last letter's tracking is not ink: the caption ends on the column's edge.
+        theme::paint_tracked(p, Pos2::new(x - l.size.x + 1.4, top(l)), l, theme::INK_2);
+        x -= cw;
+    }
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+    ui.add_space(3.0);
+}
+
+/// One "label … value" line of Engine Info.
+fn engine_info_row(ui: &mut egui::Ui, w: f32, label: &str, value: &str, value_col: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ENGINE_INFO_ROW_H), egui::Sense::hover());
+    let p = ui.painter();
+    p.text(rect.left_center(), egui::Align2::LEFT_CENTER, label, FontId::proportional(12.5), theme::CREAM_META);
+    p.text(rect.right_center(), egui::Align2::RIGHT_CENTER, value, FontId::monospace(12.0), value_col);
+    resp
+}
+
+/// One unit of the node table: name (cut to its column), average, maximum
+/// and the average's share of one buffer.
+fn engine_info_node_row(ui: &mut egui::Ui, w: f32, n: &crate::engine_info::NodeStat) {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, ENGINE_INFO_ROW_H), egui::Sense::hover());
+    let name_w = (w - ENGINE_INFO_COLS.iter().sum::<f32>() - 8.0).max(40.0);
+    let mut job = egui::text::LayoutJob::simple_singleline(n.name.clone(), FontId::proportional(12.5), theme::CREAM_META);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(name_w);
+    let name_g = ui.fonts_mut(|f| f.layout_job(job));
+    let elided = name_g.elided;
+    let p = ui.painter();
+    p.galley(Pos2::new(rect.left(), rect.center().y - name_g.size().y * 0.5), name_g, theme::CREAM_META);
+    let values = [fmt_us(n.avg_us), fmt_us(n.max_us), format!("{:.1} %", n.percent)];
+    let mut x = rect.right();
+    for (v, cw) in values.iter().zip(ENGINE_INFO_COLS).rev() {
+        p.text(Pos2::new(x, rect.center().y), egui::Align2::RIGHT_CENTER, v, FontId::monospace(12.0), theme::CREAM);
+        x -= cw;
+    }
+    if elided {
+        resp.on_hover_text(&n.name);
+    }
+}
+
+/// The DSP readout's laid-out texts (`DemoApp::dsp_chip_layout`).
+struct DspChip {
+    label: Arc<egui::Galley>,
+    value: Arc<egui::Galley>,
+    /// Width of the value's slot (the widest value).
+    value_w: f32,
+    xruns: Option<Arc<egui::Galley>>,
+    /// Border for a high or critical load.
+    stroke: Option<Color32>,
+    width: f32,
+}
+
+impl DspChip {
+    const GAP: f32 = 6.0;
+}
+
 fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
     let (fill, stroke, txt) = if recording {
         (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
@@ -2000,6 +2078,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
+    "get_engine_info", "reset_engine_peaks",
     "get_strip_knobs", "set_strip_knob",
     "list_channels",
 ];
@@ -2019,7 +2098,7 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig")
+    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks")
 }
 
 /// File-player settings carried by play_file/set_player args (AUM
@@ -2637,6 +2716,20 @@ struct DemoApp {
     /// MIDI arrivals then fake the downstream envelope instead.
     edge_levels: Option<Arc<EdgeLevels>>,
 
+    // --- Engine load (DSP readout, Engine Info, get_engine_info) ---
+    /// Render time per unit from the engine (lock-free). None = no engine.
+    node_times: Option<Arc<crate::engine_info::NodeTimes>>,
+    /// The snapshot every reader shows, refreshed four times a second so
+    /// the numbers stay readable.
+    engine_stats: crate::engine_info::EngineStats,
+    engine_stats_at: f32,
+    engine_info_open: bool,
+    engine_info_rect: Rect,
+    dsp_chip_rect: Rect,
+    /// Stands in for the audio callback's counters, which no test has.
+    #[cfg(test)]
+    test_counters: Option<crate::engine_info::EngineCounters>,
+
     // --- Audio In (live mic/guitar/interface, issue #28) ---
     /// Per-node input level (pre-gain peak), engine → UI, lock-free.
     audio_in_levels: Option<Arc<AudioInLevels>>,
@@ -2989,6 +3082,14 @@ impl DemoApp {
             bus: None,
             out_level: None,
             edge_levels: None,
+            node_times: None,
+            engine_stats: Default::default(),
+            engine_stats_at: f32::NEG_INFINITY,
+            engine_info_open: false,
+            engine_info_rect: Rect::NOTHING,
+            dsp_chip_rect: Rect::NOTHING,
+            #[cfg(test)]
+            test_counters: None,
             audio_in_levels: None,
             audio_in_tx: None,
             audio_in_streams: std::collections::HashMap::new(),
@@ -4548,6 +4649,8 @@ impl DemoApp {
             "get_rigs" => "List rigs".into(),
             "list_channels" => "List channels".into(),
             "measure_mix" => "Measure mix".into(),
+            "get_engine_info" => "Check engine load".into(),
+            "reset_engine_peaks" => "Reset engine peaks".into(),
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
                 format!("Play {}", note_name(note))
@@ -5542,8 +5645,8 @@ impl DemoApp {
                 "fps": self.fps,
                 "buffer_frames": crate::bridge::BUFFER_FRAMES,
                 "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
-                "xruns": crate::bridge::XRUNS.load(std::sync::atomic::Ordering::Relaxed),
-                "midi_latency_ms": crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+                "xruns": self.engine_counters().xruns,
+                "midi_latency_ms": self.engine_counters().midi_latency_us as f64 / 1000.0,
                 "layout": {
                     "stage_h": self.stage_rect.height(), "unit_h": self.unit_h, "rows": self.layout_rows,
                     "rack_w": self.rack_w, "rack_h": self.rack_h,
@@ -5572,6 +5675,12 @@ impl DemoApp {
                     }
                     Err(e) => format!("listen: {e}"),
                 }
+            }
+            "get_engine_info" => serde_json::to_string(&self.engine_stats_now())
+                .unwrap_or_else(|e| format!("engine info serialize: {e}")),
+            "reset_engine_peaks" => {
+                self.reset_engine_peaks();
+                "reset: worst render time, late blocks, xruns and each unit's maximum start again from now".into()
             }
             "measure_mix" => {
                 if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
@@ -9805,7 +9914,12 @@ impl DemoApp {
                             if add.clicked() { add_rig = true; }
                         }
                         nav_separator(ui);
-                        let scroll_w = ui.available_width().max(1.0);
+                        // The DSP readout keeps the strip's right end; the
+                        // rigs scroll in what is left. (The bar above is
+                        // full at the minimum width once an agent chip shows.)
+                        self.refresh_engine_stats();
+                        let dsp = self.dsp_chip_layout(ui);
+                        let scroll_w = (ui.available_width() - dsp.width - 8.0).max(1.0);
                         egui::ScrollArea::horizontal()
                             .id_salt("rig_strip")
                             .max_width(scroll_w)
@@ -9914,6 +10028,11 @@ impl DemoApp {
                                     },
                                 );
                             });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.dsp_chip(ui, dsp).clicked() {
+                                self.engine_info_open = !self.engine_info_open;
+                            }
+                        });
                     },
                 );
             });
@@ -14533,6 +14652,7 @@ impl DemoApp {
             }
             if !(self.popup_open_at_start && !self.show_help) && i.consume_key(Modifiers::NONE, Key::Escape) {
                 if self.show_help { self.show_help = false; }
+                else if self.engine_info_open { self.engine_info_open = false; }
                 else if self.knob_menu.is_some() { self.knob_menu = None; }
                 else if self.scale_menu.is_some() { self.scale_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
@@ -14589,6 +14709,13 @@ impl DemoApp {
             self.drag = Drag::None;
             return;
         };
+
+        // Engine Info lies over the stage: a click on it is its own, never
+        // the rack's underneath.
+        if self.engine_info_open && self.engine_info_rect.contains(s) {
+            self.hover = Some(Hit::Background);
+            return;
+        }
 
         // Stage view mode: the rack is not on screen, so its hit-testing is inert
         // except the masthead's Play circle (Tab returns to the rack). The
@@ -17000,6 +17127,225 @@ impl DemoApp {
 
     // -- Audio In face (issue #28) -------------------------------------------
 
+    fn engine_counters(&self) -> crate::engine_info::EngineCounters {
+        #[cfg(test)]
+        if let Some(c) = self.test_counters { return c; }
+        crate::engine_info::EngineCounters::load()
+    }
+
+    /// The engine's load right now, units under their display names.
+    fn engine_stats_now(&self) -> crate::engine_info::EngineStats {
+        let inputs = self.units.iter()
+            .filter(|u| matches!(u.node_kind, UnitKind::AudioIn))
+            .map(|u| u.channels.count())
+            .sum();
+        crate::engine_info::EngineStats::build(self.engine_counters(), self.node_times.as_deref(), inputs, |node| {
+            self.units.iter().find(|u| u.node_id == node).map(|u| sentence_case(&u.name))
+        })
+    }
+
+    fn refresh_engine_stats(&mut self) {
+        if self.ui_time - self.engine_stats_at >= 0.25 {
+            self.engine_stats_at = self.ui_time;
+            self.engine_stats = self.engine_stats_now();
+        }
+    }
+
+    fn reset_engine_peaks(&mut self) {
+        crate::engine_info::reset_counter_peaks();
+        if let Some(t) = &self.node_times { t.reset_peaks(); }
+        #[cfg(test)]
+        if let Some(c) = &mut self.test_counters {
+            (c.render_max_us, c.render_late, c.xruns) = (0, 0, 0);
+        }
+        self.engine_stats_at = f32::NEG_INFINITY;
+    }
+
+    /// The DSP readout's texts, laid out: the average render time as a
+    /// share of one buffer, and the xrun count once the device reported any.
+    /// The value's slot is as wide as "100 %", so the readout's width
+    /// follows the xrun count alone, never the load.
+    fn dsp_chip_layout(&self, ui: &egui::Ui) -> DspChip {
+        use crate::engine_info::LoadLevel;
+        let st = &self.engine_stats;
+        let value = if st.audio_live { format!("{:.0} %", st.dsp_percent) } else { "–".to_string() };
+        let (value_col, stroke) = match LoadLevel::of(st.dsp_percent) {
+            LoadLevel::Normal => (theme::CREAM, None),
+            LoadLevel::High => (theme::CABLE_AMBER, Some(theme::CABLE_AMBER)),
+            // CLIP_RED text is 3.2:1 on the chip; the border carries the red.
+            LoadLevel::Critical => (theme::CLIP_BRIGHT, Some(theme::CLIP_RED)),
+        };
+        let xruns = (st.xruns > 0).then(|| format!("{} xrun{}", st.xruns, if st.xruns == 1 { "" } else { "s" }));
+        let font = FontId::proportional(12.5);
+        let (label, value, value_w, xruns) = ui.fonts_mut(|f| (
+            f.layout_no_wrap("DSP".into(), font.clone(), theme::CREAM_MID),
+            f.layout_no_wrap(value, font.clone(), value_col),
+            f.layout_no_wrap("100 %".into(), font.clone(), theme::CREAM).size().x,
+            xruns.map(|t| f.layout_no_wrap(t, font.clone(), theme::CLIP_BRIGHT)),
+        ));
+        let width = theme::CHIP_PAD_X * 2.0 + label.size().x + DspChip::GAP + value_w
+            + xruns.as_ref().map_or(0.0, |g| DspChip::GAP * 2.0 + g.size().x);
+        DspChip { label, value, value_w, xruns, stroke, width: width.ceil() }
+    }
+
+    /// The DSP readout: a click opens Engine Info.
+    fn dsp_chip(&mut self, ui: &mut egui::Ui, chip: DspChip) -> egui::Response {
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(chip.width, 26.0), egui::Sense::click());
+        self.dsp_chip_rect = rect;
+        if ui.is_rect_visible(rect) {
+            let open = self.engine_info_open;
+            let fill = if open || resp.hovered() { mix(theme::DARK_PANEL_HI, theme::CREAM, if open { 0.10 } else { 0.07 }) } else { theme::DARK_PANEL_HI };
+            let stroke = chip.stroke.unwrap_or(if open { theme::HAIRLINE_DARK } else if resp.hovered() { theme::MUTED } else { theme::HAIRLINE });
+            let p = ui.painter();
+            p.rect_filled(rect, 2.0, fill);
+            p.rect_stroke(rect, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+            let mid = |g: &Arc<egui::Galley>| rect.center().y - g.size().y * 0.5;
+            let mut x = rect.left() + theme::CHIP_PAD_X;
+            p.galley(Pos2::new(x, mid(&chip.label)), chip.label.clone(), theme::CREAM_MID);
+            x += chip.label.size().x + DspChip::GAP + chip.value_w;
+            p.galley(Pos2::new(x - chip.value.size().x, mid(&chip.value)), chip.value.clone(), theme::CREAM);
+            if let Some(g) = &chip.xruns {
+                p.galley(Pos2::new(x + DspChip::GAP * 2.0, mid(g)), g.clone(), theme::CLIP_BRIGHT);
+            }
+        }
+        let st = &self.engine_stats;
+        let mut tip = if st.audio_live {
+            format!("DSP load: rendering takes {:.0} % of each {:.2} ms buffer on average", st.dsp_percent, st.buffer_ms)
+        } else {
+            "DSP load: no audio output is running".to_string()
+        };
+        if st.xruns > 0 {
+            tip.push_str(&format!("\n{} xruns (dropouts the audio device reported) since the last reset", st.xruns));
+        }
+        tip.push_str("\nClick for Engine Info");
+        resp.on_hover_text(tip)
+    }
+
+    /// Engine Info (AUM's sheet of the same name): the audio session, the
+    /// load, the latencies that are measured, and the render time per unit.
+    /// A popup under the DSP readout, flush with its right edge; Esc, the
+    /// readout or a click elsewhere closes it.
+    fn engine_info_ui(&mut self, ctx: &egui::Context) {
+        if !self.engine_info_open {
+            self.engine_info_rect = Rect::NOTHING;
+            return;
+        }
+        use crate::engine_info::LoadLevel;
+        const WIDTH: f32 = 344.0;
+        const MARGIN: f32 = 12.0;
+        const HEADER_H: f32 = 26.0;
+        const HEADER_GAP: f32 = 8.0;
+        let screen = ctx.content_rect();
+        let anchor = self.dsp_chip_rect.right_bottom() + Vec2::new(0.0, 6.0);
+        let width = WIDTH.min(screen.width() - 16.0 - MARGIN * 2.0);
+        let st = self.engine_stats.clone();
+        let mut reset = false;
+        let area = egui::Area::new(egui::Id::unique("engine_info"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_pos(anchor)
+            .constrain(true)
+            .show(ctx, |ui| {
+                theme::dropdown_popup_frame().inner_margin(egui::Margin::same(MARGIN as i8)).show(ui, |ui| {
+                    ui.set_width(width);
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(HEADER_H);
+                        ui.label(egui::RichText::new("Engine info").font(theme::medium_font(14.0)).color(theme::INK));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::chip_button(ui, "Reset peaks", false)
+                                .on_hover_text("start the maximum, late blocks, xruns and each unit's maximum again from now")
+                                .clicked()
+                            {
+                                reset = true;
+                            }
+                        });
+                    });
+                    ui.add_space(HEADER_GAP);
+                    // Everything under the header scrolls in what the window
+                    // leaves (rule 27: the remainder is measured, never
+                    // egui's default), behind a bar that shows without a hover.
+                    let body_h = (screen.bottom() - 8.0 - MARGIN - ui.cursor().top()).max(60.0);
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    egui::ScrollArea::vertical()
+                        .max_height(body_h)
+                        .min_scrolled_height(body_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let w = ui.available_width();
+                            let row = |ui: &mut egui::Ui, label: &str, value: String, col: Color32| engine_info_row(ui, w, label, &value, col);
+                            let plain = theme::CREAM;
+
+                            engine_info_section(ui, w, "Audio session", &[]);
+                            if st.sample_rate > 0 {
+                                row(ui, "Sample rate", format!("{} Hz", st.sample_rate), plain);
+                                row(ui, "Buffer size", format!("{} frames", st.buffer_frames), plain);
+                                row(ui, "Buffer duration", format!("{:.2} ms", st.buffer_ms), plain);
+                            } else {
+                                row(ui, "Output", "no audio output".into(), theme::CREAM_DIM);
+                            }
+                            row(ui, "Inputs", st.inputs.to_string(), plain);
+                            row(ui, "Outputs", st.outputs.to_string(), plain);
+
+                            engine_info_section(ui, w, "Load", &[]);
+                            let load_col = match LoadLevel::of(st.dsp_percent) {
+                                LoadLevel::Normal => plain,
+                                LoadLevel::High => theme::CABLE_AMBER,
+                                LoadLevel::Critical => theme::CLIP_BRIGHT,
+                            };
+                            let bad = |n: u32| if n > 0 { theme::CLIP_BRIGHT } else { plain };
+                            if st.audio_live {
+                                row(ui, "DSP load", format!("{:.1} %", st.dsp_percent), load_col);
+                                row(ui, "Render time, average", fmt_us(st.render_avg_us), plain);
+                                row(ui, "Render time, maximum", fmt_us(st.render_max_us as f64), plain);
+                            } else {
+                                row(ui, "DSP load", "not running".into(), theme::CREAM_DIM);
+                            }
+                            row(ui, "Late blocks", st.late_blocks.to_string(), bad(st.late_blocks))
+                                .on_hover_text("buffers that took more than 80 % of their time to render");
+                            row(ui, "Xruns", st.xruns.to_string(), bad(st.xruns))
+                                .on_hover_text("dropouts the audio device reported");
+
+                            engine_info_section(ui, w, "Latency", &[]);
+                            match st.midi_input_latency_ms {
+                                Some(ms) => row(ui, "MIDI input", format!("{ms:.2} ms"), plain),
+                                None => row(ui, "MIDI input", "no event yet".into(), theme::CREAM_DIM),
+                            }
+                            .on_hover_text("measured: how long a hardware MIDI event waits before the engine plays it");
+                            if st.sample_rate > 0 {
+                                row(ui, "Output buffer", format!("{:.2} ms", st.buffer_ms), plain)
+                                    .on_hover_text("one buffer: the delay the engine itself adds to every note");
+                            }
+                            const UNMEASURED: &str = "kabelsalat does not measure this, and the audio API's own figure is not reliable through PipeWire's ALSA layer.\n`kabelsalat monitor-latency-test` measures the real input to output round trip.";
+                            row(ui, "Sound card output", "not measured".into(), theme::CREAM_DIM).on_hover_text(UNMEASURED);
+                            row(ui, "Audio input", "not measured".into(), theme::CREAM_DIM).on_hover_text(UNMEASURED);
+
+                            engine_info_section(ui, w, "Node statistics", &["avg", "max", "block"]);
+                            if st.nodes.is_empty() {
+                                row(ui, "No instrument or effect has rendered yet", String::new(), plain);
+                            }
+                            for n in &st.nodes {
+                                engine_info_node_row(ui, w, n);
+                            }
+                            if st.nodes_not_timed > 0 {
+                                row(ui, &format!("{} more units are not timed", st.nodes_not_timed), String::new(), plain);
+                            }
+                        });
+                });
+            });
+        self.engine_info_rect = area.response.rect;
+        if reset {
+            self.reset_engine_peaks();
+            self.refresh_engine_stats();
+        }
+        let pressed_outside = ctx
+            .input(|i| if i.pointer.any_pressed() { i.pointer.interact_pos() } else { None })
+            .is_some_and(|p| !self.engine_info_rect.contains(p) && !self.dsp_chip_rect.contains(p));
+        if pressed_outside {
+            self.engine_info_open = false;
+        }
+    }
+
     /// The AudioIn node's input level (pre-gain peak), engine → UI, lock-free.
     fn audio_in_level(&self, node: u32) -> f32 {
         self.audio_in_levels.as_ref().map(|l| l.load(node)).unwrap_or(0.0)
@@ -17915,11 +18261,10 @@ impl DemoApp {
         if self.stats_timer <= 0.0 || self.stats_line.is_empty() {
             self.stats_timer = 0.25;
             let pulses: usize = self.cables.iter().map(|c| c.pulses.iter().filter(|p| p.active).count()).sum();
-            let midi_ms = crate::bridge::MIDI_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-            let sr = crate::bridge::SAMPLE_RATE.load(std::sync::atomic::Ordering::Relaxed);
-            let audio = if sr > 0 {
-                let frames = crate::bridge::BUFFER_FRAMES;
-                format!("{:.1} kHz · {frames} fr ({:.1} ms)", sr as f64 / 1000.0, frames as f64 / sr as f64 * 1000.0)
+            let c = self.engine_counters();
+            let midi_ms = c.midi_latency_us as f64 / 1000.0;
+            let audio = if c.sample_rate > 0 {
+                format!("{:.1} kHz · {} fr ({:.1} ms)", c.sample_rate as f64 / 1000.0, c.buffer_frames(), c.buffer_ms())
             } else { "no audio".into() };
             let midi = self.last_midi.as_deref().unwrap_or("no MIDI yet");
             let _ = pulses;
@@ -18697,6 +19042,7 @@ impl DemoApp {
         }
         self.knob_menu_ui(&ctx);
         self.scale_menu_ui(&ctx);
+        self.engine_info_ui(&ctx);
         self.delete_rig_modal(&ctx);
         self.rename_rig_modal(&ctx);
         self.save_rig_modal(&ctx);
@@ -19643,6 +19989,7 @@ struct BuiltAudio {
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
     edge_levels: Arc<EdgeLevels>,
+    node_times: Arc<crate::engine_info::NodeTimes>,
     audio_in_tx: rtrb::Producer<(u32, rtrb::Consumer<f32>)>,
     audio_in_levels: Arc<AudioInLevels>,
 }
@@ -19684,6 +20031,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     );
     let level = engine.level_handle();
     let edge_levels = engine.edge_levels_handle();
+    let node_times = engine.node_times_handle();
     // Multi-rig snapshot: engine publishes rig list/active on LoadRigs; the
     // bridge + UI read it (the audio render path never locks it).
     let rig_snapshot = Arc::new(Mutex::new(crate::control::RigSnapshot::default()));
@@ -19780,6 +20128,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         rig_snapshot,
         graph_pub,
         edge_levels,
+        node_times,
         audio_in_tx,
         audio_in_levels,
     })
@@ -19937,6 +20286,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            node_times,
                             audio_in_tx,
                             audio_in_levels,
                         } = ba;
@@ -19985,6 +20335,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             rig_snapshot,
                             graph_pub,
                             edge_levels,
+                            node_times,
                             audio_in_tx,
                             audio_in_levels,
                         ));
@@ -20014,11 +20365,13 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     rig_snapshot,
                     graph_pub,
                     edge_levels,
+                    node_times,
                     audio_in_tx,
                     audio_in_levels,
                 )) => {
                     app.shared_graph = shared_graph;
                     app.edge_levels = Some(edge_levels);
+                    app.node_times = Some(node_times);
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
@@ -27160,8 +27513,6 @@ mod mixer_parity_tests {
         g.connect_with_id(edge, PortRef { node: b, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
         g.connect_with_id(edge, PortRef { node: c, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.apply_session(&crate::session::Session::new("mixer shots", g)).unwrap();
-        let ctx = egui::Context::default();
-        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
         let src = |app: &DemoApp, n: &str| app.units.iter().find(|u| u.name == n).unwrap().node_id;
         let (na, nb, nc) = (src(&app, "SURGE A"), src(&app, "SURGE B"), src(&app, "SURGE C"));
         app.strip_insert_edit(na, StripInsertEdit::Add { kind: NodeKind::Dsp(DspKind::Reverb), name: "REVERB".into() }).unwrap();
@@ -27569,6 +27920,449 @@ mod mixer_parity_tests {
 
 /// Skipped when Surge XT is not installed.
 #[cfg(test)]
+mod engine_info_tests {
+    use super::*;
+    use crate::engine_info::{EngineCounters, NodeTimer};
+    use std::time::Duration;
+
+    const SIZE: Vec2 = Vec2 { x: 1280.0, y: 800.0 };
+
+    /// `panel`: painted by the Engine Info popup (the rack's own text lies
+    /// under it and is in the same place).
+    /// `rect` is what shows of the text: its extent inside its clip rect.
+    struct Text { s: String, rect: Rect, color: Color32, panel: bool }
+
+    fn walk(shape: &Shape, clip: Rect, panel: Rect, in_panel: &mut bool, out: &mut Vec<Text>) {
+        match shape {
+            Shape::Rect(r) if (r.rect.min - panel.min).length() < 1.0 && (r.rect.max - panel.max).length() < 1.0 => *in_panel = true,
+            Shape::Text(t) => {
+                let rect = t.galley.rect.translate(t.pos.to_vec2()).intersect(clip);
+                if !rect.is_positive() { return; }
+                out.push(Text {
+                    s: t.galley.text().to_owned(),
+                    rect,
+                    color: t.galley.job.sections.first().map_or(t.fallback_color, |sec| sec.format.color),
+                    panel: *in_panel && panel.contains_rect(rect),
+                });
+            }
+            Shape::Vec(v) => for s in v { walk(s, clip, panel, in_panel, out) },
+            _ => {}
+        }
+    }
+
+    fn run_frame(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, events: Vec<egui::Event>) -> Vec<Text> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+        // Past egui's area fade-in (rule 101).
+        raw.time = Some(ctx.input(|i| i.time) + 0.25);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear();
+        let (mut texts, mut in_panel) = (Vec::new(), false);
+        for cs in &out.shapes { walk(&cs.shape, cs.clip_rect, app.engine_info_rect, &mut in_panel, &mut texts); }
+        texts
+    }
+
+    fn click_at(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, pos: Pos2) -> Vec<Text> {
+        let b = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+        run_frame(app, ctx, size, vec![egui::Event::PointerMoved(pos)]);
+        run_frame(app, ctx, size, vec![b(true)]);
+        run_frame(app, ctx, size, vec![b(false)]);
+        run_frame(app, ctx, size, vec![])
+    }
+
+    fn key(k: Key) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]
+    }
+
+    /// 48 kHz, 256 frames (5333 µs a buffer), rendering `percent` of it.
+    fn counters(percent: f64) -> EngineCounters {
+        EngineCounters {
+            sample_rate: 48_000,
+            callback_frames: 256,
+            render_avg_ns: (percent / 100.0 * 256.0 / 48_000.0 * 1e9) as u32,
+            ..Default::default()
+        }
+    }
+
+    /// The demo rack showing `c`, laid out at `size`. Three frames: the
+    /// test scale (1.6) is set on the first, and egui lays the next one out
+    /// in the old frame's rect.
+    fn app_at(c: EngineCounters, size: Vec2) -> (DemoApp, egui::Context) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.test_counters = Some(c);
+        let ctx = egui::Context::default();
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        (app, ctx)
+    }
+
+    /// Show `c` on the next frame (the readout refreshes four times a second).
+    fn set_counters(app: &mut DemoApp, c: EngineCounters) {
+        app.test_counters = Some(c);
+        app.engine_stats_at = f32::NEG_INFINITY;
+    }
+
+    fn has(texts: &[Text], s: &str) -> bool {
+        texts.iter().any(|t| t.s == s)
+    }
+
+    fn find<'a>(texts: &'a [Text], s: &str) -> &'a Text {
+        texts.iter().find(|t| t.s == s).unwrap_or_else(|| panic!("no text {s:?} in {:?}", texts.iter().map(|t| &t.s).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn the_readout_shows_the_dsp_load_coloured_by_level() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(has(&texts, "DSP"), "the readout is on screen");
+        let value = find(&texts, "22 %");
+        assert_eq!(value.color, theme::CREAM, "below 70 % the value is neutral");
+        assert!(app.dsp_chip_rect.contains_rect(value.rect), "{:?} in {:?}", value.rect, app.dsp_chip_rect);
+        let chip = app.dsp_chip_rect;
+
+        set_counters(&mut app, counters(75.0));
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "75 %").color, theme::CABLE_AMBER, "amber from 70 %");
+
+        set_counters(&mut app, counters(100.0));
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert_eq!(find(&texts, "100 %").color, theme::CLIP_BRIGHT, "red above 90 %");
+        assert_eq!(app.dsp_chip_rect, chip, "the readout keeps its size whatever the load");
+
+        // No output stream: no number is made up.
+        set_counters(&mut app, EngineCounters::default());
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(has(&texts, "–") && !texts.iter().any(|t| t.s.ends_with(" %") && chip.contains_rect(t.rect)), "no load without audio");
+    }
+
+    #[test]
+    fn xruns_show_as_a_count_that_moves_no_rig_button() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        let chip = app.dsp_chip_rect;
+        let in_chip = |texts: &[Text], chip: Rect| texts.iter().filter(|t| chip.contains_rect(t.rect)).map(|t| t.s.clone()).collect::<Vec<_>>();
+        assert_eq!(in_chip(&texts, chip), ["DSP", "22 %"], "no xruns, no count");
+        let rigs = app.rig_chip_rects.clone();
+
+        for (xruns, shown) in [(1, "1 xrun"), (3, "3 xruns"), (250, "250 xruns")] {
+            set_counters(&mut app, EngineCounters { xruns, ..counters(22.0) });
+            let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+            let now = app.dsp_chip_rect;
+            assert_eq!(in_chip(&texts, now), ["DSP", "22 %", shown]);
+            assert_eq!(find(&texts, shown).color, theme::CLIP_BRIGHT);
+            assert!(now.right() == chip.right() && now.left() < chip.left(), "the readout grows to the left from the strip's end");
+            assert_eq!(app.rig_chip_rects, rigs, "{xruns} xruns: the rig buttons stay where they are");
+        }
+    }
+
+    /// The readout keeps the right end of the rig strip at the minimum
+    /// window too, and the rigs scroll in what is left of it.
+    #[test]
+    fn the_readout_survives_the_narrowest_window_with_many_rigs() {
+        let narrow = Vec2::new(760.0, 520.0);
+        let (mut app, ctx) = app_at(EngineCounters { xruns: 12, ..counters(22.0) }, narrow);
+        for _ in 0..3 { app.edit_rigs(None); }
+        for _ in 0..3 { run_frame(&mut app, &ctx, narrow, vec![]); }
+        assert_eq!(app.rig_count(), 4);
+        let texts = run_frame(&mut app, &ctx, narrow, vec![]);
+        let chip = app.dsp_chip_rect;
+        assert!(chip.right() <= narrow.x - 12.0 + 0.5 && chip.right() > narrow.x - 14.0, "at the strip's right end: {chip:?}");
+        for s in ["DSP", "22 %", "12 xruns"] {
+            assert!(chip.contains_rect(find(&texts, s).rect), "{s} in the readout");
+        }
+        // Whatever shows of the rig strip ends before the readout.
+        let strip_y = chip.center().y;
+        let strip: Vec<&Text> = texts.iter().filter(|t| (t.rect.center().y - strip_y).abs() < 10.0 && !chip.contains_rect(t.rect)).collect();
+        assert!(strip.iter().any(|t| t.s == "+ Rig"), "the strip is on screen");
+        for t in strip {
+            assert!(t.rect.right() <= chip.left(), "{:?} at {:?} runs into the readout {chip:?}", t.s, t.rect);
+        }
+        let top_bar_right = texts.iter().filter(|t| t.rect.bottom() < 40.0).map(|t| t.rect.right()).fold(0.0, f32::max);
+        assert!(top_bar_right <= narrow.x, "the bar above is as it was: {top_bar_right}");
+    }
+
+    #[test]
+    fn clicking_the_readout_opens_engine_info_and_esc_or_a_click_elsewhere_closes_it() {
+        let (mut app, ctx) = app_at(EngineCounters { midi_latency_us: 420, render_max_us: 2310, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(!app.engine_info_open);
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open, "a click on the readout opens the panel");
+        for (label, value) in [
+            ("Sample rate", "48000 Hz"), ("Buffer size", "256 frames"), ("Buffer duration", "5.33 ms"),
+            ("Inputs", "0"), ("Outputs", "2"), ("DSP load", "22.0 %"), ("Render time, maximum", "2310 µs"),
+            ("MIDI input", "0.42 ms"), ("Sound card output", "not measured"), ("Audio input", "not measured"),
+        ] {
+            let l = texts.iter().find(|t| t.panel && t.s == label).unwrap_or_else(|| panic!("{label} is not in the panel"));
+            assert!(
+                texts.iter().any(|t| t.panel && t.s == value && (t.rect.center().y - l.rect.center().y).abs() < 2.0),
+                "{label} reads {value}"
+            );
+        }
+
+        // Esc closes the panel and nothing else.
+        app.stage_view = StageView::Mixer;
+        run_frame(&mut app, &ctx, SIZE, key(Key::Escape));
+        assert!(!app.engine_info_open, "Esc closes it");
+        assert_eq!(app.stage_view, StageView::Mixer, "that Esc was the panel's alone");
+        app.stage_view = StageView::Rack;
+
+        // The readout toggles.
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(!app.engine_info_open, "a second click on the readout closes it");
+
+        // A click on the panel is the panel's; one elsewhere closes it.
+        click_at(&mut app, &ctx, SIZE, chip);
+        let inside = app.engine_info_rect.center();
+        let selected = app.selected;
+        click_at(&mut app, &ctx, SIZE, inside);
+        assert!(app.engine_info_open, "a click inside keeps it open");
+        assert_eq!(app.selected, selected, "and never reaches the rack underneath");
+        click_at(&mut app, &ctx, SIZE, Pos2::new(SIZE.x - 40.0, SIZE.y - 40.0));
+        assert!(!app.engine_info_open, "a click elsewhere closes it");
+    }
+
+    #[test]
+    fn engine_info_lists_a_unit_with_recorded_timing_under_its_display_name() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let (surge, delay) = (
+            app.units.iter().find(|u| u.name == "SURGE A").expect("the demo rack has SURGE A").node_id,
+            app.units.iter().find(|u| u.name == "DELAY A").expect("the demo rack has DELAY A").node_id,
+        );
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(delay, Duration::from_micros(7));
+        timer.record(surge, Duration::from_micros(800));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+        app.engine_stats_at = f32::NEG_INFINITY;
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        let row = |name: &str| {
+            let l = texts.iter().find(|t| t.panel && t.s == name).unwrap_or_else(|| panic!("no row {name}"));
+            let mut vals: Vec<&Text> = texts.iter().filter(|t| t.panel && t.s != name && (t.rect.center().y - l.rect.center().y).abs() < 2.0).collect();
+            vals.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+            (l.rect.top(), vals.iter().map(|t| t.s.clone()).collect::<Vec<_>>())
+        };
+        let (surge_y, surge_vals) = row("Surge A");
+        let (delay_y, delay_vals) = row("Delay A");
+        assert_eq!(surge_vals, ["800 µs", "800 µs", "15.0 %"], "avg, max, share of the 5333 µs buffer");
+        assert_eq!(delay_vals, ["7.0 µs", "7.0 µs", "0.1 %"]);
+        assert!(surge_y < delay_y, "the most expensive unit is on top");
+        assert!(!texts.iter().any(|t| t.panel && t.s == "SURGE A"), "display names, never raw graph names (rule 28)");
+    }
+
+    #[test]
+    fn reset_peaks_restarts_the_maximum_late_blocks_and_xruns() {
+        let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 4, xruns: 3, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let node = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let mut timer = NodeTimer::new();
+        for us in [900u64, 100] {
+            timer.begin_block();
+            timer.record(node, Duration::from_micros(us));
+            timer.end_block();
+        }
+        app.node_times = Some(timer.handle());
+
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(has(&texts, "3 xruns") && has(&texts, "2310 µs") && has(&texts, "900 µs"), "the peaks before the reset");
+        let button = find(&texts, "Reset peaks").rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, button);
+        assert!(app.engine_info_open, "the panel stays open");
+        let st = &app.engine_stats;
+        assert_eq!((st.render_max_us, st.late_blocks, st.xruns), (0, 0, 0));
+        assert!(!has(&texts, "3 xruns") && has(&texts, "DSP"), "the readout's count is gone");
+        assert!((st.dsp_percent - 22.0).abs() < 0.01, "the average is kept");
+
+        // The engine restarts each unit's maximum at its next block.
+        timer.begin_block();
+        timer.record(node, Duration::from_micros(100));
+        timer.end_block();
+        assert_eq!(timer.handle().read().0[0].max_ns, 100_000);
+    }
+
+    #[test]
+    fn the_engine_info_tools_return_the_snapshot_and_reset_it() {
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        for tool in ["get_engine_info", "reset_engine_peaks"] {
+            assert!(names.iter().any(|n| n == tool), "assistant tools missing {tool}");
+            assert!(UI_BRIDGE_TOOLS.contains(&tool), "UI_BRIDGE_TOOLS missing {tool}");
+        }
+        assert!(tool_is_read_only("get_engine_info"));
+        assert!(!tool_is_read_only("reset_engine_peaks") && tool_changes_only_system("reset_engine_peaks"), "a reset is no rack edit: no undo step");
+
+        let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 4, xruns: 3, midi_latency_us: 420, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let node = app.units.iter().find(|u| u.name == "SURGE A").unwrap().node_id;
+        let mut timer = NodeTimer::new();
+        timer.begin_block();
+        timer.record(node, Duration::from_micros(800));
+        timer.end_block();
+        app.node_times = Some(timer.handle());
+
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
+        for (key, want) in [
+            ("audio_live", serde_json::json!(true)), ("sample_rate", serde_json::json!(48_000)),
+            ("buffer_frames", serde_json::json!(256)), ("inputs", serde_json::json!(0)), ("outputs", serde_json::json!(2)),
+            ("render_max_us", serde_json::json!(2310)), ("late_blocks", serde_json::json!(4)), ("xruns", serde_json::json!(3)),
+            ("midi_input_latency_ms", serde_json::json!(0.42)), ("nodes_not_timed", serde_json::json!(0)),
+        ] {
+            assert_eq!(v[key], want, "{key} in {v}");
+        }
+        assert!((v["dsp_percent"].as_f64().unwrap() - 22.0).abs() < 0.01 && (v["buffer_ms"].as_f64().unwrap() - 5.333).abs() < 0.001, "{v}");
+        assert_eq!(v["nodes"][0]["name"], "Surge A");
+        assert_eq!(v["nodes"][0]["node"], node);
+        assert!((v["nodes"][0]["avg_us"].as_f64().unwrap() - 800.0).abs() < 1e-6 && (v["nodes"][0]["percent"].as_f64().unwrap() - 15.0).abs() < 1e-6, "{v}");
+
+        let undo_steps = app.undo_past.len();
+        let out = app.exec_tool("reset_engine_peaks", &serde_json::json!({}));
+        assert!(out.starts_with("reset"), "{out}");
+        assert_eq!(app.undo_past.len(), undo_steps);
+        let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
+        assert_eq!((v["render_max_us"].as_u64(), v["late_blocks"].as_u64(), v["xruns"].as_u64()), (Some(0), Some(0), Some(0)), "{v}");
+    }
+
+    #[test]
+    fn an_audio_in_unit_counts_its_channels_as_inputs() {
+        let (mut app, _ctx) = app_at(counters(22.0), SIZE);
+        assert_eq!(app.engine_stats_now().inputs, 0, "no Audio In unit, no input");
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::Stereo }, name_bytes("GUITAR"));
+        g.add_node(NodeKind::AudioIn { device: None, channels: crate::control::AudioInChannel::MonoL }, name_bytes("MIC"));
+        g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        app.apply_session(&crate::session::Session::new("inputs", g)).unwrap();
+        assert_eq!(app.engine_stats_now().inputs, 3, "a stereo and a mono input");
+    }
+
+    /// The panel and the readout stay inside the window, the panel's rows
+    /// inside the panel, at the default size, a tiled half and the minimum.
+    #[test]
+    fn engine_info_fits_the_window_at_every_size() {
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+            let size = Vec2::new(w, h);
+            let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, xruns: 3, midi_latency_us: 420, ..counters(22.0) }, size);
+            let mut timer = NodeTimer::new();
+            timer.begin_block();
+            for (i, u) in app.units.iter().enumerate() {
+                timer.record(u.node_id, Duration::from_micros(40 + 130 * i as u64));
+            }
+            timer.end_block();
+            app.node_times = Some(timer.handle());
+            let screen = Rect::from_min_size(Pos2::ZERO, size);
+            run_frame(&mut app, &ctx, size, vec![]);
+            assert!(screen.shrink(8.0).contains_rect(app.dsp_chip_rect), "{w}x{h}: readout {:?} in the window", app.dsp_chip_rect);
+
+            let chip = app.dsp_chip_rect.center();
+            let texts = click_at(&mut app, &ctx, size, chip);
+            let panel = app.engine_info_rect;
+            assert!(app.engine_info_open && screen.contains_rect(panel), "{w}x{h}: panel {panel:?}");
+            assert!(panel.top() >= app.dsp_chip_rect.bottom(), "{w}x{h}: the panel hangs under the readout");
+            assert!((panel.right() - app.dsp_chip_rect.right()).abs() < 1.0, "{w}x{h}: flush with the readout's right edge");
+            let header = find(&texts, "Engine info").rect;
+            let reset = find(&texts, "Reset peaks").rect;
+            assert!(panel.shrink(8.0).contains_rect(header) && panel.shrink(8.0).contains_rect(reset), "{w}x{h}: header in the panel");
+            assert!((header.center().y - reset.center().y).abs() < 2.0, "{w}x{h}: title and button share a centre line");
+            // Rows: a label never runs into its value.
+            let rows: Vec<&Text> = texts.iter().filter(|t| t.panel && t.s.chars().count() > 1).collect();
+            assert!(rows.len() > 20, "{w}x{h}: the panel's rows are painted ({})", rows.len());
+            for a in &rows {
+                for b in &rows {
+                    if std::ptr::eq(*a, *b) || a.rect.left() >= b.rect.left() { continue; }
+                    assert!(!a.rect.intersects(b.rect.shrink(0.5)), "{w}x{h}: {:?} overlaps {:?}", a.s, b.s);
+                }
+            }
+        }
+    }
+
+
+    /// The readout and panel repaint changing numbers four times a second
+    /// for as long as the app runs. egui clears a font atlas past 80 % and
+    /// the app keeps galleys across frames (wordmark, knob captions), so a
+    /// growing glyph set would garble them (rule 17).
+    #[test]
+    fn changing_engine_numbers_never_grow_the_font_atlas() {
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let chip = app.dsp_chip_rect.center();
+        click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+        let mut seed = 0x2545_f491_u64;
+        let mut next = |m: u64| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) % m };
+        let mut timer = NodeTimer::new();
+        let mut cycle = |app: &mut DemoApp, frames: usize| {
+            for _ in 0..frames {
+                let pct = next(10_000) as f64 / 100.0;
+                set_counters(app, EngineCounters {
+                    render_max_us: next(20_000) as u32, render_late: next(500) as u32, xruns: next(300) as u32,
+                    midi_latency_us: next(5_000) as u32, ..counters(pct)
+                });
+                timer.begin_block();
+                for u in &app.units { timer.record(u.node_id, Duration::from_nanos(next(3_000_000))); }
+                timer.end_block();
+                app.node_times = Some(timer.handle());
+                run_frame(app, &ctx, SIZE, vec![]);
+            }
+        };
+        let atlas = || ctx.fonts(|f| (f.font_atlas_fill_ratio(), f.font_image_size()));
+        cycle(&mut app, 100);
+        let warm = atlas();
+        cycle(&mut app, 1_000);
+        let after = atlas();
+        eprintln!("font atlas after 100 frames {warm:?}, after 1100 frames {after:?}");
+        assert!(app.engine_info_open, "the panel stayed open");
+        assert_eq!(after, warm, "1000 more frames of new numbers added glyphs to the atlas");
+        assert!(after.0 < 0.5, "far from egui's 80 % clear: {}", after.0);
+    }
+
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat engine_info_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn engine_info_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (state, c) in [
+            ("normal", EngineCounters { render_max_us: 2310, midi_latency_us: 420, ..counters(22.0) }),
+            ("high", EngineCounters { render_max_us: 4790, render_late: 12, midi_latency_us: 420, ..counters(78.0) }),
+            ("critical", EngineCounters { render_max_us: 6120, render_late: 231, xruns: 3, midi_latency_us: 420, ..counters(94.0) }),
+        ] {
+            for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
+                for panel in [false, true] {
+                    let mut app = DemoApp::new_with_sink(None);
+                    app.test_counters = Some(c);
+                    let share = c.render_avg_ns as f64 / 1000.0 / app.units.len() as f64;
+                    let mut timer = NodeTimer::new();
+                    timer.begin_block();
+                    for (i, u) in app.units.iter().enumerate() {
+                        if matches!(u.node_kind, UnitKind::Keys | UnitKind::Master) { continue; }
+                        let us = share * [1.9, 0.12, 1.4, 0.08][i % 4];
+                        timer.record(u.node_id, Duration::from_nanos((us * 1000.0) as u64));
+                    }
+                    timer.end_block();
+                    app.node_times = Some(timer.handle());
+                    app.engine_info_open = panel;
+                    let name = if panel { "panel" } else { "bar" };
+                    super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("{name}-{state}-{w}x{h}.png")));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod voice_host_tests {
     use super::*;
 
@@ -27969,6 +28763,8 @@ mod offline_shots {
     }
 
     /// Run frames of `app` at `size` points and write the last one as a PNG.
+    /// `app` must not have run a frame before: it keeps galleys laid out in
+    /// that frame's font atlas, and this fresh context draws them as glyph soup.
     pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
         let ctx = egui::Context::default();
         let mut tex = Textures::default();

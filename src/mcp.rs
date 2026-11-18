@@ -77,6 +77,8 @@ struct State {
     rigs: Arc<Mutex<RigSnapshot>>,
     /// Engine publication handle (Local: live transport/count-in/BPM status).
     graph_pub: Option<Arc<Mutex<GraphPub>>>,
+    /// Render time per node (Local: the headless engine's own table).
+    node_times: Option<Arc<crate::engine_info::NodeTimes>>,
     count_in_enabled: bool,
     count_in_bars: u8,
     /// Headless CC binding mirror keyed by (source, dest).
@@ -1220,6 +1222,7 @@ impl McpServer {
             .and_then(|p| p.lock().ok())
             .map(|g| serde_json::to_value(g.meter).unwrap_or_else(|_| json!(null)))
             .unwrap_or_else(|| json!(null));
+        let counters = crate::engine_info::EngineCounters::load();
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
             "edges": st.graph.edges.len(),
@@ -1233,14 +1236,44 @@ impl McpServer {
             "count_in_bars": count_in_bars,
             "record_sync": record_sync,
             "bpm": bpm,
-            "buffer_frames": bridge::BUFFER_FRAMES,
-            "buffer_latency_ms": bridge::BUFFER_FRAMES as f64 / st.sample_rate * 1000.0,
-            "xruns": bridge::XRUNS.load(Ordering::Relaxed),
-            "midi_latency_ms": bridge::MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
+            "buffer_frames": counters.buffer_frames(),
+            "buffer_latency_ms": counters.buffer_frames() as f64 / st.sample_rate * 1000.0,
+            "xruns": counters.xruns,
+            "midi_latency_ms": counters.midi_latency_us as f64 / 1000.0,
             "rigs": rig_count,
             "active_rig": active_rig,
             "meter": meter,
         }))
+    }
+
+    /// The engine's load and audio session (the app's Engine Info panel).
+    #[tool(name = "get_engine_info", description = "The engine's load and audio session (the app's DSP readout and Engine Info panel): dsp_percent (average render time as a share of one buffer; above 70 is high, above 90 dropouts are likely), render_avg_us, render_max_us, late_blocks (buffers that took over 80 % of their time), xruns, sample_rate, buffer_frames, buffer_ms (the output latency the buffer adds), inputs (channels of the Audio In units), outputs, midi_input_latency_ms (null until a hardware MIDI event was measured), audio_live, and nodes: every instrument and effect with avg_us, max_us and percent of the buffer, most expensive first. The sound card's own latency and the audio-input latency are not measured and not included. Read-only.")]
+    fn get_engine_info(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("get_engine_info", json!({}));
+        }
+        let inputs = st.graph.nodes.iter()
+            .map(|n| match &n.kind { NodeKind::AudioIn { channels, .. } => channels.count(), _ => 0 })
+            .sum();
+        let stats = crate::engine_info::EngineStats::build(
+            crate::engine_info::EngineCounters::load(),
+            st.node_times.as_deref(),
+            inputs,
+            |node| st.graph.node(node).map(|n| crate::ui::sentence_case(name_str(&n.name))),
+        );
+        ok_json(serde_json::to_value(stats).unwrap_or(Value::Null))
+    }
+
+    #[tool(name = "reset_engine_peaks", description = "Start the engine's peak counters again from now: render_max_us, late_blocks, xruns and every unit's max_us (the Engine Info panel's Reset peaks button). Averages are not touched.")]
+    fn reset_engine_peaks(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("reset_engine_peaks", json!({}));
+        }
+        crate::engine_info::reset_counter_peaks();
+        if let Some(t) = &st.node_times { t.reset_peaks(); }
+        ok_json(json!("reset: worst render time, late blocks, xruns and each unit's maximum start again from now"))
     }
 
     /// The audio judge (#35): record the master and ask a listening model.
@@ -2905,6 +2938,7 @@ struct AudioHandles {
     bus: CommandBus,
     level: Arc<AtomicU32>,
     graph_pub: Arc<Mutex<GraphPub>>,
+    node_times: Arc<crate::engine_info::NodeTimes>,
     sample_rate: f64,
     live: bool,
     record: Arc<crate::record::RecorderShared>,
@@ -2969,16 +3003,23 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     engine.set_listen_tap(listen_tap);
     crate::listen::install(listen_capture);
     let level = engine.level_handle();
+    let node_times = engine.node_times_handle();
+    bridge::SAMPLE_RATE.store(sample_rate as u32, Ordering::Relaxed);
     let stream = device.build_output_stream(
         config,
         move |data: &mut [f32], _| {
+            let t0 = std::time::Instant::now();
             engine.render(data, ch);
+            bridge::note_render(t0.elapsed(), data.len() / ch.max(1), sample_rate);
         },
-        |e| eprintln!("mcp audio stream error: {e}"),
+        |e| {
+            bridge::XRUNS.fetch_add(1, Ordering::Relaxed);
+            eprintln!("mcp audio stream error: {e}");
+        },
         None,
     )?;
     stream.play()?;
-    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, sample_rate, live: true, record })
+    Ok(AudioHandles { mains, stream: Some(stream), bus, level, graph_pub, node_times, sample_rate, live: true, record })
 }
 
 /// No audio device (or plugin failure): keep the engine rendering into a
@@ -2997,6 +3038,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     engine.set_listen_tap(listen_tap);
     crate::listen::install(listen_capture);
     let level = engine.level_handle();
+    let node_times = engine.node_times_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())
         .spawn(move || {
@@ -3007,7 +3049,7 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
             }
         })
         .expect("spawning dummy audio thread");
-    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, sample_rate, live: false, record }
+    AudioHandles { mains: vec![], stream: None, bus, level, graph_pub, node_times, sample_rate, live: false, record }
 }
 
 fn build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
@@ -3074,6 +3116,7 @@ pub fn run() -> anyhow::Result<()> {
         playing: false,
         rigs,
         graph_pub: Some(audio.graph_pub),
+        node_times: Some(audio.node_times),
         count_in_enabled: ci_enabled,
         count_in_bars: ci_bars,
         cc_maps: std::collections::HashMap::new(),
@@ -3108,6 +3151,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         playing: false,
         rigs: Arc::new(Mutex::new(RigSnapshot::default())),
         graph_pub: None,
+        node_times: None,
         count_in_enabled: false,
         count_in_bars: 1,
         cc_maps: std::collections::HashMap::new(),
@@ -3168,6 +3212,28 @@ mod tests {
         serde_json::from_str(text).unwrap()
     }
 
+    #[test]
+    fn get_engine_info_reports_the_headless_engines_units_and_reset_zeroes_xruns() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..4 { engine.render(&mut buf, 2); }
+        let info = tool_json(&server.get_engine_info());
+        for key in ["audio_live", "sample_rate", "buffer_frames", "buffer_ms", "inputs", "outputs", "dsp_percent",
+            "render_avg_us", "render_max_us", "late_blocks", "xruns", "midi_input_latency_ms", "nodes", "nodes_not_timed"] {
+            assert!(info.get(key).is_some(), "get_engine_info missing '{key}': {info}");
+        }
+        assert_eq!(info["outputs"], 2);
+        // The demo patch's two delays render (no CLAP voice is hosted here).
+        let mut names: Vec<&str> = info["nodes"].as_array().unwrap().iter().map(|n| n["name"].as_str().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["Delay A", "Delay B"], "units by display name: {info}");
+        assert!(info["nodes"].as_array().unwrap().iter().all(|n| n["max_us"].as_f64().unwrap() >= n["avg_us"].as_f64().unwrap()), "{info}");
+
+        bridge::XRUNS.store(5, Ordering::Relaxed);
+        tool_json(&server.reset_engine_peaks());
+        assert_eq!(tool_json(&server.get_engine_info())["xruns"], 0, "a reset zeroes the xrun count");
+    }
+
     /// Local-backend server with a real (voice-less) engine the test drains
     /// by hand — no audio device or CLAP needed.
     fn local_server() -> (McpServer, GraphEngine) {
@@ -3186,6 +3252,7 @@ mod tests {
             playing: false,
             rigs,
             graph_pub: Some(graph_pub),
+            node_times: Some(engine.node_times_handle()),
             count_in_enabled: false,
             count_in_bars: 1,
             cc_maps: std::collections::HashMap::new(),

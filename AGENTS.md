@@ -899,6 +899,20 @@ Learned so far (2026-11-15, UI polish pass):
     fixpoint. States are hashes, the halves run as separate scenarios
     (`Scenario::{Routing, Arp, RoutingWithStrip, Fx}`, 30–100 k states each),
     and a long run goes in `systemd-run --user -p MemoryMax=3G`.
+147. **An integer moving average keeps what its division drops:**
+    `RENDER_AVG_US` did `avg - avg/64 + us/64` in whole microseconds, and
+    both divisions dropped up to 63 µs: a 50 µs render read 0 and a steady
+    300 µs one read 256, so the DSP load of a light rack read 0 %. Average in
+    nanoseconds with `engine_info::ema_ns` (a signed step, rounded towards
+    the sample), and test a new average on a constant input from below and
+    from above (`the_average_converges_on_small_and_large_times`).
+148. **A headless shot starts from an app that never ran a frame:**
+    `offline_shots::shot` makes a new egui context and font atlas, but the
+    app keeps galleys (wordmark, knob captions, hints) laid out in the
+    atlas of the context it ran in before. `engine_info_shots` and
+    `mixer_parity_shots` ran frames first and drew those as glyph soup;
+    build a fresh app per image and open every PNG before using it as
+    evidence.
 
 ## Working on kabelsalat
 

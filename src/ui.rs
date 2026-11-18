@@ -8959,7 +8959,10 @@ impl DemoApp {
         let g = Self::build_lv2_chain_graph(uri, name);
         let s = crate::session::Session::new(format!("LV2: {name}"), g);
         match self.apply_session(&s) {
-            Ok(_) => self.plugin_msg = format!("Added '{name}' — Keys→Surge→{name}→Master"),
+            Ok(_) => {
+                self.plugin_msg = format!("Added '{name}' — Keys→Surge→{name}→Master");
+                self.stage_view = StageView::Rack;
+            }
             Err(e) => self.plugin_msg = format!("Add failed: {e}"),
         }
     }
@@ -8983,7 +8986,10 @@ impl DemoApp {
         let g = Self::build_lv2_instrument_graph(uri, name);
         let s = crate::session::Session::new(format!("LV2 inst: {name}"), g);
         match self.apply_session(&s) {
-            Ok(_) => self.plugin_msg = format!("Added '{name}' as instrument — Keys→{name}→Master"),
+            Ok(_) => {
+                self.plugin_msg = format!("Added '{name}' as instrument — Keys→{name}→Master");
+                self.stage_view = StageView::Rack;
+            }
             Err(e) => self.plugin_msg = format!("Add failed: {e}"),
         }
     }
@@ -8993,7 +8999,10 @@ impl DemoApp {
         let g = crate::control::plugin_rig_graph(plugin_id, name);
         let s = crate::session::Session::new(&format!("{name} rig"), g);
         match self.apply_session(&s) {
-            Ok(_) => self.plugin_msg = format!("New {name} rig — Keys→{name}→Master"),
+            Ok(_) => {
+                self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
+                self.stage_view = StageView::Rack;
+            }
             Err(e) => self.plugin_msg = format!("Add failed: {e}"),
         }
     }
@@ -9027,6 +9036,7 @@ impl DemoApp {
         self.rig_mix = keep_mix;
         self.set_active_rig(keep_rig);
         self.plugin_msg = "Added Metronome — wired to Master".into();
+        self.stage_view = StageView::Rack;
     }
 
     /// Start a fresh single-Surge rig.
@@ -19763,6 +19773,52 @@ mod stage_views_tests {
         assert!(bg.iter().any(|t| t == "Surge XT"));
         assert!(!bg.iter().any(|t| t == "Room Reverb"));
         assert!(!bg.iter().any(|t| t == "Metronome"));
+    }
+
+    #[test]
+    fn plugins_stage_new_rig_switches_to_rack() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![ClapPluginInfo {
+            id: "com.digital-suburban.dexed".into(),
+            name: "Dexed".into(),
+            vendor: "Digital Suburban".into(),
+            features: vec!["instrument".into()],
+        }];
+        app.stage_view = StageView::Plugins;
+        app.plugin_category = PluginCategory::Clap;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let run = |app: &mut DemoApp, events: Vec<egui::Event>| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.events = events;
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear(); // rule 11
+            let mut texts = Vec::new();
+            for cs in &out.shapes {
+                if let Shape::Text(t) = &cs.shape {
+                    texts.push((t.galley.text().to_owned(), t.visual_bounding_rect()));
+                }
+            }
+            texts
+        };
+        for _ in 0..2 { run(&mut app, vec![]); }
+        let texts = run(&mut app, vec![]);
+        let at = texts.iter().find(|(t, _)| t == "New rig").expect("New rig button rendered").1.center();
+        let ptr = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        run(&mut app, vec![egui::Event::PointerMoved(at)]);
+        run(&mut app, vec![ptr(at, true)]);
+        run(&mut app, vec![ptr(at, false)]);
+
+        assert_eq!(app.stage_view, StageView::Rack, "clicking New rig returns to the rack");
+        assert!(app.units.iter().any(|u| u.name == "DEXED"), "rack rebuilt with the chosen plugin");
+        assert!(app.plugin_msg.contains("New Dexed rig"), "{}", app.plugin_msg);
     }
 
     #[test]

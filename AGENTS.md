@@ -642,6 +642,10 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **Plugin actions that change the rack return to `StageView::Rack` on success:**
+    `add_clap_rig`, `add_lv2_instrument`, `add_lv2_effect`, and
+    `add_metronome_to_active_rig` left `stage_view` on `StageView::Plugins`,
+    so clicking "New rig" appeared to do nothing (`plugins_stage_new_rig_switches_to_rack`).
 
 ## Working on kabelsalat
 
@@ -705,7 +709,20 @@ Learned so far (2026-11-15, UI polish pass):
   there. Never edit on `main`. A branch alone is not enough: sessions that
   share one checkout share its working tree, so a `git switch` in one moves
   every other session's files too. Check `git branch --show-current` and
-  `pwd` before editing. When the work is finished, commit it and push the
+  `pwd` before editing.
+- **Move the session into its worktree (user, 2026-11-18):** creating the
+  worktree is not enough. Switch the session itself into it before any
+  edit, build or git command (Claude Code: `EnterWorktree` with
+  `path: ../kabelsalat-<topic>`; other harnesses: their equivalent, or
+  start the session there). Every later command must run with the
+  worktree as its working directory, on the feature branch. Never rely on
+  a `cd` per command from the `main` checkout: the shell falls back to
+  `main` after each call, and one command without the `cd` edits `main`.
+  One session edited `src/ui.rs` on `main` this way, and the diff then had
+  to be moved by patch. If you find your work on `main`, move it to a
+  branch at once (patch or WIP commit; never a bare `git stash`, the stash
+  is shared across worktrees), then revert `main`.
+- **Finish the work:** when the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
   and shows the evidence, then queue it with `gh pr merge --auto --squash`

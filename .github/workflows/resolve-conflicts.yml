@@ -1,0 +1,76 @@
+name: Resolve conflicts
+
+# After every merge to main, open PRs that now conflict get main merged in
+# when the conflicts are only insertions on both sides of a Markdown file
+# (AGENTS.md rules appended by parallel PRs, older CHANGELOG entries):
+# scripts/ci/resolve_appends.py keeps both. Any other conflict, or a merge
+# GITHUB_TOKEN may not push (it touches .github/workflows), gets the label
+# `merge-conflict` for the PR's author (an agent) to resolve by hand.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: resolve-conflicts
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Merge main into conflicting PRs
+        run: |
+          cp scripts/ci/resolve_appends.py "$RUNNER_TEMP/"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          gh label create merge-conflict --color D93F0B \
+            --description "Conflicts with main that need a hand (resolve-conflicts.yml)" 2>/dev/null || true
+          flag() { # <pr> <why>
+            if ! gh pr view "$1" --json labels -q '.labels[].name' | grep -qx merge-conflict; then
+              gh pr edit "$1" --add-label merge-conflict
+              gh pr comment "$1" --body "This PR conflicts with \`main\` and could not be merged automatically: $2. Merge \`main\` into the branch, resolve, and push."
+            fi
+          }
+          for pr in $(gh pr list --state open --json number,isCrossRepository -q '.[] | select(.isCrossRepository | not) | .number'); do
+            # GitHub computes mergeability lazily after a push to main.
+            for _ in 1 2 3 4 5 6; do
+              state=$(gh pr view "$pr" --json mergeable -q .mergeable)
+              [ "$state" != UNKNOWN ] && break
+              sleep 10
+            done
+            branch=$(gh pr view "$pr" --json headRefName -q .headRefName)
+            echo "#$pr $branch: $state"
+            if [ "$state" != CONFLICTING ]; then
+              if gh pr view "$pr" --json labels -q '.labels[].name' | grep -qx merge-conflict; then
+                gh pr edit "$pr" --remove-label merge-conflict
+              fi
+              continue
+            fi
+            git fetch -q origin "$branch"
+            git checkout -q -B work FETCH_HEAD
+            if ! git merge -q --no-edit origin/main; then
+              if ! python3 "$RUNNER_TEMP/resolve_appends.py"; then
+                git merge --abort
+                flag "$pr" "conflicts other than insertions into Markdown files"
+                continue
+              fi
+              git commit -q --no-edit
+            fi
+            if ! git push -q origin "HEAD:$branch"; then
+              flag "$pr" "the bot may not push this merge (it changes .github/workflows, or the branch moved)"
+              continue
+            fi
+            # A push with GITHUB_TOKEN starts no workflow; dispatch the required checks.
+            gh workflow run ci.yml --ref "$branch"
+            gh pr comment "$pr" --body "Merged \`main\` into this branch: the conflicts were insertions on both sides of Markdown files, both kept (\`scripts/ci/resolve_appends.py\`). Pull before your next push."
+          done

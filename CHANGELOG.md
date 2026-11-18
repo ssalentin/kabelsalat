@@ -78,6 +78,14 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **Small and tiled windows:** the rack fits windows down to the 760 px
+  minimum instead of panning with Keys and Master cut off; a short, wide
+  window lays each instrument chain out in one row; the Mixer, Matrix,
+  Plugins and Settings sheets give their margins to content, scroll instead
+  of painting into the keyboard or assistant dock, and the master meter no
+  longer stacks its dB marks. The rig strip hint is shown only where it fits.
+- **UI scale on a second monitor:** the scale follows the monitor the window
+  is on (it kept the laptop's 1.6x on a 1.0x external screen).
 - **An instrument the assistant adds plays at once:** `add_node` wires a
   CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
   rig's synth: the rig's Keys into it and it into the rig's Master. A

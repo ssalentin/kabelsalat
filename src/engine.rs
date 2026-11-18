@@ -5941,6 +5941,36 @@ mod tests {
     }
 
     #[test]
+    fn the_delay_time_knob_always_gives_an_echo_never_a_comb() {
+        use super::{dsp_native_param, knob_specs, P_MIX, P_TIME};
+        use crate::control::{DspKind, NodeKind};
+        let kind = NodeKind::Dsp(DspKind::Delay);
+        let default = knob_specs(&kind).iter().find(|k| k.label == "TIME").unwrap().default;
+        let echo_ms = |knob: f32| {
+            let sr = 48000.0;
+            let mut d = crate::dsp::build_processor(&DspKind::Delay, sr);
+            d.set_param(dsp_native_param(&DspKind::Delay, P_TIME).unwrap(), knob);
+            d.set_param(1, 0.0);
+            d.set_param(dsp_native_param(&DspKind::Delay, P_MIX).unwrap(), 1.0);
+            let mut warm = vec![0.0f32; 48000 * 2];
+            d.process(&mut warm, 48000);
+            let mut io = vec![0.0f32; 120000 * 2];
+            io[0] = 1.0;
+            io[1] = 1.0;
+            d.process(&mut io, 120000);
+            let l: Vec<f32> = io.iter().step_by(2).copied().collect();
+            let at = l.iter().enumerate().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+            at as f32 / sr as f32 * 1000.0
+        };
+        for knob in [default, 0.0, 0.2] {
+            let ms = echo_ms(knob);
+            assert!(ms >= 50.0, "TIME {knob} echoes after {ms:.1} ms: a comb filter, heard as distortion");
+        }
+        let ms = echo_ms(default);
+        assert!((150.0..=500.0).contains(&ms), "a new delay's default echo is {ms:.1} ms");
+    }
+
+    #[test]
     fn dsp_param_maps_for_templates() {
         use super::dsp_native_param;
         use crate::control::DspKind;

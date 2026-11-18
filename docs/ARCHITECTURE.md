@@ -43,7 +43,11 @@ agents are in [AGENTS.md](../AGENTS.md).
   parameter (YANES). Aeolus has no presets and starts with every stop off:
   `aeolus.rs` holds its organ's stop table and a set of registrations, each
   written as the plugin's JSON state; a freshly instantiated Aeolus gets the
-  default registration in `ClapVoice::instantiate_entry`. Each `Sound` carries its `Load` (plugin state, parameter
+  default registration in `ClapVoice::instantiate_entry`. Its stops are no
+  parameters, so the Aeolus face's stop panel (`aeolus_rects`) changes one
+  stop by taking the plugin's state, changing that stop (`aeolus::with_stop`)
+  and loading it back; it reads what is drawn (`aeolus::drawn`) once a
+  second and after each change. Each `Sound` carries its `Load` (plugin state, parameter
   value, LV2 preset, programme change), and `load` sends each along its own
   path. `Libraries` scans on a thread of its own and keeps the results;
   `search` / `find` are the one search for every library, and the

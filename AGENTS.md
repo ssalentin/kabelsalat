@@ -648,6 +648,12 @@ Learned so far (2026-11-15, UI polish pass):
     instrument (`catalog-install-test <id>`); one that starts silent gets a
     starting state (`aeolus::initial_state`, applied where every CLAP voice
     is instantiated) and its sounds as a `Source` (rule 93).
+119. **Test a face element in the rack the app opens with:** the Aeolus
+    stop panel passed its layout tests on a lone, tall unit, yet in the
+    real app (two instruments stacked over their delays, units 250 px
+    tall) it found no room and was not drawn at all. A face test asserts
+    the element IS shown in a stacked default rack at 1280x800 and
+    1600x1000, not only that what is shown does not overlap.
 
 ## Working on kabelsalat
 

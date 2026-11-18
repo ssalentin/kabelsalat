@@ -614,6 +614,29 @@ const MAX_PINS: usize = crate::main_controls::FACE_MAIN_CONTROLS;
 const KNOB_LABEL_W: f32 = KNOB_PITCH - 6.0;
 /// How often plugin knobs follow their plugin (values and renamed controls).
 const MAIN_POLL_SECS: f32 = 0.1;
+/// How often an Aeolus face re-reads which stops its plugin has drawn (the
+/// face's own clicks and sound loads update it at once).
+const AEOLUS_POLL_SECS: f32 = 1.0;
+
+/// An Aeolus unit's stop panel: what the plugin has drawn (None until read,
+/// or for an organ other than the default one) and the division shown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AeolusFace {
+    drawn: Option<[u32; 4]>,
+    division: usize,
+}
+
+impl Default for AeolusFace {
+    /// Manual I, where the registration a fresh Aeolus starts with sits.
+    fn default() -> Self { AeolusFace { drawn: None, division: 2 } }
+}
+
+/// Where an Aeolus face lays out its division tabs and the stops of the
+/// division it shows (rack-local).
+struct AeolusRects {
+    tabs: [Rect; 4],
+    stops: Vec<Rect>,
+}
 /// Readback pause after the UI or a CC moved a plugin knob.
 const READBACK_HOLD_SECS: f32 = 0.3;
 /// The warm shift an instrument's audio cable carries (the former TONE
@@ -1275,6 +1298,31 @@ fn audio_in_sub(device: Option<&str>, ch: AudioInChannel) -> String {
 /// Sentence case for unit names (§4.3): "SURGE A" → "Surge A", "MASTER OUT"
 /// → "Master out". Single-letter words (rig tags A/B) stay uppercase.
 /// Runs once per unit at galley-build time, never on the frame path.
+/// An Aeolus stop name ("Open Diapason\n8") on one line within `max_w`
+/// (screen px): the whole name, else the name cut short with "…" before its
+/// footage, which always stays.
+fn fit_stop_label(painter: &egui::Painter, name: &str, font: FontId, max_w: f32) -> String {
+    let (stem, foot) = name.split_once('\n').unwrap_or((name, ""));
+    let fits = |t: &str| painter.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x <= max_w;
+    let full = format!("{stem} {foot}").trim().to_string();
+    if fits(&full) { return full; }
+    // Organists' own short forms first, then letters off the end.
+    let short = stem.split(' ').map(|w| match w {
+        "Diapason" => "Diap.", "Principal" => "Princ.", "Double" => "Dbl.", "Harmonic" => "Harm.",
+        "Chimney" => "Chim.", "Sesquialtera" => "Sesq.", "Fourniture" => "Fourn.", "Quintadena" => "Quint.",
+        "Violoncell" => "Cello", "Cornopean" => "Cornop.", "Fifteenth" => "15th", "Twelfth" => "12th",
+        w => w,
+    }).collect::<Vec<_>>().join(" ");
+    let short_full = format!("{short} {foot}").trim().to_string();
+    if fits(&short_full) { return short_full; }
+    let chars: Vec<char> = short.chars().collect();
+    for n in (1..chars.len()).rev() {
+        let t = format!("{}… {foot}", chars[..n].iter().collect::<String>().trim_end());
+        if fits(&t) { return t; }
+    }
+    foot.to_string()
+}
+
 fn sentence_case(s: &str) -> String {
     s.split_whitespace()
         .enumerate()
@@ -2367,6 +2415,11 @@ struct DemoApp {
     editor_params: Vec<ParamDesc>,
     /// `ui_time` of the last plugin poll for main-control knobs.
     main_poll_at: f32,
+    /// Aeolus faces by node id: the stops its plugin has drawn and the
+    /// division the face shows (aeolus.rs).
+    aeolus_faces: HashMap<u32, AeolusFace>,
+    /// `ui_time` of the last read of the Aeolus plugins' stops.
+    aeolus_poll_at: f32,
     /// LV2 main-control values waiting for their knobs, which appear only
     /// once the plugin's controls are resolved: a loaded session's values
     /// (sent to the engine) and the values carried over a rack rebuild (the
@@ -2616,6 +2669,8 @@ impl DemoApp {
             editor_rig: 0,
             editor_params: Vec::new(),
             main_poll_at: 0.0,
+            aeolus_faces: HashMap::new(),
+            aeolus_poll_at: f32::NEG_INFINITY,
             lv2_main_restore: Vec::new(),
             editor_filter: String::new(),
             editor_request: None,
@@ -7254,6 +7309,8 @@ impl DemoApp {
         if let crate::sounds::Load::MidiProgram(p) = sound.load {
             self.adopt_program_drawbars(unit.node, p);
         }
+        // An Aeolus registration changed the stops: the face reads them now.
+        if let crate::sounds::Load::AeolusRegistration(_) = sound.load { self.aeolus_poll_at = f32::NEG_INFINITY; }
         match unit.slot {
             Some(slot) => {
                 if let Some(n) = self.patch_names.get_mut(slot) { *n = Some(sound.name.clone()); }
@@ -11185,6 +11242,79 @@ impl DemoApp {
             .is_some_and(|n| crate::organ::is_organ(&n.kind))
     }
 
+    /// Is this unit Aeolus (a stop panel on its face)?
+    fn is_aeolus_unit(&self, unit: usize) -> bool {
+        self.units.get(unit)
+            .and_then(|u| self.base_graph.node(u.node_id))
+            .is_some_and(|n| matches!(&n.kind, NodeKind::Clap { plugin_id } if name_str(plugin_id) == crate::aeolus::AEOLUS_ID))
+    }
+
+    /// The division an Aeolus unit's face shows.
+    fn aeolus_division(&self, unit: usize) -> usize {
+        self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default().division
+    }
+
+    /// An Aeolus face, between the header and the knob row: a column of
+    /// division tabs on the left (III, II, I, P, top to bottom as on the
+    /// console), and the shown division's stops in columns right of it.
+    /// None when the stops do not fit at a readable size (never squeeze,
+    /// rule 22).
+    fn aeolus_rects(&self, unit: usize) -> Option<AeolusRects> {
+        if !self.is_aeolus_unit(unit) { return None; }
+        let r = *self.unit_rects.get(unit)?;
+        if !(r.width() > 0.0) { return None; }
+        let (left, right) = (r.left() + FACE_X, r.right() - FACE_PAD_R);
+        let (top, bottom) = (r.top() + 64.0, self.knob_row_y(unit) - KNOB_R - 14.0);
+        let (tab_w, cell_h, row_gap, col_gap, min_cell_w) = (28.0, 17.0, 3.0, 4.0, 52.0);
+        let fit_rows = ((bottom - top + row_gap) / (cell_h + row_gap)).floor().max(0.0) as usize;
+        if fit_rows < 4 { return None; }
+        let tabs: [Rect; 4] = std::array::from_fn(|i|
+            Rect::from_min_size(Pos2::new(left, top + i as f32 * (cell_h + row_gap)), Vec2::new(tab_w, cell_h)));
+        let n = crate::aeolus::DIVISIONS[self.aeolus_division(unit)].stops.len();
+        let rows = fit_rows.min(n);
+        let cols = n.div_ceil(rows);
+        let grid_left = left + tab_w + 2.0 * col_gap;
+        let cell_w = (right - grid_left - (cols - 1) as f32 * col_gap) / cols as f32;
+        if cell_w < min_cell_w { return None; }
+        // Fill column by column, like the stop jambs of a console.
+        let stops = (0..n).map(|i| {
+            let (c, row) = (i / rows, i % rows);
+            Rect::from_min_size(Pos2::new(grid_left + c as f32 * (cell_w + col_gap), top + row as f32 * (cell_h + row_gap)), Vec2::new(cell_w, cell_h))
+        }).collect();
+        Some(AeolusRects { tabs, stops })
+    }
+
+    /// Draw or push in stop `stop` of the division an Aeolus face shows: the
+    /// plugin's own state with that one stop changed goes back into it (its
+    /// stops are no parameters, aeolus.rs), and the face reads the result.
+    fn toggle_aeolus_stop(&mut self, node: u32, stop: usize) -> Result<(), String> {
+        let face = self.aeolus_faces.get(&node).copied().unwrap_or_default();
+        let on = face.drawn.map_or(true, |d| d[face.division] >> stop & 1 == 0);
+        let main = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i))
+            .ok_or("Aeolus is not running: no stop to draw")?;
+        let state = main.save_state().map_err(|e| format!("Aeolus state: {e}"))?;
+        let next = crate::aeolus::with_stop(&state, face.division, stop, on)
+            .ok_or("this Aeolus has its own organ: its stops are not on the face")?;
+        main.load_state(&next).map_err(|e| format!("Aeolus stop: {e}"))?;
+        self.aeolus_faces.entry(node).or_default().drawn = crate::aeolus::drawn(&next);
+        Ok(())
+    }
+
+    /// Keep each Aeolus face's stops in step with its plugin (a sound load,
+    /// a session load or a new voice changes them): read every
+    /// `AEOLUS_POLL_SECS`, and forget faces whose unit is gone.
+    fn sync_aeolus_faces(&mut self) {
+        let aeolus: Vec<(usize, u32)> = (0..self.units.len()).filter(|&u| self.is_aeolus_unit(u)).map(|u| (u, self.units[u].node_id)).collect();
+        self.aeolus_faces.retain(|n, _| aeolus.iter().any(|(_, a)| a == n));
+        if aeolus.is_empty() || self.ui_time - self.aeolus_poll_at < AEOLUS_POLL_SECS { return; }
+        self.aeolus_poll_at = self.ui_time;
+        for (_, node) in aeolus {
+            let Some(main) = self.voice_slot_of_node(node).and_then(|s| self.clap_pool_idx(s)).and_then(|i| self._surge_main.get_mut(i)) else { continue };
+            let drawn = main.save_state().ok().and_then(|s| crate::aeolus::drawn(&s));
+            self.aeolus_faces.entry(node).or_default().drawn = drawn;
+        }
+    }
+
     /// An organ face's nine drawbar slots (rack-local), left to right from
     /// 16': each a footage label above a track the bar is pulled down in.
     /// Between the header and the knob row; None when there is not room for
@@ -12425,6 +12555,17 @@ impl DemoApp {
                         && self.audio_in_device_rect(ui).map_or(false, |c| c.contains(l.to_pos2())) => {
                         self.cycle_audio_in_device(ui);
                     }
+                    Some(Hit::Unit(ui)) if self.side == Side::Front
+                        && self.aeolus_rects(ui).is_some_and(|a| a.tabs.iter().chain(&a.stops).any(|r| r.contains(l.to_pos2()))) => {
+                        // Aeolus face: a division tab shows that division, a stop toggles.
+                        let a = self.aeolus_rects(ui).unwrap();
+                        let node = self.units[ui].node_id;
+                        if let Some(d) = a.tabs.iter().position(|r| r.contains(l.to_pos2())) {
+                            self.aeolus_faces.entry(node).or_default().division = d;
+                        } else if let Some(stop) = a.stops.iter().position(|r| r.contains(l.to_pos2())) {
+                            if let Err(e) = self.toggle_aeolus_stop(node, stop) { self.plugin_msg = e; }
+                        }
+                    }
                     Some(Hit::Unit(ui)) => {
                         // Double-click a CLAP or LV2 plugin unit → toggle its inline editor.
                         // A single click still pings the unit.
@@ -13027,7 +13168,10 @@ impl DemoApp {
                     self.draw_split_face(painter, ui);
                     self.draw_zone_octaves(painter, ui);
                 }
-                UnitKind::Clap => self.draw_surge_display(painter, ui),
+                UnitKind::Clap => {
+                    self.draw_surge_display(painter, ui);
+                    self.draw_aeolus_face(painter, ui);
+                }
                 UnitKind::Dsp(DspKind::Delay) => self.draw_delay_display(painter, ui),
                 UnitKind::Dsp(_) if u.transport => self.draw_transport_face(painter, ui),
                 UnitKind::Dsp(_) if self.is_organ_unit(ui) => self.draw_organ_face(painter, ui),
@@ -13161,6 +13305,37 @@ impl DemoApp {
             if pos > 0 && bar.height() >= 16.0 {
                 self.face_text(painter, Pos2::new(bar.center().x, bar.bottom() - 8.0), &pos.to_string(), theme::medium_font(11.0), ink);
             }
+        }
+    }
+
+    /// Aeolus face: division tabs, then the shown division's stops as
+    /// chips, lit when drawn. A stop name too long for its chip keeps its
+    /// footage and loses letters from the name.
+    fn draw_aeolus_face(&self, painter: &egui::Painter, unit: usize) {
+        let Some(a) = self.aeolus_rects(unit) else { return };
+        let face = self.units.get(unit).and_then(|u| self.aeolus_faces.get(&u.node_id)).copied().unwrap_or_default();
+        for (d, tab) in a.tabs.iter().enumerate() {
+            let hov = self.face_hovered(painter, unit, *tab);
+            let any = face.drawn.is_some_and(|b| b[d] != 0);
+            let shown = d == face.division;
+            let label = format!("{}{}", crate::aeolus::division_tab(d), if any && !shown { "•" } else { "" });
+            self.paint_face_chip(painter, *tab, &label, shown, hov);
+        }
+        let font = FontId::proportional(10.0);
+        let stops = crate::aeolus::DIVISIONS[face.division].stops;
+        for (i, (rect, name)) in a.stops.iter().zip(stops).enumerate() {
+            let on = face.drawn.is_some_and(|b| b[face.division] >> i & 1 == 1);
+            let hov = self.face_hovered(painter, unit, *rect);
+            let (fill, stroke, ink) = match (on, hov) {
+                (true, _) => (theme::CREAM, theme::CREAM, theme::DARK_PANEL),
+                (false, true) => (mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::MUTED, theme::CREAM),
+                (false, false) => (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID),
+            };
+            let sc = self.xf.rect(*rect);
+            painter.rect_filled(sc, 2.0, fill);
+            painter.rect_stroke(sc, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+            let label = fit_stop_label(painter, name, font.clone(), (rect.width() - 6.0) * self.xf.sx);
+            self.face_text(painter, rect.center(), &label, font.clone(), ink);
         }
     }
 
@@ -14658,6 +14833,7 @@ impl DemoApp {
         self.fps += (1.0 / dt - self.fps) * 0.05;
 
         self.sync_main_knobs();
+        self.sync_aeolus_faces();
         self.layout(rect);
         self.fit_plugin_knobs();
         if !typing(&ctx) {
@@ -21296,6 +21472,10 @@ mod face_layout_tests {
         if let Some(b) = app.drawbar_rects(ui) {
             v.push(("drawbars".into(), b[0].union(b[crate::organ::DRAWBARS - 1])));
         }
+        if let Some(a) = app.aeolus_rects(ui) {
+            v.push(("aeolus tabs".into(), a.tabs[0].union(a.tabs[3])));
+            v.push(("aeolus stops".into(), a.stops.iter().fold(Rect::NOTHING, |u, r| u.union(*r))));
+        }
         if let Some(z) = app.zone_rects(ui) {
             v.push(("zone low".into(), z[0].all()));
             v.push(("zone high".into(), z[1].all()));
@@ -21378,6 +21558,94 @@ mod face_layout_tests {
         g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.build_rack(&g, &[]);
         check(app, "organ");
+    }
+
+    /// Keys → Aeolus → Master, its unit with the main knobs a real Aeolus has.
+    fn aeolus_rack() -> (DemoApp, usize) {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let organ = g.add_node(NodeKind::Clap { plugin_id: name_bytes(crate::aeolus::AEOLUS_ID) }, name_bytes("AEOLUS"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        let ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        (app, ui)
+    }
+
+    #[test]
+    fn aeolus_faces_with_stops_are_padded_and_clear() {
+        let (app, _) = aeolus_rack();
+        check(app, "aeolus");
+        // Every division fits, the longest (Manual III, 15 stops) too.
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for d in 0..4 {
+                app.aeolus_faces.entry(app.units[ui].node_id).or_default().division = d;
+                for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+                let a = app.aeolus_rects(ui).unwrap_or_else(|| panic!("no stop panel at {size:?} for division {d}"));
+                assert_eq!(a.stops.len(), crate::aeolus::DIVISIONS[d].stops.len());
+                assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+            }
+        }
+        // The default rack with both Surges swapped for Aeolus: two short
+        // units stacked over their delays (the real app's first look).
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = app.base_graph.clone();
+        for n in g.nodes.iter_mut() {
+            if let NodeKind::Clap { plugin_id } = &mut n.kind {
+                *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID);
+                n.name = name_bytes(&format!("AEOLUS {}", n.id));
+            }
+        }
+        app.build_rack(&g, &[]);
+        super::main_control_tests::give_clap_units_main_knobs(&mut app);
+        for size in [Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            for u in (0..app.units.len()).filter(|&u| app.is_aeolus_unit(u)) {
+                assert!(app.aeolus_rects(u).is_some(), "no stop panel on a stacked Aeolus at {size:?} ({:?})", app.unit_rects[u]);
+            }
+            assert!(audit(&app).is_empty(), "{:?}", audit(&app));
+        }
+        // Other plugins have no stop panel.
+        let mut app = DemoApp::new_with_sink(None);
+        for _ in 0..3 { frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0)); }
+        assert!((0..app.units.len()).all(|u| app.aeolus_rects(u).is_none()));
+    }
+
+    /// A division tab shows that division; a stop click with no plugin
+    /// running says so and changes nothing (the plugin's state is the truth).
+    #[test]
+    fn aeolus_tabs_switch_the_division_shown() {
+        let (mut app, ui) = aeolus_rack();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let click = |app: &mut DemoApp, local: Pos2| {
+            let pos = app.xf.p(local.to_vec2());
+            for ev in [egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+                egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE }] {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                raw.events = vec![ev];
+                eframe::App::raw_input_hook(app, &ctx, &mut raw);
+                let mut out = ctx.run_ui(raw, |u| app.frame_ui(u));
+                out.textures_delta.clear();
+            }
+        };
+        for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+        assert_eq!(app.aeolus_division(ui), 2, "a fresh face shows Manual I");
+        let pedal = app.aeolus_rects(ui).unwrap().tabs[3];
+        click(&mut app, pedal.center());
+        assert_eq!(app.aeolus_division(ui), 3);
+        assert_eq!(app.aeolus_rects(ui).unwrap().stops.len(), 12, "the pedal's twelve stops");
+        let stop = app.aeolus_rects(ui).unwrap().stops[1];
+        click(&mut app, stop.center());
+        assert!(app.plugin_msg.contains("not running"), "{}", app.plugin_msg);
+        assert_eq!(app.aeolus_faces[&app.units[ui].node_id].drawn, None);
     }
 
     #[test]

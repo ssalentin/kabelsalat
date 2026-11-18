@@ -4483,7 +4483,26 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
     anyhow::ensure!(after.rms > 1e-4, "'{label}' is silent (rms {:.5})", after.rms);
     let distance = before.distance(after);
     anyhow::ensure!(distance > 0.1, "'{label}' sounds like the sound before it (distance {distance:.3})");
-    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2})",
+    // Aeolus' face draws one stop the way the face does it (state out, one
+    // stop changed, state in): the pedal's Bourdon 16 must be heard and read back.
+    let mut stop = String::new();
+    if instrument.id() == crate::aeolus::AEOLUS_ID {
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let next = crate::aeolus::with_stop(&main.save_state()?, 3, 1, true).ok_or_else(|| anyhow::anyhow!("no Pedal Bourdon 16 in the state"))?;
+        main.load_state(&next)?;
+        for _ in 0..40 {
+            engine.render(&mut buf, 2);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (main, _) = clap.as_mut().ok_or_else(|| anyhow::anyhow!("no live plugin"))?;
+        let drawn = crate::aeolus::drawn(&main.save_state()?).ok_or_else(|| anyhow::anyhow!("the stops do not read back"))?;
+        anyhow::ensure!(drawn[3] == 0b10, "the pedal reads back {:#b}, expected only Bourdon 16", drawn[3]);
+        let bourdon = timbre_of_note(&mut engine, &mut bus, 60, sr);
+        let d = after.distance(bourdon);
+        anyhow::ensure!(d > 0.1, "drawing the Bourdon 16 changed nothing (distance {d:.3})");
+        stop = format!(" · stop Pedal Bourdon 16 drawn, reads back, rms {:.4} ~{:.0} Hz (distance {d:.2})", bourdon.rms, bourdon.zero_cross_hz);
+    }
+    Ok(format!("{} {} · '{query}' finds {} (first: '{label}') · loaded: {readback} · note 60 before rms {:.4} ~{:.0} Hz, after rms {:.4} ~{:.0} Hz (distance {distance:.2}){stop}",
         library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
 }
 

@@ -153,6 +153,43 @@ pub fn initial_state(plugin_id: &str) -> Option<Vec<u8>> {
     (plugin_id == AEOLUS_ID).then(|| state(default_registration()))
 }
 
+/// Short name of a division for a face tab ("III", "II", "I", "P").
+pub fn division_tab(division: usize) -> &'static str {
+    ["III", "II", "I", "P"].get(division).copied().unwrap_or("?")
+}
+
+/// Which stops a state draws: one bit per stop of [`DIVISIONS`], per
+/// division. `None` when the state is not the default organ (a user's own
+/// `organ_config.json` has other divisions or stops), so a face never shows
+/// stops the plugin does not have.
+pub fn drawn(state: &[u8]) -> Option<[u32; 4]> {
+    let v: Value = serde_json::from_slice(state).ok()?;
+    let divisions = v.get("divisions")?.as_array()?;
+    if divisions.len() != DIVISIONS.len() { return None; }
+    let mut out = [0u32; 4];
+    for ((d, div), bits) in divisions.iter().zip(&DIVISIONS).zip(&mut out) {
+        let stops = d.get("stops")?.as_array()?;
+        if stops.len() != div.stops.len() { return None; }
+        for s in stops {
+            let i = div.stops.iter().position(|n| s.get("name").and_then(Value::as_str) == Some(*n))?;
+            if s.get("enabled").and_then(Value::as_bool) == Some(true) { *bits |= 1 << i; }
+        }
+    }
+    Some(out)
+}
+
+/// `state` with one stop drawn or pushed in, everything else (couplers,
+/// tremulant, channels, sequencer, volume, reverb) as it was. `None` when the
+/// state does not have that stop.
+pub fn with_stop(state: &[u8], division: usize, stop: usize, on: bool) -> Option<Vec<u8>> {
+    let name = *DIVISIONS.get(division)?.stops.get(stop)?;
+    let mut v: Value = serde_json::from_slice(state).ok()?;
+    let s = v.get_mut("divisions")?.get_mut(division)?.get_mut("stops")?.as_array_mut()?
+        .iter_mut().find(|s| s.get("name").and_then(Value::as_str) == Some(name))?;
+    s["enabled"] = Value::Bool(on);
+    Some(v.to_string().into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,6 +224,33 @@ mod tests {
         assert_eq!(divisions[0]["tremulant_enabled"], true, "the swell box tremulant is on for Vox Humana");
         assert_eq!(divisions[2]["tremulant_enabled"], false);
         assert!(v.get("parameters").is_none(), "volume and reverb stay as they are");
+    }
+
+    #[test]
+    fn a_stop_toggles_alone_and_reads_back() {
+        let start = state(default_registration());
+        assert_eq!(drawn(&start), Some([0, 0, 0b100_1010, 0]), "Principal Chorus: Manual I 8, 4 and 2");
+        // Draw the Pedal Bourdon 16, then push Manual I's Principal 4 in.
+        let s = with_stop(&start, 3, 1, true).unwrap();
+        let s = with_stop(&s, 2, 3, false).unwrap();
+        assert_eq!(drawn(&s), Some([0, 0, 0b100_0010, 0b10]));
+        // Everything else is kept, also keys kabelsalat never writes.
+        let mut v: Value = serde_json::from_slice(&start).unwrap();
+        v["sequencer"] = json!({ "steps": [1, 2] });
+        let kept: Value = serde_json::from_slice(&with_stop(v.to_string().as_bytes(), 0, 0, true).unwrap()).unwrap();
+        assert_eq!(kept["sequencer"], json!({ "steps": [1, 2] }));
+        assert_eq!(kept["divisions"][1]["links"], v["divisions"][1]["links"]);
+        assert_eq!(with_stop(&start, 0, 99, true), None, "no such stop");
+    }
+
+    #[test]
+    fn another_organ_shows_no_stops() {
+        let mut v: Value = serde_json::from_slice(&state(default_registration())).unwrap();
+        v["divisions"].as_array_mut().unwrap().pop();
+        assert_eq!(drawn(v.to_string().as_bytes()), None, "three divisions are another organ");
+        let mut v: Value = serde_json::from_slice(&state(default_registration())).unwrap();
+        v["divisions"][0]["stops"][0]["name"] = json!("Gamba\n8");
+        assert_eq!(drawn(v.to_string().as_bytes()), None, "a stop the default organ lacks");
     }
 
     #[test]

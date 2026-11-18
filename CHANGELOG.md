@@ -120,6 +120,12 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **Effects can be inserted from the mixer again:** "+ insert" opened its
+  effect picker and closed it in the same click, and a picked effect was
+  dropped. The picker now stays open and the chosen effect joins the
+  strip's or the master's insert chain. Clicking a strip's name opens a
+  rename dialog that stays open until Rename or Cancel (it vanished after
+  one frame).
 - **Meters no longer read hot at normal levels:** the meters' colour zones
   were left on the old linear scale, so anything above −24 dBFS showed
   tomato and anything above −3 dBFS red. Tomato now starts at −6 dBFS and

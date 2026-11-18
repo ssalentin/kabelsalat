@@ -980,6 +980,17 @@ Learned so far (2026-11-15, UI polish pass):
     playing at a normal level read as overloaded. Colour stops are dB values
     (tomato −6, red at the −1 dBFS ceiling);
     `healthy_levels_meter_cream_and_only_the_ceiling_is_red` checks them.
+153. **A popup that closes on "a click outside" runs before the widget that
+    opens it:** the mixer's insert picker ran after the strips, so the
+    release that opened it was already a click outside, and it closed in
+    its first frame; its pick also went into the `edits` list after that
+    list had been applied. No effect could be inserted from the mixer. The
+    rename modal `take()`-ed its state and never put it back, so it lived
+    one frame. Run such popups first in the frame, push edits before they
+    are drained, keep a popup's state until it is decided, and test a popup
+    by clicking its opener and an item through real frames
+    (`an_effect_picked_in_the_insert_picker_lands_in_the_strip_chain`,
+    `a_clicked_strip_name_opens_a_rename_that_stays_until_decided`).
 
 ## Working on kabelsalat
 

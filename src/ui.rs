@@ -15787,6 +15787,14 @@ impl DemoApp {
         // Insert edits are applied AFTER the frame's layout (a mid-frame
         // rack rebuild seeds NaN cable springs — rule 32).
         let mut edits: Vec<PendingInsertEdit> = Vec::new();
+        // Strip popups run before the strips: the click that opens one is
+        // not yet a click outside it, and a pick joins `edits` before they
+        // apply below.
+        if !help {
+            self.strip_rename_modal(&ctx);
+            self.strip_palette_ui(&ctx);
+            self.insert_picker_ui(&ctx, &mut edits);
+        }
         let (outputs, out_current) = self.audio_out.lock()
             .map(|s| (s.outputs.clone(), s.current.clone())).unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
@@ -15947,12 +15955,6 @@ impl DemoApp {
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
         if let Some(o) = out_pick { self.set_audio_output(o); }
-        // Strip popups (rename modal, colour palette, insert picker).
-        if !self.show_help {
-            self.strip_rename_modal(&ctx);
-            self.strip_palette_ui(&ctx);
-            self.insert_picker_ui(&ctx, &mut edits);
-        }
         if self.show_help { self.draw_help(&painter, rect); }
     }
 
@@ -16628,7 +16630,8 @@ impl DemoApp {
                 Ok(n) => self.session_msg = format!("Renamed the strip → {n}"),
                 Err(e) => self.session_msg = e,
             },
-            Some(None) | None => {}
+            Some(None) => {}
+            None => self.strip_rename = Some((node, text)),
         }
     }
 
@@ -22716,16 +22719,17 @@ mod rig_switch_tests {
         assert_eq!(app.active_rig, 1);
     }
 
-    /// Rig 0's pan DragValue in the mixer stage (first focusable drag
-    /// widget right of rig 0's bus fader).
+    /// Rig 0's pan DragValue in the mixer stage (the focusable drag widget
+    /// right under rig 0's bus fader).
     fn mixer_pan_value(app: &DemoApp, ctx: &egui::Context) -> Rect {
         let f0 = app.mixer_fader_rects[0];
         ctx.viewport(|v| {
             v.prev_pass.widgets.get_layer(egui::LayerId::background())
-                .filter(|w| w.sense.senses_drag() && w.sense.is_focusable() && w.rect.left() > f0.right())
-                .min_by(|a, b| a.rect.left().total_cmp(&b.rect.left()))
+                .filter(|w| w.sense.senses_drag() && w.sense.is_focusable()
+                    && w.rect.top() >= f0.bottom() && w.rect.x_range().contains(f0.center().x))
+                .min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
                 .map(|w| w.rect)
-        }).expect("pan DragValue right of rig 0's bus fader")
+        }).expect("pan DragValue under rig 0's bus fader")
     }
 
     fn open_mixer(app: &mut DemoApp, ctx: &egui::Context) {
@@ -28197,46 +28201,70 @@ mod mixer_parity_tests {
         assert_eq!(order, vec![b.1, a.1], "dragging the name moved the strip: {order:?}");
     }
 
+    /// One frame at a time well past the last (every popup fade-in is done,
+    /// rule 101); returns the painted texts with their rects.
+    fn popup_frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<(String, Rect)> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+        raw.time = Some(ctx.input(|i| i.time) + 0.5);
+        raw.events = events;
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        let mut texts = Vec::new();
+        fn collect(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match s {
+                egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
+                egui::Shape::Vec(v) => for x in v { collect(x, out); },
+                _ => {}
+            }
+        }
+        for cs in &out.shapes { collect(&cs.shape, &mut texts); }
+        texts
+    }
+
+    fn text_at(texts: &[(String, Rect)], text: &str) -> Pos2 {
+        texts.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("'{text}' is painted")).1.center()
+    }
+
     #[test]
     fn an_effect_picked_in_the_insert_picker_lands_in_the_strip_chain() {
         let (mut app, ctx) = app_with(Rack::Linear);
         open_mixer(&mut app, &ctx);
         let surge = app.units.iter().position(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap();
         let before = app.strip_chain(surge).unwrap().len();
-        let mut time = 0.0;
-        let mut step = |app: &mut DemoApp, events: Vec<egui::Event>| -> Vec<(String, Rect)> {
-            time += 0.5; // past every fade-in (rule 101)
-            let mut raw = egui::RawInput::default();
-            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
-            raw.time = Some(time);
-            raw.events = events;
-            eframe::App::raw_input_hook(app, &ctx, &mut raw);
-            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
-            out.textures_delta.clear(); // rule 11
-            let mut texts = Vec::new();
-            fn collect(s: &egui::Shape, out: &mut Vec<(String, Rect)>) {
-                match s {
-                    egui::Shape::Text(t) => out.push((t.galley.text().to_string(), t.visual_bounding_rect())),
-                    egui::Shape::Vec(v) => for x in v { collect(x, out); },
-                    _ => {}
-                }
-            }
-            for cs in &out.shapes { collect(&cs.shape, &mut texts); }
-            texts
-        };
-        let texts = step(&mut app, vec![]);
-        let plus = texts.iter().find(|(t, _)| t == "+ insert").expect("a '+ insert' chip").1.center();
+        let mut step = |app: &mut DemoApp, events| popup_frame(app, &ctx, events);
+        let plus = text_at(&step(&mut app, vec![]), "+ insert");
         for ev in click(plus) { step(&mut app, ev); }
         assert!(app.insert_pick.is_some(), "'+ insert' opens the picker");
         step(&mut app, vec![]); // an Area's first frame is a sizing pass
-        let texts = step(&mut app, vec![]);
-        let sat = texts.iter().find(|(t, _)| t == "Saturation").expect("the picker lists Saturation").1.center();
+        let sat = text_at(&step(&mut app, vec![]), "Saturation");
         for ev in click(sat) { step(&mut app, ev); }
         step(&mut app, vec![]);
         let chain = app.strip_chain(surge).unwrap();
         assert_eq!(chain.len(), before + 1, "the picked effect joined the chain");
         assert!(chain.iter().any(|&u| matches!(app.units[u].node_kind, UnitKind::Dsp(DspKind::Saturation))),
             "the new insert is a Saturation: {:?}", chain.iter().map(|&u| &app.units[u].name).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_clicked_strip_name_opens_a_rename_that_stays_until_decided() {
+        let (mut app, ctx) = app_with(Rack::Linear);
+        open_mixer(&mut app, &ctx);
+        let node = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        let name = text_at(&popup_frame(&mut app, &ctx, vec![]), "Surge");
+        for ev in click(name) { popup_frame(&mut app, &ctx, ev); }
+        for _ in 0..3 { popup_frame(&mut app, &ctx, vec![]); }
+        assert!(app.strip_rename.is_some(), "the rename modal stays open until Rename or Cancel");
+        let texts = popup_frame(&mut app, &ctx, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Rename strip"), "the modal is painted");
+        let select_all = egui::Event::Key { key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND };
+        popup_frame(&mut app, &ctx, vec![select_all, egui::Event::Text("Bass".into())]);
+        let rename = text_at(&popup_frame(&mut app, &ctx, vec![]), "Rename");
+        for ev in click(rename) { popup_frame(&mut app, &ctx, ev); }
+        assert!(app.strip_rename.is_none(), "Rename closes the modal");
+        let unit = app.units.iter().find(|u| u.node_id == node).unwrap();
+        assert_eq!(sentence_case(&unit.name), "Bass", "the strip took the new name");
     }
 
     #[test]

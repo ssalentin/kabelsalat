@@ -642,6 +642,15 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **An instrument a tool adds is wired like a rig's synth:** the agent
+    put setBfree into rig A with `add_node` and connected only its MIDI
+    cable, so the organ rendered into nothing (its strip LED moved, the rig
+    bus stayed dark). `AddNode { wire: true }` (Clap always; LV2 when the
+    scan says `is_instrument`) runs `Graph::wire_instrument` in the engine
+    and in headless MCP's mirror alike. Keep prompts in step with what the
+    app hosts: "LV2 instruments are coming soon" made the model give up on a
+    working organ
+    (`an_lv2_instrument_the_agent_adds_to_a_rig_reaches_that_rigs_master`).
 120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
     a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
     `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
@@ -700,15 +709,18 @@ Learned so far (2026-11-15, UI polish pass):
   with area labels (`engine`, `ui`, `agent`, `plugins`, `midi`, `mixing`,
   `testing`) and milestones per release; how and why it is built =
   `docs/ARCHITECTURE.md`; CI, packages and releases = `docs/PACKAGING.md`;
-  released changes = `CHANGELOG.md` (add yours under
-  **Unreleased**); rules = this file. Read open issues with
+  released changes = `CHANGELOG.md`, but add yours as a fragment
+  `changes/<branch>.md` (`changes/README.md`; never edit CHANGELOG.md in a
+  feature PR, parallel PRs conflict there); rules = this file. Read open issues with
   `gh issue list -R ssalentin/kabelsalat`; reference them in commits
   (`Fixes #12`). A finished task closes its issue; a new idea or a found bug
   becomes an issue, not a note in a doc.
-- **Releases:** SemVer tags `vX.Y.Z` on `main`. Pushing the tag builds every
-  package (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and
-  publishes the GitHub release from that version's CHANGELOG block; the steps
-  before the tag are in `docs/PACKAGING.md` ("Cut a release").
+- **Releases:** SemVer tags `vX.Y.Z` on `main`, cut with
+  `gh workflow run prepare-release.yml -f bump=minor` (or patch/major): it
+  opens the release PR, its merge is tagged, and the tag builds every package
+  (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and publishes
+  the GitHub release. A `nightly` pre-release of `main` is rebuilt every
+  night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
   `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
@@ -762,16 +774,19 @@ Learned so far (2026-11-15, UI polish pass):
   and shows the evidence, then queue it with `gh pr merge --auto --squash`
   (see "Merging"). Never leave finished work only on the local machine or
   only on a branch. Remove the worktree once its PR is merged.
-- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
-  (admins included), the branch must be up to date, and the required checks
-  `test (x86_64)`, `test (aarch64)` and `flatpak cargo-sources.json is current`
-  must pass. GitHub merges a queued auto-merge PR once they
+- **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
+  (admins included), and the required checks `test (x86_64)` and
+  `test (aarch64)` must pass.
+  Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
   `gh pr merge` without `--auto`. Everything merges on green CI, so the
   evidence rules above are what keeps it safe. Self-tests with real plugins
   and audio do not run in CI, so their output belongs in every PR body that
-  changes the code they cover. When `main` moves, update the branch
-  (`gh pr update-branch`) so the queued merge can proceed.
+  changes the code they cover. Update a branch only when it conflicts with
+  `main`; `resolve-conflicts.yml` merges `main` into PRs whose conflicts are
+  appended Markdown lines by itself, so `git pull` before you push again, and
+  resolve a PR labelled `merge-conflict` yourself. An open `main-red` issue means `main` is broken: fixing it comes
+  before new work (`docs/PACKAGING.md`, "Branch protection and a red main").
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

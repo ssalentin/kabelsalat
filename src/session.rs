@@ -118,6 +118,16 @@ impl Session {
         }
     }
 
+    /// True when both hold the same patch, knobs, plugin states, routes and
+    /// rig names; the session name is not compared.
+    pub fn same_content(&self, other: &Session) -> bool {
+        self.params == other.params
+            && self.states == other.states
+            && self.matrix == other.matrix
+            && self.rig_names == other.rig_names
+            && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
+    }
+
     // -- knobs / params ----------------------------------------------------
 
     pub fn param(&self, node: NodeId, param: ParamId) -> Option<f64> {
@@ -1055,7 +1065,7 @@ impl Template {
                 defaults.extend([
                     (lead, P_LEVEL, 0.85),
                     (verb, 0, 0.35), // reverb mix (param table: task-7)
-                    (master, P_VOL, 1.0),
+                    (master, P_VOL, 0.75),
                     (master, P_WARM, 0.1),
                 ]);
             }
@@ -1078,7 +1088,7 @@ impl Template {
                     (bass, P_LEVEL, 0.8),
                     (drum_gain, 0, 0.9),   // gain (param table: task-7)
                     (bass_filter, 0, 0.45), // cutoff (param table: task-7)
-                    (master, P_VOL, 1.0),
+                    (master, P_VOL, 0.75),
                     (master, P_WARM, 0.1),
                 ]);
             }

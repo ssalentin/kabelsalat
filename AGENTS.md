@@ -631,18 +631,49 @@ Learned so far (2026-11-15, UI polish pass):
     the cross alignment altogether). `ui.set_min_height(26.0)` before the
     label (`a_catalog_source_code_button_opens_the_repo` compares centres).
 
-114. **A release has its packages, or the workflow says why:** v0.1.0 was
+118. **A release has its packages, or the workflow says why:** v0.1.0 was
     tagged before `release.yml` existed, so its release shipped without one
     file and nothing failed. Release notes link each AppImage by URL
     (`release-notes.sh` fails when there is none); a tag without packages is
     backfilled with `gh workflow run release.yml -f tag=vX.Y.Z`. After a
     tag push, check `gh release view vX.Y.Z --json assets`.
-115. **Packaging scripts resolve their path arguments before any `cd`:**
+119. **Packaging scripts resolve their path arguments before any `cd`:**
     `appimage.sh` changed into its work directory and then handed linuxdeploy
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
-118. **A small window shows the whole app, not a corner of it:** the rack
+120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+    a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
+    `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
+    −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
+    dB meter). `gain_for` drops instantly when `target < gain` (120 ms
+    release prevents waveform tracking), `P_VOL` defaults to `0.75`
+    (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
+    red only above `0.95` (−3 dBFS).
+121. **Delete build output you no longer need:** parallel sessions left a
+    dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
+    copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
+    held in RAM) reached 98 %, swap filled, and a build killed the session.
+    When your PR is merged or your work is abandoned, `rm -rf` your own
+    `CARGO_TARGET_DIR` and the binaries you copied. Before a long build,
+    check `df -h /tmp ~` and `free -h`. You may delete another session's
+    target dir only when no process uses it (`pgrep -fa <dir>` is empty)
+    and its branch is merged.
+122. **A column sized beside another takes what is left in the row:** the
+    Sessions list was sized `avail - left - 25`, but the row's item spacing
+    sat between the columns too, so the Delete button ran 6 pt past the
+    sheet. Size the last column from `ui.available_width()` at the point you
+    allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
+    checks the row buttons stay inside the sheet).
+
+123. **Every instrument column of the matrix has one route per cell:** an
+    LV2 instrument column drew every row from its MIDI cable, so one click
+    lit or cleared the whole column. LV2 cells are the enabled flags of their
+    `(source, node)` matrix rules, shown and toggled with the same keyboard
+    switch + hardware radio group as CLAP cells (`matrix_cell_on`,
+    `toggled_sources`). Test a new column kind with
+    `an_lv2_column_toggles_one_cell_like_a_clap_column`.
+124. **A small window shows the whole app, not a corner of it:** the rack
     had fixed 200/220 px column floors and 60 px margins, so below ~950 px
     it panned and cut Keys and Master off; stage sheets kept 30 px margins
     and a 200 px minimum that painted into the docks; the mixer's dB marks
@@ -656,12 +687,12 @@ Learned so far (2026-11-15, UI polish pass):
     sizes. See the result without the desktop:
     `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
     (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
-119. **UI scale follows the monitor the window is on:** `ui_scale_target`
+125. **UI scale follows the monitor the window is on:** `ui_scale_target`
     read the FOCUSED monitor once at launch, so a window on the 1.0x
     external screen ran at the laptop's 1.6x (a 1368 px window laid out as
     855 px). `hypr_window_scale` finds this pid's window in `hyprctl
     clients` and is re-read every 2 s on its own thread (rule 48).
-120. **Tracked text advances by a width that is never zero:**
+126. **Tracked text advances by a width that is never zero:**
     `layout_tracked` used `glyph_width`, which answered 0 in a busy test
     run and stacked "kabelsalat" on one spot; the laid-out glyph's width
     is the fallback.
@@ -731,8 +762,19 @@ Learned so far (2026-11-15, UI polish pass):
   `pwd` before editing. When the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
-  and shows the evidence. Never leave finished work only on the local
-  machine or only on a branch. Remove the worktree once its PR is merged.
+  and shows the evidence, then queue it with `gh pr merge --auto --squash`
+  (see "Merging"). Never leave finished work only on the local machine or
+  only on a branch. Remove the worktree once its PR is merged.
+- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
+  (admins included), the branch must be up to date, and the required checks
+  `test (x86_64)`, `test (aarch64)` and `flatpak cargo-sources.json is current`
+  must pass. GitHub merges a queued auto-merge PR once they
+  do; never merge by hand around a red or pending check, and never
+  `gh pr merge` without `--auto`. Everything merges on green CI, so the
+  evidence rules above are what keeps it safe. Self-tests with real plugins
+  and audio do not run in CI, so their output belongs in every PR body that
+  changes the code they cover. When `main` moves, update the branch
+  (`gh pr update-branch`) so the queued merge can proceed.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

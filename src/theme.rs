@@ -375,7 +375,7 @@ pub fn value_arc(
 /// Meter color, stepped — not a gradient (§4.8): cream → tomato → clip red.
 pub fn meter_color(t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
-    if t < 0.6 { CREAM } else if t < 0.9 { ACCENT } else { CLIP_RED }
+    if t < 0.6 { CREAM } else if t < 0.95 { ACCENT } else { CLIP_RED }
 }
 
 // ---------------------------------------------------------------------------

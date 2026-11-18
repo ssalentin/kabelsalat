@@ -8015,25 +8015,30 @@ impl DemoApp {
         let mut close = false;
         let mut load_name: Option<String> = None;
         let mut delete_name: Option<String> = None;
-        let modal = egui::Modal::new(egui::Id::unique("load_rig_modal")).show(ctx, |ui| {
+        // A full rack has no "new rig" option: start on rig 1 so one row is
+        // always selected.
+        if target.is_none() && n >= Self::MAX_RIGS { target = Some(0); }
+        let targets: Vec<(Option<usize>, String)> = (n < Self::MAX_RIGS)
+            .then(|| (None, "New rig".to_string()))
+            .into_iter()
+            .chain((0..n).map(|r| (Some(r), format!("Replace rig {} · {}", r + 1, self.rig_name(r)))))
+            .collect();
+        let modal = egui::Modal::new(egui::Id::new("load_rig_modal")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.label(egui::RichText::new("Load rig preset").size(17.0).strong().color(theme::INK));
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-                if n < Self::MAX_RIGS && theme::chip_button(ui, "As new rig", target.is_none()).clicked() {
-                    target = None;
+            ui.add_space(14.0);
+            theme::section_label(ui, "Load into");
+            ui.add_space(6.0);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            for (t, label) in &targets {
+                if Self::load_target_row(ui, label, target == *t).clicked() {
+                    target = *t;
                 }
-                for r in 0..n {
-                    let lbl = format!("Replace {} · {}", r + 1, self.rig_name(r));
-                    if theme::chip_button(ui, &lbl, target == Some(r)).clicked() {
-                        target = Some(r);
-                    }
-                }
-            });
-            ui.add_space(10.0);
+            }
+            ui.add_space(16.0);
+            theme::section_label(ui, "Presets");
+            ui.add_space(6.0);
             Self::stage_hairline(ui);
-            ui.add_space(8.0);
             let list_h = 220.0;
             egui::ScrollArea::vertical()
                 .id_salt("rig_presets_list_scroll")
@@ -8042,17 +8047,18 @@ impl DemoApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if presets.is_empty() {
+                        ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new("No saved rig presets yet — click Save rig to save one.")
+                            egui::RichText::new("No saved rig presets yet. Use Save rig to save one.")
                                 .size(13.0)
                                 .color(theme::INK_2),
                         );
                         return;
                     }
-                    for (i, name) in presets.iter().enumerate() {
-                        if i > 0 { Self::stage_hairline(ui); }
+                    for name in &presets {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
+                            ui.set_min_height(26.0);
                             ui.label(egui::RichText::new(name).font(theme::medium_font(14.0)).color(theme::INK));
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if theme::danger_button(ui, "Delete", false).clicked() {
@@ -8065,10 +8071,13 @@ impl DemoApp {
                             });
                         });
                         ui.add_space(6.0);
+                        Self::stage_hairline(ui);
                     }
                 });
-            ui.add_space(10.0);
-            if theme::chip_button(ui, "Close", false).clicked() { close = true; }
+            ui.add_space(12.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if theme::chip_button(ui, "Close", false).clicked() { close = true; }
+            });
         });
         if modal.should_close() { close = true; }
         if let Some(name) = delete_name {
@@ -8084,6 +8093,29 @@ impl DemoApp {
         if !close {
             self.load_rig_dialog = Some(target);
         }
+    }
+
+    /// One full-width option row of the load dialog's "Load into" list: a
+    /// radio mark (tomato when selected) and a label that never wraps.
+    fn load_target_row(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+        let w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 30.0), egui::Sense::click());
+        let hot = resp.hovered();
+        let fill = if selected || hot { theme::DARK_PANEL_HI } else { theme::DARK_PANEL };
+        let stroke = if selected { theme::MUTED } else { theme::HAIRLINE };
+        let p = ui.painter();
+        p.rect(rect, 2.0, fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        let c = egui::pos2(rect.left() + 16.0, rect.center().y);
+        p.circle_stroke(c, 6.0, Stroke::new(1.5, if selected { theme::ACCENT } else { theme::MUTED }));
+        if selected { p.circle_filled(c, 3.0, theme::ACCENT); }
+        let text_x = rect.left() + 32.0;
+        let galley = egui::WidgetText::from(
+            egui::RichText::new(label).size(13.0).color(if selected { theme::INK } else { theme::INK_2 }),
+        )
+        .into_galley(ui, Some(egui::TextWrapMode::Truncate), rect.right() - 10.0 - text_x, egui::TextStyle::Body);
+        let pos = egui::pos2(text_x, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(pos, galley, theme::INK);
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
     /// Multi-rig overview strip: always visible above the rack.
@@ -17868,6 +17900,27 @@ mod rig_switch_tests {
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, key(Key::Escape));
         assert!(app.load_rig_dialog.is_none(), "Esc closes load modal");
+        let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
+    }
+
+    #[test]
+    fn load_rig_dialog_keeps_its_width_with_many_long_rig_names() {
+        // The "Replace N · name" options sat in one wrapping row of chips;
+        // once the row was full they wrapped letter by letter into towers and
+        // the modal grew past 400 px tall. Every option is now one row.
+        let (mut app, ctx) = two_rigs();
+        for _ in 0..2 { app.exec_tool("add_rig", &serde_json::json!({})); }
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        assert_eq!(app.rig_count(), 4);
+        for r in 0..4 {
+            app.exec_tool("rename_rig", &serde_json::json!({"rig": r, "name": format!("Very long rig name number {r} for layout")}));
+        }
+        app.load_rig_dialog = Some(None);
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        let rect = ctx.memory(|m| m.area_rect(egui::Id::new("load_rig_modal"))).expect("modal shown");
+        // 420 px content + frame margins; 5 option rows + list + footer.
+        assert!(rect.width() <= 460.0, "modal grew wide: {rect:?}");
+        assert!(rect.height() <= 560.0, "modal grew tall: {rect:?}");
         let _ = std::fs::remove_dir_all(&app.rig_presets_dir);
     }
 

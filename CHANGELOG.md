@@ -62,6 +62,9 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **The Load rig preset dialog has a clean layout.** "Load into" lists the new
+  rig and every rig to replace as one row each with a radio mark; long rig
+  names no longer wrap letter by letter into tall columns.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

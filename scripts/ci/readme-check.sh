@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # A PR labelled `enhancement` ships its README change in the same PR
-# (AGENTS.md rule 128): the README is the shop window, and the plugin-editor
+# (AGENTS.md rule 132): the README is the shop window, and the plugin-editor
 # windows (#71) merged without a line in "What you can do".
 # Usage: readme-check.sh <labels> < changed-files
 #   labels: comma-separated PR labels; changed files: one path per line

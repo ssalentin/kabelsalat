@@ -797,6 +797,8 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    /// The audio judge's master tap (#35): pushes only while a listen records.
+    listen: Option<crate::listen::Tap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
     record_sync: bool,
     // A synced take is armed but not started until the song clock reaches
@@ -907,6 +909,7 @@ impl GraphEngine {
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             recorder: None,
+            listen: None,
             record_sync: false,
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
@@ -1215,6 +1218,10 @@ impl GraphEngine {
     /// Attach the master recording tap (writer thread started elsewhere).
     pub fn set_recorder(&mut self, tap: RecorderTap) {
         self.recorder = Some(tap);
+    }
+
+    pub fn set_listen_tap(&mut self, tap: crate::listen::Tap) {
+        self.listen = Some(tap);
     }
 
     /// Start recording the master output (idempotent). No-op without a tap.
@@ -2549,6 +2556,9 @@ impl GraphEngine {
             // user hears. RT-safe — push never blocks; a full ring drops frames.
             if let Some(rec) = &mut self.recorder {
                 rec.push_stereo(data, ch);
+            }
+            if let Some(listen) = &mut self.listen {
+                listen.push_stereo(data, ch);
             }
             // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
             // output the user hears.

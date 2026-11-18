@@ -1,7 +1,7 @@
 name: README check
 
 # A PR labelled `enhancement` is a new feature and must update README.md in
-# the same change (AGENTS.md rule 128): the README is the shop window, and
+# the same change (AGENTS.md rule 132): the README is the shop window, and
 # the plugin-editor windows (#71) merged without a line in "What you can
 # do". Fails such a PR without a README change; when it changes UI code
 # without touching a screenshot under docs/shots/, only warns on the file —

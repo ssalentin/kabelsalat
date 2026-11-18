@@ -39,7 +39,7 @@ changelog fragments. Packaging is checked by the nightly build, not per PR.
 
 `.github/workflows/readme-check.yml` runs on every PR and on every label
 change. A PR labelled `enhancement` must also change `README.md`, or the
-check fails: the README is the shop window, and a feature that merges
+check fails (AGENTS.md rule 132): the README is the shop window, and a feature that merges
 without its entry there (the plugin editor windows, #71) is invisible to
 anyone who only reads it. When such a PR changes `src/ui.rs` or
 `src/theme.rs` without touching a screenshot under `docs/shots/`, the check

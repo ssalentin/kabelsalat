@@ -14,6 +14,12 @@ releases may still change behaviour and session files.
   window's close button. kabelsalat now runs the plugin's timers and file
   descriptor callbacks, which these editors paint from.
   `kabelsalat editor-test` opens, checks and closes every installed editor.
+- **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
+  `.vital` patches, wavetables and modulation included. Its sound list in the
+  editor and the assistant's `list_sounds` / `load_sound` show every patch in
+  Vitalium's folder. Drop a `.vitalbank` or `.vital` file on the window to add
+  it (or run `kabelsalat vital-import <file>`). A loaded patch is kept in saved
+  sessions, through rig edits and through undo.
 - **Instrument profiles: map a whole hardware instrument at once.** Pick the
   instrument for a hardware port in the MIDI matrix (a port whose name names
   the instrument is matched by itself) and its knobs, drawbars and switches

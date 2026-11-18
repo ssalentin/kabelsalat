@@ -675,6 +675,13 @@ Learned so far (2026-11-15, UI polish pass):
     release prevents waveform tracking), `P_VOL` defaults to `0.75`
     (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
     red only above `0.95` (−3 dBFS).
+118. **Check a plugin state before the plugin restores it:** Vitalium opens a
+    modal alert box for a patch it cannot parse, and that box waits for a
+    message loop no thread here runs, so the restoring thread hung for good
+    (a hand-written patch without `sample`/`wavetables`/`lfos`). Every state
+    goes through its `lv2::state_format` check (`vital::check_patch`) on the
+    loader thread before `restore_state`; test patches start from the
+    plugin's own saved state, never a hand-written fragment.
 121. **Delete build output you no longer need:** parallel sessions left a
     dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
     copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
@@ -765,7 +772,8 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
@@ -806,8 +814,8 @@ Learned so far (2026-11-15, UI polish pass):
   (see "Merging"). Never leave finished work only on the local machine or
   only on a branch. Remove the worktree once its PR is merged.
 - **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
-  (admins included), and the required checks `test (x86_64)`,
-  `test (aarch64)` and `flatpak cargo-sources.json is current` must pass.
+  (admins included), and the required checks `test (x86_64)` and
+  `test (aarch64)` must pass.
   Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
   `gh pr merge` without `--auto`. Everything merges on green CI, so the

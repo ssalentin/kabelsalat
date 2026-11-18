@@ -38,6 +38,7 @@ mod theme;
 mod transport;
 mod ui;
 mod vision;
+mod vital;
 
 const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
@@ -94,7 +95,18 @@ fn main() -> anyhow::Result<()> {
         "organ-test" => engine::organ_test(),
         "lv2-instrument-engine-test" => engine::lv2_instrument_engine_test(),
         "lv2-async-test" => engine::lv2_async_test(),
-        "sound-library-test" => engine::sound_library_test(),
+        "sound-library-test" => engine::sound_library_test(&std::env::args().skip(2).collect::<Vec<_>>()),
+        "vital-test" => vital::run_test(&std::env::args_os().skip(2).map(Into::into).collect::<Vec<_>>()),
+        "vital-import" => {
+            let files: Vec<std::path::PathBuf> = std::env::args_os().skip(2).map(Into::into).collect();
+            anyhow::ensure!(!files.is_empty(), "usage: kabelsalat vital-import <file.vitalbank|file.vital>...");
+            let data = vital::data_dir();
+            for f in &files {
+                println!("{}: {}", f.display(), vital::import(f, &data).map_err(|e| anyhow::anyhow!(e))?);
+            }
+            println!("into {}", data.display());
+            Ok(())
+        }
         "add-node-test" => engine::add_node_test(),
         "many-voices-test" => engine::many_voices_test(),
         "mono-master-test" => engine::mono_master_test(),

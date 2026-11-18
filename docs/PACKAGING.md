@@ -34,15 +34,12 @@ changelog fragments. Packaging is checked by the nightly build, not per PR.
 - `cargo fmt --check` is not run: the tree is not rustfmt-formatted, and a
   one-off reformat would conflict with every open PR. Do it in a quiet moment,
   then make it a required check.
-- A second job regenerates `packaging/flatpak/cargo-sources.json` from
-  `Cargo.lock` and fails when the committed file differs.
 
 ### Branch protection and a red main
 
-`main` requires `test (x86_64)`, `test (aarch64)` and `flatpak
-cargo-sources.json is current`, but not that a branch is up to date: with
-several agents' PRs open, "up to date" made every merge re-run every other
-PR's CI, one after another. A PR merges as soon as its own run is green.
+`main` requires `test (x86_64)` and `test (aarch64)`, but not that a branch
+is up to date: with several agents' PRs open, "up to date" made every merge
+re-run every other PR's CI, one after another. A PR merges as soon as its own run is green.
 
 The price is that two PRs, green on their own, can break `main` together.
 CI on `main` catches that within minutes, and `.github/workflows/main-health.yml`
@@ -119,7 +116,7 @@ App id `io.github.ssalentin.kabelsalat`, runtime `org.freedesktop.Platform`
 26.08, Rust from `org.freedesktop.Sdk.Extension.rust-stable`. The manifest
 `packaging/flatpak/io.github.ssalentin.kabelsalat.yml` builds lv2, zix, serd,
 sord, sratom and lilv (the runtime has none of them), then kabelsalat offline
-from `cargo-sources.json`.
+from `cargo-sources.json` (generated from `Cargo.lock` by `build.sh`).
 
 Install and run a bundle:
 
@@ -164,17 +161,6 @@ Known limits:
   `flatpak run --command=kabelsalat io.github.ssalentin.kabelsalat mcp --attach`.
 - The instrument catalog's "is it installed" probe looks at `/usr/lib/clap`
   and `/usr/lib/lv2`, which are empty in the sandbox.
-
-### When Cargo.lock changes
-
-Regenerate the vendored crate list and commit it with the lock file:
-
-```sh
-packaging/flatpak/update-cargo-sources.sh
-```
-
-It runs `flatpak-cargo-generator` from the builder image (through docker when
-the tool is not installed). CI fails while the committed file is stale.
 
 ## Build a package locally
 
@@ -233,8 +219,7 @@ gh workflow run prepare-release.yml -f bump=minor   # patch | minor | major | X.
 
 The same works without the workflow: run `scripts/release.py prepare minor`
 on a `release-X.Y.Z` branch, open the PR and queue it; step 2 follows on
-merge. If `Cargo.lock` changed beyond the version, run
-`packaging/flatpak/update-cargo-sources.sh` first.
+merge.
 
 While the version is `0.x`, a release with new features is a minor, one with
 only fixes a patch.

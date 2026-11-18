@@ -452,6 +452,8 @@ fn build_audio_in_slots(graph: &Graph) -> Vec<AudioInSlot> {
 enum Lv2Request {
     Load { node: NodeId, uri: crate::control::Lv2Uri, gen: u64 },
     Preset { node: NodeId, uri: crate::control::Lv2Uri, preset_uri: String },
+    /// A fresh instance with this state restored, to replace the node's.
+    State { node: NodeId, uri: crate::control::Lv2Uri, gen: u64, state: Vec<u8> },
     Retire(Lv2Slot),
     RetirePreset(crate::lv2::Lv2Preset),
 }
@@ -460,6 +462,7 @@ enum Lv2Request {
 enum Lv2Response {
     Loaded { node: NodeId, gen: u64, slot: Lv2Slot },
     Preset { node: NodeId, preset: crate::lv2::Lv2Preset },
+    Restored { node: NodeId, gen: u64, slot: Lv2Slot },
 }
 
 const LV2_RING: usize = 64;
@@ -470,6 +473,29 @@ fn load_lv2_slot(node: NodeId, uri: &str, sample_rate: f64) -> Option<Lv2Slot> {
         Ok(plugin) => Some(Lv2Slot { node, plugin, buf: vec![0.0; 8192 * 2] }),
         Err(e) => {
             eprintln!("lv2 node {node}: {e}");
+            None
+        }
+    }
+}
+
+/// A new instance of `uri` with `state` restored: checked first, because a
+/// state the plugin cannot read can hang the thread restoring it
+/// (`vital::check_patch`).
+fn restored_lv2_slot(node: NodeId, uri: &str, state: &[u8], sample_rate: f64) -> Option<Lv2Slot> {
+    let Some(format) = crate::lv2::state_format(uri) else {
+        eprintln!("lv2 node {node}: no known state format for {uri}");
+        return None;
+    };
+    if let Err(e) = (format.check)(state) {
+        eprintln!("lv2 node {node}: {e}");
+        return None;
+    }
+    let mut slot = load_lv2_slot(node, uri, sample_rate)?;
+    match slot.plugin.restore_state(&[(format.key, format.kind, state)]) {
+        Ok(()) => Some(slot),
+        Err(e) => {
+            eprintln!("lv2 node {node}: {e}");
+            crate::lv2::retire(slot.plugin);
             None
         }
     }
@@ -493,6 +519,9 @@ fn lv2_loader_loop(mut req: rtrb::Consumer<Lv2Request>, mut resp: rtrb::Producer
                 .into_iter()
                 .find(|p| p.uri == preset_uri)
                 .map(|preset| Lv2Response::Preset { node, preset }),
+            Lv2Request::State { node, uri, gen, state } => {
+                restored_lv2_slot(node, uri.as_str(), &state, sample_rate).map(|slot| Lv2Response::Restored { node, gen, slot })
+            }
             Lv2Request::Retire(slot) => {
                 crate::lv2::retire(slot.plugin); // parks never-free plugins (#14)
                 None
@@ -952,6 +981,22 @@ impl GraphEngine {
         }
     }
 
+    /// Put an instance with restored state in place of the node's own.
+    fn adopt_restored_lv2(&mut self, node: NodeId, gen: u64, slot: Lv2Slot) {
+        let live = gen == self.lv2_gen && matches!(self.graph.node(node).map(|n| &n.kind), Some(NodeKind::Lv2 { .. }));
+        match self.lv2.iter().position(|s| s.node == node) {
+            Some(i) if live => {
+                let old = std::mem::replace(&mut self.lv2[i], slot);
+                self.retire_lv2(old);
+            }
+            None if live && self.lv2.len() < self.lv2.capacity() => {
+                self.attach_lv2(slot);
+                self.publish_graph();
+            }
+            _ => self.retire_lv2(slot),
+        }
+    }
+
     /// Free an LV2 slot off the audio thread when the loader runs.
     fn retire_lv2(&mut self, slot: Lv2Slot) {
         if let Some(tx) = self.lv2_req.as_mut() {
@@ -995,6 +1040,7 @@ impl GraphEngine {
                         self.retire_lv2(slot);
                     }
                 }
+                Lv2Response::Restored { node, gen, slot } => self.adopt_restored_lv2(node, gen, slot),
                 Lv2Response::Preset { node, preset } => {
                     if let Some(s) = self.lv2.iter_mut().find(|s| s.node == node) {
                         s.plugin.apply_preset(&preset);
@@ -1605,6 +1651,19 @@ impl GraphEngine {
                             s.plugin.apply_preset(preset);
                         }
                     }
+                }
+            }
+            Command::LoadLv2State { node, state } => {
+                let Some(NodeKind::Lv2 { uri }) = self.graph.node(node).map(|n| n.kind.clone()) else { return };
+                let gen = self.lv2_gen;
+                if let Some(tx) = self.lv2_req.as_mut() {
+                    if tx.push(Lv2Request::State { node, uri, gen, state }).is_err() {
+                        eprintln!("lv2 loader queue full: state for node {node} dropped");
+                    }
+                    return;
+                }
+                if let Some(slot) = restored_lv2_slot(node, uri.as_str(), &state, self.sample_rate) {
+                    self.adopt_restored_lv2(node, gen, slot);
                 }
             }
             Command::ProgramChange { node, program } => {
@@ -4541,6 +4600,7 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
             anyhow::ensure!(Some(&state) != state_before.as_ref(), "plugin state unchanged after loading '{label}'");
             "plugin state changed".to_string()
         }
+        Load::VitalPatch(path) => vital_patch_readback(&mut engine, node, path)?,
         Load::Lv2Preset(uri) => {
             let preset = crate::lv2::discover_presets(instrument.id())
                 .into_iter().find(|p| p.uri == *uri).ok_or_else(|| anyhow::anyhow!("preset {uri} vanished"))?;
@@ -4583,13 +4643,35 @@ fn sound_library_check(instrument: &crate::sounds::Instrument, query: &str) -> a
         library.sounds.len(), library.kind, hits.len(), before.rms, before.zero_cross_hz, after.rms, after.zero_cross_hz))
 }
 
+/// Does the node's Vitalium now hold `path`'s patch? Its saved state must
+/// carry the patch's settings: every number in it, wavetables aside, and
+/// the tempo, which follows the host's song clock.
+fn vital_patch_readback(engine: &mut GraphEngine, node: NodeId, path: &std::path::Path) -> anyhow::Result<String> {
+    let parse = |bytes: &[u8]| -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::from_str(String::from_utf8_lossy(bytes).trim_end_matches('\0'))?)
+    };
+    let patch = parse(&std::fs::read(path)?)?;
+    let slot = engine.lv2.iter_mut().find(|s| s.node == node).ok_or_else(|| anyhow::anyhow!("LV2 slot gone"))?;
+    let saved = parse(&slot.plugin.saved_state("urn:juce:stateBinary")?)?;
+    let (want, have) = (&patch["settings"], &saved["settings"]);
+    let numbers: Vec<(&String, f64)> = want.as_object().into_iter().flatten().filter(|(k, _)| *k != "beats_per_minute").filter_map(|(k, v)| Some((k, v.as_f64()?))).collect();
+    let same = numbers.iter().filter(|(k, v)| have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0))).count();
+    let differ: Vec<String> = numbers.iter().filter(|(k, v)| !have[k.as_str()].as_f64().is_some_and(|h| (h - v).abs() <= 1e-4 * v.abs().max(1.0)))
+        .map(|(k, v)| format!("{k} {v} → {}", have[k.as_str()])).collect();
+    anyhow::ensure!(!numbers.is_empty() && same == numbers.len(), "{same} of {} patch settings hold the patch's value ({})", numbers.len(), differ.join(", "));
+    Ok(format!("{same}/{} patch settings hold the patch's values", numbers.len()))
+}
+
 /// `sound-library-test`: every catalog instrument installed on this machine
 /// lists its sound library, answers a search and loads one sound through
 /// the real engine, proven by a readback and by the note sounding different.
-pub fn sound_library_test() -> anyhow::Result<()> {
+/// `queries` (`<catalog id>=<words>`) replace the built-in search per
+/// instrument, e.g. `vitalium=woody` to load an imported Vital patch.
+pub fn sound_library_test(queries: &[String]) -> anyhow::Result<()> {
     use crate::sounds::Instrument;
+    let asked = |id: &str| queries.iter().find_map(|q| q.strip_prefix(id).and_then(|r| r.strip_prefix('=')).map(str::to_string));
     // A search the instrument's library should answer.
-    let query = |id: &str| match id {
+    let builtin = |id: &str| match id {
         "setbfree" => "jazz",
         "dexed" => "brass",
         "vitalium" => "pad",
@@ -4614,7 +4696,8 @@ pub fn sound_library_test() -> anyhow::Result<()> {
             println!("  {:<9} CLAP preset-discovery providers in its bundle: {}", entry.name,
                 if providers.is_empty() { "none".to_string() } else { format!("{} ({})", providers.len(), providers.join(", ")) });
         }
-        match sound_library_check(&instrument, query(entry.id)) {
+        let query = asked(entry.id).unwrap_or_else(|| builtin(entry.id).to_string());
+        match sound_library_check(&instrument, &query) {
             Ok(line) => println!("  {:<9} {line}", entry.name),
             Err(e) => {
                 println!("  {:<9} FAILED: {e:#}", entry.name);

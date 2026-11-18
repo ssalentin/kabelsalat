@@ -1397,7 +1397,14 @@ impl McpServer {
         let rig = args.rig.unwrap_or(0);
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
-            NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            NodeKind::Lv2 { uri } => {
+                let lv2 = crate::lv2::discover();
+                let Some(p) = lv2.iter().find(|p| p.uri == uri.as_str()) else {
+                    let installed: Vec<String> = lv2.iter().filter(|p| p.is_instrument).map(|p| format!("{} = {}", p.name, p.uri)).collect();
+                    return tool_err(format!("'{}' is not an installed LV2 plugin. Installed LV2 instruments: {}", uri.as_str(), installed.join(", ")));
+                };
+                p.is_instrument
+            }
             // An arp and a MIDI strip are inserted between the rig's Keys and
             // its synth(s) like an instrument is wired into its rig.
             NodeKind::Arp | NodeKind::MidiFx { .. } => true,
@@ -3417,8 +3424,12 @@ mod tests {
         assert!(McpServer::resolve_headless_knob(&kind, "GAIN").is_err(), "no knob on port 0 by a made-up name");
 
         let (server, mut engine) = local_server();
-        let added: AddNodeArgs = serde_json::from_value(json!({"kind": "lv2", "uri": uri, "name": "Synth"})).unwrap();
-        let node = tool_json(&server.add_node(Parameters(added)))["id"].as_u64().unwrap() as u32;
+        // Not through add_node: it refuses a URI no installed plugin has.
+        let node = {
+            let mut st = server.state.lock().unwrap();
+            send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name: name_bytes("Synth"), rig: 0, wire: false }).unwrap();
+            st.graph.add_node(kind.clone(), name_bytes("Synth"))
+        };
         engine.render(&mut vec![0.0f32; 64 * 2], 64);
         let out = tool_json(&server.list_params(Parameters(ListParamsArgs { node, query: None })));
         assert_eq!(out["main_controls_source"], json!("designation"), "{out}");

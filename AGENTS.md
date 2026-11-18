@@ -989,6 +989,20 @@ Learned so far (2026-11-15, UI polish pass):
     played a rig bound to another keyboard. Default routes go through
     `connect`, which keeps an existing rule with its shape and enabled flag
     (`a_device_turned_off_before_the_lv2_instance_loads_stays_off`).
+154. **A truncated plugin list shows instruments first, and an unknown URI
+    is refused with the real ones:** lilv sorts by URI, so Vitalium
+    (`urn:distrho:vitalium`) came after 296 `http:` effects and fell off
+    `list_plugins` (first 30 in the app, 60 in MCP). The agent never saw it,
+    guessed ten URIs, and each `add_node` "succeeded" as a dead unit.
+    `lv2::discover` orders instruments, then MIDI effects, first
+    (`instruments_first`), and `add_node` with an uninstalled LV2 URI names
+    the installed instruments
+    (`the_agent_finds_an_lv2_instrument_behind_hundreds_of_effects`).
+155. **Before a push, run every test module of each file you changed:** a
+    new refusal in headless `add_node` was checked with three hand-picked
+    tests and pushed; CI then failed on an `mcp::tests` test that adds a
+    made-up LV2 URI (`cargo test --bin kabelsalat -- mcp::` would have
+    shown it). Filter by module path, not by test name.
 
 ## Working on kabelsalat
 

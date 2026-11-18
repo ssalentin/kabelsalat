@@ -73,6 +73,9 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `transport.rs` — song clock, tempo, count-in, tap tempo.
 - `record.rs` / `player.rs` / `capture.rs` / `midi.rs` — master recording to
   WAV, WAV backing-track player, system-audio capture, MIDI I/O and hot-plug.
+  The player decodes on its own thread; the engine owns its clock and reads the
+  file at the song position (loop, tempo sync as varispeed, Number of Beats,
+  Beat Offset, start at the next bar), so a synced loop cannot drift.
 - `meter.rs` — master loudness meter for the agent's `measure_mix`: momentary,
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono

@@ -341,7 +341,18 @@ struct SetAppStreamArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetPlayerArgs {
     /// Mix level 0..1 for the file player (0 mutes).
-    gain: f32,
+    gain: Option<f32>,
+    /// Loop: restart the file seamlessly at its end.
+    #[serde(rename = "loop")]
+    loop_on: Option<bool>,
+    /// Sync: playback rate follows the transport tempo (varispeed).
+    sync: Option<bool>,
+    /// Number of Beats: loop length in beats (loop + sync derive the tempo).
+    beats: Option<f32>,
+    /// Beat Offset (+/-): start point in beats.
+    offset: Option<f32>,
+    /// The file's original BPM.
+    bpm: Option<f32>,
 }
 
 /// Arguments for `play_file`.
@@ -351,6 +362,17 @@ struct PlayFileArgs {
     path: String,
     /// Mix level 0..1 (default 0.8).
     gain: Option<f32>,
+    /// Loop: restart the file seamlessly at its end.
+    #[serde(rename = "loop")]
+    loop_on: Option<bool>,
+    /// Sync: playback rate follows the transport tempo (varispeed).
+    sync: Option<bool>,
+    /// Number of Beats: loop length in beats (loop + sync derive the tempo).
+    beats: Option<f32>,
+    /// Beat Offset (+/-): start point in beats.
+    offset: Option<f32>,
+    /// The file's original BPM (a "120 bpm" in the filename is adopted).
+    bpm: Option<f32>,
 }
 
 /// Arguments for `set_bpm`.
@@ -1451,37 +1473,63 @@ impl McpServer {
         })).collect::<Vec<_>>()}))
     }
 
-    /// Set the file-player mix gain.
-    #[tool(name = "set_player", description = "Set the backing-track file player's mix gain (Command::SetPlayer), 0..1, 0 mutes. Start a file with play_file (needs the running app).")]
+    /// Change the file player's mix gain and/or its AUM FilePlayer options.
+    #[tool(name = "set_player", description = "Change the backing-track file player: mix gain 0..1 (0 mutes) and/or the AUM FilePlayer options loop (seamless restart), sync (playback follows the transport tempo as varispeed from the file's original BPM; play starts at the next bar while the transport rolls), beats (Number of Beats: loop length, so an aligned loop never drifts), offset (Beat Offset, +/-), bpm (original BPM). Give at least one. Start a file with play_file (needs the running app).")]
     fn set_player(&self, Parameters(args): Parameters<SetPlayerArgs>) -> Result<CallToolResult, McpError> {
-        let mut st = self.state.lock().unwrap();
-        let gain = args.gain.clamp(0.0, 1.0);
-        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain }) {
-            return tool_err(e);
+        if args.gain.is_none() && args.loop_on.is_none() && args.sync.is_none() && args.beats.is_none() && args.offset.is_none() && args.bpm.is_none() {
+            return tool_err("set_player needs gain and/or loop, sync, beats, offset, bpm");
         }
-        ok_json(json!({"gain": gain}))
+        let mut st = self.state.lock().unwrap();
+        if let Some(g) = args.gain {
+            if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain: g.clamp(0.0, 1.0) }) {
+                return tool_err(e);
+            }
+        }
+        if args.loop_on.is_some() || args.sync.is_some() || args.beats.is_some() || args.offset.is_some() || args.bpm.is_some() {
+            let cmd = Command::SetPlayerCfg {
+                loop_on: args.loop_on,
+                sync: args.sync,
+                beats: args.beats,
+                offset: args.offset,
+                bpm: args.bpm,
+            };
+            if let Err(e) = send_cmd(&mut st, cmd) {
+                return tool_err(e);
+            }
+        }
+        ok_json(json!({
+            "gain": args.gain.map(|g| g.clamp(0.0, 1.0)), "loop": args.loop_on, "sync": args.sync,
+            "beats": args.beats, "offset": args.offset, "bpm": args.bpm,
+        }))
     }
 
     /// Start a backing track in the running app (the path crosses the UI
     /// bridge; the fixed-size command bus cannot carry it).
-    #[tool(name = "play_file", description = "Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). Needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "play_file", description = "Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). Optional AUM FilePlayer options: loop, sync (follow the transport tempo; starts at the next bar while it rolls), beats (loop length in beats), offset (beats, +/-), bpm (original tempo). Needs the running app (kabelsalat mcp --attach).")]
     fn play_file(&self, Parameters(args): Parameters<PlayFileArgs>) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if !remote {
             return tool_err("play_file needs the running app (kabelsalat mcp --attach) — headless mode has no file player");
         }
-        Self::ui_bridge_tool("play_file", json!({"path": args.path, "gain": args.gain.unwrap_or(0.8)}))
+        let mut a = json!({"path": args.path, "gain": args.gain.unwrap_or(0.8)});
+        for (k, v) in [("loop", args.loop_on.map(Value::from)), ("sync", args.sync.map(Value::from)),
+            ("beats", args.beats.map(Value::from)), ("offset", args.offset.map(Value::from)), ("bpm", args.bpm.map(Value::from))] {
+            if let Some(v) = v {
+                a[k] = v;
+            }
+        }
+        Self::ui_bridge_tool("play_file", a)
     }
 
     /// Stop the backing track.
-    #[tool(name = "stop_file", description = "Stop the backing-track file player (and mute its mix).")]
+    #[tool(name = "stop_file", description = "Stop the backing-track file player (the file and its settings stay; play_file restarts it).")]
     fn stop_file(&self) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if remote {
             return Self::ui_bridge_tool("stop_file", json!({}));
         }
         let mut st = self.state.lock().unwrap();
-        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain: 0.0 }) {
+        if let Err(e) = send_cmd(&mut st, Command::SetPlayerEnable { on: false }) {
             return tool_err(e);
         }
         ok_json(json!({"stopped": true}))
@@ -2915,7 +2963,7 @@ mod tests {
     #[test]
     fn play_file_needs_the_app_and_stop_file_mutes_headless() {
         let (server, mut engine) = local_server();
-        let res = serde_json::to_value(server.play_file(Parameters(PlayFileArgs { path: "/x.wav".into(), gain: None })).unwrap()).unwrap();
+        let res = serde_json::to_value(server.play_file(Parameters(PlayFileArgs { path: "/x.wav".into(), gain: None, loop_on: None, sync: None, beats: None, offset: None, bpm: None })).unwrap()).unwrap();
         assert_eq!(res["isError"], json!(true), "{res}");
         assert_eq!(tool_json(&server.stop_file()), json!({"stopped": true}));
         let mut buf = vec![0.0f32; 64 * 2];

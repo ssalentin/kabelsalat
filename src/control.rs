@@ -731,6 +731,14 @@ pub enum Command {
         cc: u8,
         value: u8,
     },
+    /// Incoming MIDI pitch bend (0xE0) routed through the matrix like
+    /// [`Command::Cc`]: `value` is the signed 14-bit bend (-8192..=8191,
+    /// 0 = center). Instruments bend what they play; nothing is edited.
+    PitchBend {
+        source: SourceId,
+        channel: u8,
+        value: i16,
+    },
     /// Add/replace (`Some(param)`) or remove (`None`) one CC→param binding on
     /// the matrix rule `(source, dest)`. Fixed-size for the RT command bus.
     MatrixCcMap {

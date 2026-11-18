@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **MIDI strip on the software keyboard:** the keyboard dock now carries a
+  pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
+  its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's
+  VEL knob), like GarageBand's. They go out as the Keys source, so every rig
+  the keys feed responds, and they light the Keys unit's MIDI cables. Pitch
+  bend from a hardware controller now reaches the instruments too, and CC 1 /
+  CC 64 reach LV2 instruments as they already reached CLAP ones (#97).
 - **The assistant can listen (#35).** A new `listen` tool records a few
   seconds of the master and sends them to an audio-capable model on
   OpenRouter (Gemini 3.8 Flash by default; `agent_listen_model` in

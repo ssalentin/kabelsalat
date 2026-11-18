@@ -35,8 +35,13 @@ jobs:
         run: python3 scripts/release.py check
       # setbfree: a real LV2 instrument, so lv2::tests::setbfree_plays_a_note
       # runs through lilv instead of skipping.
+      - name: Cache downloaded packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/apt-debs
+          key: apt-debs-${{ matrix.runner }}-${{ hashFiles('scripts/ci/ubuntu-deps.sh') }}
       - name: Install build dependencies and test plugins
-        run: scripts/ci/ubuntu-deps.sh setbfree
+        run: APT_DEB_CACHE=$HOME/.cache/apt-debs scripts/ci/ubuntu-deps.sh setbfree
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build

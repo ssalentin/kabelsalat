@@ -642,6 +642,14 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+116. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+    a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
+    `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
+    −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
+    dB meter). `gain_for` drops instantly when `target < gain` (120 ms
+    release prevents waveform tracking), `P_VOL` defaults to `0.75`
+    (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
+    red only above `0.95` (−3 dBFS).
 118. **Check a plugin state before the plugin restores it:** Vitalium opens a
     modal alert box for a patch it cannot parse, and that box waits for a
     message loop no thread here runs, so the restoring thread hung for good

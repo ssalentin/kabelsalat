@@ -140,7 +140,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
         NodeKind::Keys => knobs!(ks("RATE", 0.5, None, &[]), ks("VEL", 0.8, None, &["VELOCITY"])),
         // The plugin's main controls join LEVEL on the face (`main_controls`).
         NodeKind::Clap { .. } => knobs!(ks("LEVEL", 0.85, Some(P_LEVEL), &[])),
-        NodeKind::MasterOut => knobs!(ks("VOLUME", 1.0, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
+        NodeKind::MasterOut => knobs!(ks("VOLUME", 0.75, Some(P_VOL), &["VOL"]), ks("WARM", 0.15, Some(P_WARM), &["WARMTH"])),
         NodeKind::Dsp(dk) => match dk {
             DspKind::Delay => knobs!(ks("TIME", 0.4, Some(P_TIME), &[]), ks("MIX", 0.5, Some(P_MIX), &[])),
             DspKind::Reverb => knobs!(ks("MIX", 0.35, Some(0), &[]), ks("SIZE", 0.5, Some(1), &[])),
@@ -862,7 +862,7 @@ impl GraphEngine {
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
             fx_done: Vec::with_capacity(256),
-            master_vol: 1.0,
+            master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
             organ_pending: [None; 8],
@@ -2577,7 +2577,6 @@ struct MasterLimiter {
     env: f32,
     gain: f32,
     rel: f32,
-    atk: f32,
     /// Mean square of the reference chain (`tanh` at `DRIVE_REF`, made up)
     /// and of the chain at the current WARM, over `LOUDNESS_SECS`.
     ms_ref: f32,
@@ -2628,7 +2627,7 @@ impl MasterLimiter {
     fn new(sample_rate: f64) -> Self {
         let coef = |secs: f64| (-1.0 / (sample_rate * secs)).exp() as f32;
         Self {
-            env: 0.0, gain: 1.0, rel: coef(0.120), atk: coef(0.001),
+            env: 0.0, gain: 1.0, rel: coef(0.120),
             ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
             dc: [(0.0, 0.0); 2],
             dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
@@ -2681,8 +2680,11 @@ impl MasterLimiter {
         let peak = l.abs().max(r.abs());
         self.env = peak.max(self.env * self.rel);
         let target = if self.env > Self::CEILING { Self::CEILING / self.env } else { 1.0 };
-        let coef = if target < self.gain { self.atk } else { self.rel };
-        self.gain = coef * self.gain + (1.0 - coef) * target;
+        if target < self.gain {
+            self.gain = target;
+        } else {
+            self.gain = self.rel * self.gain + (1.0 - self.rel) * target;
+        }
         self.gain
     }
 }
@@ -2858,6 +2860,25 @@ mod master_limiter_tests {
             let (_, p) = run(amp);
             assert!((p - MasterLimiter::CEILING).abs() < 0.01, "amp {amp}: held at {p}");
         }
+    }
+
+    #[test]
+    fn sudden_chord_onset_never_overshoots_and_default_vol_stays_below_knee() {
+        let mut lim = MasterLimiter::new(48000.0);
+        let default_vol = super::knob_specs(&crate::control::NodeKind::MasterOut)
+            .iter()
+            .find(|k| k.param == Some(super::P_VOL))
+            .unwrap()
+            .default;
+        let drive = 1.0 + 0.15 * 3.0;
+        let mut max_out = 0.0f32;
+        for i in 0..4800 {
+            let x = 4.0 * (i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin().max(0.001)
+                + if i == 0 { 4.0 } else { 0.0 };
+            let (l, _) = lim.process(x, x, drive, default_vol);
+            max_out = max_out.max(l.abs());
+        }
+        assert!(max_out <= MasterLimiter::KNEE, "default master_vol={default_vol} must keep chord onsets below knee ({max_out} > {})", MasterLimiter::KNEE);
     }
 }
 

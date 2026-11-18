@@ -973,6 +973,13 @@ Learned so far (2026-11-15, UI polish pass):
     a filtered run shows fewer `ok` lines than `N passed` would, or no
     `test result:` line, the missing tests hang: find them before pushing
     (`test result: ok. 17 passed` for `clocksend`).
+152. **A scale change moves every threshold drawn on that scale:** the
+    meters went from linear amplitude to dB (`meter_db_pos`, rule 62) but
+    `theme::meter_color` kept its linear stops (0.6, 0.95), which on the dB
+    scale meant tomato from −24 dBFS and red from −3 dBFS, so every rack
+    playing at a normal level read as overloaded. Colour stops are dB values
+    (tomato −6, red at the −1 dBFS ceiling);
+    `healthy_levels_meter_cream_and_only_the_ceiling_is_red` checks them.
 
 ## Working on kabelsalat
 

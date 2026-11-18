@@ -383,6 +383,17 @@ struct MeasureMixArgs {
     reset: Option<bool>,
 }
 
+/// Arguments for `listen`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListenArgs {
+    /// Words the sound should match, each scored 0-10 (e.g. ["8-bit", "heroic"]).
+    attributes: Option<Vec<String>>,
+    /// Seconds of the master to record, 0.5-8 (default 4).
+    seconds: Option<f32>,
+    /// Anything else to ask about the sound.
+    question: Option<String>,
+}
+
 /// Arguments for `set_rig_device`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetRigDeviceArgs {
@@ -1022,6 +1033,27 @@ impl McpServer {
             "active_rig": active_rig,
             "meter": meter,
         }))
+    }
+
+    /// The audio judge (#35): record the master and ask a listening model.
+    #[tool(name = "listen", description = "Hear the master: record the next `seconds` of the master output and ask a listening model (audio-capable, OpenRouter) to score it 0-10 on each attribute and say what it heard; the answer adds the app's loudness/peak/band measurements. Only sound that plays during the recording is heard: send note_on first and note_off after. Takes about seconds + 3 s.")]
+    fn listen(&self, Parameters(args): Parameters<ListenArgs>) -> Result<CallToolResult, McpError> {
+        let args = json!({ "attributes": args.attributes, "seconds": args.seconds, "question": args.question });
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !remote {
+            // Off the async runtime: the HTTP client blocks and owns a runtime
+            // of its own, which may not be dropped inside this one.
+            return match std::thread::spawn(move || crate::listen::listen(&args)).join() {
+                Ok(text) => ok_json(json!(text)),
+                Err(_) => tool_err("listen: the listening thread panicked"),
+            };
+        }
+        let wait = Duration::from_secs_f32(crate::listen::MAX_SECS + 60.0);
+        match bridge::request_within(&json!({"op": "listen", "args": args}), wait) {
+            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => ok_json(reply.get("data").cloned().unwrap_or(Value::Null)),
+            Ok(reply) => tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("listen failed").to_string()),
+            Err(e) => tool_err(format!("listen needs the running app (attach): {e:#}")),
+        }
     }
 
     /// Master-bus loudness/true-peak/band meter (Bravo 1 "measure loop").
@@ -2372,6 +2404,9 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -2397,6 +2432,9 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())

@@ -642,7 +642,7 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
-116. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+120. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
     a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
     `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
     −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
@@ -650,7 +650,7 @@ Learned so far (2026-11-15, UI polish pass):
     release prevents waveform tracking), `P_VOL` defaults to `0.75`
     (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
     red only above `0.95` (−3 dBFS).
-118. **Delete build output you no longer need:** parallel sessions left a
+121. **Delete build output you no longer need:** parallel sessions left a
     dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
     copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
     held in RAM) reached 98 %, swap filled, and a build killed the session.
@@ -659,14 +659,14 @@ Learned so far (2026-11-15, UI polish pass):
     check `df -h /tmp ~` and `free -h`. You may delete another session's
     target dir only when no process uses it (`pgrep -fa <dir>` is empty)
     and its branch is merged.
-119. **A column sized beside another takes what is left in the row:** the
+122. **A column sized beside another takes what is left in the row:** the
     Sessions list was sized `avail - left - 25`, but the row's item spacing
     sat between the columns too, so the Delete button ran 6 pt past the
     sheet. Size the last column from `ui.available_width()` at the point you
     allocate it (`overwrite_in_the_sessions_list_replaces_that_session_after_a_confirm`
     checks the row buttons stay inside the sheet).
 
-120. **Every instrument column of the matrix has one route per cell:** an
+123. **Every instrument column of the matrix has one route per cell:** an
     LV2 instrument column drew every row from its MIDI cable, so one click
     lit or cleared the whole column. LV2 cells are the enabled flags of their
     `(source, node)` matrix rules, shown and toggled with the same keyboard

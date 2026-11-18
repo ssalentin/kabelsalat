@@ -666,6 +666,13 @@ struct CollapseStripArgs {
     collapsed: Option<bool>,
 }
 
+/// Arguments for `list_channels` (#108).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListChannelsArgs {
+    /// Optional filter: "channels", "plugins", or "all" (default "all").
+    filter: Option<String>,
+}
+
 /// Arguments for `note_on`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct NoteOnArgs {
@@ -2523,6 +2530,15 @@ impl McpServer {
         }
     }
 
+    /// The Navigator's rows (#108).
+    #[tool(name = "list_channels", description = "List what the Navigator shows (#108): every rig, its source channels (strip name and colour) and each channel's plugin chain (instrument, then inserts, with kind CLAP / LV2 / built-in). filter: channels | plugins | all (default all). Needs the running app (kabelsalat mcp --attach); headless, use get_rigs and get_graph.")]
+    fn list_channels(&self, Parameters(args): Parameters<ListChannelsArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("list_channels needs the running app (kabelsalat mcp --attach): strip names, colours and order are session state the app owns; headless, use get_rigs and get_graph");
+        }
+        Self::ui_bridge_tool("list_channels", json!({ "filter": args.filter }))
+    }
+
     /// List installed CLAP and LV2 plugins.
     #[tool(name = "list_plugins", description = "List installed CLAP and LV2 plugins (name, id/uri, features) available to host.")]
     fn list_plugins(&self) -> Result<CallToolResult, McpError> {
@@ -3522,5 +3538,12 @@ mod tests {
         assert_eq!(r, json!({"record_sync": true}));
         engine.render(&mut buf, 2); // drain SetRecordSync into the engine
         assert!(engine.transport_pub().record_sync, "engine adopted record_sync");
+    }
+
+    #[test]
+    fn list_channels_headless_points_at_the_attached_app() {
+        let (server, _engine) = local_server();
+        let res = server.list_channels(Parameters(ListChannelsArgs { filter: None }));
+        assert!(format!("{res:?}").contains("mcp --attach"), "headless list_channels names the attach path: {res:?}");
     }
 }

@@ -637,6 +637,7 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
@@ -904,6 +905,11 @@ pub(crate) fn tools() -> Value {
             "name":"collapse_strip",
             "description":"Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_channels",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugins",

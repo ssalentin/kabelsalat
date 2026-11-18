@@ -15,7 +15,7 @@ grouped into [milestones](https://github.com/ssalentin/kabelsalat/milestones);
 git clone https://github.com/ssalentin/kabelsalat.git
 cd kabelsalat
 cargo run                       # the app
-cargo test --bin kabelsalat     # the unit suite
+cargo test --bin kabelsalat <filter>   # unit tests of what you changed
 ```
 
 You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
@@ -27,7 +27,11 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
   (before/after) for anything visible. The CLI self-tests
   (`kabelsalat record-test`, `rig-mix-test`, `cc-map-test`, …) cover the
   real audio paths — the full list is in [AGENTS.md](AGENTS.md#working-on-kabelsalat).
-- **A green suite.** `cargo test --bin kabelsalat` must pass.
+- **A green suite.** Run the unit tests of what you changed locally
+  (`cargo test --bin kabelsalat <filter>`); CI runs the full suite on both
+  architectures, and a PR merges only when it is green. Locally, spend the
+  time on what CI cannot test: self-tests with real plugins, audio and MIDI
+  hardware.
 - **Its README entry.** A new feature updates [README.md](README.md) in the
   same PR — its entry under "What you can do" (or "Install"), plus fresh
   screenshots when it changes what users see (captured with

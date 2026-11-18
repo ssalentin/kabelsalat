@@ -24,8 +24,34 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
   commit it). POST `https://api.deepseek.com/chat/completions`, model
   `deepseek-flash` (text+image), OpenAI-style `image_url` data-URL parts,
   **max_tokens ≥ 4000**. Downscale images first (`magick`).
-- Non-visual changes: `cargo test` (unit suite) plus the relevant CLI self-test
-  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below).
+- Non-visual changes: the unit tests of the code you changed (filtered
+  `cargo test --bin kabelsalat <filter>`) plus the relevant CLI self-test
+  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below). The
+  full suite runs in CI, not here (next section).
+
+## Test locally what only this machine can test (user, 2026-11-18)
+
+**CI builds and tests everything; this machine tests what CI cannot.** The
+full unit suite runs on every push in CI (`test (x86_64)`, `test (aarch64)`),
+and release builds and packages run in the release workflows. Running them
+locally too only doubles the time and the machine's load. This holds for
+every agent and subagent.
+
+- **Never run locally:** the whole unit suite (`cargo test --bin kabelsalat`
+  with no filter, `scripts/ci/test.sh`), `cargo build --release`, or
+  packaging builds (Flatpak, AppImage, Arch, docker). Exception: you are
+  reproducing a CI failure of exactly that step.
+- **Run locally:** `cargo build` (debug; the self-tests and screenshots need
+  the binary) and the tests of what you changed:
+  `cargo test --bin kabelsalat <module or test name>` for the touched
+  modules and every test a rule names for that area (e.g. `held_notes`,
+  rule 41). Plus everything CI cannot do: CLI self-tests with real plugins,
+  audio and MIDI hardware, the plugin tests that return early on CI
+  (`docs/PACKAGING.md`), screenshots of the real app, `agent-eval`.
+- **CI is the gate for the rest:** push once the targeted tests are green
+  (rule 50); a PR merges only on green required checks. When CI goes red,
+  read its log (`gh run view --log-failed`) and fix that failure; do not
+  answer it with a local full-suite run.
 
 ## Every fixed error becomes a rule (user, 2026-11-15)
 
@@ -239,10 +265,13 @@ Learned so far (2026-11-15, UI polish pass):
     onset still touches it for 2–5 ms, masked by the attack). Never add
     lookahead on the master (it adds to every played note's latency).
 50. **Push only on a green gate you checked explicitly:** gate commits and
-    pushes on `cargo test` exiting 0 AND its output containing
-    `test result: ok` — never on `grep "test result"` (it also matches
-    `FAILED`) and never with `;` between test and push. Twice a red run was
-    pushed this way (f2659d7, ad36805).
+    pushes on your targeted `cargo test --bin kabelsalat <filter>` runs
+    exiting 0 AND their output containing `test result: ok` with at least
+    one test run (a filter that matches nothing is not a gate) — never on
+    `grep "test result"` (it also matches `FAILED`) and never with `;`
+    between test and push. Twice a red run was pushed this way (f2659d7,
+    ad36805). The full suite is CI's gate (`scripts/ci/test.sh`), not a
+    local step (see "Test locally what only this machine can test").
 51. **The CC that completes a MIDI learn is applied, not swallowed:** the
     engine sees a hardware CC (HwDirect) before the UI frame sends the new
     `MatrixCcMap`, so the knob adopts the value WITHOUT setting `sent` and
@@ -958,8 +987,9 @@ Learned so far (2026-11-15, UI polish pass):
   `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
-- **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
-  real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
+- **Tests:** locally `cargo test --bin kabelsalat <filter>` for the code you
+  changed (the full suite runs in CI only, see the section near the top) and
+  CLI self-tests with real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,

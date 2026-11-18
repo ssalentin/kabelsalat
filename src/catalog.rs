@@ -363,6 +363,37 @@ pub fn repo_url(repo: &str) -> String {
     format!("https://github.com/{repo}")
 }
 
+/// GitHub's star count for `repo` ("owner/repo"), read live from the REST
+/// API. None when offline, rate-limited or on any other failure: the card
+/// then shows no stars at all.
+pub fn fetch_stars(client: &reqwest::blocking::Client, repo: &str) -> Option<u32> {
+    let body = client
+        .get(format!("https://api.github.com/repos/{repo}"))
+        .header(reqwest::header::USER_AGENT, "kabelsalat")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .ok()?;
+    parse_stars(&body)
+}
+
+pub fn parse_stars(body: &str) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.get("stargazers_count")?.as_u64()?.try_into().ok()
+}
+
+/// GitHub's own short form: 235, 1.2k, 12k.
+pub fn stars_label(n: u32) -> String {
+    match n {
+        0..1000 => n.to_string(),
+        1000..10_000 => format!("{:.1}k", f64::from(n) / 1000.0).replace(".0k", "k"),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
 /// One entry as the agent tools (`list_instruments`, app and MCP) report it.
 pub fn entry_json(e: &CatalogEntry, installed: bool, installing: bool) -> serde_json::Value {
     let route = local_route(e);
@@ -904,5 +935,35 @@ mod tests {
     #[test]
     fn repo_url_is_github() {
         assert_eq!(repo_url("pantherb/setBfree"), "https://github.com/pantherb/setBfree");
+    }
+
+    #[test]
+    fn stars_come_from_the_real_github_answer() {
+        // Trimmed from `curl https://api.github.com/repos/pantherb/setBfree` (rule 63).
+        let ok = r#"{
+  "id": 5001593,
+  "name": "setBfree",
+  "full_name": "pantherb/setBfree",
+  "private": false,
+  "stargazers_count": 235,
+  "watchers_count": 235,
+  "forks_count": 44
+}"#;
+        assert_eq!(parse_stars(ok), Some(235));
+        let limited = r#"{"message":"API rate limit exceeded for 0.0.0.0. (But here's the good news: Authenticated requests get a higher rate limit. Check out the documentation for more details.)","documentation_url":"https://docs.github.com/rest/overview/resources-in-the-rest-api#rate-limiting"}"#;
+        assert_eq!(parse_stars(limited), None);
+        assert_eq!(parse_stars("<html>proxy login</html>"), None);
+    }
+
+    #[test]
+    fn star_counts_read_like_github() {
+        assert_eq!(stars_label(0), "0");
+        assert_eq!(stars_label(235), "235");
+        assert_eq!(stars_label(999), "999");
+        assert_eq!(stars_label(1000), "1k");
+        assert_eq!(stars_label(1249), "1.2k");
+        assert_eq!(stars_label(3870), "3.9k");
+        assert_eq!(stars_label(9999), "10k");
+        assert_eq!(stars_label(12_345), "12k");
     }
 }

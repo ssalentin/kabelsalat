@@ -24,6 +24,7 @@ mod main_controls;
 mod matrix;
 mod mcp;
 mod organ;
+mod instruments;
 mod meter;
 mod midi;
 mod player;

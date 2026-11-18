@@ -1,0 +1,33 @@
+name: Human gate
+
+# Required check on main: PRs that change the repo's rules or releases wait
+# for a maintainer's `human-approved` label. pull_request_target runs the
+# gate as it is on main, so a PR cannot edit the gate to pass itself; it
+# only reads the PR's file list and never runs PR code.
+# Separate from CI so label events do not cancel or rerun the test jobs.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+concurrency:
+  group: human-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    name: human gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7  # main, not the PR head
+      - name: Check changed paths and labels
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --jq '.[].filename' \
+            | scripts/ci/human-gate.sh "$LABELS"

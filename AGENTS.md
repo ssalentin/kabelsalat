@@ -780,6 +780,31 @@ Learned so far (2026-11-15, UI polish pass):
     tiny handle showed. Use a `PAPER_SINK` track + `CREAM` fill like the strip's
     wheels (`kb_strip_sends_the_standard_midi_signals` drives it by pointer),
     and look at the screenshot before calling a control done.
+133. **A plugin whose destructor crashes is parked, never freed (CLAP too):**
+    Dexed's destructor segfaulted while other instances rendered (#52, the rule
+    56 class for LV2). `CLAP_NEVER_FREE` ids are deactivated and parked on
+    retire (the editor closed first; `Drop` is bypassed with `ManuallyDrop`),
+    and `ClapVoice::new_plugin` reuses them, reloading the first instance's
+    state. Add a plugin to that list instead of dropping it.
+134. **A column's width floor comes from its faces, and a face with fixed-size
+    content says so:** the uniform mid width put the organ's LESLIE knob over
+    the next unit at 781 px (#58). `face_min_w` feeds `mid_floor`; extend it
+    when a face gets new fixed-size content
+    (`organ_next_to_a_synth_stack_fits_at_the_default_window_size`).
+135. **A test of a plugin's state never compares against a "fresh" baseline
+    other tests can move, and it polls with a deadline:** Dexed's fresh state
+    differs by length depending on what other instances in the process did, so
+    `init == reused` failed 1 run in 3 in the full suite (#64,
+    `dexed_is_parked_and_reused_not_destroyed`). Assert the change you made
+    (customized state replaced), wait on the audio thread with a bounded poll,
+    and give only the step that must time out a short timeout. Stress a new
+    test with a busy CPU and repeated full-suite runs before shipping it.
+136. **A transient message never shares a row with a title:** a
+    right-to-left layout inside `horizontal_wrapped` paints over the previous
+    labels at 781 px (#65). Title and subtitle go in a plain `horizontal` row
+    (subtitle truncated), status text gets its own wrapped row
+    (`plugins_header_message_never_overlaps_the_subtitle`).
+
 
 ## Working on kabelsalat
 

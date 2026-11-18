@@ -9509,25 +9509,30 @@ impl DemoApp {
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
             ui.shrink_clip_rect(sheet);
             ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                // Title + subtitle in a plain row (a wrapped row's galleys start
+                // at its left edge and overlap, rule 100); the subtitle
+                // truncates. The confirmation gets a row of its own (#65).
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Plugins").font(theme::medium_font(18.0)).color(theme::INK));
                     ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
-                            .size(13.0)
-                            .color(theme::INK_2),
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
+                                .size(13.0)
+                                .color(theme::INK_2),
+                        )
+                        .truncate(),
                     );
-                    if !self.plugin_msg.is_empty() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let col = if self.plugin_msg.contains("failed") {
-                                theme::CLIP_BRIGHT
-                            } else {
-                                theme::LIVE_TEAL
-                            };
-                            ui.label(egui::RichText::new(&self.plugin_msg).size(12.5).color(col));
-                        });
-                    }
                 });
+                if !self.plugin_msg.is_empty() {
+                    let col = if self.plugin_msg.contains("failed") {
+                        theme::CLIP_BRIGHT
+                    } else {
+                        theme::LIVE_TEAL
+                    };
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
+                }
                 ui.add_space(12.0);
 
                 let mut do_refresh = false;
@@ -22365,6 +22370,9 @@ mod face_layout_tests {
         let r = app.unit_rects[ui];
         let mut v = Vec::new();
         let sz = |g: &Option<Arc<theme::TrackedLabel>>| g.as_ref().map_or(Vec2::ZERO, |g| g.size);
+        // Title and subtitle are separate items: the split chip clears the
+        // title band and sits above the subtitle band, which a union box
+        // would call an overlap (false positive at narrow keys units).
         let title = Rect::from_min_size(r.min + Vec2::new(FACE_X, 17.0), u.name_g.as_ref().map_or(Vec2::ZERO, |g| g.size()));
         let sub = Rect::from_min_size(r.min + Vec2::new(FACE_X, 42.0), sz(&u.sub_g));
         v.push(("title".to_string(), title));
@@ -22497,6 +22505,35 @@ mod face_layout_tests {
         g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
         app.build_rack(&g, &[]);
         check(app, "organ");
+    }
+
+    /// The reported shape (#58): a synth+delay stack next to a setBfree organ
+    /// column, seen at the default window size — the organ column used to be
+    /// as narrow as every other mid column (200 px), which put the LESLIE
+    /// knob over the neighbouring unit and hid the drawbars.
+    #[test]
+    fn organ_next_to_a_synth_stack_fits_at_the_default_window_size() {
+        let mut app = DemoApp::new_with_sink(None);
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let delay = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
+        let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: delay, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(3, PortRef { node: delay, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        g.connect_with_id(4, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
+        app.build_rack(&g, &[]);
+        let organ_ui = app.units.iter().position(|u| u.node_id == organ).unwrap();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(1280.0, 800.0), Vec2::new(1600.0, 1000.0), Vec2::new(2560.0, 1440.0)] {
+            for _ in 0..3 { frame_at(&mut app, &ctx, size); }
+            let bad = audit(&app);
+            assert!(bad.is_empty(), "face layout violations at {}x{}:\n{}", size.x, size.y, bad.join("\n"));
+            assert!(app.drawbar_rects(organ_ui).is_some(),
+                "drawbars hidden at {}x{}", size.x, size.y);
+        }
     }
 
     /// Keys → Aeolus → Master, its unit with the main knobs a real Aeolus has.
@@ -23246,6 +23283,34 @@ mod settings_and_dropdown_tests {
             assert!(!t.contains("9942") && !t.contains("7731"), "key leaked after save: {t}");
         }
         assert!(texts.iter().any(|(t, _)| t == "set"));
+    }
+
+    /// #65: the "New <plugin> rig" confirmation shared the header row with
+    /// the subtitle (right-to-left layout) and was painted over it at 781 px.
+    #[test]
+    fn plugins_header_message_never_overlaps_the_subtitle() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Plugins;
+        app.plugins_loaded = true;
+        app.plugin_msg = "New Aeolus rig \u{2014} Keys\u{2192}Aeolus\u{2192}Master".into();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+            let header: Vec<&(String, Rect)> = texts
+                .iter()
+                .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0 && r.bottom() <= inner.top() + 110.0)
+                .collect();
+            assert!(header.iter().any(|(t, _)| t == "Plugins"), "{size:?}: title painted");
+            assert!(header.iter().any(|(t, _)| t.starts_with("New Aeolus rig")), "{size:?}: message painted: {header:?}");
+            for (i, (a, ra)) in header.iter().enumerate() {
+                assert!(ra.right() <= inner.right() + 1.0, "{size:?}: {a:?} {ra:?} leaves the sheet {inner:?}");
+                for (b, rb) in &header[i + 1..] {
+                    let o = ra.intersect(*rb);
+                    assert!(!(o.width() > 0.5 && o.height() > 0.5), "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}");
+                }
+            }
+        }
     }
 
     #[test]

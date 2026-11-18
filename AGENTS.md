@@ -913,6 +913,20 @@ Learned so far (2026-11-15, UI polish pass):
     `mixer_parity_shots` ran frames first and drew those as glyph soup;
     build a fresh app per image and open every PNG before using it as
     evidence.
+149. **Never end a turn on a build or test you have not read the end of:**
+    on #6, three turns in a row said "running `cargo test`, waiting for the
+    output" and ended; the background job died with the session, nobody
+    read a result, and the work stalled for hours. Run builds and tests in
+    the FOREGROUND with the maximum timeout (600000 ms; split into
+    `--no-run` then the run if needed). If one must run in the background,
+    block on it (`t3_background_wait`) before replying, and report its exit
+    code and `test result:` line. "Waiting for the output" is never a
+    final message.
+150. **Compare plugin audio only inside one render:** two Surge instances
+    fed the same notes differ in almost every sample (free-running
+    oscillator phases), so a stem compared against a second, soloed run
+    failed on 124770 of 124800 samples. `record-test` rebuilds the master
+    from the stems of the same take (`master_chain_from_silence`) instead.
 
 ## Working on kabelsalat
 

@@ -961,18 +961,23 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"record_start",
-            "description":"Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/. Idempotent: a second start while recording is a no-op.",
+            "description":"Start recording armed targets (master mix and/or armed rig stems) to a new timestamped take folder under ~/Music/kabelsalat/. Bar-quantized when the transport rolls. Idempotent.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"record_stop",
-            "description":"Stop recording: the writer drains the ring and finalizes the WAV header. Idempotent: a stop while idle is a no-op.",
+            "description":"Stop recording: the writer drains the rings and finalizes all WAV headers. Bar-quantized when the transport rolls (a second stop stops immediately). Idempotent.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"record_status",
-            "description":"Get recording status: recording (bool), path (the last/take WAV), seconds (elapsed), dropped_frames (ring overruns), finalized.",
+            "description":"Get recording status: recording (bool), pending (bool, waiting for bar/beat 0), path, folder, seconds, dropped_frames, finalized, stems (per-rig WAV status), armed_master, armed_rigs.",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_record_arm",
+            "description":"Arm or disarm a recording target: target='master' (or omit target and rig) for the master mix, or rig=<0-based index> for a rig's post-fader stem. Armed targets record simultaneously into the same take folder.",
+            "parameters":{"type":"object","properties":{"target":{"type":"string","enum":["master","rig"],"description":"'master' or 'rig' (defaults to 'rig' when rig is given, else 'master')"},"rig":{"type":"integer","description":"0-based rig index when target is 'rig'"},"armed":{"type":"boolean","description":"true to arm, false to disarm (defaults to true)"}},"required":["armed"]}
         }},
         {"type":"function","function":{
             "name":"set_record_sync",

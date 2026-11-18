@@ -241,14 +241,14 @@ fn sample_at(data: &[f32], frame: usize, channel: usize, channels: usize) -> f32
     data.get(frame * channels + channel).copied().unwrap_or(0.0)
 }
 
-struct Wav {
+pub(crate) struct Wav {
     sample_rate: u32,
     channels: usize,
     /// Interleaved samples, normalized to -1..1.
-    data: Vec<f32>,
+    pub(crate) data: Vec<f32>,
 }
 
-fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
+pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
     use std::io::Read;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;

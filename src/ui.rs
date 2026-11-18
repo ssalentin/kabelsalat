@@ -1472,14 +1472,24 @@ impl DspChip {
     const GAP: f32 = 6.0;
 }
 
-fn rec_chip(ui: &mut egui::Ui, recording: bool, secs: f64) -> egui::Response {
+fn rec_chip(ui: &mut egui::Ui, recording: bool, pending: bool, secs: f64) -> egui::Response {
     let (fill, stroke, txt) = if recording {
         (theme::ACCENT_DEEP, theme::ACCENT_DEEP, theme::ON_ACCENT)
+    } else if pending {
+        (theme::DARK_PANEL_HI, theme::ACCENT_DEEP, theme::CREAM)
     } else {
         (theme::DARK_PANEL_HI, theme::HAIRLINE, theme::CREAM_MID)
     };
-    let dot = if recording { "●" } else { "○" };
-    let label = if recording { format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60) } else { format!("{dot} REC") };
+    let dot = if recording { "●" } else if pending { "◐" } else { "○" };
+    let label = if recording && pending {
+        format!("{dot} REC {}:{:02} · BAR", (secs as u64) / 60, (secs as u64) % 60)
+    } else if recording {
+        format!("{dot} REC {}:{:02}", (secs as u64) / 60, (secs as u64) % 60)
+    } else if pending {
+        format!("{dot} REC · BAR")
+    } else {
+        format!("{dot} REC")
+    };
     ui.scope(|ui| {
         let base = egui::style::WidgetVisuals {
             bg_fill: fill,
@@ -2050,6 +2060,8 @@ struct UndoSnap {
     session: crate::session::Session,
     rigs: Vec<crate::control::RigMeta>,
     mix: [crate::engine::RigMix; 8],
+    arm_master: bool,
+    arm_rigs: [bool; 8],
     active: usize,
     /// Per-voice source switches, device and patch name (not in the session).
     voices: Vec<VoiceRow>,
@@ -2785,6 +2797,10 @@ struct DemoApp {
     /// "Sync to transport" toggle mirror (the engine is authoritative via
     /// Command::SetRecordSync; this only drives the chip's display).
     record_sync: bool,
+    /// Record-arm mirror: master + per-rig stem arms (authoritative on engine).
+    arm_master: bool,
+    arm_rigs: [bool; 8],
+    ui_arm_grace: f32,
     /// Signature of the living cable set behind `shared_graph` (change detect).
     graph_sig: Vec<(u32, u32, u8, u32, u8, CPortKind)>,
 
@@ -3113,6 +3129,9 @@ impl DemoApp {
             last_player_rev: 0,
             recorder: None,
             record_sync: false,
+            arm_master: true,
+            arm_rigs: [false; 8],
+            ui_arm_grace: 0.0,
             graph_sig: Vec::new(),
             editor_open: false,
             editor_rig: 0,
@@ -4217,6 +4236,17 @@ impl DemoApp {
             }
             self.playing = now_playing;
         }
+        if now >= self.ui_arm_grace {
+            if let Some(rec) = &self.recorder {
+                if rec.is_live() {
+                    let s = rec.snapshot();
+                    self.arm_master = s.armed_master;
+                    for (i, a) in s.armed_rigs.iter().enumerate().take(8) {
+                        self.arm_rigs[i] = *a;
+                    }
+                }
+            }
+        }
         // File-player mirror (rule 33): settings can come from any frontend
         // (chat, MCP, CLI send) — the engine's publication is the truth.
         if g.player_rev != self.last_player_rev {
@@ -4758,6 +4788,11 @@ impl DemoApp {
             "record_start" => "Start recording".into(),
             "record_stop" => "Stop recording".into(),
             "record_status" => "Recording status".into(),
+            "set_record_arm" => match args.get("rig").and_then(|v| v.as_u64()) {
+                Some(r) if !args.get("target").and_then(|v| v.as_str()).is_some_and(|t| t.eq_ignore_ascii_case("master")) =>
+                    format!("Arm rig {} for recording", r + 1),
+                _ => "Arm master for recording".into(),
+            },
             "system_audio" => "System audio level".into(),
             "play_file" => "Play audio file".into(),
             "stop_file" => "Stop audio file".into(),
@@ -5031,7 +5066,15 @@ impl DemoApp {
     fn capture_undo(&mut self) -> Option<UndoSnap> {
         let session = self.capture_session("Undo").ok()?;
         let rigs = self.rig_snapshot.lock().map(|s| s.rigs.clone()).unwrap_or_default();
-        Some(UndoSnap { session, rigs, mix: self.rig_mix, active: self.active_rig, voices: self.voice_rows() })
+        Some(UndoSnap {
+            session,
+            rigs,
+            mix: self.rig_mix,
+            arm_master: self.arm_master,
+            arm_rigs: self.arm_rigs,
+            active: self.active_rig,
+            voices: self.voice_rows(),
+        })
     }
 
     fn voice_rows(&self) -> Vec<VoiceRow> {
@@ -5098,6 +5141,11 @@ impl DemoApp {
         self.adopt_rig_devices();
         self.restore_voice_rows(&snap.voices);
         self.rig_mix = snap.mix;
+        self.set_record_arm(None, snap.arm_master);
+        for i in 0..list.len().min(8) {
+            self.set_record_arm(Some(i), snap.arm_rigs[i]);
+        }
+        self.sync_recorder_rig_names();
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
         for i in 0..list.len() { self.send_rig_mix(i); }
@@ -6705,12 +6753,13 @@ impl DemoApp {
                 if self.recorder.is_none() || self.bus.is_none() {
                     return "recording unavailable: no audio engine (recorder/bus missing)".into();
                 }
+                self.sync_recorder_rig_names();
                 if let Some(bus) = &self.bus {
                     let _ = bus.lock().unwrap().send(Command::RecordStart);
                 }
                 let masters: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
                 self.agent_activity.record(origin, "Record start", masters, now);
-                "recording started (master output → ~/Music/kabelsalat/)".into()
+                "recording started (armed targets → ~/Music/kabelsalat/)".into()
             }
             "record_stop" => {
                 if let Some(bus) = &self.bus {
@@ -6726,6 +6775,34 @@ impl DemoApp {
                     .unwrap_or_else(|e| format!("record status: {e}")),
                 None => "{\"recording\":false,\"available\":false}".into(),
             },
+            "set_record_arm" => {
+                let target = args.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                let rig_arg = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize);
+                let armed = args.get("armed").and_then(|v| v.as_bool()).unwrap_or(true);
+                let which: Option<usize> = if target.eq_ignore_ascii_case("master") || (rig_arg.is_none() && target.is_empty()) {
+                    None
+                } else {
+                    let r = rig_arg.unwrap_or(0);
+                    let n = self.rig_count();
+                    if r >= n {
+                        return format!("no rig {r}: there are {n}");
+                    }
+                    Some(r)
+                };
+                self.set_record_arm(which, armed);
+                let label = match which {
+                    None => "Master arm".to_string(),
+                    Some(r) => format!("Rig {} arm", r + 1),
+                };
+                self.agent_activity.record(origin, format!("{label} = {armed}"), vec![], now);
+                serde_json::json!({
+                    "target": match which { None => "master", Some(_) => "rig" },
+                    "rig": which,
+                    "armed": armed,
+                    "armed_master": self.arm_master,
+                    "armed_rigs": self.arm_rigs[..self.rig_count().min(8)],
+                }).to_string()
+            }
             "set_record_sync" => {
                 let on = args.get("on").and_then(|v| v.as_bool()).unwrap_or(!self.record_sync);
                 self.record_sync = on;
@@ -8553,6 +8630,39 @@ impl DemoApp {
         }
     }
 
+    fn set_record_arm(&mut self, rig: Option<usize>, armed: bool) {
+        self.ui_arm_grace = self.ui_time + 0.6;
+        match rig {
+            None => {
+                self.arm_master = armed;
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRecordArm { rig: None, armed });
+                }
+            }
+            Some(r) => {
+                let r = r.min(7);
+                self.arm_rigs[r] = armed;
+                if armed {
+                    if let Some(rec) = &self.recorder {
+                        rec.ensure_stem(r as u8);
+                    }
+                }
+                if let Some(bus) = &self.bus {
+                    let _ = bus.lock().unwrap().send(Command::SetRecordArm { rig: Some(r as u8), armed });
+                }
+            }
+        }
+        self.sync_recorder_rig_names();
+    }
+
+    fn sync_recorder_rig_names(&self) {
+        if let Some(rec) = &self.recorder {
+            let n = self.rig_count();
+            let names: Vec<String> = (0..n).map(|i| self.rig_name(i)).collect();
+            rec.set_rig_names(names);
+        }
+    }
+
     // -- mixer strips (#72–77) ----------------------------------------------
 
     /// One node's strip state (a default row when untouched).
@@ -9404,8 +9514,10 @@ impl DemoApp {
         // Mixer follows its rig; the new rig starts at unity (applied after
         // the reload — build_rack resets the mixer).
         let mut mix = [crate::engine::RigMix::DEFAULT; 8];
+        let mut arms = [false; 8];
         for (i, (k, _)) in rigs.iter().enumerate() {
             mix[i] = k.map_or(crate::engine::RigMix::DEFAULT, |o| self.rig_mix[o.min(7)]);
+            arms[i] = k.map_or(false, |o| self.arm_rigs[o.min(7)]);
         }
         let active = match delete {
             None => rigs.len() - 1,
@@ -9434,6 +9546,7 @@ impl DemoApp {
         self.active_rig = usize::MAX; // force set_active_rig to regroup
         self.set_active_rig(active);
         for i in 0..list.len() { self.send_rig_mix(i); }
+        for i in 0..8 { self.set_record_arm(Some(i), if i < list.len() { arms[i] } else { false }); }
         self.session_msg = msg;
         self.editor_status.clear(); // not "rack reloaded" noise for a rig edit
     }
@@ -10177,9 +10290,10 @@ impl DemoApp {
                     if !compact { ui.add_space(6.0); } else { ui.add_space(2.0); }
                     let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
                     let snap = self.recorder.as_ref().map(|r| r.snapshot());
+                    let pending = snap.as_ref().map(|s| s.pending).unwrap_or(false);
                     let secs = snap.as_ref().map(|s| s.seconds).unwrap_or(0.0);
                     let rec_err = snap.as_ref().and_then(|s| s.error.clone());
-                    if rec_chip(ui, recording, secs).on_hover_text("record the master output to ~/Music/kabelsalat/").clicked() {
+                    if rec_chip(ui, recording, pending, secs).on_hover_text("record armed targets to ~/Music/kabelsalat/ (bar-quantized while playing)").clicked() {
                         self.toggle_recording();
                     }
                     if let Some(err) = rec_err {
@@ -13619,12 +13733,17 @@ impl DemoApp {
         self.master_transport(self.playing);
     }
 
-    /// Toggle master recording (REC chip). The engine is the authority: it
+    /// Toggle master/stem recording (REC chip). The engine is the authority: it
     /// flips the recorder's recording flag and messages the writer thread.
     fn toggle_recording(&mut self) {
-        let recording = self.recorder.as_ref().map(|r| r.is_recording()).unwrap_or(false);
+        self.sync_recorder_rig_names();
+        let (recording, pending) = self
+            .recorder
+            .as_ref()
+            .map(|r| (r.is_recording(), r.is_pending()))
+            .unwrap_or((false, false));
         if let Some(bus) = &self.bus {
-            let cmd = if recording { Command::RecordStop } else { Command::RecordStart };
+            let cmd = if recording || pending { Command::RecordStop } else { Command::RecordStart };
             let _ = bus.lock().unwrap().send(cmd);
         }
     }
@@ -15756,6 +15875,8 @@ impl DemoApp {
         let mut m = self.rig_mix[rig.min(7)];
         let mut vol = m.vol;
         let old = (m.vol, m.pan, m.mute, m.solo);
+        let armed = self.arm_rigs[rig.min(7)];
+        let mut arm_toggle = false;
         let bus_resp = ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.set_width(STRIP_W);
             ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
@@ -15777,7 +15898,8 @@ impl DemoApp {
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.add_space(((STRIP_W - 56.0) * 0.5).max(4.0));
+                // M · S · R: three 26 px buttons, 4 px apart.
+                ui.add_space(((STRIP_W - 86.0) * 0.5).max(4.0));
                 ui.spacing_mut().item_spacing.x = 4.0;
                 let mb = egui::Button::new(egui::RichText::new("M").size(11.0)
                         .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
@@ -15789,8 +15911,16 @@ impl DemoApp {
                     .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
                     .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
                 if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; }
+                let rb = egui::Button::new(egui::RichText::new("R").size(11.0)
+                        .color(if armed { theme::ON_ACCENT } else { theme::CREAM_MID }))
+                    .fill(if armed { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
+                    .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
+                if ui.add(rb).on_hover_text("arm this rig's post-fader stem for recording").clicked() { arm_toggle = true; }
             });
         });
+        if arm_toggle {
+            self.set_record_arm(Some(rig), !armed);
+        }
         if self.mixer_scroll_target == Some(NavJumpTarget::Rig(rig as u8)) {
             ui.scroll_to_rect_animation(bus_resp.response.rect, Some(egui::Align::Center), egui::style::ScrollAnimation::none());
             self.mixer_scroll_target = None;
@@ -15933,6 +16063,15 @@ impl DemoApp {
             let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
             ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
                 .on_hover_text("peak meter of everything kabelsalat plays");
+            ui.add_space(4.0);
+            let arm_m = self.arm_master;
+            let rmb = egui::Button::new(egui::RichText::new(if arm_m { "● ARM" } else { "○ ARM" }).size(11.0)
+                    .color(if arm_m { theme::ON_ACCENT } else { theme::CREAM_MID }))
+                .fill(if arm_m { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
+                .corner_radius(2.0).min_size(egui::vec2(58.0, 22.0));
+            if ui.add(rmb).on_hover_text("arm the master mix for recording").clicked() {
+                self.set_record_arm(None, !arm_m);
+            }
         });
         if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
             self.set_unit_knob(mu, vk, g);
@@ -23803,7 +23942,7 @@ mod split_bpm_tests {
         // exec_tool, and record_start does not claim success without a recorder.
         let tools = crate::assistant::tools();
         let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
-        for t in ["record_start", "record_stop", "record_status", "set_record_sync"] {
+        for t in ["record_start", "record_stop", "record_status", "set_record_sync", "set_record_arm"] {
             assert!(names.contains(&t), "assistant tools missing {t}");
         }
 
@@ -23824,6 +23963,47 @@ mod split_bpm_tests {
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
         assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordSync { on: true })), "sent SetRecordSync: {cmds:?}");
+
+        // set_record_arm: rig 0 arms its stem, master can be disarmed, and a
+        // rig that does not exist is refused (never clamped onto another rig).
+        let r = app.exec_tool("set_record_arm", &serde_json::json!({"rig": 0, "armed": true}));
+        assert!(r.contains("\"armed\":true"), "{r}");
+        assert!(app.arm_rigs[0]);
+        app.exec_tool("set_record_arm", &serde_json::json!({"target": "master", "armed": false}));
+        assert!(!app.arm_master);
+        let r = app.exec_tool("set_record_arm", &serde_json::json!({"rig": 9, "armed": true}));
+        assert!(r.contains("no rig 9"), "{r}");
+        assert!(!app.arm_rigs[7], "an out-of-range rig never arms the last slot");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordArm { rig: Some(0), armed: true })), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRecordArm { rig: None, armed: false })), "{cmds:?}");
+    }
+
+    #[test]
+    fn record_arms_survive_a_rig_add_and_its_undo() {
+        // Rule 59/106: arm state is per rig and follows it through a rig add
+        // (renumbering reload) and an undo of a LATER job. Non-default values
+        // (rig armed, master disarmed) so a reset would show.
+        let (mut app, ctx) = demo();
+        app.submit_chat("arm".into());
+        app.exec_tool("set_record_arm", &serde_json::json!({"rig": 0, "armed": true}));
+        app.exec_tool("set_record_arm", &serde_json::json!({"target": "master", "armed": false}));
+        app.submit_chat("add a rig".into());
+        app.exec_tool("add_rig", &serde_json::json!({"name": "Bass"}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 2);
+        assert!(app.arm_rigs[0], "rig A stays armed across the rig add");
+        assert!(!app.arm_rigs[1], "the new rig starts disarmed");
+        assert!(!app.arm_master);
+        app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rig_count(), 1, "the rig add was undone");
+        assert!(app.arm_rigs[0], "undoing the later job keeps rig A armed");
+        assert!(!app.arm_master, "and the master disarmed");
+        app.exec_tool("undo", &serde_json::json!({}));
+        frame(&mut app, &ctx, vec![]);
+        assert!(!app.arm_rigs[0] && app.arm_master, "undoing the arm job restores the defaults");
     }
 
     #[test]
@@ -28821,11 +29001,16 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 9] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 10] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
             ("mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("armed", &|a| {
+                a.load_multi_rig_demo();
+                a.stage_view = StageView::Mixer;
+                a.set_record_arm(Some(1), true);
+            }),
             ("matrix", &|a| a.stage_view = StageView::Matrix),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("settings", &|a| a.stage_view = StageView::Settings),

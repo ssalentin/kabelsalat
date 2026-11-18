@@ -118,7 +118,11 @@ shows its CC number and follows your hardware from then on.
 ### Record your set
 **REC** records exactly what you hear into a WAV file in `~/Music/kabelsalat/`.
 After stopping you can play the take back or open its folder; **SYNC** starts
-and stops the recording with the transport.
+and stops the recording with the transport. For stems, press **R** on a rig's
+bus strip in the mixer: every armed rig records its own post-fader WAV, named
+after the rig, into the same take folder as the master mix (**ARM** under
+Master out). Pressed while the transport rolls, REC starts and stops on the
+next bar; stopping the transport keeps recording so reverb tails are not cut.
 
 ### Play along with a backing track
 Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the

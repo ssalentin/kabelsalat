@@ -1166,6 +1166,14 @@ pub struct GraphEngine {
     // (headless tests, silent demo). The tap's ring producer is pushed from
     // the render path; its `recording` flag is the authority on start/stop.
     recorder: Option<RecorderTap>,
+    // Record-arm state: master mix + up to 8 rig stems.
+    arm_master: bool,
+    arm_rigs: [bool; 8],
+    // Bar-quantized start/stop when record is pressed while transport rolls:
+    // Some((true, beat)) = start at `beat`, Some((false, beat)) = stop at `beat`.
+    record_pending: Option<(bool, f64)>,
+    // Preallocated scratch buffer for each rig's post-fader sum (RT-safe).
+    rig_buf: Vec<f32>,
     /// The audio judge's master tap (#35): pushes only while a listen records.
     listen: Option<crate::listen::Tap>,
     // "Sync to transport": start recording on master Play, stop on Stop.
@@ -1299,6 +1307,10 @@ impl GraphEngine {
             lv2_gen: 0,
             lv2_retire_backlog: Vec::new(),
             recorder: None,
+            arm_master: true,
+            arm_rigs: [false; 8],
+            record_pending: None,
+            rig_buf: vec![0.0; 8192 * 2],
             listen: None,
             record_sync: false,
             record_sync_pending: false,
@@ -1853,6 +1865,7 @@ impl GraphEngine {
 
     /// Attach the master recording tap (writer thread started elsewhere).
     pub fn set_recorder(&mut self, tap: RecorderTap) {
+        tap.shared().set_arms(self.arm_master, &self.arm_rigs);
         self.recorder = Some(tap);
     }
 
@@ -1860,18 +1873,104 @@ impl GraphEngine {
         self.listen = Some(tap);
     }
 
-    /// Start recording the master output (idempotent). No-op without a tap.
-    fn record_start(&mut self) {
+    fn record_mask(&self) -> u16 {
+        let mut mask = if self.arm_master { crate::record::MASK_MASTER } else { 0 };
+        for rig in 0..8u8 {
+            if self.arm_rigs[rig as usize] && self.recorder.as_ref().is_some_and(|r| r.stem_ready(rig)) {
+                mask |= crate::record::mask_rig(rig);
+            }
+        }
+        mask
+    }
+
+    fn record_start_now(&mut self) {
+        self.record_pending = None;
+        let mask = self.record_mask();
         if let Some(rec) = &mut self.recorder {
-            rec.begin();
+            rec.set_pending(false);
+            if mask != 0 {
+                rec.begin(mask);
+            }
         }
     }
 
-    /// Stop recording (idempotent). No-op without a tap.
-    fn record_stop(&mut self) {
+    fn record_stop_now(&mut self) {
+        self.record_pending = None;
         if let Some(rec) = &mut self.recorder {
+            rec.set_pending(false);
             rec.stop();
         }
+    }
+
+    /// Start recording armed targets (bar-quantized when transport is rolling).
+    fn record_start(&mut self) {
+        let recording = self.recorder.as_ref().is_some_and(|r| r.shared().is_recording());
+        if recording {
+            if matches!(self.record_pending, Some((false, _))) {
+                self.record_pending = None;
+                if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
+            }
+            return;
+        }
+        if self.record_mask() == 0 {
+            return;
+        }
+        if self.master_clock == MasterClock::Playing {
+            if matches!(self.record_pending, Some((true, _))) {
+                return;
+            }
+            let bpb = crate::transport::BEATS_PER_BAR as f64;
+            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
+            self.record_pending = Some((true, next_bar));
+            if let Some(rec) = &mut self.recorder {
+                rec.set_pending(true);
+            }
+        } else {
+            self.record_start_now();
+        }
+    }
+
+    /// Stop recording (bar-quantized when transport is rolling; double-stop stops immediately).
+    fn record_stop(&mut self) {
+        let recording = self.recorder.as_ref().is_some_and(|r| r.shared().is_recording());
+        if !recording {
+            if self.record_pending.is_some() {
+                self.record_pending = None;
+                if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
+            }
+            return;
+        }
+        if matches!(self.record_pending, Some((false, _))) || self.master_clock != MasterClock::Playing {
+            self.record_stop_now();
+        } else {
+            let bpb = crate::transport::BEATS_PER_BAR as f64;
+            let next_bar = ((self.transport.beats / bpb).floor() + 1.0) * bpb;
+            self.record_pending = Some((false, next_bar));
+            if let Some(rec) = &mut self.recorder {
+                rec.set_pending(true);
+            }
+        }
+    }
+
+    /// What `render`'s master chain (limiter, WARM, master volume) makes of
+    /// a summed rig signal, starting from a fresh limiter: the master output
+    /// of a take that began after silence with nothing else mixed in
+    /// (monitor, count-in, system audio, player, master inserts). `record-test` rebuilds the
+    /// master from the stems with it, sample for sample.
+    pub fn master_chain_from_silence(&self, sum: &[f32]) -> Vec<f32> {
+        let mut lim = MasterLimiter::new(self.sample_rate);
+        let drive = 1.0 + self.master_warm * 3.0;
+        let mut out = Vec::with_capacity(sum.len());
+        for f in sum.chunks_exact(2) {
+            let (l, r) = lim.process(f[0], f[1], drive, self.master_vol);
+            out.push(l);
+            out.push(r);
+        }
+        out
     }
 
     pub fn graph(&self) -> &Graph {
@@ -3625,6 +3724,15 @@ impl GraphEngine {
             }
             Command::RecordStart => self.record_start(),
             Command::RecordStop => self.record_stop(),
+            Command::SetRecordArm { rig, armed } => {
+                match rig {
+                    None => self.arm_master = armed,
+                    Some(r) => self.arm_rigs[(r as usize).min(7)] = armed,
+                }
+                if let Some(rec) = &self.recorder {
+                    rec.shared().set_arms(self.arm_master, &self.arm_rigs);
+                }
+            }
             Command::SetRecordSync { on } => {
                 if !on {
                     self.record_sync_pending = false; // a count-in still running must not start a take
@@ -3715,7 +3823,15 @@ impl GraphEngine {
         } else {
             self.record_sync_pending = false;
             if self.record_sync {
-                self.record_stop();
+                self.record_stop_now();
+            } else if self.record_pending.is_some() {
+                let stop_now = matches!(self.record_pending, Some((false, _)));
+                self.record_pending = None;
+                if stop_now {
+                    self.record_stop_now();
+                } else if let Some(rec) = &mut self.recorder {
+                    rec.set_pending(false);
+                }
             }
         }
     }
@@ -3787,6 +3903,9 @@ impl GraphEngine {
 
     /// Render one device block, allocation-free.
     pub fn render(&mut self, data: &mut [f32], ch: usize) {
+        if let Some(rec) = &mut self.recorder {
+            rec.drain_stems();
+        }
         while let Some(cmd) = self.drain.pop() {
             self.apply(cmd);
         }
@@ -3795,7 +3914,17 @@ impl GraphEngine {
         // beat 0 (immediately on play without a count-in, or right after one).
         if self.record_sync_pending && self.master_clock == MasterClock::Playing {
             self.record_sync_pending = false;
-            self.record_start();
+            self.record_start_now();
+        }
+        // Bar-quantized start/stop when record was pressed while transport rolls.
+        if let Some((start, target_beat)) = self.record_pending {
+            if self.master_clock == MasterClock::Playing && self.transport.beats >= target_beat - 1e-9 {
+                if start {
+                    self.record_start_now();
+                } else {
+                    self.record_stop_now();
+                }
+            }
         }
         self.drain_voice_msgs();
         self.publish_voices();
@@ -4099,67 +4228,81 @@ impl GraphEngine {
             }
             for mi in 0..n_masters {
                 let master = masters[mi];
+                let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(7);
                 let (gl, gr) = gains[mi];
-                if gl == 0.0 && gr == 0.0 { continue; } // muted: skip the work
-                for v in &self.voices {
-                    if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
-                        continue;
+                let rig_buf = &mut self.rig_buf[..n2];
+                for x in rig_buf.iter_mut() {
+                    *x = 0.0;
+                }
+                if gl != 0.0 || gr != 0.0 {
+                    for v in &self.voices {
+                        if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = v.scratch[i * 2]; // mono in: center to both
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += v.scratch[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
+                            }
+                        }
                     }
-                    if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = v.scratch[i * 2]; // mono in: center to both
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
+                    for d in &self.dsp {
+                        if !self.graph.has_route(d.node, master, PortKind::Audio) {
+                            continue;
                         }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += v.scratch[i * 2] * gl;
-                            acc[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
+                        if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = d.buf[i * 2];
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += d.buf[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
+                            }
                         }
+                    }
+                    for slot in &self.lv2 {
+                        if !self.graph.has_route(slot.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
+                            for i in 0..frames {
+                                let m = slot.buf[i * 2];
+                                rig_buf[i * 2] += m * gl;
+                                rig_buf[i * 2 + 1] += m * gr;
+                            }
+                        } else {
+                            for i in 0..frames {
+                                rig_buf[i * 2] += slot.buf[i * 2] * gl;
+                                rig_buf[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
+                            }
+                        }
+                    }
+                    // Audio In wired into this master (OUT jack → graph routing).
+                    for a in &self.audio_in {
+                        if !self.graph.has_route(a.node, master, PortKind::Audio) {
+                            continue;
+                        }
+                        for i in 0..frames {
+                            rig_buf[i * 2] += a.buf[i * 2] * gl;
+                            rig_buf[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                        }
+                    }
+                    for i in 0..n2 {
+                        acc[i] += rig_buf[i];
                     }
                 }
-                for d in &self.dsp {
-                    if !self.graph.has_route(d.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = d.buf[i * 2];
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
-                        }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += d.buf[i * 2] * gl;
-                            acc[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
-                        }
-                    }
-                }
-                for slot in &self.lv2 {
-                    if !self.graph.has_route(slot.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
-                        for i in 0..frames {
-                            let m = slot.buf[i * 2];
-                            acc[i * 2] += m * gl;
-                            acc[i * 2 + 1] += m * gr;
-                        }
-                    } else {
-                        for i in 0..frames {
-                            acc[i * 2] += slot.buf[i * 2] * gl;
-                            acc[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
-                        }
-                    }
-                }
-                // Audio In wired into this master (OUT jack → graph routing).
-                for a in &self.audio_in {
-                    if !self.graph.has_route(a.node, master, PortKind::Audio) {
-                        continue;
-                    }
-                    for i in 0..frames {
-                        acc[i * 2] += a.buf[i * 2] * gl;
-                        acc[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                if let Some(rec) = &mut self.recorder {
+                    if rec.is_stem_active(rig as u8) {
+                        rec.push_rig_stereo(rig as u8, rig_buf);
                     }
                 }
             }

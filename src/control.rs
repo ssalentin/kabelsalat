@@ -114,6 +114,19 @@ impl AudioInChannel {
     }
 }
 
+/// A hosted MIDI-effect plugin (AUM "MIDI strips"): events in, processed
+/// events out — a rack unit that sits IN the MIDI path (arpeggiators,
+/// chord tools, MIDI filters, transposers). `NodeKind::MidiFx` carries it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MidiFxPlugin {
+    /// LV2 MIDI plugin, by URI: MIDI in, MIDI out, no audio port (a plugin
+    /// that is no instrument, rule 72, and could never be an audio effect).
+    Lv2 { uri: Lv2Uri },
+    /// Built-in transposer — always available, no plugin to load. Also the
+    /// portable engine-test path (rule 37: unit tests never host a plugin).
+    Builtin { semis: i8 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
     /// MIDI source: the computer keyboard (on-screen + laptop), hardware MIDI.
@@ -124,6 +137,10 @@ pub enum NodeKind {
     Dsp(DspKind),
     /// Hosted LV2 plugin (audio effect), identified by URI.
     Lv2 { uri: Lv2Uri },
+    /// Hosted MIDI-effect plugin (AUM MIDI strips): the unit's MIDI OUT is a
+    /// routable matrix source (`SourceId::MidiFx(node)`), so it chains
+    /// source → MIDI-FX → rig input through the matrix.
+    MidiFx { plugin: MidiFxPlugin },
     /// Desktop playback capture (P2).
     SystemAudio,
     /// Live audio input (microphone / guitar / interface) — a rack-able source
@@ -435,6 +452,107 @@ impl Graph {
 
     pub fn disconnect(&mut self, id: EdgeId) {
         self.edges.retain(|e| e.id != id);
+    }
+
+    /// The instruments of a rig's MIDI chain: every node a MIDI cable from
+    /// the rig's Keys or a MIDI-FX unit ends at. Judged by the cables (the
+    /// graph's own facts), so an LV2 audio effect is never one.
+    pub fn midi_sinks(&self, rig: u8) -> Vec<NodeId> {
+        let mut out: Vec<NodeId> = Vec::new();
+        for e in self.edges.iter().filter(|e| e.kind == PortKind::Midi) {
+            let from_chain = self.node(e.from.node).is_some_and(|n| {
+                n.rig == rig && matches!(n.kind, NodeKind::Keys | NodeKind::MidiFx { .. })
+            });
+            let to = self.node(e.to.node);
+            let to_inst = to.is_some_and(|n| n.rig == rig && !matches!(n.kind, NodeKind::MidiFx { .. }));
+            if from_chain && to_inst && !out.contains(&e.to.node) {
+                out.push(e.to.node);
+            }
+        }
+        out
+    }
+
+    /// Insert a MIDI-FX unit into its rig's MIDI chain (AUM "MIDI strips"):
+    /// every MIDI cable that fed an instrument from the rig's Keys (or from
+    /// an earlier unit) is re-pointed at the new unit, and the unit feeds
+    /// each of those instruments — so the chain order is the order units
+    /// were added, and notes reach an instrument once, through the units.
+    /// The cables are what gate the two routing legs (the engine's
+    /// `keys_route` for the unit's input, `fx_cable` for its output). A rig
+    /// without instruments just gets Keys → unit. Returns the cables added.
+    pub fn wire_midi_fx(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let sinks = self.midi_sinks(rig);
+        let keys = self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id);
+        let fresh = |g: &Self| g.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+        let mut added = 0;
+        let mut feeders: Vec<PortRef> = Vec::new();
+        let mut gone: Vec<EdgeId> = Vec::new();
+        for e in self.edges.iter().filter(|e| e.kind == PortKind::Midi && sinks.contains(&e.to.node)) {
+            let from_chain = self.node(e.from.node).is_some_and(|n| {
+                n.rig == rig && matches!(n.kind, NodeKind::Keys | NodeKind::MidiFx { .. }) && n.id != node
+            });
+            if from_chain {
+                gone.push(e.id);
+                if !feeders.contains(&e.from) {
+                    feeders.push(e.from);
+                }
+            }
+        }
+        self.edges.retain(|e| !gone.contains(&e.id));
+        if feeders.is_empty() {
+            if let Some(keys) = keys {
+                feeders.push(PortRef { node: keys, port: 0 });
+            }
+        }
+        for from in feeders {
+            let id = fresh(self);
+            added += self.connect_with_id(id, from, PortRef { node, port: 0 }, PortKind::Midi) as usize;
+        }
+        for inst in sinks {
+            let id = fresh(self);
+            added += self.connect_with_id(id, PortRef { node, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) as usize;
+        }
+        added
+    }
+
+    /// After a MIDI-FX unit left `rig`: give the instruments that lost their
+    /// MIDI input a cable again — from the chain's remaining tail unit (one
+    /// that feeds nothing) or else from the rig's Keys. Returns the cables added.
+    pub fn heal_midi_after_fx(&mut self, rig: u8) -> usize {
+        let has_in = |g: &Self, id: NodeId| g.edges.iter().any(|e| e.kind == PortKind::Midi && e.to.node == id);
+        let tail = self
+            .nodes
+            .iter()
+            .find(|n| {
+                n.rig == rig
+                    && matches!(n.kind, NodeKind::MidiFx { .. })
+                    && !self.edges.iter().any(|e| e.kind == PortKind::Midi && e.from.node == n.id)
+            })
+            .map(|n| n.id);
+        let source = tail.or_else(|| {
+            self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::Keys)).map(|n| n.id)
+        });
+        let Some(source) = source else { return 0 };
+        // Instruments by their own audio cables: a node of the rig that
+        // sounds (an audio cable leaves it for the rig's Master) but lost MIDI.
+        let orphans: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.rig == rig
+                    && matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. })
+                    && !has_in(self, n.id)
+                    && self.edges.iter().any(|e| e.kind == PortKind::Audio && e.from.node == n.id)
+            })
+            .map(|n| n.id)
+            .collect();
+        let mut added = 0;
+        for inst in orphans {
+            let id = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            added += self.connect_with_id(id, PortRef { node: source, port: 0 }, PortRef { node: inst, port: 0 }, PortKind::Midi) as usize;
+        }
+        added
     }
 
     pub fn node(&self, id: NodeId) -> Option<&Node> {

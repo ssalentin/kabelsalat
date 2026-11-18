@@ -119,6 +119,9 @@ struct AddNodeArgs {
     channels: Option<String>,
     /// Multi-rig: which rig (0-based, see get_rigs) the node joins. Default 0.
     rig: Option<u8>,
+    /// For kind "midi_fx" with neither `uri` nor `plugin_id`: the built-in
+    /// transposer's semitones (-24..24, default 0).
+    semis: Option<i8>,
 }
 
 /// Arguments for `add_rig`.
@@ -916,6 +919,17 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
             channels: parse_audio_ch(args.channels.as_deref()),
         }),
         "master_out" => Ok(NodeKind::MasterOut),
+        "midi_fx" | "midi-fx" => Ok(NodeKind::MidiFx {
+            plugin: match (args.uri.as_deref(), args.plugin_id.as_deref()) {
+                (Some(uri), _) => crate::control::MidiFxPlugin::Lv2 { uri: crate::control::Lv2Uri::new(uri) },
+                (None, Some(_)) => {
+                    return Err("CLAP note effects are listed by list_midi_fx but cannot be hosted yet; use an LV2 MIDI plugin (uri) or the built-in transposer".into());
+                }
+                (None, None) => crate::control::MidiFxPlugin::Builtin {
+                    semis: args.semis.unwrap_or(0).clamp(-crate::engine::MIDIFX_SEMI_MAX, crate::engine::MIDIFX_SEMI_MAX),
+                },
+            },
+        }),
         "lv2" => {
             let uri = args
                 .uri
@@ -997,6 +1011,14 @@ fn graph_json(g: &Graph) -> Value {
                 }),
                 NodeKind::Arp => json!({"type": "arp"}),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
+                NodeKind::MidiFx { plugin } => match plugin {
+                    crate::control::MidiFxPlugin::Lv2 { uri } => {
+                        json!({"type": "midi_fx", "plugin": "lv2", "uri": uri.as_str()})
+                    }
+                    crate::control::MidiFxPlugin::Builtin { semis } => {
+                        json!({"type": "midi_fx", "plugin": "builtin", "semis": semis})
+                    }
+                },
             };
             // `transport`: the node has its own Play/Stop (set_node_playing);
             // `playing`: its current state (always false without transport).
@@ -1272,7 +1294,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|midi_fx|audio_in|system_audio|master_out; midi_fx = a MIDI-effect unit in the rig's MIDI chain (AUM MIDI strips: arpeggiator, chord tool, transposer): give uri (an LV2 MIDI plugin from list_midi_fx) or neither for the built-in transposer (semis); it is inserted between the rig's Keys and its instruments; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -1292,6 +1314,12 @@ impl McpServer {
             NodeKind::SystemAudio => "SYSTEM AUDIO".into(),
             NodeKind::Arp => "ARP".into(),
             NodeKind::MasterOut => "MASTER OUT".into(),
+            NodeKind::MidiFx { plugin } => match plugin {
+                crate::control::MidiFxPlugin::Builtin { .. } => "TRANSPOSE".into(),
+                crate::control::MidiFxPlugin::Lv2 { uri } => {
+                    uri.as_str().rsplit(['/', '#']).next().unwrap_or("MIDI FX").to_ascii_uppercase()
+                }
+            },
         });
         let name = name_bytes(&label);
         let mut st = self.state.lock().unwrap();
@@ -1304,9 +1332,9 @@ impl McpServer {
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
             NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
-            // An arp is inserted between the rig's Keys and its synth(s)
-            // like an instrument is wired into its rig.
-            NodeKind::Arp => true,
+            // An arp and a MIDI strip are inserted between the rig's Keys and
+            // its synth(s) like an instrument is wired into its rig.
+            NodeKind::Arp | NodeKind::MidiFx { .. } => true,
             _ => false,
         };
         if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
@@ -1319,6 +1347,9 @@ impl McpServer {
             match st.graph.node(id).map(|n| n.kind.clone()) {
                 Some(NodeKind::Arp) => {
                     let _ = st.graph.wire_arp(id);
+                }
+                Some(NodeKind::MidiFx { .. }) => {
+                    st.graph.wire_midi_fx(id);
                 }
                 _ => {
                     let _ = st.graph.wire_instrument(id);
@@ -2046,6 +2077,13 @@ impl McpServer {
                 (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
             ],
             NodeKind::Keys => Vec::new(),
+            NodeKind::MidiFx { plugin } => match plugin {
+                crate::control::MidiFxPlugin::Builtin { .. } => vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())],
+                crate::control::MidiFxPlugin::Lv2 { uri } => crate::lv2::control_descs_for_uri(uri.as_str())
+                    .into_iter()
+                    .map(|c| (c.index as u32, c.name))
+                    .collect(),
+            },
         };
         let q = args.query.unwrap_or_default().to_lowercase();
         let words: Vec<&str> = q.split_whitespace().collect();
@@ -2065,7 +2103,9 @@ impl McpServer {
             .collect();
         // No plugin runs headless: an LV2 control shows the default it starts at.
         let found = match &n.kind {
-            NodeKind::Lv2 { uri } => crate::lv2::main_controls_blocking(uri.as_str()),
+            NodeKind::Lv2 { uri } | NodeKind::MidiFx { plugin: crate::control::MidiFxPlugin::Lv2 { uri } } => {
+                crate::lv2::main_controls_blocking(uri.as_str())
+            }
             _ => Default::default(),
         };
         let main_controls: Vec<Value> = found
@@ -2587,9 +2627,29 @@ impl McpServer {
         let lv2_json: Vec<_> = lv2
             .iter()
             .take(60)
-            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports, "is_instrument": p.is_instrument}))
+            .map(|p| json!({"uri": p.uri, "name": p.name, "num_ports": p.num_ports, "is_instrument": p.is_instrument, "is_midi_fx": p.is_midi_fx}))
             .collect();
         ok_json(json!({"clap": clap_json, "lv2_count": lv2.len(), "lv2": lv2_json}))
+    }
+
+    /// List the MIDI-effect units a rig can host.
+    #[tool(name = "list_midi_fx", description = "List the MIDI-effect units add_node(kind=midi_fx) can host (AUM MIDI strips: arpeggiators, chord tools, transposers, MIDI filters): the built-in transposer, installed LV2 MIDI plugins (uri). Installed CLAP note effects are listed too but cannot be hosted yet.")]
+    fn list_midi_fx(&self) -> Result<CallToolResult, McpError> {
+        let lv2: Vec<_> = crate::lv2::discover()
+            .into_iter()
+            .filter(|p| p.is_midi_fx)
+            .map(|p| json!({"uri": p.uri, "name": p.name}))
+            .collect();
+        let clap: Vec<_> = crate::host::list_clap_plugins()
+            .into_iter()
+            .filter(crate::host::is_note_effect)
+            .map(|p| json!({"plugin_id": p.id, "name": p.name, "vendor": p.vendor}))
+            .collect();
+        ok_json(json!({
+            "builtin": [{"name": "Transpose", "add_with": "add_node kind=midi_fx (optionally semis)"}],
+            "lv2": lv2,
+            "clap_not_hostable_yet": clap,
+        }))
     }
 
     /// List the built-in instrument catalog with installed/running state.
@@ -3370,6 +3430,7 @@ mod tests {
             device: None,
             channels: None,
             rig: None,
+            semis: None,
         })));
         let id = added["id"].as_u64().unwrap() as NodeId;
         let mut buf = vec![0.0f32; 64 * 2];
@@ -3411,7 +3472,7 @@ mod tests {
         let organ = g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:organ") }, name_bytes("ORGAN"));
         g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:reverb") }, name_bytes("VERB"));
         g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
-        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument };
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, is_midi_fx: false };
         let units = headless_instruments(&g, &[lv2("urn:test:organ", true), lv2("urn:test:reverb", false)]);
         assert_eq!(units.iter().map(|u| (u.node, u.name.as_str())).collect::<Vec<_>>(), [(surge, "SURGE"), (organ, "ORGAN")]);
         assert_eq!(units[1].instrument, crate::sounds::Instrument::Lv2("urn:test:organ".into()));

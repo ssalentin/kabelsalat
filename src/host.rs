@@ -1630,6 +1630,13 @@ pub struct ClapPluginInfo {
     pub features: Vec<String>,
 }
 
+/// Is a scanned CLAP plugin a MIDI effect — one that declares the
+/// `note-effect` feature (what an arpeggiator or chord tool declares)?
+/// Such plugins are listed; hosting them is not implemented yet.
+pub fn is_note_effect(p: &ClapPluginInfo) -> bool {
+    p.features.iter().any(|f| f == "note-effect")
+}
+
 /// Enumerate all CLAP plugins in ~/.clap (id, name, vendor, features).
 /// One Surge patch on disk (factory / 3rd-party / user library).
 #[derive(Clone, Debug, serde::Serialize)]

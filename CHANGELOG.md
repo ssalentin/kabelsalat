@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
+  Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
+  editor pane, in a window of its own, and closes from the same button or the
+  window's close button. kabelsalat now runs the plugin's timers and file
+  descriptor callbacks, which these editors paint from.
+  `kabelsalat editor-test` opens, checks and closes every installed editor.
 - **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
   `.vital` patches, wavetables and modulation included. Its sound list in the
   editor and the assistant's `list_sounds` / `load_sound` show every patch in
@@ -65,6 +71,11 @@ releases may still change behaviour and session files.
   when it puts a bass there. Saved with the session.
 
 ### Changed
+- **Native Wayland:** the app no longer forces XWayland and needs no X
+  server. It renders at the compositor's fractional scale (sharp at 1.6x),
+  opens maximized as it asks to, and text input goes through the Wayland
+  input method instead of fcitx's X bridge. The Flatpak drops its X11
+  socket. `KABELSALAT_UI_SCALE` still overrides the scale.
 - **MIDI matrix sources read like devices:** hardware rows show the device name
   ("ESI MIDIMATE eX") instead of ALSA's "client:port 24:0" string, with a port
   chip only when a device has several ports and further ports joined to the

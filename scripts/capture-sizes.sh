@@ -12,7 +12,7 @@ shift $(( $# >= 2 ? 2 : 1 ))
 SIZES=("$@")
 [ ${#SIZES[@]} -gt 0 ] || SIZES=(1600x1000 1280x800 781x950 1576x468 781x468)
 mkdir -p "$OUT"
-export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} DISPLAY=${DISPLAY:-:0} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1000}
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/1000}
 export HYPRLAND_INSTANCE_SIGNATURE=$(ls "$XDG_RUNTIME_DIR/hypr/" | head -1)
 
 DEMO=
@@ -23,7 +23,7 @@ ours() {
   active=$(hyprctl activewindow -j | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pid",""))')
   if [ "$active" != "$DEMO" ]; then echo "focus is not on the demo (pid $active), stopping"; exit 1; fi
 }
-key() { ours; python3 "$HERE/xtest_key.py" "$@"; sleep 0.8; }
+key() { ours; wtype -k "$1"; sleep 0.8; }
 shot() { "$HERE/shot.sh" "$OUT/$1.png" "$DEMO" >/dev/null; }
 
 for size in "${SIZES[@]}"; do
@@ -52,13 +52,13 @@ for size in "${SIZES[@]}"; do
   sleep 2
   p="$size"
   shot "$p-rack"
-  key 0xff09; sleep 1; shot "$p-back"; key 0xff09
-  key 0x6d; shot "$p-mixer"; key 0x6d          # m
-  key 0x6e; shot "$p-matrix"; key 0x6e         # n
-  key 0x62; shot "$p-plugins"; key 0x62        # b
-  key 0x2c; shot "$p-settings"; key 0x2c       # ,
-  key 0x76; shot "$p-keyboard"; key 0x76       # v
-  key 0xffc9; shot "$p-assistant"; key 0xffc9  # F12
+  key Tab; sleep 1; shot "$p-back"; key Tab
+  key m; shot "$p-mixer"; key m
+  key n; shot "$p-matrix"; key n
+  key b; shot "$p-plugins"; key b
+  key comma; shot "$p-settings"; key comma
+  key v; shot "$p-keyboard"; key v
+  key F12; shot "$p-assistant"; key F12
   kill $DEMO; wait $DEMO 2>/dev/null || true; DEMO=
   echo "captured $size: $(ls "$OUT"/"$p"-*.png | wc -l) frames"
 done

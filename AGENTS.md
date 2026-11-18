@@ -15,10 +15,10 @@ cargo build
 scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transport
 ```
 
-- Environment: `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000`
+- Environment: `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000`
   (the harness sets these itself). Single frames of the real app: `scripts/shot.sh out.png [pid]`
   (window buffer only; never `grim -o`/`-g`, rule 108).
-- Key injection: `scripts/xtest_key.py` (XTEST; F11/F12 = keycodes 95/96, F4 = 0xffc1).
+- Key injection: `wtype` (Wayland virtual keyboard): `wtype -k F4`, `wtype -k Tab`, `wtype "text"`.
 - Visual review = DeepSeek vision via the app's BYOK key
   (`~/.config/kabelsalat/config.json`, field `deepseek_api_key` — NEVER print or
   commit it). POST `https://api.deepseek.com/chat/completions`, model
@@ -117,16 +117,18 @@ Learned so far (2026-11-15, UI polish pass):
     `assistant::tools()` + `exec_tool` + MCP; destructive ones need
     `confirm=true` after asking the user.
 24. **Live-app automation is focus-guarded:** the user may be using the
-    desktop — send XTEST keys/clicks and take `grim` evidence only after
+    desktop — send `wtype` keys or `scripts/click.sh` clicks and take `grim` evidence only after
     checking `hyprctl activewindow` is kabelsalat (scripts must abort
     otherwise); a stray F12 went to another window once.
 25. **Routing tools update the UI mirror too:** every tool that changes
     engine routing (`set_rig_source`, …) must also update the UI state it
     drives (`rig_sources`), or chips and matrix show stale state.
-26. **UI scale = the compositor's monitor scale (`ui_scale_target`):**
-    never trust winit's XWayland DPI guess (2.33 on the 1.6x eDP-1) —
-    it inflated every element ~46% and squished the rack. Check
-    `ui scale: first-frame ppp=` in the log; `KABELSALAT_UI_SCALE` overrides.
+26. **UI scale = the compositor's scale, as winit reports it on Wayland:**
+    the app is a native Wayland client and never forces XWayland, whose DPI
+    guess (2.33 on the 1.6x eDP-1) inflated every element ~46% and squished
+    the rack. Only `KABELSALAT_UI_SCALE`, tests and windowless renders (1.6)
+    override it (`ui_scale_override`). Check `ui scale: first-frame ppp=` in
+    the log and the window's buffer size (2560x1600 maximized on eDP-1).
 27. **Size scroll areas explicitly in fixed-height panels:** set
     `min_scrolled_height` AND `max_height` to the measured remainder —
     egui's default 64px minimum pushed the assistant header out of its
@@ -642,6 +644,20 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **A plugin editor is judged by its window, not by `gui.show`'s answer:**
+    Odin 2 returns false from `show` yet attaches and paints its editor;
+    treating that as failure refused a working GUI. `editor-test` checks the
+    plugin put a child window into ours, and that it closes and reopens.
+119. **Plugin editor windows are dialogs:** Hyprland tiled a plain X11
+    toplevel (781x950, the plugin squeezed to fit); `PluginWindow` sets
+    `_NET_WM_WINDOW_TYPE_DIALOG`, so it floats at the plugin's own size. Its
+    class is `kabelsalat-plugin`; `scripts/shot.sh <out> <pid> <title>`
+    captures one.
+120. **Plugin timers run only while that plugin's editor is open:** JUCE's
+    timers drive one message loop per process; running every Surge's timers
+    each frame deadlocked the unit suite, whose tests host Surge on parallel
+    threads (`voice_host_tests` hung 3 of 4 runs, 12 of 12 passed after).
+    `ClapVoiceMain::pump` returns at once without an editor.
 118. **An instrument a tool adds is wired like a rig's synth:** the agent
     put setBfree into rig A with `add_node` and connected only its MIDI
     cable, so the organ rendered into nothing (its strip LED moved, the rig
@@ -715,11 +731,11 @@ Learned so far (2026-11-15, UI polish pass):
     sizes. See the result without the desktop:
     `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
     (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
-125. **UI scale follows the monitor the window is on:** `ui_scale_target`
-    read the FOCUSED monitor once at launch, so a window on the 1.0x
-    external screen ran at the laptop's 1.6x (a 1368 px window laid out as
-    855 px). `hypr_window_scale` finds this pid's window in `hyprctl
-    clients` and is re-read every 2 s on its own thread (rule 48).
+125. **UI scale follows the monitor the window is on:** the launch-time
+    focused monitor's scale ran a window on the 1.0x external screen at the
+    laptop's 1.6x (a 1368 px window laid out as 855 px). As a native Wayland
+    client (rule 26) the app takes winit's per-surface scale, which changes
+    when the window moves; never poll `hyprctl` for it.
 126. **Tracked text advances by a width that is never zero:**
     `layout_tracked` used `glyph_width`, which answered 0 in a busy test
     run and stacked "kabelsalat" on one spot; the laid-out glyph's width
@@ -751,7 +767,7 @@ Learned so far (2026-11-15, UI polish pass):
   the GitHub release. A `nightly` pre-release of `main` is rebuilt every
   night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
 - **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
-  `WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+  `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
@@ -781,10 +797,10 @@ Learned so far (2026-11-15, UI polish pass):
   the running app); one-shot: `kabelsalat send '<json>'`.
 - **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
   shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
-  (rule 55), inject keys with `scripts/xtest_key.py` (F4 = 0xffc1, F1–F10 = X
-  keycodes 67–76, F11/F12 = 95/96 — the script handles it), then
-  `scripts/shot.sh out.png <pid>` (rule 108).
-  Mouse clicks need screen coords: window origin × monitor scale + egui pos.
+  (rule 55), inject keys with `wtype -k F4` (rule 24), then
+  `scripts/shot.sh out.png <pid>` (rule 108). Click with
+  `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
+  points; needs `wlrctl`, here built into `~/.local/bin`).
 - **Hyprland window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
 
@@ -819,7 +835,9 @@ Learned so far (2026-11-15, UI polish pass):
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).
-- **No X11 child windows** — plugin editors are native egui.
+- **Plugin GUIs only in their own windows:** the main window is native
+  Wayland and never embeds X11. A plugin's own editor opens in a separate
+  `PluginWindow` (XWayland) on request; check with `kabelsalat editor-test`.
 - **egui 0.37 deadlock:** never call `Painter::add`/`galley` inside
   `ctx.fonts_mut`/`ui.fonts_mut` — layout under the lock, paint after release.
 - RT discipline: the audio render path is allocation-free; UI animation reads

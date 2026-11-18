@@ -28,6 +28,7 @@ mod instruments;
 mod meter;
 mod midi;
 mod player;
+mod plugin_window;
 mod preview;
 mod record;
 mod rope;
@@ -39,7 +40,7 @@ mod ui;
 mod vision;
 mod vital;
 
-const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, catalog-install-test [id...]";
+const MODES: &str = "app, preview, audio-test, audio-in-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test [--image <file> <request>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, record-test, cc-map-test, meter-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, main-controls-test, sound-library-test, many-voices-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -49,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         "audio-test" => audio::run_test(),
         "midi-test" => midi::run_test(),
         "host-test" => host::run_test(),
+        "editor-test" => host::run_editor_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "preset-test" => host::run_preset_test(),
         "ui-demo" => ui::run_demo(),
         "mcp" => {

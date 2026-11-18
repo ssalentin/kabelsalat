@@ -638,7 +638,9 @@ fn system_prompt() -> String {
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
-     verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
+     verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
+     get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
+     \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima).\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
      it 0-10 on the words you pass as attributes (take them from the user's request: \
      \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
@@ -729,6 +731,16 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"get_status",
             "description":"Get current audio/MIDI/UI status of the app, including recent MIDI events",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"get_engine_info",
+            "description":"The engine's load and audio session (the DSP readout beside the rigs and its Engine Info panel): dsp_percent (average render time as a share of one buffer; above 70 is high, above 90 dropouts are likely), render_avg_us, render_max_us, late_blocks (buffers that took over 80 % of their time), xruns, sample_rate, buffer_frames, buffer_ms (the output latency the buffer adds), inputs (channels of the Audio In units), outputs, midi_input_latency_ms (null until a hardware MIDI event was measured), and nodes: every instrument and effect with avg_us, max_us and percent of the buffer, most expensive first. Use it to find which unit costs CPU. The sound card's own latency and the audio-input latency are not measured and not included.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"reset_engine_peaks",
+            "description":"Start the engine's peak counters again from now: render_max_us, late_blocks, xruns and every unit's max_us (the Engine Info panel's Reset peaks button). Averages are not touched.",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{

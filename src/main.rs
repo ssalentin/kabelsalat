@@ -20,6 +20,7 @@ mod catalog;
 mod control;
 mod dsp;
 mod engine;
+mod engine_info;
 mod guitar;
 mod host;
 mod juce;

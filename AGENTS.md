@@ -886,6 +886,13 @@ Learned so far (2026-11-15, UI polish pass):
     pattern position apart (`a_press_mid_bar_starts_the_pattern_on_its_first_note`).
     In the held-notes check, judge arps by "the last release silences
     everything", never per key: chords of two held keys can share a pitch.
+145. **An integer moving average keeps what its division drops:**
+    `RENDER_AVG_US` did `avg - avg/64 + us/64` in whole microseconds, and
+    both divisions dropped up to 63 µs: a 50 µs render read 0 and a steady
+    300 µs one read 256, so the DSP load of a light rack read 0 %. Average in
+    nanoseconds with `engine_info::ema_ns` (a signed step, rounded towards
+    the sample), and test a new average on a constant input from below and
+    from above (`the_average_converges_on_small_and_large_times`).
 
 ## Working on kabelsalat
 

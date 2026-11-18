@@ -15,6 +15,10 @@ agents are in [AGENTS.md](../AGENTS.md).
 - `control.rs` — the typed control plane: `Command` (one API for UI, assistant,
   CLI and MCP), `Graph`/`Node`/`Edge` (nodes carry their `rig`), `Rig`,
   `RigSnapshot`, `merge_rigs`/`split_rigs`, the lock-free `command_bus()` (rtrb).
+- `engine_info.rs` — engine load: `EngineCounters` (the audio callback's
+  atomics, read once), `NodeTimes` (lock-free render time per unit) and the
+  `EngineStats` snapshot the DSP readout, Engine Info and `get_engine_info`
+  all show.
 - `engine.rs` — `GraphEngine`: voices → DSP → LV2 → per-rig mix → master
   limiter → master saturation. Sums every MasterOut (one per rig). Publishes
   `GraphPub` (graph, rules, mix, voice binding) and edge levels to the UI; the
@@ -237,6 +241,21 @@ agents are in [AGENTS.md](../AGENTS.md).
   UI scale from the compositor (1.6, not winit's 2.33 DPI guess), background
   repaint throttled to 30 fps (UI CPU 24% → 12% unfocused), get_status reports
   render_avg_us / render_max_us / render_late.
+- **2026-11-18** — **DSP load and Engine Info** (#106, AUM parity): one
+  `engine_info::EngineStats` snapshot feeds the DSP readout, the Engine
+  Info popup and `get_engine_info`; nothing else reads the callback counters.
+  The readout sits at the right end of the rig strip, not in the bar above
+  it: at the 760 px minimum that bar has 46 px left once the agent chip
+  shows, so a readout there pushed SYNC out of the window.
+  The render path times every voice and effect into `NodeTimes`, a fixed
+  table of atomics written in render order (row i = the i-th unit of the
+  block, so no search and no allocation; rows restart when the order
+  changes). Cost: one clock read per voice and two per effect, not
+  measurable in `many-voices-test` (median block 503 µs before and after, 10
+  voices, six alternating runs each), so every block is timed. The sound
+  card's output latency and the audio-input latency are shown as "not
+  measured": cpal's `playback − callback` reads 185 ms through pipewire-alsa
+  on a one-quantum graph (`audio-in-test`), and no other figure is measured.
 - **2026-11-15** — **No squished racks** (user): the assistant panel only takes
   the height the rack can spare; big patches keep readable units and pan
   (wheel / trackpad) inside a clipped view with hairline pan indicators.

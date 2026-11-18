@@ -982,6 +982,8 @@ pub struct GraphEngine {
     out_peak: Arc<AtomicU32>,
     // Per-edge audio levels (source node's block peak), published per block.
     edge_levels: Arc<EdgeLevels>,
+    /// Render time per voice and effect (Engine Info), written per block.
+    node_timer: crate::engine_info::NodeTimer,
     // MIDI routing matrix (source → instrument: channel/transpose/ranges).
     // Default rules mirror "every source plays every instrument"; keyboard
     // zones are NOT matrix rules — a split Keys node's LOW/HIGH ports gate
@@ -1158,6 +1160,7 @@ impl GraphEngine {
             transport_dirty: false,
             out_peak: Arc::new(AtomicU32::new(0)),
             edge_levels: Arc::new(EdgeLevels::new()),
+            node_timer: crate::engine_info::NodeTimer::new(),
             matrix,
             route_out: Vec::with_capacity(route_cap),
             #[cfg(test)]
@@ -1883,6 +1886,11 @@ impl GraphEngine {
 
     /// Lock-free per-edge audio levels for the UI's breathing/flowing cables.
     pub fn edge_levels_handle(&self) -> Arc<EdgeLevels> {        self.edge_levels.clone()
+    }
+
+    /// Lock-free render time per voice and effect node.
+    pub fn node_times_handle(&self) -> Arc<crate::engine_info::NodeTimes> {
+        self.node_timer.handle()
     }
 
     /// The strip table as it goes into `GraphPub::strips`.
@@ -3305,6 +3313,8 @@ impl GraphEngine {
         let solo_rigs = self.rigs_with_solo_source();
 
         // 1. Every instrument renders and applies its level.
+        self.node_timer.begin_block();
+        let mut node_t0 = std::time::Instant::now();
         for s in &mut self.voices {
             // A free voice (no Clap node bound): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
@@ -3326,6 +3336,10 @@ impl GraphEngine {
                     }
                 }
             }
+            // One clock read per voice: each ends where the next begins.
+            let now = std::time::Instant::now();
+            self.node_timer.record(s.node, now - node_t0);
+            node_t0 = now;
         }
 
         // 1a. Audio In nodes: pull the input ring into each node's stereo
@@ -3472,6 +3486,7 @@ impl GraphEngine {
         self.fx_done.extend((0..n_dsp).map(|i| self.dsp[i].kind == DspKind::Metronome));
         self.fx_done.extend(std::iter::repeat(false).take(self.lv2.len()));
         while let Some(f) = self.next_effect(n_dsp, n_fx) {
+            let node_t0 = std::time::Instant::now();
             self.fx_done[f] = true;
             let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
             self.sum_audio_into(node, &mut bus[..n2]);
@@ -3508,7 +3523,9 @@ impl GraphEngine {
                     }
                 }
             }
+            self.node_timer.record(node, node_t0.elapsed());
         }
+        self.node_timer.end_block();
         self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
@@ -6794,6 +6811,31 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         median / budget_us * 100.0
     );
 
+    // Engine Info's node statistics, from the same blocks: every unit has a
+    // row, and together they explain most of the block.
+    let stats = crate::engine_info::EngineStats::build(
+        crate::engine_info::EngineCounters {
+            sample_rate: SR as u32,
+            callback_frames: BLOCK as u32,
+            render_avg_ns: (median * 1000.0) as u32,
+            ..Default::default()
+        },
+        Some(&engine.node_times_handle()),
+        0,
+        |node| units.iter().position(|(n, _)| *n == node).map(|i| plugins[i].0.clone()),
+    );
+    println!("  node statistics (avg / max per {BLOCK}-frame block, share of the {budget_us:.0} us budget):");
+    for n in &stats.nodes {
+        println!("    {:<10} node {:>2}  avg {:7.1} us  max {:7.1} us  {:5.2} %", n.name, n.node, n.avg_us, n.max_us, n.percent);
+    }
+    let node_sum: f64 = stats.nodes.iter().map(|n| n.avg_us).sum();
+    println!("    sum of units {node_sum:.0} us = {:.0} % of the median block ({median:.0} us)", node_sum / median * 100.0);
+    anyhow::ensure!(stats.nodes.len() == units.len(), "{} of {} units were timed", stats.nodes.len(), units.len());
+    anyhow::ensure!(stats.nodes.iter().all(|n| n.avg_us > 0.0 && n.max_us >= n.avg_us), "a unit has no render time: {:?}", stats.nodes);
+    // The averages follow the latest blocks, so a spike lifts them over the
+    // median; the worst block bounds them.
+    anyhow::ensure!(node_sum > median * 0.5 && node_sum < max, "units sum to {node_sum:.0} us (median block {median:.0} us, worst {max:.0} us)");
+
     // Retire: every voice comes back and is stopped and deactivated here.
     for (vid, _) in &mains {
         tx.push(VoiceMsg::Retire(*vid)).map_err(|_| anyhow::anyhow!("voice ring full"))?;
@@ -6810,7 +6852,9 @@ pub fn many_voices_test() -> anyhow::Result<()> {
         freed += 1;
     }
     anyhow::ensure!(mains.is_empty(), "{} voices never came back", mains.len());
-    for _ in 0..8 {
+    // The master's 5 Hz DC blocker rings on after the cut (rule 133): the
+    // residual of this chord falls below 1e-4 after about 48 blocks.
+    for _ in 0..64 {
         engine.render(&mut buf, 2);
     }
     anyhow::ensure!(block_peak(&buf) < 1e-4, "sound after every voice was retired");

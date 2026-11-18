@@ -5,6 +5,7 @@
 //! can develop and verify them in parallel; integration happens in `main` once
 //! the spikes pass their go/no-go checks.
 
+mod aeolus;
 mod assistant;
 mod audio;
 mod audio_in;

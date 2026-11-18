@@ -483,10 +483,16 @@ impl Matrix {
         id
     }
 
-    /// Convenience: add a transparent rule (omni, full ranges) and return
-    /// its id for further editing via [`Matrix::rule_mut`].
+    /// Route `source` to `dest`: add a transparent rule (omni, full ranges),
+    /// or keep the one already there, shape and enabled flag included. An
+    /// LV2 instrument connects when its instance attaches, after the user's
+    /// edits to its cells may have arrived; a second rule would route a
+    /// source the user turned off. Returns the rule's id.
     pub fn connect(&mut self, source: SourceId, dest: NodeId) -> RuleId {
-        self.add_rule(Rule::new(source, dest))
+        match self.rules.iter().find(|r| r.source == source && r.dest == dest) {
+            Some(r) => r.id,
+            None => self.add_rule(Rule::new(source, dest)),
+        }
     }
 
     pub fn rule(&self, id: RuleId) -> Option<&Rule> {

@@ -120,6 +120,10 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **A MIDI device turned off for an LV2 instrument stays off:** with two rigs
+  on two keyboards, the keyboard of the CLAP rig also played an LV2
+  instrument such as setBfree, when its cells were set while the plugin was
+  still loading (session load, new rig) (#123).
 - **Meters no longer read hot at normal levels:** the meters' colour zones
   were left on the old linear scale, so anything above −24 dBFS showed
   tomato and anything above −3 dBFS red. Tomato now starts at −6 dBFS and

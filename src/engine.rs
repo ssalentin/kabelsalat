@@ -5820,6 +5820,40 @@ mod tests {
     }
 
     #[test]
+    fn a_device_turned_off_before_the_lv2_instance_loads_stays_off() {
+        use crate::control::{command_bus, Graph, Lv2Uri, NodeKind};
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(Graph::default(), drain, 48000.0, vec![]);
+        engine.spawn_lv2_loader();
+        let (g, organ) = super::instrument_graph(NodeKind::Lv2 { uri: Lv2Uri::new("http://gareus.org/oss/lv2/b_synth") });
+        let mut buf = vec![0.0f32; 256 * 2];
+        bus.send(Command::LoadGraph { graph: g });
+        engine.render(&mut buf, 2);
+        let off = SourceId::Hardware(3);
+        bus.send(Command::MatrixRule {
+            source: off, dest: organ, channel: None, transpose: 0,
+            key_lo: 0, key_hi: 127, vel_lo: 0, vel_hi: 127, enabled: false,
+        });
+        engine.render(&mut buf, 2);
+        let t0 = std::time::Instant::now();
+        while !engine.lv2.iter().any(|s| s.node == organ) && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            engine.render(&mut buf, 2);
+        }
+        if !engine.lv2.iter().any(|s| s.node == organ) {
+            return; // setBfree is not installed (CI)
+        }
+        engine.note_log.clear();
+        bus.send(Command::NoteOn { note: 60, velocity: 0.8, source: off });
+        bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: SourceId::Hardware(1) });
+        engine.render(&mut buf, 2);
+        let heard: Vec<u8> = engine.note_log.iter().filter(|e| e.0 == organ && e.2).map(|e| e.1).collect();
+        assert_eq!(heard, vec![62], "device 3 was turned off for the organ before its instance loaded; device 1 still plays it");
+        let rules = engine.matrix.rules.iter().filter(|r| r.source == off && r.dest == organ).count();
+        assert_eq!(rules, 1, "one rule per (source, instrument)");
+    }
+
+    #[test]
     fn audio_in_routes_and_meters() {
         use crate::control::{command_bus, name_bytes, AudioInChannel, Command, NodeKind, PortKind, PortRef};
         use super::{P_AUDIO_IN_GAIN, P_AUDIO_IN_MONITOR};

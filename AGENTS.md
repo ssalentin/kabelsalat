@@ -642,6 +642,14 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+116. **Zero-latency master limiting catches peaks on sample 0 and leaves headroom:**
+    a 1 ms attack let chord onsets overshoot `MasterLimiter::CEILING` into
+    `tanh` + `knee` clipping, `master_vol = 1.0` left zero headroom below
+    −1 dBFS, and `meter_color` turned `CLIP_RED` at −6 dBFS (`0.9` on the
+    dB meter). `gain_for` drops instantly when `target < gain` (120 ms
+    release prevents waveform tracking), `P_VOL` defaults to `0.75`
+    (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
+    red only above `0.95` (−3 dBFS).
 118. **A rack rebuild never scans plugins:** `build_rack` called
     `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
     load (and every agent edit) of a rack with an LV2 unit classified all
@@ -714,8 +722,19 @@ Learned so far (2026-11-15, UI polish pass):
   `pwd` before editing. When the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
-  and shows the evidence. Never leave finished work only on the local
-  machine or only on a branch. Remove the worktree once its PR is merged.
+  and shows the evidence, then queue it with `gh pr merge --auto --squash`
+  (see "Merging"). Never leave finished work only on the local machine or
+  only on a branch. Remove the worktree once its PR is merged.
+- **Merging (user, 2026-11-17):** `main` is protected: no direct pushes
+  (admins included), the branch must be up to date, and the required checks
+  `test (x86_64)`, `test (aarch64)` and `flatpak cargo-sources.json is current`
+  must pass. GitHub merges a queued auto-merge PR once they
+  do; never merge by hand around a red or pending check, and never
+  `gh pr merge` without `--auto`. Everything merges on green CI, so the
+  evidence rules above are what keeps it safe. Self-tests with real plugins
+  and audio do not run in CI, so their output belongs in every PR body that
+  changes the code they cover. When `main` moves, update the branch
+  (`gh pr update-branch`) so the queued merge can proceed.
 - Design language: **Hurricane** — `docs/design-reference-analysis.md` is the
   spec; `src/theme.rs` is the single palette source. All-dark warm chrome,
   one near-black hero rack panel, one tomato accent (CTA/selection only).

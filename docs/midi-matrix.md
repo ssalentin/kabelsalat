@@ -14,7 +14,8 @@ is the lead's step; the contract for that is at the bottom of this doc.
 | `MidiMsg` | One channel-voice message. `Copy`, fixed-size: `status` (type nibble `0x80`–`0xE0`), `channel` (0-based 0..=15), `data: [u8; 2]` (7-bit). Constructors: `note_on`, `note_off`, `cc`, `pitch_bend` (signed −8192..=8191), `program_change`, `channel_aftertouch`, `poly_aftertouch`. `from_bytes` decodes raw midir/ALSA bytes; system messages and sysex are out of P1 scope and rejected. |
 | `SourceId` | Where an event came from: `Hardware(port)`, `Virtual(port)`, `Keys` (on-screen), `LaptopKeys`, `FilePlayer(id)` (P2). Ids are opaque handles — the matrix matches them, never resolves them. |
 | `Rule` | One routing entry: `source → dest` (a control-plane `NodeId`) plus `channel: Option<u8>`, `transpose: i8`, `key_range: (u8, u8)`, `vel_range: (u8, u8)`, `cc_map: Vec<CcMapping>`, `enabled: bool`. Chainable builders: `Rule::new(src, dest).on_channel(2).key_range(0, 59).transpose(-12).map_cc(1, 5)`. |
-| `CcMapping` | `cc: u8 → param: ParamId` on the rule's destination node. |
+| `CcMapping` | `cc: u8 → param: ParamId` on the rule's destination node, with a `target` space and a `scale` (`CcScale`). |
+| `CcScale` | How a controller value becomes the parameter value: `steps` equal sections of 0..=127 (0 = continuous) spread over `lo..=hi`. The default is the identity (MIDI learn); instrument profiles (`instruments.rs`) use steps so a slow/fast switch lands on SLOW or FAST. |
 | `Matrix` | The routing table (`rules: Vec<Rule>`, serde-serializable for sessions). `add_rule` assigns stable `RuleId`s; `connect(src, dest)` adds a transparent rule; `rule_mut(id)` edits live; `remove_rule(id)` deletes. |
 
 Core API:

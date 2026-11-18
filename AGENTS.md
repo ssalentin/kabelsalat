@@ -899,7 +899,21 @@ Learned so far (2026-11-15, UI polish pass):
     fixpoint. States are hashes, the halves run as separate scenarios
     (`Scenario::{Routing, Arp, RoutingWithStrip, Fx}`, 30–100 k states each),
     and a long run goes in `systemd-run --user -p MemoryMax=3G`.
-147. **Never end a turn on a build or test you have not read the end of:**
+147. **An integer moving average keeps what its division drops:**
+    `RENDER_AVG_US` did `avg - avg/64 + us/64` in whole microseconds, and
+    both divisions dropped up to 63 µs: a 50 µs render read 0 and a steady
+    300 µs one read 256, so the DSP load of a light rack read 0 %. Average in
+    nanoseconds with `engine_info::ema_ns` (a signed step, rounded towards
+    the sample), and test a new average on a constant input from below and
+    from above (`the_average_converges_on_small_and_large_times`).
+148. **A headless shot starts from an app that never ran a frame:**
+    `offline_shots::shot` makes a new egui context and font atlas, but the
+    app keeps galleys (wordmark, knob captions, hints) laid out in the
+    atlas of the context it ran in before. `engine_info_shots` and
+    `mixer_parity_shots` ran frames first and drew those as glyph soup;
+    build a fresh app per image and open every PNG before using it as
+    evidence.
+149. **Never end a turn on a build or test you have not read the end of:**
     on #6, three turns in a row said "running `cargo test`, waiting for the
     output" and ended; the background job died with the session, nobody
     read a result, and the work stalled for hours. Run builds and tests in
@@ -908,7 +922,7 @@ Learned so far (2026-11-15, UI polish pass):
     block on it (`t3_background_wait`) before replying, and report its exit
     code and `test result:` line. "Waiting for the output" is never a
     final message.
-148. **Compare plugin audio only inside one render:** two Surge instances
+150. **Compare plugin audio only inside one render:** two Surge instances
     fed the same notes differ in almost every sample (free-running
     oscillator phases), so a stem compared against a second, soloed run
     failed on 124770 of 124800 samples. `record-test` rebuilds the master

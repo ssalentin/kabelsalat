@@ -98,16 +98,17 @@ pub static SAMPLE_RATE: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_MAX_US: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_LAST_FRAMES: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_LATE: AtomicU32 = AtomicU32::new(0);
-/// Smoothed (EMA, 1/64) render time in microseconds.
-pub static RENDER_AVG_US: AtomicU32 = AtomicU32::new(0);
+/// Smoothed (EMA, 1/64) render time. Nanoseconds: in whole microseconds the
+/// step's division dropped up to 63 µs, and a 50 µs render read 0.
+pub static RENDER_AVG_NS: AtomicU32 = AtomicU32::new(0);
 
 /// Record one callback's render time (called from the audio thread; atomics only).
 pub fn note_render(elapsed: std::time::Duration, frames: usize, sample_rate: f64) {
     let us = elapsed.as_micros().min(u32::MAX as u128) as u32;
     RENDER_MAX_US.fetch_max(us, Ordering::Relaxed);
     RENDER_LAST_FRAMES.store(frames as u32, Ordering::Relaxed);
-    let avg = RENDER_AVG_US.load(Ordering::Relaxed);
-    RENDER_AVG_US.store(avg - avg / 64 + us / 64, Ordering::Relaxed);
+    let ns = elapsed.as_nanos().min(u32::MAX as u128) as u32;
+    RENDER_AVG_NS.store(crate::engine_info::ema_ns(RENDER_AVG_NS.load(Ordering::Relaxed), ns), Ordering::Relaxed);
     let budget_us = frames as f64 / sample_rate * 1e6;
     if us as f64 > budget_us * 0.8 {
         RENDER_LATE.fetch_add(1, Ordering::Relaxed);
@@ -418,6 +419,7 @@ fn handle_line_with_pub(
                     .and_then(|p| p.lock().ok())
                     .map(|g| serde_json::to_value(g.meter).unwrap_or(serde_json::Value::Null))
                     .unwrap_or(serde_json::Value::Null);
+                let c = crate::engine_info::EngineCounters::load();
                 json!({"ok": true, "data": {
                     "nodes": g.nodes.len(),
                     "edges": g.edges.len(),
@@ -433,12 +435,12 @@ fn handle_line_with_pub(
                     "bpm": tp.bpm,
                     "buffer_frames": BUFFER_FRAMES,
                     "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
-                    "xruns": XRUNS.load(Ordering::Relaxed),
-                    "render_max_us": RENDER_MAX_US.load(Ordering::Relaxed),
-                    "render_frames": RENDER_LAST_FRAMES.load(Ordering::Relaxed),
-                    "render_late": RENDER_LATE.load(Ordering::Relaxed),
-                    "render_avg_us": RENDER_AVG_US.load(Ordering::Relaxed),
-                    "midi_latency_ms": MIDI_LATENCY_US.load(Ordering::Relaxed) as f64 / 1000.0,
+                    "xruns": c.xruns,
+                    "render_max_us": c.render_max_us,
+                    "render_frames": c.callback_frames,
+                    "render_late": c.render_late,
+                    "render_avg_us": c.render_avg_ns / 1000,
+                    "midi_latency_ms": c.midi_latency_us as f64 / 1000.0,
                     "rigs": rig_count,
                     "active_rig": active_rig,
                     "meter": meter,

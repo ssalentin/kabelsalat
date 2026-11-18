@@ -112,6 +112,14 @@ impl AudioInChannel {
             AudioInChannel::Stereo => "ST",
         }
     }
+
+    /// Device channels the selection reads.
+    pub fn count(&self) -> u32 {
+        match self {
+            AudioInChannel::MonoL | AudioInChannel::MonoR => 1,
+            AudioInChannel::Stereo => 2,
+        }
+    }
 }
 
 /// A hosted MIDI-effect plugin (AUM "MIDI strips"): events in, processed

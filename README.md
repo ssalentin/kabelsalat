@@ -95,6 +95,15 @@ every rig's channels in their mixer colours and unfold their plugin chains
 (**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
 and selects the unit in the rack or scrolls and flashes its strip in the mixer.
 
+### Keep an eye on the engine
+Beside your rigs, **DSP** shows how much of each audio buffer the engine needs
+to render your rack. It turns amber from 70 % and red above 90 %, and counts
+the dropouts (xruns) the sound card reported. Click it for **Engine info**:
+sample rate and buffer, inputs and outputs, late blocks and xruns, the
+latencies kabelsalat measures, and the render time of every instrument and
+effect, most expensive first, so you see which unit to swap when the load
+climbs. The assistant and MCP agents read the same numbers (`get_engine_info`).
+
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be
 shaped: only some keys (keyboard splits), another MIDI channel, transposed, or

@@ -36,6 +36,19 @@ test result: ok
 
 `KNOWN` is empty. Every stuck note is a failure.
 
+## Arp scenario (issue #90)
+
+`held_notes_are_released_with_the_arp_and_the_scale_snap` runs the same search
+from the same start patch with a different alphabet: `Tick` (time passes, the
+arp steps), `SetKeysScale`, `AddNode` of an arp (wired in, once per load),
+the arp's MODE knob (up / chord), `RemoveNode` of the arp, an unplugged
+arp → synth cable, and the stale `Connect` of a cable the arp took over. A
+generated note belongs to no key, so the property is stronger: when the LAST
+held key is released nothing sounds at all (chords of two held keys can share
+a pitch, so single releases are not judged). Expect about 16k states to a
+fixpoint, ~5 s. States are hashed (`u64`), so memory stays small; keep the
+alphabet short, a bigger one does not reach its fixpoint.
+
 ## How it works (enough to judge a result)
 
 - A breadth-first search over the **real** `GraphEngine::apply`

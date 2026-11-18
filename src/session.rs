@@ -99,6 +99,48 @@ pub struct Session {
     matrix: Option<Value>,
     /// Rig names in rig order (#33); empty = the default "Rig A/B/…".
     pub rig_names: Vec<String>,
+    /// Mixer strip state keyed by node (#72–77): a source's pan/mute/solo,
+    /// an FX node's bypass, the strip's colour and collapse flag. Node-keyed
+    /// like `params` — `remap_session` carries each entry to its node's new
+    /// id across rig edits and reloads (rule 44).
+    strips: Vec<StripSaved>,
+    /// Source strips in display order, flat across rigs (a rig's strips are
+    /// the entries whose node is in that rig; nodes missing from the list
+    /// sort last in unit order). Keyed by node id, remapped with the strips.
+    strip_order: Vec<NodeId>,
+}
+
+/// One strip's persisted state (#72–77). Defaults mirror the engine's
+/// `StripMix::DEFAULT` plus UI-local colour/collapse.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StripSaved {
+    pub node: NodeId,
+    /// Pan −1 (L) … 1 (R).
+    pub pan: f32,
+    pub mute: bool,
+    /// Solo scope: within the node's rig (#73).
+    pub solo: bool,
+    /// Insert bypass (#74) — an FX node's flag.
+    pub bypass: bool,
+    /// Strip colour as 0xRRGGBB (#77); None = the plain chrome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    /// Strip collapsed to its mini form (#77).
+    pub collapsed: bool,
+}
+
+impl Default for StripSaved {
+    fn default() -> Self {
+        Self { node: 0, pan: 0.0, mute: false, solo: false, bypass: false, color: None, collapsed: false }
+    }
+}
+
+impl StripSaved {
+    /// True while nothing differs from a node nobody ever touched.
+    pub fn is_plain(&self) -> bool {
+        *self == Self { node: self.node, ..Self::default() }
+    }
 }
 
 impl Default for Session {
@@ -116,16 +158,20 @@ impl Session {
             states: Vec::new(),
             matrix: None,
             rig_names: Vec::new(),
+            strips: Vec::new(),
+            strip_order: Vec::new(),
         }
     }
 
-    /// True when both hold the same patch, knobs, plugin states, routes and
-    /// rig names; the session name is not compared.
+    /// True when both hold the same patch, knobs, plugin states, routes, rig
+    /// names and mixer strips; the session name is not compared.
     pub fn same_content(&self, other: &Session) -> bool {
         self.params == other.params
             && self.states == other.states
             && self.matrix == other.matrix
             && self.rig_names == other.rig_names
+            && self.strips == other.strips
+            && self.strip_order == other.strip_order
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -204,12 +250,53 @@ impl Session {
         self.matrix = matrix;
     }
 
+    // -- mixer strips (#72–77) ----------------------------------------------
+
+    /// One node's persisted strip state, if any.
+    pub fn strip(&self, node: NodeId) -> Option<&StripSaved> {
+        self.strips.iter().find(|s| s.node == node)
+    }
+
+    /// Upsert one node's strip state (the persisted form of
+    /// `Command::SetStripMix` / `SetStripBypass` plus the UI-local colour and
+    /// collapse flag). A plain (all-default) entry is dropped: an untouched
+    /// node has no row.
+    pub fn set_strip(&mut self, strip: StripSaved) {
+        match self.strips.iter_mut().find(|s| s.node == strip.node) {
+            Some(s) => *s = strip,
+            None => {
+                if !strip.is_plain() {
+                    self.strips.push(strip);
+                    self.strips.sort_by_key(|s| s.node);
+                }
+            }
+        }
+        self.strips.retain(|s| !s.is_plain());
+    }
+
+    /// All strip rows (sorted by node).
+    pub fn strips(&self) -> &[StripSaved] {
+        &self.strips
+    }
+
+    /// Source strips' display order (flat; per-rig sections derive from it).
+    pub fn strip_order(&self) -> &[NodeId] {
+        &self.strip_order
+    }
+
+    /// Set the strips' display order; unknown node ids are dropped.
+    pub fn set_strip_order(&mut self, order: Vec<NodeId>) {
+        self.strip_order = order.into_iter().filter(|n| self.graph.node(*n).is_some()).collect();
+    }
+
     // -- integrity -------------------------------------------------------------
 
     /// Drop params/blobs whose node no longer exists (call after `RemoveNode`).
     pub fn prune_to_graph(&mut self) {
         self.params.retain(|p| self.graph.node(p.node).is_some());
         self.states.retain(|s| self.graph.node(s.node).is_some());
+        self.strips.retain(|s| self.graph.node(s.node).is_some());
+        self.strip_order.retain(|n| self.graph.node(*n).is_some());
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -286,6 +373,26 @@ impl Session {
                 bail!("The state blob for node {} has no plugin id.", s.node);
             }
         }
+        for s in &self.strips {
+            if self.graph.node(s.node).is_none() {
+                bail!(
+                    "A mixer strip belongs to node {} which is no longer in the patch. \
+                     Call prune_to_graph() after removing nodes.",
+                    s.node
+                );
+            }
+            if !s.pan.is_finite() || !(-1.0..=1.0).contains(&s.pan) {
+                bail!("The mixer strip of node {} has a pan outside -1..1.", s.node);
+            }
+        }
+        for n in &self.strip_order {
+            if self.graph.node(*n).is_none() {
+                bail!(
+                    "The strip order lists node {} which is no longer in the patch.",
+                    n
+                );
+            }
+        }
         Ok(())
     }
 
@@ -317,6 +424,8 @@ impl Session {
             matrix: self.matrix.clone(),
             states: refs,
             rig_names: self.rig_names.clone(),
+            strips: self.strips.clone(),
+            strip_order: self.strip_order.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -352,6 +461,8 @@ impl Session {
             states,
             matrix: manifest.matrix,
             rig_names: manifest.rig_names,
+            strips: manifest.strips,
+            strip_order: manifest.strip_order,
         };
         session.validate()?;
         Ok(session)
@@ -452,6 +563,13 @@ struct SessionFile {
     /// Rig names (older sessions have none → default names).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rig_names: Vec<String>,
+    /// Mixer strips (#72–77): a source's pan/mute/solo, an FX's bypass, the
+    /// strip colour/collapse. Older sessions have none → engine defaults.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strips: Vec<StripSaved>,
+    /// Strip display order (older sessions have none → unit order).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    strip_order: Vec<NodeId>,
 }
 
 #[derive(Serialize, Deserialize)]

@@ -65,10 +65,14 @@ input says so instead of falling back to the laptop microphone.
 <p align="center"><img src="docs/shots/guitar-rig.png" width="85%" alt="The Guitar rig: Audio In with level meter and tuner, Scream, Delay, Reverb, Amp and Cabinet in one stack beside Master out"/></p>
 
 ### Mix
-The mixer gives every rig volume, pan, mute and solo, with meters that show
-what you actually hear.
+Every source gets its own channel strip: a fader in dB with a 0 dB detent
+(double-click for exact unity), a held peak and a clip light, plus pan, mute
+and solo. Each strip lists the effects on its cable chain as insert slots —
+add, bypass, reorder or remove them — and the master has inserts that run on
+the whole mix before the limiter. Rename a strip, give it a colour, drag it to
+reorder or collapse it; names and colours are saved with the session.
 
-<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: per-rig faders, pan, mute and solo, and the master meter"/></p>
+<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be
@@ -85,6 +89,15 @@ shows its CC number and follows your hardware from then on.
 **REC** records exactly what you hear into a WAV file in `~/Music/kabelsalat/`.
 After stopping you can play the take back or open its folder; **SYNC** starts
 and stops the recording with the transport.
+
+### Play along with a backing track
+Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the
+master like AUM's FilePlayer: **loop** restarts it seamlessly, **sync** plays it
+at the transport tempo from its original BPM (a "120 bpm" in the file name is
+picked up; speed changes, pitch follows, no time-stretch), **beats** sets the loop
+length in beats so an aligned loop never drifts off the metronome, and **offset**
+shifts the start. With sync on and the transport rolling, it starts on the next
+bar line.
 
 ### Ask the assistant — or your own AI agent
 The built-in assistant (bring your own DeepSeek key) can set things up for you:

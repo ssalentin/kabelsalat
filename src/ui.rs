@@ -1865,6 +1865,53 @@ fn tool_changes_only_system(name: &str) -> bool {
     matches!(name, "install_instrument" | "save_rig")
 }
 
+/// File-player settings carried by play_file/set_player args (AUM
+/// FilePlayer parity, issue #84). Builds the bus command when at least one
+/// is present; None fields keep the engine's current value.
+fn player_cfg_command(args: &serde_json::Value) -> Option<Command> {
+    let flag = |k: &str| args.get(k).and_then(|v| v.as_bool());
+    let num = |k: &str| args.get(k).and_then(|v| v.as_f64()).map(|n| n as f32);
+    let cfg = Command::SetPlayerCfg {
+        loop_on: flag("loop"),
+        sync: flag("sync"),
+        beats: num("beats"),
+        offset: num("offset"),
+        bpm: num("bpm"),
+    };
+    let Command::SetPlayerCfg { loop_on, sync, beats, offset, bpm } = &cfg else { unreachable!() };
+    (loop_on.is_some() || sync.is_some() || beats.is_some() || offset.is_some() || bpm.is_some())
+        .then_some(cfg)
+}
+
+/// Human summary of the settings a tool call carried ("" when none).
+fn player_cfg_summary(args: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = args.get("loop").and_then(|v| v.as_bool()) {
+        parts.push(if v { "looping".into() } else { "one-shot".into() });
+    }
+    if let Some(v) = args.get("sync").and_then(|v| v.as_bool()) {
+        parts.push(if v {
+            "synced to the tempo (starts at the next bar while the transport rolls)".into()
+        } else {
+            "own rate".into()
+        });
+    }
+    if let Some(v) = args.get("beats").and_then(|v| v.as_f64()) {
+        parts.push(format!("{v} beats"));
+    }
+    if let Some(v) = args.get("offset").and_then(|v| v.as_f64()) {
+        parts.push(format!("offset {v:+} beats"));
+    }
+    if let Some(v) = args.get("bpm").and_then(|v| v.as_f64()) {
+        parts.push(format!("{v} BPM file tempo"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(", "))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum AgentOrigin {
     Assistant,
@@ -2403,6 +2450,14 @@ struct DemoApp {
     last_graph_rev: u64,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
+    /// Retired player buffers the engine handed back: dropped here (UI
+    /// thread) so a multi-MB decode never frees on the audio thread.
+    player_retire_rx: Option<rtrb::Consumer<Arc<[f32]>>>,
+    /// File-player state as the engine published it (loop/sync/enable —
+    /// rule 33: settings any frontend can change are mirrored from the
+    /// engine, never guessed locally). Read by get_status.
+    player: crate::engine::PlayerPub,
+    last_player_rev: u64,
     /// Master recorder status (engine writes `recording`/`dropped`; the writer
     /// thread owns the path/seconds). Read-only here — the REC button sends
     /// RecordStart/Stop through the command bus, the engine stays authoritative.
@@ -2692,6 +2747,9 @@ impl DemoApp {
             graph_pub: None,
             last_graph_rev: 0,
             player_ctrl: None,
+            player_retire_rx: None,
+            player: crate::engine::PlayerPub::default(),
+            last_player_rev: 0,
             recorder: None,
             record_sync: false,
             graph_sig: Vec::new(),
@@ -3730,6 +3788,12 @@ impl DemoApp {
             }
             self.playing = now_playing;
         }
+        // File-player mirror (rule 33): settings can come from any frontend
+        // (chat, MCP, CLI send) — the engine's publication is the truth.
+        if g.player_rev != self.last_player_rev {
+            self.last_player_rev = g.player_rev;
+            self.player = g.player;
+        }
         let graph_rev_changed = g.rev != self.last_graph_rev;
         // The engine's voice binding. While it has not published the load
         // this app sent last, its table still describes the old graph.
@@ -4579,9 +4643,16 @@ impl DemoApp {
         let playing = self.take_play_until > self.ui_time;
         let gain = if playing { 0.0 } else { 0.8 };
         if let Some(pc) = &self.player_ctrl {
-            if playing { pc.stop() } else { pc.play(path) }
+            if !playing {
+                pc.play(path);
+            }
         }
         if let Some(bus) = &self.bus {
+            // The play-enable is the engine's (AUM circular toggle): stopping
+            // disables it; the load from pc.play() enables and starts.
+            if playing {
+                let _ = bus.lock().unwrap().send(Command::SetPlayerEnable { on: false });
+            }
             let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
         }
         self.take_play_until = if playing { 0.0 } else { self.ui_time + secs as f32 + 0.2 };
@@ -4721,6 +4792,13 @@ impl DemoApp {
                 self.clap_plugin_ids.remove(pos);
                 self.clap_voice_ids.remove(pos);
                 main.retire(slot.into_voice());
+            }
+        }
+        // Retired file-player buffers: dropping them here is the whole
+        // point (the audio thread only moves the Arc into the ring).
+        while let Some(rx) = self.player_retire_rx.as_mut() {
+            if rx.pop().is_err() {
+                break;
             }
         }
     }
@@ -5035,6 +5113,20 @@ impl DemoApp {
                 "count_in_bars": self.count_in_bars,
                 "record_sync": self.record_sync,
                 "bpm": self.bpm,
+                "player": serde_json::json!({
+                    "loaded": self.player.loaded,
+                    "enabled": self.player.enabled,
+                    "pending": self.player.pending,
+                    "playing": self.player.playing,
+                    "loop": self.player.loop_on,
+                    "sync": self.player.sync,
+                    "beats": self.player.beats,
+                    "offset": self.player.offset,
+                    "bpm": self.player.bpm,
+                    "eff_bpm": self.player.eff_bpm,
+                    "duration": self.player.duration,
+                    "gain": self.player.gain,
+                }),
                 "cables": self.cables.len(),
                 "fps": self.fps,
                 "buffer_frames": crate::bridge::BUFFER_FRAMES,
@@ -5281,30 +5373,57 @@ impl DemoApp {
                     return format!("play_file: no file at '{path}'");
                 }
                 if let Some(pc) = &self.player_ctrl {
+                    // AUM FilePlayer settings ride along (issue #84): they
+                    // must land BEFORE the decoded file, so the engine arms
+                    // the start with them already in force.
+                    if let Some(cfg) = player_cfg_command(args) {
+                        if let Some(bus) = &self.bus {
+                            let _ = bus.lock().unwrap().send(cfg);
+                        }
+                    }
                     pc.play(path);
                     if let Some(bus) = &self.bus {
                         let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
                     }
-                    format!("playing '{path}' at gain {gain:.2} (backing track mixed to master)")
+                    let what = player_cfg_summary(args);
+                    format!("playing '{path}' at gain {gain:.2}{what} (backing track mixed to master)")
                 } else {
                     "file player unavailable (no audio)".into()
                 }
             }
             "stop_file" => {
-                if let Some(pc) = &self.player_ctrl {
-                    pc.stop();
-                }
                 if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain: 0.0 });
+                    // Disable the play-enable; the file and its settings stay
+                    // (play_file or the take button restart at the start).
+                    let _ = bus.lock().unwrap().send(Command::SetPlayerEnable { on: false });
                 }
                 "file player stopped".into()
             }
             "set_player" => {
-                let gain = args.get("gain").and_then(|v| v.as_f64()).unwrap_or(0.0).clamp(0.0, 1.0) as f32;
-                if let Some(bus) = &self.bus {
-                    let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                let gain = args.get("gain").and_then(|v| v.as_f64()).map(|g| g.clamp(0.0, 1.0) as f32);
+                let cfg = player_cfg_command(args);
+                if gain.is_none() && cfg.is_none() {
+                    return "set_player needs gain and/or playback settings (loop, sync, beats, offset, bpm)".into();
                 }
-                format!("file player gain {gain:.2}")
+                if let Some(bus) = &self.bus {
+                    if let Some(gain) = gain {
+                        let _ = bus.lock().unwrap().send(Command::SetPlayer { gain });
+                    }
+                    if let Some(cfg) = cfg {
+                        let _ = bus.lock().unwrap().send(cfg);
+                    }
+                }
+                let mut out = String::new();
+                if let Some(gain) = gain {
+                    out.push_str(&format!("file player gain {gain:.2}"));
+                }
+                let what = player_cfg_summary(args);
+                if out.is_empty() {
+                    out = what.trim_start_matches(" · ").to_string();
+                } else {
+                    out.push_str(&what);
+                }
+                out
             }
             "set_rig_device" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
@@ -16177,6 +16296,8 @@ struct BuiltAudio {
     level: Arc<std::sync::atomic::AtomicU32>,
     sample_rate: f64,
     player_ctrl: crate::player::PlayerControl,
+    /// Retired player buffers to free on this (UI) thread.
+    player_retire_rx: rtrb::Consumer<Arc<[f32]>>,
     recorder: std::sync::Arc<crate::record::RecorderShared>,
     rig_snapshot: Arc<Mutex<crate::control::RigSnapshot>>,
     graph_pub: Arc<Mutex<crate::engine::GraphPub>>,
@@ -16241,9 +16362,15 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
             Err(e) => eprintln!("system audio: capture unavailable: {e}"),
         }
     }
-    // File player (backing track): decode thread + ring; UI holds the control.
-    let (player_sink, player_ctrl) = crate::player::start(sample_rate as u32, ch);
-    engine.set_player_sink(player_sink);
+    // File player (backing track): the decode thread parses WAVs off the
+    // UI and audio threads and hands each decoded buffer to the engine
+    // through this ring. The engine owns the clock (loop/sync/beats,
+    // issue #84) and returns retired buffers here; the UI frame drops them
+    // so nothing big is ever freed on the audio thread.
+    let (player_tx, player_rx) = rtrb::RingBuffer::<crate::player::PlayerData>::new(4);
+    let (player_back_tx, player_retire_rx) = rtrb::RingBuffer::<Arc<[f32]>>::new(4);
+    engine.set_player_channels(player_rx, player_back_tx);
+    let player_ctrl = crate::player::start(player_tx);
     // Master recorder: writer thread + ring; engine holds the tap, the UI (and
     // the bridge via LIVE_RECORDER) hold the shared status.
     let (recorder_tap, recorder) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
@@ -16304,6 +16431,7 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
         level,
         sample_rate,
         player_ctrl,
+        player_retire_rx,
         recorder,
         rig_snapshot,
         graph_pub,
@@ -16460,6 +16588,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             sample_rate,
                             player_ctrl,
+                            player_retire_rx,
                             recorder,
                             rig_snapshot,
                             graph_pub,
@@ -16507,6 +16636,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             level,
                             shared_graph,
                             player_ctrl,
+                            player_retire_rx,
                             recorder,
                             rig_snapshot,
                             graph_pub,
@@ -16535,6 +16665,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     level,
                     shared_graph,
                     player_ctrl,
+                    player_retire_rx,
                     recorder,
                     rig_snapshot,
                     graph_pub,
@@ -16547,6 +16678,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.player_ctrl = Some(player_ctrl);
+                    app.player_retire_rx = Some(player_retire_rx);
                     app.recorder = Some(recorder);
                     app.audio_in_tx = Some(audio_in_tx);
                     app.audio_in_levels = Some(audio_in_levels);
@@ -18085,7 +18217,7 @@ mod rig_switch_tests {
         assert_eq!(stopped, "file player stopped");
         let mut cmds = Vec::new();
         drain.drain(|c| cmds.push(c));
-        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayer { gain } if *gain == 0.0)), "{cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetPlayerEnable { on: false })), "{cmds:?}");
     }
 
     #[test]

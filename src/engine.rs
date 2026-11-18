@@ -24,7 +24,7 @@ use crate::host::ClapVoice;
 use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
 use crate::meter::{MasterMeter, MeterSnapshot};
-use crate::player::PlayerSink;
+use crate::player::{read_frame, PlayerCfg, PlayerData};
 use crate::record::RecorderTap;
 use crate::transport::{CountInConfig, MasterClock, Transport};
 
@@ -651,6 +651,55 @@ impl Default for TransportPub {
     }
 }
 
+/// Published file-player state (issue #84): what the engine is playing and
+/// how — frontends (UI mirror, bridge get_status, MCP) read it under
+/// `player_rev`. Copied under `try_lock`, zero allocation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerPub {
+    /// A file is loaded.
+    pub loaded: bool,
+    /// The play-enable (AUM's circular toggle) is on.
+    pub enabled: bool,
+    /// Enabled but waiting for the bar line (sync on, transport rolling).
+    pub pending: bool,
+    /// Sounding right now (enabled, started, not finished).
+    pub playing: bool,
+    pub loop_on: bool,
+    pub sync: bool,
+    /// Number of Beats setting (0 = unset).
+    pub beats: f32,
+    /// Beat Offset setting.
+    pub offset: f32,
+    /// Original BPM setting (adopted from "nnn bpm" in the filename on load).
+    pub bpm: f32,
+    /// The tempo the file is played against: beats-derived while loop+sync
+    /// are on, otherwise the original BPM.
+    pub eff_bpm: f32,
+    /// File length in seconds.
+    pub duration: f32,
+    /// Mix gain (0..1).
+    pub gain: f32,
+}
+
+impl Default for PlayerPub {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            enabled: false,
+            pending: false,
+            playing: false,
+            loop_on: false,
+            sync: false,
+            beats: 0.0,
+            offset: 0.0,
+            bpm: crate::player::DEFAULT_BPM,
+            eff_bpm: 0.0,
+            duration: 0.0,
+            gain: 0.0,
+        }
+    }
+}
+
 /// Shared graph publication for frontends (MCP→UI live sync).
 /// The engine writes it ONLY on structural ops that actually changed the
 /// graph (loads, add/remove node, connect/disconnect) at block boundaries;
@@ -679,6 +728,9 @@ pub struct GraphPub {
     /// Master transport, tempo, and count-in state, bumped by `transport_rev`.
     pub transport: TransportPub,
     pub transport_rev: u64,
+    /// File-player state (loop/sync/enable), bumped by `player_rev`.
+    pub player: PlayerPub,
+    pub player_rev: u64,
     /// Master-bus loudness/peak/band meter (Bravo 1 "measure loop"), bumped by
     /// `meter_rev` every render block via a non-blocking `try_lock` (rule 33).
     pub meter: MeterSnapshot,
@@ -697,6 +749,45 @@ impl GraphPub {
     pub fn reserve_voices(&mut self, n: usize) {
         self.voices.reserve(n.saturating_sub(self.voices.len()));
     }
+}
+
+/// The loaded file and its runtime clock. Plain engine-owned state: no
+/// locks, no atomics on the render path.
+struct PlayerFile {
+    /// Interleaved stereo at the file's own rate, shared with the host
+    /// (freed only through the retire ring).
+    samples: Arc<[f32]>,
+    frames: usize,
+    file_sr: f64,
+    duration: f64,
+    /// Play-enable (AUM's circular toggle).
+    enabled: bool,
+    /// Enabled but waiting for the bar line (sync on, transport active).
+    pending: bool,
+    /// Song beat the pending start waits for.
+    target_beats: f64,
+    /// Play position in file frames. Authoritative in free-run; the sync
+    /// path re-derives it from the anchors every frame and mirrors it here.
+    pos: f64,
+    /// The song-clock mapping: file beats ↔ song beats while synced.
+    anchor_song_beats: f64,
+    anchor_file_beats: f64,
+    /// A one-shot (loop off) played past its end.
+    finished: bool,
+}
+
+/// Start sounding from the configured point (Beat Offset), anchored to the
+/// song clock at `song_beats`. Returns the start position in file frames.
+fn player_start_now(p: &mut PlayerFile, cfg: PlayerCfg, song_beats: f64) -> f64 {
+    let ref_bpm = cfg.ref_bpm(p.duration);
+    let start_beats = cfg.start_beats(ref_bpm, p.duration);
+    let pos = start_beats * 60.0 / ref_bpm * p.file_sr;
+    p.pending = false;
+    p.finished = false;
+    p.pos = pos;
+    p.anchor_file_beats = start_beats;
+    p.anchor_song_beats = song_beats;
+    pos
 }
 
 pub struct GraphEngine {
@@ -765,10 +856,23 @@ pub struct GraphEngine {
     system_capture: Option<SystemCapture>,
     system_gain: f32,
     system_buf: Vec<f32>,
-    // File player (backing track) mixed into the master.
-    player_sink: Option<PlayerSink>,
+    // File player (backing track) mixed into the master. The decoded file
+    // arrives through `player_rx` (parse happens on the decode thread); the
+    // engine owns the clock and reads the buffer directly — RT-safe, no
+    // locks. Retired buffers leave through `player_back` (dropping a
+    // several-MB allocation on the audio thread would stall it).
+    player: Option<PlayerFile>,
+    player_cfg: PlayerCfg,
     player_gain: f32,
     player_buf: Vec<f32>,
+    /// Decode thread → audio: one decoded file per `play_file`.
+    player_rx: Option<rtrb::Consumer<PlayerData>>,
+    /// Audio → host: buffers to free off the audio thread.
+    player_back: Option<rtrb::Producer<Arc<[f32]>>>,
+    /// Retires waiting while the return ring is full (preallocated).
+    player_backlog: Vec<Arc<[f32]>>,
+    /// The player state changed since its last publication.
+    player_dirty: bool,
     // Audio In nodes (live mic/guitar/interface): one slot per node, rings fed
     // by input callbacks off the audio thread (rule 46).
     audio_in: Vec<AudioInSlot>,
@@ -892,9 +996,14 @@ impl GraphEngine {
             system_capture: None,
             system_gain: 0.0,
             system_buf: vec![0.0; 8192 * 2],
-            player_sink: None,
+            player: None,
+            player_cfg: PlayerCfg::default(),
             player_gain: 0.0,
             player_buf: vec![0.0; 8192 * 2],
+            player_rx: None,
+            player_back: None,
+            player_backlog: Vec::with_capacity(8),
+            player_dirty: false,
             audio_in,
             audio_in_levels: Arc::new(AudioInLevels::new()),
             audio_in_rx: None,
@@ -1207,9 +1316,237 @@ impl GraphEngine {
         self.audio_in.iter().find(|s| s.node == node).map(|s| (s.dropped, s.starved))
     }
 
-    /// Attach the file-player ring consumer (decode thread started elsewhere).
-    pub fn set_player_sink(&mut self, sink: PlayerSink) {
-        self.player_sink = Some(sink);
+    /// Attach the file-player channels: `rx` delivers decoded files from the
+    /// decode thread (popped at block boundaries), `back` returns retired
+    /// buffers to whoever can free them off the audio thread.
+    pub fn set_player_channels(
+        &mut self,
+        rx: rtrb::Consumer<PlayerData>,
+        back: rtrb::Producer<Arc<[f32]>>,
+    ) {
+        self.player_rx = Some(rx);
+        self.player_back = Some(back);
+    }
+
+    /// The file player's own stereo output of the last rendered block, before
+    /// gain and the master chain (self-tests measure the loop seam and the
+    /// beat lock on it).
+    pub fn player_block(&self, frames: usize) -> &[f32] {
+        &self.player_buf[..(frames * 2).min(self.player_buf.len())]
+    }
+
+    /// Current file-player state for frontends (rule 33: what the engine
+    /// owns is published back).
+    pub fn player_pub(&self) -> PlayerPub {
+        let cfg = &self.player_cfg;
+        let p = self.player.as_ref();
+        PlayerPub {
+            loaded: p.is_some(),
+            enabled: p.map_or(false, |p| p.enabled),
+            pending: p.map_or(false, |p| p.pending),
+            playing: p.map_or(false, |p| p.enabled && !p.pending && !p.finished),
+            loop_on: cfg.loop_on,
+            sync: cfg.sync,
+            beats: cfg.beats,
+            offset: cfg.offset,
+            bpm: cfg.bpm,
+            eff_bpm: p.map_or(0.0, |p| cfg.ref_bpm(p.duration) as f32),
+            duration: p.map_or(0.0, |p| p.duration as f32),
+            gain: self.player_gain,
+        }
+    }
+
+    /// Load a decoded file (from the decode thread's ring): adopt the
+    /// filename BPM (AUM: it is the original-BPM default) and start it —
+    /// at the next bar line when sync is on and the transport rolls, else
+    /// now. Retires whatever file it replaces.
+    fn load_player(&mut self, d: PlayerData) {
+        let old = self.player.take();
+        if let Some(b) = d.bpm {
+            self.player_cfg.bpm = b;
+        }
+        let frames = d.frames().max(1);
+        let mut p = PlayerFile {
+            samples: d.samples,
+            file_sr: d.sample_rate.max(1) as f64,
+            duration: frames as f64 / d.sample_rate.max(1) as f64,
+            frames,
+            enabled: true,
+            pending: false,
+            target_beats: 0.0,
+            pos: 0.0,
+            anchor_song_beats: 0.0,
+            anchor_file_beats: 0.0,
+            finished: false,
+        };
+        if self.player_cfg.sync && self.master_clock.is_active() {
+            p.pending = true;
+            p.target_beats = self.player_target_beats();
+        } else {
+            player_start_now(&mut p, self.player_cfg, self.transport.beats);
+        }
+        self.player = Some(p);
+        self.player_dirty = true;
+        if let Some(old) = old {
+            self.retire_player(old.samples);
+        }
+    }
+
+    /// The bar line a synced start waits for: beat 0 (the song's own
+    /// downbeat) during a count-in, else the next bar boundary.
+    fn player_target_beats(&self) -> f64 {
+        if self.master_clock.is_counting_in() {
+            0.0
+        } else {
+            crate::transport::next_bar_beats(self.transport.beats)
+        }
+    }
+
+    /// Hand a retired decoded buffer to the host so it is freed off the
+    /// audio thread. A full return ring parks it in the preallocated
+    /// backlog; the only remaining option leaks, never frees here.
+    fn retire_player(&mut self, samples: Arc<[f32]>) {
+        let item = match self.player_back.as_mut() {
+            Some(tx) => match tx.push(samples) {
+                Ok(()) => return,
+                Err(rtrb::PushError::Full(s)) => s,
+            },
+            None => samples,
+        };
+        if self.player_backlog.len() < self.player_backlog.capacity() {
+            self.player_backlog.push(item);
+        } else {
+            std::mem::forget(item);
+        }
+    }
+
+    /// Drain the retire backlog into the return ring (one slot per block is
+    /// plenty — loads are rare).
+    fn flush_player_backlog(&mut self) {
+        while let Some(item) = self.player_backlog.pop() {
+            let Some(tx) = self.player_back.as_mut() else {
+                self.player_backlog.push(item);
+                return;
+            };
+            if let Err(rtrb::PushError::Full(s)) = tx.push(item) {
+                self.player_backlog.push(s);
+                return;
+            }
+        }
+    }
+
+    /// Fill the player mix buffer for this block: the AUM FilePlayer clock.
+    /// While sync is on and the song clock rolls, the file position is
+    /// DERIVED from the song beats (same factor the metronome counts with,
+    /// rule 43) — drift-free by construction, and a tempo change is
+    /// followed in the same block with no phase jump. Otherwise the
+    /// position integrates at the session tempo (sync on, transport idle)
+    /// or the file's own rate (sync off). Allocation-free.
+    fn fill_player(&mut self, frames: usize, block_start_beats: f64, beat_inc: f64) {
+        let n2 = frames * 2;
+        while let Some(rx) = self.player_rx.as_mut() {
+            let Ok(d) = rx.pop() else { break };
+            self.load_player(d);
+        }
+        self.flush_player_backlog();
+        let Some(p) = self.player.as_mut() else {
+            for x in &mut self.player_buf[..n2] {
+                *x = 0.0;
+            }
+            return;
+        };
+        let cfg = self.player_cfg;
+        let bpm = self.transport.bpm;
+        let sr = self.sample_rate;
+        let rolling = self.master_clock == MasterClock::Playing;
+        // The clock only truly rolls once it has advanced: the block that
+        // ends a count-in flips to Playing without advancing (beat 0 is the
+        // FIRST frame of the block after it).
+        let clock_live = rolling && (self.transport.beats > 0.0 || self.transport.seconds > 0.0);
+        let ref_bpm = cfg.ref_bpm(p.duration);
+        let total_beats = (ref_bpm * p.duration / 60.0).max(1e-9);
+        let mut dirty = false;
+        for i in 0..frames {
+            let song_b = block_start_beats + i as f64 * beat_inc;
+            // Position this frame reads, or None for silence.
+            let mut pos: Option<f64> = None;
+            if p.pending {
+                let wait = cfg.sync
+                    && self.master_clock.is_active()
+                    && (!clock_live || song_b < p.target_beats);
+                if !wait {
+                    // The bar line arrived (or sync/transport no longer
+                    // asks for it): start at the configured point, anchored
+                    // to the song clock exactly here.
+                    pos = Some(player_start_now(p, cfg, song_b));
+                    dirty = true;
+                }
+            } else if p.enabled && !p.finished {
+                if cfg.sync && rolling {
+                    // Song-clock-derived position: file beats advance 1:1
+                    // with song beats at matched varispeed, so the loop
+                    // pass lasts exactly its beats in song beats and a
+                    // tempo change is followed without a phase jump.
+                    let file_beats = p.anchor_file_beats + (song_b - p.anchor_song_beats);
+                    let b = if cfg.loop_on { file_beats.rem_euclid(total_beats) } else { file_beats };
+                    let t = b * 60.0 / ref_bpm;
+                    if !cfg.loop_on && t >= p.duration {
+                        p.finished = true;
+                        dirty = true;
+                    } else {
+                        pos = Some(t * p.file_sr);
+                        p.pos = t * p.file_sr; // coherent handover to free-run
+                    }
+                } else {
+                    // Free-run: read at the current position, then advance
+                    // by the rate the song clock would run at (sync on) or
+                    // the file's own rate (sync off).
+                    if cfg.loop_on {
+                        p.pos = p.pos.rem_euclid(p.frames as f64);
+                    } else if p.pos >= p.frames as f64 {
+                        p.finished = true;
+                        dirty = true;
+                    }
+                    let rate = if cfg.sync { bpm / ref_bpm } else { 1.0 };
+                    pos = Some(p.pos);
+                    p.pos += rate * p.file_sr / sr;
+                    if p.pos >= p.frames as f64 {
+                        if cfg.loop_on {
+                            p.pos = p.pos.rem_euclid(p.frames as f64);
+                        } else {
+                            p.finished = true;
+                            dirty = true;
+                        }
+                    }
+                }
+            }
+            let (sound, x) = match pos {
+                Some(x) if x.is_finite() => {
+                    // A looped position sitting exactly on the end (float
+                    // rounding at the seam) wraps; it must never re-anchor.
+                    let x = if cfg.loop_on && x >= p.frames as f64 { x.rem_euclid(p.frames as f64) } else { x };
+                    ((0.0..p.frames as f64).contains(&x), x)
+                }
+                Some(_) => {
+                    // Heal (rule 32): a non-finite position restarts the
+                    // file instead of seeding NaNs into the mix.
+                    let start = player_start_now(p, cfg, song_b);
+                    (start.is_finite() && (0.0..p.frames as f64).contains(&start), start)
+                }
+                None => (false, 0.0),
+            };
+            if sound {
+                let s = read_frame(&p.samples, p.frames, x, cfg.loop_on);
+                self.player_buf[i * 2] = s[0];
+                self.player_buf[i * 2 + 1] = s[1];
+            } else {
+                self.player_buf[i * 2] = 0.0;
+                self.player_buf[i * 2 + 1] = 0.0;
+            }
+        }
+        if dirty {
+            self.player_dirty = true;
+        }
     }
 
     /// Attach the master recording tap (writer thread started elsewhere).
@@ -2060,7 +2397,76 @@ impl GraphEngine {
                 self.publish_graph();
             }
             Command::SetPlayer { gain } => {
-                self.player_gain = gain.clamp(0.0, 1.0);
+                let gain = gain.clamp(0.0, 1.0);
+                if (self.player_gain - gain).abs() > 1e-9 {
+                    self.player_gain = gain;
+                    self.player_dirty = true;
+                }
+            }
+            Command::SetPlayerCfg { loop_on, sync, beats, offset, bpm } => {
+                let old = self.player_cfg;
+                if let Some(v) = loop_on {
+                    self.player_cfg.loop_on = v;
+                }
+                if let Some(v) = sync {
+                    self.player_cfg.sync = v;
+                }
+                if let Some(v) = beats {
+                    self.player_cfg.beats = v.max(0.0);
+                }
+                if let Some(v) = offset {
+                    self.player_cfg.offset = v.clamp(-64.0, 64.0);
+                }
+                if let Some(v) = bpm {
+                    self.player_cfg.bpm = v.clamp(20.0, 300.0);
+                }
+                if self.player_cfg == old {
+                    return;
+                }
+                if let Some(p) = self.player.as_mut() {
+                    // Looping again unfreezes a one-shot that ran out.
+                    if self.player_cfg.loop_on {
+                        p.finished = false;
+                    }
+                    // A pending start with sync now off begins immediately
+                    // (AUM: no sync, no waiting for the quantum).
+                    if p.pending && !self.player_cfg.sync {
+                        player_start_now(p, self.player_cfg, self.transport.beats);
+                    } else if p.enabled
+                        && !p.pending
+                        && !p.finished
+                        && old.sync != self.player_cfg.sync
+                        && self.master_clock == MasterClock::Playing
+                    {
+                        // Toggle sync mid-play without a jump: re-anchor
+                        // the song-clock mapping at the current position.
+                        let ref_bpm = self.player_cfg.ref_bpm(p.duration);
+                        let t = (p.pos / p.file_sr).clamp(0.0, p.duration);
+                        p.anchor_file_beats = t * ref_bpm / 60.0;
+                        p.anchor_song_beats = self.transport.beats;
+                    }
+                }
+                self.player_dirty = true;
+            }
+            Command::SetPlayerEnable { on } => {
+                let target = self.player_target_beats();
+                let Some(p) = self.player.as_mut() else { return };
+                if on {
+                    p.enabled = true;
+                    if self.player_cfg.sync && self.master_clock.is_active() {
+                        // AUM: while the transport rolls, the play-enable
+                        // starts at the next sync-quantum (bar) boundary;
+                        // during a count-in that is beat 0.
+                        p.pending = true;
+                        p.target_beats = target;
+                    } else {
+                        player_start_now(p, self.player_cfg, self.transport.beats);
+                    }
+                } else {
+                    p.enabled = false;
+                    p.pending = false;
+                }
+                self.player_dirty = true;
             }
             // Global transport = MASTER: fan out to every transport-capable
             // node (all start together on the downbeat). Per-node
@@ -2145,6 +2551,16 @@ impl GraphEngine {
             self.transport_dirty = true;
             if changed {
                 self.publish_graph();
+            }
+            // File player (AUM): a synced, enabled player starts WITH the
+            // transport, anchored to the song clock's beat 0 — right after
+            // any count-in, so an aligned loop lands on the downbeat.
+            if self.player_cfg.sync {
+                if let Some(p) = self.player.as_mut().filter(|p| p.enabled) {
+                    p.pending = true;
+                    p.target_beats = 0.0;
+                    self.player_dirty = true;
+                }
             }
         } else {
             let was_active = self.master_clock.is_active() || self.transport.playing;
@@ -2299,6 +2715,10 @@ impl GraphEngine {
         // normal audio routing like any DSP node.
         let (sr, bpm) = (self.sample_rate, self.transport.bpm);
         let beat_inc = Transport::beats_per_frame(bpm, sr);
+        // Song position of THIS block's first frame — the file player and
+        // the metronome both count beats from it with the same factor
+        // (rule 43). Snapped before the clock advances below.
+        let block_start_beats = self.transport.beats;
         let block_beats = frames as f64 * beat_inc;
         let counting_in_this_block = self.master_clock.is_counting_in();
         let suppress_wrap_click = matches!(
@@ -2345,15 +2765,26 @@ impl GraphEngine {
                 }
             }
         }
-        if self.transport_dirty {
+        if self.transport_dirty || self.player_dirty {
             let tp = self.transport_pub();
+            let pp = self.player_pub();
             match &self.graph_pub {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
-                    g.transport = tp;
-                    g.transport_rev = g.transport_rev.wrapping_add(1);
-                    self.transport_dirty = false;
+                    if self.transport_dirty {
+                        g.transport = tp;
+                        g.transport_rev = g.transport_rev.wrapping_add(1);
+                        self.transport_dirty = false;
+                    }
+                    if self.player_dirty {
+                        g.player = pp;
+                        g.player_rev = g.player_rev.wrapping_add(1);
+                        self.player_dirty = false;
+                    }
                 },
-                None => self.transport_dirty = false,
+                None => {
+                    self.transport_dirty = false;
+                    self.player_dirty = false;
+                }
             }
         }
 
@@ -2392,12 +2823,11 @@ impl GraphEngine {
                 cap.read(&mut self.system_buf[..n2]);
             }
         }
-        let ply = self.player_gain > 0.0 && self.player_sink.is_some();
-        if ply {
-            if let Some(sink) = &mut self.player_sink {
-                sink.read(&mut self.player_buf[..n2]);
-            }
-        }
+        // File player: read the decoded buffer at the clock's position
+        // (loop/sync/beat-offset all live in the engine, issue #84). Runs
+        // even without a master node so the clock stays true.
+        self.fill_player(frames, block_start_beats, beat_inc);
+        let ply = self.player.is_some() && self.player_gain > 0.0;
         let mut peak = 0.0f32;
         // Multi-rig: sum every rig's MasterOut to the physical output. Fixed
         // stack array — no allocation on the audio thread (max 8 rigs).

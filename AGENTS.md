@@ -746,6 +746,14 @@ Learned so far (2026-11-15, UI polish pass):
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
 
+128. **A looped read that lands on the file end wraps, never "heals":** at the
+    seam a derived position can equal `frames` by float rounding; the NaN-heal
+    path restarted the file from its Beat Offset and silently re-anchored a
+    synced loop one pass out of phase. Only non-finite positions heal; looped
+    ones `rem_euclid` (`beat_offset_shifts_the_start_point`). A synced start
+    armed in the block the transport starts waits for the NEXT bar by design:
+    arm it before `TransportPlay` to land on beat 0.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

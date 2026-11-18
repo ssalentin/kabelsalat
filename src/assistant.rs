@@ -772,18 +772,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"play_file",
-            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
-            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"}},"required":["path"]}
+            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). AUM FilePlayer options: loop, sync (follow the tempo), beats (loop length), offset, bpm (file tempo).",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}},"required":["path"]}
         }},
         {"type":"function","function":{
             "name":"stop_file",
-            "description":"Stop the backing-track file player.",
+            "description":"Stop the backing-track file player (the file and its settings stay; play_file restarts it).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_player",
-            "description":"Set the file-player mix gain (0..1, 0 mutes) without changing what's playing.",
-            "parameters":{"type":"object","properties":{"gain":{"type":"number"}},"required":["gain"]}
+            "description":"Change the file player without restarting it: mix gain (0..1, 0 mutes) and/or the AUM FilePlayer options loop, sync, beats, offset, bpm. Give at least one.",
+            "parameters":{"type":"object","properties":{"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_device",

@@ -759,6 +759,23 @@ pub enum Command {
     /// Mix the file player (backing track) into the master at `gain` (0..1).
     /// Loading/stopping a file is done off-bus (variable-length path).
     SetPlayer { gain: f32 },
+    /// Configure the file player's playback settings (AUM FilePlayer, issue
+    /// #84): `loop_on` restarts the file seamlessly, `sync` follows the
+    /// transport tempo (varispeed), `beats` is the loop's length in beats
+    /// (0 = derive the tempo from `bpm` instead), `offset` shifts the start
+    /// point in beats (±), `bpm` is the file's original tempo. Omitted
+    /// fields keep their current value; settings apply to the loaded file.
+    SetPlayerCfg {
+        loop_on: Option<bool>,
+        sync: Option<bool>,
+        beats: Option<f32>,
+        offset: Option<f32>,
+        bpm: Option<f32>,
+    },
+    /// File-player play-enable (AUM's circular toggle): with sync on and the
+    /// master transport rolling (or counting in), sounding starts at the
+    /// next bar boundary; otherwise it starts now. `on: false` stops.
+    SetPlayerEnable { on: bool },
     /// Master transport: start EVERY transport-capable node (sets
     /// `Node::playing` on all of them) and run the song clock hosted CLAP
     /// plugins follow, from beat 0. Per-node SetNodePlaying overrides

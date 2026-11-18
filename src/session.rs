@@ -118,6 +118,16 @@ impl Session {
         }
     }
 
+    /// True when both hold the same patch, knobs, plugin states, routes and
+    /// rig names; the session name is not compared.
+    pub fn same_content(&self, other: &Session) -> bool {
+        self.params == other.params
+            && self.states == other.states
+            && self.matrix == other.matrix
+            && self.rig_names == other.rig_names
+            && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
+    }
+
     // -- knobs / params ----------------------------------------------------
 
     pub fn param(&self, node: NodeId, param: ParamId) -> Option<f64> {

@@ -35,6 +35,20 @@ pub fn load_config_str(field: &str) -> Option<String> {
         .filter(|m| !m.is_empty())
 }
 
+/// Any JSON field of config.json (None in tests, rule 37).
+pub fn load_config_value(field: &str) -> Option<Value> {
+    if cfg!(test) { return None; }
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|mut v| v.get_mut(field).map(Value::take))
+}
+
+/// Merge one JSON field into config.json (no-op in tests, rule 37).
+pub fn save_config_value(field: &str, value: Value) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_config_values_to(&config_path(), &[(field, value)])
+}
+
 /// Merge key/value pairs into a config JSON file (mode 0600), preserving
 /// unrelated fields.
 fn save_config_values_to(path: &std::path::Path, pairs: &[(&str, Value)]) -> std::io::Result<()> {
@@ -135,6 +149,21 @@ pub fn load_reduce_motion() -> bool {
 pub fn save_reduce_motion(reduce: bool) -> std::io::Result<()> {
     if cfg!(test) { return Ok(()); }
     save_reduce_motion_to(&config_path(), reduce)
+}
+
+/// Persisted `session_autosave` flag in config.json (default on; off in
+/// tests, which never write the user's sessions, rule 37).
+pub fn load_session_autosave() -> bool {
+    if cfg!(test) { return false; }
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("session_autosave").and_then(Value::as_bool))
+        .unwrap_or(true)
+}
+
+pub fn save_session_autosave(on: bool) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_config_values_to(&config_path(), &[("session_autosave", json!(on))])
 }
 
 #[derive(Clone)]

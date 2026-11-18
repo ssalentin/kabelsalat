@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Instrument profiles: map a whole hardware instrument at once.** Pick the
+  instrument for a hardware port in the MIDI matrix (a port whose name names
+  the instrument is matched by itself) and its knobs, drawbars and switches
+  drive the rack, with no MIDI learn per control. The first profile is the
+  **Nord Electro 2**: its nine upper drawbars, rotary slow/fast, percussion and
+  overdrive drive the setBfree organ face. Profiles are MIDI Guide CSV files
+  with a `role` column; more go in `~/.config/kabelsalat/instruments/`.
 - **Odin 2 and Floe in the instrument catalog** (Plugins → Install). Odin 2
   installs from its prebuilt release on x86_64 and builds from source on
   aarch64; its 260 factory patches are fetched too, so the assistant can list,
@@ -17,6 +24,15 @@ releases may still change behaviour and session files.
 - **Catalog cards say what you install:** a short description, the licence,
   how it is installed on this machine, and buttons that open the source code
   and the project's website. `list_instruments` reports the same fields.
+- **GitHub stars on catalog cards:** each card shows its project's star count
+  (★ 235, ★ 3.9k), read live from GitHub once per run when the Install tab
+  opens. Without internet access, or when GitHub refuses, cards show no stars.
+- **Sessions save themselves (#51):** with *Autosave sessions* on (Settings,
+  on by default) the open session is written every 20 s when it changed, and
+  on quit; a patch that was never saved goes to `Autosave`. Loading a session
+  or saving one makes it the open session; a starter template never replaces
+  it. Each saved session has an **Overwrite** action (with a confirm) that
+  saves the current patch over it, and the open session is marked in the list.
 - **AppImage download links in every release:** release notes link the
   x86_64 and aarch64 AppImages directly, and the Release workflow can attach
   packages to a tag that was released before it existed (`-f tag=v0.1.0`).
@@ -58,6 +74,10 @@ releases may still change behaviour and session files.
   setBfree added to a rig was left with only its MIDI cable and stayed
   silent. The assistant also no longer believes LV2 instruments are
   "coming soon".
+- **MIDI matrix, LV2 instrument columns:** a click in a setBfree (or any LV2
+  instrument) column lit or cleared every cell of it, because all its rows
+  showed the MIDI cable. Each cell now routes its own source, with the same
+  keyboard switch and hardware radio group as a Surge column.
 - **A failed catalog install could not be retried:** the next attempt found
   the earlier clone in the build cache and `git clone` refused it. Every
   install now starts from a fresh cache folder.

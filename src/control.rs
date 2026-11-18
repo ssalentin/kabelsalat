@@ -778,6 +778,10 @@ pub enum Command {
     SetCountIn { enabled: bool, bars: u8 },
     /// Apply an installed LV2 preset (`pset:Preset` URI) to an LV2 node.
     LoadLv2Preset { node: NodeId, preset_uri: String },
+    /// Restore an LV2 node's plugin state (a Vital patch for Vitalium), in
+    /// the format `lv2::state_format` names for its plugin. The loader thread
+    /// restores it into a fresh instance that then replaces the node's.
+    LoadLv2State { node: NodeId, state: Vec<u8> },
     /// Send a MIDI programme change (0..=127) to ONE instrument node: how an
     /// instrument with built-in programmes (setBfree) changes its sound.
     ProgramChange { node: NodeId, program: u8 },
@@ -822,7 +826,7 @@ impl Command {
             | Command::Disconnect { .. } | Command::SetParam { .. } | Command::SetRigSource { .. }
             | Command::SetRigDevice { .. } | Command::RenameRig { .. } | Command::SetRigMix { .. } | Command::LoadGraph { .. }
             | Command::SetAudioIn { .. } | Command::LoadRigs { .. } | Command::SetNodeSplit { .. } | Command::SetZoneOctave { .. } | Command::MatrixRule { .. }
-            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::ProgramChange { .. })
+            | Command::MatrixCcMap { .. } | Command::LoadLv2Preset { .. } | Command::LoadLv2State { .. } | Command::ProgramChange { .. })
     }
 }
 

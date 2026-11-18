@@ -659,12 +659,13 @@ Learned so far (2026-11-15, UI polish pass):
     release prevents waveform tracking), `P_VOL` defaults to `0.75`
     (−2.5 dB, keeping chords below `KNEE`), and `meter_color` marks clip
     red only above `0.95` (−3 dBFS).
-118. **A rack rebuild never scans plugins:** `build_rack` called
-    `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
-    load (and every agent edit) of a rack with an LV2 unit classified all
-    ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
-    `classify_lv2_units` reads the background scan's list and runs again when
-    the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+118. **Check a plugin state before the plugin restores it:** Vitalium opens a
+    modal alert box for a patch it cannot parse, and that box waits for a
+    message loop no thread here runs, so the restoring thread hung for good
+    (a hand-written patch without `sample`/`wavetables`/`lfos`). Every state
+    goes through its `lv2::state_format` check (`vital::check_patch`) on the
+    loader thread before `restore_state`; test patches start from the
+    plugin's own saved state, never a hand-written fragment.
 121. **Delete build output you no longer need:** parallel sessions left a
     dozen `~/.cache/ksalat-*-target` dirs (4 to 7 GB each) and 5.2 GB of
     copied test binaries in an old session's scratchpad. `/tmp` (tmpfs,
@@ -700,6 +701,35 @@ Learned so far (2026-11-15, UI polish pass):
     switch + hardware radio group as CLAP cells (`matrix_cell_on`,
     `toggled_sources`). Test a new column kind with
     `an_lv2_column_toggles_one_cell_like_a_clap_column`.
+124. **A small window shows the whole app, not a corner of it:** the rack
+    had fixed 200/220 px column floors and 60 px margins, so below ~950 px
+    it panned and cut Keys and Master off; stage sheets kept 30 px margins
+    and a 200 px minimum that painted into the docks; the mixer's dB marks
+    stacked on a short meter. Column floors come from the faces
+    (`face_min_w`: own knobs, title clear of the LED, Master's meter), a
+    small stage switches to `RackChrome::TIGHT`, a short but wide stage
+    lays the stacks out in one row (`rack_flat`), and sheets clip to
+    themselves. `every_view_fits_small_windows` fails on any text overlap,
+    text outside the window or sideways rack overflow in every view at six
+    window sizes × three docks; `face_layout_tests` audits faces at the same
+    sizes. See the result without the desktop:
+    `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
+    (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
+125. **UI scale follows the monitor the window is on:** `ui_scale_target`
+    read the FOCUSED monitor once at launch, so a window on the 1.0x
+    external screen ran at the laptop's 1.6x (a 1368 px window laid out as
+    855 px). `hypr_window_scale` finds this pid's window in `hyprctl
+    clients` and is re-read every 2 s on its own thread (rule 48).
+126. **Tracked text advances by a width that is never zero:**
+    `layout_tracked` used `glyph_width`, which answered 0 in a busy test
+    run and stacked "kabelsalat" on one spot; the laid-out glyph's width
+    is the fallback.
+127. **A rack rebuild never scans plugins:** `build_rack` called
+    `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
+    load (and every agent edit) of a rack with an LV2 unit classified all
+    ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
+    `classify_lv2_units` reads the background scan's list and runs again when
+    the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
 
 ## Working on kabelsalat
 
@@ -732,7 +762,8 @@ Learned so far (2026-11-15, UI polish pass):
   `main-controls-test`,
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `lv2-async-test`,
-  `sound-library-test`, `organ-test`, `catalog-install-test [id...]`
+  `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `catalog-install-test [id...]`
   (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 29 scripted requests
@@ -773,8 +804,8 @@ Learned so far (2026-11-15, UI polish pass):
   (see "Merging"). Never leave finished work only on the local machine or
   only on a branch. Remove the worktree once its PR is merged.
 - **Merging (user, 2026-11-18):** `main` is protected: no direct pushes
-  (admins included), and the required checks `test (x86_64)`,
-  `test (aarch64)` and `flatpak cargo-sources.json is current` must pass.
+  (admins included), and the required checks `test (x86_64)` and
+  `test (aarch64)` must pass.
   Branches need not be up to date, so a green PR merges at once. GitHub merges a queued auto-merge PR once they
   do; never merge by hand around a red or pending check, and never
   `gh pr merge` without `--auto`. Everything merges on green CI, so the

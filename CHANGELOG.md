@@ -8,6 +8,12 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **Vital patches in Vitalium:** Vitalium (the Linux port of Vital) now plays
+  `.vital` patches, wavetables and modulation included. Its sound list in the
+  editor and the assistant's `list_sounds` / `load_sound` show every patch in
+  Vitalium's folder. Drop a `.vitalbank` or `.vital` file on the window to add
+  it (or run `kabelsalat vital-import <file>`). A loaded patch is kept in saved
+  sessions, through rig edits and through undo.
 - **Instrument profiles: map a whole hardware instrument at once.** Pick the
   instrument for a hardware port in the MIDI matrix (a port whose name names
   the instrument is matched by itself) and its knobs, drawbars and switches
@@ -78,11 +84,14 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
-- **Loading a session with an LV2 unit took 3 to 4 seconds:** every rack
-  rebuild scanned all installed LV2 plugins on the UI thread to tell whether
-  the unit is an instrument. It now uses the background plugin scan, and the
-  setBfree session loads in under 1 ms of UI time (was 2.6 to 4.0 s). Agent
-  edits of such a rack no longer freeze the window either.
+- **Small and tiled windows:** the rack fits windows down to the 760 px
+  minimum instead of panning with Keys and Master cut off; a short, wide
+  window lays each instrument chain out in one row; the Mixer, Matrix,
+  Plugins and Settings sheets give their margins to content, scroll instead
+  of painting into the keyboard or assistant dock, and the master meter no
+  longer stacks its dB marks. The rig strip hint is shown only where it fits.
+- **UI scale on a second monitor:** the scale follows the monitor the window
+  is on (it kept the laptop's 1.6x on a 1.0x external screen).
 - **An instrument the assistant adds plays at once:** `add_node` wires a
   CLAP instrument or an LV2 instrument (setBfree, Vitalium, …) like a new
   rig's synth: the rig's Keys into it and it into the rig's Master. A

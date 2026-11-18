@@ -169,7 +169,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         name: "Vitalium",
         format: Format::Lv2,
         description: "Spectral warping wavetable synth (Vital port)",
-        about: "The DISTRHO port of the Vital wavetable synth, with spectral warping and a modulation matrix.",
+        about: "The DISTRHO port of the Vital wavetable synth, with spectral warping and a modulation matrix. Plays Vital patches: drop a .vitalbank or .vital file on the window to add it.",
         license: "GPL-3.0",
         homepage: Some("https://distrho.github.io/DISTRHO-Ports/"),
         repo: "DISTRHO/DISTRHO-Ports",

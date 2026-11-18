@@ -10137,6 +10137,11 @@ impl DemoApp {
                         .size(13.0)
                         .color(theme::INK_2),
                 );
+                ui.label(
+                    egui::RichText::new(format!("kabelsalat {}", crate::VERSION))
+                        .size(12.5)
+                        .color(theme::INK_2),
+                );
                 ui.add_space(12.0);
                 Self::stage_hairline(ui);
                 ui.add_space(14.0);

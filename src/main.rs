@@ -5,6 +5,9 @@
 //! can develop and verify them in parallel; integration happens in `main` once
 //! the spikes pass their go/no-go checks.
 
+/// Release version and the commit it was built from, e.g. "0.1.0 (abc1234)".
+pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("KABELSALAT_COMMIT"), ")");
+
 mod aeolus;
 mod assistant;
 mod audio;
@@ -120,7 +123,7 @@ fn main() -> anyhow::Result<()> {
         "record-test" => record::run_test(),
         "audio-in-test" => audio_in::run_test(),
         "--version" | "-V" => {
-            println!("kabelsalat {}", env!("CARGO_PKG_VERSION"));
+            println!("kabelsalat {VERSION}");
             Ok(())
         }
         "--help" | "-h" | "help" => {

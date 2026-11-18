@@ -19776,6 +19776,30 @@ mod split_bpm_tests {
         assert!(!crate::host::discover_dexed_patches().is_empty() || !crate::host::list_clap_plugins().iter().any(|p| p.id == DEXED_ID));
     }
 
+    /// Rule 127: a session load classifies LV2 units from the background
+    /// scan, never a scan of its own, and a scan that lands later fixes them.
+    #[test]
+    fn session_load_classifies_lv2_from_the_background_scan() {
+        let uri = "urn:test:organ";
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst };
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_lv2 = vec![info(false)];
+        app.plugins_loaded = true;
+        let s = crate::session::Session::new("organ", DemoApp::build_lv2_instrument_graph(uri, "Organ"));
+        app.apply_session(&s).unwrap();
+        let node = s.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Lv2 { .. })).unwrap().id;
+        let organ = |app: &DemoApp| app.units.iter().position(|u| u.node_id == node).expect("organ unit");
+        assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send((Vec::new(), vec![info(true)])).unwrap();
+        app.plugin_scan = Some(rx);
+        app.poll_plugin_scan();
+        let u = &app.units[organ(&app)];
+        assert!(u.lv2_inst, "a landing scan reclassifies the loaded rack");
+        assert_eq!(u.sub, "lv2 synth");
+    }
+
     #[test]
     fn sync_mirrors_remote_cc_maps() {
         let mut app = DemoApp::new_with_sink(None);
@@ -23668,6 +23692,33 @@ mod voice_host_tests {
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
+}
+
+/// Times loading saved session packages (args: package paths) on the
+/// offline-engine app with real plugins: the UI-thread `apply_session`, and
+/// the slowest of the frames that follow while plugins load.
+pub fn run_session_load_bench(paths: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(!paths.is_empty(), "usage: kabelsalat session-load-bench <package.ksalat>...");
+    let mut rig = EvalRig::new(Assistant::new(), &(Vec::new(), crate::lv2::discover()))?;
+    rig.settle();
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    for round in 0..2 {
+        for p in paths {
+            let s = crate::session::Session::load(std::path::Path::new(p))?;
+            let t = std::time::Instant::now();
+            rig.app.apply_session(&s)?;
+            let apply = ms(t.elapsed());
+            let mut worst = 0.0f64;
+            for _ in 0..100 {
+                let f = std::time::Instant::now();
+                rig.frame();
+                worst = worst.max(ms(f.elapsed()));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            println!("session-load-bench round {round} {p}: apply_session {apply:.1} ms, slowest next frame {worst:.1} ms");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

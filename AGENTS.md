@@ -724,6 +724,12 @@ Learned so far (2026-11-15, UI polish pass):
     `layout_tracked` used `glyph_width`, which answered 0 in a busy test
     run and stacked "kabelsalat" on one spot; the laid-out glyph's width
     is the fallback.
+127. **A rack rebuild never scans plugins:** `build_rack` called
+    `lv2::discover()` to tell whether an LV2 unit is an instrument, so every
+    load (and every agent edit) of a rack with an LV2 unit classified all
+    ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
+    `classify_lv2_units` reads the background scan's list and runs again when
+    the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
 
 ## Working on kabelsalat
 

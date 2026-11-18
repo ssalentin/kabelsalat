@@ -349,8 +349,11 @@ pub fn plan_pass(
             out.push(OutEvent::Start { at_ns: a.tick0_ns.max(now_ns) });
             st.running = true;
         }
+        // Only the lookahead window: every later tick is still "worth
+        // scheduling", so without this bound the loop never ends.
         while let Some(k) = next_grid_k(a.tick0_ns, a.spb_ns, st.next_tick, now_ns) {
             let at = a.tick0_ns + (k as u64) * (a.spb_ns / PPQN) as u64;
+            if at > now_ns + LOOKAHEAD_NS { break; }
             out.push(OutEvent::Tick { at_ns: at.max(now_ns) });
             st.next_tick = k + 1;
         }

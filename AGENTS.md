@@ -7,6 +7,13 @@ proven with screenshots.** Do not claim a visual change works without showing
 it. Before/after screenshots are expected for design work; embed them in the
 reply by absolute path so the user can see them inline.
 
+**This machine's setup lives outside the repo:** if
+`~/.config/kabelsalat/agents.local.md` exists, read it before you build, run
+or capture the app. It holds the display environment, the compositor's
+window commands, the input tools, the key for visual review and the attached
+MIDI hardware. Keep machine- and person-specific details there, never in this
+file (the repo is public, and other contributors have other machines).
+
 How to capture (verified harness, see "Working on kabelsalat" below):
 
 ```sh
@@ -15,15 +22,11 @@ cargo build
 scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transport
 ```
 
-- Environment: `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000`
-  (the harness sets these itself). Single frames of the real app: `scripts/shot.sh out.png [pid]`
+- Single frames of the real app: `scripts/shot.sh out.png [pid]`
   (window buffer only; never `grim -o`/`-g`, rule 108).
-- Key injection: `wtype` (Wayland virtual keyboard): `wtype -k F4`, `wtype -k Tab`, `wtype "text"`.
-- Visual review = DeepSeek vision via the app's BYOK key
-  (`~/.config/kabelsalat/config.json`, field `deepseek_api_key` — NEVER print or
-  commit it). POST `https://api.deepseek.com/chat/completions`, model
-  `deepseek-flash` (text+image), OpenAI-style `image_url` data-URL parts,
-  **max_tokens ≥ 4000**. Downscale images first (`magick`).
+- Key injection: `wtype` (Wayland virtual keyboard), e.g. `wtype -k F4`.
+- Visual review = a vision model looking at the downscaled screenshots
+  (endpoint, model and key: the local setup file; never print or commit a key).
 - Non-visual changes: `cargo test` (unit suite) plus the relevant CLI self-test
   (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below).
 
@@ -954,8 +957,8 @@ Learned so far (2026-11-15, UI polish pass):
   (Flatpak, AppImage, tarball, Arch, for x86_64 and aarch64) and publishes
   the GitHub release. A `nightly` pre-release of `main` is rebuilt every
   night. Details: `docs/PACKAGING.md` ("Releases", "Nightly").
-- **Build / run:** `export PATH="$HOME/.cargo/bin:$PATH"; cargo build`, then
-  `WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000 ./target/debug/kabelsalat`.
+- **Build / run:** `cargo build`, then `./target/debug/kabelsalat` in the
+  desktop session's environment (this machine's values: local setup file).
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
 - **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
@@ -984,13 +987,13 @@ Learned so far (2026-11-15, UI polish pass):
   `llm::fake::FakeTransport` (rule 37).
 - **Agents:** `kabelsalat mcp` (headless) or `kabelsalat mcp --attach` (drive
   the running app); one-shot: `kabelsalat send '<json>'`.
-- **Screenshots of the real app:** launch, wait until `hyprctl activewindow`
-  shows your pid, fullscreen it with `hyprctl dispatch 'hl.dsp.window.fullscreen()'`
-  (rule 55), inject keys with `wtype -k F4` (rule 24), then
+- **Screenshots of the real app:** launch, wait until the compositor shows
+  your pid as the active window, fullscreen it (rule 55; commands: local
+  setup file), inject keys with `wtype -k F4` (rule 24), then
   `scripts/shot.sh out.png <pid>` (rule 108). Click with
   `scripts/click.sh <pid> <x> <y>` (window-relative logical px = egui
-  points; needs `wlrctl`, here built into `~/.local/bin`).
-- **Hyprland window glitch:** the app process can run while its window stops
+  points; needs `wlrctl`).
+- **Window glitch:** the app process can run while its window stops
   listing; relaunch cleanly (`pkill -x kabelsalat; rm -f $XDG_RUNTIME_DIR/kabelsalat.sock`).
 
 ## Ground rules

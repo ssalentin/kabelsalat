@@ -1,27 +1,37 @@
 //! File player (backing tracks) — ARCHITECTURE §8 P2.
 //!
-//! Decodes an audio file on its own thread and streams stereo f32 samples into a
-//! lock-free ring the engine consumes (same RT pattern as `capture.rs`). The
-//! engine only pops samples and multiplies by a gain — no decoding, allocation,
-//! or file I/O on the audio thread.
+//! AUM FilePlayer parity (issue #84): loop (seamless restart), tempo sync
+//! (varispeed from the file's original BPM — never time-stretch), number of
+//! beats (the loop's length in beats, so the tempo is derived from the file
+//! and an aligned loop never drifts), beat offset, and a play-enable that
+//! starts at the next bar boundary while the transport rolls.
 //!
-//! Control is split: the engine owns the `PlayerSink` (ring consumer); the UI
-//! owns the `PlayerControl` (a channel to the decode thread) and calls
-//! `play(path)` / `stop()`. This keeps variable-length paths off the fixed-size
-//! control-plane command bus.
+//! Split of work:
+//! - This module's thread owns every file I/O: parse the WAV (16/24-bit PCM
+//!   or 32-bit float — the recorder's own format), upmix to stereo, and hand
+//!   the decoded buffer to the engine through a lock-free ring. It parks on
+//!   its channel between loads (rule 47).
+//! - The engine owns the clock: it reads the decoded buffer at a fractional
+//!   position advanced per frame. While sync is on and the master transport
+//!   rolls, the position is DERIVED from the song clock (the metronome's own
+//!   beat factor, rule 43), so a beats-aligned loop is locked by construction
+//!   — a BPM change is followed within the same block, with no phase jump.
+//!   No decoding, allocation, or file I/O on the audio thread; big buffers
+//!   leave it through a retirement ring (rule 107 discipline).
 //!
-//! First milestone: 16/24-bit PCM or 32-bit float WAV (mono/stereo), linearly resampled to the
-//! engine rate. Compressed formats (mp3/flac/ogg via symphonia) are a follow-up.
+//! Compressed formats (mp3/flac/ogg via symphonia) are a follow-up.
 
-use std::io::Read;
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::path::Path;
+use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 
-use rtrb::{Consumer, Producer, RingBuffer};
+use rtrb::{Producer, PushError};
+
+/// Default original BPM when a file carries no "nnn bpm" in its name.
+pub const DEFAULT_BPM: f32 = 120.0;
 
 enum PlayerMsg {
-    Play(PathBuf),
-    Stop,
+    Play(std::path::PathBuf),
 }
 
 /// UI-side handle: tell the decode thread what to play.
@@ -31,138 +41,199 @@ pub struct PlayerControl {
 }
 
 impl PlayerControl {
-    pub fn play(&self, path: impl Into<PathBuf>) {
+    /// Load `path` and start playback (the engine arms the file at the next
+    /// bar line when sync is on and the transport rolls; see `load_player`).
+    pub fn play(&self, path: impl Into<std::path::PathBuf>) {
         let _ = self.tx.send(PlayerMsg::Play(path.into()));
     }
-    pub fn stop(&self) {
-        let _ = self.tx.send(PlayerMsg::Stop);
+}
+
+/// A decoded file, ready for the engine: interleaved STEREO samples at the
+/// file's own rate (the engine reads it at a fractional position, so the
+/// varispeed rate can change every frame) plus the original BPM discovered
+/// from the filename.
+#[derive(Clone)]
+pub struct PlayerData {
+    pub samples: Arc<[f32]>,
+    pub sample_rate: u32,
+    /// "nnn bpm" in the filename (AUM's default for the original tempo).
+    pub bpm: Option<f32>,
+}
+
+impl PlayerData {
+    pub fn frames(&self) -> usize {
+        self.samples.len() / 2
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.frames() as f64 / self.sample_rate.max(1) as f64
+    }
+
+    /// Build from a parsed WAV: upmix mono/multichannel to stereo.
+    pub fn from_wav(w: Wav) -> Self {
+        let file_ch = w.channels.max(1);
+        let frames = w.data.len() / file_ch;
+        let mut samples = Vec::with_capacity(frames * 2);
+        for f in 0..frames {
+            samples.push(sample_at(&w.data, f, 0, file_ch));
+            samples.push(sample_at(&w.data, f, file_ch - 1, file_ch));
+        }
+        Self { samples: samples.into(), sample_rate: w.sample_rate, bpm: None }
+    }
+
+    /// Interleaved stereo at `sample_rate`, for tests and self-tests.
+    pub fn from_samples(samples: Vec<f32>, sample_rate: u32) -> Self {
+        Self { samples: samples.into(), sample_rate, bpm: None }
     }
 }
 
-/// Engine-side handle: pop decoded samples (RT-safe).
-pub struct PlayerSink {
-    consumer: Consumer<f32>,
+/// "nnn bpm" in the filename, AUM's default for the file's original tempo.
+/// Digits (optionally with a decimal point) immediately before "bpm",
+/// case-insensitive, clamped to the transport's tempo range.
+pub fn filename_bpm(path: &Path) -> Option<f32> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    let idx = name.find("bpm")?;
+    let before = name[..idx].trim_end_matches(|c: char| c.is_whitespace() || c == '_' || c == '-');
+    let num: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if !num.chars().any(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let bpm: f32 = num.trim_start_matches('.').replace(',', ".").parse().ok()?;
+    (20.0..=300.0).contains(&bpm).then_some(bpm)
 }
 
-impl PlayerSink {
-    pub fn read(&mut self, out: &mut [f32]) {
-        for s in out.iter_mut() {
-            *s = self.consumer.pop().unwrap_or(0.0);
+/// File-player playback settings (AUM FilePlayer options). Engine-owned,
+/// applied to whatever file is loaded; set through `Command::SetPlayerCfg`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayerCfg {
+    /// Loop: restart the file seamlessly at its end.
+    pub loop_on: bool,
+    /// Sync: playback rate follows the transport tempo (varispeed).
+    pub sync: bool,
+    /// Number of Beats: the loop's length in beats. With loop+sync on, the
+    /// file's tempo is DERIVED from it (`ref_bpm`), so one pass lasts exactly
+    /// this many song beats and an aligned loop never drifts. 0 = unset.
+    pub beats: f32,
+    /// Beat Offset (±): where in the file playback starts, in beats.
+    pub offset: f32,
+    /// Original BPM: the file's own tempo (adopted from "nnn bpm" in the
+    /// filename at load, overridable).
+    pub bpm: f32,
+}
+
+impl Default for PlayerCfg {
+    fn default() -> Self {
+        Self { loop_on: false, sync: false, beats: 0.0, offset: 0.0, bpm: DEFAULT_BPM }
+    }
+}
+
+impl PlayerCfg {
+    /// The file's reference tempo. AUM "Number of Beats": with loop AND sync
+    /// on and beats set, the tempo is derived from the file duration so one
+    /// pass is exactly `beats` song beats; otherwise it is the original BPM.
+    pub fn ref_bpm(&self, duration: f64) -> f64 {
+        if self.loop_on && self.sync && self.beats > 0.0 && duration > 0.0 {
+            self.beats as f64 * 60.0 / duration
+        } else {
+            self.bpm as f64
         }
     }
+
+    /// Where playback starts, in file beats (AUM "Beat Offset", ±): the
+    /// offset wrapped into one pass of the file.
+    pub fn start_beats(&self, ref_bpm: f64, duration: f64) -> f64 {
+        let total = (ref_bpm * duration / 60.0).max(1e-9);
+        (self.offset as f64).rem_euclid(total)
+    }
 }
 
-/// Spawn the decode thread; return (engine sink, UI control).
-pub fn start(sample_rate: u32, channels: usize) -> (PlayerSink, PlayerControl) {
-    let cap = (sample_rate as usize) * channels * 4; // ~4 s headroom
-    let (producer, consumer) = RingBuffer::new(cap);
+/// Read one stereo frame at fractional position `pos` (in file frames) with
+/// cubic Hermite interpolation. `wrap` makes the neighbors loop around the
+/// file ends, so a looping seam interpolates the file's own end→start
+/// transition — no gap, no jump (test: the seam renders a whole-cycle sine
+/// exactly). Allocation-free.
+pub fn read_frame(data: &[f32], frames: usize, pos: f64, wrap: bool) -> [f32; 2] {
+    if frames == 0 {
+        return [0.0, 0.0];
+    }
+    let pos = if wrap {
+        pos.rem_euclid(frames as f64)
+    } else {
+        pos.clamp(0.0, (frames - 1) as f64)
+    };
+    let i = pos.floor() as usize;
+    let f = (pos - i as f64) as f32;
+    let n = frames as isize;
+    let idx = |k: isize| -> usize {
+        let mut j = i as isize + k;
+        if wrap {
+            j = j.rem_euclid(n);
+        } else {
+            j = j.clamp(0, n - 1);
+        }
+        j as usize
+    };
+    let (i0, i1, i2, i3) = (idx(-1), idx(0), idx(1), idx(2));
+    let mut out = [0.0f32; 2];
+    for c in 0..2 {
+        let (p0, p1) = (data[i0 * 2 + c], data[i1 * 2 + c]);
+        let (p2, p3) = (data[i2 * 2 + c], data[i3 * 2 + c]);
+        let m1 = (p2 - p0) * 0.5;
+        let m2 = (p3 - p1) * 0.5;
+        out[c] = (2.0 * f * f * f - 3.0 * f * f + 1.0) * p1
+            + (f * f * f - 2.0 * f * f + f) * m1
+            + (-2.0 * f * f * f + 3.0 * f * f) * p2
+            + (f * f * f - f * f) * m2;
+    }
+    out
+}
+
+/// Spawn the decode thread; return the UI-side control. The thread parses
+/// WAVs off both the audio and UI threads and pushes each decoded buffer
+/// into `loader` (the engine pops it at block boundaries). It parks on its
+/// channel between loads and exits when the app drops the engine's ring.
+pub fn start(mut loader: Producer<PlayerData>) -> PlayerControl {
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("file-player".into())
-        .spawn(move || decode_loop(rx, producer, sample_rate, channels))
+        .spawn(move || {
+            while let Ok(PlayerMsg::Play(path)) = rx.recv() {
+                match load_file(&path) {
+                    Ok(data) => push_loaded(&mut loader, data),
+                    Err(e) => eprintln!("file-player: cannot open {}: {e:#}", path.display()),
+                }
+            }
+        })
         .expect("spawn file-player thread");
-    (PlayerSink { consumer }, PlayerControl { tx })
+    PlayerControl { tx }
 }
 
-fn decode_loop(rx: Receiver<PlayerMsg>, mut producer: Producer<f32>, sr: u32, ch: usize) {
-    let mut playing = false;
-    loop {
-    // Wait for a command (idle) or poll for stop while playing.
-    let msg = if playing {
-        match rx.try_recv() {
-            Ok(m) => Some(m),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => break,
-        }
-    } else {
-        match rx.recv() {
-            Ok(m) => Some(m),
-            Err(_) => break,
-        }
-    };
-    if let Some(PlayerMsg::Stop) = msg {
-        playing = false;
-        continue;
-    }
-    if let Some(PlayerMsg::Play(path)) = msg {
-        playing = true;
-        match std::fs::File::open(&path) {
-            Ok(f) => stream_wav(f, &mut producer, sr, ch, &rx, &mut playing),
-            Err(e) => eprintln!("file-player: cannot open {}: {e}", path.display()),
-        }
-        playing = false;
-    }
-    }
+/// Decode a WAV file into a `PlayerData` (parse, upmix, filename BPM).
+pub fn load_file(path: &Path) -> anyhow::Result<PlayerData> {
+    let mut file = std::fs::File::open(path)?;
+    let wav = parse_wav(&mut file)?;
+    let mut data = PlayerData::from_wav(wav);
+    data.bpm = filename_bpm(path);
+    Ok(data)
 }
 
-/// Decode a WAV (16/24-bit PCM, 32-bit float), resample to `sr`, upmix to `ch`, push to the ring.
-/// Checks `rx` for Stop between blocks so playback can be interrupted.
-fn stream_wav(
-    mut file: std::fs::File,
-    producer: &mut Producer<f32>,
-    sr: u32,
-    ch: usize,
-    rx: &Receiver<PlayerMsg>,
-    playing: &mut bool,
-) {
-    let wav = match parse_wav(&mut file) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("file-player: {e}");
-            return;
+/// Hand one decoded buffer to the engine. The ring holds a handful of
+/// slots; the engine drains one per render block, so this parks briefly
+/// rather than spinning (rule 47) and gives up if the app is gone.
+fn push_loaded(loader: &mut Producer<PlayerData>, mut data: PlayerData) {
+    while let Err(PushError::Full(d)) = loader.push(data) {
+        if loader.is_abandoned() {
+            return; // engine side dropped: nobody will ever drain this
         }
-    };
-    let file_sr = wav.sample_rate.max(1);
-    let file_ch = wav.channels.max(1);
-    let ratio = file_sr as f64 / sr as f64;
-    let frames = wav.data.len() / file_ch;
-    let mut pos = 0.0f64;
-    let mut block = [0.0f32; 1024];
-    while *playing {
-        // Check for a stop/new command without blocking.
-        match rx.try_recv() {
-            Ok(PlayerMsg::Stop) => {
-                *playing = false;
-                return;
-            }
-            Ok(PlayerMsg::Play(_)) => {
-                // A new play request: abort this file (loop will pick it up).
-                *playing = false;
-                return;
-            }
-            Err(TryRecvError::Disconnected) => {
-                *playing = false;
-                return;
-            }
-            Err(TryRecvError::Empty) => {}
-        }
-        let mut n = 0;
-        while n < block.len() / ch {
-            let i = pos as usize;
-            if i + 1 >= frames {
-                *playing = false;
-                break;
-            }
-            let fr = (pos - i as f64) as f32;
-            for c in 0..ch {
-                let src_c = c.min(file_ch - 1);
-                let a = sample_at(&wav.data, i, src_c, file_ch);
-                let b = sample_at(&wav.data, i + 1, src_c, file_ch);
-                block[n * ch + c] = a * (1.0 - fr) + b * fr;
-            }
-            n += 1;
-            pos += ratio;
-        }
-        for &s in &block[..n * ch] {
-            if producer.push(s).is_err() {
-                // Ring full: brief sleep so we don't spin-drop the whole file.
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                let _ = producer.push(s);
-            }
-        }
-        if n == 0 {
-            break;
-        }
+        data = d;
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 
@@ -178,6 +249,7 @@ pub(crate) struct Wav {
 }
 
 pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
+    use std::io::Read;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
@@ -221,31 +293,6 @@ pub(crate) fn parse_wav(file: &mut std::fs::File) -> anyhow::Result<Wav> {
         anyhow::bail!("WAV missing fmt/data chunks");
     }
     Ok(Wav { sample_rate, channels, data })
-}
-/// End-to-end player self-test: play a system WAV and assert audio flows
-/// through the ring (decode → resample → upmix → ring).
-pub fn run_test() -> anyhow::Result<()> {
-    let path = "/usr/share/sounds/alsa/Front_Center.wav";
-    anyhow::ensure!(std::path::Path::new(path).exists(), "test WAV missing: {path}");
-    let (mut sink, ctrl) = start(48000, 2);
-    ctrl.play(path);
-    let mut buf = vec![0.0f32; 4800];
-    let (mut nonzero, mut total) = (0usize, 0usize);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
-    while std::time::Instant::now() < deadline {
-        sink.read(&mut buf);
-        for &s in &buf {
-            if s.abs() > 1e-4 {
-                nonzero += 1;
-            }
-            total += 1;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    ctrl.stop();
-    anyhow::ensure!(nonzero > 1000, "player produced no audio ({nonzero} nonzero of {total})");
-    println!("player-test: OK — backing track decoded and streamed ({nonzero} nonzero samples of {total})");
-    Ok(())
 }
 
 #[cfg(test)]
@@ -293,5 +340,511 @@ mod wav_format_tests {
         assert!((w.data[0] - 0.5).abs() < 1e-6);
 
         assert!(parse(&wav_bytes(1, 8, 44100, 1, &[128])).is_err(), "8-bit is refused with a reason");
+    }
+
+    /// A parsed file becomes stereo at its own rate (rule 54: the player
+    /// reads what the recorder writes — float32 round trip).
+    #[test]
+    fn parsed_files_upmix_to_stereo_at_file_rate() {
+        // Mono float32: L and R both carry the sample.
+        let mono: Vec<u8> = [0.25f32, -0.75, 0.5].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let d = PlayerData::from_wav(parse(&wav_bytes(3, 32, 44100, 1, &mono)).unwrap());
+        assert_eq!((d.sample_rate, d.frames()), (44100, 3));
+        assert_eq!(&d.samples[..], &[0.25, 0.25, -0.75, -0.75, 0.5, 0.5]);
+
+        // 3-channel float32: L = ch0, R = ch2.
+        let tri: Vec<u8> = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let d = PlayerData::from_wav(parse(&wav_bytes(3, 32, 48000, 3, &tri)).unwrap());
+        assert_eq!(&d.samples[..], &[0.1, 0.3, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn filename_bpm_reads_the_tempo_aum_style() {
+        let bpm = |s: &str| filename_bpm(Path::new(s));
+        assert_eq!(bpm("/x/take 120 bpm.wav"), Some(120.0));
+        assert_eq!(bpm("/x/90BPM Groove.wav"), Some(90.0));
+        assert_eq!(bpm("/x/groove-87.5bpm.wav"), Some(87.5));
+        assert_eq!(bpm("/x/backing_300_bpm.wav"), Some(300.0));
+        assert_eq!(bpm("/x/bpm120.wav"), None, "digits come before 'bpm'");
+        assert_eq!(bpm("/x/9 bpm.wav"), None, "outside the tempo range");
+        assert_eq!(bpm("/x/take.wav"), None);
+        assert_eq!(bpm("/x/way too long name with bpm but no digits.wav"), None);
+    }
+
+    /// AUM "Number of Beats": with loop+sync on, the reference tempo comes
+    /// from the file duration, so one pass lasts exactly `beats` song beats.
+    #[test]
+    fn ref_bpm_derives_from_beats_only_for_looped_sync() {
+        let mut cfg = PlayerCfg::default();
+        cfg.beats = 8.0;
+        // 8 beats over 4 s = 120 BPM.
+        assert!((cfg.ref_bpm(4.0) - 120.0).abs() < 1e-9, "loop+sync derives the tempo");
+        cfg.sync = false;
+        assert!((cfg.ref_bpm(4.0) - DEFAULT_BPM as f64).abs() < 1e-9, "sync off: original BPM");
+        cfg.sync = true;
+        cfg.loop_on = false;
+        assert!((cfg.ref_bpm(4.0) - DEFAULT_BPM as f64).abs() < 1e-9, "one-shot: original BPM");
+        cfg.loop_on = true;
+        cfg.beats = 0.0;
+        assert!((cfg.ref_bpm(4.0) - DEFAULT_BPM as f64).abs() < 1e-9, "no beats set: original BPM");
+    }
+
+    #[test]
+    fn start_beats_wraps_the_offset_into_one_pass() {
+        let mut cfg = PlayerCfg::default();
+        cfg.beats = 4.0;
+        cfg.loop_on = true;
+        cfg.sync = true;
+        // 4 s at 60 BPM = 4 beats: offset 5 → 1; −0.5 → 3.5.
+        cfg.offset = 5.0;
+        assert_eq!(cfg.start_beats(60.0, 4.0), 1.0);
+        cfg.offset = -0.5;
+        assert!((cfg.start_beats(60.0, 4.0) - 3.5).abs() < 1e-9);
+        cfg.offset = 0.0;
+        assert_eq!(cfg.start_beats(60.0, 4.0), 0.0);
+    }
+
+    /// The seam read interpolates the file's own end→start transition: a
+    /// whole-cycle sine rendered across the wrap stays on the sine (cubic
+    /// Hermite is exact enough that any index slip would stand out), and a
+    /// rate-1 read of integer positions is bit-exact.
+    #[test]
+    fn read_frame_wraps_the_seam_without_a_click() {
+        const SR: f64 = 48000.0;
+        let frames = SR as usize; // exactly 440 cycles of 440 Hz
+        let samples: Vec<f32> = (0..frames)
+            .flat_map(|i| {
+                let s = (440.0 * i as f64 / SR * std::f64::consts::TAU).sin() as f32;
+                [s, -s]
+            })
+            .collect();
+        // Integer positions: exact.
+        assert_eq!(read_frame(&samples, frames, 0.0, true), [samples[0], samples[1]]);
+        assert_eq!(read_frame(&samples, frames, 1234.0, true), [samples[2468], samples[2469]]);
+        // Across the wrap the sine continues, not jumps: sample the 400
+        // frames around it against the ideal.
+        let mut worst = 0.0f32;
+        for k in 0..400 {
+            let pos = frames as f64 - 200.0 + k as f64 * 0.25;
+            let [l, r] = read_frame(&samples, frames, pos, true);
+            let ideal = (440.0 * pos / SR * std::f64::consts::TAU).sin() as f32;
+            worst = worst.max((l - ideal).abs()).max((r + ideal).abs());
+        }
+        assert!(worst < 2e-5, "seam read is continuous (worst {worst})");
+        // No wrap: the tail clamps instead of ringing.
+        let [l, _] = read_frame(&samples, frames, frames as f64 + 3.0, false);
+        assert_eq!(l, samples[(frames - 1) * 2]);
+    }
+}
+
+/// Headless engine fixtures shared by the unit tests and `player-test`
+/// (issue #84): a real `GraphEngine` rendering block by block, a file of
+/// beat-aligned bursts, and onset measurement on the song clock.
+pub mod selftest {
+    use super::*;
+    use crate::control::{command_bus, Command, CommandBus, Graph};
+    use crate::engine::{GraphEngine, GraphPub, PlayerPub};
+    use crate::transport::Transport;
+    use std::sync::Mutex;
+
+    pub const OUT_SR: f64 = 48_000.0;
+    /// Not the engine rate, so every test also exercises the rate conversion.
+    pub const FILE_SR: u32 = 44_100;
+
+    /// Engine + the player's channels, as `build_audio` wires them.
+    pub struct Rig {
+        pub engine: GraphEngine,
+        pub bus: CommandBus,
+        pub load: Producer<PlayerData>,
+        pub back: rtrb::Consumer<Arc<[f32]>>,
+        pub published: Arc<Mutex<GraphPub>>,
+    }
+
+    impl Rig {
+        pub fn new() -> Self {
+            let (bus, drain) = command_bus();
+            let mut engine = GraphEngine::new(Graph::default(), drain, OUT_SR, vec![]);
+            let published = Arc::new(Mutex::new(GraphPub::default()));
+            engine.set_graph_pub(published.clone());
+            let (load, rx) = rtrb::RingBuffer::new(4);
+            let (back_tx, back) = rtrb::RingBuffer::new(4);
+            engine.set_player_channels(rx, back_tx);
+            Self { engine, bus, load, back, published }
+        }
+
+        /// Deliver a decoded file (the decode thread's job in the app).
+        pub fn load(&mut self, d: PlayerData) {
+            assert!(self.load.push(d).is_ok(), "player ring full");
+        }
+
+        pub fn send(&mut self, cmd: Command) {
+            assert!(self.bus.send(cmd), "command bus full");
+        }
+
+        pub fn state(&self) -> PlayerPub {
+            self.published.lock().unwrap().player
+        }
+
+        /// Render `frames` frames in blocks of `block`; `f` sees each block's
+        /// player output plus the song beat of its first frame and the
+        /// per-frame beat increment (the tempo is constant within a block).
+        pub fn run(&mut self, frames: usize, block: usize, mut f: impl FnMut(&[f32], f64, f64)) {
+            let mut buf = vec![0.0f32; block * 2];
+            let mut done = 0;
+            while done < frames {
+                let n = block.min(frames - done);
+                let t = self.engine.transport();
+                let inc = Transport::beats_per_frame(t.bpm, OUT_SR);
+                self.engine.render(&mut buf[..n * 2], 2);
+                f(self.engine.player_block(n), t.beats, inc);
+                done += n;
+            }
+        }
+
+        /// Run and collect the song beat of every burst onset (the first
+        /// loud frame after at least 2000 quiet ones).
+        pub fn onsets(&mut self, frames: usize, block: usize) -> Vec<f64> {
+            let mut out = Vec::new();
+            let mut quiet_for = 1_000_000usize;
+            self.run(frames, block, |p, b0, inc| {
+                for (i, s) in p.chunks(2).enumerate() {
+                    if s[0].abs() > 0.3 {
+                        if quiet_for > 2000 {
+                            out.push(b0 + i as f64 * inc);
+                        }
+                        quiet_for = 0;
+                    } else {
+                        quiet_for += 1;
+                    }
+                }
+            });
+            out
+        }
+    }
+
+    /// A file of `frames` frames at `FILE_SR` with an instant-attack burst at
+    /// every `every`-th of `beats` equal slices (a pass is `beats` beats long).
+    pub fn burst_file(frames: usize, beats: usize, every: usize) -> PlayerData {
+        let mut s = vec![0.0f32; frames * 2];
+        for k in (0..beats).step_by(every) {
+            let at = k * frames / beats;
+            for n in 0..400.min(frames - at) {
+                let v = 0.9 * (-(n as f32) / 40.0).exp() * (std::f32::consts::TAU * 1000.0 * n as f32 / FILE_SR as f32).cos();
+                s[(at + n) * 2] = v;
+                s[(at + n) * 2 + 1] = v;
+            }
+        }
+        PlayerData::from_samples(s, FILE_SR)
+    }
+
+    /// A 4-beat loop that lasts exactly 4 beats at `bpm` (a beats-aligned loop).
+    pub fn aligned_loop(bpm: f64) -> PlayerData {
+        burst_file((4.0 * 60.0 / bpm * FILE_SR as f64).round() as usize, 4, 1)
+    }
+
+    /// Worst distance of any onset from the integer beat grid.
+    pub fn worst_off_grid(onsets: &[f64]) -> f64 {
+        onsets.iter().map(|b| (b - b.round()).abs()).fold(0.0, f64::max)
+    }
+
+    /// Frames' worth of beats at `bpm` (the tolerance unit).
+    pub fn frames_to_beats(frames: f64, bpm: f64) -> f64 {
+        frames * Transport::beats_per_frame(bpm, OUT_SR)
+    }
+
+    /// A whole-cycle sine file for seam measurements: 441 Hz over 1 s at
+    /// `FILE_SR` is exactly 441 cycles, so loop-around is the sine itself.
+    pub fn sine_loop() -> PlayerData {
+        let n = FILE_SR as usize;
+        let s: Vec<f32> = (0..n)
+            .flat_map(|i| {
+                let v = (441.0 * i as f64 / FILE_SR as f64 * std::f64::consts::TAU).sin() as f32;
+                [v, -v]
+            })
+            .collect();
+        PlayerData::from_samples(s, FILE_SR)
+    }
+
+    /// (a) Loop seam: render `secs` of the looping sine (sync off, so rate =
+    /// file/engine) across several seams in odd block sizes. Returns the
+    /// worst deviation from the ideal continuous sine.
+    pub fn seam_check(secs: f64) -> f32 {
+        let mut r = Rig::new();
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(false), beats: None, offset: None, bpm: None });
+        r.load(sine_loop());
+        let (mut worst, mut i) = (0.0f32, 0usize);
+        r.run((secs * OUT_SR) as usize, 61, |p, _, _| {
+            for s in p.chunks(2) {
+                let ideal = (441.0 * i as f64 / OUT_SR * std::f64::consts::TAU).sin() as f32;
+                worst = worst.max((s[0] - ideal).abs()).max((s[1] + ideal).abs());
+                i += 1;
+            }
+        });
+        worst
+    }
+
+    /// (b) Drift: an aligned loop (Number of Beats set) under a rolling
+    /// transport, `secs` long. Returns (onset count, worst off-grid beats).
+    pub fn drift_check(secs: f64, bpm: f64) -> (usize, f64) {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: bpm as f32 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.load(aligned_loop(100.0));
+        r.send(Command::TransportPlay);
+        let on = r.onsets((secs * OUT_SR) as usize, 512);
+        (on.len(), worst_off_grid(&on))
+    }
+
+    /// The same loop without Number of Beats, its file running 0.37 % off the
+    /// 100 BPM it is labelled with: the contrast showing why Beats exists.
+    pub fn drift_without_beats(secs: f64) -> f64 {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(0.0), offset: None, bpm: Some(100.0) });
+        r.load(aligned_loop(100.37));
+        r.send(Command::TransportPlay);
+        worst_off_grid(&r.onsets((secs * OUT_SR) as usize, 512))
+    }
+
+    /// (c) A BPM change mid-play, between beats: returns (worst off-grid
+    /// before, worst off-grid after, seconds between onsets before, after).
+    pub fn tempo_change_check() -> (f64, f64, f64, f64) {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.load(aligned_loop(100.0));
+        r.send(Command::TransportPlay);
+        let before = r.onsets(5 * 48_000 + 12_345, 512); // ends mid-beat
+        r.send(Command::SetBpm { bpm: 90.0 });
+        let after = r.onsets(8 * 48_000, 512);
+        let gap = |v: &[f64], bpm: f64| v.windows(2).map(|w| (w[1] - w[0]) * 60.0 / bpm).sum::<f64>() / (v.len().max(2) - 1) as f64;
+        (worst_off_grid(&before), worst_off_grid(&after), gap(&before, 120.0), gap(&after, 90.0))
+    }
+}
+
+/// `kabelsalat player-test`: the real decode thread feeding a real engine,
+/// then the loop seam, the beat lock over five minutes, and a tempo change
+/// (issue #84). Every number printed is measured, not asserted from a model.
+pub fn run_test() -> anyhow::Result<()> {
+    use selftest::*;
+    let path = "/usr/share/sounds/alsa/Front_Center.wav";
+    anyhow::ensure!(Path::new(path).exists(), "test WAV missing: {path}");
+
+    // 1. Decode thread → engine: a real WAV reaches the player's output.
+    let mut r = Rig::new();
+    let (dummy, _unused) = rtrb::RingBuffer::new(1);
+    let ctrl = start(std::mem::replace(&mut r.load, dummy));
+    ctrl.play(path);
+    let (mut peak, mut loaded) = (0.0f32, false);
+    for _ in 0..200 {
+        r.run(480, 480, |p, _, _| peak = p.iter().fold(peak, |m, s| m.max(s.abs())));
+        loaded = r.state().loaded;
+        if loaded && peak > 0.01 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    anyhow::ensure!(loaded && peak > 0.01, "decoded file never reached the engine (loaded {loaded}, peak {peak})");
+    println!("player-test: decode → engine OK (peak {peak:.3}, {:.2} s file)", r.state().duration);
+
+    // 2. (a) Loop seam: a whole-cycle sine across 10 seams stays on the ideal sine.
+    let worst = seam_check(10.0);
+    anyhow::ensure!(worst < 5e-4, "loop seam deviates by {worst}");
+    println!("player-test: (a) loop seam clean — 10 s across 10 seams, worst deviation from the ideal sine {worst:.2e}");
+
+    // 3. (b) Drift: an aligned loop over five minutes at 120 BPM and one at 87.
+    let tol = frames_to_beats(3.0, 120.0);
+    let (n, worst) = drift_check(300.0, 120.0);
+    anyhow::ensure!(n >= 590 && worst < tol, "drift: {n} onsets, worst {worst} beats (tolerance {tol})");
+    println!(
+        "player-test: (b) drift — 300 s @120 BPM, {n} beat onsets, worst {worst:.5} beats ({:.2} frames) off the metronome grid",
+        worst / frames_to_beats(1.0, 120.0)
+    );
+    let (n87, worst87) = drift_check(120.0, 87.0);
+    let tol87 = frames_to_beats(3.0, 87.0);
+    anyhow::ensure!(n87 >= 170 && worst87 < tol87, "drift @87: {n87} onsets, worst {worst87}");
+    println!("player-test: (b) drift — 120 s @87 BPM, {n87} onsets, worst {worst87:.5} beats ({:.2} frames)", worst87 / frames_to_beats(1.0, 87.0));
+    let loose = drift_without_beats(20.0);
+    anyhow::ensure!(loose > 0.05, "contrast case should drift (worst {loose})");
+    println!("player-test: (b) contrast — the same loop on a 0.37 % off file WITHOUT Number of Beats drifts {loose:.3} beats in 20 s");
+
+    // 4. (c) BPM change mid-beat: followed with no phase jump.
+    let (before, after, gap_b, gap_a) = tempo_change_check();
+    anyhow::ensure!(before < frames_to_beats(3.0, 120.0) && after < frames_to_beats(3.0, 90.0), "tempo change: off grid {before} / {after}");
+    anyhow::ensure!((gap_b - 0.5).abs() < 2e-3 && (gap_a - 60.0 / 90.0).abs() < 2e-3, "beat gaps {gap_b} / {gap_a}");
+    println!(
+        "player-test: (c) tempo change 120→90 BPM mid-beat followed — worst off-grid {before:.5} before / {after:.5} after, beat gap {gap_b:.4} s → {gap_a:.4} s"
+    );
+    println!("player-test: OK");
+    Ok(())
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::selftest::*;
+    use crate::control::Command;
+
+    /// (a) The loop seam is the file's own end→start transition: no click.
+    #[test]
+    fn loop_seam_is_clean() {
+        let worst = seam_check(3.5);
+        assert!(worst < 5e-4, "seam deviates from the ideal sine by {worst}");
+    }
+
+    /// (b) A beats-aligned loop stays on the metronome's beat grid.
+    #[test]
+    fn aligned_loop_stays_locked_to_the_beat_grid() {
+        let (n, worst) = drift_check(60.0, 120.0);
+        assert!(n >= 100, "expected an onset per beat, got {n}");
+        assert!(worst < frames_to_beats(3.0, 120.0), "drifted {worst} beats");
+    }
+
+    #[test]
+    fn without_number_of_beats_a_slightly_off_file_drifts() {
+        let worst = drift_without_beats(20.0);
+        assert!(worst > 0.05, "contrast case should drift, worst {worst}");
+    }
+
+    /// (c) A BPM change mid-beat is followed: still on the grid, and the
+    /// pass gets longer in time exactly as the tempo drops.
+    #[test]
+    fn a_bpm_change_mid_play_is_followed() {
+        let (b, a, gap_b, gap_a) = tempo_change_check();
+        let tol = frames_to_beats(3.0, 90.0);
+        assert!(b < tol && a < tol, "off grid before {b} / after {a}");
+        assert!((gap_b - 0.5).abs() < 2e-3, "beat gap at 120 BPM = {gap_b} s");
+        assert!((gap_a - 60.0 / 90.0).abs() < 2e-3, "beat gap at 90 BPM = {gap_a} s");
+    }
+
+    /// Sync + a rolling transport: enabling mid-bar waits for the NEXT bar
+    /// line (beat 8 after beat 5.3), and the loop then sits on the grid.
+    #[test]
+    fn play_enable_starts_at_the_next_bar_boundary() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.send(Command::TransportPlay);
+        r.run((2.65 * OUT_SR) as usize, 512, |_, _, _| {}); // beat 5.3
+        r.load(aligned_loop(100.0));
+        let on = r.onsets(5 * 48_000, 512);
+        assert!(r.state().playing && !r.state().pending, "{:?}", r.state());
+        let first = on[0];
+        assert!((first - 8.0).abs() < frames_to_beats(3.0, 120.0), "first onset at beat {first}, wanted the bar line 8");
+        assert!(worst_off_grid(&on) < frames_to_beats(3.0, 120.0));
+    }
+
+    /// While waiting for the bar line the player is pending, silent.
+    #[test]
+    fn a_pending_start_is_silent_until_the_bar() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.send(Command::TransportPlay);
+        r.run((2.65 * OUT_SR) as usize, 512, |_, _, _| {}); // beat 5.3
+        r.load(aligned_loop(100.0));
+        let mut peak = 0.0f32;
+        r.run((1.0 * OUT_SR) as usize, 512, |p, _, _| peak = p.iter().fold(peak, |m, s| m.max(s.abs()))); // to beat 7.3
+        assert!(r.state().pending && r.state().enabled && !r.state().playing, "{:?}", r.state());
+        assert_eq!(peak, 0.0, "nothing sounds before the bar line");
+    }
+
+    /// Without sync the file starts at once and ignores the transport.
+    #[test]
+    fn without_sync_it_starts_now_at_its_own_rate() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::TransportPlay);
+        r.send(Command::SetPlayerCfg { loop_on: Some(false), sync: Some(false), beats: None, offset: None, bpm: None });
+        r.run(4800, 512, |_, _, _| {});
+        r.load(aligned_loop(100.0));
+        let mut first = None;
+        let mut at = 0usize;
+        r.run(4800, 512, |p, _, _| {
+            for s in p.chunks(2) {
+                if first.is_none() && s[0].abs() > 0.3 {
+                    first = Some(at);
+                }
+                at += 1;
+            }
+        });
+        assert_eq!(first, Some(0), "starts on the first frame of its block");
+        assert!(r.state().playing);
+    }
+
+    /// A count-in is not the song: the file waits for the downbeat after it.
+    #[test]
+    fn a_synced_player_lands_on_beat_zero_after_the_count_in() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 120.0 });
+        r.send(Command::SetCountIn { enabled: true, bars: 1 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: None, bpm: Some(100.0) });
+        r.load(aligned_loop(100.0));
+        r.run(2000, 512, |_, _, _| {}); // loaded, transport stopped: sounding now
+        r.send(Command::TransportPlay);
+        let mut during = 0.0f32;
+        let mut frame = 0usize;
+        let mut first = None;
+        r.run(4 * 48_000, 480, |p, _, _| {
+            for s in p.chunks(2) {
+                if frame < 96_000 {
+                    during = during.max(s[0].abs()); // the 2 s count-in
+                } else if first.is_none() && s[0].abs() > 0.3 {
+                    first = Some(frame);
+                }
+                frame += 1;
+            }
+        });
+        assert_eq!(during, 0.0, "silent during the count-in");
+        let first = first.expect("the file starts after the count-in");
+        assert!((first as i64 - 96_000).abs() <= 3, "first onset at frame {first}, wanted 96000");
+    }
+
+    /// Beat Offset shifts the start: +1 beat on a file with one burst per pass
+    /// puts the burst 3 beats after the downbeat.
+    #[test]
+    fn beat_offset_shifts_the_start_point() {
+        let mut r = Rig::new();
+        r.send(Command::SetBpm { bpm: 100.0 });
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: Some(true), beats: Some(4.0), offset: Some(1.0), bpm: Some(100.0) });
+        let frames = (4.0 * 60.0 / 100.0 * FILE_SR as f64) as usize;
+        r.load(burst_file(frames, 4, 4)); // a single burst at file beat 0
+        r.run(512, 512, |_, _, _| {}); // loaded while the transport is stopped
+        r.send(Command::TransportPlay); // arms the start for beat 0
+        let on = r.onsets(10 * 48_000, 512);
+        assert!((on[0] - 3.0).abs() < frames_to_beats(3.0, 100.0), "burst at beat {}", on[0]);
+        assert!((on[1] - 7.0).abs() < frames_to_beats(3.0, 100.0), "next pass at beat {}", on[1]);
+    }
+
+    /// A one-shot ends and stays silent; Loop switched on revives it.
+    #[test]
+    fn a_one_shot_stops_at_its_end_and_loop_revives_it() {
+        let mut r = Rig::new();
+        r.send(Command::SetPlayerCfg { loop_on: Some(false), sync: Some(false), beats: None, offset: None, bpm: None });
+        r.load(sine_loop());
+        r.run(2 * 48_000, 512, |_, _, _| {});
+        assert!(r.state().loaded && !r.state().playing, "{:?}", r.state());
+        let mut tail = 0.0f32;
+        r.run(4800, 512, |p, _, _| tail = p.iter().fold(tail, |m, s| m.max(s.abs())));
+        assert_eq!(tail, 0.0);
+        r.send(Command::SetPlayerCfg { loop_on: Some(true), sync: None, beats: None, offset: None, bpm: None });
+        let mut peak = 0.0f32;
+        r.run(4800, 512, |p, _, _| peak = p.iter().fold(peak, |m, s| m.max(s.abs())));
+        assert!(peak > 0.5 && r.state().playing, "loop on restarts it ({peak})");
+    }
+
+    /// The replaced file goes back through the retire ring, never dropped on
+    /// the audio thread, and the filename BPM is adopted on load.
+    #[test]
+    fn a_replaced_file_is_retired_off_the_audio_thread() {
+        let mut r = Rig::new();
+        r.load(sine_loop());
+        r.run(512, 512, |_, _, _| {});
+        let mut d = aligned_loop(100.0);
+        d.bpm = Some(87.5);
+        r.load(d);
+        r.run(1024, 512, |_, _, _| {}); // the publication trails the load by a block
+        let back = r.back.pop().expect("old buffer handed back");
+        assert_eq!(back.len(), FILE_SR as usize * 2);
+        assert_eq!(r.state().bpm, 87.5, "filename BPM adopted");
     }
 }

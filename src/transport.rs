@@ -186,6 +186,14 @@ impl Transport {
     }
 }
 
+/// The next bar boundary strictly after `beats` (AUM's sync quantum, one
+/// bar): the file player's play-enable waits for it while the transport
+/// rolls. Beat 0 itself is not "next" — a start there begins immediately.
+pub fn next_bar_beats(beats: f64) -> f64 {
+    let bar = BEATS_PER_BAR as f64;
+    (beats.max(0.0) / bar).floor() * bar + bar
+}
+
 /// Note-onset strength of a stereo-interleaved signal: the rising part of
 /// its RMS envelope, one value per `ONSET_HOP` frames.
 fn onset_strength(samples: &[f32]) -> Vec<f64> {
@@ -517,6 +525,15 @@ mod tests {
         assert_eq!(t.bar(), (0, 0.0));
         t.beats = 9.5;
         assert_eq!(t.bar(), (2, 8.0));
+    }
+
+    #[test]
+    fn next_bar_is_strictly_ahead() {
+        assert_eq!(next_bar_beats(0.0), 4.0);
+        assert_eq!(next_bar_beats(3.999), 4.0);
+        assert_eq!(next_bar_beats(4.0), 8.0);
+        assert_eq!(next_bar_beats(12.5), 16.0);
+        assert_eq!(next_bar_beats(-0.5), 4.0, "never played: the first downbeat");
     }
 
     #[test]

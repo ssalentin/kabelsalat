@@ -28,6 +28,13 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
   (`kabelsalat record-test`, `rig-mix-test`, `cc-map-test`, …) cover the
   real audio paths — the full list is in [AGENTS.md](AGENTS.md#working-on-kabelsalat).
 - **A green suite.** `cargo test --bin kabelsalat` must pass.
+- **Its README entry.** A new feature updates [README.md](README.md) in the
+  same PR — its entry under "What you can do" (or "Install"), plus fresh
+  screenshots when it changes what users see (captured with
+  [scripts/shot.sh](scripts/shot.sh), so nothing else on your screen is in
+  them). PRs labelled
+  [`enhancement`](https://github.com/ssalentin/kabelsalat/labels/enhancement)
+  are checked by CI.
 - **The project rules.** [AGENTS.md](AGENTS.md) lists rules learned from real
   bugs (realtime safety, agent parity, layout). They apply to humans too —
   in short: nothing allocates or locks on the audio thread, every UI action
@@ -40,14 +47,15 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
 
 The visual language is described in
 [docs/design-reference-analysis.md](docs/design-reference-analysis.md);
-`src/theme.rs` is the single palette source. No floating plugin windows —
-editors are native egui panels.
+`src/theme.rs` is the single palette source. A plugin's own editor opens in
+its own window on request — the main window never embeds one.
 
 ## Releases
 
 Versions follow [Semantic Versioning](https://semver.org/) and are tagged
 `vX.Y.Z` on `main`; each tag gets a GitHub release with notes from
-[CHANGELOG.md](CHANGELOG.md). Add your change under **Unreleased** there.
+[CHANGELOG.md](CHANGELOG.md). Add your change as a fragment under
+[`changes/`](changes/README.md) instead of editing the changelog directly.
 
 ## License
 

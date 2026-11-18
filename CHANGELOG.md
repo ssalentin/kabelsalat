@@ -124,6 +124,10 @@ releases may still change behaviour and session files.
   on two keyboards, the keyboard of the CLAP rig also played an LV2
   instrument such as setBfree, when its cells were set while the plugin was
   still loading (session load, new rig) (#123).
+- **Meters no longer read hot at normal levels:** the meters' colour zones
+  were left on the old linear scale, so anything above −24 dBFS showed
+  tomato and anything above −3 dBFS red. Tomato now starts at −6 dBFS and
+  red only at the master's −1 dBFS ceiling.
 - **Small and tiled windows:** the rack fits windows down to the 760 px
   minimum instead of panning with Keys and Master cut off; a short, wide
   window lays each instrument chain out in one row; the Mixer, Matrix,

@@ -21926,6 +21926,23 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn healthy_levels_meter_cream_and_only_the_ceiling_is_red() {
+        let colour_at = |db: f32| theme::meter_color(meter_db_pos(10f32.powf(db / 20.0)));
+        for db in [-30.0, -18.0, -12.0, -8.0] {
+            assert_eq!(colour_at(db), theme::CREAM, "{db} dBFS is normal playing level");
+        }
+        for db in [-5.0, -3.0, -1.5] {
+            assert_eq!(colour_at(db), theme::ACCENT, "{db} dBFS is hot, close to the limiter");
+        }
+        for db in [-0.9, 0.0] {
+            assert_eq!(colour_at(db), theme::CLIP_RED, "{db} dBFS is at the −1 dBFS ceiling");
+        }
+        let lit = lit_segments(meter_db_pos(10f32.powf(-12.0 / 20.0)), METER_SEGS);
+        let warm = (0..lit).filter(|&i| theme::meter_color(i as f32 / (METER_SEGS - 1) as f32) != theme::CREAM).count();
+        assert_eq!(warm, 0, "the rack meter at −12 dBFS lights no tomato or red segment");
+    }
+
+    #[test]
     fn silent_meters_light_nothing() {
         // Master meter in dB: −12 dBFS sits at 80 %, not at a linear 25 %.
         assert!((meter_db_pos(10f32.powf(-12.0 / 20.0)) - 0.8).abs() < 1e-4);
@@ -28143,6 +28160,25 @@ mod mixer_parity_tests {
         app.stage_view = StageView::Mixer;
         for (w, h) in [(1600.0, 1000.0), (781.0, 950.0), (760.0, 520.0)] {
             super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("mixer-{w}x{h}.png")));
+        }
+    }
+
+    /// Every meter at a healthy −12 dBFS, rack and mixer, as PNGs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat healthy_meter_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn healthy_meter_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut app, _ctx) = app_with(Rack::Linear);
+        let level = 10f32.powf(-12.0 / 20.0);
+        for view in [StageView::Rack, StageView::Mixer] {
+            app.stage_view = view;
+            app.meter = level;
+            app.meter_peak = level;
+            app.rig_levels = vec![level; 8];
+            for u in app.units.iter_mut() { u.led = level; }
+            super::offline_shots::shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join(format!("{view:?}-minus12dbfs.png").to_lowercase()));
         }
     }
 

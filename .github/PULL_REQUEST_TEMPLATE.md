@@ -4,7 +4,7 @@
 
 ## Evidence
 
-- [ ] `cargo test --bin kabelsalat` passes
+- [ ] Unit tests of the changed code pass locally (`cargo test --bin kabelsalat <filter>`; the full suite runs in CI)
 - [ ] Relevant self-test(s) run (e.g. `kabelsalat rig-mix-test`)
 - [ ] Screenshots (before/after) for visible changes
 - [ ] CHANGELOG.md updated under **Unreleased**

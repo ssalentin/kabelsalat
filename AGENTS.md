@@ -27,8 +27,34 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
 - Key injection: `wtype` (Wayland virtual keyboard), e.g. `wtype -k F4`.
 - Visual review = a vision model looking at the downscaled screenshots
   (endpoint, model and key: the local setup file; never print or commit a key).
-- Non-visual changes: `cargo test` (unit suite) plus the relevant CLI self-test
-  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below).
+- Non-visual changes: the unit tests of the code you changed (filtered
+  `cargo test --bin kabelsalat <filter>`) plus the relevant CLI self-test
+  (`session-test`, `multi-rig-test`, `rig-mix-test`, … — list below). The
+  full suite runs in CI, not here (next section).
+
+## Test locally what only this machine can test (user, 2026-11-18)
+
+**CI builds and tests everything; this machine tests what CI cannot.** The
+full unit suite runs on every push in CI (`test (x86_64)`, `test (aarch64)`),
+and release builds and packages run in the release workflows. Running them
+locally too only doubles the time and the machine's load. This holds for
+every agent and subagent.
+
+- **Never run locally:** the whole unit suite (`cargo test --bin kabelsalat`
+  with no filter, `scripts/ci/test.sh`), `cargo build --release`, or
+  packaging builds (Flatpak, AppImage, Arch, docker). Exception: you are
+  reproducing a CI failure of exactly that step.
+- **Run locally:** `cargo build` (debug; the self-tests and screenshots need
+  the binary) and the tests of what you changed:
+  `cargo test --bin kabelsalat <module or test name>` for the touched
+  modules and every test a rule names for that area (e.g. `held_notes`,
+  rule 41). Plus everything CI cannot do: CLI self-tests with real plugins,
+  audio and MIDI hardware, the plugin tests that return early on CI
+  (`docs/PACKAGING.md`), screenshots of the real app, `agent-eval`.
+- **CI is the gate for the rest:** push once the targeted tests are green
+  (rule 50); a PR merges only on green required checks. When CI goes red,
+  read its log (`gh run view --log-failed`) and fix that failure; do not
+  answer it with a local full-suite run.
 
 ## Every fixed error becomes a rule (user, 2026-11-15)
 
@@ -242,10 +268,13 @@ Learned so far (2026-11-15, UI polish pass):
     onset still touches it for 2–5 ms, masked by the attack). Never add
     lookahead on the master (it adds to every played note's latency).
 50. **Push only on a green gate you checked explicitly:** gate commits and
-    pushes on `cargo test` exiting 0 AND its output containing
-    `test result: ok` — never on `grep "test result"` (it also matches
-    `FAILED`) and never with `;` between test and push. Twice a red run was
-    pushed this way (f2659d7, ad36805).
+    pushes on your targeted `cargo test --bin kabelsalat <filter>` runs
+    exiting 0 AND their output containing `test result: ok` with at least
+    one test run (a filter that matches nothing is not a gate) — never on
+    `grep "test result"` (it also matches `FAILED`) and never with `;`
+    between test and push. Twice a red run was pushed this way (f2659d7,
+    ad36805). The full suite is CI's gate (`scripts/ci/test.sh`), not a
+    local step (see "Test locally what only this machine can test").
 51. **The CC that completes a MIDI learn is applied, not swallowed:** the
     engine sees a hardware CC (HwDirect) before the UI frame sends the new
     `MatrixCcMap`, so the knob adopts the value WITHOUT setting `sent` and
@@ -646,6 +675,10 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **Plugin actions that change the rack return to `StageView::Rack` on success:**
+    `add_clap_rig`, `add_lv2_instrument`, `add_lv2_effect`, and
+    `add_metronome_to_active_rig` left `stage_view` on `StageView::Plugins`,
+    so clicking "New rig" appeared to do nothing (`plugins_stage_new_rig_switches_to_rack`).
 118. **A plugin editor is judged by its window, not by `gui.show`'s answer:**
     Odin 2 returns false from `show` yet attaches and paints its editor;
     treating that as failure refused a working GUI. `editor-test` checks the
@@ -961,8 +994,9 @@ Learned so far (2026-11-15, UI polish pass):
   desktop session's environment (this machine's values: local setup file).
   The running app owns `$XDG_RUNTIME_DIR/kabelsalat.sock`; a background task
   that starts it is killed at its time limit — say so to the user.
-- **Tests:** `cargo test --bin kabelsalat` (unit suite) and CLI self-tests with
-  real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
+- **Tests:** locally `cargo test --bin kabelsalat <filter>` for the code you
+  changed (the full suite runs in CI only, see the section near the top) and
+  CLI self-tests with real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
@@ -1005,7 +1039,20 @@ Learned so far (2026-11-15, UI polish pass):
   there. Never edit on `main`. A branch alone is not enough: sessions that
   share one checkout share its working tree, so a `git switch` in one moves
   every other session's files too. Check `git branch --show-current` and
-  `pwd` before editing. When the work is finished, commit it and push the
+  `pwd` before editing.
+- **Move the session into its worktree (user, 2026-11-18):** creating the
+  worktree is not enough. Switch the session itself into it before any
+  edit, build or git command (Claude Code: `EnterWorktree` with
+  `path: ../kabelsalat-<topic>`; other harnesses: their equivalent, or
+  start the session there). Every later command must run with the
+  worktree as its working directory, on the feature branch. Never rely on
+  a `cd` per command from the `main` checkout: the shell falls back to
+  `main` after each call, and one command without the `cd` edits `main`.
+  One session edited `src/ui.rs` on `main` this way, and the diff then had
+  to be moved by patch. If you find your work on `main`, move it to a
+  branch at once (patch or WIP commit; never a bare `git stash`, the stash
+  is shared across worktrees), then revert `main`.
+- **Finish the work:** when the work is finished, commit it and push the
   branch (`git push -u origin <topic>`, gated per rule 50), then open a
   pull request against `main` (`gh pr create`) that references its issue
   and shows the evidence, then queue it with `gh pr merge --auto --squash`

@@ -637,8 +637,15 @@ fn system_prompt() -> String {
      by animated cables. Tab flips the rack front (perform) / back (patch). You have full \
      control through tools:\n\
      - Inspect: get_graph (nodes + cables with ids — call it before wiring), \
+     list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe).\n\
+     - Hear: listen records the next seconds of the master and a listening model scores \
+     it 0-10 on the words you pass as attributes (take them from the user's request: \
+     \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
+     It hears only what plays during the recording: call play_note for the notes first, \
+     in the same step. Use it to check a sound you made against what the user asked for, \
+     change one thing, then listen again to compare; stop after 3 rounds.\n\
      - Play: play_note, set_octave.\n\
      - Routing: set_rig_source (which source classes feed a rig: keyboard — on-screen      keys and laptop typing are ONE source — and hardware), set_rig_device (which \
      hardware keyboard), set_split (split a Keys node: it then has TWO MIDI outs, port 0 = \
@@ -646,7 +653,7 @@ fn system_prompt() -> String {
      from_port 0/1 — there is no automatic rig split; low_octave/high_octave shift a zone by \
      octaves. The keys below a split are low already and many bass sounds are pitched down: \
      when you put a bass on the LOW zone, set low_octave 1 unless the user asked for a deep \
-     bass, and tell the user; if they say it is too deep or too high, step it), flip_rack.\n\
+     bass, and tell the user; if they say it is too deep or too high, step it), set_scale (keys play only one scale: out-of-scale keys snap to the nearest in-scale note), flip_rack. For arpeggios or one-key chords: add_node kind arp into the rig (it sits between the rig's Keys and its synth, already wired), then set_arp (mode up/down/up-down/chord/random, rate 1/4..1/32 synced to the tempo, octaves, gate, swing, chord shape).\n\
      - Sound: system_audio (mix YouTube/browser playback), play_file/stop_file/set_player \
      (backing tracks), set_bpm (tempo — ONE global tempo shared by every metronome and by the \
      tempo-synced features of hosted CLAP plugins (synced LFOs, sequencers, arps); \
@@ -667,6 +674,12 @@ fn system_prompt() -> String {
      one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     - Mixing (the Mixer view, F10): every source strip has set_strip_mix (pan/mute/solo at \
+     the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
+     rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
+     before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
+     shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
+     quick knob; faders are dB with double-click at 0 dB. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -726,6 +739,15 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
         }},
         {"type":"function","function":{
+            "name":"listen",
+            "description":"Hear the master: records the next `seconds` of the master output (what the user hears) and asks a listening model to score it 0-10 on each attribute and describe what it heard; the answer includes the app's own loudness/peak/band measurements. Only sound that plays during the recording is heard, so call play_note first in the same step. Takes about seconds + 3 s.",
+            "parameters":{"type":"object","properties":{
+                "attributes":{"type":"string","description":"Comma-separated words from the user's request the sound should match, e.g. \"8-bit, heroic\""},
+                "seconds":{"type":"number","description":"How long to record, 0.5-8 (default 4)"},
+                "question":{"type":"string","description":"Anything else to ask about the sound"}
+            }}
+        }},
+        {"type":"function","function":{
             "name":"play_note",
             "description":"Play a note on the built-in synth (MIDI note number, duration in ms)",
             "parameters":{"type":"object","properties":{"note":{"type":"integer"},"ms":{"type":"integer"}},"required":["note"]}
@@ -751,6 +773,16 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"point":{"type":"integer","description":"MIDI note 0-127 to split at; omit with no octaves = unsplit"},"low_octave":{"type":"integer","description":"octave shift of the LOW zone, -3..3"},"high_octave":{"type":"integer","description":"octave shift of the HIGH zone, -3..3"}}}
         }},
         {"type":"function","function":{
+            "name":"set_scale",
+            "description":"Make a Keys node's keyboard play only one scale (a property of the Keys node): out-of-scale keys snap to the nearest in-scale note, so every key sounds right (GarageBand's scale-limited keys). key: C, C#, D … B (default C); scale: major | minor | dorian | mixolydian | harmonic minor | maj penta | min penta | blues (default major); off true switches snapping off. Example: {key:'A', scale:'min penta'}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Keys node id (get_graph); omit = the Keys node in view"},"key":{"type":"string"},"scale":{"type":"string"},"off":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_arp",
+            "description":"Set an Arp unit's settings by name. Add the unit first with add_node {kind:'arp'} (it is inserted between the rig's Keys and its synth(s); held keys then arpeggiate). mode: up | down | up-down | chord | random ('chord' = each held key sounds a whole chord, shape from chord); rate: 1/4 | 1/8 | 1/8T | 1/16 | 1/16T | 1/32, synced to the tempo; octaves 1-4; gate 0.05-1 (how much of each step a note sounds); swing 0-1; chord: maj | min | sus2 | sus4 | 7 | maj7 | min7 | power. Give any subset. Example: {node:7, mode:'up-down', rate:'1/16', octaves:2}.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"arp node id (get_graph, kind arp)"},"mode":{"type":"string"},"rate":{"type":"string"},"octaves":{"type":"integer"},"gate":{"type":"number"},"swing":{"type":"number"},"chord":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
             "name":"save_session",
             "description":"Save the current patch, knob values, and Surge plugin state as a named session package (.ksalat) in ~/kabelsalat-sessions.",
             "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Session name (no slashes)"}},"required":["name"]}
@@ -772,18 +804,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"play_file",
-            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8).",
-            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"}},"required":["path"]}
+            "description":"Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). AUM FilePlayer options: loop, sync (follow the tempo), beats (loop length), offset, bpm (file tempo).",
+            "parameters":{"type":"object","properties":{"path":{"type":"string"},"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}},"required":["path"]}
         }},
         {"type":"function","function":{
             "name":"stop_file",
-            "description":"Stop the backing-track file player.",
+            "description":"Stop the backing-track file player (the file and its settings stay; play_file restarts it).",
             "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"set_player",
-            "description":"Set the file-player mix gain (0..1, 0 mutes) without changing what's playing.",
-            "parameters":{"type":"object","properties":{"gain":{"type":"number"}},"required":["gain"]}
+            "description":"Change the file player without restarting it: mix gain (0..1, 0 mutes) and/or the AUM FilePlayer options loop, sync, beats, offset, bpm. Give at least one.",
+            "parameters":{"type":"object","properties":{"gain":{"type":"number"},"loop":{"type":"boolean","description":"restart the file seamlessly at its end"},"sync":{"type":"boolean","description":"playback rate follows the transport tempo (AUM varispeed from the file's original BPM, not time-stretch); with the transport rolling, play starts at the next bar"},"beats":{"type":"number","description":"Number of Beats: the loop length in beats (loop+sync derive the tempo from it, so an aligned loop never drifts)"},"offset":{"type":"number","description":"Beat Offset (+/-): start point in beats"},"bpm":{"type":"number","description":"the file's original BPM (a \"120 bpm\" in the file name is adopted automatically)"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_device",
@@ -834,6 +866,61 @@ pub(crate) fn tools() -> Value {
             "name":"set_rig_mix",
             "description":"Per-rig mixer: rig index (0-based), vol 0..1, pan -1..1, mute, solo (solo mutes other rigs). Omitted fields keep their value. Example: rig 1 mute true.",
             "parameters":{"type":"object","properties":{"rig":{"type":"integer"},"vol":{"type":"number"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["rig"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_mix",
+            "description":"Per-SOURCE mixer (#73): pan -1..1, mute, solo on ONE instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Example: node 1 pan -0.5 mute false.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_node_bypass",
+            "description":"Bypass one effect node (#74): a bypassed FX passes its input through unchanged, its knobs are kept. True = bypass, false = enable.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"FX node id (get_graph)"},"bypass":{"type":"boolean","description":"Default true"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"add_insert",
+            "description":"Add an effect at the end of a strip's insert chain (#74) — the chain is the rack cables, so the rack re-wires with it. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect from list_plugins). source = the strip's source node id; omit source to add a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"kind":{"type":"string","enum":["dsp","lv2"]},"dsp":{"type":"string","enum":["gain","pan","eq3","filter","limiter","saturation","delay","reverb"]},"uri":{"type":"string","description":"LV2 effect URI (list_plugins)"},"name":{"type":"string"}},"required":["kind"]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_insert",
+            "description":"Remove one effect from a strip's insert chain (#74); the chain closes up (source → next). Pass fx = the effect's node id; source = its strip's source node id, omitted for a master insert.",
+            "parameters":{"type":"object","properties":{"source":{"type":"integer","description":"Source node id; omit for a master insert"},"fx":{"type":"integer","description":"The effect node id to remove"}},"required":["fx"]}
+        }},
+        {"type":"function","function":{
+            "name":"rename_strip",
+            "description":"Rename one strip (#77): the name is the node's name, so the rack face, the mixer and saved sessions all show it. Up to 24 characters.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"name":{"type":"string"}},"required":["node","name"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_color",
+            "description":"Give a mixer strip a colour (#77): 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan), or none to clear. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"color":{"type":"string"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"move_strip",
+            "description":"Move one source strip to slot `to` (1-based) within its rig's display order in the mixer (#77). Display only — the sound is unchanged.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"to":{"type":"integer","description":"1-based slot in its rig"}},"required":["node","to"]}
+        }},
+        {"type":"function","function":{
+            "name":"collapse_strip",
+            "description":"Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"collapsed":{"type":"boolean","description":"Default true (toggle when omitted)"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_strip_knobs",
+            "description":"List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), whether it is custom-assigned, and available knob choices. Filter optionally with node.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Optional node id to inspect one unit"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_strip_knob",
+            "description":"Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id (from get_strip_knobs or list_params), or empty string \"\" to reset to default. Saved with the session.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Node id (get_graph)"},"knob":{"type":"string","description":"Knob label/name, or empty string for default"}},"required":["node","knob"]}
+        }},
+        {"type":"function","function":{
+            "name":"list_channels",
+            "description":"List every rig's mixer channels and plugin chains (Navigator view: rigs, source channels with strip colours, and each channel's instrument + linear insert chain with kind CLAP / LV2 / built-in).",
+            "parameters":{"type":"object","properties":{"filter":{"type":"string","enum":["channels","plugins","all"],"description":"Default all"}}}
         }},
         {"type":"function","function":{
             "name":"list_plugins",
@@ -897,12 +984,12 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"load_template",
-            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | demo | multi_rig (two independent rigs, switch view with 1-9).",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","demo","multi_rig"]}},"required":["name"]}
+            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; the player plugs a guitar or mic into the Audio In unit, whose face also carries the tuner) | demo | multi_rig (two independent rigs, switch view with 1-9).",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","guitar_rig","demo","multi_rig"]}},"required":["name"]}
         }},
         {"type":"function","function":{
             "name":"add_node",
-            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|midi_fx|audio_in|system_audio|master_out. midi_fx = a MIDI effect in the rig's MIDI chain (arpeggiator, chord tool, transposer, MIDI filter; list_midi_fx): uri = an LV2 MIDI plugin, no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
+            "description":"Add a node to the patch. kind: keys|clap|dsp|lv2|arp|midi_fx|audio_in|system_audio|master_out. kind arp adds an arpeggiator/chord unit between the rig's Keys and its synth (wired for you; tune it with set_arp). kind midi_fx = a MIDI effect in the rig's MIDI chain (list_midi_fx): uri = an LV2 MIDI plugin (transpose, filter, …), no uri = the built-in transposer (semis -24..24); it is inserted between the rig's Keys and its instruments for you (result says so, do not connect it). dsp needs 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 needs 'uri' (see list_plugins); clap takes optional plugin_id; audio_in takes optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). rig: which rig it joins (index from get_rigs; default = the rig in view). An instrument (clap, or an lv2 instrument such as setBfree) is wired for you like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; the result names those cables, so do not connect them again. Other dsp/lv2 nodes sound once wired with connect — only wire nodes of the SAME rig. Use get_graph to see node ids.",
             "parameters":{"type":"object","properties":{"kind":{"type":"string"},"dsp":{"type":"string"},"uri":{"type":"string"},"plugin_id":{"type":"string"},"semis":{"type":"integer"},"device":{"type":"string"},"channels":{"type":"string"},"name":{"type":"string"},"rig":{"type":"integer"}},"required":["kind"]}
         }},
         {"type":"function","function":{
@@ -1561,6 +1648,14 @@ const SHORTCUTS: &[Shortcut] = &[
     Shortcut { key: "show_rig", means: "Show or switch the view to one named rig.",
         plan: |f, done| once(done, || Some(call("select_rig", json!({ "rig": f.rig? }))), say_result) },
     Shortcut { key: "metronome", means: "Add a metronome (a click), or start the metronome.", plan: metronome },
+    Shortcut { key: "guitar_rig", means: "Load the Guitar rig template: a live Audio In unit (guitar, mic or interface — its face carries the tuner) run through overdrive, delay and reverb into a guitar amp and cabinet, replacing the current patch. Only a request that asks for a GUITAR rig (it may name its stomps or the input); 'a new rig with a sound' is not this.",
+        plan: |_, done| once(done, || Some(call("load_template", json!({ "name": "guitar_rig" }))), |r| {
+            if r.starts_with("Loaded template 'Guitar Rig'") {
+                "Guitar rig loaded: Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master. Pick the input device on the Audio In unit's face (its tuner is there); the Delay unit's TIME and MIX are on its face.".to_string()
+            } else {
+                say_result(r)
+            }
+        }) },
     Shortcut { key: "play", means: "Start the transport (play), with no word about a metronome.",
         plan: |_, done| once(done, || Some(call("transport_play", json!({}))), say_result) },
     Shortcut { key: "stop", means: "Stop the transport.",
@@ -1666,6 +1761,7 @@ const JEV_SAMPLES: &[&str] = &[
     "Make rig 2 a bit quieter.", "make rig B a bit louder", "turn rig 1 down by 6 dB", "Pan rig 1 to the left.",
     "pan rig 2 right", "Pan rig 1 hard left and rig 2 hard right.", "Mute rig 1.", "unmute rig 1", "solo the second rig",
     "Delete rig 2.", "show rig 2", "undo that", "Why is there no sound?",
+    "Build me a guitar rig.", "Give me a guitar rig with a warm delay.",
 ];
 
 /// What a decision leads to, for the test printout.

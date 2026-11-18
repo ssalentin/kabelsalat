@@ -31,6 +31,11 @@ USB MIDI keyboard — devices are found while the app runs, just plug them in.
 Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
 ambient pad with one key.
 
+The on-screen keyboard carries the controls a real keyboard has: a pitch-bend
+wheel that springs back to centre, a modulation wheel, a sustain pedal and a
+velocity slider. They reach every rig the keys feed, and hardware pitch bend,
+modulation and sustain reach your instruments the same way.
+
 <p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The rack with the full-width software keyboard opened at the bottom"/></p>
 
 ### Patch with real cables
@@ -47,11 +52,48 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded.
 
-### Mix
-The mixer gives every rig volume, pan, mute and solo, with meters that show
-what you actually hear.
+### Put MIDI effects in front of an instrument
+A **MIDI strip** sits between your keys and the instrument and changes the notes
+on the way: the built-in **MIDI transpose**, or any installed LV2 MIDI plugin
+(note transposers, filters, arpeggiators — pick one in **Plugins** and press
+*Add MIDI strip*). The strip shows the plugin's own main controls, they can be
+learned from a hardware knob like any other, and a note released while you turn
+a knob never hangs. The assistant can add strips too (`list_midi_fx`, `add_node`
+with kind `midi_fx`).
 
-<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: per-rig faders, pan, mute and solo, and the master meter"/></p>
+<p align="center"><img src="docs/shots/midi-strip.png" width="85%" alt="The rack with a Transpose MIDI strip between Keys and the two Surge synths"/></p>
+
+### Play your guitar
+Plug a guitar (or a microphone) into your audio interface and press **⇧F5**: the
+Guitar rig loads **Audio In → Scream → Delay → Reverb → Amp → Cabinet →
+Master**. The Audio In unit picks any input by name, has a gain knob, a live
+level meter, a **MON** switch for monitoring through the rig, and a built-in
+**tuner** (note and cents) on its face. The stomps, amp and cabinet are the
+Guitarix LV2 plugins from the Plugins browser (install the *Guitarix* card).
+Monitoring goes through the same low-latency path as everything else; a missing
+input says so instead of falling back to the laptop microphone.
+
+<p align="center"><img src="docs/shots/guitar-rig.png" width="85%" alt="The Guitar rig: Audio In with level meter and tuner, Scream, Delay, Reverb, Amp and Cabinet in one stack beside Master out"/></p>
+
+### Mix
+Every source gets its own channel strip: a fader in dB with a 0 dB detent
+(double-click for exact unity), a held peak and a clip light, plus pan, mute
+and solo. Each strip lists the effects on its cable chain as insert slots —
+add, bypass, reorder or remove them — and the master has inserts that run on
+the whole mix before the limiter. Every source and insert slot has a quick
+parameter knob beside it (defaulting to the plugin's first main control or an
+effect's mix; right-click to reassign, double-click to reset). Rename a strip,
+give it a colour, drag it to reorder or collapse it; names, colours and quick
+knob assignments are saved with the session.
+
+<p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
+
+### Navigate rigs, channels and plugins
+Press **Q** (or click **Navigator** in the top bar) to open the right-hand
+Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see
+every rig's channels in their mixer colours and unfold their plugin chains
+(**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
+and selects the unit in the rack or scrolls and flashes its strip in the mixer.
 
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be
@@ -68,6 +110,15 @@ shows its CC number and follows your hardware from then on.
 **REC** records exactly what you hear into a WAV file in `~/Music/kabelsalat/`.
 After stopping you can play the take back or open its folder; **SYNC** starts
 and stops the recording with the transport.
+
+### Play along with a backing track
+Ask the assistant (or an MCP agent) to play a WAV file and it mixes into the
+master like AUM's FilePlayer: **loop** restarts it seamlessly, **sync** plays it
+at the transport tempo from its original BPM (a "120 bpm" in the file name is
+picked up; speed changes, pitch follows, no time-stretch), **beats** sets the loop
+length in beats so an aligned loop never drifts off the metronome, and **offset**
+shifts the start. With sync on and the transport rolling, it starts on the next
+bar line.
 
 ### Ask the assistant — or your own AI agent
 The built-in assistant (bring your own DeepSeek key) can set things up for you:

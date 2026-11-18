@@ -179,6 +179,25 @@ struct InstallInstrumentArgs {
     confirm: bool,
 }
 
+/// Arguments for `load_template`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct LoadTemplateArgs {
+    /// Template name: lead_reverb | drums_bass | ambient_pad | guitar_rig | demo | multi_rig.
+    name: String,
+}
+
+/// Resolve a template name (same aliases the app's tool takes).
+fn template_by_name(name: &str) -> Option<crate::session::Template> {
+    use crate::session::Template;
+    Some(match name.to_lowercase().as_str() {
+        "lead_reverb" | "lead" => Template::LeadReverb,
+        "drums_bass" | "drums" => Template::DrumsBass,
+        "ambient_pad" | "ambient" | "pad" => Template::AmbientPad,
+        "guitar_rig" | "guitar" => Template::GuitarRig,
+        _ => return None,
+    })
+}
+
 /// Arguments for `remove_node`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct RemoveNodeArgs {
@@ -297,6 +316,40 @@ struct SetSplitArgs {
     high_octave: Option<i8>,
 }
 
+/// Arguments for `set_scale`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetScaleArgs {
+    /// Keys node id (see get_graph, kind keys). Omit = the first Keys node.
+    node: Option<NodeId>,
+    /// Key the scale starts on: "C", "F#", … or 0..=11. Default C.
+    key: Option<String>,
+    /// Scale: major, minor, dorian, mixolydian, harmonic minor, maj penta,
+    /// min penta, blues. Default major.
+    scale: Option<String>,
+    /// true = switch snapping off (every key plays as pressed).
+    off: Option<bool>,
+}
+
+/// Arguments for `set_arp`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetArpArgs {
+    /// Arp node id (see get_graph, kind arp).
+    node: NodeId,
+    /// up, down, up-down, chord, random.
+    mode: Option<String>,
+    /// Note value synced to the song clock: 1/4, 1/8, 1/8T, 1/16, 1/16T, 1/32.
+    rate: Option<String>,
+    /// How many octaves the pattern spans, 1..=4.
+    octaves: Option<u8>,
+    /// How much of a step each note sounds, 0.05..=1.
+    gate: Option<f64>,
+    /// 0..=1: every second step starts late.
+    swing: Option<f64>,
+    /// Chord shape one held key becomes in chord mode: maj, min, sus2, sus4,
+    /// 7, maj7, min7, power.
+    chord: Option<String>,
+}
+
 /// Arguments for `set_system_audio`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetSystemAudioArgs {
@@ -344,7 +397,18 @@ struct SetAppStreamArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetPlayerArgs {
     /// Mix level 0..1 for the file player (0 mutes).
-    gain: f32,
+    gain: Option<f32>,
+    /// Loop: restart the file seamlessly at its end.
+    #[serde(rename = "loop")]
+    loop_on: Option<bool>,
+    /// Sync: playback rate follows the transport tempo (varispeed).
+    sync: Option<bool>,
+    /// Number of Beats: loop length in beats (loop + sync derive the tempo).
+    beats: Option<f32>,
+    /// Beat Offset (+/-): start point in beats.
+    offset: Option<f32>,
+    /// The file's original BPM.
+    bpm: Option<f32>,
 }
 
 /// Arguments for `play_file`.
@@ -354,6 +418,17 @@ struct PlayFileArgs {
     path: String,
     /// Mix level 0..1 (default 0.8).
     gain: Option<f32>,
+    /// Loop: restart the file seamlessly at its end.
+    #[serde(rename = "loop")]
+    loop_on: Option<bool>,
+    /// Sync: playback rate follows the transport tempo (varispeed).
+    sync: Option<bool>,
+    /// Number of Beats: loop length in beats (loop + sync derive the tempo).
+    beats: Option<f32>,
+    /// Beat Offset (+/-): start point in beats.
+    offset: Option<f32>,
+    /// The file's original BPM (a "120 bpm" in the filename is adopted).
+    bpm: Option<f32>,
 }
 
 /// Arguments for `set_bpm`.
@@ -384,6 +459,17 @@ struct RecordSyncArgs {
 struct MeasureMixArgs {
     /// Restart the integrated-loudness gate from now (default false).
     reset: Option<bool>,
+}
+
+/// Arguments for `listen`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListenArgs {
+    /// Words the sound should match, each scored 0-10 (e.g. ["8-bit", "heroic"]).
+    attributes: Option<Vec<String>>,
+    /// Seconds of the master to record, 0.5-8 (default 4).
+    seconds: Option<f32>,
+    /// Anything else to ask about the sound.
+    question: Option<String>,
 }
 
 /// Arguments for `set_rig_device`.
@@ -499,6 +585,111 @@ struct SetRigMixArgs {
     mute: Option<bool>,
     /// Solo — mutes every non-solo rig (omit to keep).
     solo: Option<bool>,
+}
+
+/// Arguments for `set_strip_mix` (#73).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripMixArgs {
+    /// Source node id (get_graph).
+    node: NodeId,
+    /// Pan -1 (L) .. 1 (R) (omit to keep).
+    pan: Option<f32>,
+    /// Mute (omit to keep).
+    mute: Option<bool>,
+    /// Solo — within the node's rig (omit to keep).
+    solo: Option<bool>,
+}
+
+/// Arguments for `set_node_bypass` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetNodeBypassArgs {
+    /// FX node id (get_graph).
+    node: NodeId,
+    /// True = bypass (default), false = enable.
+    bypass: Option<bool>,
+}
+
+/// Arguments for `add_insert` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AddInsertArgs {
+    /// The strip's source node id; omit for a MASTER insert.
+    source: Option<NodeId>,
+    /// "dsp" (with dsp=…) or "lv2" (with uri=…).
+    kind: String,
+    /// Built-in effect: gain, pan, eq3, filter, limiter, saturation, delay, reverb.
+    dsp: Option<String>,
+    /// LV2 effect URI (list_plugins).
+    uri: Option<String>,
+    /// Optional display name for the new unit.
+    name: Option<String>,
+}
+
+/// Arguments for `remove_insert` (#74).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoveInsertArgs {
+    /// The effect node id to remove.
+    fx: NodeId,
+    /// Its strip's source node id; omit for a master insert.
+    source: Option<NodeId>,
+}
+
+/// Arguments for `rename_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RenameStripArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// New name (≤ 24 characters).
+    name: String,
+}
+
+/// Arguments for `set_strip_color` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripColorArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan), or none.
+    color: String,
+}
+
+/// Arguments for `move_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MoveStripArgs {
+    /// Source node id (get_graph).
+    node: NodeId,
+    /// 1-based slot within its rig.
+    to: u64,
+}
+
+/// Arguments for `collapse_strip` (#77).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CollapseStripArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// True = collapse (default), false = expand.
+    collapsed: Option<bool>,
+}
+
+/// Arguments for `get_strip_knobs` (#107).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetStripKnobsArgs {
+    /// Optional node id to inspect one slot.
+    node: Option<NodeId>,
+}
+
+/// Arguments for `set_strip_knob` (#107).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetStripKnobArgs {
+    /// Node id (get_graph).
+    node: NodeId,
+    /// Knob label or parameter name/id; empty string resets to default.
+    knob: String,
+}
+
+/// Arguments for `list_channels` (#108).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListChannelsArgs {
+    /// Optional filter: "channels", "plugins", or "all" (default "all").
+    filter: Option<String>,
 }
 
 /// Arguments for `note_on`.
@@ -720,6 +911,9 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
             Ok(NodeKind::Dsp(parse_dsp_kind(dsp)?))
         }
         "system_audio" => Ok(NodeKind::SystemAudio),
+        // The arpeggiator / chord unit (issue #90): inserted between the
+        // rig's Keys and its synth(s) when wired.
+        "arp" | "arpeggiator" => Ok(NodeKind::Arp),
         "audio_in" => Ok(NodeKind::AudioIn {
             device: args.device.clone().filter(|d| !d.is_empty()),
             channels: parse_audio_ch(args.channels.as_deref()),
@@ -815,6 +1009,7 @@ fn graph_json(g: &Graph) -> Value {
                     "device": device,
                     "channels": ch_kind_str(*channels),
                 }),
+                NodeKind::Arp => json!({"type": "arp"}),
                 NodeKind::MasterOut => json!({"type": "master_out"}),
                 NodeKind::MidiFx { plugin } => match plugin {
                     crate::control::MidiFxPlugin::Lv2 { uri } => {
@@ -836,6 +1031,8 @@ fn graph_json(g: &Graph) -> Value {
                 // Keys only: split point (null = unsplit, one MIDI OUT on
                 // port 0); when set, port 0 = LOW (< point), port 1 = HIGH.
                 "split": n.split,
+                // Keys only: key + scale its notes snap to (null = no snap).
+                "scale": n.scale.map(|c| json!({"key": c.key, "scale": c.scale})),
             })
         })
         .collect();
@@ -1046,6 +1243,27 @@ impl McpServer {
         }))
     }
 
+    /// The audio judge (#35): record the master and ask a listening model.
+    #[tool(name = "listen", description = "Hear the master: record the next `seconds` of the master output and ask a listening model (audio-capable, OpenRouter) to score it 0-10 on each attribute and say what it heard; the answer adds the app's loudness/peak/band measurements. Only sound that plays during the recording is heard: send note_on first and note_off after. Takes about seconds + 3 s.")]
+    fn listen(&self, Parameters(args): Parameters<ListenArgs>) -> Result<CallToolResult, McpError> {
+        let args = json!({ "attributes": args.attributes, "seconds": args.seconds, "question": args.question });
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if !remote {
+            // Off the async runtime: the HTTP client blocks and owns a runtime
+            // of its own, which may not be dropped inside this one.
+            return match std::thread::spawn(move || crate::listen::listen(&args)).join() {
+                Ok(text) => ok_json(json!(text)),
+                Err(_) => tool_err("listen: the listening thread panicked"),
+            };
+        }
+        let wait = Duration::from_secs_f32(crate::listen::MAX_SECS + 60.0);
+        match bridge::request_within(&json!({"op": "listen", "args": args}), wait) {
+            Ok(reply) if reply.get("ok").and_then(Value::as_bool) == Some(true) => ok_json(reply.get("data").cloned().unwrap_or(Value::Null)),
+            Ok(reply) => tool_err(reply.get("error").and_then(Value::as_str).unwrap_or("listen failed").to_string()),
+            Err(e) => tool_err(format!("listen needs the running app (attach): {e:#}")),
+        }
+    }
+
     /// Master-bus loudness/true-peak/band meter (Bravo 1 "measure loop").
     #[tool(name = "measure_mix", description = "Read the master-bus loudness/profile meter: momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation with a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness gate.")]
     fn measure_mix(&self, Parameters(args): Parameters<MeasureMixArgs>) -> Result<CallToolResult, McpError> {
@@ -1094,6 +1312,7 @@ impl McpServer {
                 .unwrap_or("LV2")
                 .to_ascii_uppercase(),
             NodeKind::SystemAudio => "SYSTEM AUDIO".into(),
+            NodeKind::Arp => "ARP".into(),
             NodeKind::MasterOut => "MASTER OUT".into(),
             NodeKind::MidiFx { plugin } => match plugin {
                 crate::control::MidiFxPlugin::Builtin { .. } => "TRANSPOSE".into(),
@@ -1113,7 +1332,9 @@ impl McpServer {
         let wire = match &kind {
             NodeKind::Clap { .. } => true,
             NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
-            NodeKind::MidiFx { .. } => true,
+            // An arp and a MIDI strip are inserted between the rig's Keys and
+            // its synth(s) like an instrument is wired into its rig.
+            NodeKind::Arp | NodeKind::MidiFx { .. } => true,
             _ => false,
         };
         if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
@@ -1122,10 +1343,18 @@ impl McpServer {
         let id = st.graph.add_node(kind, name);
         st.graph.set_rig(id, rig);
         let before = st.graph.edges.len();
-        if wire && matches!(st.graph.node(id).map(|n| &n.kind), Some(NodeKind::MidiFx { .. })) {
-            st.graph.wire_midi_fx(id);
-        } else if wire {
-            st.graph.wire_instrument(id);
+        if wire {
+            match st.graph.node(id).map(|n| n.kind.clone()) {
+                Some(NodeKind::Arp) => {
+                    let _ = st.graph.wire_arp(id);
+                }
+                Some(NodeKind::MidiFx { .. }) => {
+                    st.graph.wire_midi_fx(id);
+                }
+                _ => {
+                    let _ = st.graph.wire_instrument(id);
+                }
+            }
         }
         let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
         let mut result = json!({"id": id, "name": name_str(&name), "cables": cables});
@@ -1270,6 +1499,97 @@ impl McpServer {
         ok_json(json!({"node": node, "point": point, "split": point.is_some(), "low_octave": oct[0], "high_octave": oct[1]}))
     }
 
+    /// Scale snap on a Keys node (issue #90).
+    #[tool(name = "set_scale", description = "Make a Keys node's keyboard play only one scale (Command::SetKeysScale) — a property of the Keys node like set_split: out-of-scale keys snap to the nearest in-scale note (ties go down), so every key sounds 'right'. key: C, C#, … B (default C); scale: major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues (default major); off:true switches snapping off. node defaults to the first Keys node. Held notes are released. Example: {key:'A', scale:'min penta'} for an A minor pentatonic keyboard.")]
+    fn set_scale(&self, Parameters(args): Parameters<SetScaleArgs>) -> Result<CallToolResult, McpError> {
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("set_scale", json!({"node": args.node, "key": args.key, "scale": args.scale, "off": args.off}));
+        }
+        let choice = if args.off == Some(true) {
+            None
+        } else {
+            let key = match args.key.as_deref() {
+                Some(k) => match crate::arp::key_from_name(k) {
+                    Some(k) => k,
+                    None => return tool_err(format!("'{k}' is not a key (C, C#, D, … B, or 0..11)")),
+                },
+                None => 0,
+            };
+            let scale = match args.scale.as_deref() {
+                Some(s) => match crate::arp::Scale::from_name(s) {
+                    Some(s) => s,
+                    None => return tool_err(format!("'{s}' is not a scale (major, minor, dorian, mixolydian, harmonic minor, maj penta, min penta, blues)")),
+                },
+                None => crate::arp::Scale::Major,
+            };
+            Some(crate::arp::ScaleChoice { key, scale })
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        let node = match args.node {
+            Some(id) => match st.graph.node(id) {
+                None => return tool_err(format!("node {id} does not exist")),
+                Some(n) if !matches!(n.kind, NodeKind::Keys) => {
+                    return tool_err(format!("node {id} ({}) is not a Keys node — only keyboards snap to a scale", name_str(&n.name)))
+                }
+                Some(_) => id,
+            },
+            None => match st.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Keys)) {
+                Some(n) => n.id,
+                None => return tool_err("the patch has no Keys node"),
+            },
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetKeysScale { node, scale: choice }) {
+            return tool_err(e);
+        }
+        st.graph.set_scale(node, choice);
+        ok_json(json!({"node": node, "scale": choice.map(|c| c.label())}))
+    }
+
+    /// The arp unit's settings by name (issue #90).
+    #[tool(name = "set_arp", description = "Set an Arp unit's settings by name (its rack knobs, Command::SetParam). Add the unit first with add_node {kind:'arp'} — it is inserted between the rig's Keys and its synth(s), so held keys become an arpeggio. mode: up | down | up-down | chord | random ('chord' = one held key sounds a whole chord, shape from chord); rate: 1/4 | 1/8 | 1/8T | 1/16 | 1/16T | 1/32 (synced to the song clock/tempo); octaves 1..4; gate 0.05..1 (how much of each step a note sounds); swing 0..1; chord: maj | min | sus2 | sus4 | 7 | maj7 | min7 | power. Give any subset. Changing the pattern releases what is sounding. Example: {node:7, mode:'up-down', rate:'1/16', octaves:2, gate:0.6}.")]
+    fn set_arp(&self, Parameters(args): Parameters<SetArpArgs>) -> Result<CallToolResult, McpError> {
+        let body = json!({
+            "node": args.node, "mode": args.mode, "rate": args.rate, "octaves": args.octaves,
+            "gate": args.gate, "swing": args.swing, "chord": args.chord,
+        });
+        // Null fields mean "not given" for the shared parser.
+        let mut given = body.clone();
+        if let Some(o) = given.as_object_mut() {
+            o.retain(|_, v| !v.is_null());
+        }
+        let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
+        if remote {
+            return Self::ui_bridge_tool("set_arp", given);
+        }
+        let values = match crate::arp::knob_values_from_args(&given) {
+            Ok(v) => v,
+            Err(e) => return tool_err(e),
+        };
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = refresh_remote(&mut st) {
+            return tool_err(e);
+        }
+        match st.graph.node(args.node) {
+            None => return tool_err(format!("node {} does not exist", args.node)),
+            Some(n) if !matches!(n.kind, NodeKind::Arp) => {
+                return tool_err(format!("node {} ({}) is not an arp unit", args.node, name_str(&n.name)))
+            }
+            Some(_) => {}
+        }
+        let mut set = Vec::new();
+        for (label, param, v) in values {
+            if let Err(e) = send_cmd(&mut st, Command::SetParam { node: args.node, param, value: v as f64 }) {
+                return tool_err(e);
+            }
+            set.push(label.to_lowercase());
+        }
+        ok_json(json!({"node": args.node, "set": set}))
+    }
+
     /// Mix system audio into the master.
     #[tool(name = "set_system_audio", description = "Mix system-audio capture (e.g. YouTube) into the master (Command::SetSystemAudio). gain 0..1, 0 mutes. In the GUI app this captures the default output's monitor; headless mode has no capture source so it only stores the gain.")]
     fn set_system_audio(&self, Parameters(args): Parameters<SetSystemAudioArgs>) -> Result<CallToolResult, McpError> {
@@ -1368,37 +1688,63 @@ impl McpServer {
         })).collect::<Vec<_>>()}))
     }
 
-    /// Set the file-player mix gain.
-    #[tool(name = "set_player", description = "Set the backing-track file player's mix gain (Command::SetPlayer), 0..1, 0 mutes. Start a file with play_file (needs the running app).")]
+    /// Change the file player's mix gain and/or its AUM FilePlayer options.
+    #[tool(name = "set_player", description = "Change the backing-track file player: mix gain 0..1 (0 mutes) and/or the AUM FilePlayer options loop (seamless restart), sync (playback follows the transport tempo as varispeed from the file's original BPM; play starts at the next bar while the transport rolls), beats (Number of Beats: loop length, so an aligned loop never drifts), offset (Beat Offset, +/-), bpm (original BPM). Give at least one. Start a file with play_file (needs the running app).")]
     fn set_player(&self, Parameters(args): Parameters<SetPlayerArgs>) -> Result<CallToolResult, McpError> {
-        let mut st = self.state.lock().unwrap();
-        let gain = args.gain.clamp(0.0, 1.0);
-        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain }) {
-            return tool_err(e);
+        if args.gain.is_none() && args.loop_on.is_none() && args.sync.is_none() && args.beats.is_none() && args.offset.is_none() && args.bpm.is_none() {
+            return tool_err("set_player needs gain and/or loop, sync, beats, offset, bpm");
         }
-        ok_json(json!({"gain": gain}))
+        let mut st = self.state.lock().unwrap();
+        if let Some(g) = args.gain {
+            if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain: g.clamp(0.0, 1.0) }) {
+                return tool_err(e);
+            }
+        }
+        if args.loop_on.is_some() || args.sync.is_some() || args.beats.is_some() || args.offset.is_some() || args.bpm.is_some() {
+            let cmd = Command::SetPlayerCfg {
+                loop_on: args.loop_on,
+                sync: args.sync,
+                beats: args.beats,
+                offset: args.offset,
+                bpm: args.bpm,
+            };
+            if let Err(e) = send_cmd(&mut st, cmd) {
+                return tool_err(e);
+            }
+        }
+        ok_json(json!({
+            "gain": args.gain.map(|g| g.clamp(0.0, 1.0)), "loop": args.loop_on, "sync": args.sync,
+            "beats": args.beats, "offset": args.offset, "bpm": args.bpm,
+        }))
     }
 
     /// Start a backing track in the running app (the path crosses the UI
     /// bridge; the fixed-size command bus cannot carry it).
-    #[tool(name = "play_file", description = "Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). Needs the running app (kabelsalat mcp --attach).")]
+    #[tool(name = "play_file", description = "Play a backing-track audio file (WAV: 16/24-bit PCM or 32-bit float, e.g. a kabelsalat recording) mixed into the master. path is an absolute file path; gain 0..1 (default 0.8). Optional AUM FilePlayer options: loop, sync (follow the transport tempo; starts at the next bar while it rolls), beats (loop length in beats), offset (beats, +/-), bpm (original tempo). Needs the running app (kabelsalat mcp --attach).")]
     fn play_file(&self, Parameters(args): Parameters<PlayFileArgs>) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if !remote {
             return tool_err("play_file needs the running app (kabelsalat mcp --attach) — headless mode has no file player");
         }
-        Self::ui_bridge_tool("play_file", json!({"path": args.path, "gain": args.gain.unwrap_or(0.8)}))
+        let mut a = json!({"path": args.path, "gain": args.gain.unwrap_or(0.8)});
+        for (k, v) in [("loop", args.loop_on.map(Value::from)), ("sync", args.sync.map(Value::from)),
+            ("beats", args.beats.map(Value::from)), ("offset", args.offset.map(Value::from)), ("bpm", args.bpm.map(Value::from))] {
+            if let Some(v) = v {
+                a[k] = v;
+            }
+        }
+        Self::ui_bridge_tool("play_file", a)
     }
 
     /// Stop the backing track.
-    #[tool(name = "stop_file", description = "Stop the backing-track file player (and mute its mix).")]
+    #[tool(name = "stop_file", description = "Stop the backing-track file player (the file and its settings stay; play_file restarts it).")]
     fn stop_file(&self) -> Result<CallToolResult, McpError> {
         let remote = matches!(self.state.lock().unwrap().backend, Backend::Remote);
         if remote {
             return Self::ui_bridge_tool("stop_file", json!({}));
         }
         let mut st = self.state.lock().unwrap();
-        if let Err(e) = send_cmd(&mut st, Command::SetPlayer { gain: 0.0 }) {
+        if let Err(e) = send_cmd(&mut st, Command::SetPlayerEnable { on: false }) {
             return tool_err(e);
         }
         ok_json(json!({"stopped": true}))
@@ -1719,6 +2065,17 @@ impl McpServer {
                 return tool_err("CLAP parameter listing needs the running app (kabelsalat mcp --attach)");
             }
             NodeKind::SystemAudio => vec![(crate::engine::P_SYSTEM_GAIN, "Gain".into())],
+            // The arp's stepped knobs, spelled out so a model can pick one
+            // by name headless (the running app answers the same via
+            // ui_bridge_tool("list_params")).
+            NodeKind::Arp => vec![
+                (crate::arp::P_ARP_MODE, "Mode (up/down/up-down/chord/random)".into()),
+                (crate::arp::P_ARP_RATE, "Rate (1/4|1/8|1/8T|1/16|1/16T|1/32)".into()),
+                (crate::arp::P_ARP_OCTAVE, "Octaves (1-4)".into()),
+                (crate::arp::P_ARP_GATE, "Gate".into()),
+                (crate::arp::P_ARP_SWING, "Swing".into()),
+                (crate::arp::P_ARP_CHORD, "Chord (maj|min|sus2|sus4|7|maj7|min7|power)".into()),
+            ],
             NodeKind::Keys => Vec::new(),
             NodeKind::MidiFx { plugin } => match plugin {
                 crate::control::MidiFxPlugin::Builtin { .. } => vec![(crate::engine::P_MIDIFX_SEMI, "Transpose".into())],
@@ -1900,6 +2257,136 @@ impl McpServer {
         ok_json(json!({"rig": args.rig, "name": name}))
     }
 
+    /// Per-source strip mix (#73).
+    #[tool(name = "set_strip_mix", description = "Per-SOURCE mixer (#73): pan -1..1, mute, solo on one instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Applied by the engine at the node's output; resets on graph loads. In the running app (mcp --attach) the Mixer view shows it live.")]
+    fn set_strip_mix(&self, Parameters(args): Parameters<SetStripMixArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_strip_mix", json!({
+                "node": args.node, "pan": args.pan, "mute": args.mute, "solo": args.solo,
+            }));
+        }
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetStripMix { node: args.node, pan: args.pan, mute: args.mute, solo: args.solo }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "pan": args.pan, "mute": args.mute, "solo": args.solo}))
+    }
+
+    /// Bypass one effect node (#74).
+    #[tool(name = "set_node_bypass", description = "Bypass one effect node (#74): a bypassed FX passes its input through unchanged (its knobs are kept). True = bypass, false = enable. Resets on graph loads.")]
+    fn set_node_bypass(&self, Parameters(args): Parameters<SetNodeBypassArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_node_bypass", json!({"node": args.node, "bypass": args.bypass}));
+        }
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        let bypass = args.bypass.unwrap_or(true);
+        if let Err(e) = send_cmd(&mut st, Command::SetStripBypass { node: args.node, bypass }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"node": args.node, "bypass": bypass}))
+    }
+
+    /// Add an insert to a strip's chain (#74).
+    #[tool(name = "add_insert", description = "Add an effect at the end of a strip's insert chain (#74) — the chain IS the rack cables, so the rack re-wires with it and the sound changes. kind=dsp with dsp= (gain, pan, eq3, filter, limiter, saturation, delay, reverb) or kind=lv2 with uri= (an installed LV2 effect, see list_plugins). source = the strip's source node id; omit source for a MASTER insert (runs on the whole mix before the fixed limiter). Only works on a strip with a linear chain. Needs the running app (kabelsalat mcp --attach).")]
+    fn add_insert(&self, Parameters(args): Parameters<AddInsertArgs>) -> Result<CallToolResult, McpError> {
+        let mut a = json!({"kind": args.kind});
+        if let Some(s) = args.source { a["source"] = json!(s); }
+        if let Some(d) = &args.dsp { a["dsp"] = json!(d); }
+        if let Some(u) = &args.uri { a["uri"] = json!(u); }
+        if let Some(n) = &args.name { a["name"] = json!(n); }
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("add_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");
+        }
+        Self::ui_bridge_tool("add_insert", a)
+    }
+
+    /// Remove an insert from a strip's chain (#74).
+    #[tool(name = "remove_insert", description = "Remove one effect from a strip's insert chain (#74); the chain closes up (source -> next). fx = the effect's node id; source = its strip's source node id, omitted for a master insert. Needs the running app (kabelsalat mcp --attach).")]
+    fn remove_insert(&self, Parameters(args): Parameters<RemoveInsertArgs>) -> Result<CallToolResult, McpError> {
+        let mut a = json!({"fx": args.fx});
+        if let Some(s) = args.source { a["source"] = json!(s); }
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("remove_insert needs the running app (kabelsalat mcp --attach): it edits the rack's cables");
+        }
+        Self::ui_bridge_tool("remove_insert", a)
+    }
+
+    /// Rename one strip (#77).
+    #[tool(name = "rename_strip", description = "Rename one strip (#77): the name is the node's name, so the rack face, the mixer and saved sessions all show it. Up to 24 characters. In headless mcp the engine's graph is renamed (get_graph shows it).")]
+    fn rename_strip(&self, Parameters(args): Parameters<RenameStripArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("rename_strip", json!({"node": args.node, "name": args.name}));
+        }
+        let name: String = args.name.trim().chars().take(24).collect();
+        if name.is_empty() { return tool_err("a strip name cannot be empty"); }
+        let mut st = self.state.lock().unwrap();
+        if st.graph.node(args.node).is_none() {
+            return tool_err(format!("no node {} in the patch (see get_graph)", args.node));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::RenameNode { node: args.node, name: name_bytes(&name) }) {
+            return tool_err(e);
+        }
+        if let Some(n) = st.graph.nodes.iter_mut().find(|n| n.id == args.node) {
+            n.name = name_bytes(&name);
+        }
+        ok_json(json!({"node": args.node, "name": name}))
+    }
+
+    /// Set a strip's colour (#77).
+    #[tool(name = "set_strip_color", description = "Give a mixer strip a colour (#77): 0xRRGGBB, a palette name (teal, amber, rose, sand, violet, cyan) or none to clear. Saved with the session. Needs the running app (kabelsalat mcp --attach).")]
+    fn set_strip_color(&self, Parameters(args): Parameters<SetStripColorArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("set_strip_color needs the running app (kabelsalat mcp --attach): the colour is session state the app owns");
+        }
+        Self::ui_bridge_tool("set_strip_color", json!({"node": args.node, "color": args.color}))
+    }
+
+    /// Move a strip in the display order (#77).
+    #[tool(name = "move_strip", description = "Move one source strip to slot `to` (1-based) within its rig's display order in the mixer (#77). Display only — the sound is unchanged. Needs the running app (kabelsalat mcp --attach).")]
+    fn move_strip(&self, Parameters(args): Parameters<MoveStripArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("move_strip needs the running app (kabelsalat mcp --attach): the order is session state the app owns");
+        }
+        Self::ui_bridge_tool("move_strip", json!({"node": args.node, "to": args.to}))
+    }
+
+    /// Collapse a strip (#77).
+    #[tool(name = "collapse_strip", description = "Collapse a mixer strip to its mini form (#77): meter, M/S and the expand chip. Pass collapsed=false to expand. Needs the running app (kabelsalat mcp --attach).")]
+    fn collapse_strip(&self, Parameters(args): Parameters<CollapseStripArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("collapse_strip needs the running app (kabelsalat mcp --attach): the collapse flag is session state the app owns");
+        }
+        Self::ui_bridge_tool("collapse_strip", json!({"node": args.node, "collapsed": args.collapsed}))
+    }
+
+    /// Query quick knobs on mixer strips (#107).
+    #[tool(name = "get_strip_knobs", description = "List each mixer strip slot's quick knob (#107): node id, unit name, rig, active quick knob label, parameter name, current value (0..1), custom flag, and available choices. Needs the running app (kabelsalat mcp --attach).")]
+    fn get_strip_knobs(&self, Parameters(args): Parameters<GetStripKnobsArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("get_strip_knobs needs the running app (kabelsalat mcp --attach): quick knob assignments are session state the app owns");
+        }
+        let mut a = json!({});
+        if let Some(node) = args.node { a["node"] = json!(node); }
+        Self::ui_bridge_tool("get_strip_knobs", a)
+    }
+
+    /// Assign a mixer strip slot's quick knob (#107).
+    #[tool(name = "set_strip_knob", description = "Assign which knob a source or insert slot's quick knob controls in the mixer (#107). Pass knob by label or parameter name/id, or empty string \"\" to reset to default. Saved with the session. Needs the running app (kabelsalat mcp --attach).")]
+    fn set_strip_knob(&self, Parameters(args): Parameters<SetStripKnobArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("set_strip_knob needs the running app (kabelsalat mcp --attach): quick knob assignments are session state the app owns");
+        }
+        Self::ui_bridge_tool("set_strip_knob", json!({"node": args.node, "knob": args.knob}))
+    }
+
     /// Delete one rig.
     #[tool(name = "delete_rig", description = "Delete rig `rig` (index from get_rigs) with everything in it. DESTRUCTIVE: requires confirm=true; the last rig cannot be deleted. Returns {rigs, active}.")]
     fn delete_rig(&self, Parameters(args): Parameters<DeleteRigArgs>) -> Result<CallToolResult, McpError> {
@@ -2008,6 +2495,43 @@ impl McpServer {
         ok_json(json!({"loaded": preset.name, "rig": target, "rigs": metas, "active": target}))
     }
 
+    /// Load a starter template, replacing the patch.
+    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face; the three guitarix units need the Guitarix card installed) | demo | multi_rig (the two demo patches exist in the running app only).")]
+    fn load_template(&self, Parameters(args): Parameters<LoadTemplateArgs>) -> Result<CallToolResult, McpError> {
+        if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return Self::ui_bridge_tool("load_template", json!({"name": args.name}));
+        }
+        let name = args.name.to_lowercase();
+        if matches!(name.as_str(), "demo" | "multi_rig" | "rigs") {
+            return tool_err("demo and multi_rig are demo patches of the running app; headless templates are lead_reverb, drums_bass, ambient_pad, guitar_rig");
+        }
+        let Some(t) = template_by_name(&name) else {
+            return tool_err(format!(
+                "unknown template '{}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)",
+                args.name
+            ));
+        };
+        let s = t.session();
+        let mut st = self.state.lock().unwrap();
+        if let Err(e) = send_cmd(&mut st, Command::LoadGraph { graph: s.graph.clone() }) {
+            return tool_err(e);
+        }
+        for p in s.params() {
+            let _ = send_cmd(&mut st, Command::SetParam { node: p.node, param: p.param, value: p.value });
+        }
+        st.graph = s.graph.clone();
+        // A single-graph load leaves no rig list (the app's multi-rig path
+        // owns rig names; LoadGraph resets the engine's list too).
+        if let Ok(mut r) = st.rigs.lock() { r.rigs.clear(); r.active = 0; }
+        let mut result = json!({
+            "loaded": t.title(),
+            "nodes": s.graph.nodes.iter().map(|n| json!({"id": n.id, "name": name_str(&n.name), "rig": n.rig})).collect::<Vec<_>>(),
+            "edges": s.graph.edges.len(),
+        });
+        note_silent_claps(&st, &mut result);
+        ok_json(result)
+    }
+
     /// List saved single-rig presets.
     #[tool(name = "list_rig_presets", description = "List saved single-rig preset names in ~/kabelsalat-rig-presets.")]
     fn list_rig_presets(&self) -> Result<CallToolResult, McpError> {
@@ -2080,6 +2604,15 @@ impl McpServer {
             Ok(v) => ok_json(v),
             Err(e) => tool_err(format!("serializing rig snapshot: {e}")),
         }
+    }
+
+    /// The Navigator's rows (#108).
+    #[tool(name = "list_channels", description = "List what the Navigator shows (#108): every rig, its source channels (strip name and colour) and each channel's plugin chain (instrument, then inserts, with kind CLAP / LV2 / built-in). filter: channels | plugins | all (default all). Needs the running app (kabelsalat mcp --attach); headless, use get_rigs and get_graph.")]
+    fn list_channels(&self, Parameters(args): Parameters<ListChannelsArgs>) -> Result<CallToolResult, McpError> {
+        if !matches!(self.state.lock().unwrap().backend, Backend::Remote) {
+            return tool_err("list_channels needs the running app (kabelsalat mcp --attach): strip names, colours and order are session state the app owns; headless, use get_rigs and get_graph");
+        }
+        Self::ui_bridge_tool("list_channels", json!({ "filter": args.filter }))
     }
 
     /// List installed CLAP and LV2 plugins.
@@ -2432,6 +2965,9 @@ fn try_build_audio(rigs: Arc<Mutex<RigSnapshot>>) -> anyhow::Result<AudioHandles
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     let stream = device.build_output_stream(
         config,
@@ -2457,6 +2993,9 @@ fn dummy_audio(rigs: Arc<Mutex<RigSnapshot>>) -> AudioHandles {
     engine.set_graph_pub(graph_pub.clone());
     let (recorder_tap, record) = crate::record::start(crate::record::record_dir(), sample_rate as u32, 2);
     engine.set_recorder(recorder_tap);
+    let (listen_tap, listen_capture) = crate::listen::tap(sample_rate as u32);
+    engine.set_listen_tap(listen_tap);
+    crate::listen::install(listen_capture);
     let level = engine.level_handle();
     std::thread::Builder::new()
         .name("mcp-audio-dummy".into())
@@ -2745,7 +3284,7 @@ mod tests {
     #[test]
     fn play_file_needs_the_app_and_stop_file_mutes_headless() {
         let (server, mut engine) = local_server();
-        let res = serde_json::to_value(server.play_file(Parameters(PlayFileArgs { path: "/x.wav".into(), gain: None })).unwrap()).unwrap();
+        let res = serde_json::to_value(server.play_file(Parameters(PlayFileArgs { path: "/x.wav".into(), gain: None, loop_on: None, sync: None, beats: None, offset: None, bpm: None })).unwrap()).unwrap();
         assert_eq!(res["isError"], json!(true), "{res}");
         assert_eq!(tool_json(&server.stop_file()), json!({"stopped": true}));
         let mut buf = vec![0.0f32; 64 * 2];
@@ -3096,5 +3635,23 @@ mod tests {
         assert_eq!(r, json!({"record_sync": true}));
         engine.render(&mut buf, 2); // drain SetRecordSync into the engine
         assert!(engine.transport_pub().record_sync, "engine adopted record_sync");
+    }
+
+    #[test]
+    fn strip_knob_tools_require_attached_app_when_headless() {
+        let (server, _engine) = local_server();
+        let is_err = |res: Result<CallToolResult, McpError>| {
+            let v = serde_json::to_value(res.unwrap()).unwrap();
+            v.get("isError").and_then(Value::as_bool) == Some(true)
+        };
+        assert!(is_err(server.get_strip_knobs(Parameters(GetStripKnobsArgs { node: None }))));
+        assert!(is_err(server.set_strip_knob(Parameters(SetStripKnobArgs { node: 1, knob: "LEVEL".into() }))));
+    }
+
+    #[test]
+    fn list_channels_headless_points_at_the_attached_app() {
+        let (server, _engine) = local_server();
+        let res = server.list_channels(Parameters(ListChannelsArgs { filter: None }));
+        assert!(format!("{res:?}").contains("mcp --attach"), "headless list_channels names the attach path: {res:?}");
     }
 }

@@ -8,6 +8,24 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **MIDI strip on the software keyboard:** the keyboard dock now carries a
+  pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
+  its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's
+  VEL knob), like GarageBand's. They go out as the Keys source, so every rig
+  the keys feed responds, and they light the Keys unit's MIDI cables. Pitch
+  bend from a hardware controller now reaches the instruments too, and CC 1 /
+  CC 64 reach LV2 instruments as they already reached CLAP ones (#97).
+- **The assistant can listen (#35).** A new `listen` tool records a few
+  seconds of the master and sends them to an audio-capable model on
+  OpenRouter (Gemini 3.8 Flash by default; `agent_listen_model` in
+  config.json picks another). The model scores the sound 0-10 on the words
+  of your request ("8-bit", "heroic", "warm") and says what it heard and how
+  to move toward them. The agent plays notes, listens, changes one thing and
+  listens again. A listen takes the recording plus about 3 s. It needs an
+  OpenRouter key; without one the agent is pointed at `measure_mix`. MCP
+  agents get the same `listen` tool, headless and attached.
+  `kabelsalat listen-test` checks that the model ranks known reference clips
+  the right way round and prints its latency.
 - **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
   Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
   editor pane, in a window of its own, and closes from the same button or the

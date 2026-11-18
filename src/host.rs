@@ -386,8 +386,20 @@ impl ClapVoice {
         plugin_id: CString,
         sample_rate: f64,
     ) -> Result<(ClapVoice, ClapVoiceMain)> {
-        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id_str = plugin_id.to_string_lossy().into_owned();
+        // A parked instance of a never-free plugin is reused instead of
+        // instantiating a new one next to it (#52, rule 56 class). The fresh
+        // `entry` we just loaded is dropped: dlopen is refcounted, and the
+        // parked instance keeps its own.
+        if let Some(parked) = take_parked_clap(&id_str) {
+            println!("reusing parked instance: {}", parked.plugin_id);
+            let ParkedClap { plugin_id, instance, exts, _entry } = parked;
+            let (voice, mut main) = Self::build_voice(instance, exts, _entry, plugin_id.clone(), sample_rate)?;
+            if let Some(init) = init_state(&plugin_id) {
+                let _ = main.load_state(&init); // fresh-instance state
+            }
+            return Ok((voice, main));
+        }
         let host_info = HostInfo::new(
             "kabelsalat",
             "kabelsalat",
@@ -423,9 +435,25 @@ impl ClapVoice {
             exts.remote_controls.is_some()
         );
 
+        let (voice, mut main) = Self::build_voice(plugin, exts, entry, id_str.clone(), sample_rate)?;
+        if clap_never_free(&id_str) {
+            remember_init_state(&id_str, &mut main);
+        }
+        Ok((voice, main))
+    }
+
+    /// Activate `plugin`, start processing and build both halves of the
+    /// voice. Shared by fresh instantiation and parked reuse.
+    fn build_voice(
+        mut plugin: PluginInstance<TestHost>,
+        exts: Exts,
+        entry: PluginEntry,
+        id_str: String,
+        sample_rate: f64,
+    ) -> Result<(ClapVoice, ClapVoiceMain)> {
+        static NEXT_VOICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let (in_count, in_ch, out_chs, main_out) =
             inspect_audio_ports(&mut plugin, exts.audio_ports)?;
-
         let audio_config = PluginAudioConfiguration {
             sample_rate,
             min_frames_count: 1,
@@ -553,6 +581,13 @@ impl ClapVoice {
     /// Queue a raw MIDI 1.0 CC event on the audio thread without locking or allocating.
     pub fn send_cc_rt(&mut self, channel: u8, cc: u8, value: u8) {
         self.push_rt(VoiceCmd::Midi([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F]));
+    }
+
+    /// Queue a raw MIDI 1.0 pitch bend on the audio thread without locking
+    /// or allocating. `value` is the signed 14-bit bend (0 = center).
+    pub fn send_pitch_bend_rt(&mut self, channel: u8, value: i16) {
+        let v = (value.clamp(-8192, 8191) + 8192) as u16;
+        self.push_rt(VoiceCmd::Midi([0xE0 | (channel & 0x0F), (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8]));
     }
 
     /// Queue a MIDI programme change on the audio thread without locking or allocating.
@@ -878,6 +913,79 @@ pub fn run_editor_test(ids: &[String]) -> Result<()> {
 /// later.
 const MAIN_CONTROLS_RECHECKS: u8 = 10;
 
+/// CLAP plugins whose instances must never be destroyed (#52): Dexed's
+/// destructor segfaults while other plugin instances render (same class as
+/// the LV2 `NEVER_FREE` list, rule 56). Retired instances are deactivated
+/// and parked instead of destroyed; `ClapVoice::new_plugin` reuses them.
+const CLAP_NEVER_FREE: &[&str] = &["com.digital-suburban.dexed"];
+
+fn clap_never_free(plugin_id: &str) -> bool {
+    CLAP_NEVER_FREE.iter().any(|id| plugin_id.contains(id))
+}
+
+/// A deactivated instance of a `CLAP_NEVER_FREE` plugin, kept for reuse.
+/// Instances stay on the thread that created them (the plugin main thread):
+/// the pool is thread-local, so an instance never crosses a thread.
+struct ParkedClap {
+    plugin_id: String,
+    instance: PluginInstance<TestHost>,
+    exts: Exts,
+    _entry: PluginEntry,
+}
+
+thread_local! {
+    /// Parked instances are never dropped — not even at exit.
+    static CLAP_PARKED: std::cell::RefCell<Vec<ParkedClap>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Post-activation state of each never-free plugin's *first* fresh
+/// instantiation: what a new instance starts with. Reloaded when a parked
+/// instance is reused, so the player never hears the previous unit's patch.
+static INIT_STATE: Mutex<Vec<(String, Vec<u8>)>> = Mutex::new(Vec::new());
+
+fn remember_init_state(plugin_id: &str, main: &mut ClapVoiceMain) {
+    let mut store = INIT_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if store.iter().any(|(id, _)| id == plugin_id) {
+        return; // keep the first capture: this one may already be customized
+    }
+    if let Ok(state) = main.save_state() {
+        store.push((plugin_id.to_string(), state));
+    }
+}
+
+fn init_state(plugin_id: &str) -> Option<Vec<u8>> {
+    INIT_STATE
+        .lock()
+        .ok()?
+        .iter()
+        .find(|(id, _)| id == plugin_id)
+        .map(|(_, s)| s.clone())
+}
+
+/// Take a parked instance of `plugin_id`, if this thread parked one.
+fn take_parked_clap(plugin_id: &str) -> Option<ParkedClap> {
+    if !clap_never_free(plugin_id) {
+        return None;
+    }
+    CLAP_PARKED.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let i = pool.iter().position(|p| p.plugin_id == plugin_id)?;
+        Some(pool.swap_remove(i))
+    })
+}
+
+/// How many instances of `plugin_id` this thread has parked (tests).
+pub fn parked_clap_count(plugin_id: &str) -> usize {
+    CLAP_PARKED.with(|pool| {
+        pool.borrow()
+            .iter()
+            .filter(|p| p.plugin_id.contains(plugin_id))
+            .count()
+    })
+}
+
+
 /// Main-thread side of a [`ClapVoice`]: the CLAP plugin instance (which is
 /// `!Send`), state save/restore and deactivation. Must stay on the
 /// thread that called `ClapVoice::new`.
@@ -1051,10 +1159,48 @@ impl ClapVoiceMain {
         self.instance.deactivate(stopped);
     }
 
-    /// Stop `voice` and deactivate both halves (main thread only).
+    /// Stop `voice` and retire both halves (main thread only).
+    /// `CLAP_NEVER_FREE` plugins are deactivated and parked for reuse —
+    /// never destroyed: their destructor is unsafe while other plugin
+    /// instances render (#52).
     pub fn retire(self, voice: ClapVoice) {
+        let plugin_id = voice.plugin_id.clone();
         let stopped = voice.stop();
-        self.deactivate(stopped);
+        if clap_never_free(&plugin_id) {
+            self.park(stopped, plugin_id);
+        } else {
+            self.deactivate(stopped);
+        }
+    }
+
+    /// Deactivate a never-free instance and park it for the next
+    /// `new_plugin` of the same id. If the pool cannot take it, leak it —
+    /// never destroy (rule 56 class).
+    fn park(self, stopped: StoppedPluginAudioProcessor<TestHost>, plugin_id: String) {
+        // `Drop` closes the editor and frees the instance; a parked plugin
+        // is never freed, so take the fields out by hand.
+        let mut me = std::mem::ManuallyDrop::new(self);
+        me.close_editor();
+        me.instance.deactivate(stopped);
+        // SAFETY: `me` is never used or dropped again, and each field is read
+        // exactly once (the editor is closed, so there is nothing else to free).
+        let (instance, exts, entry, controls) = unsafe {
+            (
+                std::ptr::read(&me.instance),
+                std::ptr::read(&me.exts),
+                std::ptr::read(&me._entry),
+                std::ptr::read(&me.main_controls),
+            )
+        };
+        drop(controls);
+        let parked = ParkedClap { plugin_id, instance, exts, _entry: entry };
+        CLAP_PARKED.with(|pool| {
+            if let Ok(mut pool) = pool.try_borrow_mut() {
+                pool.push(parked);
+            } else {
+                std::mem::forget(parked); // poisoned pool: leak rather than free
+            }
+        });
     }
 
     /// Enumerate all plugin parameters for the native (egui) editor. Main thread
@@ -2605,6 +2751,64 @@ mod patch_search_tests {
         assert!(peak > 1e-4, "Dexed should render non-zero audio after patch load (peak={peak})");
         main.retire(voice);
     }
+
+    /// Retiring a Dexed instance parks it instead of destroying it (#52:
+    /// its destructor segfaults while other instances render), and a later
+    /// `new_plugin` reuses the parked instance — reset to fresh state.
+    #[test]
+    fn dexed_is_parked_and_reused_not_destroyed() {
+        let plugins = list_clap_plugins();
+        let Some(dexed) = plugins.iter().find(|p| p.id == "com.digital-suburban.dexed") else {
+            return; // skip cleanly on machines without dexed-clap
+        };
+        let before = parked_clap_count(&dexed.id);
+        let (voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate");
+        assert_eq!(parked_clap_count(&dexed.id), before, "a live instance is not parked");
+        // Customize the instance so we can prove the reuse resets its state.
+        let patches = discover_dexed_patches();
+        let stock = main.save_state().expect("stock state");
+        if let Some(target) = patches.iter().find(|p| p.program != 0) {
+            load_dexed_voice(&mut main, &target.syx_path, target.program).expect("load_dexed_voice");
+        }
+        let custom = main.save_state().expect("customized state");
+        main.retire(voice);
+        assert_eq!(parked_clap_count(&dexed.id), before + 1, "retire parks a never-free instance");
+
+        let (mut voice, mut main) = ClapVoice::new_plugin(48000.0, &dexed.id)
+            .expect("Dexed CLAP should instantiate again");
+        assert_eq!(parked_clap_count(&dexed.id), before, "the second instance reused the parked one");
+        // The reset lands on the audio thread a few blocks later (longer on a
+        // loaded machine): render until the customized patch is gone, bounded.
+        // Not compared byte for byte with a fresh instance: Dexed's fresh state
+        // also depends on what other instances in the process did.
+        if custom != stock {
+            let mut buf = vec![0.0f32; 256 * 2];
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let reused = loop {
+                for _ in 0..8 {
+                    voice.render(&mut buf, Transport::default());
+                }
+                let state = main.save_state().expect("reused state");
+                if state != custom || Instant::now() > deadline {
+                    break state;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_ne!(reused, custom, "a reused instance must not keep the previous unit's patch");
+        }
+        voice.note_on(60, 0.8);
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            voice.render(&mut buf, Transport::default());
+            for &s in &buf {
+                peak = peak.max(s.abs());
+            }
+        }
+        assert!(peak > 1e-4, "reused Dexed should render non-zero audio (peak={peak})");
+        main.retire(voice);
+    }
 }
 
 #[cfg(test)]
@@ -2806,24 +3010,27 @@ mod clap_scan_tests {
         let cache_file = tmp.0.join("cache").join("clap-scan.json");
         let spawn_log = tmp.0.join("spawns.log");
         let hang = sh_cmd(&r#"printf '%s\n' "$1" >> '__LOG__'; sleep 10"#.replace("__LOG__", &spawn_log.display().to_string()));
-        let list = |cmd: &ScannerCommand| {
+        // Only the hanging scanner needs the short timeout; the "fixed" one
+        // gets a generous timeout so a loaded machine's shell spawn cannot
+        // flake the third assertion (issue #64).
+        let list = |cmd: &ScannerCommand, timeout: Duration| {
             let start = Instant::now();
-            let out = list_clap_plugins_with(&[bad.clone()], cmd, Some(&cache_file), Duration::from_millis(150), 1);
+            let out = list_clap_plugins_with(&[bad.clone()], cmd, Some(&cache_file), timeout, 1);
             (out, start.elapsed())
         };
         let spawns = || std::fs::read_to_string(&spawn_log).map_or(0, |s| s.lines().count());
 
-        let (first, _) = list(&hang);
+        let (first, _) = list(&hang, Duration::from_millis(150));
         assert!(first.is_empty());
         assert_eq!(spawns(), 1);
-        let (second, took) = list(&hang);
+        let (second, took) = list(&hang, Duration::from_millis(150));
         assert!(second.is_empty());
         assert_eq!(spawns(), 1, "a cached failure must not spawn the scanner again");
         assert!(took < Duration::from_millis(100), "cached failure still paid the timeout: {took:?}");
 
         std::fs::write(&bad, b"v2-fixed").unwrap();
         let fixed = sh_cmd(r#"printf '[{"id":"id.fixed","name":"F","vendor":"V","features":[]}]\n'"#);
-        let (third, _) = list(&fixed);
+        let (third, _) = list(&fixed, Duration::from_secs(30));
         assert_eq!(third.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["id.fixed"]);
     }
 

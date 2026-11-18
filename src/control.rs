@@ -796,6 +796,10 @@ pub enum Command {
     /// "Sync to transport": while on, master TransportPlay starts a recording
     /// and TransportStop stops it (recording follows the master transport).
     SetRecordSync { on: bool },
+    /// Arm or disarm a recording target (`rig: None` = master mix, `Some(r)` =
+    /// rig `r`'s post-fader stem). Armed targets are captured together in the
+    /// next take.
+    SetRecordArm { rig: Option<u8>, armed: bool },
     /// Reset the master-bus loudness meter (Bravo 1 "measure loop"): clears
     /// the integrated-loudness gate, windows, true-peak hold and band/LFE
     /// accumulators so a fresh integrated measurement starts now.
@@ -963,6 +967,8 @@ mod tests {
             Command::RecordStart,
             Command::RecordStop,
             Command::SetRecordSync { on: true },
+            Command::SetRecordArm { rig: None, armed: true },
+            Command::SetRecordArm { rig: Some(1), armed: true },
             Command::ResetMeter,
             Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },

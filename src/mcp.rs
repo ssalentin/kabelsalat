@@ -376,6 +376,17 @@ struct RecordSyncArgs {
     on: bool,
 }
 
+/// Arguments for `set_record_arm`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetRecordArmArgs {
+    /// Target: "master" or "rig" (defaults to "rig" when `rig` is set, else "master").
+    target: Option<String>,
+    /// 0-based rig index when arming a rig stem.
+    rig: Option<u8>,
+    /// True to arm, false to disarm (defaults to true).
+    armed: Option<bool>,
+}
+
 /// Arguments for `measure_mix`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MeasureMixArgs {
@@ -2223,12 +2234,16 @@ impl McpServer {
         ok_json(json!({"enabled": enabled, "bars": bars}))
     }
 
-    /// Start recording the master output.
-    #[tool(name = "record_start", description = "Start recording the final master output (what the user hears) to a new timestamped 32-bit-float WAV under ~/Music/kabelsalat/ (Command::RecordStart). Idempotent: a second start while recording is a no-op.")]
+    /// Start recording armed targets (master mix and/or armed rig stems).
+    #[tool(name = "record_start", description = "Start recording armed targets (master mix and/or armed rig stems) to a new timestamped take folder under ~/Music/kabelsalat/ (Command::RecordStart). Bar-quantized when the transport rolls. Idempotent.")]
     fn record_start(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Local(_)) && !st.record.is_live() {
             return tool_err("recording unavailable: no audio engine (recorder not attached)");
+        }
+        if matches!(st.backend, Backend::Local(_)) {
+            let names: Vec<String> = st.rigs.lock().map(|s| s.rigs.iter().map(|r| r.name.clone()).collect()).unwrap_or_default();
+            st.record.set_rig_names(names);
         }
         if let Err(e) = send_cmd(&mut st, Command::RecordStart) {
             return tool_err(e);
@@ -2237,7 +2252,7 @@ impl McpServer {
     }
 
     /// Stop recording.
-    #[tool(name = "record_stop", description = "Stop recording (Command::RecordStop): the writer drains the ring and finalizes the WAV header. Idempotent: a stop while idle is a no-op.")]
+    #[tool(name = "record_stop", description = "Stop recording (Command::RecordStop): the writer drains the rings and finalizes all WAV headers. Bar-quantized when the transport rolls (a second stop stops immediately). Idempotent.")]
     fn record_stop(&self) -> Result<CallToolResult, McpError> {
         let mut st = self.state.lock().unwrap();
         if let Err(e) = send_cmd(&mut st, Command::RecordStop) {
@@ -2246,8 +2261,8 @@ impl McpServer {
         ok_json(json!({"recording": false}))
     }
 
-    /// Recording status: path, elapsed seconds, dropped frames.
-    #[tool(name = "record_status", description = "Get recording status: recording (bool), path (the last/finalized WAV), seconds (elapsed), dropped_frames (ring overruns), finalized.")]
+    /// Recording status: path, folder, elapsed seconds, dropped frames, stems, armed targets.
+    #[tool(name = "record_status", description = "Get recording status: recording (bool), pending (bool), path, folder, seconds, dropped_frames, finalized, stems, armed_master, armed_rigs.")]
     fn record_status(&self) -> Result<CallToolResult, McpError> {
         let st = self.state.lock().unwrap();
         if matches!(st.backend, Backend::Remote) {
@@ -2261,6 +2276,35 @@ impl McpServer {
             return ok_json(reply.get("data").cloned().unwrap_or(Value::Null));
         }
         ok_json(serde_json::to_value(st.record.snapshot()).unwrap_or(json!({})))
+    }
+
+    /// Arm or disarm a recording target (master mix or a rig's post-fader stem).
+    #[tool(name = "set_record_arm", description = "Arm or disarm a recording target (Command::SetRecordArm): target='master' (or omit target and rig) for the master mix, or rig=<0-based index> for a rig's post-fader stem. Armed targets record simultaneously into the same take folder.")]
+    fn set_record_arm(&self, Parameters(args): Parameters<SetRecordArmArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        let armed = args.armed.unwrap_or(true);
+        let rig = if args.target.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("master"))
+            || (args.rig.is_none() && args.target.is_none())
+        {
+            None
+        } else {
+            let r = args.rig.unwrap_or(0);
+            if r >= 8 {
+                return tool_err(format!("no rig {r}: stems exist for rigs 0..7"));
+            }
+            if matches!(st.backend, Backend::Local(_)) && armed {
+                st.record.ensure_stem(r);
+            }
+            Some(r)
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetRecordArm { rig, armed }) {
+            return tool_err(e);
+        }
+        ok_json(json!({
+            "target": if rig.is_none() { "master" } else { "rig" },
+            "rig": rig,
+            "armed": armed,
+        }))
     }
 
     /// Toggle sync-to-transport recording.

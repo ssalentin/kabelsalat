@@ -303,6 +303,17 @@ fn handle_line_with_pub(
                 Ok(c) => c,
                 Err(e) => return err_reply(format!("invalid Command: {e}")),
             };
+            if let Some(rec) = crate::record::LIVE_RECORDER.get() {
+                match cmd {
+                    Command::SetRecordArm { rig: Some(r), armed: true } => rec.ensure_stem(r),
+                    Command::RecordStart => {
+                        if let Ok(s) = rigs.lock() {
+                            rec.set_rig_names(s.rigs.iter().map(|m| m.name.clone()).collect());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // Agent undo: let the app snapshot BEFORE the engine applies the
             // edit (best effort — an idle/absent UI must not block the bus).
             // Never while holding the bus lock: the UI frame may need it.

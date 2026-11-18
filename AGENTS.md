@@ -745,6 +745,15 @@ Learned so far (2026-11-15, UI polish pass):
     ~200 installed plugins on the UI thread: 2.6 to 4.0 s per session load.
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
+128. **Never end a turn on a build or test you have not read the end of:**
+    on #6, three turns in a row said "running `cargo test`, waiting for the
+    output" and ended; the background job died with the session, nobody
+    read a result, and the work stalled for hours. Run builds and tests in
+    the FOREGROUND with the maximum timeout (600000 ms; split into
+    `--no-run` then the run if needed). If one must run in the background,
+    block on it (`t3_background_wait`) before replying, and report its exit
+    code and `test result:` line. "Waiting for the output" is never a
+    final message.
 
 ## Working on kabelsalat
 

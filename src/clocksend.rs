@@ -578,6 +578,12 @@ impl ClockControl {
         if let Ok(mut w) = self.wired.lock() { *w = s.wired; }
     }
 
+    /// The thread's computed net offset (manual + compensation), for the
+    /// UI's pre-roll decision at play time.
+    pub fn publish_net_offset_ns(&self, ns: i64) {
+        self.net_off_ns.store(ns, Ordering::Relaxed);
+    }
+
     pub fn net_offset_ms(&self) -> f32 {
         self.net_off_ns.load(Ordering::Relaxed) as f32 / 1e6
     }
@@ -711,7 +717,7 @@ pub fn spawn_clock_thread(ctl: Arc<ClockControl>) {
             };
             let align_ns = (lat.align_ms(cfg.comp) as f64 * 1e6).round() as i64;
             let net_off = net_offset_ns(cfg, align_ns);
-            ctl.net_off_ns.store(net_off, Ordering::Relaxed);
+            ctl.publish_net_offset_ns(net_off);
 
             // Engine snapshot; a missing engine keeps the clock idle.
             let snap = ctl.pos.lock().ok()
@@ -793,10 +799,9 @@ fn deliver(seq: &mut SeqClient, port: u8, queue: u8, events: &[OutEvent], ctl: &
                 n += 1;
             }
             OutEvent::Spp { at_ns, value } => {
-                // MIDI order: SPP first, then Continue (AUM parity).
+                // MIDI order: SPP first; the planner's Continue follows it.
                 batch[n] = seq.timed_clock_event(queue, port, EVENT_SONGPOS, at_ns, value as u32);
-                batch[n + 1] = seq.timed_clock_event(queue, port, EVENT_CONTINUE, at_ns, 0);
-                n += 2;
+                n += 1;
             }
             OutEvent::Tick { at_ns } => {
                 batch[n] = seq.timed_clock_event(queue, port, EVENT_CLOCK, at_ns, 0);
@@ -1084,6 +1089,8 @@ pub fn run_clock_test() -> anyhow::Result<()> {
     let spp_idx = received.iter().position(|(_, ty, _)| *ty == alsaseq::EVENT_SONGPOS);
     let cont_idx = received.iter().position(|(_, ty, _)| *ty == alsaseq::EVENT_CONTINUE);
     anyhow::ensure!(spp_idx < cont_idx, "SPP must precede Continue");
+    let conts = received.iter().filter(|(_, ty, _)| *ty == alsaseq::EVENT_CONTINUE).count();
+    anyhow::ensure!(conts == 1, "expected exactly one Continue, saw {conts}");
 
     // 3. The command bus never saw a spontaneous play (only the pre-roll
     // sends EnginePlay; offset is 0 here).

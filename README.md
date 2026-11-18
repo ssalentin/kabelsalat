@@ -60,6 +60,13 @@ only loud notes.
 
 <p align="center"><img src="docs/shots/matrix.png" width="85%" alt="The MIDI matrix: keyboard and hardware sources routed to two rigs"/></p>
 
+### Be the clock
+Switch on MIDI Clock Send in the matrix view and kabelsalat becomes the master
+clock: 24 clocks per beat plus Start and Stop go to the MIDI outputs you wire
+(drum machines, synths) and to a virtual port other apps can connect to. A sync
+offset and three latency modes (none, output, input) line the clock up with what
+you hear.
+
 ### Control knobs from your controller
 Right-click any knob, turn a knob on your MIDI controller — bound. The knob
 shows its CC number and follows your hardware from then on.

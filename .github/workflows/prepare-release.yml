@@ -1,0 +1,69 @@
+name: Prepare release
+
+# Actions → "Prepare release" → Run (or `gh workflow run prepare-release.yml
+# -f bump=minor`): bumps the version, folds changes/*.md into CHANGELOG.md,
+# adds the metainfo entry and queues the PR for auto-merge. Once it merges,
+# tag-release.yml tags it and release.yml publishes every package.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: patch, minor, major or an explicit X.Y.Z
+        required: true
+        default: minor
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: prepare-release
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUMP: ${{ inputs.bump }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Bump version, CHANGELOG and metainfo
+        id: bump
+        run: |
+          version=$(python3 scripts/release.py prepare "$BUMP")
+          if git ls-remote --exit-code origin "refs/tags/v$version" > /dev/null; then
+            echo "::error::v$version is already tagged"
+            exit 1
+          fi
+          scripts/ci/release-notes.sh "$version" > "$RUNNER_TEMP/notes.md"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          git diff --stat
+      - name: Open the release PR and queue it
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch=release-$VERSION
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add -A CHANGELOG.md Cargo.toml Cargo.lock changes packaging/flatpak
+          git commit -q -m "release: v$VERSION"
+          git push -u origin "$branch"
+          {
+            echo "Release **v$VERSION**, prepared by \`prepare-release.yml\` (bump: \`$BUMP\`)."
+            echo "Merging tags it and publishes every package (\`tag-release.yml\` → \`release.yml\`)."
+            echo
+            echo "## Notes"
+            echo
+            cat "$RUNNER_TEMP/notes.md"
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --base main --head "$branch" --title "Release v$VERSION" \
+            --body-file "$RUNNER_TEMP/body.md"
+          gh pr merge "$branch" --auto --squash
+          # A PR opened with GITHUB_TOKEN starts no pull_request workflows;
+          # dispatching CI on the branch produces the required checks.
+          gh workflow run ci.yml --ref "$branch"

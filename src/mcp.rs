@@ -1054,7 +1054,7 @@ impl McpServer {
     }
 
     /// Add a node to the patch.
-    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
+    #[tool(name = "add_node", description = "Add a node (Command::AddNode). kind: keys|clap|dsp|lv2|audio_in|system_audio|master_out; dsp nodes need 'dsp' (gain|pan|eq3|filter|limiter|saturation|delay|reverb|metronome); lv2 nodes need 'uri'; clap nodes take an optional plugin_id (default Surge XT); audio_in nodes take optional device (PipeWire source name from list_audio_devices; omit = default input) and channels (in_1|in_2|stereo). Added dsp/lv2 nodes sound immediately (processors are built); wire them with connect. An instrument (clap, or an lv2 plugin that declares lv2:InstrumentPlugin) is wired like a standard rig's synth: the rig's Keys -> it (MIDI) and it -> the rig's Master L and R; 'cables' lists those cable ids. In the running app (mcp --attach) every clap node gets its own voice, however many there are; headless mcp hosts two Surge XT voices and returns silent_clap_nodes when the new node has none.")]
     fn add_node(&self, Parameters(args): Parameters<AddNodeArgs>) -> Result<CallToolResult, McpError> {
         let kind = match parse_node_kind(&args) {
             Ok(k) => k,
@@ -1082,12 +1082,22 @@ impl McpServer {
         // Send first, then mirror into the local model: both id counters
         // advance exactly once per accepted command and stay in sync.
         let rig = args.rig.unwrap_or(0);
-        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig }) {
+        let wire = match &kind {
+            NodeKind::Clap { .. } => true,
+            NodeKind::Lv2 { uri } => crate::lv2::discover().iter().any(|p| p.uri == uri.as_str() && p.is_instrument),
+            _ => false,
+        };
+        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
             return tool_err(e);
         }
         let id = st.graph.add_node(kind, name);
         st.graph.set_rig(id, rig);
-        let mut result = json!({"id": id, "name": name_str(&name)});
+        let before = st.graph.edges.len();
+        if wire {
+            st.graph.wire_instrument(id);
+        }
+        let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
+        let mut result = json!({"id": id, "name": name_str(&name), "cables": cables});
         note_silent_claps(&st, &mut result);
         ok_json(result)
     }

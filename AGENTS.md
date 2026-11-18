@@ -746,6 +746,12 @@ Learned so far (2026-11-15, UI polish pass):
     `classify_lv2_units` reads the background scan's list and runs again when
     the scan lands. Time loads with `kabelsalat session-load-bench <pkg>`.
 
+128. **Dock controls are painted from the theme, never stock `egui::Slider`:**
+    the VEL slider's rail has the panel's own fill on the dark dock, so only a
+    tiny handle showed. Use a `PAPER_SINK` track + `CREAM` fill like the strip's
+    wheels (`kb_strip_sends_the_standard_midi_signals` drives it by pointer),
+    and look at the screenshot before calling a control done.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

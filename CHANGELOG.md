@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **MIDI strip on the software keyboard:** the keyboard dock now carries a
+  pitch-bend wheel (springs back to centre), a modulation wheel (CC 1, holds
+  its value), a sustain pedal (CC 64) and a velocity slider (the Keys unit's
+  VEL knob), like GarageBand's. They go out as the Keys source, so every rig
+  the keys feed responds, and they light the Keys unit's MIDI cables. Pitch
+  bend from a hardware controller now reaches the instruments too, and CC 1 /
+  CC 64 reach LV2 instruments as they already reached CLAP ones (#97).
 - **Plugin windows:** a CLAP instrument's own editor (Surge XT, Odin 2,
   Dexed, YANES, Aeolus) opens from "Open plugin window" at the top of its
   editor pane, in a window of its own, and closes from the same button or the

@@ -441,6 +441,13 @@ fn connect_hw_input(
                             cq.pop_front();
                         }
                     }
+                } else if st == 0xE0 {
+                    // Pitch bend from a wheel/wind controller: to the engine
+                    // like a CC (the pitch-bend half of #68). The UI animates
+                    // nothing here, so no queue.
+                    let ch = msg[0] & 0x0F;
+                    let val = ((msg[2] as i16) << 7 | msg[1] as i16) - 8192;
+                    let _ = direct.send_bend(SourceId::Hardware(dev), ch, val, std::time::Instant::now());
                 }
             }
         },
@@ -488,6 +495,21 @@ impl HwDirect {
             channel: channel & 0x0F,
             cc: cc & 0x7F,
             value: value & 0x7F,
+        };
+        let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
+        crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
+        ok
+    }
+
+    /// Send one hardware pitch bend straight to the engine from the midir
+    /// thread, like [`Self::send_cc`].
+    fn send_bend(&self, source: SourceId, channel: u8, value: i16, created: std::time::Instant) -> bool {
+        let Ok(guard) = self.bus.lock() else { return false };
+        let Some(bus) = guard.as_ref() else { return false };
+        let cmd = Command::PitchBend {
+            source,
+            channel: channel & 0x0F,
+            value: value.clamp(-8192, 8191),
         };
         let ok = bus.lock().map(|mut b| b.send(cmd)).unwrap_or(false);
         crate::bridge::record_midi_latency(created.elapsed().as_micros() as u32);
@@ -2230,6 +2252,16 @@ struct DemoApp {
     dock_rect: Rect,
     /// Last frame's key area inside the dock keyboard (points).
     dock_kb_rect: Rect,
+    /// Software-keyboard MIDI strip (GitHub #97): pitch-bend wheel position
+    /// (-1..=1, 0 = center, springs back on release), modulation wheel
+    /// (0..=1, stays), sustain pedal (CC 64, the instruments hold the
+    /// notes themselves). The velocity slider drives the Keys VEL knob.
+    kb_bend: f32,
+    kb_mod: f32,
+    kb_sustain: bool,
+    /// Last frame's strip rects: [pitch wheel, mod wheel, sustain chip, VEL
+    /// slider] (tests + hit-testing).
+    kb_strip: [Rect; 4],
     /// Per-hardware-device activity LEDs for the matrix row headers.
     hw_leds: Vec<f32>,
     /// Motion (design polish): staged fade-in after a template/session load.
@@ -2601,6 +2633,10 @@ impl DemoApp {
             fading_cables: Vec::new(),
             dock_rect: Rect::NOTHING,
             dock_kb_rect: Rect::NOTHING,
+            kb_bend: 0.0,
+            kb_mod: 0.0,
+            kb_sustain: false,
+            kb_strip: [Rect::NOTHING; 4],
             hw_leds: Vec::new(),
             load_fade: 1.0,
             unit_hover: Vec::new(),
@@ -10996,10 +11032,11 @@ impl DemoApp {
     }
 
     /// Keyboard dock height: a share of the WINDOW height (rule 64), never
-    /// below the minimum playable size, and only what the rack can spare
-    /// (rule 22). Whole pixels, so a resize does not jitter the layout.
+    /// below the minimum playable size (header + MIDI strip + keys of at
+    /// least 60 px), and only what the rack can spare (rule 22). Whole
+    /// pixels, so a resize does not jitter the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 112.0; // header + keys of at least 60 px
+        const MIN_H: f32 = 164.0;
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -11029,6 +11066,7 @@ impl DemoApp {
         let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
         let mut note: Option<usize> = None;
         let mut kb_rect = Rect::NOTHING;
+        let mut strip = [Rect::NOTHING; 4];
         // exact_size, not default_size: egui keeps a panel's first size, so
         // the dock never followed a window resize (#23).
         let resp = egui::Panel::bottom("dock")
@@ -11054,6 +11092,68 @@ impl DemoApp {
                                 self.dock = DockView::None;
                             }
                         });
+                    },
+                );
+                ui.add_space(4.0);
+                // --- MIDI control strip (GitHub #97) -------------------------
+                // The standard signals a keyboard sends besides notes, laid
+                // out like GarageBand's: pitch bend and modulation wheels,
+                // the sustain pedal, and the velocity slider. All go out as
+                // the Keys source, so the matrix routes them to the same
+                // rigs the played notes reach.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), 56.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        self.kb_wheel_ui(ui, "PITCH", true, &mut strip[0]);
+                        ui.add_space(10.0);
+                        self.kb_wheel_ui(ui, "MOD", false, &mut strip[1]);
+                        ui.add_space(14.0);
+                        let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
+                            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
+                        strip[2] = sus.rect;
+                        if sus.clicked() {
+                            self.kb_sustain = !self.kb_sustain;
+                            self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
+                            self.kb_strip_pulse(0.85);
+                        }
+                        ui.add_space(14.0);
+                        // Velocity: one source of truth — the Keys unit's VEL
+                        // knob, which the laptop keys and clicks already
+                        // scale by (find it by label, rule 92).
+                        let ki = self.keys_idx();
+                        let vel_idx = self.units.get(ki).and_then(|u| u.knob_index("VEL"));
+                        let vel = vel_idx
+                            .and_then(|i| self.units.get(ki).map(|u| u.knobs[i].value))
+                            .unwrap_or(0.8);
+                        let (track, resp) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::click_and_drag());
+                        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
+                        strip[3] = track;
+                        let mut vel_new = vel;
+                        if resp.dragged() || resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                            }
+                        }
+                        if (vel_new - vel).abs() > f32::EPSILON {
+                            if let Some(i) = vel_idx {
+                                if let Some(u) = self.units.get_mut(ki) {
+                                    // Rule 109: the drawn knob follows at once.
+                                    u.knobs[i].set_immediate(vel_new);
+                                }
+                            }
+                        }
+                        let painter = ui.painter();
+                        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
+                        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
+                        painter.rect_filled(
+                            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
+                            1.0,
+                            theme::CREAM,
+                        );
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(format!("VEL {:.2}", vel_new)).size(11.0).color(theme::INK_2));
                     },
                 );
                 ui.add_space(4.0);
@@ -11102,6 +11202,7 @@ impl DemoApp {
             });
         self.dock_rect = resp.response.rect;
         self.dock_kb_rect = kb_rect;
+        self.kb_strip = strip;
         self.assistant_rect = Rect::NOTHING;
         self.assistant_input_rect = Rect::NOTHING;
         if let Some(semi) = note {
@@ -11115,6 +11216,103 @@ impl DemoApp {
         self.current_source = SourceId::Keys;
         self.fire_keys(note, 0.95);
         self.note_offs.push((std::time::Instant::now() + std::time::Duration::from_millis(CLICK_NOTE_MS), note));
+    }
+
+    /// One keyboard-strip channel message, out as the Keys source: the same
+    /// bus the played notes take, so the matrix routes it to the same rigs
+    /// (and per-rig keyboard switches gate it the same way).
+    fn kb_cc(&mut self, cc: u8, value: u8) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| {
+                b.send(Command::Cc { source: SourceId::Keys, channel: 0, cc, value })
+            });
+        }
+    }
+
+    /// One keyboard-strip pitch bend (signed 14-bit, 0 = center).
+    fn kb_bend_cmd(&mut self, value: i16) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().map(|mut b| {
+                b.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value })
+            });
+        }
+    }
+
+    /// A strip message pulses the Keys unit's living MIDI cables, so the
+    /// rack shows the wheels feeding the rigs (the note pulse path).
+    fn kb_strip_pulse(&mut self, amp: f32) {
+        let ki = self.keys_idx();
+        if !self.units.get(ki).map(|u| matches!(u.node_kind, UnitKind::Keys)).unwrap_or(false) {
+            return;
+        }
+        for ci in 0..self.cables.len() {
+            let c = &mut self.cables[ci];
+            if c.src == ki && c.kind == PortKind::Midi && c.dying < 0.0 {
+                c.spawn_pulse(0.0, amp);
+            }
+        }
+    }
+
+    /// One strip wheel (GitHub #97): a small vertical track the pointer
+    /// drags — pitch (`spring`, value -1..=1, back to center on release,
+    /// like a real wheel) or modulation (value 0..=1, holds). Sends only
+    /// when the quantized MIDI value moves, so a frame that rounds to the
+    /// same bend/CC sends nothing.
+    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, label: &str, spring: bool, rect_out: &mut Rect) {
+        const W: f32 = 26.0;
+        const H: f32 = 40.0;
+        let mut track = Rect::NOTHING;
+        ui.vertical(|ui| {
+            let (t_rect, resp) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::click_and_drag());
+            track = t_rect;
+            // Pointer → value: the track bottom is the rest position (pitch:
+            // -1), the top is the extreme. Absolute, like a real wheel.
+            let mut value = if spring { self.kb_bend } else { self.kb_mod };
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    let t = ((t_rect.bottom() - pos.y) / t_rect.height()).clamp(0.0, 1.0);
+                    value = if spring { t * 2.0 - 1.0 } else { t };
+                }
+            } else if spring && resp.drag_stopped() {
+                value = 0.0;
+            }
+            if spring {
+                let after = (value * 8191.0).round() as i16;
+                if after != (self.kb_bend * 8191.0).round() as i16 {
+                    self.kb_bend = value;
+                    self.kb_bend_cmd(after);
+                    self.kb_strip_pulse(0.3 + value.abs() * 0.5);
+                }
+            } else {
+                let after = (value * 127.0).round() as u8;
+                if after != (self.kb_mod * 127.0).round() as u8 {
+                    self.kb_mod = value;
+                    self.kb_cc(1, after);
+                    self.kb_strip_pulse(0.3 + value * 0.5);
+                }
+            }
+            let painter = ui.painter().clone();
+            painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
+            painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            if spring {
+                // The center detent a pitch wheel returns to.
+                let cy = t_rect.center().y;
+                painter.line_segment(
+                    [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
+                    Stroke::new(1.0, theme::MUTED),
+                );
+            }
+            let t = if spring { (value + 1.0) * 0.5 } else { value };
+            let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
+            let thumb = Rect::from_min_size(
+                Pos2::new(t_rect.left() + 3.0, yc - 2.0),
+                Vec2::new(t_rect.width() - 6.0, 4.0),
+            );
+            painter.rect_filled(thumb, 1.0, theme::CREAM);
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(label).size(9.5).color(theme::INK_2));
+        });
+        *rect_out = track;
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -21319,9 +21517,108 @@ mod ui_polish_agent_tests {
         assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
         assert!(kb_big.height() > kb_small.height());
         let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
-        assert!(h_tiny >= 111.0, "minimum dock height: {h_tiny}");
+        assert!(h_tiny >= 163.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
+        // The MIDI strip fits above the keys at every size (GitHub #97).
+        for _ in 0..3 { run_frame(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]); }
+        let sr = app.kb_strip;
+        assert!(sr.iter().all(|r| r.is_positive() && r.width() > 0.0), "strip laid out: {sr:?}");
+        let kb = app.dock_kb_rect;
+        assert!(sr.iter().all(|r| r.bottom() <= kb.top() + 0.5), "strip stays above the keys: {sr:?} vs {kb:?}");
+        assert!(sr.iter().all(|r| r.top() >= app.dock_rect.top()), "strip inside the dock");
+    }
+
+    /// GitHub #97: the dock's MIDI strip sends the standard keyboard
+    /// signals — pitch bend (springs back to center on release),
+    /// modulation (holds its value), sustain (CC 64 toggle) — and the VEL
+    /// slider drives the Keys unit's VEL knob (found by label, rule 92;
+    /// assert the DRAWN value, rule 109).
+    #[test]
+    fn kb_strip_sends_the_standard_midi_signals() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+        let strip = app.kb_strip;
+        assert!(strip.iter().all(|r| r.is_positive()), "strip laid out: {strip:?}");
+        let mut sent = Vec::new();
+
+        // Press-drag-release, in points, like a user moves a wheel.
+        let ptr = |pos: Pos2, pressed: bool| egui::Event::PointerButton {
+            pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+        };
+        let drag_to = |app: &mut DemoApp, from: Pos2, to: Pos2| {
+            run_frame(app, &ctx, size, vec![egui::Event::PointerMoved(from)]);
+            run_frame(app, &ctx, size, vec![ptr(from, true)]);
+            for i in 1..=4 {
+                let p = from + (to - from) * (i as f32 / 4.0);
+                run_frame(app, &ctx, size, vec![egui::Event::PointerMoved(p)]);
+            }
+            run_frame(app, &ctx, size, vec![ptr(to, false)]);
+        };
+
+        // Pitch wheel: from the bottom (-1) to the top (+1), released there.
+        let w = strip[0];
+        drag_to(&mut app, Pos2::new(w.center().x, w.bottom() - 2.0), Pos2::new(w.center().x, w.top() + 2.0));
+        drain.drain(|c| sent.push(c));
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::PitchBend { source: SourceId::Keys, value, .. } if *value > 4000)),
+            "the drag sent a bend up: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::PitchBend { .. })).collect::<Vec<_>>()
+        );
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::PitchBend { source: SourceId::Keys, value: 0, .. })),
+            "releasing the wheel springs back to center: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::PitchBend { .. })).collect::<Vec<_>>()
+        );
+        assert_eq!(app.kb_bend, 0.0, "the wheel is at rest after release");
+
+        // Mod wheel: from the bottom (0) to the top (1), released there.
+        sent.clear();
+        let m = strip[1];
+        // Past the top: the value clamps to the extreme.
+        drag_to(&mut app, Pos2::new(m.center().x, m.bottom() - 2.0), Pos2::new(m.center().x, m.top() - 6.0));
+        drain.drain(|c| sent.push(c));
+        assert!(
+            sent.iter().any(|c| matches!(c, Command::Cc { source: SourceId::Keys, cc: 1, value: 127, .. })),
+            "the drag sent CC 1 (modulation) at full: {:?}",
+            sent.iter().filter(|c| matches!(c, Command::Cc { cc: 1, .. })).collect::<Vec<_>>()
+        );
+        assert!(app.kb_mod > 0.9, "the mod wheel HOLDS its value: {}", app.kb_mod);
+
+        // Sustain pedal: on, then off.
+        sent.clear();
+        click_at(&mut app, &ctx, size, strip[2].center());
+        drain.drain(|c| sent.push(c));
+        sent.retain(|c| matches!(c, Command::Cc { .. })); // the frame also re-publishes cables
+        assert!(matches!(sent.as_slice(), [Command::Cc { source: SourceId::Keys, cc: 64, value: 127, .. }]), "pedal down is CC 64 = 127: {sent:?}");
+        assert!(app.kb_sustain);
+        sent.clear();
+        click_at(&mut app, &ctx, size, strip[2].center());
+        drain.drain(|c| sent.push(c));
+        sent.retain(|c| matches!(c, Command::Cc { .. })); // the frame also re-publishes cables
+        assert!(matches!(sent.as_slice(), [Command::Cc { source: SourceId::Keys, cc: 64, value: 0, .. }]), "pedal up is CC 64 = 0: {sent:?}");
+        assert!(!app.kb_sustain);
+        // Strip messages pulse the Keys unit's MIDI cables, like notes do.
+        let ki = app.keys_idx();
+        assert!(
+            app.cables.iter().any(|c| c.src == ki && c.kind == PortKind::Midi && c.pulses.iter().any(|p| p.active)),
+            "a strip send lit the keys MIDI cable"
+        );
+
+        // Velocity: the slider drives the Keys unit's VEL knob.
+        let ki_vel = app.units.get(ki).and_then(|u| u.knob_index("VEL")).expect("Keys has a VEL knob");
+        let before = app.units[ki].knobs[ki_vel].display_value;
+        let s = strip[3];
+        click_at(&mut app, &ctx, size, Pos2::new(s.left() + s.width() * 0.45, s.center().y));
+        let after = app.units[ki].knobs[ki_vel].display_value;
+        assert!(after != before, "the VEL slider moved the knob: {before} → {after}");
+        assert!((after - app.units[ki].knobs[ki_vel].value).abs() < 1e-6, "drawn and stored VEL agree: {after}");
+        assert!((after - 0.45).abs() < 0.05, "the track maps the pointer to the value: {after}");
     }
 
     /// User report: the software keyboard must show a note as long as it is

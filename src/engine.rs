@@ -2057,6 +2057,47 @@ impl GraphEngine {
                             #[cfg(test)]
                             self.cc_log.push((dest, pid, norm));
                         }
+                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        // An unmapped CC reaches an LV2 instrument the same
+                        // way it reaches a CLAP voice: the plugin implements
+                        // the controller (mod wheel CC 1, sustain CC 64, …).
+                        if s.plugin.is_instrument() && has_midi {
+                            s.plugin.control_change(m.data[0], m.data[1]);
+                            #[cfg(test)]
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    }
+                }
+            }
+            Command::PitchBend { source, channel, value } => {
+                // A bend is a channel message like CC: routed through the
+                // matrix, passed through to the instruments (plugins bend
+                // what they play); no binding applies to it.
+                let msg = MidiMsg::pitch_bend(channel, value);
+                self.matrix.route_into(source, msg, &mut self.route_out);
+                for i in 0..self.route_out.len() {
+                    let (dest, m) = self.route_out[i];
+                    let has_midi = self.has_midi_cable(dest);
+                    if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                        if !has_midi || !source_accepted(s, source) {
+                            continue;
+                        }
+                        s.voice.send_pitch_bend_rt(m.channel, m.pitch_bend_value());
+                        #[cfg(test)]
+                        self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                    } else if self.graph.node(dest).map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. })) {
+                        // A Clap node whose voice is not hosted yet: nothing to
+                        // bend (same shape as the CC path; logged under test).
+                        #[cfg(test)]
+                        if has_midi {
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
+                    } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                        if s.plugin.is_instrument() && has_midi {
+                            s.plugin.pitch_bend(m.pitch_bend_value());
+                            #[cfg(test)]
+                            self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                        }
                     }
                 }
             }
@@ -4136,6 +4177,80 @@ mod tests {
         assert!((at_min - cutoff.min).abs() < 1e-3, "CC 0 should reach min {}: got {at_min}", cutoff.min);
     }
 
+    /// GitHub #97: a keyboard-strip pitch bend routes through the matrix
+    /// like a CC — every rig the Keys source feeds bends, gated by the
+    /// MIDI cable (and, with a hosted voice, the per-rig keyboard switch).
+    #[test]
+    fn pitch_bend_routes_to_the_rigs_the_keys_feed() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        // +4095 = 0x2FFF: lsb 127, msb 95.
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 4095 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 127, 95), (4, 127, 95)], "both rigs bend by +4095");
+        // Center: 0 = 0x2000 (lsb 0, msb 64).
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 0, 64), (4, 0, 64)], "back to center on both");
+        // The strip's mod (CC 1) and sustain (CC 64) also pass through to
+        // the rigs the keys feed.
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 1, value: 127 });
+        bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 127 });
+        engine.render(&mut buf, 2);
+        assert_eq!(engine.cc_passthrough_log, vec![(1, 1, 127), (4, 1, 127), (1, 64, 127), (4, 64, 127)], "mod and sustain reach every rig the keys feed");
+    }
+
+    /// GitHub #97, the audible half: a full pitch bend (+2 st at Surge's
+    /// default range) raises the rendered pitch — counted as zero crossings
+    /// of the master output, like `organ-test` counts drawbar brightness.
+    #[test]
+    fn surge_pitch_bend_bends_the_note() {
+        let Ok((voice, _main)) = crate::host::ClapVoice::new(48000.0) else { return };
+        let (mut bus, drain) = command_bus();
+        let mut g = crate::control::Graph::default();
+        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SURGE"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, PortKind::Midi);
+        g.connect_with_id(2, PortRef { node: surge, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![(surge, voice)]);
+        let mut buf = vec![0.0f32; 256 * 2];
+        // Zero crossings/s of the left channel: a saw's period crosses twice,
+        // so crossings/s ≈ 2 × the fundamental.
+        let mut crossings = |engine: &mut super::GraphEngine, blocks: usize, settle: usize| -> f32 {
+            for _ in 0..settle { engine.render(&mut buf, 2); }
+            let mut n = 0usize;
+            for _ in 0..blocks {
+                engine.render(&mut buf, 2);
+                for i in (2..buf.len()).step_by(2) {
+                    if (buf[i - 2] <= 0.0) != (buf[i] <= 0.0) { n += 1; }
+                }
+            }
+            n as f32 * 48000.0 / (blocks as f32 * 256.0)
+        };
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        let straight = crossings(&mut engine, 100, 20);
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 8191 });
+        let bent = crossings(&mut engine, 100, 20);
+        bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+        let back = crossings(&mut engine, 100, 20);
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        engine.render(&mut buf, 2);
+        println!("pitch bend: {straight:.0} → {bent:.0} → {back:.0} crossings/s (full up = +2 st ≈ ×1.12)");
+        assert!(straight > 50.0, "no signal at the master: {straight:.0} crossings/s");
+        assert!(bent > straight * 1.05, "full pitch bend did not raise the pitch: {straight:.0} → {bent:.0} crossings/s");
+        assert!(
+            (back / straight - 1.0).abs() < 0.05,
+            "releasing the wheel did not return to the straight pitch: {straight:.0} → {back:.0} crossings/s"
+        );
+    }
+
     #[test]
     fn cc_knob_target_matches_set_param_on_dsp_and_clap() {
         // 1. DSP Delay knob: CC target Knob with P_MIX moves the exact same Delay mix as Command::SetParam.
@@ -4519,6 +4634,32 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     let legato_after = peak_over(&mut engine, 94);
     println!("lv2-instrument-engine-test: legato held={legato:.4} 4-5 s after release={legato_after:.4}");
     anyhow::ensure!(legato_after < legato * 0.01, "LV2 instrument {uri} leaves a legato note hanging (note-off and note-on in one block)");
+    // The keyboard strip's standard signals (GitHub #97) reach an LV2
+    // instrument as-is: modulation (CC 1), sustain (CC 64) and pitch bend.
+    // What they DO is the plugin's business, like a pedal over real MIDI.
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 1, value: 90 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e == [0xB0, 1, 90]),
+        "mod wheel CC 1 did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 127 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e == [0xB0, 64, 127]),
+        "sustain CC 64 did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 2010 });
+    peak_over(&mut engine, 2);
+    anyhow::ensure!(
+        matches!(engine.lv2_last_note(inst), Some(e) if e[0] == 0xE0 && (((e[2] as i16) << 7) | e[1] as i16) - 8192 == 2010),
+        "pitch bend did not reach the LV2 instrument: {:?}", engine.lv2_last_note(inst)
+    );
+    // Leave the plugin centered and the pedal up for what follows.
+    bus.send(Command::Cc { source: SourceId::Keys, channel: 0, cc: 64, value: 0 });
+    bus.send(Command::PitchBend { source: SourceId::Keys, channel: 0, value: 0 });
+    peak_over(&mut engine, 2);
+    println!("lv2-instrument-engine-test: strip signals (mod, sustain, bend) delivered");
     // Through a built-in effect, like a live organ rig (setBfree → Drive →
     // Master): the effect must hear the LV2 instrument.
     let drive = master + 1;

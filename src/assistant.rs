@@ -882,18 +882,18 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"set_cc_map",
-            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). Omit param/knob to unbind that CC.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
+            "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). A MIXER control binds with mix: 'vol' | 'pan' | 'mute' | 'solo' instead: on a rig's Master out node it is that rig's bus (fader, pan, mute, solo); on a source node it is the source strip's pan, mute or solo (a source's fader is knob 'LEVEL', the master fader knob 'VOLUME' on a Master out node). Mute and solo are on in the upper half of the controller's travel. Omit param/knob/mix to unbind that CC.",
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",
             "description":"Clear one CC binding (when cc is given) or matching bindings (filtered by optional target/knob, or ALL when omitted) on source → node.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"}},"required":["node","source"]}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]}},"required":["node","source"]}
         }},
         {"type":"function","function":{
             "name":"learn_cc",
             "description":"Arm MIDI-learn for (node, param/target or knob) on source ('keys' = default, any hardware device, records sender | 'hw:<d>') so the next incoming hardware CC binds to it. Pass cancel=true to disarm.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob"]},"knob":{"type":"string"},"cancel":{"type":"boolean"}}}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]},"cancel":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_mix",

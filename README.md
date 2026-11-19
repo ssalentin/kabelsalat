@@ -129,9 +129,20 @@ clock: 24 clocks per beat plus Start and Stop go to the MIDI outputs you wire
 offset and three latency modes (none, output, input) line the clock up with what
 you hear.
 
-### Control knobs from your controller
+### Control knobs and the mixer from your controller
 Right-click any knob, turn a knob on your MIDI controller — bound. The knob
 shows its CC number and follows your hardware from then on.
+
+The mixer learns the same way. Right-click a fader, a pan field, or a mute or
+solo button on a source strip, a rig bus or the master, then move a fader or
+press a button on your controller. A learned fader shows its CC beside the dB
+readout, and every learned control gets a blue outline. Mute and solo follow
+the button: on while it is latched (CC value 64 or more), off when it is
+released. Right-click a learned control to limit a fader's range, learn it
+again or clear it. The bindings are saved with the session and stay with their
+rig when you add or delete rigs.
+
+<p align="center"><img src="docs/shots/mixer-midi-learn.png" width="85%" alt="The mixer with learned controls: rig bus faders showing CC 7 and CC 8 beside their dB readouts, and blue outlines on the learned faders, mute buttons and a pan field"/></p>
 
 ### Record your set
 **REC** records exactly what you hear into a WAV file in `~/Music/kabelsalat/`.
@@ -177,6 +188,9 @@ chmod +x kabelsalat-*.AppImage
 
 Older versions and the other packages are on the
 [releases page](https://github.com/ssalentin/kabelsalat/releases).
+
+Text fields read the keyboard directly, not through an input method. To
+write Chinese, Japanese or Korean, start it with `KABELSALAT_IME=1`.
 
 It runs unsandboxed, so it finds the CLAP/LV2 plugins installed on your system
 and gets realtime audio priority like a native install. Install the plugins

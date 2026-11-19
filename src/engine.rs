@@ -2669,6 +2669,55 @@ impl GraphEngine {
         }
     }
 
+    /// One rig bus's mix (SetRigMix, or a CC bound to it). Omitted fields
+    /// keep their value. Allocation-free.
+    fn set_rig_mix(&mut self, rig: u8, e: crate::matrix::MixEdit) {
+        let m = &mut self.rig_mix[(rig as usize).min(7)];
+        if let Some(v) = e.vol { m.vol = v.clamp(0.0, 1.0); }
+        if let Some(p) = e.pan { m.pan = p.clamp(-1.0, 1.0); }
+        if let Some(b) = e.mute { m.mute = b; }
+        if let Some(b) = e.solo { m.solo = b; }
+        self.mix_dirty = true;
+    }
+
+    /// One source strip's pan/mute/solo (SetStripMix, or a CC bound to it).
+    /// The table is allocated once (`MAX_STRIP_MIXES`); a strip past it is
+    /// dropped.
+    fn set_strip_mix(&mut self, node: NodeId, e: crate::matrix::MixEdit) {
+        let set = |m: &mut StripMix| {
+            if let Some(p) = e.pan { m.pan = p.clamp(-1.0, 1.0); }
+            if let Some(b) = e.mute { m.mute = b; }
+            if let Some(b) = e.solo { m.solo = b; }
+        };
+        match self.strips.iter_mut().find(|(n, _)| *n == node) {
+            Some((_, m)) => set(m),
+            None => {
+                if self.strips.len() >= MAX_STRIP_MIXES { return; }
+                let mut m = StripMix::DEFAULT;
+                set(&mut m);
+                if m.is_default() { return; }
+                self.strips.push((node, m));
+            }
+        }
+        self.strips.retain(|(_, m)| !m.is_default());
+        self.mix_dirty = true;
+    }
+
+    /// A controller bound to a mixer control (`CcTarget::Mix`): the rig bus
+    /// when `dest` is a MasterOut, else that node's source strip. The mix is
+    /// published back like any other mix edit (rule 33). False when the
+    /// binding names no control of that strip.
+    fn apply_mix_cc(&mut self, dest: NodeId, param: ParamId, norm: f64) -> bool {
+        let Some(ctl) = crate::matrix::MixControl::from_param(param) else { return false };
+        let Some((rig, rig_bus)) = self.graph.node(dest).map(|n| (n.rig, matches!(n.kind, NodeKind::MasterOut))) else {
+            return false;
+        };
+        if ctl.fits(rig_bus).is_err() { return false; }
+        let e = ctl.edit(norm);
+        if rig_bus { self.set_rig_mix(rig, e) } else { self.set_strip_mix(dest, e) }
+        true
+    }
+
     /// Apply an engine-level knob/parameter change (shared by `Command::SetParam`
     /// and `CcTarget::Knob` CC bindings). Allocation-free.
     fn apply_engine_param(&mut self, node: NodeId, param: ParamId, value: f64) -> bool {
@@ -3393,33 +3442,10 @@ impl GraphEngine {
                 }
             }
             Command::SetRigMix { rig, vol, pan, mute, solo } => {
-                let m = &mut self.rig_mix[(rig as usize).min(7)];
-                if let Some(v) = vol { m.vol = v.clamp(0.0, 1.0); }
-                if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
-                if let Some(b) = mute { m.mute = b; }
-                if let Some(b) = solo { m.solo = b; }
-                self.mix_dirty = true;
+                self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo });
             }
             Command::SetStripMix { node, pan, mute, solo } => {
-                let e = self.strips.iter_mut().find(|(n, _)| *n == node);
-                match e {
-                    Some((_, m)) => {
-                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
-                        if let Some(b) = mute { m.mute = b; }
-                        if let Some(b) = solo { m.solo = b; }
-                    }
-                    None => {
-                        if self.strips.len() >= MAX_STRIP_MIXES { return; }
-                        let mut m = StripMix::DEFAULT;
-                        if let Some(p) = pan { m.pan = p.clamp(-1.0, 1.0); }
-                        if let Some(b) = mute { m.mute = b; }
-                        if let Some(b) = solo { m.solo = b; }
-                        if m.is_default() { return; }
-                        self.strips.push((node, m));
-                    }
-                }
-                self.strips.retain(|(_, m)| !m.is_default());
-                self.mix_dirty = true;
+                self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo });
             }
             Command::SetStripBypass { node, bypass } => {
                 if bypass {
@@ -3556,6 +3582,13 @@ impl GraphEngine {
                         .node(dest)
                         .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
                     let norm = mapping.map_or(m.data[1] as f64 / 127.0, |b| b.scale.norm(m.data[1]));
+                    if let Some(CcMapping { param: pid, target: CcTarget::Mix, .. }) = mapping {
+                        if self.apply_mix_cc(dest, pid, norm) {
+                            #[cfg(test)]
+                            self.cc_log.push((dest, pid, norm));
+                        }
+                        continue;
+                    }
                     if let Some(CcMapping { param: pid, target: CcTarget::Knob, .. }) = mapping {
                         if self.apply_engine_param(dest, pid, norm) || is_clap_node {
                             #[cfg(test)]
@@ -5443,6 +5476,66 @@ mod tests {
         let r = engine.matrix.rules.iter().find(|r| r.source == SourceId::Hardware(9) && r.dest == 2).unwrap();
         assert_eq!(r.transpose, 5);
         assert!(!r.enabled);
+    }
+
+    /// #75: a CC bound to a mixer control drives the rig bus of the rig its
+    /// MasterOut node belongs to, or the source strip of any other node, and
+    /// the engine publishes the mix it now plays (rule 33).
+    #[test]
+    fn a_cc_bound_to_a_mixer_control_drives_that_rigs_bus_and_the_source_strip() {
+        use crate::control::{name_bytes, Graph, NodeKind};
+        use crate::matrix::MixControl;
+        let mut g = Graph::default();
+        g.reserve(8, 8);
+        let src_a = g.add_node(NodeKind::Dsp(crate::control::DspKind::Gain), name_bytes("A"));
+        let master_a = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
+        let master_b = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
+        g.nodes.iter_mut().find(|n| n.id == master_b).unwrap().rig = 1;
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(g, drain, 48000.0, vec![]);
+        let pub_ = std::sync::Arc::new(std::sync::Mutex::new(super::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        let dev = SourceId::Hardware(0);
+        let bind = |bus: &mut crate::control::CommandBus, dest, cc, ctl: MixControl| bus.send(Command::MatrixCcMap {
+            source: dev, dest, cc, param: Some(ctl.param()), target: CcTarget::Mix, scale: Default::default(),
+        });
+        bind(&mut bus, master_b, 7, MixControl::Vol);
+        bind(&mut bus, master_b, 8, MixControl::Mute);
+        bind(&mut bus, master_a, 9, MixControl::Solo);
+        bind(&mut bus, src_a, 10, MixControl::Pan);
+        bind(&mut bus, src_a, 11, MixControl::Mute);
+        // A strip has no fader of its own: this binding moves nothing.
+        bind(&mut bus, src_a, 12, MixControl::Vol);
+        let mut buf = vec![0.0f32; 64 * 2];
+        let mut cc = |engine: &mut super::GraphEngine, cc: u8, value: u8| {
+            bus.send(Command::Cc { source: dev, channel: 0, cc, value });
+            engine.render(&mut buf, 2);
+        };
+        cc(&mut engine, 7, 32);
+        cc(&mut engine, 8, 127);
+        cc(&mut engine, 9, 127);
+        cc(&mut engine, 10, 0);
+        cc(&mut engine, 11, 127);
+        cc(&mut engine, 12, 0);
+        assert_eq!(engine.rig_mix[1], super::RigMix { vol: 32.0 / 127.0, pan: 0.0, mute: true, solo: false });
+        assert_eq!(engine.rig_mix[0], super::RigMix { solo: true, ..super::RigMix::DEFAULT }, "rig A keeps its fader");
+        let strip = engine.strips.iter().find(|(n, _)| *n == src_a).map(|(_, m)| *m).expect("the strip has an entry");
+        assert_eq!((strip.pan, strip.mute, strip.solo), (-1.0, true, false));
+        assert_eq!(engine.cc_log.len(), 5, "the fader binding on a source strip applies nothing: {:?}", engine.cc_log);
+        {
+            let p = pub_.lock().unwrap();
+            assert_eq!(p.mix[1], engine.rig_mix[1], "the mix the engine plays is the mix it publishes");
+            assert!(p.strips.iter().any(|s| s.node == src_a && s.mix.mute && s.mix.pan == -1.0));
+        }
+        // The switch follows the controller: released, the mute is off.
+        cc(&mut engine, 8, 0);
+        cc(&mut engine, 11, 0);
+        cc(&mut engine, 10, 64);
+        assert!(!engine.rig_mix[1].mute);
+        assert!(engine.strips.iter().all(|(n, _)| *n != src_a), "a strip back at its defaults leaves the table");
+        // An unbound controller on the same rule reaches no mixer control.
+        cc(&mut engine, 99, 127);
+        assert_eq!(engine.rig_mix[1].vol, 32.0 / 127.0);
     }
 
     #[test]
@@ -8253,6 +8346,13 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         target: CcTarget::PluginParam,
         scale: Default::default(),
     });
+    // Mixer controls (#75), bound like knobs: checked in part 3 below.
+    use crate::matrix::MixControl;
+    for (dest, cc, ctl) in [(master, 20, MixControl::Vol), (master, 21, MixControl::Mute), (surge, 22, MixControl::Pan)] {
+        bus.send(Command::MatrixCcMap {
+            source: SourceId::Hardware(0), dest, cc, param: Some(ctl.param()), target: CcTarget::Mix, scale: Default::default(),
+        });
+    }
     let mut buf = vec![0.0f32; 256 * 2];
     let mut render_note = |engine: &mut GraphEngine, cc: u8, val: u8| -> Vec<f32> {
         bus.send(Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value: val });
@@ -8302,6 +8402,47 @@ pub fn cc_map_test() -> anyhow::Result<()> {
         "cc-map-test: OK — Surge XT '{}/{}' (id {}) CC74 0→127 moved {:.2}→{:.2}; '{}/{}' (id {}) CC7 0→127 moved {:.2}→{:.2}, RMS {:.4}→{:.4}",
         cutoff.module, cutoff.name, cutoff.id, val_low, val_high,
         gain_p.module, gain_p.name, gain_p.id, g_low, g_high, rms_low, rms_high
+    );
+
+    // 3. Mixer controls (#75): a rig-bus fader (CC 20), the bus mute (CC 21)
+    // and a source strip's pan (CC 22), learned like knobs. What the engine
+    // publishes is what the mixer shows (rule 33).
+    let published = Arc::new(Mutex::new(GraphPub::default()));
+    engine.set_graph_pub(published.clone());
+    let bus_mix = |published: &Arc<Mutex<GraphPub>>| published.lock().unwrap().mix[0];
+    let full = rms(&render_note(&mut engine, 20, 127));
+    let vol_full = bus_mix(&published).vol;
+    let low = rms(&render_note(&mut engine, 20, 16));
+    let vol_low = bus_mix(&published).vol;
+    anyhow::ensure!(
+        (vol_full - 1.0).abs() < 1e-6 && (vol_low - 16.0 / 127.0).abs() < 1e-6,
+        "the rig-bus fader did not follow CC 20: published vol {vol_full} then {vol_low}"
+    );
+    anyhow::ensure!(full > low * 3.0 + 1e-4, "the rig-bus fader CC did not change the level: RMS {full} at 127, {low} at 16");
+    let _ = render_note(&mut engine, 20, 127);
+    // Mute on: flush the master's tails (rule 133), then measure a new note.
+    let _ = render_note(&mut engine, 21, 127);
+    let muted = rms(&render_note(&mut engine, 21, 127));
+    let mute_on = bus_mix(&published).mute;
+    let unmuted = rms(&render_note(&mut engine, 21, 0));
+    let mute_off = bus_mix(&published).mute;
+    anyhow::ensure!(mute_on && !mute_off, "the bus mute did not follow CC 21: published {mute_on} then {mute_off}");
+    anyhow::ensure!(
+        muted < 1e-4 && unmuted > full * 0.5,
+        "the mute CC did not silence and restore the rig: RMS {muted} muted, {unmuted} after (full {full})"
+    );
+    let side = |s: &[f32], ch: usize| rms(&s.iter().skip(ch).step_by(2).copied().collect::<Vec<f32>>());
+    let left = render_note(&mut engine, 22, 0);
+    let pan = published.lock().unwrap().strips.iter().find(|s| s.node == surge).map(|s| s.mix.pan);
+    anyhow::ensure!(pan == Some(-1.0), "the source pan did not follow CC 22: published {pan:?}");
+    anyhow::ensure!(
+        side(&left, 1) < side(&left, 0) * 0.05,
+        "a hard-left pan CC left the right channel sounding: L {} R {}", side(&left, 0), side(&left, 1)
+    );
+    println!(
+        "cc-map-test: OK — mixer: rig-bus fader CC20 127→16 moved vol {vol_full:.2}→{vol_low:.2}, RMS {full:.4}→{low:.4}; \
+         mute CC21 127→0: RMS {muted:.5}→{unmuted:.4}; source pan CC22=0: L {:.4} R {:.5}",
+        side(&left, 0), side(&left, 1)
     );
     Ok(())
 }

@@ -191,6 +191,11 @@ pub enum CcTarget {
     /// Rack unit knob (`Command::SetParam` semantics: e.g. CLAP voice `P_LEVEL`, DSP engine param, Master vol/warm).
     #[serde(alias = "knob")]
     Knob,
+    /// Mixer control of the destination's strip; `param` is a
+    /// [`MixControl`]. A rig's MasterOut node stands for that rig's bus
+    /// (`SetRigMix`), any other node for its own source strip (`SetStripMix`).
+    #[serde(alias = "mix")]
+    Mix,
 }
 
 impl CcTarget {
@@ -198,6 +203,118 @@ impl CcTarget {
         match self {
             CcTarget::PluginParam => "plugin",
             CcTarget::Knob => "knob",
+            CcTarget::Mix => "mix",
+        }
+    }
+
+    /// The target an agent tool names (`None` = plugin).
+    pub fn parse(target: Option<&str>) -> Result<Self, String> {
+        match target.map(str::trim).map(str::to_lowercase).as_deref() {
+            None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => Ok(CcTarget::PluginParam),
+            Some("knob") => Ok(CcTarget::Knob),
+            Some("mix") => Ok(CcTarget::Mix),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob' or 'mix')")),
+        }
+    }
+}
+
+/// One control of a mixer strip, as the `param` of a [`CcTarget::Mix`]
+/// binding. The numbers are saved in sessions: add controls, never renumber.
+/// A send level takes the next free numbers (one per send slot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MixControl {
+    /// The rig bus fader. A source's fader is its LEVEL knob ([`CcTarget::Knob`]).
+    Vol,
+    Pan,
+    Mute,
+    Solo,
+}
+
+/// What one controller value sets on a strip: the fields of
+/// `Command::SetRigMix` / `SetStripMix`, of which exactly one is `Some`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MixEdit {
+    pub vol: Option<f32>,
+    pub pan: Option<f32>,
+    pub mute: Option<bool>,
+    pub solo: Option<bool>,
+}
+
+impl MixControl {
+    pub const ALL: [MixControl; 4] = [MixControl::Vol, MixControl::Pan, MixControl::Mute, MixControl::Solo];
+
+    pub fn param(self) -> ParamId {
+        match self {
+            MixControl::Vol => 0,
+            MixControl::Pan => 1,
+            MixControl::Mute => 2,
+            MixControl::Solo => 3,
+        }
+    }
+
+    pub fn from_param(param: ParamId) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.param() == param)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MixControl::Vol => "vol",
+            MixControl::Pan => "pan",
+            MixControl::Mute => "mute",
+            MixControl::Solo => "solo",
+        }
+    }
+
+    /// The control's name on a strip, as menus and tool answers show it.
+    pub fn label(self) -> &'static str {
+        match self {
+            MixControl::Vol => "Fader",
+            MixControl::Pan => "Pan",
+            MixControl::Mute => "Mute",
+            MixControl::Solo => "Solo",
+        }
+    }
+
+    /// A switch (mute, solo) has two states; its binding has no range to edit.
+    pub fn is_switch(self) -> bool {
+        matches!(self, MixControl::Mute | MixControl::Solo)
+    }
+
+    pub fn parse(name: &str) -> Result<Self, String> {
+        let q = name.trim().to_lowercase();
+        let q = match q.as_str() {
+            "volume" | "fader" | "level" => "vol",
+            other => other,
+        };
+        Self::ALL.into_iter().find(|c| c.as_str() == q)
+            .ok_or_else(|| format!("unknown mixer control '{name}' (expected 'vol', 'pan', 'mute' or 'solo')"))
+    }
+
+    /// Whether a strip has this control: only a rig bus has its own fader.
+    pub fn fits(self, rig_bus: bool) -> Result<(), &'static str> {
+        if self == MixControl::Vol && !rig_bus {
+            return Err("mix 'vol' is a rig bus fader: bind it on the rig's Master out node, or bind a source's fader as knob 'LEVEL'");
+        }
+        Ok(())
+    }
+
+    /// The edit a controller position (`norm`, 0..=1 after the binding's
+    /// scale) makes. Faders follow the controller linearly, like a learned
+    /// LEVEL knob; pan has its centre at controller value 64; a switch is on
+    /// in the upper half of the travel, so a latching button and a fader
+    /// both drive it and the strip always shows the controller's state.
+    pub fn edit(self, norm: f64) -> MixEdit {
+        let v = norm.clamp(0.0, 1.0);
+        let on = v >= 0.5;
+        match self {
+            MixControl::Vol => MixEdit { vol: Some(v as f32), ..MixEdit::default() },
+            MixControl::Pan => {
+                // 64/127 is the centre detent of a 7-bit pan knob.
+                let p = if v >= 0.5 { (v - 64.0 / 127.0) / (63.0 / 127.0) } else { (v - 64.0 / 127.0) / (64.0 / 127.0) };
+                MixEdit { pan: Some(p.clamp(-1.0, 1.0) as f32), ..MixEdit::default() }
+            }
+            MixControl::Mute => MixEdit { mute: Some(on), ..MixEdit::default() },
+            MixControl::Solo => MixEdit { solo: Some(on), ..MixEdit::default() },
         }
     }
 }
@@ -1169,5 +1286,35 @@ mod tests {
         assert_eq!(r3.mapping_for_cc(7), Some(CcMapping { cc: 7, param: 0, target: CcTarget::Knob, scale: CcScale::IDENTITY }));
         let back3: Rule = serde_json::from_str(&serde_json::to_string(&r3).unwrap()).unwrap();
         assert_eq!(back3.cc_map, r3.cc_map);
+    }
+
+    #[test]
+    fn a_mix_binding_round_trips_and_maps_the_controller_travel() {
+        let mut r = Rule::new(SourceId::Hardware(0), SURGE_A);
+        assert!(r.set_cc_target(7, MixControl::Vol.param(), CcTarget::Mix));
+        let back: Rule = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(back.cc_map, r.cc_map);
+        assert_eq!(CcTarget::parse(Some("mix")), Ok(CcTarget::Mix));
+        for c in MixControl::ALL {
+            assert_eq!(MixControl::from_param(c.param()), Some(c));
+            assert_eq!(MixControl::parse(c.as_str()), Ok(c));
+        }
+        assert_eq!(MixControl::from_param(99), None);
+        let at = |c: MixControl, value: u8| c.edit(CcScale::IDENTITY.norm(value));
+        assert_eq!(at(MixControl::Vol, 127).vol, Some(1.0));
+        assert_eq!(at(MixControl::Vol, 0).vol, Some(0.0));
+        // Pan: hard left, the centre detent exactly, hard right.
+        assert_eq!(at(MixControl::Pan, 0).pan, Some(-1.0));
+        assert_eq!(at(MixControl::Pan, 64).pan, Some(0.0));
+        assert_eq!(at(MixControl::Pan, 127).pan, Some(1.0));
+        // A switch follows the controller: on in the upper half.
+        assert_eq!(at(MixControl::Mute, 127).mute, Some(true));
+        assert_eq!(at(MixControl::Mute, 64).mute, Some(true));
+        assert_eq!(at(MixControl::Mute, 63).mute, Some(false));
+        assert_eq!(at(MixControl::Solo, 0).solo, Some(false));
+        // One field per edit: a mute binding never touches the fader.
+        assert_eq!(at(MixControl::Mute, 127), MixEdit { mute: Some(true), ..MixEdit::default() });
+        assert!(MixControl::Vol.fits(false).is_err() && MixControl::Vol.fits(true).is_ok());
+        assert!(MixControl::Pan.fits(false).is_ok());
     }
 }

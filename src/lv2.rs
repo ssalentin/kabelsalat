@@ -1498,12 +1498,23 @@ impl Lv2Plugin {
     /// Queue a MIDI note-on for the next run() (frame 0). Events queue up
     /// within a block, so every note of a chord reaches the plugin.
     pub fn note_on(&mut self, note: u8, velocity: u8) {
-        self.queue_midi([0x90, note, velocity]);
+        self.note_on_ch(note, velocity, 0);
     }
 
     /// Queue a MIDI note-off for the next run().
     pub fn note_off(&mut self, note: u8) {
-        self.queue_midi([0x80, note, 0]);
+        self.note_off_ch(note, 0);
+    }
+
+    /// Note-on on a 0-based MIDI channel: the organ dock's Lower Manual
+    /// plays channel 1 while the Upper plays channel 0 (#163).
+    pub fn note_on_ch(&mut self, note: u8, velocity: u8, channel: u8) {
+        self.queue_midi([0x90 | (channel & 0x0F), note, velocity]);
+    }
+
+    /// Note-off on a 0-based MIDI channel.
+    pub fn note_off_ch(&mut self, note: u8, channel: u8) {
+        self.queue_midi([0x80 | (channel & 0x0F), note, 0]);
     }
 
     /// Queue a MIDI control change (channel 1) for the next run().

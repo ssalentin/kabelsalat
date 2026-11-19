@@ -557,7 +557,7 @@ fn surge_clip(category: &str, name: &str, phrase: Phrase, secs: f32) -> anyhow::
     let mut frame = 0;
     while !recording.is_finished() {
         for &(_, note, on) in events.iter().filter(|(at, _, _)| (frame..frame + BLOCK).contains(at)) {
-            bus.send(if on { Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys } } else { Command::NoteOff { note, source: SourceId::Keys } });
+            bus.send(if on { Command::NoteOn { note, velocity: 0.9, source: SourceId::Keys, channel: 0 } } else { Command::NoteOff { note, source: SourceId::Keys, channel: 0 } });
         }
         engine.render(&mut buf, 2);
         frame += BLOCK;

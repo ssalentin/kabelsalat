@@ -89,6 +89,8 @@ struct State {
     record_sync: bool,
     /// Single-rig preset directory (isolated in unit tests).
     rig_presets_dir: std::path::PathBuf,
+    /// Virtual keyboard surface selection (#163, headless mirror).
+    keyboard_mode: crate::keyboard::KeyboardMode,
 }
 
 #[derive(Clone)]
@@ -500,6 +502,25 @@ struct SetMasterTargetArgs {
     target: Option<String>,
     /// Target integrated loudness in LUFS (-36 to -6), instead of `target`.
     lufs: Option<f64>,
+}
+
+/// Arguments for `set_keyboard_mode`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetKeyboardModeArgs {
+    /// Surface mode: "auto", "piano", "jazz_organ", "pipe_organ", or "synth".
+    mode: Option<String>,
+    /// Show (true) or hide (false) the virtual keyboard dock.
+    open: Option<bool>,
+    /// Expand the keyboard dock to fullscreen performance mode (true) or return to bottom dock (false).
+    expanded: Option<bool>,
+    /// Jazz Organ: stack Upper (Ch 1) and Lower (Ch 2) manuals.
+    dual_manual: Option<bool>,
+    /// Synth: fold the keybed to show only in-scale keys.
+    scale_fold: Option<bool>,
+    /// Piano: vertical hit position modulates velocity.
+    y_touch: Option<bool>,
+    /// Synth horizontal drag behavior: "gliss" or "slide".
+    synth_drag: Option<String>,
 }
 
 /// Arguments for `measure_mix`.
@@ -1463,6 +1484,61 @@ impl McpServer {
             Some(r) => ok_json(r),
             None => tool_err("no engine"),
         }
+    }
+
+    #[tool(name = "get_keyboard_state", description = "Read the virtual software keyboard dock state: open, expanded (fullscreen mode), auto vs pinned instrument mode (piano | jazz_organ | pipe_organ | synth), detected mode, target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.")]
+    fn get_keyboard_state(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("get_keyboard_state", json!({}));
+        }
+        let detected = st.graph.nodes.iter()
+            .find(|n| matches!(n.kind, NodeKind::Clap { .. } | NodeKind::Lv2 { .. }))
+            .map(|n| crate::keyboard::classify_instrument(&n.kind, None, Some(crate::control::name_str(&n.name)), &[]))
+            .unwrap_or(crate::keyboard::KeyboardType::Synth);
+        let active = st.keyboard_mode.pinned().unwrap_or(detected);
+        ok_json(json!({
+            "open": false,
+            "expanded": false,
+            "auto": st.keyboard_mode == crate::keyboard::KeyboardMode::Auto,
+            "mode": active.as_str(),
+            "detected_mode": detected.as_str(),
+        }))
+    }
+
+    #[tool(name = "set_keyboard_mode", description = "Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, switch between auto or a pinned instrument surface (piano | jazz_organ | pipe_organ | synth), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide).")]
+    fn set_keyboard_mode(&self, Parameters(args): Parameters<SetKeyboardModeArgs>) -> Result<CallToolResult, McpError> {
+        let parsed_mode = match args.mode.as_deref() {
+            Some(s) => match crate::keyboard::KeyboardMode::parse(s) {
+                Some(m) => Some(m),
+                None => return tool_err(format!("unknown keyboard mode '{s}' (use auto, piano, jazz_organ, pipe_organ, or synth)")),
+            },
+            None => None,
+        };
+        if let Some(d) = args.synth_drag.as_deref() {
+            if crate::keyboard::SynthDragMode::parse(d).is_none() {
+                return tool_err(format!("unknown synth_drag '{d}' (use gliss or slide)"));
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("set_keyboard_mode", json!({
+                "mode": args.mode,
+                "open": args.open,
+                "expanded": args.expanded,
+                "dual_manual": args.dual_manual,
+                "scale_fold": args.scale_fold,
+                "y_touch": args.y_touch,
+                "synth_drag": args.synth_drag,
+            }));
+        }
+        if let Some(m) = parsed_mode {
+            st.keyboard_mode = m;
+        }
+        ok_json(json!({
+            "auto": st.keyboard_mode == crate::keyboard::KeyboardMode::Auto,
+            "mode": st.keyboard_mode.as_str(),
+        }))
     }
 
     /// Add a node to the patch.
@@ -3038,7 +3114,7 @@ impl McpServer {
         };
         let velocity = args.velocity.unwrap_or(0.8).clamp(0.0, 1.0);
         let mut st = self.state.lock().unwrap();
-        if let Err(e) = send_cmd(&mut st, Command::NoteOn { note: args.note, velocity, source }) {
+        if let Err(e) = send_cmd(&mut st, Command::NoteOn { note: args.note, velocity, source, channel: 0 }) {
             return tool_err(e);
         }
         ok_json(json!({"note": args.note, "velocity": velocity, "source": format!("{source:?}")}))
@@ -3055,7 +3131,7 @@ impl McpServer {
             Err(e) => return tool_err(e),
         };
         let mut st = self.state.lock().unwrap();
-        if let Err(e) = send_cmd(&mut st, Command::NoteOff { note: args.note, source }) {
+        if let Err(e) = send_cmd(&mut st, Command::NoteOff { note: args.note, source, channel: 0 }) {
             return tool_err(e);
         }
         ok_json(json!({"note": args.note, "source": format!("{source:?}")}))
@@ -3463,6 +3539,7 @@ pub fn run() -> anyhow::Result<()> {
         record: audio.record,
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
+        keyboard_mode: crate::keyboard::KeyboardMode::Auto,
     }));
     let server = McpServer { state, tool_router: McpServer::tool_router() };
     let result = serve_stdio(server, rpc_stdout);
@@ -3498,6 +3575,7 @@ pub fn run_attach() -> anyhow::Result<()> {
         record: Arc::new(crate::record::RecorderShared::new()),
         record_sync: false,
         rig_presets_dir: crate::session::rig_presets_dir(),
+        keyboard_mode: crate::keyboard::KeyboardMode::Auto,
     };
     // Connect + pull the live graph before serving; a missing socket surfaces
     // here as an actionable error ("start the app"), not mid-tool-call.
@@ -3630,6 +3708,7 @@ mod tests {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(std::env::temp_dir)
                 .join(format!("test-mcp-rig-presets-{}", std::process::id())),
+            keyboard_mode: crate::keyboard::KeyboardMode::Auto,
         };
         let server = McpServer {
             state: Arc::new(Mutex::new(state)),

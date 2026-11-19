@@ -833,6 +833,24 @@ pub(crate) fn tools() -> Value {
             "parameters":{"type":"object","properties":{"octave":{"type":"integer"}},"required":["octave"]}
         }},
         {"type":"function","function":{
+            "name":"get_keyboard_state",
+            "description":"Read the virtual software keyboard dock state: open, expanded (fullscreen mode), auto vs pinned instrument mode (piano | jazz_organ | pipe_organ | synth), detected mode, target instrument, octave, sustain, swell, dual_manual, scale_fold, y_touch and synth_drag.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_keyboard_mode",
+            "description":"Configure the virtual software keyboard dock: open/close it, toggle expanded/fullscreen performance view, switch between auto or a pinned instrument surface (piano | jazz_organ | pipe_organ | synth), or toggle surface options (dual_manual, scale_fold, y_touch, synth_drag: gliss|slide).",
+            "parameters":{"type":"object","properties":{
+                "mode":{"type":"string","description":"auto | piano | jazz_organ | pipe_organ | synth"},
+                "open":{"type":"boolean","description":"Show (true) or hide (false) the keyboard dock"},
+                "expanded":{"type":"boolean","description":"Fullscreen/expanded GarageBand-style keyboard dock"},
+                "dual_manual":{"type":"boolean","description":"Jazz Organ: stack Upper (Ch 1) and Lower (Ch 2) manuals"},
+                "scale_fold":{"type":"boolean","description":"Synth: fold keybed to in-scale notes only"},
+                "y_touch":{"type":"boolean","description":"Piano: vertical key position controls velocity"},
+                "synth_drag":{"type":"string","description":"Synth horizontal drag: gliss | slide"}
+            }}
+        }},
+        {"type":"function","function":{
             "name":"flip_rack",
             "description":"Flip the rack between front (perform) and back (patch cables)",
             "parameters":{"type":"object","properties":{}}

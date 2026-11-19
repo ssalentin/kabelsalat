@@ -118,6 +118,9 @@ pub struct Session {
     /// session says nothing about it (older files, templates, rig edits
     /// built from parts): a load then leaves the engine's target alone.
     pub master_target: Option<crate::meter::MasterTarget>,
+    /// Virtual keyboard surface selection (#163): `None` = unspecified
+    /// (older sessions/templates leave current mode alone), `Some(Auto)` or `Some(Pinned(..))`.
+    pub keyboard_mode: Option<crate::keyboard::KeyboardMode>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -173,6 +176,7 @@ impl Session {
             strip_knobs: BTreeMap::new(),
             sends: Vec::new(),
             master_target: None,
+            keyboard_mode: None,
         }
     }
 
@@ -188,6 +192,7 @@ impl Session {
             && self.strip_knobs == other.strip_knobs
             && self.sends == other.sends
             && self.master_target == other.master_target
+            && self.keyboard_mode == other.keyboard_mode
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -515,6 +520,7 @@ impl Session {
             strip_knobs: self.strip_knobs.clone(),
             sends: self.sends.clone(),
             master_target: self.master_target,
+            keyboard_mode: self.keyboard_mode,
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -555,6 +561,7 @@ impl Session {
             strip_knobs: manifest.strip_knobs,
             sends: manifest.sends,
             master_target: manifest.master_target,
+            keyboard_mode: manifest.keyboard_mode,
         };
         session.validate()?;
         Ok(session)
@@ -671,6 +678,9 @@ struct SessionFile {
     /// The master's loudness target (#12); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     master_target: Option<crate::meter::MasterTarget>,
+    /// Virtual keyboard surface selection (#163); older sessions have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keyboard_mode: Option<crate::keyboard::KeyboardMode>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1592,6 +1602,28 @@ mod tests {
         let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
         assert!(!json.contains("master_target"), "absent when unset: old readers stay happy");
         assert_eq!(Session::load(&pkg2).unwrap().master_target, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keyboard_mode_round_trips_and_old_sessions_have_none() {
+        use crate::keyboard::{KeyboardMode, KeyboardType};
+        let dir = std::env::temp_dir().join(format!("ksalat-kbmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("kb.ksalat");
+        let mut s = Session::new("kb", Graph::demo_patch());
+        s.keyboard_mode = Some(KeyboardMode::Pinned(KeyboardType::PipeOrgan));
+        s.save(&pkg).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().keyboard_mode, Some(KeyboardMode::Pinned(KeyboardType::PipeOrgan)));
+        s.keyboard_mode = Some(KeyboardMode::Auto);
+        s.save(&pkg).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().keyboard_mode, Some(KeyboardMode::Auto));
+        s.keyboard_mode = None;
+        let pkg2 = dir.join("plain.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("keyboard_mode"), "absent when unset: old readers stay happy");
+        assert_eq!(Session::load(&pkg2).unwrap().keyboard_mode, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

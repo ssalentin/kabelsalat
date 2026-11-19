@@ -328,11 +328,11 @@ pub fn run_test() -> anyhow::Result<()> {
     /// Hold note 60 and return the onsets of `seconds` of it, skipping the
     /// first 2 s (attack, effect tails building up); then release.
     fn hold_note(engine: &mut GraphEngine, bus: &mut CommandBus, seconds: f64) -> Vec<f64> {
-        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys });
+        bus.send(Command::NoteOn { note: 60, velocity: 0.9, source: SourceId::Keys, channel: 0 });
         render(engine, 2.0, None);
         let mut heard = Vec::new();
         render(engine, seconds, Some(&mut heard));
-        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys });
+        bus.send(Command::NoteOff { note: 60, source: SourceId::Keys, channel: 0 });
         render(engine, 1.3, None);
         onset_strength(&heard)
     }

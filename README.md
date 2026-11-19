@@ -31,12 +31,27 @@ USB MIDI keyboard — devices are found while the app runs, just plug them in.
 Starter setups (**F5–F8**) give you a lead with reverb, drums and bass, or an
 ambient pad with one key.
 
-The on-screen keyboard carries the controls a real keyboard has: a pitch-bend
-wheel that springs back to centre, a modulation wheel, a sustain pedal and a
-velocity slider. They reach every rig the keys feed, and hardware pitch bend,
-modulation and sustain reach your instruments the same way.
+The on-screen keyboard (**V**) turns into the instrument the active rig plays,
+or the one you pin:
 
-<p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The rack with the full-width software keyboard opened at the bottom"/></p>
+- **Piano:** damper and soft pedals, touch velocity from where you hit the key
+  (soft at the top, loud at the bottom), sustained notes marked in teal.
+- **Jazz Organ** (setBfree): the nine drawbars, JAZZ/ROCK/GOSPEL/FLUTE
+  registrations, Leslie STOP/SLOW/FAST, swell pedal, percussion, and two
+  stacked manuals on MIDI channels 1 and 2. Drag across the keys for a
+  glissando.
+- **Pipe Organ** (Aeolus): division tabs, the stop jamb, six pistons,
+  tremulant, couplers (II/I, III/I, …) and the swell pedal.
+- **Synth:** pitch-bend and modulation wheels, the patch's own macro knobs and
+  an X/Y pad over the first two, scale highlight and FOLD (only the scale's
+  notes as keys), arpeggiator switch, sustain and velocity.
+
+Keys sound for as long as you hold them, and the chord you hold is named in the
+header. **EXPAND** (**Shift+V**) gives the keyboard the whole stage, with the
+instrument's full console above the keys. The agent can read and switch all of
+this too (`get_keyboard_state`, `set_keyboard_mode`).
+
+<p align="center"><img src="docs/shots/keyboard.png" width="85%" alt="The software keyboard's four surfaces stacked: Piano with pedals, Jazz Organ with drawbars and Leslie, Pipe Organ with its stop jamb, Synth with wheels, macros and X/Y pad"/></p>
 
 ### Patch with real cables
 Press **Tab** to turn the rack around and patch on the back. Drag from jack to

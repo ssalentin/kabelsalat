@@ -6248,7 +6248,7 @@ impl DemoApp {
         self.free_returned_voices();
         let nodes: Vec<(u32, String)> = graph.nodes.iter()
             .filter_map(|n| match &n.kind {
-                NodeKind::Clap { plugin_id } => Some((n.id, crate::control::clap_plugin_key(name_str(plugin_id)).to_string())),
+                NodeKind::Clap { plugin_id } => Some((n.id, crate::control::clap_plugin_key(plugin_id.as_str()).to_string())),
                 _ => None,
             })
             .collect();
@@ -6505,7 +6505,7 @@ impl DemoApp {
             let mut g = Graph::default();
             g.reserve(8, 8);
             let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-            let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+            let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
             let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
             g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
             if with_delay {
@@ -7855,7 +7855,7 @@ impl DemoApp {
                 let name = name_bytes(args.get("name").and_then(|v| v.as_str()).unwrap_or(&kind_str));
                 let kind = match kind_str.as_str() {
                     "keys" => Some(NodeKind::Keys),
-                    "clap" => Some(NodeKind::Clap { plugin_id: name_bytes(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
+                    "clap" => Some(NodeKind::Clap { plugin_id: crate::control::ClapId::new(args.get("plugin_id").and_then(|v| v.as_str()).unwrap_or("org.surge-synth-team.surge-xt")) }),
                     "arp" | "arpeggiator" => Some(NodeKind::Arp),
                     "dsp" => match args.get("dsp").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().as_str() {
                         "gain" => Some(NodeKind::Dsp(DspKind::Gain)),
@@ -10251,7 +10251,7 @@ impl DemoApp {
         let kind = &self.base_graph.nodes.iter().find(|n| n.id == u.node_id)?.kind;
         match kind {
             NodeKind::Clap { plugin_id } => {
-                let label = self.plugin_display_name(&name_str(plugin_id))
+                let label = self.plugin_display_name(&plugin_id.as_str())
                     .unwrap_or_else(|| sentence_case(&u.name));
                 Some((label, "CLAP"))
             }
@@ -13762,9 +13762,9 @@ impl DemoApp {
                     let Ok(client) = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(8)).build() else {
                         return;
                     };
-                    for e in crate::catalog::CATALOG {
-                        if let Some(n) = crate::catalog::fetch_stars(&client, e.repo) {
-                            if tx.send((e.repo, n)).is_err() {
+                    for repo in crate::catalog::CATALOG.iter().filter_map(|e| e.source.github()) {
+                        if let Some(n) = crate::catalog::fetch_stars(&client, repo) {
+                            if tx.send((repo, n)).is_err() {
                                 return;
                             }
                             ctx.request_repaint();
@@ -13975,7 +13975,7 @@ impl DemoApp {
                                 .filter(|e| {
                                     self.plugin_catalog_type.is_none_or(|t| e.plugin_type == t)
                                         && matches_query(
-                                            &[e.name, e.description, e.id, e.repo, e.format.label(), e.plugin_type.label()],
+                                            &[e.name, e.description, e.id, &e.source.url().unwrap_or_default(), e.format.label(), e.plugin_type.label()],
                                             &filter,
                                         )
                                 })
@@ -13984,7 +13984,7 @@ impl DemoApp {
                             theme::section_label(ui, &format!("Install from the catalog ({})", matches.len()));
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("Hand-picked plugins from GitHub: a distro package where one exists, else a prebuilt release or a source build into ~/.clap or ~/.lv2")
+                                egui::RichText::new("Hand-picked instruments and tools: a distro package where one exists, else a prebuilt release or a source build into ~/.clap or ~/.lv2")
                                     .size(12.0)
                                     .color(theme::INK_2),
                             );
@@ -14069,9 +14069,10 @@ impl DemoApp {
                                                 || format!("No Linux build for {}", std::env::consts::ARCH),
                                                 |r| r.summary(),
                                             );
-                                            let stars = self
-                                                .catalog_stars
-                                                .get(e.repo)
+                                            let stars = e
+                                                .source
+                                                .github()
+                                                .and_then(|repo| self.catalog_stars.get(repo))
                                                 .map(|&n| format!("★ {} · ", crate::catalog::stars_label(n)))
                                                 .unwrap_or_default();
                                             ui.add(
@@ -14100,9 +14101,10 @@ impl DemoApp {
                                                         action = Some(BrowserAction::Install(e.id.to_string()));
                                                     }
                                                 }
-                                                let source = crate::catalog::repo_url(e.repo);
-                                                if theme::chip_button(ui, "Source code", false).on_hover_text(&source).clicked() {
-                                                    ui.ctx().open_url(egui::OpenUrl::new_tab(source));
+                                                if let Some(source) = e.source.url() {
+                                                    if theme::chip_button(ui, "Source code", false).on_hover_text(&source).clicked() {
+                                                        ui.ctx().open_url(egui::OpenUrl::new_tab(source));
+                                                    }
                                                 }
                                                 if let Some(site) = e.homepage {
                                                     if theme::chip_button(ui, "Website", false).on_hover_text(site).clicked() {
@@ -15883,7 +15885,7 @@ impl DemoApp {
         }
         let ids: Vec<(u32, String)> = self.base_graph.nodes.iter()
             .filter_map(|n| match &n.kind {
-                NodeKind::Clap { plugin_id } => Some((n.id, name_str(plugin_id).to_string())),
+                NodeKind::Clap { plugin_id } => Some((n.id, plugin_id.as_str().to_string())),
                 _ => None,
             })
             .collect();
@@ -16402,7 +16404,7 @@ impl DemoApp {
     fn is_aeolus_unit(&self, unit: usize) -> bool {
         self.units.get(unit)
             .and_then(|u| self.base_graph.node(u.node_id))
-            .is_some_and(|n| matches!(&n.kind, NodeKind::Clap { plugin_id } if name_str(plugin_id) == crate::aeolus::AEOLUS_ID))
+            .is_some_and(|n| matches!(&n.kind, NodeKind::Clap { plugin_id } if plugin_id.as_str() == crate::aeolus::AEOLUS_ID))
     }
 
     /// The division an Aeolus unit's face shows.
@@ -24629,7 +24631,7 @@ mod rig_switch_tests {
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut eid = 1;
         for _ in 0..8 {
-            let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+            let synth = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
             g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi); eid += 1;
             let mut prev = synth;
             for k in [DspKind::Filter, DspKind::Delay, DspKind::Reverb, DspKind::Filter, DspKind::Delay, DspKind::Reverb] {
@@ -24879,7 +24881,7 @@ mod rig_switch_tests {
             .find(|n| n.rig == rig && matches!(n.kind, NodeKind::Clap { .. }))
             .expect("the new rig has a CLAP synth");
         let NodeKind::Clap { plugin_id } = &synth.kind else { unreachable!() };
-        assert_eq!(name_str(plugin_id), "org.example.synth");
+        assert_eq!(plugin_id.as_str(), "org.example.synth");
         assert!(app.base_graph.nodes.iter().any(|n| n.rig == 0 && matches!(n.kind, NodeKind::Clap { .. })), "rig A keeps its synth");
         let bad = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.not.installed"}));
         assert!(bad.contains("no installed CLAP plugin"), "{bad}");
@@ -25329,7 +25331,7 @@ mod rig_switch_tests {
     fn any_number_of_clap_units_have_their_own_voice_state() {
         let mut app = DemoApp::new_with_sink(None);
         let mut g = Graph::demo_patch();
-        let surge = || NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") };
+        let surge = || NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
         let extra: Vec<u32> = (0..10).map(|i| g.add_node(surge(), name_bytes(&format!("EXTRA {i}")))).collect();
         app.build_rack(&g, &[]);
         let slots = app.clap_rigs();
@@ -26408,12 +26410,10 @@ mod split_bpm_tests {
         let ctx = egui::Context::default();
         for _ in 0..2 { frame(&mut app, &ctx, vec![]); }
         let texts = frame(&mut app, &ctx, vec![]);
-        for e in crate::catalog::CATALOG {
-            assert!(texts.iter().any(|t| t == e.name), "catalog shows {}: {texts:?}", e.name);
-        }
+        let n = crate::catalog::CATALOG.len();
+        assert!(texts.iter().any(|t| *t == format!("Install ({n})")), "the tab counts every card: {texts:?}");
         assert!(texts.iter().any(|t| t == "Install"), "an Install button is painted: {texts:?}");
         assert!(texts.iter().any(|t| t == "Installed"), "installed entries show an Installed badge: {texts:?}");
-        assert!(texts.iter().any(|t| t.starts_with("License GPL-3.0-or-later · ")), "Floe's card names its licence: {texts:?}");
         assert!(!texts.iter().any(|t| t.contains('★')), "no stars without a fetched count: {texts:?}");
         app.catalog_stars.insert("pantherb/setBfree", 235);
         app.catalog_stars.insert("surge-synthesizer/surge", 3870);
@@ -26421,9 +26421,36 @@ mod split_bpm_tests {
         assert!(texts.iter().any(|t| t.starts_with("★ 235 · License ")), "setBfree's card shows its stars: {texts:?}");
         assert!(texts.iter().any(|t| t.starts_with("★ 3.9k · License ")), "Surge's card shows its stars: {texts:?}");
         assert_eq!(texts.iter().filter(|t| t.contains('★')).count(), 2, "only fetched repos show stars: {texts:?}");
-        assert!(texts.iter().any(|t| t.starts_with("Plays sample libraries")), "cards show the about text: {texts:?}");
-        let sources = texts.iter().filter(|t| *t == "Source code").count();
-        assert_eq!(sources, crate::catalog::CATALOG.len(), "every card has a Source code button");
+
+        // The list scrolls past the window: every card is found by its name.
+        for e in crate::catalog::CATALOG {
+            app.plugin_filter = e.name.to_string();
+            let texts = frame(&mut app, &ctx, vec![]);
+            assert!(texts.iter().any(|t| t == e.name), "a search finds {}: {texts:?}", e.name);
+            assert!(texts.iter().any(|t| t == e.about), "{}'s card shows its about text", e.name);
+            assert!(texts.iter().any(|t| t.contains(&format!("License {} · ", e.license))), "{}'s card names its licence: {texts:?}", e.name);
+            let source_button = texts.iter().any(|t| t == "Source code");
+            assert_eq!(source_button, e.source.url().is_some(), "{} has a Source code button iff its source is published", e.name);
+        }
+    }
+
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat catalog_shots -- --ignored`:
+    /// the Install tab, whole and searched, one fresh app per image (rule 148).
+    #[test]
+    #[ignore]
+    fn catalog_shots() {
+        let Ok(dir) = std::env::var("KABELSALAT_SHOTS") else { return };
+        for (name, filter) in [("catalog", ""), ("catalog-onetrick", "OneTrick"), ("catalog-starbreath", "Starbreath"), ("catalog-drums", "drum")] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.plugins_loaded = true;
+            app.catalog_roots = Some(vec![]);
+            app.stage_view = StageView::Plugins;
+            app.plugin_category = PluginCategory::Install;
+            app.plugin_filter = filter.to_string();
+            app.catalog_stars.insert("surge-synthesizer/surge", 4147);
+            app.catalog_stars.insert("pantherb/setBfree", 235);
+            super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &std::path::Path::new(&dir).join(format!("{name}.png")));
+        }
     }
 
     #[test]
@@ -27299,7 +27326,7 @@ mod split_bpm_tests {
         let mut g = Graph::default();
         g.reserve(8, 8);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
         let filt = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("FILTER"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: surge, port: 0 }, CPortKind::Midi);
@@ -28470,7 +28497,7 @@ mod ui_polish_agent_tests {
         std::fs::write(vital_test_patch(), &patch).unwrap();
         let vital = (NodeKind::Lv2 { uri: Lv2Uri::new(crate::vital::URI) }, "VITALIUM");
         let rigs = vec![
-            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, "SURGE")]),
             instrument_rig("Winds", &[vital]),
         ];
         let mut app = DemoApp::new_with_sink(None);
@@ -28547,7 +28574,7 @@ mod ui_polish_agent_tests {
     /// Rig A: a Surge. Rig B: the test organ. Rig C: a Surge, the
     /// organ and the oscillator together. Returns the bus's far end.
     fn app_of_instruments() -> (DemoApp, crate::control::CommandDrain) {
-        let surge = || (NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE");
+        let surge = || (NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, "SURGE");
         let lv2 = |uri: &str, name: &'static str| (NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name);
         let rigs = vec![
             instrument_rig("Rig A", &[surge()]),
@@ -28674,7 +28701,7 @@ mod ui_polish_agent_tests {
     #[test]
     fn the_organ_face_pulls_drawbars_and_shows_a_programmes_registration() {
         let rigs = vec![
-            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, "SURGE")]),
+            instrument_rig("Rig A", &[(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, "SURGE")]),
             instrument_rig("Organ", &[(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, "ORGAN")]),
         ];
         let mut app = DemoApp::new_with_sink(None);
@@ -30377,7 +30404,7 @@ mod face_layout_tests {
         let mut app = DemoApp::new_with_sink(None);
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
         let delay = g.add_node(NodeKind::Dsp(crate::control::DspKind::Delay), name_bytes("DELAY"));
         let organ = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) }, name_bytes("ORGAN"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -30402,7 +30429,7 @@ mod face_layout_tests {
         let mut app = DemoApp::new_with_sink(None);
         let mut g = crate::control::Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let organ = g.add_node(NodeKind::Clap { plugin_id: name_bytes(crate::aeolus::AEOLUS_ID) }, name_bytes("AEOLUS"));
+        let organ = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) }, name_bytes("AEOLUS"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: organ, port: 0 }, CPortKind::Midi);
         g.connect_with_id(2, PortRef { node: organ, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
@@ -30434,7 +30461,7 @@ mod face_layout_tests {
         let mut g = app.base_graph.clone();
         for n in g.nodes.iter_mut() {
             if let NodeKind::Clap { plugin_id } = &mut n.kind {
-                *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID);
+                *plugin_id = crate::control::ClapId::new(crate::aeolus::AEOLUS_ID);
                 n.name = name_bytes(&format!("AEOLUS {}", n.id));
             }
         }
@@ -30462,7 +30489,7 @@ mod face_layout_tests {
         let mut app = DemoApp::new_with_sink(None);
         let mut g = app.base_graph.clone();
         for n in g.nodes.iter_mut() {
-            if let NodeKind::Clap { plugin_id } = &mut n.kind { *plugin_id = name_bytes(crate::aeolus::AEOLUS_ID); }
+            if let NodeKind::Clap { plugin_id } = &mut n.kind { *plugin_id = crate::control::ClapId::new(crate::aeolus::AEOLUS_ID); }
         }
         app.build_rack(&g, &[]);
         super::main_control_tests::give_clap_units_main_knobs(&mut app);
@@ -31762,7 +31789,7 @@ mod mixer_parity_tests {
                 let mut g = Graph::default();
                 g.reserve(16, 16);
                 let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-                let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+                let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
                 let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
                 let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
                 let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -32353,7 +32380,7 @@ mod mixer_parity_tests {
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut edge = 1;
         for name in ["SURGE A", "SURGE B"] {
-            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(name));
+            let s = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes(name));
             g.connect_with_id(edge, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); edge += 1;
             g.connect_with_id(edge, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); edge += 1;
         }
@@ -32425,10 +32452,10 @@ mod mixer_parity_tests {
         let mut g = Graph::default();
         g.reserve(24, 24);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE A"));
         let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
-        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
-        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE C"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut edge = 1;
         for s in [a, b, c] {
@@ -32643,7 +32670,7 @@ mod mixer_parity_tests {
         let mut g = Graph::default();
         g.reserve(16, 16);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
         let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
         let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
         let filt = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("FILTER"));
@@ -32917,11 +32944,11 @@ mod mixer_parity_tests {
         let mut g = Graph::default();
         g.reserve(24, 24);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let a = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let a = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE A"));
         let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
         let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
-        let b = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
-        let c = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE C"));
+        let b = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE B"));
+        let c = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE C"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         let mut edge = 1;
         for s in [a, b, c] {
@@ -34131,7 +34158,7 @@ mod voice_host_tests {
         assert_eq!(rig.app.clap_rigs()[0].1, second);
         assert_marks(&marks(&mut rig, &p), &own[1..], "the surviving unit");
 
-        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0, wire: false });
+        send(&mut rig, Command::AddNode { kind: NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name: name_bytes("SURGE C"), rig: 0, wire: false });
         assert_voiced(&mut rig, 2, "after a remote AddNode");
         assert_marks(&marks(&mut rig, &p)[..1], &own[1..], "the surviving unit after an add");
     }
@@ -34761,7 +34788,7 @@ mod navigator_tests {
         let mut rig_a = Graph::default();
         rig_a.reserve(8, 8);
         let ka = rig_a.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let sa = rig_a.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE A"));
+        let sa = rig_a.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE A"));
         let da = rig_a.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY"));
         let va = rig_a.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
         let ma = rig_a.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
@@ -34777,7 +34804,7 @@ mod navigator_tests {
         let mut rig_b = Graph::default();
         rig_b.reserve(8, 8);
         let kb = rig_b.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let sb = rig_b.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE B"));
+        let sb = rig_b.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE B"));
         let sat = rig_b.add_node(NodeKind::Dsp(DspKind::Saturation), name_bytes("SATURATION"));
         let mb = rig_b.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
         rig_b.connect_with_id(1, PortRef { node: kb, port: 0 }, PortRef { node: sb, port: 0 }, CPortKind::Midi);
@@ -34903,7 +34930,7 @@ mod navigator_tests {
         let mut eid = 1;
         let mut srcs = Vec::new();
         for i in 0..6 {
-            let s = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes(&format!("CH {}", i + 1)));
+            let s = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes(&format!("CH {}", i + 1)));
             g.connect_with_id(eid, PortRef { node: keys, port: 0 }, PortRef { node: s, port: 0 }, CPortKind::Midi); eid += 1;
             g.connect_with_id(eid, PortRef { node: s, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio); eid += 1;
             srcs.push(s);

@@ -59,14 +59,16 @@ pub enum InstallRoute {
         /// Built artifact, relative to the clone dir, copied into `home`.
         artifact: &'static str,
     },
-    /// A prebuilt bundle from a pinned GitHub release of the entry's repo,
-    /// unpacked into the build cache and copied into `home`.
+    /// A prebuilt bundle from a pinned release download (a GitHub release
+    /// asset, or the vendor's own file), unpacked into the build cache and
+    /// copied into `home`.
     Release {
         /// The only CPU it runs on (`std::env::consts::ARCH` naming).
         arch: &'static str,
+        /// The release, as the card names it.
         tag: &'static str,
-        /// Release asset file name (`.zip` or `.tar.gz`).
-        asset: &'static str,
+        /// The `.zip` or `.tar.gz` to download.
+        url: &'static str,
         /// The asset's SHA-256: a re-uploaded asset under the same name
         /// fails the install instead of being installed.
         sha256: &'static str,
@@ -85,6 +87,36 @@ pub struct RepoData {
     pub dest: &'static str,
 }
 
+/// Where a project publishes its source code.
+#[derive(Clone, Copy)]
+pub enum Source {
+    /// GitHub "owner/repo": the card shows its stars, and release and data
+    /// routes download from it.
+    GitHub(&'static str),
+    /// A project page off GitHub (Punk Labs publishes source zips on its site).
+    Web(&'static str),
+    /// Freeware without published source (Starbreath): the card links only
+    /// the vendor's website.
+    Closed,
+}
+
+impl Source {
+    pub fn url(self) -> Option<String> {
+        match self {
+            Source::GitHub(repo) => Some(repo_url(repo)),
+            Source::Web(url) => Some(url.to_string()),
+            Source::Closed => None,
+        }
+    }
+
+    pub fn github(self) -> Option<&'static str> {
+        match self {
+            Source::GitHub(repo) => Some(repo),
+            Source::Web(_) | Source::Closed => None,
+        }
+    }
+}
+
 /// One static catalog entry.
 #[derive(Clone, Copy)]
 pub struct CatalogEntry {
@@ -99,10 +131,9 @@ pub struct CatalogEntry {
     pub about: &'static str,
     /// The licence as its SPDX id, or a short name when it has none.
     pub license: &'static str,
-    /// The project's own website, when it has one besides GitHub.
+    /// The project's own website, when it has one besides its source page.
     pub homepage: Option<&'static str>,
-    /// GitHub "owner/repo".
-    pub repo: &'static str,
+    pub source: Source,
     /// Install routes, best first; an install takes the first one that
     /// runs on this machine ([`route_for`]).
     pub routes: &'static [InstallRoute],
@@ -127,12 +158,13 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "A tonewheel organ modelled on the Hammond B3, with drawbars, percussion, vibrato and a rotary speaker. kabelsalat gives it its own organ face.",
         license: "GPL-2.0",
         homepage: Some("https://setbfree.org"),
-        repo: "pantherb/setBfree",
-        routes: &[InstallRoute::DistroPackage { pkg: "setbfree" }],
+        source: Source::GitHub("pantherb/setBfree"),
+        routes: &[InstallRoute::DistroPackage { pkg: "setbfree-lv2" }],
         home: Home::Lv2,
         clap_id: None,
         lv2_uris: &["http://gareus.org/oss/lv2/b_synth"],
-        bundles: &["b_synth.lv2", "setBfree.lv2"],
+        // Arch installs the bundle without the .lv2 suffix.
+        bundles: &["b_synth", "b_synth.lv2", "setBfree.lv2"],
         data: None,
     },
     CatalogEntry {
@@ -144,12 +176,12 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "A hybrid synth with wavetable, FM, analogue-style and physical-modelling oscillators. Ships with about 3000 patches that kabelsalat can search and load.",
         license: "GPL-3.0",
         homepage: Some("https://surge-synthesizer.github.io"),
-        repo: "surge-synthesizer/surge",
+        source: Source::GitHub("surge-synthesizer/surge"),
         routes: &[InstallRoute::DistroPackage { pkg: "surge-xt-clap" }],
         home: Home::Clap,
         clap_id: Some("org.surge-synth-team.surge-xt"),
         lv2_uris: &[],
-        bundles: &["org.surge-synth-team.surge-xt.clap"],
+        bundles: &["Surge XT.clap", "org.surge-synth-team.surge-xt.clap"],
         data: None,
     },
     CatalogEntry {
@@ -161,12 +193,12 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "An FM synth modelled on the Yamaha DX7, loading the classic SysEx cartridges: electric pianos, basses, bells and brass.",
         license: "GPL-3.0",
         homepage: None,
-        repo: "asb2m10/dexed",
-        routes: &[InstallRoute::DistroPackage { pkg: "dexed" }],
+        source: Source::GitHub("asb2m10/dexed"),
+        routes: &[InstallRoute::DistroPackage { pkg: "dexed-clap" }],
         home: Home::Clap,
         clap_id: Some("com.digital-suburban.dexed"),
         lv2_uris: &[],
-        bundles: &["com.digital-suburban.dexed.clap"],
+        bundles: &["Dexed.clap", "com.digital-suburban.dexed.clap"],
         data: None,
     },
     CatalogEntry {
@@ -178,7 +210,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "The DISTRHO port of the Vital wavetable synth, with spectral warping and a modulation matrix. Plays Vital patches: drop a .vitalbank or .vital file on the window to add it.",
         license: "GPL-3.0",
         homepage: Some("https://distrho.github.io/DISTRHO-Ports/"),
-        repo: "DISTRHO/DISTRHO-Ports",
+        source: Source::GitHub("DISTRHO/DISTRHO-Ports"),
         routes: &[InstallRoute::Source {
             repo: "DISTRHO/DISTRHO-Ports",
             submodules: true,
@@ -213,7 +245,7 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "A chiptune synth with NES-style pulse, triangle and noise channels plus extra chips, and 146 built-in presets.",
         license: "Source-available",
         homepage: None,
-        repo: "andrewfader/yanes",
+        source: Source::GitHub("andrewfader/yanes"),
         routes: &[InstallRoute::Source {
             repo: "andrewfader/yanes",
             submodules: false,
@@ -240,24 +272,10 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "Three oscillators with analogue, wavetable, FM and chiptune modes, two filters with Moog, Korg and SEM models, and a modulation matrix.",
         license: "GPL-3.0",
         homepage: Some("https://thewavewarden.com/odin2"),
-        repo: "TheWaveWarden/odin2",
-        routes: &[InstallRoute::Release {
-            arch: "x86_64",
-            tag: "NightlyDevel",
-            asset: "Odin2.4.1Linux.zip",
-            sha256: "462c4fffda99ff91a6c362d8cf41616b50807778ae7a96471753046a799aed63",
-            artifact: "Odin2.clap",
-        }, InstallRoute::Source {
-            repo: "TheWaveWarden/odin2",
-            submodules: true,
-            // README.md "Build Instructions": cmake configure + build. Only the
-            // CLAP target (clap-juce-extensions), not VST3/LV2/Standalone.
-            build: &[
-                &["cmake", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"],
-                &["cmake", "--build", "build", "--target", "Odin2_CLAP"],
-            ],
-            artifact: "build/Odin2_artefacts/Release/CLAP/Odin2.clap",
-        }],
+        source: Source::GitHub("TheWaveWarden/odin2"),
+        // Arch packages Odin for both CPUs, but not its factory patches
+        // (the data folder below brings them).
+        routes: &[InstallRoute::DistroPackage { pkg: "odin2-synthesizer-clap" }],
         home: Home::Clap,
         clap_id: Some("com.thewavewarden.odin2"),
         lv2_uris: &[],
@@ -265,6 +283,214 @@ pub static CATALOG: &[CatalogEntry] = &[
         // Odin's factory patches are compiled into the plugin; kabelsalat's
         // sound library reads them from Odin's soundbank folder (rule 94).
         data: Some(RepoData { path: "assets/Soundbanks/Factory Presets", dest: ".local/share/odin2/Soundbanks" }),
+    },
+    CatalogEntry {
+        id: "ob-xf",
+        name: "OB-Xf",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Oberheim OB-X / OB-Xa / OB-8 polysynth",
+        about: "A virtual-analogue polysynth modelled on Oberheim's OB-X, OB-Xa and OB-8, for brass, pads, stabs and fat basses. The Surge Synth Team's continuation of OB-Xd.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        source: Source::GitHub("surge-synthesizer/OB-Xf"),
+        routes: &[InstallRoute::DistroPackage { pkg: "ob-xf-clap" }],
+        home: Home::Clap,
+        clap_id: Some("org.surge-synth-team.OB-Xf"),
+        lv2_uris: &[],
+        bundles: &["OB-Xf.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "kr106",
+        name: "Ultramaster KR-106",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Roland Juno-106 style polysynth",
+        about: "A polysynth inspired by the Roland Juno: one oscillator with saw, pulse and sub, a resonant low-pass filter and the Juno's chorus, all on one panel. Quick to play live.",
+        license: "GPL-3.0-only",
+        homepage: Some("https://kayrock.org/kr106/"),
+        source: Source::GitHub("kayrockscreenprinting/ultramaster_kr106"),
+        routes: &[InstallRoute::DistroPackage { pkg: "ultramaster-kr106-clap" }],
+        home: Home::Clap,
+        clap_id: Some("org.kayrock.kr106"),
+        lv2_uris: &[],
+        bundles: &["Ultramaster KR-106.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "six-sines",
+        name: "Six Sines",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Six-operator FM / phase-modulation synth",
+        about: "Six sine operators that modulate each other at audio rate, each with its own envelope and LFO, for bells, electric pianos, plucks and basses. A modern take on FM by Surge XT's lead developer, with MPE.",
+        license: "GPL-3.0 (source MIT)",
+        homepage: None,
+        source: Source::GitHub("baconpaul/six-sines"),
+        routes: &[InstallRoute::Release {
+            arch: "x86_64",
+            tag: "v1.2.1",
+            url: "https://github.com/baconpaul/six-sines/releases/download/v1.2.1/six-sines-Linux-2026-07-20-18ecb36.zip",
+            sha256: "9b5353eebfec3e462c80ed8c0f53c965e6262bb38537518159cce71de7eace41",
+            artifact: "six-sines_assets/Six Sines.clap",
+        }, InstallRoute::Source {
+            repo: "baconpaul/six-sines",
+            submodules: true,
+            // README.md "How to build this software".
+            build: &[
+                &["cmake", "-Bignore/build", "-DCMAKE_BUILD_TYPE=Release"],
+                &["cmake", "--build", "ignore/build", "--config", "Release", "--target", "six-sines_all"],
+            ],
+            artifact: "ignore/build/six-sines_assets/Six Sines.clap",
+        }],
+        home: Home::Clap,
+        clap_id: Some("org.baconpaul.six-sines"),
+        lv2_uris: &[],
+        bundles: &["Six Sines.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "jc303",
+        name: "JC303",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Roland TB-303 acid bass line",
+        about: "A model of the Roland TB-303 bass line: saw or square into the 303's squelchy resonant filter, with accent and slide. Put kabelsalat's arpeggiator in front of it for acid lines.",
+        license: "GPL-3.0-only",
+        homepage: Some("https://midilab.co/jc303/"),
+        source: Source::GitHub("midilab/jc303"),
+        routes: &[InstallRoute::DistroPackage { pkg: "jc303-clap" }],
+        home: Home::Clap,
+        clap_id: Some("co.midilab.JC303"),
+        lv2_uris: &[],
+        bundles: &["JC303.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "cardinal",
+        name: "Cardinal",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Modular synth: VCV Rack in a rack unit",
+        about: "A free and open build of VCV Rack with over a thousand modules: oscillators, filters, sequencers and effects you patch with virtual cables in its own window. kabelsalat hosts Cardinal Synth, the instrument version.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        source: Source::GitHub("DISTRHO/Cardinal"),
+        routes: &[InstallRoute::DistroPackage { pkg: "cardinal-clap" }],
+        home: Home::Clap,
+        clap_id: Some("studio.kx.distrho.cardinal#synth"),
+        lv2_uris: &[],
+        // One bundle dir holds the three Cardinal plugins.
+        bundles: &["Cardinal.clap/CardinalSynth.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "ot-keys",
+        name: "OneTrick KEYS",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Physically modelled lo-fi piano",
+        about: "A piano that is modelled, not sampled: a small download with a warm, slightly worn tone. Fills the acoustic piano slot without gigabytes of samples.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        source: Source::Web("https://punklabs.com/ot-keys"),
+        routes: &[InstallRoute::DistroPackage { pkg: "ot-keys-clap" }],
+        home: Home::Clap,
+        clap_id: Some("com.punklabs.onetrick.keys"),
+        lv2_uris: &[],
+        bundles: &["OneTrick KEYS.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "ot-chonk",
+        name: "OneTrick CHONK",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Physically modelled electric bass",
+        about: "A monophonic electric bass guitar modelled from the string up. Good on the left hand of a split keyboard.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        source: Source::Web("https://punklabs.com/ot-chonk"),
+        routes: &[InstallRoute::DistroPackage { pkg: "ot-chonk-clap" }],
+        home: Home::Clap,
+        clap_id: Some("com.punklabs.onetrick.chonk"),
+        lv2_uris: &[],
+        bundles: &["OneTrick CHONK.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "ot-cryptid",
+        name: "OneTrick CRYPTID",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "FM drum machine with a DX7 engine",
+        about: "Drums synthesised with a Yamaha DX7 style FM engine: kicks, snares, hats and toms, no samples. Plays on the General MIDI drum notes.",
+        license: "GPL-3.0-or-later",
+        homepage: None,
+        source: Source::Web("https://punklabs.com/ot-cryptid"),
+        routes: &[InstallRoute::DistroPackage { pkg: "ot-cryptid-clap" }],
+        home: Home::Clap,
+        clap_id: Some("com.punklabs.onetrick.cryptid"),
+        lv2_uris: &[],
+        bundles: &["OneTrick CRYPTID.clap"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "avldrums",
+        name: "AVL Drumkits",
+        format: Format::Lv2,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Sampled acoustic drum kits",
+        about: "Five multi-velocity acoustic kits from the AV Linux drum library (Black Pearl, Red Zeppelin, Blonde Bop, Blonde Bop HR, Buskman's Holiday), samples included. Plays on the General MIDI drum notes.",
+        license: "GPL-2.0-or-later",
+        homepage: Some("https://x42-plugins.com/x42/x42-avldrums"),
+        source: Source::GitHub("x42/avldrums.lv2"),
+        routes: &[InstallRoute::Source {
+            repo: "x42/avldrums.lv2",
+            // robtk (the GUI toolkit) is a submodule.
+            submodules: true,
+            // Makefile: `make install DESTDIR=... PREFIX=/usr` puts the bundle
+            // with its five .sf2 kits in $(DESTDIR)/usr/lib/lv2/avldrums.lv2.
+            build: &[&["make"], &["make", "install", "DESTDIR=out", "PREFIX=/usr"]],
+            artifact: "out/usr/lib/lv2/avldrums.lv2",
+        }],
+        home: Home::Lv2,
+        clap_id: None,
+        // The stereo kits; the "Multi" variants have one output per drum.
+        lv2_uris: &[
+            "http://gareus.org/oss/lv2/avldrums#BlackPearl",
+            "http://gareus.org/oss/lv2/avldrums#RedZeppelin",
+            "http://gareus.org/oss/lv2/avldrums#BlondeBop",
+            "http://gareus.org/oss/lv2/avldrums#BlondeBopHR",
+            "http://gareus.org/oss/lv2/avldrums#BuskmansHoliday",
+        ],
+        bundles: &["avldrums.lv2"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "starbreath",
+        name: "Starbreath",
+        format: Format::Clap,
+        plugin_type: crate::plugins::PluginType::Instrument,
+        description: "Physically modelled winds for breath controllers",
+        about: "Flutes, reeds, saxophone and brass modelled from physics and played from the breath of a wind controller (EWI, Aerophone, Sylphyo; it finds breath on CC2, CC11 or aftertouch), with harmoniser and spaces. Freeware, not open source: free to download until 31 January 2027, and the version you have keeps working. Linux x86-64 only.",
+        license: "Proprietary freeware",
+        homepage: Some("https://vsti.im-a-bird.com"),
+        source: Source::Closed,
+        routes: &[InstallRoute::Release {
+            arch: "x86_64",
+            tag: "v0.9.0",
+            url: "https://vsti.im-a-bird.com/downloads/v0.9.0/Starbreath-v0.9.0-linux-x64.tar.gz",
+            sha256: "74332886c1f2f8e4f58034ad4dda8de60ccca9f600f40b322463c9ebaabb585c",
+            artifact: "Starbreath.clap",
+        }],
+        home: Home::Clap,
+        // Not published; the card finds the bundle by its file name.
+        clap_id: None,
+        lv2_uris: &[],
+        bundles: &["Starbreath.clap"],
+        data: None,
     },
     CatalogEntry {
         id: "floe",
@@ -275,11 +501,11 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "Plays sample libraries in the Floe format, with layered instruments, effects and presets. Its sounds come from libraries installed separately from floe.audio.",
         license: "GPL-3.0-or-later",
         homepage: Some("https://floe.audio"),
-        repo: "floe-audio/Floe",
+        source: Source::GitHub("floe-audio/Floe"),
         routes: &[InstallRoute::Release {
             arch: "x86_64",
             tag: "v2.0.5",
-            asset: "Floe-CLAP-v2.0.5-Linux.tar.gz",
+            url: "https://github.com/floe-audio/Floe/releases/download/v2.0.5/Floe-CLAP-v2.0.5-Linux.tar.gz",
             sha256: "14e6e7bf684253facb534ae034bc7324772552997017fb03de608a8c6f25d476",
             artifact: "Floe.clap",
         }],
@@ -298,11 +524,11 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "A church pipe organ built on Fons Adriaensen's Aeolus: additive pipe models with chiff on the attack, several divisions of stops, tremulant and a convolution reverb.",
         license: "GPL-3.0-or-later",
         homepage: None,
-        repo: "Archie3d/aeolus_plugin",
+        source: Source::GitHub("Archie3d/aeolus_plugin"),
         routes: &[InstallRoute::Release {
             arch: "x86_64",
             tag: "v0.3.0",
-            asset: "Aeolus-clap-linux-0.3.0.zip",
+            url: "https://github.com/Archie3d/aeolus_plugin/releases/download/v0.3.0/Aeolus-clap-linux-0.3.0.zip",
             sha256: "498170149337c7d2ce19783156522d3bf489f811c2a61b7323b64071882cc370",
             artifact: "Aeolus.clap",
         }, InstallRoute::Source {
@@ -332,12 +558,36 @@ pub static CATALOG: &[CatalogEntry] = &[
         about: "A mono guitar amplifier with a tube-modelled preamp, tone stack and power amp, matched cabinet impulses and a pedalboard of stomps (overdrive, fuzz, delay, reverb, wah, tremolo). kabelsalat's Guitar rig template wires an Audio In through the screamer, the amp and a cabinet — the tuner is on the Audio In unit's face.",
         license: "GPL-2.0-or-later",
         homepage: Some("https://guitarix.org"),
-        repo: "brummer10/guitarix",
+        source: Source::GitHub("brummer10/guitarix"),
         routes: &[InstallRoute::DistroPackage { pkg: "guitarix" }],
         home: Home::Lv2,
         clap_id: None,
         lv2_uris: crate::guitar::ALL,
         bundles: &["gx_amp.lv2", "gx_cabinet.lv2", "gx_scream.lv2"],
+        data: None,
+    },
+    CatalogEntry {
+        id: "x42-midifilter",
+        name: "x42 MIDI filters",
+        format: Format::Lv2,
+        plugin_type: crate::plugins::PluginType::MidiFx,
+        description: "36 MIDI tools for the MIDI strips",
+        about: "Robin Gareus' MIDI filter set: chord, strum, transpose, key split, scale lock, velocity curves, CC remapping, mono legato and more, each a MIDI unit you put in front of an instrument. For a wind controller: Velocity Scale fixes the velocity, Mono Legato plays one note at a time, Map CC turns breath CC2 into the CC a patch reads. Comes with the rest of the x42 LV2 set (EQ, limiter, meters, tuner).",
+        license: "GPL-2.0-or-later",
+        homepage: Some("https://x42-plugins.com/x42/x42-midifilter"),
+        source: Source::GitHub("x42/midifilter.lv2"),
+        routes: &[InstallRoute::DistroPackage { pkg: "x42-plugins-lv2" }],
+        home: Home::Lv2,
+        clap_id: None,
+        lv2_uris: &[
+            "http://gareus.org/oss/lv2/midifilter#midichord",
+            "http://gareus.org/oss/lv2/midifilter#miditranspose",
+            "http://gareus.org/oss/lv2/midifilter#monolegato",
+            "http://gareus.org/oss/lv2/midifilter#velocityscale",
+            "http://gareus.org/oss/lv2/midifilter#mapcc",
+            "http://gareus.org/oss/lv2/midifilter#midistrum",
+        ],
+        bundles: &["midifilter.lv2"],
         data: None,
     },
 ];
@@ -433,7 +683,7 @@ pub fn entry_json(e: &CatalogEntry, installed: bool, installing: bool) -> serde_
         "about": e.about,
         "license": e.license,
         "homepage": e.homepage,
-        "source_url": repo_url(e.repo),
+        "source_url": e.source.url(),
         "route": route.map(InstallRoute::kind),
         "installable_here": route.is_some(),
         "installed": installed,
@@ -504,14 +754,18 @@ pub struct InstallCommand {
 /// assert and what [`run_install`] executes.
 pub fn plan(entry: &CatalogEntry, route: &InstallRoute, cache: &Path, home: &Path) -> Vec<InstallCommand> {
     match *route {
-        InstallRoute::DistroPackage { pkg } => vec![InstallCommand {
-            argv: vec![
-                "sudo".into(), "-n".into(), "pacman".into(), "-S".into(),
-                "--needed".into(), "--noconfirm".into(), pkg.into(),
-            ],
-            cwd: None,
-            changes_system: true,
-        }],
+        InstallRoute::DistroPackage { pkg } => {
+            let mut cmds = vec![InstallCommand {
+                argv: vec![
+                    "sudo".into(), "-n".into(), "pacman".into(), "-S".into(),
+                    "--needed".into(), "--noconfirm".into(), pkg.into(),
+                ],
+                cwd: None,
+                changes_system: true,
+            }];
+            cmds.extend(fetch_data(entry, cache, home));
+            cmds
+        }
         InstallRoute::Source { repo, submodules, build, artifact } => {
             let clone_dir = cache.join(entry.id);
             let mut cmds = vec![fresh_dir(&clone_dir)];
@@ -536,8 +790,9 @@ pub fn plan(entry: &CatalogEntry, route: &InstallRoute, cache: &Path, home: &Pat
             cmds.extend(fetch_data(entry, cache, home));
             cmds
         }
-        InstallRoute::Release { tag, asset, sha256, artifact, .. } => {
+        InstallRoute::Release { url, sha256, artifact, .. } => {
             let dir = cache.join(entry.id);
+            let asset = url.rsplit('/').next().unwrap_or(url);
             let file = path_arg(&dir.join(asset));
             let unpacked = dir.join("unpacked");
             let unpack: Vec<String> = if asset.ends_with(".zip") {
@@ -549,8 +804,7 @@ pub fn plan(entry: &CatalogEntry, route: &InstallRoute, cache: &Path, home: &Pat
                 fresh_dir(&dir),
                 user_cmd(vec!["mkdir".into(), "-p".into(), path_arg(&unpacked)]),
                 user_cmd(vec![
-                    "curl".into(), "-fL".into(), "--retry".into(), "2".into(), "-o".into(), file.clone(),
-                    format!("{}/releases/download/{tag}/{asset}", repo_url(entry.repo)),
+                    "curl".into(), "-fL".into(), "--retry".into(), "2".into(), "-o".into(), file.clone(), url.into(),
                 ]),
                 // The hash and path go in as $0/$1, never spliced into the script.
                 user_cmd(vec![
@@ -580,7 +834,7 @@ fn fetch_data(entry: &CatalogEntry, cache: &Path, home: &Path) -> Vec<InstallCom
         fresh_dir(&dir),
         user_cmd(vec![
             "git".into(), "clone".into(), "--depth".into(), "1".into(), "--filter=blob:none".into(), "--sparse".into(),
-            repo_url(entry.repo), path_arg(&dir),
+            repo_url(entry.source.github().expect("a data folder comes from GitHub (catalog test)")), path_arg(&dir),
         ]),
         user_cmd(vec!["git".into(), "-C".into(), path_arg(&dir), "sparse-checkout".into(), "set".into(), data.path.into()]),
         user_cmd(vec!["mkdir".into(), "-p".into(), path_arg(&dest)]),
@@ -658,45 +912,223 @@ fn shell_join(argv: &[String]) -> String {
 /// exact command the user can run themselves — passwords are never prompted or
 /// handled (rule: install changes the system, confirm first).
 pub fn run_install(entry: &CatalogEntry, cache: &Path, home: &Path, log: &mut dyn FnMut(String)) -> Result<(), String> {
-    log(format!("installing {} ({})", entry.name, entry.repo));
+    log(format!("installing {}", entry.name));
     let route = local_route(entry).ok_or_else(|| {
         format!("{} has no Linux build for this machine ({})", entry.name, std::env::consts::ARCH)
     })?;
-    for cmd in plan(entry, route, cache, home) {
-        let label = shell_join(&cmd.argv);
-        log(format!("$ {label}"));
-        match run_one(&cmd, log) {
-            Ok(status) if status.success() => {}
-            Ok(status) => {
-                let mut msg = format!(
-                    "command failed (exit {status}): {label}\ninstall left incomplete.",
-                );
-                if let InstallRoute::DistroPackage { pkg } = route {
-                    msg.push_str(&format!("\nrun: sudo pacman -S {pkg}"));
-                }
-                return Err(msg);
-            }
-            Err(e) => return Err(e),
+    run_commands(&plan(entry, route, cache, home), log).map_err(|mut msg| {
+        if let InstallRoute::DistroPackage { pkg } = route {
+            msg.push_str(&format!("\nrun: sudo pacman -S {pkg}"));
         }
-    }
+        msg
+    })?;
     log(format!("installed {}", entry.name));
     Ok(())
 }
 
-/// First URI of `entry` that loads as an LV2 *effect* (feed it audio, listen
-/// to the output). An instrument card is played by `lv2-instrument-engine-test`.
-fn lv2_effect_uri(entry: &CatalogEntry) -> Option<&'static str> {
-    entry.lv2_uris.iter().copied()
-        .find(|u| crate::lv2::Lv2Plugin::load(u, 48_000.0, 512).map_or(false, |p| !p.is_instrument()))
+fn run_commands(cmds: &[InstallCommand], log: &mut dyn FnMut(String)) -> Result<(), String> {
+    for cmd in cmds {
+        let label = shell_join(&cmd.argv);
+        log(format!("$ {label}"));
+        let status = run_one(cmd, log)?;
+        if !status.success() {
+            return Err(format!("command failed (exit {status}): {label}\ninstall left incomplete."));
+        }
+    }
+    Ok(())
 }
 
-/// Feed a loaded LV2 effect a 220 Hz test signal for half a second and
-/// return the output peak (rule 116's spirit: verify the *installed* bundle
-/// by its own URI, never another copy elsewhere on the search paths).
-fn play_lv2_card(uri: &str) -> anyhow::Result<f32> {
+/// `kabelsalat catalog-install-test [id...]`: puts each named card (default:
+/// every card whose route here is not a source build) into a scratch dir under
+/// `~/.cache` (rule 79) the way its route would, without changing the system,
+/// then loads it from there and plays it (rule 116: the bundle just fetched,
+/// never another copy on the search paths).
+///
+/// A source build or release installs into a scratch home. A distro package
+/// is downloaded with `pacman -Sp` and unpacked, never installed: no root,
+/// and its dependencies are whatever this machine has. A CLAP card must report
+/// its catalog id and sound on a probe chord; every URI of an LV2 card must
+/// load: an instrument sounds, an effect passes a test tone, a MIDI unit
+/// passes a note.
+pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
+    let entries: Vec<&CatalogEntry> = if ids.is_empty() {
+        CATALOG.iter().filter(|e| local_route(e).is_some_and(|r| !matches!(r, InstallRoute::Source { .. }))).collect()
+    } else {
+        ids.iter().map(|id| find(id).ok_or_else(|| anyhow::anyhow!("no catalog entry '{id}'"))).collect::<anyhow::Result<_>>()?
+    };
+    let root = home_dir().join(".cache").join("ksalat-catalog-install-test");
+    let _ = std::fs::remove_dir_all(&root);
+    let (mut tested, mut failed) = (0, Vec::new());
+    for entry in entries {
+        let Some(route) = local_route(entry) else {
+            println!("  {}: no route for {}, skipped", entry.name, std::env::consts::ARCH);
+            continue;
+        };
+        tested += 1;
+        println!("  {}: {}", entry.name, route.summary());
+        match fetch_and_play(entry, route, &root.join(entry.id)) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("  {}: FAILED: {e:#}", entry.name);
+                failed.push(entry.name);
+            }
+        }
+    }
+    anyhow::ensure!(tested > 0, "catalog-install-test: nothing installable here");
+    anyhow::ensure!(failed.is_empty(), "catalog-install-test failed: {}", failed.join(", "));
+    println!("catalog-install-test: OK ({tested} fetched, loaded and heard)");
+    Ok(())
+}
+
+fn fetch_and_play(entry: &CatalogEntry, route: &InstallRoute, dir: &Path) -> anyhow::Result<()> {
+    let log = &mut |l: String| println!("  | {l}");
+    let (cache, home) = (dir.join("build"), dir.join("home"));
+    let plugins = match *route {
+        InstallRoute::DistroPackage { pkg } => {
+            let unpacked = dir.join("pkg");
+            fetch_package(pkg, &unpacked, log)?;
+            // What the install adds besides the package (Odin's patches).
+            let user_steps: Vec<InstallCommand> = plan(entry, route, &cache, &home).into_iter().filter(|c| !c.changes_system).collect();
+            run_commands(&user_steps, log).map_err(anyhow::Error::msg)?;
+            unpacked.join("usr/lib").join(match entry.home { Home::Clap => "clap", Home::Lv2 => "lv2" })
+        }
+        _ => {
+            run_install(entry, &cache, &home, log).map_err(anyhow::Error::msg)?;
+            home.join(entry.home.dir_name())
+        }
+    };
+    if let Some(data) = entry.data {
+        let folder = Path::new(data.path).file_name().expect("a data path names a folder");
+        let files = files_under(&home.join(data.dest).join(folder));
+        let patches: Vec<&PathBuf> = files.iter().filter(|f| f.extension().is_some_and(|x| x == "odin")).collect();
+        let unreadable: Vec<String> = patches
+            .iter()
+            .filter_map(|f| crate::juce::value_tree_to_state(&std::fs::read(f).ok()?).err().map(|e| format!("{}: {e}", f.display())))
+            .collect();
+        println!("  {}: {} data files under ~/{}, {} .odin patches convert to plugin state", entry.name, files.len(), data.dest, patches.len() - unreadable.len());
+        anyhow::ensure!(!files.is_empty() && unreadable.is_empty(), "data: {unreadable:?}");
+    }
+    match entry.format {
+        Format::Clap => play_clap_card(entry, &plugins.join(entry.bundles[0])),
+        Format::Lv2 => play_lv2_card(entry, &plugins),
+    }
+}
+
+/// Download `pkg` (no dependencies) the way pacman would install it and
+/// unpack it into `dir`. `pacman -Sp` only prints URLs: it needs no root.
+fn fetch_package(pkg: &str, dir: &Path, log: &mut dyn FnMut(String)) -> anyhow::Result<()> {
+    let out = std::process::Command::new("pacman").args(["-Sp", "--print-format", "%n %l", pkg]).output()?;
+    anyhow::ensure!(out.status.success(), "pacman -Sp {pkg}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    let listing = String::from_utf8_lossy(&out.stdout);
+    let mut url = None;
+    for (name, u) in listing.lines().filter_map(|l| l.split_once(' ')) {
+        if name == pkg {
+            url = Some(u.to_string());
+        } else {
+            log(format!("{pkg} needs {name}, not installed here (the test runs without it)"));
+        }
+    }
+    let url = url.ok_or_else(|| anyhow::anyhow!("pacman -Sp lists no package {pkg}"))?;
+    let file = dir.join(url.rsplit('/').next().unwrap_or(pkg));
+    std::fs::create_dir_all(dir)?;
+    run_commands(
+        &[
+            user_cmd(vec!["curl".into(), "-fsSL".into(), "--retry".into(), "2".into(), "-o".into(), path_arg(&file), url]),
+            user_cmd(vec!["tar".into(), "-xf".into(), path_arg(&file), "-C".into(), path_arg(dir)]),
+        ],
+        log,
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+/// Notes every card should answer: General MIDI kick and snare for the drum
+/// machines, middle C for everything else.
+const PROBE_CHORD: [u8; 3] = [36, 38, 60];
+
+fn play_clap_card(entry: &CatalogEntry, bundle: &Path) -> anyhow::Result<()> {
+    let infos = crate::host::scan_clap_bundle(bundle)?;
+    let id = match entry.clap_id {
+        Some(id) => {
+            anyhow::ensure!(infos.iter().any(|p| p.id == id), "bundle reports {:?}, catalog says {id}", infos.iter().map(|p| &p.id).collect::<Vec<_>>());
+            id.to_string()
+        }
+        None => {
+            let p = infos.iter().find(|p| p.features.iter().any(|f| f == "instrument")).ok_or_else(|| anyhow::anyhow!("bundle has no instrument"))?;
+            println!("  {}: the bundle's instrument is {}", entry.name, p.id);
+            p.id.clone()
+        }
+    };
+    let rate = 48_000.0;
+    let (mut voice, main) = crate::host::ClapVoice::new_from_bundle(rate, bundle, &id)?;
+    let mut buf = vec![0.0f32; 2 * 4800];
+    let mut peak = 0.0f32;
+    for n in PROBE_CHORD {
+        voice.note_on(n.into(), 0.8);
+    }
+    for _ in 0..10 {
+        voice.render(&mut buf, crate::transport::Transport::default());
+        peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
+    }
+    for n in PROBE_CHORD {
+        voice.note_off(n.into());
+    }
+    main.retire(voice);
+    println!("  {}: {id} loads from {}, probe chord peak {peak:.3}", entry.name, bundle.display());
+    anyhow::ensure!(peak >= 1e-3, "silent");
+    Ok(())
+}
+
+/// Load every URI of the card from `plugins` alone (`LV2_PATH`, so a copy in
+/// `/usr/lib/lv2` cannot stand in) and play it as what it is.
+fn play_lv2_card(entry: &CatalogEntry, plugins: &Path) -> anyhow::Result<()> {
+    // Single-threaded here: the test runs one card at a time, before any
+    // LV2 thread exists.
+    std::env::set_var("LV2_PATH", plugins);
     let (rate, block) = (48_000.0, 512usize);
-    let mut p = crate::lv2::Lv2Plugin::load(uri, rate, block)?;
-    anyhow::ensure!(!p.is_instrument(), "{uri} is an instrument, not an effect");
+    let mut silent = Vec::new();
+    for uri in entry.lv2_uris {
+        let mut p = crate::lv2::Lv2Plugin::load(uri, rate, block)?;
+        let (what, level) = if p.is_midi_fx() {
+            ("MIDI unit, notes out", midi_through(&mut p, block))
+        } else if p.is_instrument() {
+            ("instrument, probe chord peak", lv2_probe_chord(&mut p, rate, block))
+        } else {
+            ("effect, test tone peak", lv2_test_tone(&mut p, rate, block))
+        };
+        crate::lv2::retire(p); // rule 56: retire, never free
+        println!("  {}: {uri}: {what} {level:.3}", entry.name);
+        if level < 1e-3 {
+            silent.push(*uri);
+        }
+    }
+    anyhow::ensure!(silent.is_empty(), "silent: {silent:?}");
+    Ok(())
+}
+
+fn lv2_probe_chord(p: &mut crate::lv2::Lv2Plugin, rate: f64, block: usize) -> f32 {
+    let inp = vec![0.0f32; block * 2];
+    let mut out = vec![0.0f32; block * 2];
+    // A sample player loads its kit on its worker thread (AVL Drumkits:
+    // 20 to 45 MB of SoundFont), which takes wall-clock time: render in real
+    // time for a few seconds before the notes.
+    let warm_up = std::time::Instant::now();
+    while warm_up.elapsed() < std::time::Duration::from_secs(3) {
+        p.process(&inp, &mut out, block);
+        std::thread::sleep(std::time::Duration::from_secs_f64(block as f64 / rate));
+    }
+    for n in PROBE_CHORD {
+        p.note_on(n, 100);
+    }
+    let mut peak = 0.0f32;
+    for _ in 0..(rate as usize / block) {
+        p.process(&inp, &mut out, block);
+        peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
+    }
+    peak
+}
+
+/// Feed an effect a 220 Hz tone for half a second; the output peak.
+fn lv2_test_tone(p: &mut crate::lv2::Lv2Plugin, rate: f64, block: usize) -> f32 {
     let mut inp = vec![0.0f32; block * 2];
     let mut out = vec![0.0f32; block * 2];
     let mut peak = 0.0f32;
@@ -711,109 +1143,25 @@ fn play_lv2_card(uri: &str) -> anyhow::Result<f32> {
             peak = out.iter().fold(peak, |m, s| m.max(s.abs()));
         }
     }
-    crate::lv2::retire(p); // rule 56: retire, never free
-    Ok(peak)
+    peak
 }
 
-/// `kabelsalat catalog-install-test [id...]`: installs each named entry
-/// (default: Odin 2 and Floe) through the route this machine takes, into a
-/// scratch home under `~/.cache` (rule 79), then loads the bundle in the CLAP
-/// host, checks its plugin id and plays a note. Downloads from GitHub; a
-/// source route builds, which takes minutes. An LV2 card whose distro package
-/// is already installed is verified by its URI instead (no system change).
-pub fn install_test(ids: &[String]) -> anyhow::Result<()> {
-    let ids: Vec<&str> = if ids.is_empty() { vec!["odin2", "floe"] } else { ids.iter().map(String::as_str).collect() };
-    let root = home_dir().join(".cache").join("ksalat-catalog-install-test");
-    let _ = std::fs::remove_dir_all(&root);
-    let (cache, home) = (root.join("build"), root.join("home"));
-    let (mut tested, mut failed, mut considered) = (0, Vec::new(), 0);
-    for id in ids {
-        let entry = find(id).ok_or_else(|| anyhow::anyhow!("no catalog entry '{id}'"))?;
-        let Some(route) = local_route(entry) else {
-            println!("  {}: no route for {}, skipped", entry.name, std::env::consts::ARCH);
-            continue;
-        };
-        considered += 1;
-        let Some(clap_id) = entry.clap_id else {
-            // An LV2 card. Nothing to build into the scratch home: when the
-            // distro package is on disk the plugin is verified by URI; when
-            // it is not, installing it changes the system and stays with the
-            // user (the card names the exact command).
-            let root_paths = plugin_roots(&home);
-            let roots: Vec<&Path> = root_paths.iter().map(|p| p.as_path()).collect();
-            if !bundle_installed(entry, &roots) {
-                println!("  {}: LV2 bundle not installed here, skipped (the card installs it: {})", entry.name, route.summary());
-                continue;
-            }
-            if let Some(uri) = lv2_effect_uri(entry) {
-                tested += 1;
-                println!("  {}: installed LV2, verifying {uri}", entry.name);
-                match play_lv2_card(uri) {
-                    Ok(peak) => {
-                        println!("  {}: {uri} renders the test signal, peak {peak:.3}", entry.name);
-                        if peak < 1e-3 {
-                            println!("  {}: FAILED: silent", entry.name);
-                            failed.push(entry.name);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  {}: FAILED: {e}", entry.name);
-                        failed.push(entry.name);
-                    }
-                }
-            } else {
-                println!("  {}: LV2 instrument card, play it via KABELSALAT_LV2_URI={} lv2-instrument-engine-test", entry.name, entry.lv2_uris.first().unwrap_or(&""));
-            }
-            continue;
-        };
-        if let InstallRoute::DistroPackage { .. } = route {
-            println!("  {}: distro package, skipped (changes the system)", entry.name);
-            continue;
+/// Notes a MIDI unit put out for a held middle C over a second (1.0 = at
+/// least one; chord or delay units answer after some blocks).
+fn midi_through(p: &mut crate::lv2::Lv2Plugin, block: usize) -> f32 {
+    let inp = vec![0.0f32; block * 2];
+    let mut out = vec![0.0f32; block * 2];
+    let mut events = Vec::with_capacity(64);
+    p.note_on(60, 100);
+    for _ in 0..(48_000 / block) {
+        p.process(&inp, &mut out, block);
+        p.read_midi_out(&mut events);
+        if events.iter().any(|e| matches!(e, crate::lv2::FxOutEvent::NoteOn { .. })) {
+            return 1.0;
         }
-        tested += 1;
-        println!("  {}: {}", entry.name, route.summary());
-        if let Err(e) = run_install(entry, &cache, &home, &mut |l| println!("  | {l}")) {
-            println!("  {}: install FAILED: {e}", entry.name);
-            failed.push(entry.name);
-            continue;
-        }
-        let bundle = home.join(".clap").join(entry.bundles[0]);
-        let ids: Vec<String> = crate::host::scan_clap_bundle(&bundle)?.into_iter().map(|p| p.id).collect();
-        if !ids.iter().any(|i| i == clap_id) {
-            println!("  {}: bundle reports {ids:?}, catalog says {clap_id}", entry.name);
-            failed.push(entry.name);
-            continue;
-        }
-        if let Some(data) = entry.data {
-            let folder = Path::new(data.path).file_name().expect("a data path names a folder");
-            let files = files_under(&home.join(data.dest).join(folder));
-            let patches: Vec<&PathBuf> = files.iter().filter(|f| f.extension().is_some_and(|x| x == "odin")).collect();
-            let unreadable: Vec<String> = patches
-                .iter()
-                .filter_map(|f| crate::juce::value_tree_to_state(&std::fs::read(f).ok()?).err().map(|e| format!("{}: {e}", f.display())))
-                .collect();
-            println!("  {}: {} data files under ~/{}, {} .odin patches convert to plugin state", entry.name, files.len(), data.dest, patches.len() - unreadable.len());
-            if files.is_empty() || !unreadable.is_empty() {
-                println!("  {}: data FAILED: {unreadable:?}", entry.name);
-                failed.push(entry.name);
-            }
-        }
-        let peak = play_one_note(&bundle, clap_id)?;
-        println!("  {}: installed, scan sees {clap_id}, middle C peak {peak:.3}", entry.name);
-        if peak < 1e-3 {
-            failed.push(entry.name);
-        }
+        events.clear();
     }
-    anyhow::ensure!(considered > 0, "catalog-install-test: nothing installable here");
-    anyhow::ensure!(failed.is_empty(), "catalog-install-test failed: {}", failed.join(", "));
-    if tested > 0 {
-        println!("catalog-install-test: OK ({tested} installed, found by the scan and heard)");
-    } else {
-        // Only distro LV2 cards named, none installed yet: verified nothing,
-        // but the named entries all exist and have a route.
-        println!("catalog-install-test: OK (no bundle to verify here; the distro card's install stays with the user)");
-    }
-    Ok(())
+    0.0
 }
 
 fn files_under(dir: &Path) -> Vec<PathBuf> {
@@ -823,23 +1171,6 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
         .map(|e| e.path())
         .flat_map(|p| if p.is_dir() { files_under(&p) } else { vec![p] })
         .collect()
-}
-
-/// Peak of one second of middle C on a fresh voice of `plugin_id`, loaded
-/// from `bundle` (never an installed copy elsewhere on the search paths).
-fn play_one_note(bundle: &Path, plugin_id: &str) -> anyhow::Result<f32> {
-    let rate = 48_000.0;
-    let (mut voice, main) = crate::host::ClapVoice::new_from_bundle(rate, bundle, plugin_id)?;
-    let mut buf = vec![0.0f32; 2 * 4800];
-    let mut peak = 0.0f32;
-    voice.note_on(60, 0.8);
-    for _ in 0..10 {
-        voice.render(&mut buf, crate::transport::Transport::default());
-        peak = buf.iter().fold(peak, |m, s| m.max(s.abs()));
-    }
-    voice.note_off(60);
-    main.retire(voice);
-    Ok(peak)
 }
 
 #[cfg(test)]
@@ -856,7 +1187,12 @@ mod tests {
             assert!(!e.about.is_empty(), "{} has an about text", e.id);
             assert!(!e.license.is_empty(), "{} names its licence", e.id);
             assert!(e.homepage.is_none_or(|h| h.starts_with("https://")), "{} homepage is https", e.id);
-            assert!(e.repo.contains('/'), "{} repo is owner/repo", e.id);
+            match e.source {
+                Source::GitHub(repo) => assert!(repo.split('/').count() == 2, "{} repo is owner/repo", e.id),
+                Source::Web(url) => assert!(url.starts_with("https://"), "{} source page is https", e.id),
+                Source::Closed => assert!(e.homepage.is_some(), "{} links at least its website", e.id),
+            }
+            assert!(e.data.is_none() || e.source.github().is_some(), "{} fetches its data folder from GitHub", e.id);
             assert!(!e.routes.is_empty(), "{} has an install route", e.id);
             for route in e.routes {
                 match *route {
@@ -866,9 +1202,10 @@ mod tests {
                         assert!(!build.is_empty(), "{} has build steps", e.id);
                         assert!(!artifact.is_empty(), "{} has an artifact", e.id);
                     }
-                    InstallRoute::Release { tag, asset, sha256, artifact, .. } => {
+                    InstallRoute::Release { tag, url, sha256, artifact, .. } => {
                         assert!(!tag.is_empty() && !artifact.is_empty(), "{} release", e.id);
-                        assert!(asset.ends_with(".zip") || asset.ends_with(".tar.gz"), "{} asset unpacks", e.id);
+                        assert!(url.starts_with("https://"), "{} downloads over https", e.id);
+                        assert!(url.ends_with(".zip") || url.ends_with(".tar.gz"), "{} asset unpacks", e.id);
                         assert!(sha256.len() == 64 && sha256.bytes().all(|b| b.is_ascii_hexdigit()), "{} sha256", e.id);
                     }
                 }
@@ -880,7 +1217,7 @@ mod tests {
                 e.id
             );
         }
-        assert_eq!(CATALOG.len(), 9);
+        assert_eq!(CATALOG.len(), 20);
         assert_eq!(CATALOG[0].id, "setbfree", "setBfree is first per the spec");
     }
 
@@ -951,7 +1288,7 @@ mod tests {
         let setbfree = find("setbfree").unwrap();
         let cmds = plan(setbfree, &setbfree.routes[0], Path::new("/c"), Path::new("/home/u"));
         assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].argv, vec!["sudo", "-n", "pacman", "-S", "--needed", "--noconfirm", "setbfree"]);
+        assert_eq!(cmds[0].argv, vec!["sudo", "-n", "pacman", "-S", "--needed", "--noconfirm", "setbfree-lv2"]);
         assert!(cmds[0].changes_system);
         assert!(cmds[0].cwd.is_none());
     }
@@ -986,36 +1323,24 @@ mod tests {
 
     #[test]
     fn release_plan_downloads_verifies_unpacks_and_copies() {
-        let odin = find("odin2").unwrap();
-        let release = route_for(odin, "x86_64").unwrap();
+        let aeolus = find("aeolus").unwrap();
+        let release = route_for(aeolus, "x86_64").unwrap();
         assert_eq!(release.kind(), "release", "x86_64 takes the prebuilt release");
-        let cmds = plan(odin, release, Path::new("/c"), Path::new("/home/u"));
+        let cmds = plan(aeolus, release, Path::new("/c"), Path::new("/home/u"));
         let argv: Vec<Vec<&str>> = cmds.iter().map(|c| c.argv.iter().map(String::as_str).collect()).collect();
-        assert_eq!(argv[0], ["rm", "-rf", "/c/odin2"]);
-        assert_eq!(argv[1], ["mkdir", "-p", "/c/odin2/unpacked"]);
+        assert_eq!(argv[0], ["rm", "-rf", "/c/aeolus"]);
+        assert_eq!(argv[1], ["mkdir", "-p", "/c/aeolus/unpacked"]);
         assert_eq!(
             argv[2],
-            ["curl", "-fL", "--retry", "2", "-o", "/c/odin2/Odin2.4.1Linux.zip",
-             "https://github.com/TheWaveWarden/odin2/releases/download/NightlyDevel/Odin2.4.1Linux.zip"]
+            ["curl", "-fL", "--retry", "2", "-o", "/c/aeolus/Aeolus-clap-linux-0.3.0.zip",
+             "https://github.com/Archie3d/aeolus_plugin/releases/download/v0.3.0/Aeolus-clap-linux-0.3.0.zip"]
         );
         assert_eq!(argv[3][..3], ["sh", "-c", r#"echo "$0  $1" | sha256sum -c -"#]);
-        assert_eq!(argv[3][3..], ["462c4fffda99ff91a6c362d8cf41616b50807778ae7a96471753046a799aed63", "/c/odin2/Odin2.4.1Linux.zip"]);
-        assert_eq!(argv[4], ["unzip", "-o", "-q", "/c/odin2/Odin2.4.1Linux.zip", "-d", "/c/odin2/unpacked"]);
+        assert_eq!(argv[3][3..], ["498170149337c7d2ce19783156522d3bf489f811c2a61b7323b64071882cc370", "/c/aeolus/Aeolus-clap-linux-0.3.0.zip"]);
+        assert_eq!(argv[4], ["unzip", "-o", "-q", "/c/aeolus/Aeolus-clap-linux-0.3.0.zip", "-d", "/c/aeolus/unpacked"]);
         assert_eq!(argv[5], ["mkdir", "-p", "/home/u/.clap"]);
-        assert_eq!(argv[6], ["cp", "-r", "/c/odin2/unpacked/Odin2.clap", "/home/u/.clap/"]);
-        // The factory patches the release zip does not carry.
-        assert_eq!(argv[7], ["rm", "-rf", "/c/odin2-data"]);
-        assert_eq!(
-            argv[8],
-            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "https://github.com/TheWaveWarden/odin2", "/c/odin2-data"]
-        );
-        assert_eq!(argv[9], ["git", "-C", "/c/odin2-data", "sparse-checkout", "set", "assets/Soundbanks/Factory Presets"]);
-        assert_eq!(argv[10], ["mkdir", "-p", "/home/u/.local/share/odin2/Soundbanks"]);
-        assert_eq!(
-            argv[11],
-            ["cp", "-r", "/c/odin2-data/assets/Soundbanks/Factory Presets", "/home/u/.local/share/odin2/Soundbanks/"]
-        );
-        assert_eq!(argv.len(), 12);
+        assert_eq!(argv[6], ["cp", "-r", "/c/aeolus/unpacked/Aeolus.clap", "/home/u/.clap/"]);
+        assert_eq!(argv.len(), 7);
         assert!(cmds.iter().all(|c| !c.changes_system && c.cwd.is_none()));
 
         let floe = find("floe").unwrap();
@@ -1026,27 +1351,69 @@ mod tests {
     }
 
     #[test]
-    fn each_machine_takes_the_first_route_that_runs_on_it() {
-        let odin = find("odin2").unwrap();
-        let arm = route_for(odin, "aarch64").unwrap();
-        assert_eq!(arm.kind(), "source", "aarch64 builds Odin 2 from source");
-        let cmds = plan(odin, arm, Path::new("/c"), Path::new("/home/u"));
-        assert!(cmds[1].argv.iter().any(|a| a == "--recurse-submodules"), "JUCE comes as a submodule");
-        assert_eq!(cmds[5].argv[2], "/c/odin2/build/Odin2_artefacts/Release/CLAP/Odin2.clap");
-        assert!(cmds.last().unwrap().argv[2].ends_with("assets/Soundbanks/Factory Presets"), "then the factory patches");
+    fn a_vendor_release_downloads_from_the_vendor_and_installs_only_on_its_cpu() {
+        let sb = find("starbreath").unwrap();
+        assert!(route_for(sb, "aarch64").is_none(), "Starbreath ships x86-64 Linux builds only");
+        let cmds = plan(sb, route_for(sb, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(
+            cmds[2].argv[5..],
+            ["/c/starbreath/Starbreath-v0.9.0-linux-x64.tar.gz", "https://vsti.im-a-bird.com/downloads/v0.9.0/Starbreath-v0.9.0-linux-x64.tar.gz"]
+        );
+        assert_eq!(cmds[3].argv[3], "74332886c1f2f8e4f58034ad4dda8de60ccca9f600f40b322463c9ebaabb585c");
+        assert_eq!(cmds[6].argv, ["cp", "-r", "/c/starbreath/unpacked/Starbreath.clap", "/home/u/.clap/"]);
+        let json = entry_json(sb, false, false);
+        assert_eq!(json["source_url"], serde_json::Value::Null, "closed freeware has no source link");
+        assert_eq!(json["installable_here"], std::env::consts::ARCH == "x86_64");
+    }
 
+    #[test]
+    fn a_source_off_github_is_linked_but_has_no_stars() {
+        let keys = find("ot-keys").unwrap();
+        assert_eq!(keys.source.url().as_deref(), Some("https://punklabs.com/ot-keys"));
+        assert_eq!(keys.source.github(), None, "the star fetch skips it");
+        assert_eq!(find("ob-xf").unwrap().source.github(), Some("surge-synthesizer/OB-Xf"));
+    }
+
+    #[test]
+    fn a_distro_card_also_fetches_its_data_folder() {
+        // Arch's Odin 2 package has no factory patches.
+        let odin = find("odin2").unwrap();
+        let cmds = plan(odin, route_for(odin, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        let argv: Vec<Vec<&str>> = cmds.iter().map(|c| c.argv.iter().map(String::as_str).collect()).collect();
+        assert_eq!(argv[0], ["sudo", "-n", "pacman", "-S", "--needed", "--noconfirm", "odin2-synthesizer-clap"]);
+        assert_eq!(argv[1], ["rm", "-rf", "/c/odin2-data"]);
+        assert_eq!(
+            argv[2],
+            ["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "https://github.com/TheWaveWarden/odin2", "/c/odin2-data"]
+        );
+        assert_eq!(argv[3], ["git", "-C", "/c/odin2-data", "sparse-checkout", "set", "assets/Soundbanks/Factory Presets"]);
+        assert_eq!(argv[4], ["mkdir", "-p", "/home/u/.local/share/odin2/Soundbanks"]);
+        assert_eq!(argv[5], ["cp", "-r", "/c/odin2-data/assets/Soundbanks/Factory Presets", "/home/u/.local/share/odin2/Soundbanks/"]);
+        assert_eq!(argv.len(), 6);
+        assert_eq!(cmds.iter().filter(|c| c.changes_system).count(), 1, "only pacman needs root");
+    }
+
+    #[test]
+    fn each_machine_takes_the_first_route_that_runs_on_it() {
         let floe = find("floe").unwrap();
         assert!(route_for(floe, "aarch64").is_none(), "Floe ships x86_64 Linux builds only");
         assert_eq!(route_for(find("dexed").unwrap(), "aarch64").unwrap().kind(), "distro");
 
         let aeolus = find("aeolus").unwrap();
-        let cmds = plan(aeolus, route_for(aeolus, "x86_64").unwrap(), Path::new("/c"), Path::new("/home/u"));
-        assert_eq!(cmds[4].argv, ["unzip", "-o", "-q", "/c/aeolus/Aeolus-clap-linux-0.3.0.zip", "-d", "/c/aeolus/unpacked"]);
-        assert_eq!(cmds[6].argv, ["cp", "-r", "/c/aeolus/unpacked/Aeolus.clap", "/home/u/.clap/"]);
         let cmds = plan(aeolus, route_for(aeolus, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
         assert!(cmds[1].argv.iter().any(|a| a == "--recurse-submodules"), "JUCE comes as a submodule");
         assert_eq!(cmds[3].argv, ["cmake", "--build", "build", "--target", "Aeolus_CLAP"]);
         assert_eq!(cmds[5].argv, ["cp", "-r", "/c/aeolus/build/Aeolus_artefacts/Release/CLAP/Aeolus.clap", "/home/u/.clap/"]);
+
+        let six = find("six-sines").unwrap();
+        assert_eq!(route_for(six, "x86_64").unwrap().kind(), "release");
+        assert_eq!(route_for(six, "aarch64").unwrap().kind(), "source", "no aarch64 release: built here");
+
+        let avl = find("avldrums").unwrap();
+        let cmds = plan(avl, route_for(avl, "aarch64").unwrap(), Path::new("/c"), Path::new("/home/u"));
+        assert_eq!(cmds[2].argv, ["make"]);
+        assert_eq!(cmds[3].argv, ["make", "install", "DESTDIR=out", "PREFIX=/usr"]);
+        assert_eq!(cmds[5].argv, ["cp", "-r", "/c/avldrums/out/usr/lib/lv2/avldrums.lv2", "/home/u/.lv2/"]);
     }
 
     #[test]

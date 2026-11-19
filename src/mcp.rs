@@ -1013,7 +1013,7 @@ fn parse_node_kind(args: &AddNodeArgs) -> Result<NodeKind, String> {
     match args.kind.to_ascii_lowercase().as_str() {
         "keys" => Ok(NodeKind::Keys),
         "clap" => Ok(NodeKind::Clap {
-            plugin_id: name_bytes(args.plugin_id.as_deref().unwrap_or(SURGE_ID)),
+            plugin_id: crate::control::ClapId::new(args.plugin_id.as_deref().unwrap_or(SURGE_ID)),
         }),
         "dsp" => {
             let dsp = args
@@ -1111,7 +1111,7 @@ fn graph_json(g: &Graph) -> Value {
             let kind = match &n.kind {
                 NodeKind::Keys => json!({"type": "keys"}),
                 NodeKind::Clap { plugin_id } => {
-                    json!({"type": "clap", "plugin_id": name_str(plugin_id)})
+                    json!({"type": "clap", "plugin_id": plugin_id.as_str()})
                 }
                 NodeKind::Dsp(k) => json!({"type": "dsp", "dsp": dsp_kind_str(k)}),
                 NodeKind::Lv2 { uri } => json!({"type": "lv2", "uri": uri.as_str()}),
@@ -3925,7 +3925,7 @@ mod tests {
         let mut g = Graph::default();
         g.reserve(8, 8);
         g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let surge = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
+        let surge = g.add_node(NodeKind::Clap { plugin_id: crate::control::ClapId::new(SURGE_ID) }, name_bytes("SURGE"));
         let organ = g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:organ") }, name_bytes("ORGAN"));
         g.add_node(NodeKind::Lv2 { uri: control::Lv2Uri::new("urn:test:reverb") }, name_bytes("VERB"));
         g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));

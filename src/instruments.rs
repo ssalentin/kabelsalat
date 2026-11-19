@@ -271,7 +271,7 @@ mod tests {
         assert_eq!(param_of(111), Some(organ::P_DRIVE));
         assert_eq!(b.len(), 12);
         assert!(b.iter().all(|x| x.target == CcTarget::Knob));
-        assert!(electro().bindings(&NodeKind::Clap { plugin_id: crate::control::name_bytes("org.surge-synth-team.surge-xt") }).is_empty());
+        assert!(electro().bindings(&NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") }).is_empty());
     }
 
     /// The values a control sends land on the organ's own steps, wherever in

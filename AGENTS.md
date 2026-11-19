@@ -1242,6 +1242,36 @@ Learned so far (2026-11-15, UI polish pass):
     plugin takes L (`a_stereo_effect_hears_left_and_right_apart`, real
     Carla Audio Gain, red before: right peak 0.50 from a left-only tone).
 
+168. **A plugin id is stored whole, never in a `Name`:** `Clap { plugin_id:
+    Name }` cut ids at 31 bytes, so Cardinal Synth
+    (`studio.kx.distrho.cardinal#synth`, 32) could never bind a voice, and
+    LSP's ids run to 55. CLAP ids are `ClapId` (128 bytes, saved as a
+    string; the old byte array still loads,
+    `a_session_saved_with_the_byte_array_id_still_loads`). Check the length
+    of a new plugin's real id (`kabelsalat scan-clap <bundle>`).
+169. **A catalog card's names come from the real package, and the test
+    fetches that package:** the Surge XT, Dexed and setBfree cards probed
+    for bundle names Arch never installs (`Surge XT.clap`, `Dexed.clap`,
+    `b_synth` without `.lv2`), so they read "not installed" unless the scan
+    had run. `catalog-install-test` downloads a distro card's package with
+    `pacman -Sp` (no root, nothing installed), unpacks it under `~/.cache`
+    and loads the card's first bundle from there; run it for every new or
+    changed card. Name the plugin package (`dexed-clap`), not a
+    metapackage that pulls in standalone and VST3 builds.
+170. **A plugin's output ports are as many as it declares:** the host
+    refused more than 8 (`[_; 8]` destructured for disjoint borrows), so
+    OneTrick CRYPTID (12 ports, one per drum) failed to load. Port buffers
+    are a `Vec` handed to clack with `iter_mut()`; only `main_out` is heard.
+171. **An LV2 lookup by URI matches the exact URI first:** `find_plugin`
+    took the first URI that *contains* the needle, so `…avldrums#BlondeBop`
+    resolved to `#BlondeBop` only because lilv happens to sort it before
+    `#BlondeBopHR`.
+172. **A sample player is tested in wall-clock time:** AVL Drumkits loads
+    its SoundFont on the LV2 worker thread, and a test that rendered as
+    fast as it could played the probe notes before any kit existed (peak
+    0.000 on all five kits). Render in real time until the worker is done
+    (`lv2_probe_chord` warms up for 3 s) before judging silence.
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs
@@ -1290,8 +1320,10 @@ Learned so far (2026-11-15, UI polish pass):
   delay compensation through the engine without plugins; Surge adds a note),
   `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
   (calls the listening model; prints rankings and latency),
-  `catalog-install-test [id...]`
-  (`./target/debug/kabelsalat <name>`; the last one downloads and builds).
+  `catalog-install-test [id...]` (downloads distro packages without
+  installing them, runs release and source routes in a scratch home, then
+  loads and plays every card; default: every card that is not a source build)
+  (`./target/debug/kabelsalat <name>`).
 - **Agent changes:** `kabelsalat agent-eval [--model <id>] [--runs N]
   [--task <name>] [--no-jev]` runs the in-app agent over 26 scripted requests
   (headless app, offline engine, real Surge voices, plus YANES and setBfree

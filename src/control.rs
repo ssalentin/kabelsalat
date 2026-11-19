@@ -70,6 +70,50 @@ impl<'de> Deserialize<'de> for Lv2Uri {
     }
 }
 
+/// A CLAP plugin id. Ids run past `Name`'s 31 bytes
+/// (`studio.kx.distrho.cardinal#synth` is 32, LSP's up to 55), so it is held
+/// in 128 bytes like [`Lv2Uri`] and saved as a string. Sessions saved before
+/// hold the id as a 32-byte array; both forms load.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ClapId([u8; 128]);
+
+impl ClapId {
+    pub fn new(s: &str) -> Self {
+        Self(Lv2Uri::new(s).0)
+    }
+    pub fn as_str(&self) -> &str {
+        let end = self.0.iter().position(|&c| c == 0).unwrap_or(self.0.len());
+        std::str::from_utf8(&self.0[..end]).unwrap_or("")
+    }
+}
+
+impl std::fmt::Debug for ClapId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ClapId({})", self.as_str())
+    }
+}
+
+impl Serialize for ClapId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ClapId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Saved {
+            Text(String),
+            Bytes(Name),
+        }
+        Ok(match Saved::deserialize(d)? {
+            Saved::Text(s) => ClapId::new(&s),
+            Saved::Bytes(n) => ClapId::new(name_str(&n)),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DspKind {
     Gain,
@@ -173,7 +217,7 @@ pub enum NodeKind {
     /// MIDI source: the computer keyboard (on-screen + laptop), hardware MIDI.
     Keys,
     /// Hosted CLAP plugin (e.g. Surge XT).
-    Clap { plugin_id: Name },
+    Clap { plugin_id: ClapId },
     /// Built-in processing node.
     Dsp(DspKind),
     /// Hosted LV2 plugin (audio effect), identified by URI.
@@ -670,13 +714,13 @@ impl Graph {
         g.reserve(64, 256);
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let surge_a = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: ClapId::new("org.surge-synth-team.surge-xt") },
             name_bytes("SURGE A"),
         );
         let delay_a = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY A"));
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
         let surge_b = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: ClapId::new("org.surge-synth-team.surge-xt") },
             name_bytes("SURGE B"),
         );
         let delay_b = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY B"));
@@ -793,7 +837,7 @@ pub fn bind_voices(graph: &Graph, voices: &[(u64, &str)]) -> Vec<(NodeId, Option
         .nodes
         .iter()
         .filter_map(|n| match &n.kind {
-            NodeKind::Clap { plugin_id } => Some((n.id, clap_plugin_key(name_str(plugin_id)))),
+            NodeKind::Clap { plugin_id } => Some((n.id, clap_plugin_key(plugin_id.as_str()))),
             _ => None,
         })
         .map(|(node, key)| {
@@ -817,7 +861,7 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
     if with_synth {
         let synth = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes(SURGE_PLUGIN_ID) },
+            NodeKind::Clap { plugin_id: ClapId::new(SURGE_PLUGIN_ID) },
             name_bytes("SURGE"),
         );
         g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
@@ -830,7 +874,7 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
 /// A rig around one CLAP instrument: Keys → plugin → Master (MIDI + stereo
 /// L/R). `name` labels the synth unit.
 pub fn plugin_rig_graph(plugin_id: &str, name: &str) -> Graph {
-    instrument_rig_graph(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name)
+    instrument_rig_graph(NodeKind::Clap { plugin_id: ClapId::new(plugin_id) }, name)
 }
 
 /// Single-instrument rig for any instrument node (CLAP or LV2): Keys →
@@ -1216,6 +1260,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_clap_id_longer_than_a_name_reaches_its_voice_whole() {
+        let cardinal = "studio.kx.distrho.cardinal#synth"; // 32 bytes
+        let g = plugin_rig_graph(cardinal, "Cardinal");
+        let back: Graph = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        let voices = [(7, cardinal)];
+        assert!(bind_voices(&back, &voices).iter().any(|&(_, v)| v == Some(7)), "the saved graph binds Cardinal's voice");
+    }
+
+    #[test]
+    fn a_session_saved_with_the_byte_array_id_still_loads() {
+        // The shape of `~/kabelsalat-sessions/Default.ksalat/session.json`
+        // before ids were saved as strings.
+        let mut saved = serde_json::json!({ "Clap": { "plugin_id": name_bytes("com.digital-suburban.dexed") } });
+        let kind: NodeKind = serde_json::from_value(saved.take()).unwrap();
+        assert_eq!(kind, NodeKind::Clap { plugin_id: ClapId::new("com.digital-suburban.dexed") });
+        let now = serde_json::to_value(&kind).unwrap();
+        assert_eq!(now, serde_json::json!({ "Clap": { "plugin_id": "com.digital-suburban.dexed" } }));
+    }
+
+    #[test]
     fn an_instrument_is_wired_into_its_own_rig_with_fresh_ids() {
         let rigs = [Rig::new("A", standard_rig_graph(false), None), Rig::new("B", standard_rig_graph(true), None)];
         let mut g = merge_rigs(&rigs);
@@ -1235,7 +1299,7 @@ mod tests {
     #[test]
     fn voices_bind_in_graph_order_lowest_free_id_of_the_nodes_plugin() {
         let mut g = Graph::default();
-        let clap = |id: &str| NodeKind::Clap { plugin_id: name_bytes(id) };
+        let clap = |id: &str| NodeKind::Clap { plugin_id: ClapId::new(id) };
         let a = g.add_node(clap(SURGE_PLUGIN_ID), name_bytes("A"));
         g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let dexed = g.add_node(clap("dexed"), name_bytes("D"));
@@ -1410,7 +1474,7 @@ mod tests {
         let mut g = Graph::default();
         let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
         let synth = g.add_node(
-            NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") },
+            NodeKind::Clap { plugin_id: ClapId::new("org.surge-synth-team.surge-xt") },
             name_bytes("SYNTH"),
         );
         let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));

@@ -758,6 +758,29 @@ fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &str) -> bool 
     }
 }
 
+/// Where distributions keep the Noto fonts: Arch (`noto-fonts`),
+/// Debian/Ubuntu (`fonts-noto-core`), Fedora (`google-noto-*`).
+const NOTO_DIRS: [&str; 4] = [
+    "/usr/share/fonts/noto",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/opentype/noto",
+    "/usr/share/fonts/google-noto",
+];
+
+/// Load `file` from the first Noto directory that has it.
+fn load_noto(fonts: &mut egui::FontDefinitions, name: &str, file: &str) -> bool {
+    NOTO_DIRS.iter().any(|dir| load_font(fonts, name, &format!("{dir}/{file}")))
+}
+
+/// Symbol faces behind Noto Sans, which has none of the UI's arrows,
+/// shapes and marks (○ ● ◐ ▶ ✓ ← ⏎ ★ …; rule 170). Together they cover every
+/// symbol the UI writes (`every_ui_symbol_has_a_glyph`).
+const SYMBOL_FONTS: [(&str, &str); 3] = [
+    ("noto-symbols2", "NotoSansSymbols2-Regular.ttf"),
+    ("noto-math", "NotoSansMath-Regular.ttf"),
+    ("noto-symbols", "NotoSansSymbols-Regular.ttf"),
+];
+
 /// Install the Hurricane typefaces. Missing files degrade gracefully to the
 /// egui defaults (the app must never fail to start over a font).
 /// Global breathing room for plain egui buttons / drag values (rule 7):
@@ -771,25 +794,41 @@ pub fn install_spacing(ctx: &egui::Context) {
 
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    let reg = load_font(&mut fonts, "noto", "/usr/share/fonts/noto/NotoSans-Regular.ttf");
-    let med = load_font(&mut fonts, "noto-medium", "/usr/share/fonts/noto/NotoSans-Medium.ttf");
-    let bold = load_font(&mut fonts, "noto-bold", "/usr/share/fonts/noto/NotoSans-Bold.ttf");
+    let reg = load_noto(&mut fonts, "noto", "NotoSans-Regular.ttf");
+    let med = load_noto(&mut fonts, "noto-medium", "NotoSans-Medium.ttf");
+    let bold = load_noto(&mut fonts, "noto-bold", "NotoSans-Bold.ttf");
     let mono = load_font(&mut fonts, "jbmono", "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf");
+    let symbols: Vec<String> = SYMBOL_FONTS
+        .iter()
+        .filter(|(name, file)| load_noto(&mut fonts, name, file))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    // egui's bundled faces stay last in every family, behind the symbols.
+    let egui_fallback = fonts.families[&FontFamily::Proportional].clone();
+    let family = |first: &[&str]| -> Vec<String> {
+        first.iter().map(|s| s.to_string())
+            .chain(symbols.iter().cloned())
+            .chain(egui_fallback.iter().cloned())
+            .collect()
+    };
     if reg {
-        fonts.families.get_mut(&FontFamily::Proportional).unwrap().insert(0, "noto".into());
+        fonts.families.insert(FontFamily::Proportional, family(&["noto"]));
+    } else {
+        fonts.families.insert(FontFamily::Proportional, family(&[]));
     }
-    if mono {
-        fonts.families.get_mut(&FontFamily::Monospace).unwrap().insert(0, "jbmono".into());
-    }
+    let mono_fallback = fonts.families[&FontFamily::Monospace].clone();
+    let mono_first: Vec<String> = if mono { vec!["jbmono".into()] } else { Vec::new() };
+    fonts.families.insert(
+        FontFamily::Monospace,
+        mono_first.into_iter().chain(symbols.iter().cloned()).chain(mono_fallback).collect(),
+    );
     if bold {
-        let mut fam = vec!["noto-bold".to_owned()];
-        if reg { fam.push("noto".into()); }
+        let fam = if reg { family(&["noto-bold", "noto"]) } else { family(&["noto-bold"]) };
         fonts.families.insert(FontFamily::Name("bold".into()), fam);
         BOLD_INSTALLED.store(true, Ordering::Relaxed);
     }
     if med {
-        let mut fam = vec!["noto-medium".to_owned()];
-        if reg { fam.push("noto".into()); }
+        let fam = if reg { family(&["noto-medium", "noto"]) } else { family(&["noto-medium"]) };
         fonts.families.insert(FontFamily::Name("medium".into()), fam);
         MEDIUM_INSTALLED.store(true, Ordering::Relaxed);
     }
@@ -1051,6 +1090,92 @@ fn show_dropdown_popup<'a>(
                     add_contents(&mut menu);
                 });
         });
+}
+
+#[cfg(test)]
+mod font_coverage_tests {
+    use super::*;
+
+    /// Every non-ASCII character in a string or char literal of `src`
+    /// (comments skipped), with the line it was first seen on.
+    fn literal_symbols(src: &str) -> Vec<(char, usize)> {
+        let mut out: Vec<(char, usize)> = Vec::new();
+        let mut add = |c: char, line: usize| {
+            if !c.is_ascii() && !out.iter().any(|(o, _)| *o == c) { out.push((c, line)); }
+        };
+        let b: Vec<char> = src.chars().collect();
+        let (mut i, mut line) = (0, 1);
+        while i < b.len() {
+            let c = b[i];
+            if c == '\n' { line += 1; i += 1; continue; }
+            if c == '/' && b.get(i + 1) == Some(&'/') {
+                while i < b.len() && b[i] != '\n' { i += 1; }
+                continue;
+            }
+            if c == '"' {
+                i += 1;
+                while i < b.len() && b[i] != '"' {
+                    if b[i] == '\\' { i += 1; } else if b[i] == '\n' { line += 1; } else { add(b[i], line); }
+                    i += 1;
+                }
+                i += 1;
+                continue;
+            }
+            // A char literal of one non-ASCII character ('●'); lifetimes never match.
+            if c == '\'' && b.get(i + 2) == Some(&'\'') {
+                add(b[i + 1], line);
+                i += 3;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn literal_symbols_reads_strings_and_chars_but_not_comments() {
+        let src = "// ◧ comment\nlet a = \"● REC\"; let b = '✓'; fn f<'a>(x: &'a str) {}\n";
+        let got: Vec<char> = literal_symbols(src).into_iter().map(|(c, _)| c).collect();
+        assert_eq!(got, vec!['●', '✓']);
+    }
+
+    /// The UI's symbols (○ ● ◐ ▶ ✓ ← ⏎ ★ …) were boxes: Noto Sans has none
+    /// of them and egui's bundled faces only some (rule 170). With the
+    /// symbol faces installed, every one has a glyph in the regular, medium
+    /// and monospace families. Runs wherever the Noto fonts are installed
+    /// (CI installs `fonts-noto-core`); CI fails without them.
+    #[test]
+    fn every_ui_symbol_has_a_glyph() {
+        let missing_files: Vec<&str> = std::iter::once("NotoSans-Regular.ttf")
+            .chain(SYMBOL_FONTS.iter().map(|(_, f)| *f))
+            .filter(|f| !NOTO_DIRS.iter().any(|d| std::path::Path::new(d).join(f).exists()))
+            .collect();
+        if !missing_files.is_empty() {
+            assert!(std::env::var_os("CI").is_none(), "CI must install the Noto fonts: missing {missing_files:?}");
+            eprintln!("skipped: Noto fonts not installed ({missing_files:?})");
+            return;
+        }
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear(); // rule 11
+        let mut missing = Vec::new();
+        for (file, src) in [
+            ("ui.rs", include_str!("ui.rs")),
+            ("theme.rs", include_str!("theme.rs")),
+            ("preview.rs", include_str!("preview.rs")),
+            ("rope.rs", include_str!("rope.rs")),
+        ] {
+            for (c, line) in literal_symbols(src) {
+                for font in [FontId::proportional(12.0), medium_font(12.0), FontId::monospace(12.0)] {
+                    if !ctx.fonts_mut(|f| f.has_glyph(&font, c)) {
+                        missing.push(format!("{c} U+{:04X} ({file}:{line}, {:?})", c as u32, font.family));
+                    }
+                }
+            }
+        }
+        assert!(missing.is_empty(), "symbols without a glyph:\n{}", missing.join("\n"));
+    }
 }
 
 #[cfg(test)]

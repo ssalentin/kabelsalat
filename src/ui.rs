@@ -5633,7 +5633,7 @@ impl DemoApp {
     }
 
     fn sessions_dir() -> std::path::PathBuf {
-        // Tests never read or write the user's sessions (rule 37, 167).
+        // Tests never read or write the user's sessions (rule 37, 169).
         #[cfg(test)]
         let dir = std::env::temp_dir().join(format!("kabelsalat-test-sessions-{}", std::process::id()));
         #[cfg(not(test))]
@@ -33592,6 +33592,8 @@ mod offline_shots {
     /// that frame's font atlas, and this fresh context draws them as glyph soup.
     pub(super) fn shot(app: &mut DemoApp, size: Vec2, path: &std::path::Path) {
         let ctx = egui::Context::default();
+        // The real app's faces (Noto + symbol fallbacks), not egui's defaults.
+        theme::install_fonts(&ctx);
         let mut tex = Textures::default();
         let mut last = None;
         for i in 0..5 {

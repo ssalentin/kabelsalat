@@ -822,7 +822,7 @@ Learned so far (2026-11-15, UI polish pass):
     window sizes × three docks; `face_layout_tests` audits faces at the same
     sizes. See the result without the desktop:
     `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat window_size_shots -- --ignored`
-    (CPU-rasterized real frames; symbol glyphs the test fonts lack show as boxes).
+    (CPU-rasterized real frames, drawn with the app's fonts).
 125. **UI scale follows the monitor the window is on:** the launch-time
     focused monitor's scale ran a window on the 1.0x external screen at the
     laptop's 1.6x (a 1368 px window laid out as 855 px). As a native Wayland
@@ -1196,11 +1196,21 @@ Learned so far (2026-11-15, UI polish pass):
     stacking a row onto it
     (`the_midi_strip_leaves_the_keys_the_dock_height`).
 
-167. **Tests never list or write the user's sessions:** `sessions_dir()`
+169. **Tests never list or write the user's sessions:** `sessions_dir()`
     pointed at `~/kabelsalat-sessions` in tests too, so the session popover
     and Library of every headless shot listed the user's real session names,
     and a test autosave would have written there. Under `cfg(test)` it is a
     per-process temp dir; check any new path helper the same way (rule 37).
+
+170. **Every symbol the UI writes has a glyph:** Noto Sans has none of the
+    arrows, shapes and marks the UI uses (○ ● ◐ ▶ ✓ ← ⏎ ★ …), and egui's
+    bundled faces only some, so the REC button and others showed boxes in
+    the app and in headless shots (which also skipped the app's fonts).
+    `install_fonts` puts Noto Sans Symbols 2, Math and Symbols behind Noto
+    Sans in every family, `offline_shots::shot` installs them, and CI
+    installs `fonts-noto-core`. A new symbol must pass
+    `every_ui_symbol_has_a_glyph`; if no installed face has it, add a face
+    to `SYMBOL_FONTS`, never paint a box.
 
 ## Working on kabelsalat
 

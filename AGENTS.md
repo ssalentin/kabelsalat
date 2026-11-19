@@ -1182,6 +1182,14 @@ Learned so far (2026-11-15, UI polish pass):
     sent into it (`pdc::compensation` takes the sends), and a send that
     starts or stops sounding replans
     (`a_bus_return_meets_the_dry_rig_in_phase`).
+167. **A new row in a sized panel brings its own height, or goes beside:**
+    the keyboard dock's MIDI strip (#101) took a 56 pt row out of a dock
+    sized for header + keys (20 % of the window), so the keys shrank from
+    146 to 86 pt and only the minimum was raised. When a panel gains an
+    element, check what the panel's size formula budgets; put controls
+    where there is room (header row, beside the main content) before
+    stacking a row onto it
+    (`the_midi_strip_leaves_the_keys_the_dock_height`).
 
 ## Working on kabelsalat
 

@@ -1196,6 +1196,12 @@ Learned so far (2026-11-15, UI polish pass):
     stacking a row onto it
     (`the_midi_strip_leaves_the_keys_the_dock_height`).
 
+167. **Tests never list or write the user's sessions:** `sessions_dir()`
+    pointed at `~/kabelsalat-sessions` in tests too, so the session popover
+    and Library of every headless shot listed the user's real session names,
+    and a test autosave would have written there. Under `cfg(test)` it is a
+    per-process temp dir; check any new path helper the same way (rule 37).
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

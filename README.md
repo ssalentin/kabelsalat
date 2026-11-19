@@ -133,12 +133,22 @@ sound back to the system's output. The assistant and MCP agents do the same
 
 <p align="center"><img src="docs/shots/system-audio.png" width="85%" alt="The mixer with a System audio section: a Firefox strip turned down and a muted Spotify strip, each with a meter, beside Master out with the MOTU M2 chosen as the output"/></p>
 
-### Navigate rigs, channels and plugins
-Press **Q** (or click **Navigator** in the top bar) to open the right-hand
-Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see
-every rig's channels in their mixer colours and unfold their plugin chains
-(**CLAP**, **LV2** and **built-in**). Clicking an entry switches to that rig
-and selects the unit in the rack or scrolls and flashes its strip in the mixer.
+### Navigate rigs, sessions and plugins
+One top bar holds the session, the rigs and the views. The **session pill**
+on the left (`● Untitled ▾`, teal once saved) opens a small popover to save,
+load or delete sessions and start from a template (**Ctrl+O**). While the
+left rail is closed, the bar shows the rigs as compact pills: the active one
+as `1 · Lead` with a live level bar, the others as numbers with an activity
+dot, and **+** adds a rig.
+
+Press **Q** (or the rail button left of the session pill) to open the
+**left rail**. Its **Rigs** tab lists every rig with its MIDI input, level and
+a **⋯** menu (rename, save as or replace from a rig preset, MIDI input, delete), its channels in their mixer
+colours and their plugin chains (**CLAP**, **LV2** and **built-in**); filter
+with **ALL**, **CHANNELS** and **PLUGINS**. Clicking an entry switches to that
+rig and selects the unit in the rack or scrolls and flashes its strip in the
+mixer. The **Library** tab keeps sessions, rig presets and starter templates
+in one place.
 
 ### Keep an eye on the engine
 Beside your rigs, **DSP** shows how much of each audio buffer the engine needs

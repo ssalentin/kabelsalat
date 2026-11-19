@@ -1748,6 +1748,80 @@ pub fn run_preset_test() -> Result<()> {
     Ok(())
 }
 
+/// `kabelsalat state-race-test [seconds] [patch.fxp...]`: the two ways the
+/// host crashed Surge XT (#29), on the installed plugin. A crash ends the
+/// process with its signal, so reaching the end is the pass.
+///
+/// 1. A parameter event whose id the plugin does not have. Surge
+///    dereferences the parameter it did not find, inside `process()`.
+/// 2. States saved on the main thread while the render thread applies the
+///    state loaded just before. Surge applies a load inside `process()` and
+///    its save reads the patch without a lock.
+///
+/// Without patch files the first installed factory patches are used.
+pub fn run_state_race_test(seconds: u64, patches: &[PathBuf]) -> Result<()> {
+    let mut states = Vec::new();
+    let paths: Vec<PathBuf> = if patches.is_empty() {
+        list_surge_patches().into_iter().step_by(97).take(6).map(|p| p.path).collect()
+    } else {
+        patches.to_vec()
+    };
+    for path in &paths {
+        states.push(fxp_to_state(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)?);
+    }
+    anyhow::ensure!(states.len() >= 2, "state-race-test needs two Surge patches (installed, or as arguments)");
+    let (mut voice, mut main) = ClapVoice::new(48_000.0)?;
+    let ctl = voice.controller();
+    let known: Vec<u32> = main.param_list().iter().map(|p| p.id).collect();
+    let unknown = (0xDEAD_0000u32..).find(|id| !known.contains(id)).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let render = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let mut buf = [0.0f32; BLOCK * 2];
+            let (mut blocks, mut peak) = (0u64, 0.0f32);
+            while !stop.load(Ordering::SeqCst) {
+                voice.render(&mut buf, Transport::default());
+                peak = buf.iter().fold(peak, |p, x| p.max(x.abs()));
+                blocks += 1;
+            }
+            (voice, blocks, peak)
+        }
+    });
+    for key in [48, 55, 60, 64] {
+        ctl.note_on(key, 0.9);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    ctl.set_param(ClapId::new(unknown), 0.5);
+    std::thread::sleep(Duration::from_millis(50));
+    println!("1. a parameter event with the unknown id {unknown:#x} was rendered");
+
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let (mut loads, mut saves) = (0u64, 0u64);
+    while Instant::now() < end {
+        main.load_state(&states[loads as usize % states.len()])?;
+        loads += 1;
+        // Saves land before, inside and after the block that applies the load.
+        for pause_us in [0, 150, 700] {
+            std::thread::sleep(Duration::from_micros(pause_us));
+            anyhow::ensure!(!main.save_state()?.is_empty(), "an empty state");
+            saves += 1;
+        }
+        for key in [48, 55, 60, 64] {
+            ctl.note_on(key, 0.9);
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (voice, blocks, peak) = render.join().map_err(|_| anyhow!("the render thread panicked"))?;
+    println!("2. {loads} loads and {saves} saves against {blocks} rendered blocks (peak {peak:.3})");
+    anyhow::ensure!(voice.process_errors() == 0, "process() reported {} errors", voice.process_errors());
+    anyhow::ensure!(peak > 1e-3, "the voice stayed silent: nothing was rendered between the loads");
+    main.retire(voice);
+    println!("state-race-test: OK");
+    Ok(())
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct DexedPatch {
     pub bank: String,

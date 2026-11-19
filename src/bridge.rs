@@ -86,8 +86,36 @@ const PAUSED_MSG: &str = "external agents are paused in the kabelsalat app — t
 /// snapshots the rack for agent undo while the engine has not seen the edit.
 pub const BEFORE_REMOTE_EDIT: &str = "__before_remote_edit";
 
-/// Output buffer size in frames (shared with the audio setup in `ui`).
+/// Default output buffer size in frames (shared with the audio setup in `ui`).
 pub const BUFFER_FRAMES: u32 = 256;
+/// Selectable output buffer sizes in frames (powers of two: 1.3 ms..42.7 ms @ 48 kHz).
+pub const BUFFER_SIZE_CHOICES: &[u32] = &[64, 128, 256, 512, 1024, 2048];
+/// Configured output buffer size in frames (updated when the user picks a new size).
+pub static CONFIGURED_BUFFER_FRAMES: AtomicU32 = AtomicU32::new(BUFFER_FRAMES);
+
+pub fn valid_buffer_frames(frames: u32) -> bool {
+    BUFFER_SIZE_CHOICES.contains(&frames)
+}
+
+pub fn configured_buffer_frames() -> u32 {
+    let f = CONFIGURED_BUFFER_FRAMES.load(Ordering::Relaxed);
+    if f > 0 { f } else { BUFFER_FRAMES }
+}
+
+pub fn set_configured_buffer_frames(frames: u32) {
+    CONFIGURED_BUFFER_FRAMES.store(frames, Ordering::Relaxed);
+}
+
+/// Step to the next smaller (`delta < 0`) or larger (`delta > 0`) buffer size choice.
+pub fn step_buffer_frames(current: u32, delta: i32) -> Option<u32> {
+    if delta < 0 {
+        BUFFER_SIZE_CHOICES.iter().copied().rev().find(|&f| f < current)
+    } else if delta > 0 {
+        BUFFER_SIZE_CHOICES.iter().copied().find(|&f| f > current)
+    } else {
+        None
+    }
+}
 /// Count of audio stream errors / xruns reported by cpal since startup.
 pub static XRUNS: AtomicU32 = AtomicU32::new(0);
 /// The output stream's sample rate in Hz (0 = no audio yet).
@@ -433,8 +461,8 @@ fn handle_line_with_pub(
                     "count_in_bars": tp.count_in_bars,
                     "record_sync": tp.record_sync,
                     "bpm": tp.bpm,
-                    "buffer_frames": BUFFER_FRAMES,
-                    "buffer_latency_ms": BUFFER_FRAMES as f64 / sample_rate * 1000.0,
+                    "buffer_frames": c.buffer_frames(),
+                    "buffer_latency_ms": c.buffer_frames() as f64 / sample_rate * 1000.0,
                     "xruns": c.xruns,
                     "render_max_us": c.render_max_us,
                     "render_frames": c.callback_frames,
@@ -746,5 +774,23 @@ mod tests {
         assert!(refused_while_paused(&json!({"op": "ui", "tool": "add_rig", "args": {}})));
         assert!(!refused_while_paused(&json!({"op": "ui", "tool": "list_sounds"})));
         assert!(!refused_while_paused(&json!({"op": "query", "name": "get_graph"})));
+    }
+
+    #[test]
+    fn buffer_size_choices_step_and_validate() {
+        assert!(valid_buffer_frames(64));
+        assert!(valid_buffer_frames(256));
+        assert!(valid_buffer_frames(2048));
+        assert!(!valid_buffer_frames(0));
+        assert!(!valid_buffer_frames(100));
+        assert_eq!(step_buffer_frames(64, -1), None);
+        assert_eq!(step_buffer_frames(64, 1), Some(128));
+        assert_eq!(step_buffer_frames(256, -1), Some(128));
+        assert_eq!(step_buffer_frames(256, 1), Some(512));
+        assert_eq!(step_buffer_frames(2048, 1), None);
+        assert_eq!(step_buffer_frames(2048, -1), Some(1024));
+        // Non-standard value snaps to nearest strictly smaller/larger choice.
+        assert_eq!(step_buffer_frames(300, -1), Some(256));
+        assert_eq!(step_buffer_frames(300, 1), Some(512));
     }
 }

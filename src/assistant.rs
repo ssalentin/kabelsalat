@@ -165,6 +165,37 @@ pub fn save_session_autosave(on: bool) -> std::io::Result<()> {
     save_config_values_to(&config_path(), &[("session_autosave", json!(on))])
 }
 
+/// Load persisted `audio_buffer_frames` from `path` (default `bridge::BUFFER_FRAMES`).
+pub fn load_buffer_frames_from(path: &std::path::Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("audio_buffer_frames").and_then(Value::as_u64))
+        .map(|n| n as u32)
+        .filter(|&n| crate::bridge::valid_buffer_frames(n))
+        .unwrap_or(crate::bridge::BUFFER_FRAMES)
+}
+
+pub fn save_buffer_frames_to(path: &std::path::Path, frames: u32) -> std::io::Result<()> {
+    let frames = if crate::bridge::valid_buffer_frames(frames) {
+        frames
+    } else {
+        crate::bridge::BUFFER_FRAMES
+    };
+    save_config_values_to(path, &[("audio_buffer_frames", json!(frames))])
+}
+
+/// Persisted `audio_buffer_frames` in config.json (default 256, test-safe under cfg(test), rule 37).
+pub fn load_buffer_frames() -> u32 {
+    if cfg!(test) { return crate::bridge::BUFFER_FRAMES; }
+    load_buffer_frames_from(&config_path())
+}
+
+pub fn save_buffer_frames(frames: u32) -> std::io::Result<()> {
+    if cfg!(test) { return Ok(()); }
+    save_buffer_frames_to(&config_path(), frames)
+}
+
 #[derive(Clone)]
 pub struct ChatLine {
     pub role: String,
@@ -642,7 +673,9 @@ fn system_prompt() -> String {
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
      get_master_target (the master's loudness target with loudness before and after), \
      get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
-     \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima).\n\
+     \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima; \
+     set_buffer_size changes the audio buffer size in frames live — smaller for lower latency, \
+     larger to stop dropouts/xruns).\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
      it 0-10 on the words you pass as attributes (take them from the user's request: \
      \"8-bit\", \"heroic\", \"warm\"), says what it heard and how to move toward them. \
@@ -752,6 +785,11 @@ pub(crate) fn tools() -> Value {
             "name":"reset_engine_peaks",
             "description":"Start the engine's peak counters again from now: render_max_us, late_blocks, xruns and every unit's max_us (the Engine Info panel's Reset peaks button). Averages are not touched.",
             "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_buffer_size",
+            "description":"Change the audio output buffer size in frames (64, 128, 256, 512, 1024, or 2048). Smaller reduces latency; larger gives more headroom against audio dropouts (xruns/overruns). Applies live by reopening the audio stream without losing the rack, and is remembered across restarts.",
+            "parameters":{"type":"object","properties":{"frames":{"type":"integer","enum":[64,128,256,512,1024,2048]}},"required":["frames"]}
         }},
         {"type":"function","function":{
             "name":"measure_mix",
@@ -2921,5 +2959,23 @@ mod tests {
         a.remove_api_key(Endpoint::OpenRouter).unwrap();
         assert!(!a.keys().openrouter);
         assert!(!a.key_set);
+    }
+
+    #[test]
+    fn buffer_frames_persists_to_config_and_rejects_invalid_values() {
+        let dir = std::env::temp_dir().join(format!("ksalat-buf-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+
+        assert_eq!(load_buffer_frames_from(&p), crate::bridge::BUFFER_FRAMES);
+        save_buffer_frames_to(&p, 512).unwrap();
+        assert_eq!(load_buffer_frames_from(&p), 512);
+        save_buffer_frames_to(&p, 128).unwrap();
+        assert_eq!(load_buffer_frames_from(&p), 128);
+        // Invalid config values fall back to default.
+        std::fs::write(&p, r#"{"audio_buffer_frames": 300}"#).unwrap();
+        assert_eq!(load_buffer_frames_from(&p), crate::bridge::BUFFER_FRAMES);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

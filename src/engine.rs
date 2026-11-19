@@ -492,7 +492,7 @@ pub struct AudioInSlot {
 
 impl AudioInSlot {
     fn new(node: NodeId, channels: AudioInChannel, device: Option<String>) -> Self {
-        let block = crate::bridge::BUFFER_FRAMES as usize * 2;
+        let block = crate::bridge::configured_buffer_frames() as usize * 2;
         Self {
             node,
             channels,
@@ -4001,6 +4001,7 @@ impl GraphEngine {
             // A backlog (capture ahead of its consumer) is cut to the target
             // fill in one go; the ring holds interleaved stereo, so every
             // discard is a whole frame (one sample would swap L and R).
+            s.drift = crate::audio_in::Drift::new(n2.max(2));
             let backlog = s.drift.catch_up(consumer.slots());
             if backlog > 0 {
                 for _ in 0..backlog {

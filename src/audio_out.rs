@@ -143,6 +143,9 @@ pub fn stream_level(levels: &StreamLevels, index: u64) -> f32 {
 pub enum StreamCmd {
     Volume(u64, f32),
     Mute(u64, bool),
+    /// Wake the scan thread to re-apply our chosen output sink right away
+    /// (e.g. after reopening the audio stream at a new buffer size).
+    Resync,
 }
 
 /// What the scan thread last saw: every output, the sink our stream
@@ -190,6 +193,7 @@ pub fn apply_stream_cmds(cmds: Vec<StreamCmd>) {
                 let _ = std::process::Command::new("pactl")
                     .args(["set-sink-input-mute", &i.to_string(), if m { "1" } else { "0" }]).status();
             }
+            StreamCmd::Resync => {}
         }
     }
     for (i, v) in last_vol {

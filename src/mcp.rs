@@ -547,10 +547,12 @@ struct SetCcMapArgs {
     cc: u8,
     /// Parameter id on the destination node; omit/null to remove the binding (unless `knob` is set).
     param: Option<u32>,
-    /// Target parameter space: "plugin" (default, CLAP/LV2/DSP native) or "knob" (rack unit knob / SetParam).
+    /// Target parameter space: "plugin" (default, CLAP/LV2/DSP native), "knob" (rack unit knob / SetParam) or "mix" (mixer control, see `mix`).
     target: Option<String>,
     /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
     knob: Option<String>,
+    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo". On a rig's Master out node it is that rig's bus; on a source node the source strip's pan, mute or solo. Resolves `param` + `target` ("mix").
+    mix: Option<String>,
     /// Lowest parameter value the controller reaches (0..1, default 0).
     min: Option<f32>,
     /// Highest parameter value the controller reaches (0..1, default 1), e.g. 0.6 so a pedal never pushes drive past 60 %.
@@ -566,10 +568,12 @@ struct ClearCcMapArgs {
     source: String,
     /// Optional CC number (0..=127); omit to clear all bindings on this rule (or matching `target`/`knob`).
     cc: Option<u8>,
-    /// Optional target filter ("plugin" | "knob") when `cc` is omitted.
+    /// Optional target filter ("plugin" | "knob" | "mix") when `cc` is omitted.
     target: Option<String>,
     /// Optional rack knob label when `cc` is omitted.
     knob: Option<String>,
+    /// Optional mixer control ("vol" | "pan" | "mute" | "solo") when `cc` is omitted.
+    mix: Option<String>,
 }
 
 /// Arguments for `list_cc_maps`.
@@ -603,6 +607,8 @@ struct LearnCcArgs {
     target: Option<String>,
     /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
     knob: Option<String>,
+    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo" (rig bus on a Master out node, source strip elsewhere).
+    mix: Option<String>,
     /// Set true to cancel any armed MIDI-learn instead of arming.
     cancel: Option<bool>,
 }
@@ -1912,13 +1918,15 @@ impl McpServer {
     }
 
     fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
-        match target.map(str::trim).map(str::to_lowercase).as_deref() {
-            None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => {
-                Ok(crate::matrix::CcTarget::PluginParam)
-            }
-            Some("knob") => Ok(crate::matrix::CcTarget::Knob),
-            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin' or 'knob')")),
-        }
+        crate::matrix::CcTarget::parse(target)
+    }
+
+    /// The param of the mixer control `mix` names on a node of `kind`: a
+    /// MasterOut node is its rig's bus, any other node its own source strip.
+    fn resolve_headless_mix(kind: &NodeKind, mix: &str) -> Result<u32, String> {
+        let ctl = crate::matrix::MixControl::parse(mix)?;
+        ctl.fits(matches!(kind, NodeKind::MasterOut))?;
+        Ok(ctl.param())
     }
 
     /// Same tables as the rack faces: `engine::knob_specs` (labels like
@@ -1937,7 +1945,7 @@ impl McpServer {
     }
 
     /// Bind or unbind one CC on a matrix rule.
-    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL', or knob=<a main control's name from list_params>). Optional min/max (0..1) limit how far the controller moves the parameter: its whole travel spans min..max (a pedal on organ drive that must stay below 60 %: max=0.6). Omit param/knob to unbind that CC.")]
+    #[tool(name = "set_cc_map", description = "Bind ONE MIDI CC (0..=127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack unit knob (target='plugin'|'knob', or knob='LEVEL', or knob=<a main control's name from list_params>), or to a MIXER control with mix='vol'|'pan'|'mute'|'solo': on a rig's Master out node that is the rig bus (fader, pan, mute, solo), on a source node the source strip's pan, mute or solo (a source's fader is knob='LEVEL'; mute and solo are on in the upper half of the controller's travel). Optional min/max (0..1) limit how far the controller moves the parameter: its whole travel spans min..max (a pedal on organ drive that must stay below 60 %: max=0.6). Omit param/knob to unbind that CC.")]
     fn set_cc_map(&self, Parameters(args): Parameters<SetCcMapArgs>) -> Result<CallToolResult, McpError> {
         if args.cc > 127 {
             return tool_err("cc must be 0..=127");
@@ -1956,6 +1964,7 @@ impl McpServer {
                     "param": args.param,
                     "target": args.target,
                     "knob": args.knob,
+                    "mix": args.mix,
                     "min": args.min,
                     "max": args.max,
                 }),
@@ -1981,16 +1990,32 @@ impl McpServer {
         let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
             return tool_err(format!("node {} does not exist", args.node));
         };
-        let param = match args.knob.as_deref() {
-            Some(k) => match Self::resolve_headless_knob(&node_kind, k) {
+        let param = match (args.mix.as_deref(), args.knob.as_deref()) {
+            (Some(m), _) => match Self::resolve_headless_mix(&node_kind, m) {
+                Ok(p) => {
+                    target = crate::matrix::CcTarget::Mix;
+                    Some(p)
+                }
+                Err(e) => return tool_err(e),
+            },
+            (None, Some(k)) => match Self::resolve_headless_knob(&node_kind, k) {
                 Ok(p) => {
                     target = crate::matrix::CcTarget::Knob;
                     Some(p)
                 }
                 Err(e) => return tool_err(e),
             },
-            None => args.param,
+            (None, None) => args.param,
         };
+        // target='mix' with a bare param must name a control of that strip.
+        if let (crate::matrix::CcTarget::Mix, Some(p)) = (target, param) {
+            let fits = crate::matrix::MixControl::from_param(p)
+                .ok_or_else(|| format!("no mixer control {p}: pass mix='vol'|'pan'|'mute'|'solo'"))
+                .and_then(|c| c.fits(matches!(node_kind, NodeKind::MasterOut)).map_err(String::from));
+            if let Err(e) = fits {
+                return tool_err(e);
+            }
+        }
         if let Err(e) = send_cmd(&mut st, Command::MatrixCcMap { source, dest: args.node, cc: args.cc, param, target, scale }) {
             return tool_err(e);
         }
@@ -2017,7 +2042,7 @@ impl McpServer {
     }
 
     /// Clear one or all CC bindings on a matrix rule.
-    #[tool(name = "clear_cc_map", description = "Clear one CC binding (when cc is provided) or all CC bindings (when cc is omitted, optionally filtered by target='plugin'|'knob' or knob='LEVEL') on source → node.")]
+    #[tool(name = "clear_cc_map", description = "Clear one CC binding (when cc is provided) or all CC bindings (when cc is omitted, optionally filtered by target='plugin'|'knob'|'mix', knob='LEVEL' or mix='mute') on source → node.")]
     fn clear_cc_map(&self, Parameters(args): Parameters<ClearCcMapArgs>) -> Result<CallToolResult, McpError> {
         if let Some(cc) = args.cc {
             if cc > 127 {
@@ -2037,6 +2062,7 @@ impl McpServer {
                     "cc": args.cc,
                     "target": args.target,
                     "knob": args.knob,
+                    "mix": args.mix,
                 }),
             );
         }
@@ -2055,12 +2081,16 @@ impl McpServer {
         let Some(node_kind) = st.graph.node(args.node).map(|n| n.kind.clone()) else {
             return tool_err(format!("node {} does not exist", args.node));
         };
-        let knob_param = match args.knob.as_deref() {
-            Some(k) => match Self::resolve_headless_knob(&node_kind, k) {
-                Ok(p) => Some(p),
+        let knob_param = match (args.mix.as_deref(), args.knob.as_deref()) {
+            (Some(m), _) => match Self::resolve_headless_mix(&node_kind, m) {
+                Ok(p) => Some((p, crate::matrix::CcTarget::Mix)),
                 Err(e) => return tool_err(e),
             },
-            None => None,
+            (None, Some(k)) => match Self::resolve_headless_knob(&node_kind, k) {
+                Ok(p) => Some((p, crate::matrix::CcTarget::Knob)),
+                Err(e) => return tool_err(e),
+            },
+            (None, None) => None,
         };
         let ccs: Vec<u8> = match args.cc {
             Some(c) => vec![c],
@@ -2068,7 +2098,7 @@ impl McpServer {
                 .map(|v| {
                     v.iter()
                         .filter(|m| {
-                            knob_param.map_or(true, |kp| m.param == kp && m.target == crate::matrix::CcTarget::Knob)
+                            knob_param.map_or(true, |(kp, kt)| m.param == kp && m.target == kt)
                                 && target_filter.map_or(true, |tf| m.target == tf)
                         })
                         .map(|m| m.cc)
@@ -2227,7 +2257,7 @@ impl McpServer {
     }
 
     /// Arm MIDI-learn in the running GUI app.
-    #[tool(name = "learn_cc", description = "Arm MIDI-learn in the running GUI app for (source, node, param/target or knob) so the next incoming hardware CC binds to it. Pass cancel=true to disarm. Needs --attach.")]
+    #[tool(name = "learn_cc", description = "Arm MIDI-learn in the running GUI app for (source, node, param/target, knob, or mix='vol'|'pan'|'mute'|'solo' for a mixer control) so the next incoming hardware CC binds to it. Pass cancel=true to disarm. Needs --attach.")]
     fn learn_cc(&self, Parameters(args): Parameters<LearnCcArgs>) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool(
             "learn_cc",
@@ -2237,6 +2267,7 @@ impl McpServer {
                 "param": args.param,
                 "target": args.target,
                 "knob": args.knob,
+                "mix": args.mix,
                 "cancel": args.cancel,
             }),
         )
@@ -3711,6 +3742,7 @@ mod tests {
             param: Some(42),
             target: None,
             knob: None,
+            mix: None,
             min: None,
             max: None,
         })));
@@ -3724,6 +3756,7 @@ mod tests {
             param: None,
             target: None,
             knob: Some("LEVEL".into()),
+            mix: None,
             min: None,
             max: Some(0.6),
         })));
@@ -3745,6 +3778,7 @@ mod tests {
             cc: None,
             target: None,
             knob: None,
+            mix: None,
         })));
         assert_eq!(cleared["cc_map"].as_array().unwrap().len(), 0);
         let cleared_knob = tool_json(&server.clear_cc_map(Parameters(ClearCcMapArgs {
@@ -3753,11 +3787,53 @@ mod tests {
             cc: None,
             target: Some("knob".into()),
             knob: None,
+            mix: None,
         })));
         assert_eq!(cleared_knob["cc_map"].as_array().unwrap().len(), 0);
         engine.render(&mut buf, 2);
         let empty = tool_json(&server.list_cc_maps(Parameters(ListCcMapsArgs { node: None, source: None })));
         assert_eq!(empty["cc_maps"].as_array().unwrap().len(), 0);
+    }
+
+    /// #75: a mixer control binds headless too: the rig bus on the rig's
+    /// Master out node, a source strip's pan/mute/solo on the source node.
+    #[test]
+    fn a_mixer_control_binds_through_set_cc_map_headless() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 64 * 2];
+        let master = server.state.lock().unwrap().graph.nodes.iter()
+            .find(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).unwrap();
+        let set = |node: NodeId, cc: u8, mix: &str| server.set_cc_map(Parameters(SetCcMapArgs {
+            node, source: "hw:0".into(), cc, param: None, target: None, knob: None, mix: Some(mix.into()), min: None, max: None,
+        }));
+        let res = tool_json(&set(master, 20, "vol"));
+        assert_eq!((&res["target"], &res["param"]), (&json!("mix"), &json!(0)), "{res}");
+        let res = tool_json(&set(master, 21, "mute"));
+        assert_eq!(res["cc_map"].as_array().unwrap().len(), 2, "{res}");
+        let res = tool_json(&set(1, 22, "pan"));
+        assert_eq!(res["target"], json!("mix"), "{res}");
+        // A source strip has no fader of its own: the answer says what to bind.
+        let refused = set(1, 23, "vol").unwrap();
+        assert_eq!(refused.is_error, Some(true));
+        assert!(format!("{refused:?}").contains("LEVEL"), "{refused:?}");
+        assert_eq!(set(master, 24, "width").unwrap().is_error, Some(true));
+        // The engine got the bindings: the controllers move the mix.
+        {
+            let mut st = server.state.lock().unwrap();
+            for (cc, value) in [(20u8, 64u8), (21, 127), (22, 0)] {
+                send_cmd(&mut st, Command::Cc { source: SourceId::Hardware(0), channel: 0, cc, value }).unwrap();
+            }
+        }
+        engine.render(&mut buf, 2);
+        engine.render(&mut buf, 2);
+        let cleared = tool_json(&server.clear_cc_map(Parameters(ClearCcMapArgs {
+            node: master, source: "hw:0".into(), cc: None, target: None, knob: None, mix: Some("mute".into()),
+        })));
+        assert_eq!(cleared["cc_map"].as_array().unwrap().len(), 1, "only the mute binding is cleared: {cleared}");
+        let published = server.state.lock().unwrap().graph_pub.clone().unwrap();
+        let p = published.lock().unwrap();
+        assert_eq!(p.mix[0], crate::engine::RigMix { vol: 64.0 / 127.0, pan: 0.0, mute: true, solo: false });
+        assert!(p.strips.iter().any(|s| s.node == 1 && s.mix.pan == -1.0), "the source strip is panned hard left");
     }
 
     #[test]

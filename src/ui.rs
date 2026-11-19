@@ -27353,6 +27353,26 @@ mod ui_polish_agent_tests {
         assert!(sr.iter().all(|r| r.top() >= app.dock_rect.top()), "strip inside the dock");
     }
 
+    /// The MIDI strip (#97) costs the keys no height: only the header row
+    /// sits above them, the wheels stand beside them. The strip once took a
+    /// 56 pt row out of the dock, and the keys shrank from 146 to 86 pt at
+    /// 1600x1000.
+    #[test]
+    fn the_midi_strip_leaves_the_keys_the_dock_height() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0), Vec2::new(781.0, 468.0)] {
+            for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+            let (dock, kb, sr) = (app.dock_rect, app.dock_kb_rect, app.kb_strip);
+            let key_h = DemoApp::dock_key_rect(kb, 0).height();
+            assert!(kb.top() - dock.top() <= 40.0, "{size:?}: only the header sits above the keys: dock {dock:?}, keys {kb:?}");
+            assert!(key_h >= dock.height() - 60.0, "{size:?}: keys {key_h} pt of a {} pt dock", dock.height());
+            assert!(sr.iter().all(|r| r.is_positive() && dock.contains_rect(*r)), "{size:?}: strip inside the dock: {sr:?}");
+            assert!(sr.iter().all(|r| !r.intersects(kb.shrink(6.0))), "{size:?}: no strip control over the keys: {sr:?} vs {kb:?}");
+        }
+    }
+
     /// GitHub #97: the dock's MIDI strip sends the standard keyboard
     /// signals — pitch bend (springs back to center on release),
     /// modulation (holds its value), sustain (CC 64 toggle) — and the VEL

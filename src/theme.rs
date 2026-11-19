@@ -36,7 +36,9 @@ pub const MUTED: Color32 = Color32::from_rgb(0x6E, 0x6A, 0x66); // decorative / 
 
 // The inverted hero panel (dark side).
 pub const DARK_PANEL: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // rack chassis, help card
-pub const DARK_PANEL_HI: Color32 = Color32::from_rgb(0x23, 0x21, 0x20); // plates, rails, plugs
+pub const DARK_PANEL_HI: Color32 = Color32::from_rgb(0x23, 0x21, 0x20); // plates, plugs
+pub const RAIL_SLOT: Color32 = Color32::from_rgb(0x14, 0x13, 0x12); // rail channel, one step below the chassis
+pub const RAIL_EDGE: Color32 = Color32::from_rgb(0x2E, 0x2C, 0x2A); // 1px edge of the rail channel
 pub const SCRIM: Color32 = Color32::from_rgb(0x1C, 0x1C, 0x1C); // help backdrop (α 0.62)
 pub const CREAM: Color32 = Color32::from_rgb(0xEF, 0xEE, 0xE9); // primary text on dark
 pub const CREAM_META: Color32 = Color32::from_rgb(0xCC, 0xCB, 0xC6); // secondary metadata on dark (11.5:1 on PAPER, dimmer than CREAM)

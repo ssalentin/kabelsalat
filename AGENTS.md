@@ -1167,6 +1167,14 @@ Learned so far (2026-11-15, UI polish pass):
     (`onsets_of_a_gated_low_chord_sit_on_the_gate_grid`). Before blaming
     timing, dump the measured signal of 40+ runs and look at how far the
     passing ones are from the threshold.
+167. **Chrome lines are snapped after the transform, never left soft:** the
+    rack's side rails were 14 pt rounded fills one whisper step lighter than
+    the chassis, on fractional edges, overhanging the units by 8 pt; the
+    user saw them as "drawn in paint". Structural chrome is snapped to
+    device pixels after `xf.rect` (`GuiRounding::round_to_pixels`) with a
+    `1/ppp` stroke, sits on the units' grid, and is recessed (darker), not a
+    raised lighter blob. Zoom into a 1.0x and a 1.6x shot before calling it
+    crisp (`draw_rails`).
 167. **A solo silences sources, never effects:** render step 2b asked
     `strip_gains_of` for every effect, and a unit without a strip entry
     counts as not soloed (rule 134), so a solo in a rig silenced every effect

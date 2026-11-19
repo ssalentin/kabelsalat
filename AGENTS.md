@@ -1175,13 +1175,18 @@ Learned so far (2026-11-15, UI polish pass):
     `mixer_sources`) are silenced by another's solo. Prove routing with the
     noise probe (`noise_appears_exactly_where_it_is_routed`), not with
     levels alone.
-168. **A delay plan counts every way audio travels, not only cables:**
-    sends are not cables, so the plan took an aux bus for "no delay" and
-    delayed the return of a whole-rig send a second time (480 frames against
-    the dry 240, a 5 ms comb on a parallel bus). A bus is as late as what is
-    sent into it (`pdc::compensation` takes the sends), and a send that
-    starts or stops sounding replans
-    (`a_bus_return_meets_the_dry_rig_in_phase`).
+168. **A delay plan counts every way audio travels, and aligns a return
+    with its sender:** sends are not cables, so the plan took an aux bus for
+    "no delay" and delayed the return of a whole-rig send twice (480 frames
+    against the dry 240); the next fix aligned the return with the rig the
+    bus is cabled to, so another rig's send came back 5 ms off its own dry
+    sound. A return lines up with whoever sent into the bus
+    (`pdc::compensation` takes the sends): a rig send needs nothing, a
+    source's send waits for its rig's latent units, a latent unit in the
+    bus's chain makes only the senders wait
+    (`a_bus_return_meets_the_dry_rig_in_phase`,
+    `a_send_from_another_rig_returns_in_phase_with_its_own_rig`). When two
+    fixes fail the same check, write down what both assumed and test that.
 167. **A new row in a sized panel brings its own height, or goes beside:**
     the keyboard dock's MIDI strip (#101) took a 56 pt row out of a dock
     sized for header + keys (20 % of the window), so the keys shrank from

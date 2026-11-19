@@ -570,11 +570,15 @@ input waits the difference to the largest, as a `(source, destination,
 frames)` delay. The plan follows the engine's effect order (`next_effect`),
 so the cable that closes a feedback loop (it carries the previous block)
 neither counts nor gets a delay, and the plan ends. Sends are not cables, so
-the plan takes them beside the graph: an aux bus is as late as the latest
-thing sent into it (a source, or a rig's already aligned sum), an early
-return waits at the mix, and when a return is later than a rig's sum (a
-latent unit in the bus's chain) that rig waits after its sends are tapped
-(`Pdc::rig_out`). A send that starts or stops sounding replans. Master
+the plan takes them beside the graph. A return has to line up with the dry
+sound of whoever sent into the bus, not with the master its cable ends at: a
+whole-rig send taps the rig's aligned sum and needs nothing; a send of one
+source waits on its way into the bus for the latent units of its rig
+(`(source, bus, frames)`, applied in `BusTaps::tap`); a latent unit in a
+bus's own chain makes the senders' rigs wait after their sends are tapped
+(`(master, master, frames)`, `Pdc::rig_out`). Without a latent unit in a
+bus's chain, rig sends change nothing and rigs never wait for each other. A
+send that starts or stops sounding replans. Master
 inserts, the file player, system audio and the Audio In monitor are serial
 or outside the graph and are not part of it. `Pdc` owns one ring per planned delay; it
 replans in `publish_graph` (every structural edit ends there), keeps the

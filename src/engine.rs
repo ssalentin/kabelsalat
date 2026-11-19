@@ -776,15 +776,19 @@ impl BusTaps<'_> {
     }
 
     /// Add every send of `from` tapped at this point (`pre` or post fader)
-    /// into its bus. Allocation-free; no work at all without sends.
-    fn tap(&mut self, sends: &[AuxSend], from: SendSource, pre: bool, src: &[f32]) {
+    /// into its bus, scaled by `gain`, through its compensation delay when
+    /// the plan has one. Allocation-free; no work at all without sends.
+    fn tap(&mut self, pdc: &mut pdc::Pdc, sends: &[AuxSend], from: SendSource, pre: bool, gain: f32, src: &[f32]) {
+        // Only a source's send can have a delay; a rig's has no key.
+        let key = match from {
+            SendSource::Node(n) => n,
+            SendSource::Rig(_) => NodeId::MAX,
+        };
         for s in sends {
             if s.from != from || s.pre != pre || s.level <= 0.0 { continue; }
             let Some(b) = self.nodes[..self.n].iter().position(|n| *n == s.bus) else { continue };
-            let n2 = src.len();
-            for (o, x) in self.buf(b, n2).iter_mut().zip(src) {
-                *o += *x * s.level;
-            }
+            let g = s.level * gain;
+            pdc.mix(key, s.bus, src, false, (g, g), self.buf(b, src.len()));
         }
     }
 }
@@ -799,14 +803,19 @@ fn source_out(
     solo_rigs: &[bool; 8],
     sends: &[AuxSend],
     taps: &mut BusTaps,
+    pdc: &mut pdc::Pdc,
     node: NodeId,
     level: f32,
     buf: &mut [f32],
 ) {
     let gains = strip_gains_of(strips, graph, node, solo_rigs);
     let silenced = gains == Some((0.0, 0.0));
-    if !sends.is_empty() && !silenced {
-        taps.tap(sends, SendSource::Node(node), true, buf);
+    // A silenced source sends nothing; a delayed send still runs, at zero,
+    // or its delay line would replay stale audio when the source returns.
+    let tapped = !sends.is_empty() && (!silenced || pdc.delays_from(node));
+    let send_gain = if silenced { 0.0 } else { 1.0 };
+    if tapped {
+        taps.tap(pdc, sends, SendSource::Node(node), true, send_gain, buf);
     }
     if level != 1.0 {
         for x in buf.iter_mut() { *x *= level; }
@@ -823,8 +832,8 @@ fn source_out(
             }
         }
     }
-    if !sends.is_empty() && !silenced {
-        taps.tap(sends, SendSource::Node(node), false, buf);
+    if tapped {
+        taps.tap(pdc, sends, SendSource::Node(node), false, send_gain, buf);
     }
 }
 
@@ -2429,10 +2438,10 @@ impl GraphEngine {
             let solo = if source { solo_rigs } else { &[false; 8] };
             let strips = &self.strips;
             match taps.as_deref_mut() {
-                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, node, 1.0, &mut buf[..n2]),
+                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, &mut self.pdc, node, 1.0, &mut buf[..n2]),
                 None => {
                     let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
-                    source_out(strips, &self.graph, solo, &[], &mut none, node, 1.0, &mut buf[..n2]);
+                    source_out(strips, &self.graph, solo, &[], &mut none, &mut self.pdc, node, 1.0, &mut buf[..n2]);
                 }
             }
             self.node_timer.record(node, node_t0.elapsed());
@@ -4392,7 +4401,7 @@ impl GraphEngine {
             // Level and strip mix (mute/solo/pan) at the source's own output:
             // the edge levels published from this buffer stay post-fader
             // (rule 53). Sends tap on either side of it.
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, s.node, s.level, &mut s.scratch[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, s.node, s.level, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -4403,7 +4412,7 @@ impl GraphEngine {
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
         for a in &mut self.audio_in {
-            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, a.node, 1.0, &mut a.buf[..n2]);
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, a.node, 1.0, &mut a.buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -4440,7 +4449,7 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
-                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, d.node, 1.0, &mut d.buf[..n2]);
+                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, &mut self.pdc, d.node, 1.0, &mut d.buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -4638,14 +4647,14 @@ impl GraphEngine {
                     rig_buf.fill(0.0);
                 } else {
                     // Sends tap the rig bus on either side of its fader.
-                    if sends { taps.tap(&self.sends, from, true, rig_buf); }
+                    if sends { taps.tap(&mut self.pdc, &self.sends, from, true, 1.0, rig_buf); }
                     if gl != 1.0 || gr != 1.0 {
                         for f in rig_buf.chunks_exact_mut(2) {
                             f[0] *= gl;
                             f[1] *= gr;
                         }
                     }
-                    if sends { taps.tap(&self.sends, from, false, rig_buf); }
+                    if sends { taps.tap(&mut self.pdc, &self.sends, from, false, 1.0, rig_buf); }
                 }
                 self.pdc.rig_out(master, rig_buf);
                 if live {

@@ -19,13 +19,17 @@ use crate::control::{AuxSend, DspKind, Graph, NodeId, NodeKind, PortKind, SendSo
 
 /// The delays that align every summing point: (source, destination, frames).
 ///
-/// Sends are not cables, so they come in beside the graph: an aux bus is as
-/// late as the latest thing sent into it. A send of a source is as late as
-/// that source; a send of a whole rig taps the rig's sum, which is already
-/// aligned, so it is as late as that sum. What returns from a bus meets the
-/// rig sums at the mix: early returns wait there, and when a return is later
-/// than a rig's sum (a latent unit in the bus's chain) that rig waits after
-/// its sends are tapped, as a `(master, master, frames)` delay.
+/// Sends are not cables, so they come in beside the graph. A bus return
+/// has to line up with the dry sound of whoever sent into the bus, not
+/// with the master its cable ends at:
+/// - a send of a whole rig taps the rig's sum, so its return is as late as
+///   that sum already, whatever the rig holds: no delay;
+/// - a send of one source taps it before the rig's latent units: it waits
+///   for them on its way into the bus, `(source, bus, frames)`;
+/// - a latent unit in a bus's own chain makes the return late for every
+///   sender: their rigs wait after their sends are tapped, `(master,
+///   master, frames)`, and a faster return of the same bus waits too.
+/// Without a latent unit in a bus's chain, rig sends change nothing.
 pub fn compensation(graph: &Graph, sends: &[AuxSend], latency_of: impl Fn(NodeId) -> usize) -> Vec<(NodeId, NodeId, usize)> {
     let n = graph.nodes.len();
     let index = |id: NodeId| graph.nodes.iter().position(|x| x.id == id);
@@ -67,76 +71,82 @@ pub fn compensation(graph: &Graph, sends: &[AuxSend], latency_of: impl Fn(NodeId
             None => break,
         }
     }
-    // What is sent into each bus: a source, or the master whose rig sum it
-    // taps. A return cannot send.
-    let mut sent: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for s in sends.iter().filter(|s| s.level > 0.0) {
-        let from = match s.from {
-            SendSource::Node(id) => index(id).filter(|&i| !wet[i]),
-            SendSource::Rig(r) => (0..n).find(|&i| is_master(i) && graph.nodes[i].rig == r),
-        };
-        if let (Some(b), Some(f)) = (index(s.bus), from) {
-            sent[b].push(f);
-        }
+    // A bus hears its sends, not what is cabled into it.
+    for b in (0..n).filter(|&b| is_bus(b)) {
+        inputs[b].clear();
     }
-    struct Plan<'a> {
-        inputs: &'a [Vec<usize>],
-        sent: &'a [Vec<usize>],
-        wet: &'a [bool],
-        master: Vec<bool>,
-        own: Vec<usize>,
-        memo: Vec<Option<usize>>,
-    }
-    impl Plan<'_> {
-        /// A master's rig sum: its latest dry input.
-        fn dry(&mut self, m: usize) -> usize {
-            let ins = self.inputs;
-            ins[m].iter().filter(|&&s| !self.wet[s]).map(|&s| self.out(s)).max().unwrap_or(0)
+    // Ranks rise along every cable left, so this ends.
+    fn latency(i: usize, inputs: &[Vec<usize>], own: &[usize], memo: &mut [Option<usize>]) -> usize {
+        if let Some(l) = memo[i] {
+            return l;
         }
-        /// Ranks rise along every cable left, sends lead from dry nodes
-        /// into buses only, and a rig sum has dry inputs only: this ends.
-        fn out(&mut self, i: usize) -> usize {
-            if let Some(l) = self.memo[i] {
-                return l;
-            }
-            let (ins, sent) = (self.inputs, self.sent);
-            let cabled = ins[i].iter().map(|&s| self.out(s)).max().unwrap_or(0);
-            let by_send = sent[i].iter().map(|&f| if self.master[f] { self.dry(f) } else { self.out(f) }).max().unwrap_or(0);
-            let l = self.own[i] + cabled.max(by_send);
-            self.memo[i] = Some(l);
-            l
-        }
+        let l = own[i] + inputs[i].iter().map(|&s| latency(s, inputs, own, memo)).max().unwrap_or(0);
+        memo[i] = Some(l);
+        l
     }
-    let mut p = Plan {
-        inputs: &inputs,
-        sent: &sent,
-        wet: &wet,
-        master: (0..n).map(is_master).collect(),
-        own: graph.nodes.iter().map(|x| latency_of(x.id)).collect(),
-        memo: vec![None; n],
-    };
+    let own: Vec<usize> = graph.nodes.iter().map(|x| latency_of(x.id)).collect();
+    let mut memo = vec![None; n];
+    // A return's latency counts from its bus, a dry node's from its source.
+    let out: Vec<usize> = (0..n).map(|i| latency(i, &inputs, &own, &mut memo)).collect();
+    let id = |i: usize| graph.nodes[i].id;
+    let dry_sum = |m: usize| inputs[m].iter().filter(|&&s| !wet[s]).map(|&s| out[s]).max().unwrap_or(0);
+    let master_of = |rig: u8| (0..n).find(|&i| is_master(i) && graph.nodes[i].rig == rig);
     let mut plan = Vec::new();
+    // Every summing point of the dry side.
     for (d, ins) in inputs.iter().enumerate() {
-        let id = |i: usize| graph.nodes[i].id;
-        if is_master(d) {
-            let dry = p.dry(d);
-            let mix = ins.iter().filter(|&&s| wet[s]).map(|&s| p.out(s)).max().unwrap_or(0).max(dry);
-            for &s in ins {
-                let target = if wet[s] { mix } else { dry };
-                if p.out(s) < target {
-                    plan.push((id(s), id(d), target - p.out(s)));
-                }
+        let max = if is_master(d) { dry_sum(d) } else { ins.iter().map(|&s| out[s]).max().unwrap_or(0) };
+        for &s in ins.iter().filter(|&&s| !(is_master(d) && wet[s])) {
+            if out[s] < max {
+                plan.push((id(s), id(d), max - out[s]));
             }
-            if mix > dry {
-                plan.push((id(d), id(d), mix - dry));
+        }
+    }
+    // Who shares a bus: senders' masters with the bus, and a bus with what
+    // its cables lead to. `group[i]` names the set node `i` is in.
+    let mut group: Vec<usize> = (0..n).collect();
+    let join = |group: &mut Vec<usize>, a: usize, b: usize| {
+        let (ga, gb) = (group[a], group[b]);
+        if ga != gb {
+            for g in group.iter_mut().filter(|g| **g == gb) {
+                *g = ga;
             }
-        } else {
-            let max = ins.iter().map(|&s| p.out(s)).max().unwrap_or(0);
-            for &s in ins {
-                if p.out(s) < max {
-                    plan.push((id(s), id(d), max - p.out(s)));
-                }
+        }
+    };
+    for (d, ins) in inputs.iter().enumerate().filter(|(d, _)| wet[*d]) {
+        for &s in ins.iter().filter(|&&s| wet[s]) {
+            join(&mut group, s, d);
+        }
+    }
+    for s in sends.iter().filter(|s| s.level > 0.0) {
+        let Some(b) = index(s.bus).filter(|&b| is_bus(b)) else { continue };
+        let (source, rig) = match s.from {
+            SendSource::Node(x) => match index(x).filter(|&i| !wet[i]) {
+                Some(i) => (Some(i), graph.nodes[i].rig),
+                None => continue,
+            },
+            SendSource::Rig(r) => (None, r),
+        };
+        let Some(m) = master_of(rig) else { continue };
+        join(&mut group, m, b);
+        // A source's send waits for the rest of its rig.
+        if let Some(i) = source {
+            if out[i] < dry_sum(m) {
+                plan.push((id(i), id(b), dry_sum(m) - out[i]));
             }
+        }
+    }
+    // Returns into the mix: the slowest return of a set is what its
+    // senders' rigs and its faster returns wait for.
+    let returns: Vec<(usize, usize)> = (0..n).filter(|&m| is_master(m)).flat_map(|m| inputs[m].iter().filter(|&&w| wet[w]).map(move |&w| (w, m))).collect();
+    let slowest = |g: usize| returns.iter().filter(|(w, _)| group[*w] == g).map(|(w, _)| out[*w]).max().unwrap_or(0);
+    for &(w, m) in &returns {
+        if out[w] < slowest(group[w]) {
+            plan.push((id(w), id(m), slowest(group[w]) - out[w]));
+        }
+    }
+    for m in (0..n).filter(|&m| is_master(m)) {
+        if slowest(group[m]) > 0 {
+            plan.push((id(m), id(m), slowest(group[m])));
         }
     }
     plan
@@ -250,6 +260,12 @@ impl Pdc {
         for f in rig_buf.chunks_exact_mut(2) {
             (f[0], f[1]) = line.push(f[0], f[1]);
         }
+    }
+
+    /// Does a line start at `src`? Then what it sends must keep running
+    /// while it is silenced.
+    pub fn delays_from(&self, src: NodeId) -> bool {
+        self.lines.iter().any(|l| l.src == src)
     }
 
     /// A unit with a lookahead delays by it also while bypassed, so the
@@ -419,6 +435,65 @@ mod tests {
         assert!(p.lag_frames == 240 && p.r > 0.95, "input send beside a limited rig: {p:?}");
         let (plan, p) = dry_and_return(&[], lim, false);
         assert!(plan.len() == 1 && plan[0].0 == plan[0].1 && plan[0].2 == 240, "the rig waits after its send: {plan:?}");
+        assert!(p.lag_frames == 240 && p.r > 0.95, "a limiter in the bus's chain: {p:?}");
+    }
+
+    /// Rig A: In A → Limiter → Master A, and the aux bus → `ret` units →
+    /// Master A. Rig B: In B → Master B, fed with noise, sending into rig
+    /// A's bus by `sends`. Returns the plan (as node names) and how the
+    /// master lines up with rig B's noise.
+    fn other_rigs_send(ret: &[DspKind], sends: impl Fn(NodeId) -> Vec<SendSource>) -> (Vec<(String, String, usize)>, crate::analysis::XcorrPeak) {
+        use crate::control::AudioInChannel;
+        use crate::engine::probe::{Probe, Tap, MAX_LAG, SETTLE_BLOCKS};
+        let mut g = Graph::default();
+        let audio_in = |g: &mut Graph, name: &str| g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes(name));
+        let (in_a, in_b) = (audio_in(&mut g, "IN A"), audio_in(&mut g, "IN B"));
+        let lim = dsp(&mut g, DspKind::Limiter, "LIM A");
+        let bus = dsp(&mut g, DspKind::Bus, "BUS");
+        let (master_a, master_b) = (g.add_node(NodeKind::MasterOut, name_bytes("MASTER A")), g.add_node(NodeKind::MasterOut, name_bytes("MASTER B")));
+        g.set_rig(in_b, 1);
+        g.set_rig(master_b, 1);
+        wire(&mut g, 1, in_a, lim, 0);
+        wire(&mut g, 2, lim, master_a, 0);
+        wire(&mut g, 3, in_b, master_b, 0);
+        let mut prev = bus;
+        for (i, k) in ret.iter().enumerate() {
+            let u = dsp(&mut g, k.clone(), "RETURN FX");
+            wire(&mut g, 10 + i as u32, prev, u, 0);
+            prev = u;
+        }
+        wire(&mut g, 4, prev, master_a, 0);
+        let mut probe = Probe::new(g);
+        for from in sends(in_b) {
+            probe.send(Command::SetSend { from, bus, level: Some(1.0), pre: Some(false) });
+        }
+        probe.feed("B", in_b, crate::analysis::white(9).map(|x| x * 0.1));
+        probe.settle(SETTLE_BLOCKS);
+        let run = probe.run(32, &[Tap::MasterL]);
+        let graph = probe.engine.graph();
+        let name = |id: NodeId| graph.node(id).map_or(String::new(), |n| crate::control::name_str(&n.name).to_string());
+        let plan = compensation(graph, &probe.engine.sends, lim_latency(graph)).into_iter().map(|(s, d, f)| (name(s), name(d), f)).collect();
+        (plan, crate::analysis::xcorr_peak(&run.feeds[0].1, &run.taps[0].1, 2 * MAX_LAG))
+    }
+
+    /// A return lines up with whoever sent into the bus, not with the rig
+    /// the bus is cabled to: rig B plays and returns on time although rig A
+    /// (the bus's own rig) has a Limiter, alone or sending beside it. Only a
+    /// Limiter in the bus's chain makes rig B wait, and only rig B.
+    #[test]
+    fn a_send_from_another_rig_returns_in_phase_with_its_own_rig() {
+        let cases: [(&str, fn(NodeId) -> Vec<SendSource>); 3] = [
+            ("rig B sends", |_| vec![SendSource::Rig(1)]),
+            ("In B sends", |in_b| vec![SendSource::Node(in_b)]),
+            ("both rigs send", |_| vec![SendSource::Rig(0), SendSource::Rig(1)]),
+        ];
+        for (what, sends) in cases {
+            let (plan, p) = other_rigs_send(&[], sends);
+            assert!(plan.is_empty(), "{what}: nothing waits: {plan:?}");
+            assert!(p.lag_frames == 0 && p.r > 0.95, "{what}: {p:?}");
+        }
+        let (plan, p) = other_rigs_send(&[DspKind::Limiter], |_| vec![SendSource::Rig(1)]);
+        assert_eq!(plan, vec![("MASTER B".to_string(), "MASTER B".to_string(), 240)], "only the sender waits for the return");
         assert!(p.lag_frames == 240 && p.r > 0.95, "a limiter in the bus's chain: {p:?}");
     }
 

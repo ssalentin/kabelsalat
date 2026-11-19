@@ -8664,7 +8664,7 @@ pub fn target_test() -> anyhow::Result<()> {
         let settled = engine.meter_snapshot();
         // The same phrase reads up to 0.4 LU apart from one play to the next
         // (Surge's oscillators run free), so the replay gets that much more.
-        let on_target = (settled.integrated_lufs - lufs).abs() <= 0.9;
+        let on_target = (after.integrated_lufs - lufs).abs() <= 0.5 && (settled.integrated_lufs - lufs).abs() <= 0.9;
         let peak_ok = settled.true_peak_max_db <= TRUE_PEAK_CEILING_DB + 0.05;
         println!(
             "target-test: {name:<12} {lufs:>6.1} LUFS: before {:.2} -> after {:.2} LUFS (settled {:.2}), trim {:+.2} dB, guard {:+.2} dB, true peak {:.2} dBTP, {tries} match(es){}{}",

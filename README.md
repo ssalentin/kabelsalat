@@ -142,7 +142,7 @@ sample rate and buffer, inputs and outputs, late blocks and xruns, the
 latencies kabelsalat measures, and the render time of every instrument and
 effect, most expensive first, so you see which unit to swap when the load
 climbs. Adjust the audio **Buffer size** (64–2048 frames, default 256) live
-with **− / +** in Engine info or from **Settings** — smaller lowers latency,
+with **− / +** in Engine info or from **Settings → Audio** — smaller lowers latency,
 larger prevents xruns — and the choice is remembered across restarts. The
 assistant and MCP agents read and adjust the same engine settings
 (`get_engine_info`, `set_buffer_size`).
@@ -195,7 +195,8 @@ shifts the start. With sync on and the transport rolling, it starts on the next
 bar line.
 
 ### Ask the assistant — or your own AI agent
-The built-in assistant (bring your own DeepSeek key) can set things up for you:
+The built-in assistant (bring your own DeepSeek or OpenRouter key, entered under
+**Settings → Agent → API keys**) can set things up for you:
 "add a reverb to this rig", "split the keys at C4", "load a warm pad". Everything
 an agent changes lights up in the rack, and **Ctrl+Z** undoes the whole request
 in one step. External AI agents (Claude, …) can drive the running app through

@@ -2000,6 +2000,60 @@ enum StageView {
     Settings,
 }
 
+/// A page of the Settings view. The App pages change how kabelsalat plays
+/// and looks; the Agent pages change only the assistant. The order is the
+/// rail's order (and the index of `settings_summaries`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsPage {
+    Audio,
+    Session,
+    Display,
+    Models,
+    Keys,
+}
+
+impl SettingsPage {
+    const APP: [SettingsPage; 3] = [SettingsPage::Audio, SettingsPage::Session, SettingsPage::Display];
+    const AGENT: [SettingsPage; 2] = [SettingsPage::Models, SettingsPage::Keys];
+
+    fn label(self) -> &'static str {
+        match self {
+            SettingsPage::Audio => "Audio",
+            SettingsPage::Session => "Session",
+            SettingsPage::Display => "Display",
+            SettingsPage::Models => "Models",
+            SettingsPage::Keys => "API keys",
+        }
+    }
+
+    fn is_agent(self) -> bool {
+        matches!(self, SettingsPage::Models | SettingsPage::Keys)
+    }
+
+    fn blurb(self) -> &'static str {
+        match self {
+            SettingsPage::Audio => "Where kabelsalat plays and how much latency it adds.",
+            SettingsPage::Session => "How your work is kept and how playback starts.",
+            SettingsPage::Display => "How the app moves and how large it is drawn.",
+            SettingsPage::Models => "The models the assistant works with. Nothing here changes the sound.",
+            SettingsPage::Keys => "Keys for the model providers, stored locally in ~/.config/kabelsalat/config.json (0600). Saving restarts the assistant.",
+        }
+    }
+}
+
+/// A change made on the Settings view, applied after the frame drew it.
+enum SettingsAction {
+    ToggleDecide,
+    SetModel(crate::llm::Role, String),
+    SaveKey(crate::llm::Endpoint, String),
+    RemoveKey(crate::llm::Endpoint),
+    ToggleReduceMotion,
+    ToggleAutosave,
+    SetCountIn(bool, u8),
+    SetAudioOutput(Option<String>),
+    SetBufferSize(u32),
+}
+
 /// The bottom dock holds exactly one occupant at a time: no dock, the full-width
 /// software keyboard, or the assistant chat. One owner of the computer keyboard
 /// (rule: the assistant captures typing; the keyboard plays notes; neither when
@@ -2603,6 +2657,8 @@ struct DemoApp {
     settings_deepseek_key: String,
     settings_openrouter_key: String,
     settings_msg: String,
+    /// The Settings page shown; kept while the app runs.
+    settings_page: SettingsPage,
     /// Ctrl-drag of a unit: last rack-local cursor (drives the live layout
     /// preview) and the slot rect the dragged unit would land in.
     drag_cursor: Option<Vec2>,
@@ -3124,6 +3180,7 @@ impl DemoApp {
             settings_deepseek_key: String::new(),
             settings_openrouter_key: String::new(),
             settings_msg: String::new(),
+            settings_page: SettingsPage::Audio,
             drag_cursor: None,
             drop_ghost: None,
             col_x: Vec::new(),
@@ -12756,22 +12813,10 @@ impl DemoApp {
         }
     }
 
-    /// Main-stage view for agent models, API keys, and app preferences.
+    /// Main-stage view: a rail of pages in two groups, App (sound, sessions,
+    /// display) and Agent (the assistant's models and keys), beside the
+    /// selected page.
     fn settings_stage(&mut self, ui: &mut egui::Ui) {
-        use crate::llm::{Endpoint, Role};
-
-        enum SettingsAction {
-            ToggleDecide,
-            SetModel(Role, String),
-            SaveKey(Endpoint, String),
-            RemoveKey(Endpoint),
-            ToggleReduceMotion,
-            ToggleAutosave,
-            SetCountIn(bool, u8),
-            SetAudioOutput(Option<String>),
-            SetBufferSize(u32),
-        }
-
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
         let painter = ui.painter().clone();
@@ -12779,515 +12824,621 @@ impl DemoApp {
         let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
         painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
         let help = self.show_help;
+        let summaries = self.settings_summaries(ui.ctx().pixels_per_point());
+        let mut actions: Vec<SettingsAction> = Vec::new();
 
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
+            ui.add_enabled_ui(!help, |ui| {
+                ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("Tab / Esc: back to the rack · kabelsalat {}", crate::VERSION))
+                        .size(12.5)
+                        .color(theme::INK_2),
+                );
+                // The last change's outcome, on a row of its own that is
+                // always reserved, so nothing moves when it appears (rule 136).
+                let (msg_rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 18.0), egui::Sense::hover());
+                if !self.settings_msg.is_empty() {
+                    let col = if self.settings_msg.contains("failed") { theme::CLIP_BRIGHT } else { theme::LIVE_TEAL };
+                    let g = Self::ellipsized(ui.painter(), &self.settings_msg, FontId::proportional(12.5), col, msg_rect.width());
+                    ui.painter().galley(Pos2::new(msg_rect.left(), msg_rect.center().y - g.size().y * 0.5), g, col);
+                }
+                ui.add_space(6.0);
+                Self::stage_hairline(ui);
+                ui.add_space(14.0);
+
+                let avail_w = ui.available_width().max(200.0);
+                let body_h = ui.available_height().max(80.0);
+                if avail_w >= 620.0 && body_h >= 300.0 {
+                    let rail_w = (avail_w * 0.24).clamp(170.0, 220.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(rail_w, body_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            self.settings_rail(ui, rail_w, &summaries);
+                        });
+                        ui.add_space(14.0);
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, body_h), egui::Sense::hover());
+                        ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                        ui.add_space(22.0);
+                        let page_w = ui.available_width();
+                        ui.allocate_ui_with_layout(egui::vec2(page_w, body_h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            self.settings_page_ui(ui, body_h, true, &mut actions);
+                        });
+                    });
+                } else {
+                    self.settings_tabs(ui);
+                    ui.add_space(12.0);
+                    let page_h = ui.available_height().max(60.0);
+                    self.settings_page_ui(ui, page_h, false, &mut actions);
+                }
+            });
+        });
+
+        for act in actions {
+            self.apply_settings_action(act);
+        }
+
+        if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// One line per page for the rail: what is set there now, and a warning
+    /// colour when the page holds something the user has to fix.
+    fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 5] {
+        use crate::llm::{Endpoint, Role};
+        let ok = theme::CREAM_DIM;
+        let warn = theme::ACCENT_BRIGHT;
+        let wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
+        let out = match wanted {
+            None => "System default".to_string(),
+            Some(raw) => self
+                .audio_out
+                .lock()
+                .ok()
+                .and_then(|s| s.outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()))
+                .unwrap_or(raw),
+        };
+        let on_off = |on: bool| if on { "on" } else { "off" };
         let keys = self.assistant.keys();
-        let decide_on = self.assistant.decide_enabled();
-        let decide_route = self.assistant.route_for(Role::Decide);
-        let act_route = self.assistant.route_for(Role::Act);
+        let act = self.assistant.route_for(Role::Act);
+        let models = if keys.has(act.endpoint) {
+            (format!("{} · Jev {}", act.model, on_off(self.assistant.decide_enabled())), ok)
+        } else {
+            (format!("{} · no key", act.model), warn)
+        };
+        let set = [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().filter(|e| keys.has(**e)).count();
+        let keys_line = if set == 0 { ("no key set".to_string(), warn) } else { (format!("{set} of 2 set"), ok) };
+        [
+            (format!("{} frames · {out}", self.buffer_frames), ok),
+            (format!("autosave {} · count-in {}", on_off(self.autosave.enabled), on_off(self.count_in_enabled)), ok),
+            (format!("{:.2}× · motion {}", ppp, if self.reduce_motion { "reduced" } else { "full" }), ok),
+            models,
+            keys_line,
+        ]
+    }
+
+    /// Group heading of the rail and of the tab row. Agent pages wear the
+    /// agent's teal, the same mark the rack puts on what the agent changed.
+    fn settings_group_label(ui: &mut egui::Ui, agent: bool) -> egui::Response {
+        if agent {
+            theme::tracked_label(ui, "AGENT", 10.0, 0.14, theme::AGENT_TEXT)
+        } else {
+            theme::section_label(ui, "App")
+        }
+    }
+
+    /// The vertical page list: App pages, then Agent pages under their own
+    /// heading, each with a line of what is set there.
+    fn settings_rail(&mut self, ui: &mut egui::Ui, w: f32, summaries: &[(String, Color32); 5]) {
+        for (gi, pages) in [&SettingsPage::APP[..], &SettingsPage::AGENT[..]].into_iter().enumerate() {
+            if gi > 0 {
+                ui.add_space(12.0);
+                Self::stage_hairline(ui);
+                ui.add_space(14.0);
+            }
+            Self::settings_group_label(ui, gi > 0);
+            ui.add_space(6.0);
+            for &p in pages {
+                let on = self.settings_page == p;
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 44.0), egui::Sense::click());
+                let hov = resp.hovered();
+                let fill = if on {
+                    theme::DARK_PANEL_HI
+                } else if hov {
+                    theme::mix(theme::DARK_PANEL, theme::DARK_PANEL_HI, 0.6)
+                } else {
+                    Color32::TRANSPARENT
+                };
+                ui.painter().rect_filled(rect, 3.0, fill);
+                if on {
+                    let bar = Rect::from_min_size(Pos2::new(rect.left(), rect.top() + 6.0), egui::vec2(3.0, rect.height() - 12.0));
+                    ui.painter().rect_filled(bar, 1.5, if p.is_agent() { theme::AGENT_COLOR } else { theme::ACCENT });
+                }
+                if hov {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                let text_w = (rect.width() - 24.0).max(16.0);
+                let title_col = if on || hov { theme::INK } else { theme::CREAM_META };
+                let g = Self::ellipsized(ui.painter(), p.label(), theme::medium_font(13.0), title_col, text_w);
+                ui.painter().galley(Pos2::new(rect.left() + 14.0, rect.top() + 6.0), g, title_col);
+                let (line, col) = &summaries[p as usize];
+                let g = Self::ellipsized(ui.painter(), line, FontId::proportional(11.0), *col, text_w);
+                ui.painter().galley(Pos2::new(rect.left() + 14.0, rect.bottom() - 6.0 - g.size().y), g, *col);
+                if resp.clicked() {
+                    self.settings_page = p;
+                }
+                ui.add_space(2.0);
+            }
+        }
+    }
+
+    /// The page list of a small sheet: one row of segments, App then Agent,
+    /// wrapping to one row per group when the sheet is too narrow.
+    fn settings_tabs(&mut self, ui: &mut egui::Ui) {
+        let font = theme::medium_font(12.0);
+        let seg_w = |ui: &egui::Ui, p: SettingsPage| {
+            ui.painter().layout_no_wrap(p.label().into(), font.clone(), theme::INK).size().x + 22.0
+        };
+        let gap = ui.spacing().item_spacing.x;
+        let group_w = |ui: &egui::Ui, pages: &[SettingsPage]| -> f32 {
+            56.0 + pages.iter().map(|p| seg_w(ui, *p) + gap).sum::<f32>()
+        };
+        let one_row = group_w(ui, &SettingsPage::APP) + 24.0 + group_w(ui, &SettingsPage::AGENT) <= ui.available_width();
+        let mut group = |ui: &mut egui::Ui, pages: &[SettingsPage], agent: bool| {
+            let (lr, _) = ui.allocate_exact_size(egui::vec2(52.0, 26.0), egui::Sense::hover());
+            ui.scope_builder(egui::UiBuilder::new().max_rect(lr).layout(egui::Layout::left_to_right(egui::Align::Center)), |ui| {
+                Self::settings_group_label(ui, agent);
+            });
+            for &p in pages {
+                let on = self.settings_page == p;
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(seg_w(ui, p), 26.0), egui::Sense::click());
+                let hov = resp.hovered();
+                let (fill, txt) = match (on, agent) {
+                    (true, false) => (theme::ACCENT_DEEP, theme::ON_ACCENT),
+                    (true, true) => (theme::AGENT_COLOR, theme::AGENT_COLOR_TEXT),
+                    (false, _) if hov => (theme::mix(theme::DARK_PANEL_HI, theme::CREAM, 0.07), theme::CREAM),
+                    (false, _) => (theme::DARK_PANEL_HI, theme::CREAM_MID),
+                };
+                ui.painter().rect_filled(rect, 2.0, fill);
+                if !on {
+                    ui.painter().rect_stroke(rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+                }
+                let g = ui.painter().layout_no_wrap(p.label().into(), font.clone(), txt);
+                ui.painter().galley(rect.center() - g.size() * 0.5, g, txt);
+                if hov {
+                    ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    self.settings_page = p;
+                }
+            }
+        };
+        if one_row {
+            ui.horizontal(|ui| {
+                group(ui, &SettingsPage::APP, false);
+                ui.add_space(8.0);
+                let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, 26.0), egui::Sense::hover());
+                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                ui.add_space(8.0);
+                group(ui, &SettingsPage::AGENT, true);
+            });
+        } else {
+            ui.horizontal(|ui| group(ui, &SettingsPage::APP, false));
+            ui.add_space(4.0);
+            ui.horizontal(|ui| group(ui, &SettingsPage::AGENT, true));
+        }
+    }
+
+    /// The selected page: its title (unless the tab row already names it),
+    /// what it is for, then its settings in a scroll area of height `h`.
+    fn settings_page_ui(&mut self, ui: &mut egui::Ui, h: f32, titled: bool, actions: &mut Vec<SettingsAction>) {
+        let page = self.settings_page;
+        let w = ui.available_width().min(640.0);
+        let h = h.max(40.0);
+        egui::ScrollArea::vertical()
+            .id_salt(("settings_scroll", page as usize))
+            .min_scrolled_height(h)
+            .max_height(h)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_max_width(w);
+                if titled || page.is_agent() {
+                    ui.horizontal(|ui| {
+                        ui.set_min_height(22.0); // rule 117
+                        if titled {
+                            ui.label(egui::RichText::new(page.label()).font(theme::medium_font(16.0)).color(theme::INK));
+                            ui.add_space(8.0);
+                        }
+                        if page.is_agent() {
+                            Self::agent_tag(ui);
+                        }
+                    });
+                    ui.add_space(2.0);
+                }
+                ui.label(egui::RichText::new(page.blurb()).size(12.0).color(theme::INK_2));
+                ui.add_space(if titled { 16.0 } else { 10.0 });
+                match page {
+                    SettingsPage::Audio => self.settings_audio_page(ui, actions),
+                    SettingsPage::Session => self.settings_session_page(ui, actions),
+                    SettingsPage::Display => self.settings_display_page(ui, actions),
+                    SettingsPage::Models => self.settings_models_page(ui, actions),
+                    SettingsPage::Keys => self.settings_keys_page(ui, actions),
+                }
+                ui.add_space(8.0);
+            });
+    }
+
+    /// The small teal "ASSISTANT ONLY" plate beside an Agent page's title.
+    fn agent_tag(ui: &mut egui::Ui) {
+        let font = theme::medium_font(9.5);
+        let g = ui.painter().layout_no_wrap("ASSISTANT ONLY".into(), font, theme::AGENT_TEXT);
+        let (r, _) = ui.allocate_exact_size(g.size() + egui::vec2(16.0, 8.0), egui::Sense::hover());
+        ui.painter().rect_filled(r, 2.0, theme::alpha(theme::AGENT_COLOR, 0.14));
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, theme::alpha(theme::AGENT_COLOR, 0.55)), egui::StrokeKind::Inside);
+        ui.painter().galley(r.center() - g.size() * 0.5, g, theme::AGENT_TEXT);
+    }
+
+    /// One setting: its name left, its control right, what it does below.
+    fn settings_row(ui: &mut egui::Ui, title: &str, desc: &str, control: impl FnOnce(&mut egui::Ui)) {
+        ui.horizontal(|ui| {
+            ui.set_min_height(26.0); // rule 117
+            ui.label(egui::RichText::new(title).font(theme::medium_font(13.5)).color(theme::INK));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
+        });
+        ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
+    }
+
+    fn settings_gap(ui: &mut egui::Ui) {
+        ui.add_space(12.0);
+        Self::stage_hairline(ui);
+        ui.add_space(12.0);
+    }
+
+    fn settings_audio_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
         let (outputs, out_current) = self
             .audio_out
             .lock()
             .map(|s| (s.outputs.clone(), s.current.clone()))
             .unwrap_or_default();
         let out_wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
-        let reduce_motion = self.reduce_motion;
-        let autosave_on = self.autosave.enabled;
-        let count_in_enabled = self.count_in_enabled;
-        let count_in_bars = self.count_in_bars;
-        let buffer_frames = self.buffer_frames;
-        let buf_sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
-        let live_buffer = self.engine_stats.audio_live.then_some((self.engine_stats.buffer_frames, self.engine_stats.buffer_ms));
-        let detected_scale = ui.ctx().pixels_per_point();
-        let mut actions: Vec<SettingsAction> = Vec::new();
-
-        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-            ui.shrink_clip_rect(sheet);
-            ui.add_enabled_ui(!help, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Settings").font(theme::medium_font(18.0)).color(theme::INK));
-                    if !self.settings_msg.is_empty() {
-                        ui.add_space(16.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let col = if self.settings_msg.contains("failed") {
-                                theme::CLIP_BRIGHT
-                            } else {
-                                theme::LIVE_TEAL
-                            };
-                            ui.add(egui::Label::new(egui::RichText::new(&self.settings_msg).size(12.5).color(col)).truncate());
-                        });
+        let label_of = |raw: &str| outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string());
+        let selected_out = out_wanted.as_deref().map(label_of).unwrap_or_else(|| "System default".to_string());
+        Self::settings_row(ui, "Audio output", "The sound card kabelsalat plays to (the same choice as in the Mixer).", |ui| {
+            let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+            theme::Dropdown::new("dd_settings_audio_output", &selected_out)
+                .width(dd_w)
+                .popup_min_width(240.0)
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
+                    if menu.item(out_wanted.is_none(), "System default") {
+                        actions.push(SettingsAction::SetAudioOutput(None));
+                    }
+                    for o in &outputs {
+                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
+                            actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
+                        }
                     }
                 });
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("agent models · API keys · preferences · Tab / Esc: back to the rack")
-                        .size(13.0)
-                        .color(theme::INK_2),
-                );
-                ui.label(
-                    egui::RichText::new(format!("kabelsalat {}", crate::VERSION))
-                        .size(12.5)
-                        .color(theme::INK_2),
-                );
-                ui.add_space(12.0);
-                Self::stage_hairline(ui);
-                ui.add_space(14.0);
-
-                let avail_w = ui.available_width().max(200.0);
-                let body_h = ui.available_height().max(80.0);
-                let two_col = avail_w >= 640.0;
-
-                let draw_models = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
-                    theme::section_label(ui, "Agent models");
-                    ui.add_space(8.0);
-                    for (idx, role) in Role::ALL.iter().copied().enumerate() {
-                        if idx > 0 {
-                            ui.add_space(10.0);
-                            Self::stage_hairline(ui);
-                            ui.add_space(10.0);
-                        }
-                        let route = match role {
-                            Role::Decide => &decide_route,
-                            Role::Act => &act_route,
-                        };
-                        let choices = crate::assistant::role_model_choices(role, keys, &route.model);
-                        let desc = match role {
-                            Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
-                            Role::Act => "Handles conversation, questions, and multi-step rack edits.",
-                        };
-
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(role.label()).font(theme::medium_font(14.0)).color(theme::INK));
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new(role.model_field()).size(11.0).color(theme::INK_2));
-                            if role == Role::Decide {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if theme::chip_button(ui, if decide_on { "On" } else { "Off" }, decide_on)
-                                        .on_hover_text("enable or disable Jev decisions before the chat model")
-                                        .clicked()
-                                    {
-                                        actions.push(SettingsAction::ToggleDecide);
-                                    }
-                                });
-                            }
-                        });
-                        ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
-                        ui.add_space(6.0);
-
-                        // One row when the column fits dropdown + field + Apply,
-                        // else the dropdown gets its own row; every width comes
-                        // from the column so a row never widens it.
-                        let col_w = ui.available_width();
-                        let gap = ui.spacing().item_spacing.x;
-                        let one_row = col_w >= 460.0;
-                        let dd_w = if one_row { (col_w * 0.44).clamp(150.0, 240.0) } else { col_w.min(320.0) };
-                        let mut picked: Option<String> = None;
-                        let mut apply_other = false;
-                        let mut dropdown = |ui: &mut egui::Ui| {
-                            theme::Dropdown::new(("dd_settings_model", role.model_field()), &route.model)
-                                .width(dd_w)
-                                .popup_min_width(240.0)
-                                .text_size(12.0)
-                                .show_ui(ui, |menu| {
-                                    for m in &choices {
-                                        if menu.item(*m == route.model, m) {
-                                            picked = Some(m.clone());
-                                        }
-                                    }
-                                });
-                        };
-                        let mut other_id = |ui: &mut egui::Ui| {
-                            let field_w = ui.available_width()
-                                - theme::chip_button_width(ui, "Apply")
-                                - gap
-                                - RECESSED_INPUT_CHROME;
-                            let input = app.settings_role_input_mut(role);
-                            let edit = Self::recessed_input(ui, input, field_w.max(60.0), "other model id…");
-                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                                apply_other = true;
-                            }
-                            if theme::chip_button(ui, "Apply", false).clicked() {
-                                apply_other = true;
-                            }
-                        };
-                        if one_row {
-                            ui.horizontal(|ui| {
-                                dropdown(ui);
-                                other_id(ui);
-                            });
-                        } else {
-                            dropdown(ui);
-                            ui.add_space(6.0);
-                            ui.horizontal(|ui| other_id(ui));
-                        }
-                        if let Some(m) = picked {
-                            actions.push(SettingsAction::SetModel(role, m));
-                        }
-                        if apply_other {
-                            let input = app.settings_role_input_mut(role);
-                            let custom = input.trim().to_string();
-                            if !custom.is_empty() {
-                                input.clear();
-                                actions.push(SettingsAction::SetModel(role, custom));
-                            }
-                        }
-
-                        ui.add_space(6.0);
-                        // One galley for the whole status line: it wraps inside
-                        // the column as a unit instead of as overlapping labels.
-                        let mut status = egui::text::LayoutJob::default();
-                        let mut part = |text: &str, color: Color32| {
-                            status.append(
-                                text,
-                                0.0,
-                                egui::TextFormat { font_id: FontId::proportional(11.5), color, ..Default::default() },
-                            );
-                        };
-                        if role == Role::Decide && !decide_on {
-                            part("Effective route: Off · chat model handles requests", theme::INK_2);
-                        } else {
-                            let spec = route.endpoint.spec();
-                            part(&format!("Route: {} · {}", spec.label, route.model), theme::CREAM_META);
-                            if keys.has(route.endpoint) {
-                                part(&format!("  ·  {} key set", spec.label), theme::LIVE_TEAL);
-                            } else {
-                                part(&format!("  ·  {} key not set", spec.label), theme::ACCENT_BRIGHT);
-                            }
-                            if role == Role::Decide && spec.decisions_url.is_none() {
-                                part("  ·  endpoint has no decisions API", theme::ACCENT_BRIGHT);
-                            }
-                        }
-                        ui.add(egui::Label::new(status).wrap());
-                    }
-                };
-
-                let draw_keys = |ui: &mut egui::Ui, app: &mut Self, actions: &mut Vec<SettingsAction>| {
-                    theme::section_label(ui, "API keys");
-                    ui.add_space(6.0);
-                    ui.label(
-                        egui::RichText::new("Stored locally (~/.config/kabelsalat/config.json, 0600). Saving restarts the assistant worker.")
-                            .size(11.5)
-                            .color(theme::INK_2),
-                    );
-                    ui.add_space(10.0);
-                    for (idx, endpoint) in [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().copied().enumerate() {
-                        if idx > 0 {
-                            ui.add_space(10.0);
-                        }
-                        let spec = endpoint.spec();
-                        let is_set = keys.has(endpoint);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(spec.label).font(theme::medium_font(14.0)).color(theme::INK));
-                            ui.add_space(6.0);
-                            let (status, col) = if is_set {
-                                ("set", theme::LIVE_TEAL)
-                            } else {
-                                ("not set", theme::CREAM_DIM)
-                            };
-                            ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new(spec.key_field).size(11.0).color(theme::INK_2));
-                        });
-                        ui.add_space(4.0);
-
-                        let field_w = (ui.available_width()
-                            - theme::primary_button_width(ui, "Save")
-                            - theme::chip_button_width(ui, "Remove")
-                            - ui.spacing().item_spacing.x * 2.0
-                            - RECESSED_INPUT_CHROME)
-                            .clamp(60.0, 320.0);
-                        let hint = match endpoint {
-                            Endpoint::DeepSeek => "sk-…",
-                            Endpoint::OpenRouter => "sk-or-…",
-                        };
-                        let mut do_save = false;
-                        let mut do_remove = false;
-                        ui.horizontal(|ui| {
-                            let buf = app.settings_key_input_mut(endpoint);
-                            let edit = egui::Frame::new()
-                                .fill(theme::PAPER_SINK)
-                                .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                                .corner_radius(2.0)
-                                .inner_margin(egui::Margin::symmetric(8, 5))
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(buf)
-                                            .id_salt(("settings_api_key", spec.key_field))
-                                            .password(true)
-                                            .frame(egui::Frame::NONE)
-                                            .desired_width(field_w)
-                                            .hint_text(hint),
-                                    )
-                                })
-                                .inner;
-                            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                                do_save = true;
-                            }
-                            if theme::primary_button(ui, "Save").clicked() {
-                                do_save = true;
-                            }
-                            ui.add_enabled_ui(is_set, |ui| {
-                                if theme::danger_button(ui, "Remove", false).clicked() {
-                                    do_remove = true;
-                                }
-                            });
-                        });
-                        if do_save {
-                            let buf = app.settings_key_input_mut(endpoint);
-                            let val = buf.trim().to_string();
-                            if !val.is_empty() {
-                                buf.clear();
-                                actions.push(SettingsAction::SaveKey(endpoint, val));
-                            }
-                        }
-                        if do_remove {
-                            app.settings_key_input_mut(endpoint).clear();
-                            actions.push(SettingsAction::RemoveKey(endpoint));
-                        }
-                    }
-                };
-
-                let draw_prefs = |ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>| {
-                    theme::section_label(ui, "Preferences");
-                    ui.add_space(8.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Reduce motion").font(theme::medium_font(13.5)).color(theme::INK));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::chip_button(ui, if reduce_motion { "On" } else { "Off" }, reduce_motion).clicked() {
-                                actions.push(SettingsAction::ToggleReduceMotion);
-                            }
-                        });
-                    });
-                    ui.label(egui::RichText::new("Snaps rack animations and disables pulsing indicators (ui_reduce_motion).").size(11.5).color(theme::INK_2));
-                    ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Autosave sessions").font(theme::medium_font(13.5)).color(theme::INK));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::chip_button(ui, if autosave_on { "On" } else { "Off" }, autosave_on).clicked() {
-                                actions.push(SettingsAction::ToggleAutosave);
-                            }
-                        });
-                    });
-                    ui.label(egui::RichText::new("Saves changes to the open session every 20 s and on quit; unsaved patches go to 'Autosave' (session_autosave).").size(11.5).color(theme::INK_2));
-                    ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Count-in").font(theme::medium_font(13.5)).color(theme::INK));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let bars_label = if count_in_bars == 1 { "1 bar".to_string() } else { format!("{count_in_bars} bars") };
-                            theme::Dropdown::new("dd_settings_count_in_bars", bars_label)
-                                .width(92.0)
-                                .text_size(12.0)
-                                .show_ui(ui, |menu| {
-                                    for b in 1..=crate::transport::MAX_COUNT_IN_BARS {
-                                        let lbl = if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
-                                        if menu.item(count_in_bars == b, &lbl) {
-                                            actions.push(SettingsAction::SetCountIn(count_in_enabled, b));
-                                        }
-                                    }
-                                });
-                            ui.add_space(6.0);
-                            if theme::chip_button(ui, if count_in_enabled { "On" } else { "Off" }, count_in_enabled).clicked() {
-                                actions.push(SettingsAction::SetCountIn(!count_in_enabled, count_in_bars));
-                            }
-                        });
-                    });
-                    ui.label(egui::RichText::new("Plays metronome clicks before master playback starts.").size(11.5).color(theme::INK_2));
-                    ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(10.0);
-
-                    let label_of = |raw: &str| {
-                        outputs.iter().find(|o| o.raw == raw).map(|o| o.name.clone()).unwrap_or_else(|| raw.to_string())
-                    };
-                    let selected_out = match &out_wanted {
-                        Some(w) => label_of(w),
-                        None => "System default".to_string(),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Audio output").font(theme::medium_font(13.5)).color(theme::INK));
-                        let out_dd_w = (ui.available_width() - 100.0).clamp(130.0, 200.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            theme::Dropdown::new("dd_settings_audio_output", &selected_out)
-                                .width(out_dd_w)
-                                .popup_min_width(240.0)
-                                .text_size(12.0)
-                                .show_ui(ui, |menu| {
-                                    if menu.item(out_wanted.is_none(), "System default") {
-                                        actions.push(SettingsAction::SetAudioOutput(None));
-                                    }
-                                    for o in &outputs {
-                                        if menu.item(out_wanted.as_deref() == Some(o.raw.as_str()), &o.name) {
-                                            actions.push(SettingsAction::SetAudioOutput(Some(o.raw.clone())));
-                                        }
-                                    }
-                                });
-                        });
-                    });
-                    ui.label(egui::RichText::new("Sound card kabelsalat plays to (same as Mixer).").size(11.5).color(theme::INK_2));
-                    if let Some(c) = &out_current {
-                        ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::INK_2));
-                    }
-                    ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(10.0);
-
-                    let fmt_buf = |f: u32| format!("{f} frames ({:.1} ms)", f as f64 / buf_sr * 1000.0);
-                    let selected_buf = fmt_buf(buffer_frames);
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Buffer size").font(theme::medium_font(13.5)).color(theme::INK));
-                        let buf_dd_w = (ui.available_width() - 8.0).clamp(130.0, 200.0);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            theme::Dropdown::new("dd_settings_buffer_size", &selected_buf)
-                                .width(buf_dd_w)
-                                .popup_min_width(180.0)
-                                .text_size(12.0)
-                                .show_ui(ui, |menu| {
-                                    for &f in crate::bridge::BUFFER_SIZE_CHOICES {
-                                        if menu.item(buffer_frames == f, &fmt_buf(f)) {
-                                            actions.push(SettingsAction::SetBufferSize(f));
-                                        }
-                                    }
-                                });
-                        });
-                    });
-                    ui.label(egui::RichText::new("Lower reduces latency; higher prevents dropouts (xruns).").size(11.5).color(theme::INK_2));
-                    if let Some((live_f, live_ms)) = live_buffer {
-                        if live_f != buffer_frames {
-                            ui.label(egui::RichText::new(format!("Active: {live_f} frames ({live_ms:.1} ms)")).size(11.0).color(theme::INK_2));
-                        }
-                    }
-                    ui.add_space(10.0);
-                    Self::stage_hairline(ui);
-                    ui.add_space(10.0);
-
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("UI scale").font(theme::medium_font(13.5)).color(theme::INK));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("{detected_scale:.2}×"))
-                                    .font(theme::medium_font(13.5))
-                                    .color(theme::INK),
-                            );
-                        });
-                    });
-                    ui.label(egui::RichText::new("From the display · override with KABELSALAT_UI_SCALE.").size(11.5).color(theme::INK_2));
-                };
-
-                egui::ScrollArea::vertical()
-                    .id_salt("settings_scroll")
-                    .min_scrolled_height(body_h)
-                    .max_height(body_h)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        if two_col {
-                            let left_w = ((avail_w - 25.0) * 0.52).clamp(300.0, 620.0);
-                            ui.horizontal_top(|ui| {
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(left_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        draw_models(ui, self, &mut actions);
-                                    },
-                                );
-                                ui.add_space(12.0);
-                                let (r, _) = ui.allocate_exact_size(egui::vec2(1.0, body_h.max(420.0)), egui::Sense::hover());
-                                ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
-                                ui.add_space(12.0);
-                                let right_w = ui.available_width();
-                                ui.allocate_ui_with_layout(
-                                    egui::vec2(right_w, 0.0),
-                                    egui::Layout::top_down(egui::Align::Min),
-                                    |ui| {
-                                        draw_keys(ui, self, &mut actions);
-                                        ui.add_space(16.0);
-                                        Self::stage_hairline(ui);
-                                        ui.add_space(14.0);
-                                        draw_prefs(ui, &mut actions);
-                                    },
-                                );
-                            });
-                        } else {
-                            draw_models(ui, self, &mut actions);
-                            ui.add_space(16.0);
-                            Self::stage_hairline(ui);
-                            ui.add_space(14.0);
-                            draw_keys(ui, self, &mut actions);
-                            ui.add_space(16.0);
-                            Self::stage_hairline(ui);
-                            ui.add_space(14.0);
-                            draw_prefs(ui, &mut actions);
-                        }
-                    });
-            });
         });
+        if let Some(c) = &out_current {
+            ui.label(egui::RichText::new(format!("Active: {}", label_of(c))).size(11.0).color(theme::CREAM_META));
+        }
+        Self::settings_gap(ui);
 
-        for act in actions {
-            match act {
-                SettingsAction::ToggleDecide => {
-                    let next = !self.assistant.decide_enabled();
-                    self.assistant.set_decide_enabled(next);
-                    self.settings_msg = if next {
-                        "Decisions model enabled".into()
-                    } else {
-                        "Decisions model turned off".into()
-                    };
-                }
-                SettingsAction::SetModel(role, m) => {
-                    self.settings_msg = self.assistant.set_role_model(role, &m);
-                }
-                SettingsAction::SaveKey(endpoint, key) => {
-                    let label = endpoint.spec().label;
-                    match self.assistant.save_api_key(endpoint, &key) {
-                        Ok(()) => self.settings_msg = format!("{label} key saved · worker restarted"),
-                        Err(e) => self.settings_msg = format!("Save {label} key failed: {e}"),
+        let buffer_frames = self.buffer_frames;
+        let sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
+        let fmt_buf = |f: u32| format!("{f} frames ({:.1} ms)", f as f64 / sr * 1000.0);
+        let selected_buf = fmt_buf(buffer_frames);
+        Self::settings_row(ui, "Buffer size", "Lower reduces latency; higher prevents dropouts (xruns).", |ui| {
+            let dd_w = (ui.available_width() - 8.0).clamp(130.0, 220.0);
+            theme::Dropdown::new("dd_settings_buffer_size", &selected_buf)
+                .width(dd_w)
+                .popup_min_width(180.0)
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
+                    for &f in crate::bridge::BUFFER_SIZE_CHOICES {
+                        if menu.item(buffer_frames == f, &fmt_buf(f)) {
+                            actions.push(SettingsAction::SetBufferSize(f));
+                        }
                     }
+                });
+        });
+        if self.engine_stats.audio_live && self.engine_stats.buffer_frames != buffer_frames {
+            let (f, ms) = (self.engine_stats.buffer_frames, self.engine_stats.buffer_ms);
+            ui.label(egui::RichText::new(format!("Active: {f} frames ({ms:.1} ms)")).size(11.0).color(theme::CREAM_META));
+        }
+    }
+
+    fn settings_session_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        let autosave_on = self.autosave.enabled;
+        Self::settings_row(
+            ui,
+            "Autosave sessions",
+            "Saves changes to the open session every 20 s and on quit; unsaved patches go to 'Autosave'.",
+            |ui| {
+                if theme::chip_button(ui, if autosave_on { "On" } else { "Off" }, autosave_on).clicked() {
+                    actions.push(SettingsAction::ToggleAutosave);
                 }
-                SettingsAction::RemoveKey(endpoint) => {
-                    let label = endpoint.spec().label;
-                    match self.assistant.remove_api_key(endpoint) {
-                        Ok(()) => self.settings_msg = format!("{label} key removed"),
-                        Err(e) => self.settings_msg = format!("Remove {label} key failed: {e}"),
+            },
+        );
+        Self::settings_gap(ui);
+
+        let (enabled, bars) = (self.count_in_enabled, self.count_in_bars);
+        let bars_label = |b: u8| if b == 1 { "1 bar".to_string() } else { format!("{b} bars") };
+        Self::settings_row(ui, "Count-in", "Plays metronome clicks before master playback starts.", |ui| {
+            theme::Dropdown::new("dd_settings_count_in_bars", bars_label(bars))
+                .width(92.0)
+                .text_size(12.0)
+                .show_ui(ui, |menu| {
+                    for b in 1..=crate::transport::MAX_COUNT_IN_BARS {
+                        if menu.item(bars == b, &bars_label(b)) {
+                            actions.push(SettingsAction::SetCountIn(enabled, b));
+                        }
                     }
+                });
+            ui.add_space(6.0);
+            if theme::chip_button(ui, if enabled { "On" } else { "Off" }, enabled).clicked() {
+                actions.push(SettingsAction::SetCountIn(!enabled, bars));
+            }
+        });
+    }
+
+    fn settings_display_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        let reduce_motion = self.reduce_motion;
+        Self::settings_row(ui, "Reduce motion", "Snaps rack animations and stops pulsing indicators.", |ui| {
+            if theme::chip_button(ui, if reduce_motion { "On" } else { "Off" }, reduce_motion).clicked() {
+                actions.push(SettingsAction::ToggleReduceMotion);
+            }
+        });
+        Self::settings_gap(ui);
+        let scale = ui.ctx().pixels_per_point();
+        Self::settings_row(ui, "UI scale", "Follows the display the window is on; override with KABELSALAT_UI_SCALE.", |ui| {
+            ui.label(egui::RichText::new(format!("{scale:.2}×")).font(theme::medium_font(13.5)).color(theme::INK));
+        });
+    }
+
+    fn settings_models_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        use crate::llm::Role;
+        let keys = self.assistant.keys();
+        let decide_on = self.assistant.decide_enabled();
+        for (idx, role) in Role::ALL.iter().copied().enumerate() {
+            if idx > 0 {
+                Self::settings_gap(ui);
+            }
+            let route = self.assistant.route_for(role);
+            let choices = crate::assistant::role_model_choices(role, keys, &route.model);
+            let desc = match role {
+                Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
+                Role::Act => "Handles conversation, questions, and multi-step rack edits.",
+            };
+            ui.horizontal(|ui| {
+                ui.set_min_height(26.0); // rule 117
+                ui.label(egui::RichText::new(role.label()).font(theme::medium_font(14.0)).color(theme::INK));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(role.model_field()).size(11.0).color(theme::INK_2));
+                if role == Role::Decide {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::chip_button(ui, if decide_on { "On" } else { "Off" }, decide_on)
+                            .on_hover_text("enable or disable Jev decisions before the chat model")
+                            .clicked()
+                        {
+                            actions.push(SettingsAction::ToggleDecide);
+                        }
+                    });
                 }
-                SettingsAction::ToggleReduceMotion => {
-                    self.reduce_motion = !self.reduce_motion;
-                    let _ = crate::assistant::save_reduce_motion(self.reduce_motion);
-                    self.settings_msg = if self.reduce_motion {
-                        "Reduce motion enabled".into()
-                    } else {
-                        "Reduce motion disabled".into()
-                    };
+            });
+            ui.label(egui::RichText::new(desc).size(11.5).color(theme::INK_2));
+            ui.add_space(8.0);
+
+            // One row when the column fits dropdown + field + Apply, else the
+            // dropdown gets its own row; every width comes from the column so
+            // a row never widens it (rule 100).
+            let col_w = ui.available_width();
+            let gap = ui.spacing().item_spacing.x;
+            let one_row = col_w >= 460.0;
+            let dd_w = if one_row { (col_w * 0.44).clamp(150.0, 240.0) } else { col_w.min(320.0) };
+            let mut picked: Option<String> = None;
+            let mut apply_other = false;
+            let mut dropdown = |ui: &mut egui::Ui| {
+                theme::Dropdown::new(("dd_settings_model", role.model_field()), &route.model)
+                    .width(dd_w)
+                    .popup_min_width(240.0)
+                    .text_size(12.0)
+                    .show_ui(ui, |menu| {
+                        for m in &choices {
+                            if menu.item(*m == route.model, m) {
+                                picked = Some(m.clone());
+                            }
+                        }
+                    });
+            };
+            let mut other_id = |ui: &mut egui::Ui, app: &mut Self| {
+                let field_w = ui.available_width() - theme::chip_button_width(ui, "Apply") - gap - RECESSED_INPUT_CHROME;
+                let edit = Self::recessed_input(ui, app.settings_role_input_mut(role), field_w.max(60.0), "other model id…");
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    apply_other = true;
                 }
-                SettingsAction::ToggleAutosave => {
-                    self.autosave.enabled = !self.autosave.enabled;
-                    self.autosave_rebase();
-                    let saved = crate::assistant::save_session_autosave(self.autosave.enabled);
-                    self.settings_msg = match (saved, self.autosave.enabled) {
-                        (Err(e), _) => format!("Saving the autosave setting failed: {e}"),
-                        (Ok(()), true) => "Autosave enabled".into(),
-                        (Ok(()), false) => "Autosave disabled".into(),
-                    };
+                if theme::chip_button(ui, "Apply", false).clicked() {
+                    apply_other = true;
                 }
-                SettingsAction::SetCountIn(enabled, bars) => {
-                    self.set_count_in(enabled, bars);
+            };
+            if one_row {
+                ui.horizontal(|ui| {
+                    dropdown(ui);
+                    other_id(ui, self);
+                });
+            } else {
+                dropdown(ui);
+                ui.add_space(6.0);
+                ui.horizontal(|ui| other_id(ui, self));
+            }
+            if let Some(m) = picked {
+                actions.push(SettingsAction::SetModel(role, m));
+            }
+            if apply_other {
+                let input = self.settings_role_input_mut(role);
+                let custom = input.trim().to_string();
+                if !custom.is_empty() {
+                    input.clear();
+                    actions.push(SettingsAction::SetModel(role, custom));
                 }
-                SettingsAction::SetAudioOutput(out) => {
-                    self.set_audio_output(out);
+            }
+
+            ui.add_space(6.0);
+            let spec = route.endpoint.spec();
+            let in_use = role != Role::Decide || decide_on;
+            // One galley for the whole status line: it wraps inside the
+            // column as a unit instead of as overlapping labels (rule 100).
+            let mut status = egui::text::LayoutJob::default();
+            let mut part = |text: &str, color: Color32| {
+                status.append(text, 0.0, egui::TextFormat { font_id: FontId::proportional(11.5), color, ..Default::default() });
+            };
+            if !in_use {
+                part("Effective route: Off · chat model handles requests", theme::INK_2);
+            } else {
+                part(&format!("Route: {} · {}", spec.label, route.model), theme::CREAM_META);
+                if keys.has(route.endpoint) {
+                    part(&format!("  ·  {} key set", spec.label), theme::LIVE_TEAL);
+                } else {
+                    part(&format!("  ·  {} key not set", spec.label), theme::ACCENT_BRIGHT);
                 }
-                SettingsAction::SetBufferSize(frames) => match self.set_buffer_frames(frames) {
-                    Ok(msg) => self.settings_msg = msg,
-                    Err(e) => self.settings_msg = format!("Buffer size failed: {e}"),
-                },
+                if role == Role::Decide && spec.decisions_url.is_none() {
+                    part("  ·  endpoint has no decisions API", theme::ACCENT_BRIGHT);
+                }
+            }
+            ui.add(egui::Label::new(status).wrap());
+            if in_use && !keys.has(route.endpoint) {
+                ui.add_space(6.0);
+                if theme::chip_button(ui, &format!("Set {} key", spec.label), false).clicked() {
+                    self.settings_page = SettingsPage::Keys;
+                }
             }
         }
+    }
 
-        if self.show_help { self.draw_help(&painter, rect); }
+    fn settings_keys_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
+        use crate::llm::Endpoint;
+        let keys = self.assistant.keys();
+        for (idx, endpoint) in [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().copied().enumerate() {
+            if idx > 0 {
+                Self::settings_gap(ui);
+            }
+            let spec = endpoint.spec();
+            let is_set = keys.has(endpoint);
+            ui.horizontal(|ui| {
+                ui.set_min_height(22.0); // rule 117
+                ui.label(egui::RichText::new(spec.label).font(theme::medium_font(14.0)).color(theme::INK));
+                ui.add_space(6.0);
+                let (status, col) = if is_set { ("set", theme::LIVE_TEAL) } else { ("not set", theme::CREAM_DIM) };
+                ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(spec.key_field).size(11.0).color(theme::INK_2));
+            });
+            ui.add_space(6.0);
+
+            let field_w = (ui.available_width()
+                - theme::primary_button_width(ui, "Save")
+                - theme::chip_button_width(ui, "Remove")
+                - ui.spacing().item_spacing.x * 2.0
+                - RECESSED_INPUT_CHROME)
+                .clamp(60.0, 320.0);
+            let hint = match endpoint {
+                Endpoint::DeepSeek => "sk-…",
+                Endpoint::OpenRouter => "sk-or-…",
+            };
+            let mut do_save = false;
+            let mut do_remove = false;
+            ui.horizontal(|ui| {
+                let buf = self.settings_key_input_mut(endpoint);
+                let edit = egui::Frame::new()
+                    .fill(theme::PAPER_SINK)
+                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                    .corner_radius(2.0)
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(buf)
+                                .id_salt(("settings_api_key", spec.key_field))
+                                .password(true)
+                                .frame(egui::Frame::NONE)
+                                .desired_width(field_w)
+                                .hint_text(hint),
+                        )
+                    })
+                    .inner;
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    do_save = true;
+                }
+                if theme::primary_button(ui, "Save").clicked() {
+                    do_save = true;
+                }
+                ui.add_enabled_ui(is_set, |ui| {
+                    if theme::danger_button(ui, "Remove", false).clicked() {
+                        do_remove = true;
+                    }
+                });
+            });
+            if do_save {
+                let buf = self.settings_key_input_mut(endpoint);
+                let val = buf.trim().to_string();
+                if !val.is_empty() {
+                    buf.clear();
+                    actions.push(SettingsAction::SaveKey(endpoint, val));
+                }
+            }
+            if do_remove {
+                self.settings_key_input_mut(endpoint).clear();
+                actions.push(SettingsAction::RemoveKey(endpoint));
+            }
+        }
+    }
+
+    fn apply_settings_action(&mut self, act: SettingsAction) {
+        match act {
+            SettingsAction::ToggleDecide => {
+                let next = !self.assistant.decide_enabled();
+                self.assistant.set_decide_enabled(next);
+                self.settings_msg = if next { "Decisions model enabled".into() } else { "Decisions model turned off".into() };
+            }
+            SettingsAction::SetModel(role, m) => {
+                self.settings_msg = self.assistant.set_role_model(role, &m);
+            }
+            SettingsAction::SaveKey(endpoint, key) => {
+                let label = endpoint.spec().label;
+                self.settings_msg = match self.assistant.save_api_key(endpoint, &key) {
+                    Ok(()) => format!("{label} key saved · assistant restarted"),
+                    Err(e) => format!("Save {label} key failed: {e}"),
+                };
+            }
+            SettingsAction::RemoveKey(endpoint) => {
+                let label = endpoint.spec().label;
+                self.settings_msg = match self.assistant.remove_api_key(endpoint) {
+                    Ok(()) => format!("{label} key removed"),
+                    Err(e) => format!("Remove {label} key failed: {e}"),
+                };
+            }
+            SettingsAction::ToggleReduceMotion => {
+                self.reduce_motion = !self.reduce_motion;
+                let _ = crate::assistant::save_reduce_motion(self.reduce_motion);
+                self.settings_msg = if self.reduce_motion { "Reduce motion enabled".into() } else { "Reduce motion disabled".into() };
+            }
+            SettingsAction::ToggleAutosave => {
+                self.autosave.enabled = !self.autosave.enabled;
+                self.autosave_rebase();
+                let saved = crate::assistant::save_session_autosave(self.autosave.enabled);
+                self.settings_msg = match (saved, self.autosave.enabled) {
+                    (Err(e), _) => format!("Saving the autosave setting failed: {e}"),
+                    (Ok(()), true) => "Autosave enabled".into(),
+                    (Ok(()), false) => "Autosave disabled".into(),
+                };
+            }
+            SettingsAction::SetCountIn(enabled, bars) => self.set_count_in(enabled, bars),
+            SettingsAction::SetAudioOutput(out) => self.set_audio_output(out),
+            SettingsAction::SetBufferSize(frames) => match self.set_buffer_frames(frames) {
+                Ok(msg) => self.settings_msg = msg,
+                Err(e) => self.settings_msg = format!("Buffer size failed: {e}"),
+            },
+        }
     }
 
     /// One bottom dock: exactly one occupant at a time (None / Keyboard /
@@ -28926,6 +29077,22 @@ mod settings_and_dropdown_tests {
         run_frame(app, ctx, size, vec![])
     }
 
+    /// Opens a Settings page by clicking its entry in the rail or the tab
+    /// row (the leftmost text with that label: a page title sits right of
+    /// the rail) and returns the frame of the page it shows.
+    fn open_settings_page(app: &mut DemoApp, ctx: &egui::Context, size: Vec2, label: &str) -> (Vec<(String, Rect)>, Vec<(Rect, Color32)>, Vec<egui::LayerId>) {
+        let (texts, _, _) = warm(app, ctx, size);
+        let pos = texts
+            .iter()
+            .filter(|(t, _)| t == label)
+            .min_by(|a, b| a.1.left().total_cmp(&b.1.left()))
+            .unwrap_or_else(|| panic!("{size:?}: no {label:?} entry in Settings: {texts:?}"))
+            .1
+            .center();
+        click_at(app, ctx, size, pos);
+        warm(app, ctx, size)
+    }
+
     /// Every text galley of the Settings sheet stays inside the sheet,
     /// keeps its words on one line, and overlaps no other galley.
     fn assert_settings_text_layout(app: &DemoApp, texts: &[(String, Rect)], size: Vec2) {
@@ -29197,7 +29364,7 @@ mod settings_and_dropdown_tests {
 
         run_frame(&mut app, &ctx, size, key(Key::Comma));
         assert_eq!(app.stage_view, StageView::Settings);
-        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
         let hint_pos = texts.iter().find(|(t, _)| t == "other model id…").expect("other model id input").1.center();
         click_at(&mut app, &ctx, size, hint_pos);
         let mut ev = key(Key::Comma);
@@ -29218,7 +29385,7 @@ mod settings_and_dropdown_tests {
 
         let ctx = egui::Context::default();
         for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
-            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "API keys");
             for (t, _) in &texts {
                 assert!(!t.contains("9942") && !t.contains("deepseek-secret"), "painted text leaked key: {t}");
                 assert!(!t.contains("7731") && !t.contains("openrouter-secret"), "painted text leaked key: {t}");
@@ -29280,24 +29447,33 @@ mod settings_and_dropdown_tests {
         app.stage_view = StageView::Settings;
         let ctx = egui::Context::default();
 
-        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
-            let (texts, _, _) = warm(&mut app, &ctx, size);
-            assert_settings_text_layout(&app, &texts, size);
-            assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"));
-            if size.y >= 800.0 {
-                assert!(texts.iter().any(|(t, _)| t == "Chat model"));
-                assert!(texts.iter().all(|(t, _)| t != "Vision model"), "no vision role: {texts:?}");
-                assert!(texts.iter().any(|(t, _)| t == "1.60×"), "read-only UI scale shown at 781x950: {texts:?}");
-            }
-            for (t, _) in &texts {
-                let low = t.to_lowercase();
-                assert!(!low.contains("faster") && !low.contains("speed") && !low.contains("0.2 s") && !low.contains("0.3 s"),
-                    "rule 78 violation in Settings text: {t}");
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(781.0, 468.0), Vec2::new(1280.0, 900.0)] {
+            for page in SettingsPage::APP.into_iter().chain(SettingsPage::AGENT) {
+                let (texts, _, _) = open_settings_page(&mut app, &ctx, size, page.label());
+                assert_settings_text_layout(&app, &texts, size);
+                for (t, _) in &texts {
+                    let low = t.to_lowercase();
+                    assert!(!low.contains("faster") && !low.contains("speed") && !low.contains("0.2 s") && !low.contains("0.3 s"),
+                        "rule 78 violation in Settings text: {t}");
+                }
+                match page {
+                    SettingsPage::Models => {
+                        assert!(texts.iter().any(|(t, _)| t == "Decisions (Jev)"), "{size:?}");
+                        assert!(texts.iter().all(|(t, _)| t != "Vision model"), "no vision role: {texts:?}");
+                        if size.y >= 800.0 {
+                            assert!(texts.iter().any(|(t, _)| t == "Chat model"), "{size:?}");
+                        }
+                    }
+                    SettingsPage::Display => {
+                        assert!(texts.iter().any(|(t, _)| t == "1.60×"), "{size:?}: read-only UI scale shown: {texts:?}");
+                    }
+                    _ => {}
+                }
             }
         }
 
         let size = Vec2::new(1280.0, 900.0);
-        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
         let act_dd = texts.iter().find(|(t, _)| t == crate::llm::DEEPSEEK_CHAT).expect("Act model dropdown").1.center();
         let (texts, _, _) = open_dropdown(&mut app, &ctx, size, act_dd);
         let opus = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("OpenRouter choice in Act dropdown").1.center();
@@ -29333,7 +29509,7 @@ mod settings_and_dropdown_tests {
         assert!(!app.assistant.decide_enabled());
         assert!(!app.assistant.decides_first());
 
-        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Display");
         let rm_y = texts.iter().find(|(t, _)| t == "Reduce motion").unwrap().1.center().y;
         let rm_toggle = texts.iter()
             .find(|(t, r)| t == "Off" && (r.center().y - rm_y).abs() < 16.0)
@@ -29341,12 +29517,81 @@ mod settings_and_dropdown_tests {
         click_at(&mut app, &ctx, size, rm_toggle);
         assert!(app.reduce_motion);
 
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Session");
         let ci_y = texts.iter().find(|(t, _)| t == "Count-in").unwrap().1.center().y;
         let ci_toggle = texts.iter()
             .find(|(t, r)| t == "Off" && (r.center().y - ci_y).abs() < 16.0)
             .expect("Count-in toggle").1.center();
         click_at(&mut app, &ctx, size, ci_toggle);
         assert!(app.count_in_enabled);
+    }
+
+    /// Agent settings have pages of their own, listed after every App page
+    /// under their own heading and marked in the agent's teal: no App page
+    /// shows an assistant control and no Agent page an app one, beside the
+    /// rail (1280x900) and under the tab row of a small sheet (781x468).
+    #[test]
+    fn agent_settings_have_their_own_pages_apart_from_the_app_settings() {
+        let app_only = ["Audio output", "Buffer size", "Autosave sessions", "Count-in", "Reduce motion", "UI scale"];
+        let agent_only = ["Decisions (Jev)", "Chat model", "DeepSeek", "OpenRouter", "ASSISTANT ONLY"];
+        for (size, rail) in [(Vec2::new(1280.0, 900.0), true), (Vec2::new(781.0, 468.0), false)] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.stage_view = StageView::Settings;
+            let ctx = egui::Context::default();
+            let mut seen: Vec<&str> = Vec::new();
+            for page in SettingsPage::APP.into_iter().chain(SettingsPage::AGENT) {
+                let (texts, _, _) = open_settings_page(&mut app, &ctx, size, page.label());
+                assert_eq!(app.settings_page, page, "{size:?}: clicking {:?} opens it", page.label());
+                let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+                let (foreign, own) = if page.is_agent() { (&app_only[..], &agent_only[..]) } else { (&agent_only[..], &app_only[..]) };
+                for t in foreign {
+                    assert!(texts.iter().all(|(x, _)| x != t), "{size:?}: {t:?} shown on the {:?} page", page.label());
+                }
+                seen.extend(own.iter().copied().filter(|t| texts.iter().any(|(x, _)| x == t)));
+                // The selection wears the group's colour: teal for the agent.
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+                let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+                out.textures_delta.clear(); // rule 11
+                let (mut rects, mut ignored) = (Vec::new(), Vec::new());
+                for cs in &out.shapes {
+                    collect_shapes(&cs.shape, &mut ignored, &mut rects);
+                }
+                let teal = rects.iter().any(|(r, f)| *f == theme::AGENT_COLOR && inner.contains_rect(*r));
+                assert_eq!(teal, page.is_agent(), "{size:?}: teal selection on the {:?} page", page.label());
+                // Every Agent entry comes after every App entry, with a gap.
+                let entry = |label: &str| {
+                    texts.iter().filter(|(t, _)| t == label).map(|(_, r)| *r)
+                        .min_by(|a, b| a.left().total_cmp(&b.left())).expect("page entry")
+                };
+                let last_app = entry(SettingsPage::Display.label());
+                let first_agent = entry(SettingsPage::Models.label());
+                if rail {
+                    assert!(first_agent.top() > last_app.bottom() + 40.0, "{size:?}: Agent group below the App group");
+                } else {
+                    assert!(first_agent.left() > last_app.right() + 40.0, "{size:?}: Agent group right of the App group");
+                }
+            }
+            if rail {
+                for t in app_only.iter().chain(agent_only.iter()) {
+                    assert!(seen.contains(t), "{size:?}: {t:?} is on some page");
+                }
+            }
+        }
+    }
+
+    /// A model whose provider has no key offers a way to that key.
+    #[test]
+    fn a_model_without_its_key_leads_to_the_api_keys_page() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
+        assert!(texts.iter().any(|(t, _)| *t == format!("{} \u{b7} no key", crate::llm::DEEPSEEK_CHAT)), "the rail warns: {texts:?}");
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Set DeepSeek key");
+        assert_eq!(app.settings_page, SettingsPage::Keys);
+        assert!(texts.iter().any(|(t, _)| t == "sk-\u{2026}"), "the DeepSeek key field is shown");
     }
 
     #[test]
@@ -31955,7 +32200,7 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 15] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
@@ -31976,6 +32221,10 @@ mod window_size_layout_tests {
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("settings", &|a| a.stage_view = StageView::Settings),
+            ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
+            ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
+            ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
+            ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
         ];
 }
 
@@ -32123,7 +32372,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 15] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -32142,6 +32391,10 @@ mod offline_shots {
             }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
             ("settings", &|a| a.stage_view = StageView::Settings),
+            ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
+            ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),
+            ("settings-models", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Models }),
+            ("settings-keys", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Keys }),
             ("sessions", &|a| a.stage_view = StageView::Sessions),
             ("agent", &|a| a.stage_demo_agent(false)),
         ];

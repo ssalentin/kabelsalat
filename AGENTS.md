@@ -1043,6 +1043,20 @@ Learned so far (2026-11-15, UI polish pass):
     DSP param range changes, check the knob default and every template value
     against it in physical units
     (`the_delay_time_knob_always_gives_an_echo_never_a_comb`).
+158. **A CLAP voice sends a parameter event only for an id its plugin
+    declared:** Surge XT dereferences the parameter it did not find, so one
+    event with another plugin's id (a knob or editor slider whose voice
+    mapping moved) was a SIGSEGV inside `process()` on the audio thread
+    (#29). `push_cmd` checks the voice's own `param_ranges`; never add a
+    path that puts a parameter event into `ev_in` around it.
+159. **A state save never runs beside the block that applies a state load:**
+    Surge XT applies `state.load` inside `process()` and its save reads the
+    patch without a lock, so `save_state` right after `load_state` (undo
+    snapshot, session capture) crashed inside the plugin. `StateGate` holds
+    such a save until no block is in flight and the voice renders silence
+    meanwhile; the audio thread never waits. Check with
+    `kabelsalat state-race-test [seconds] [patch.fxp...]` (real Surge: SIGSEGV
+    or abort within seconds before the fix).
 
 ## Working on kabelsalat
 
@@ -1080,6 +1094,7 @@ Learned so far (2026-11-15, UI polish pass):
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `state-race-test [seconds] [patch.fxp...]`,
   `main-controls-test`, `engine-bench` (offline render timing and output hash),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,

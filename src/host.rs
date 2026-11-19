@@ -324,6 +324,67 @@ macro_rules! out_port {
     };
 }
 
+/// Keeps a state save apart from the `process()` call that applies a state
+/// load (#29). Surge XT applies a loaded state inside `process()` and its
+/// save reads the patch without a lock, so a save on the main thread while
+/// that block renders crashed inside the plugin.
+///
+/// The main side holds the gate for a save while a load is pending. The
+/// audio side never waits: a block that finds the gate held is silent and
+/// keeps its events for the next one.
+#[derive(Default)]
+struct StateGate {
+    /// The audio side is inside `process()`.
+    processing: AtomicBool,
+    /// `process()` calls that returned.
+    processed: AtomicU64,
+    /// The main side wants no `process()` call to run.
+    held: AtomicBool,
+}
+
+impl StateGate {
+    /// Audio side, before `process()`: false while the main side holds the
+    /// gate. After true, `leave` follows the call.
+    fn enter(&self) -> bool {
+        self.processing.store(true, Ordering::SeqCst);
+        if self.held.load(Ordering::SeqCst) {
+            self.processing.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn leave(&self) {
+        self.processed.fetch_add(1, Ordering::SeqCst);
+        self.processing.store(false, Ordering::SeqCst);
+    }
+
+    /// Main side: a count no `process()` call that began before now can
+    /// reach or pass without one more call after it. A load enqueued before
+    /// this is applied once `processed` is past it.
+    fn mark(&self) -> u64 {
+        let running = self.processing.load(Ordering::SeqCst) as u64;
+        self.processed.load(Ordering::SeqCst) + running
+    }
+
+    /// Main side: whether a `process()` call that began after `mark` was
+    /// taken has returned.
+    fn passed(&self, mark: u64) -> bool {
+        self.processed.load(Ordering::SeqCst) > mark
+    }
+
+    /// Main side: run `f` with no `process()` call in flight.
+    fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.held.store(true, Ordering::SeqCst);
+        while self.processing.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let out = f();
+        self.held.store(false, Ordering::SeqCst);
+        out
+    }
+}
+
 /// A live Surge XT voice: the CLAP audio processor plus preallocated buffers.
 ///
 /// `Send` but `!Sync`: create it on the main thread, then move it to the audio
@@ -357,6 +418,7 @@ pub struct ClapVoice {
     ev_in: EventBuffer,
     ev_out: EventBuffer,
     process_errors: u64,
+    gate: Arc<StateGate>,
 }
 
 impl ClapVoice {
@@ -483,6 +545,7 @@ impl ClapVoice {
             .map_err(|_| anyhow!("start_processing failed"))?;
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let gate = Arc::new(StateGate::default());
         let n_out = out_chs.len();
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -512,6 +575,7 @@ impl ClapVoice {
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
+            gate: gate.clone(),
         };
         let main_id = id_str;
         let mut main = ClapVoiceMain {
@@ -520,6 +584,8 @@ impl ClapVoice {
             main_controls: MainControls::default(),
             main_controls_rechecks: 0,
             editor: None,
+            gate,
+            load_mark: None,
             _entry: entry,
         };
         main.refresh_main_controls();
@@ -626,6 +692,10 @@ impl ClapVoice {
     }
 
     fn render_block(&mut self, n: usize, out: &mut [f32], transport: &Transport) {
+        if !self.gate.enter() {
+            out[..n * 2].fill(0.0);
+            return;
+        }
         self.ev_in.clear();
         self.ev_out.clear();
 
@@ -693,6 +763,7 @@ impl ClapVoice {
             Some(self.frame),
             Some(&transport_event(transport)),
         );
+        self.gate.leave();
         if status.is_err() {
             self.process_errors += 1;
         }
@@ -769,6 +840,61 @@ fn push_cmd(ev_in: &mut EventBuffer, params: &[(u32, f64, f64)], time: u32, cmd:
             v,
         )),
         VoiceCmd::Midi(data) => ev_in.push(&MidiEvent::new(time, 0, data)),
+    }
+}
+
+#[cfg(test)]
+mod state_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_is_skipped_while_the_gate_is_held() {
+        let gate = StateGate::default();
+        assert!(gate.enter(), "an open gate lets the block in");
+        gate.leave();
+        gate.hold(|| assert!(!gate.enter(), "a held gate turns the block away"));
+        assert!(gate.enter(), "and lets the next one in");
+        gate.leave();
+        assert_eq!(gate.processed.load(Ordering::SeqCst), 2, "a skipped block is not a processed one");
+    }
+
+    #[test]
+    fn holding_the_gate_waits_for_the_block_in_flight() {
+        let gate = Arc::new(StateGate::default());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (began_tx, began_rx) = mpsc::channel();
+        let block = std::thread::spawn({
+            let (gate, finished) = (gate.clone(), finished.clone());
+            move || {
+                assert!(gate.enter());
+                began_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+                finished.store(true, Ordering::SeqCst);
+                gate.leave();
+            }
+        });
+        began_rx.recv().unwrap();
+        gate.hold(|| assert!(finished.load(Ordering::SeqCst), "the save ran beside a block"));
+        block.join().unwrap();
+    }
+
+    #[test]
+    fn a_load_is_applied_by_a_block_that_began_after_it() {
+        let gate = StateGate::default();
+        let idle = gate.mark();
+        assert!(!gate.passed(idle));
+        assert!(gate.enter());
+        // This block began before the load below returned: it may have
+        // missed it, so its end does not settle the load.
+        let in_flight = gate.mark();
+        gate.leave();
+        assert!(gate.passed(idle), "no block ran at the first load: this one applied it");
+        assert!(!gate.passed(in_flight));
+        gate.hold(|| assert!(!gate.enter()));
+        assert!(!gate.passed(in_flight), "a skipped block applies nothing");
+        assert!(gate.enter());
+        gate.leave();
+        assert!(gate.passed(in_flight));
     }
 }
 
@@ -1025,6 +1151,9 @@ pub struct ClapVoiceMain {
     main_controls_rechecks: u8,
     /// The plugin's own editor, while it is open.
     editor: Option<ClapEditor>,
+    gate: Arc<StateGate>,
+    /// `StateGate::mark` of the last state load, until a block applied it.
+    load_mark: Option<u64>,
     _entry: PluginEntry,
 }
 
@@ -1166,8 +1295,23 @@ impl ClapVoiceMain {
     pub fn save_state(&mut self) -> Result<Vec<u8>> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         let mut buf = Vec::new();
-        state.save(&mut self.instance.plugin_handle(), &mut buf).context("saving plugin state")?;
+        let pending = self.load_pending();
+        let mut handle = self.instance.plugin_handle();
+        if pending {
+            self.gate.hold(|| state.save(&mut handle, &mut buf))
+        } else {
+            state.save(&mut handle, &mut buf)
+        }
+        .context("saving plugin state")?;
         Ok(buf)
+    }
+
+    /// Whether a block may still be applying the last state load.
+    fn load_pending(&mut self) -> bool {
+        if self.load_mark.is_some_and(|mark| self.gate.passed(mark)) {
+            self.load_mark = None;
+        }
+        self.load_mark.is_some()
     }
 
     /// Restore plugin state. Surge applies it on the audio thread: keep
@@ -1175,6 +1319,7 @@ impl ClapVoiceMain {
     pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
+        self.load_mark = Some(self.gate.mark());
         self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
         Ok(())
     }
@@ -1210,15 +1355,16 @@ impl ClapVoiceMain {
         me.instance.deactivate(stopped);
         // SAFETY: `me` is never used or dropped again, and each field is read
         // exactly once (the editor is closed, so there is nothing else to free).
-        let (instance, exts, entry, controls) = unsafe {
+        let (instance, exts, entry, controls, gate) = unsafe {
             (
                 std::ptr::read(&me.instance),
                 std::ptr::read(&me.exts),
                 std::ptr::read(&me._entry),
                 std::ptr::read(&me.main_controls),
+                std::ptr::read(&me.gate),
             )
         };
-        drop(controls);
+        drop((controls, gate));
         let parked = ParkedClap { plugin_id, instance, exts, _entry: entry };
         CLAP_PARKED.with(|pool| {
             if let Ok(mut pool) = pool.try_borrow_mut() {

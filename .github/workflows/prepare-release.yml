@@ -4,6 +4,9 @@ name: Prepare release
 # -f bump=minor`): bumps the version, folds changes/*.md into CHANGELOG.md,
 # adds the metainfo entry and queues the PR for auto-merge. Once it merges,
 # tag-release.yml tags it and release.yml publishes every package.
+# Refuses while bench issues are open: merged changes nobody has tested on
+# real hardware yet (AGENTS.md, "Bench tests"). `-f skip_bench=true`
+# releases anyway.
 on:
   workflow_dispatch:
     inputs:
@@ -12,11 +15,16 @@ on:
         required: true
         default: minor
         type: string
+      skip_bench:
+        description: Release although bench issues are open
+        default: false
+        type: boolean
 
 permissions:
   contents: write
   pull-requests: write
   actions: write
+  issues: read
 
 concurrency:
   group: prepare-release
@@ -31,6 +39,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: main
+      - name: Every merged change is tested on real hardware
+        if: ${{ !inputs.skip_bench }}
+        run: python3 scripts/ci/bench.py gate
       - name: Bump version, CHANGELOG and metainfo
         id: bump
         run: |

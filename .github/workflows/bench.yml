@@ -1,0 +1,71 @@
+name: Bench tests
+
+# Most development runs on headless servers, so a PR can merge with checks
+# still owed on real hardware (AGENTS.md, "Bench tests"). Every PR body says
+# what is left under `## Bench test`. `bench-check` fails a PR whose section
+# is missing or malformed (advisory, like readme-check). When a PR merges,
+# `bench-issue` turns the section into one issue labelled `bench`, which a
+# bench session on a machine with the devices picks up; a PR that merged
+# without a valid section still gets an issue, asking for the steps. Open
+# bench issues hold back prepare-release.yml.
+#
+# The merge job runs on pull_request_target so a fork's PR can open the
+# issue too. It checks out main, never the PR's head, and reads the PR's
+# text only as data inside scripts/ci/bench.py.
+# Re-run or backfill one PR: gh workflow run bench.yml -f pr=<number>
+on:
+  pull_request:
+    types: [opened, edited, reopened, ready_for_review]
+  pull_request_target:
+    types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Number of a merged PR whose bench issue to open
+        required: true
+        type: number
+
+concurrency:
+  group: bench-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: bench-check
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: The parser reads real PR bodies
+        run: python3 scripts/ci/bench.py --selftest
+      - name: The PR says what is left to test on real hardware
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: python3 scripts/ci/bench.py check --pr "$PR"
+
+  issue:
+    name: bench-issue
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request_target' && github.event.pull_request.merged) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Open the bench issue of the merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: python3 scripts/ci/bench.py open --pr "$PR"

@@ -86,6 +86,17 @@ effect's mix; right-click to reassign, double-click to reset). Rename a strip,
 give it a colour, drag it to reorder or collapse it; names, colours and quick
 knob assignments are saved with the session.
 
+**Master to a loudness.** Beside Master out, the Loudness column takes a
+target: −14 LUFS (Spotify, YouTube, Tidal), −16 (Apple Music), −8 (club), or
+any value in 1 LU steps. Play your loudest passage first; picking a target
+then trims the level in front of the master limiter by what is missing, and
+the true peak is held under −1 dBTP. The column shows the loudness before,
+the loudness now, the true peak and the trim. **Match** measures what you
+played since and corrects the trim; if the limiter has no more to give, the
+readout says so and asks for more master VOLUME. The target is saved with
+the session. The assistant and MCP agents do the same with
+`set_master_target` and read the numbers with `get_master_target`.
+
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
 ### Mix the other apps and pick your sound card

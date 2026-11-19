@@ -1136,6 +1136,27 @@ Learned so far (2026-11-15, UI polish pass):
     meanwhile; the audio thread never waits. Check with
     `kabelsalat state-race-test [seconds] [patch.fxp...]` (real Surge: SIGSEGV
     or abort within seconds before the fix).
+163. **A meter is tested at a level you can state in advance:** the master
+    meter's true peak was `10·log10` of an amplitude (a −6 dBFS sine read −3)
+    behind an interpolator built from `sinc(d)`, no low-pass at all (the same
+    sine read −4.2); its only test asked for "more than the sample peak" and
+    passed. Integrated loudness averaged the gating blocks' dB values, not
+    their energy, and read dynamic material 2.4 LU low. Every meter value gets
+    a test with a known answer (`true_peak_of_a_half_scale_sine_reads_minus_6_dbtp`,
+    `integrated_loudness_averages_energy_not_db`); peaks are `amp_db`, mean
+    squares `to_db`.
+164. **A control loop through the limiter measures its own yield:** the
+    loudness target added the missing LU as dB of trim, but into the limiter
+    a dB gives 0.4 LU or less, so "club" was 1.3 LU short after four matches,
+    and at the default VOLUME it is out of reach altogether. `MasterTarget::matched`
+    divides a step by the yield of the previous one and stops (`limited`, with
+    a readout that says why) when a raise gave back under a third. Check any
+    change to the master chain with `kabelsalat target-test` (real Surge).
+165. **What a session does not state, a load leaves alone:** the loudness
+    target is `Option` in `Session`: `None` (template, older file, a session
+    built from parts) keeps the engine's target, `Some(OFF)` turns it off.
+    A plain default would have switched the target off on every rig add,
+    because those rebuild the session from parts (rule 65 class).
 
 ## Working on kabelsalat
 
@@ -1177,6 +1198,7 @@ Learned so far (2026-11-15, UI polish pass):
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,
   `main-controls-test`, `engine-bench` (offline render timing and output hash),
+  `meter-test`, `target-test` (the master's loudness target on a real phrase),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,

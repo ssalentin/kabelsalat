@@ -468,6 +468,42 @@ mod tests {
 
     const SR: f64 = 48000.0;
 
+    /// A low chord gated on an 8 Hz grid with Gate Chord's step pattern:
+    /// the onsets are the gates, not the cycles of the chord's waveform (#18).
+    #[test]
+    fn onsets_of_a_gated_low_chord_sit_on_the_gate_grid() {
+        const STEP_HZ: f64 = 8.0;
+        let mut samples = Vec::new();
+        for i in 0..(14.0 * SR) as usize {
+            let t = i as f64 / SR;
+            let step = (t * STEP_HZ) as usize;
+            let in_step = t - step as f64 / STEP_HZ;
+            let gate = if GATE_CHORD_SOUNDING >> (step % 16) & 1 == 1 {
+                (in_step / 0.002).min(1.0) * (-in_step * 12.0).exp() * (0.5 + 0.5 * ((step * 7) % 16) as f64 / 16.0)
+            } else {
+                0.0
+            };
+            let chord: f64 = [130.81, 131.4, 164.81, 165.5, 196.0, 196.9]
+                .iter()
+                .map(|hz| (std::f64::consts::TAU * hz * t).sin())
+                .sum();
+            let x = (gate * chord / 6.0) as f32;
+            samples.extend([x, x]);
+        }
+        let onsets = onset_strength(&samples);
+        let on_grid = grid_coherence(&onsets, SR, STEP_HZ);
+        let (rival, rival_hz) = (0..1370)
+            .map(|i| 1.0 + i as f64 * 0.005)
+            .map(|hz| (grid_coherence(&onsets, SR, hz), hz))
+            .fold((0.0, 0.0), |a, b| if b.0 > a.0 { b } else { a });
+        assert!(
+            rival < 0.6 * on_grid,
+            "the 8 Hz gate grid scores {on_grid:.3}, {rival_hz:.3} Hz below it {rival:.3}"
+        );
+        let hz = onset_grid_hz(&onsets, SR);
+        assert!((hz - STEP_HZ).abs() < 0.04, "grid read as {hz:.3} Hz");
+    }
+
     #[test]
     fn beats_advance_with_tempo_while_playing() {
         let mut t = Transport::stopped(120.0);

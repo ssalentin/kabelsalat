@@ -20,6 +20,11 @@ pub trait Processor: Send {
     fn set_param(&mut self, id: u32, value: f32);
     fn param_count(&self) -> u32;
     fn param_name(&self, id: u32) -> &'static str;
+    /// Frames the output lags the input (a lookahead); the engine delays
+    /// parallel paths to match (`engine::pdc`).
+    fn latency_frames(&self) -> usize {
+        0
+    }
 }
 
 /// Instantiate a built-in node for the control plane's `DspKind`.
@@ -563,7 +568,7 @@ impl Processor for Filter {
 /// - 1 `drive`: input gain 0..+24 dB (pushes material into the limiter).
 /// - 2 `release`: 10..500 ms (log).
 ///
-/// Reports its latency via `latency_frames()` for later compensation (P2).
+/// Reports its lookahead as `latency_frames`, which the engine compensates.
 pub struct Limiter {
     sr: f64,
     ring: Vec<f32>, // stereo interleaved lookahead ring
@@ -598,11 +603,6 @@ impl Limiter {
             atk_coef: (-1.0 / (sample_rate * 0.0005)).exp() as f32,
             up_coef: (-1.0 / (sample_rate * tau_rel * 0.5)).exp() as f32,
         }
-    }
-
-    /// Latency introduced by the lookahead, in frames.
-    pub fn latency_frames(&self) -> usize {
-        self.lookahead
     }
 }
 
@@ -662,6 +662,10 @@ impl Processor for Limiter {
             2 => "release",
             _ => "unknown",
         }
+    }
+
+    fn latency_frames(&self) -> usize {
+        self.lookahead
     }
 }
 

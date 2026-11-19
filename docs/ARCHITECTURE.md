@@ -79,7 +79,12 @@ agents are in [AGENTS.md](../AGENTS.md).
   important: one `MainControls` list per plugin, the rule that finds it
   (`resolve`), knob labels, and name lookup for agents and CC bindings.
 - `dsp.rs` — built-in processors (gain, pan, EQ, filter, limiter, saturation,
-  delay, reverb, metronome).
+  delay, reverb, metronome). A processor reports its latency
+  (`Processor::latency_frames`; the Limiter's 5 ms lookahead).
+- `engine/pdc.rs` — delay compensation, see "Delay compensation and the
+  analysis harness" below.
+- `analysis.rs` / `engine/probe.rs` / `engine/analysis_test.rs` — the audio
+  analysis harness (issue #13), same section.
 - `matrix.rs` — MIDI routing: sources × destinations, per-cell rules (channel,
   transpose, key/velocity range), splits, CC maps; allocation-free `route_into`.
   A CC binding carries a `CcScale`: a stepped control (a switch, an LED
@@ -543,8 +548,8 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **MIDI:** midir ALSA-seq ports (hardware + virtual). Matrix = per-block routing
   table with sample-accurate scheduling: channel filter, transpose, key/velocity
   range (splits/layers), CC map. MIDI-learn binds CCs to any parameter.
-- **Latency comp:** nodes report latency (CLAP extension); align parallel paths at
-  outputs. Uncompensated first (serial chains align naturally).
+- **Latency comp:** nodes report latency; parallel paths are aligned at every
+  summing point (built-in units today, see below).
 - **System audio:** capture the default output's monitor via PipeWire's PulseAudio
   compatibility (works today, no extra packages); per-app stream selection later via
   native PipeWire (pipewire-rs) or pipewire-jack input ports. Feedback guard: exclude
@@ -552,6 +557,53 @@ src/main.rs            # clap CLI: `kabelsalat open|mcp|<cmd> --json`
 - **One render path** for realtime and offline bounce.
 - **Sessions:** `name.ksalat/` package: `session.ron` + plugin state + copied assets;
   atomic temp-then-rename; originals never modified.
+
+### Delay compensation and the analysis harness
+
+**Delay compensation** (`engine/pdc.rs`). A unit with a lookahead (the
+Limiter: 240 frames at 48 kHz) delays its path; where that path meets a
+parallel one, the two would be 5 ms apart (a hollow, comb-filtered sum).
+`compensation(graph, latency_of)` is a pure plan: a node's output latency is
+its own plus the largest of its audio inputs', and at every summing point
+(an effect's input, `sum_audio_into`; a rig's master, render step 3) each
+input waits the difference to the largest, as a `(source, destination,
+frames)` delay. The plan follows the engine's effect order (`next_effect`),
+so the cable that closes a feedback loop (it carries the previous block)
+neither counts nor gets a delay, and the plan ends. Sends are not cables, so
+the plan takes them beside the graph. A return has to line up with the dry
+sound of whoever sent into the bus, not with the master its cable ends at: a
+whole-rig send taps the rig's aligned sum and needs nothing; a send of one
+source waits on its way into the bus for the latent units of its rig
+(`(source, bus, frames)`, applied in `BusTaps::tap`); a latent unit in a
+bus's own chain makes the senders' rigs wait after their sends are tapped
+(`(master, master, frames)`, `Pdc::rig_out`). Without a latent unit in a
+bus's chain, rig sends change nothing and rigs never wait for each other. A
+send that starts or stops sounding replans. Master
+inserts, the file player, system audio and the Audio In monitor are serial
+or outside the graph and are not part of it. `Pdc` owns one ring per planned delay; it
+replans in `publish_graph` (every structural edit ends there), keeps the
+rings whose delay is unchanged and allocates only for new ones, never per
+block. With no latent unit the plan is empty and every sum is the plain sum
+(`engine-bench` hashes the same). A bypassed latent unit keeps its delay (its
+input runs through a ring of its latency), so a bypass toggle moves nothing
+in time. `latency_of` reads the built-in processors only: LV2
+`lv2:reportsLatency` and the CLAP latency extension slot in there.
+
+**Analysis harness** (issue #13). `analysis.rs` holds pure measures with no
+dependency: a radix-2 FFT and `Spectrum` (Hann window) with
+`fundamental_hz`, `centroid_hz`, `share_above` and `inharmonic_share`
+(aliasing), waveform measures (`hard_saturation_share`, `flat_top_run`,
+`non_fundamental_share`), deterministic `white`/`pink` noise, and a
+normalised cross-correlation (`xcorr_peak`, `presence`). `engine/probe.rs`
+feeds signals into Audio In nodes through the real input ring, one block
+before each render, and taps the master or any node's output block; a
+routing check is a table of `(feed, tap, present)` rows, so new buses and
+sends add rows. The unit tests (crackle regression, noise routing, plan and
+alignment) run in CI without plugins; `kabelsalat analysis-test [--save
+<dir>]` runs the same scenarios, prints every measured number, a "listen
+for" line per check that stays by ear, and with `--save` writes those clips
+(16-bit WAV, read back by the player). With Surge XT installed it also
+measures a played note's pitch, brightness and aliasing.
 
 ## 8. Build phases (history)
 

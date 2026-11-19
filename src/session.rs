@@ -113,7 +113,7 @@ pub struct Session {
     strip_knobs: BTreeMap<NodeId, String>,
     /// Sends into aux buses (issue #5), keyed by node and rig like the
     /// engine's table; `remap_session` carries them across reloads.
-    sends: Vec<crate::control::Send>,
+    sends: Vec<crate::control::AuxSend>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -285,13 +285,13 @@ impl Session {
     }
 
     /// Sends into aux buses (issue #5).
-    pub fn sends(&self) -> &[crate::control::Send] {
+    pub fn sends(&self) -> &[crate::control::AuxSend] {
         &self.sends
     }
 
     /// Replace the sends. One entry per (source, bus); entries that do
     /// nothing, point at a node the patch lacks or at a non-bus are dropped.
-    pub fn set_sends(&mut self, sends: Vec<crate::control::Send>) {
+    pub fn set_sends(&mut self, sends: Vec<crate::control::AuxSend>) {
         self.sends.clear();
         for s in sends {
             if !s.is_default() && !self.sends.iter().any(|o| o.from == s.from && o.bus == s.bus) {
@@ -659,7 +659,7 @@ struct SessionFile {
     strip_knobs: BTreeMap<NodeId, String>,
     /// Sends into aux buses (issue #5); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    sends: Vec<crate::control::Send>,
+    sends: Vec<crate::control::AuxSend>,
 }
 
 #[derive(Serialize, Deserialize)]

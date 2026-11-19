@@ -104,7 +104,7 @@ pub enum SendSource {
 /// bus node `bus`. `pre` taps before the source's fader and pan, so the send
 /// keeps its level when the fader moves; mute and solo silence it either way.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Send {
+pub struct AuxSend {
     pub from: SendSource,
     pub bus: NodeId,
     pub level: f32,
@@ -112,7 +112,7 @@ pub struct Send {
     pub pre: bool,
 }
 
-impl Send {
+impl AuxSend {
     /// A send that does nothing and remembers nothing: not worth an entry.
     pub fn is_default(&self) -> bool {
         self.level <= 0.0 && !self.pre

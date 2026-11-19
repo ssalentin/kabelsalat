@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::control::{Send, SendSource};
+use crate::control::{AuxSend, SendSource};
 use crate::control::{
     name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
     NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
@@ -776,7 +776,7 @@ impl BusTaps<'_> {
 
     /// Add every send of `from` tapped at this point (`pre` or post fader)
     /// into its bus. Allocation-free; no work at all without sends.
-    fn tap(&mut self, sends: &[Send], from: SendSource, pre: bool, src: &[f32]) {
+    fn tap(&mut self, sends: &[AuxSend], from: SendSource, pre: bool, src: &[f32]) {
         for s in sends {
             if s.from != from || s.pre != pre || s.level <= 0.0 { continue; }
             let Some(b) = self.nodes[..self.n].iter().position(|n| *n == s.bus) else { continue };
@@ -796,7 +796,7 @@ fn source_out(
     strips: &[(NodeId, StripMix)],
     graph: &Graph,
     solo_rigs: &[bool; 8],
-    sends: &[Send],
+    sends: &[AuxSend],
     taps: &mut BusTaps,
     node: NodeId,
     level: f32,
@@ -844,7 +844,7 @@ fn add_routed(graph: &Graph, node: NodeId, dest: NodeId, src: &[f32], out: &mut 
 
 /// The published send table (`GraphPub::sends`): empty slots have
 /// `bus == NodeId::MAX`.
-pub const NO_SEND: Send = Send { from: SendSource::Rig(0), bus: NodeId::MAX, level: 0.0, pre: false };
+pub const NO_SEND: AuxSend = AuxSend { from: SendSource::Rig(0), bus: NodeId::MAX, level: 0.0, pre: false };
 
 /// Is this FX node bypassed (#74)? Allocation-free linear scan.
 fn strip_bypassed(strips: &[(NodeId, StripMix)], node: NodeId) -> bool {
@@ -1040,7 +1040,7 @@ pub struct GraphPub {
     /// FX nodes — same publication discipline as `mix` (fixed-size copy).
     pub strips: [StripPub; MAX_STRIP_MIXES],
     /// Sends into aux buses (issue #5), same publication as `strips`.
-    pub sends: [Send; MAX_SENDS],
+    pub sends: [AuxSend; MAX_SENDS],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     pub mix_rev: u64,
@@ -1205,7 +1205,7 @@ pub struct GraphEngine {
     /// node past it keeps playing at unity. Linear scans, like the rest.
     strips: Vec<(NodeId, StripMix)>,
     /// Sends into aux buses (SetSend, issue #5). Capacity MAX_SENDS, fixed.
-    sends: Vec<Send>,
+    sends: Vec<AuxSend>,
     /// The buses' send accumulators: MAX_BUSES stereo blocks back to back.
     bus_acc: Vec<f32>,
     /// Per effect (DSP slots, then LV2 slots): it sits in a bus's insert
@@ -3623,7 +3623,7 @@ impl GraphEngine {
                     Some(i) => i,
                     None => {
                         if self.sends.len() >= MAX_SENDS { return; }
-                        self.sends.push(Send { from, bus, level: 0.0, pre: false });
+                        self.sends.push(AuxSend { from, bus, level: 0.0, pre: false });
                         self.sends.len() - 1
                     }
                 };
@@ -8873,10 +8873,10 @@ mod send_tests {
         r.send(SendSource::Rig(1), 0.75, false);
         r.render(1);
         let g = pubd.lock().unwrap();
-        let listed: Vec<Send> = g.sends.iter().copied().filter(|s| s.bus != NodeId::MAX).collect();
+        let listed: Vec<AuxSend> = g.sends.iter().copied().filter(|s| s.bus != NodeId::MAX).collect();
         assert_eq!(listed, vec![
-            Send { from: SendSource::Rig(0), bus: r.aux, level: 0.5, pre: false },
-            Send { from: SendSource::Rig(1), bus: r.aux, level: 0.75, pre: false },
+            AuxSend { from: SendSource::Rig(0), bus: r.aux, level: 0.5, pre: false },
+            AuxSend { from: SendSource::Rig(1), bus: r.aux, level: 0.75, pre: false },
         ]);
     }
 

@@ -34,7 +34,8 @@ scripts/capture.sh <outdir> [binary]   # ui-demo: front/back/playing/help/transp
 
 ## Test locally what only this machine can test (user, 2026-11-18)
 
-**CI builds and tests everything; this machine tests what CI cannot.** The
+**CI builds and tests everything; this machine tests what CI cannot, as far
+as it has the hardware (next section).** The
 full unit suite runs on every push in CI (`test (x86_64)`, `test (aarch64)`),
 and release builds and packages run in the release workflows. Running them
 locally too only doubles the time and the machine's load. This holds for
@@ -48,13 +49,63 @@ every agent and subagent.
   the binary) and the tests of what you changed:
   `cargo test --bin kabelsalat <module or test name>` for the touched
   modules and every test a rule names for that area (e.g. `held_notes`,
-  rule 41). Plus everything CI cannot do: CLI self-tests with real plugins,
-  audio and MIDI hardware, the plugin tests that return early on CI
-  (`docs/PACKAGING.md`), screenshots of the real app, `agent-eval`.
+  rule 41). Plus everything CI cannot do and this machine can: CLI
+  self-tests with real plugins, the plugin tests that return early on CI
+  (`docs/PACKAGING.md`), `agent-eval`, and, where the machine has them,
+  audio and MIDI hardware and screenshots of the real app. What it cannot
+  do becomes the PR's bench test (next section).
 - **CI is the gate for the rest:** push once the targeted tests are green
   (rule 50); a PR merges only on green required checks. When CI goes red,
   read its log (`gh run view --log-failed`) and fix that failure; do not
   answer it with a local full-suite run.
+
+## Bench tests: hand over what this machine cannot test (user, 2026-11-19)
+
+**Most development runs on headless servers that work around the clock.
+What they cannot test is handed to a machine that can, as a GitHub issue,
+and never passed off as tested.**
+
+- **What this machine can test** is one line in its local setup file
+  (`~/.config/kabelsalat/agents.local.md`), e.g. `bench: audio midi display
+  human`. No file or no such line: none of the four, a headless machine.
+
+  | Need | Means | Examples |
+  |---|---|---|
+  | `audio` | a real sound card or audio interface | `audio-test`, `audio-in-test`, `monitor-latency-test`, xruns, latency figures |
+  | `midi` | a hardware MIDI device | hot-plug, device binding, a controller's real messages |
+  | `display` | the real app in a desktop session | `scripts/shot.sh`, key injection, plugin editor windows |
+  | `human` | a person who listens, plays or looks | "does it sound right", feel under the fingers |
+
+  A headless machine still runs everything else: unit tests, the offline
+  engine, self-tests with the plugins it has, `offline_shots` images
+  (rule 148), `listen-test`.
+- **Every PR body has a `## Bench test` section** (it is in the PR
+  template). Write `none: <reason>` when nothing is left, including when
+  this machine has the hardware and you ran the test (its output goes under
+  Evidence). Otherwise write a `Needs:` line with the needs from the table,
+  then the test: exact commands and steps, and under `Expect:` what to see,
+  hear or measure. The reader is an agent or person who never saw your PR,
+  so name the device, the session or template to load, and the numbers.
+  "Not tested with a physical controller" in the evidence is not a handover
+  (#138 merged that way and nobody was told).
+- **The issue opens itself.** When the PR merges, `bench.yml`
+  (`scripts/ci/bench.py`, self-tested on #138's real body) turns the section
+  into one issue labelled `bench`, `bench:<need>` and the PR's area labels.
+  Do not open one by hand for a PR. A PR that merged without a valid section
+  gets an issue anyway, asking for the steps: settle it from the PR's diff.
+  A check that belongs to no PR uses the "Bench test" issue template.
+- **A bench test does not hold the merge; it holds the release.** PRs still
+  merge on green CI. `prepare-release.yml` refuses while an issue labelled
+  `bench` or `bench-failed` is open; releasing anyway (`-f skip_bench=true`)
+  is the user's call, never an agent's.
+- **Prefer a test the server can run.** Before you write a bench test, ask
+  whether the same thing can be checked headless: raw MIDI bytes, the
+  offline engine, a rendered file. A bench test is for what truly needs the
+  device or the person.
+- **On a machine with the devices,** work the queue with the `bench-session`
+  skill (`.claude/skills/bench-session/SKILL.md`): one build of `main`, every
+  open issue the connected devices allow, the output as a comment, close on
+  a pass, a bug labelled `bench-failed` on a fail.
 
 ## Every fixed error becomes a rule (user, 2026-11-15)
 
@@ -1043,6 +1094,17 @@ Learned so far (2026-11-15, UI polish pass):
     DSP param range changes, check the knob default and every template value
     against it in physical units
     (`the_delay_time_knob_always_gives_an_echo_never_a_comb`).
+158. **Text fields type without the desktop's input method:** a focused
+    egui `TextEdit` sets `PlatformOutput::ime`, eframe then enables Wayland
+    text-input, and every character of every text field waits for the
+    input-method process (fcitx5). With that process stalled, all text fields
+    went dead while the rest of the app reacted (#30; the XWayland build had
+    the same dependency through XIM, and its workaround was dropped with the
+    move to Wayland). `frame_ui` clears `ime` last in the frame unless
+    `KABELSALAT_IME=1`
+    (`a_focused_text_field_types_without_the_desktops_input_method`). Live
+    check: headless sway + fcitx5, type with `wtype`, `kill -STOP` fcitx5,
+    type again.
 158. **A CLAP voice sends a parameter event only for an id its plugin
     declared:** Surge XT dereferences the parameter it did not find, so one
     event with another plugin's id (a knob or editor slider whose voice
@@ -1161,7 +1223,8 @@ Learned so far (2026-11-15, UI polish pass):
   `gh pr merge` without `--auto`. Everything merges on green CI, so the
   evidence rules above are what keeps it safe. Self-tests with real plugins
   and audio do not run in CI, so their output belongs in every PR body that
-  changes the code they cover. Update a branch only when it conflicts with
+  changes the code they cover; what this machine could not run goes under
+  `## Bench test` ("Bench tests" above). Update a branch only when it conflicts with
   `main`; `resolve-conflicts.yml` merges `main` into PRs whose conflicts are
   appended Markdown lines by itself, so `git pull` before you push again, and
   resolve a PR labelled `merge-conflict` yourself. An open `main-red` issue means `main` is broken: fixing it comes

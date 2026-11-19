@@ -151,7 +151,11 @@ the dropouts (xruns) the sound card reported. Click it for **Engine info**:
 sample rate and buffer, inputs and outputs, late blocks and xruns, the
 latencies kabelsalat measures, and the render time of every instrument and
 effect, most expensive first, so you see which unit to swap when the load
-climbs. The assistant and MCP agents read the same numbers (`get_engine_info`).
+climbs. Adjust the audio **Buffer size** (64–2048 frames, default 256) live
+with **− / +** in Engine info or from **Settings** — smaller lowers latency,
+larger prevents xruns — and the choice is remembered across restarts. The
+assistant and MCP agents read and adjust the same engine settings
+(`get_engine_info`, `set_buffer_size`).
 
 ### Route MIDI anywhere
 The MIDI matrix decides which keyboard plays which rig. Each connection can be

@@ -138,6 +138,8 @@ pub struct EngineCounters {
     pub sample_rate: u32,
     /// Frames of the last callback; 0 before the first one.
     pub callback_frames: u32,
+    /// Configured target buffer size; 0 falls back to `bridge::configured_buffer_frames()`.
+    pub configured_frames: u32,
     pub render_avg_ns: u32,
     pub render_max_us: u32,
     pub render_late: u32,
@@ -151,6 +153,7 @@ impl EngineCounters {
         Self {
             sample_rate: bridge::SAMPLE_RATE.load(Ordering::Relaxed),
             callback_frames: bridge::RENDER_LAST_FRAMES.load(Ordering::Relaxed),
+            configured_frames: bridge::configured_buffer_frames(),
             render_avg_ns: bridge::RENDER_AVG_NS.load(Ordering::Relaxed),
             render_max_us: bridge::RENDER_MAX_US.load(Ordering::Relaxed),
             render_late: bridge::RENDER_LATE.load(Ordering::Relaxed),
@@ -162,7 +165,13 @@ impl EngineCounters {
     /// The buffer the device asks for per callback; the configured size
     /// until the first callback reports the real one.
     pub fn buffer_frames(&self) -> u32 {
-        if self.callback_frames > 0 { self.callback_frames } else { bridge::BUFFER_FRAMES }
+        if self.callback_frames > 0 {
+            self.callback_frames
+        } else if self.configured_frames > 0 {
+            self.configured_frames
+        } else {
+            bridge::configured_buffer_frames()
+        }
     }
 
     /// Duration of one buffer in ms (0 without an output stream).
@@ -176,6 +185,13 @@ pub fn reset_counter_peaks() {
     bridge::RENDER_MAX_US.store(0, Ordering::Relaxed);
     bridge::RENDER_LATE.store(0, Ordering::Relaxed);
     bridge::XRUNS.store(0, Ordering::Relaxed);
+}
+
+/// Reset timing and dropout counters after reopening the stream at a new buffer size.
+pub fn reset_for_buffer_change() {
+    bridge::RENDER_LAST_FRAMES.store(0, Ordering::Relaxed);
+    bridge::RENDER_AVG_NS.store(0, Ordering::Relaxed);
+    reset_counter_peaks();
 }
 
 /// One unit's share of the render time.
@@ -308,6 +324,10 @@ mod tests {
         let s = EngineStats::build(EngineCounters::default(), None, 0, |_| None);
         assert!(!s.audio_live);
         assert_eq!((s.dsp_percent, s.buffer_ms, s.buffer_frames), (0.0, 0.0, bridge::BUFFER_FRAMES));
+
+        // Before the first callback reports its size, configured_frames is used.
+        let s = EngineStats::build(EngineCounters { configured_frames: 512, ..Default::default() }, None, 0, |_| None);
+        assert_eq!(s.buffer_frames, 512);
     }
 
     #[test]

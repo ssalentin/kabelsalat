@@ -1167,6 +1167,14 @@ Learned so far (2026-11-15, UI polish pass):
     (`onsets_of_a_gated_low_chord_sit_on_the_gate_grid`). Before blaming
     timing, dump the measured signal of 40+ runs and look at how far the
     passing ones are from the threshold.
+167. **A new row in a sized panel brings its own height, or goes beside:**
+    the keyboard dock's MIDI strip (#101) took a 56 pt row out of a dock
+    sized for header + keys (20 % of the window), so the keys shrank from
+    146 to 86 pt and only the minimum was raised. When a panel gains an
+    element, check what the panel's size formula budgets; put controls
+    where there is room (header row, beside the main content) before
+    stacking a row onto it
+    (`the_midi_strip_leaves_the_keys_the_dock_height`).
 
 167. **Tests never list or write the user's sessions:** `sessions_dir()`
     pointed at `~/kabelsalat-sessions` in tests too, so the session popover

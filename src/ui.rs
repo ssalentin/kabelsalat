@@ -152,6 +152,10 @@ const FLIP_SECS: f32 = 0.35;
 
 const WHITE_SEMI: [usize; 8] = [0, 2, 4, 5, 7, 9, 11, 12];
 const BLACK_SEMI: [usize; 5] = [1, 3, 6, 8, 10];
+/// Width of one MIDI-strip wheel in the keyboard dock, and of the wheel
+/// column left of the keys (two wheels, their gap and the gap to the keys).
+const KB_WHEEL_W: f32 = 26.0;
+const KB_WHEELS_W: f32 = 2.0 * KB_WHEEL_W + 10.0 + 12.0;
 const BLACK_AFTER: [usize; 5] = [0, 1, 3, 4, 5]; // white-key index each black key follows
 
 // ---------------------------------------------------------------------------
@@ -1685,6 +1689,80 @@ fn engine_info_row(ui: &mut egui::Ui, w: f32, label: &str, value: &str, value_co
     resp
 }
 
+/// Interactive "Buffer size  [-] 256 frames [+]" line in Engine Info.
+/// Returns `Some(new_frames)` when the user clicks `-` or `+`.
+fn engine_info_buffer_row(ui: &mut egui::Ui, w: f32, shown_frames: u32, configured_frames: u32) -> Option<u32> {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 24.0), egui::Sense::hover());
+    let btn_s = 20.0;
+    let gap = 4.0;
+    let val_w = 88.0;
+    let plus_rect = Rect::from_center_size(
+        Pos2::new(rect.right() - btn_s * 0.5, rect.center().y),
+        Vec2::splat(btn_s),
+    );
+    let val_center = Pos2::new(plus_rect.left() - gap - val_w * 0.5, rect.center().y);
+    let minus_rect = Rect::from_center_size(
+        Pos2::new(plus_rect.left() - gap * 2.0 - val_w - btn_s * 0.5, rect.center().y),
+        Vec2::splat(btn_s),
+    );
+
+    let smaller = crate::bridge::step_buffer_frames(configured_frames, -1);
+    let larger = crate::bridge::step_buffer_frames(configured_frames, 1);
+
+    let minus_id = ui.scope_id().with("engine_info_buf_minus");
+    let plus_id = ui.scope_id().with("engine_info_buf_plus");
+    let minus_resp = ui.interact(
+        minus_rect,
+        minus_id,
+        if smaller.is_some() { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let plus_resp = ui.interact(
+        plus_rect,
+        plus_id,
+        if larger.is_some() { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+
+    let p = ui.painter();
+    p.text(rect.left_center(), egui::Align2::LEFT_CENTER, "Buffer size", FontId::proportional(12.5), theme::CREAM_META);
+    p.text(val_center, egui::Align2::CENTER_CENTER, format!("{shown_frames} frames"), FontId::monospace(12.0), theme::CREAM);
+
+    let paint_btn = |r: Rect, sym: &str, enabled: bool, hovered: bool| {
+        let fill = if !enabled {
+            theme::DARK_PANEL
+        } else if hovered {
+            mix(theme::DARK_PANEL_HI, theme::CREAM, 0.10)
+        } else {
+            theme::DARK_PANEL_HI
+        };
+        let stroke = if enabled && hovered { theme::MUTED } else { theme::HAIRLINE };
+        let fg = if enabled { theme::CREAM } else { theme::INK_2 };
+        p.rect_filled(r, 2.0, fill);
+        p.rect_stroke(r, 2.0, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+        p.text(r.center(), egui::Align2::CENTER_CENTER, sym, FontId::proportional(13.0), fg);
+    };
+    paint_btn(minus_rect, "\u{2212}", smaller.is_some(), minus_resp.hovered());
+    paint_btn(plus_rect, "+", larger.is_some(), plus_resp.hovered());
+
+    let minus_tip = match smaller {
+        Some(f) => format!("Smaller buffer ({f} frames): lower latency, higher CPU load"),
+        None => format!("Already at the smallest buffer size ({} frames)", crate::bridge::BUFFER_SIZE_CHOICES[0]),
+    };
+    let plus_tip = match larger {
+        Some(f) => format!("Larger buffer ({f} frames): more headroom against xruns, higher latency"),
+        None => format!("Already at the largest buffer size ({} frames)", *crate::bridge::BUFFER_SIZE_CHOICES.last().unwrap()),
+    };
+    let minus_clicked = minus_resp.on_hover_text(minus_tip).clicked();
+    let plus_clicked = plus_resp.on_hover_text(plus_tip).clicked();
+
+    if minus_clicked {
+        smaller
+    } else if plus_clicked {
+        larger
+    } else {
+        None
+    }
+}
+
 /// One unit of the node table: name (cut to its column), average, maximum
 /// and the average's share of one buffer.
 fn engine_info_node_row(ui: &mut egui::Ui, w: f32, n: &crate::engine_info::NodeStat) {
@@ -2380,7 +2458,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_scale", "set_arp",
     "set_strip_mix", "set_node_bypass", "add_insert", "remove_insert",
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
-    "get_engine_info", "reset_engine_peaks",
+    "get_engine_info", "reset_engine_peaks", "set_buffer_size",
     "get_strip_knobs", "set_strip_knob",
     "add_bus", "remove_bus", "set_send", "get_sends",
     "list_channels",
@@ -2403,7 +2481,7 @@ fn tool_is_read_only(name: &str) -> bool {
 /// install never touches the graph/session), but still a mutation for the
 /// agent-paused gate (the bridge treats them as changing, not read-only).
 fn tool_changes_only_system(name: &str) -> bool {
-    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_midi_clock")
+    matches!(name, "install_instrument" | "save_rig" | "reset_engine_peaks" | "set_buffer_size" | "set_midi_clock")
 }
 
 /// File-player settings carried by play_file/set_player args (AUM
@@ -3051,9 +3129,11 @@ struct DemoApp {
     /// voice binding is not adopted until it has published that load.
     voice_hold_rev: Option<u64>,
     sample_rate: f64,
+    buffer_frames: u32,
+    buffer_size_err: Option<String>,
     voice_tx: Option<rtrb::Producer<VoiceMsg>>,
     voice_retire_rx: Option<rtrb::Consumer<VoiceBack>>,
-    _audio_stream: Option<cpal::Stream>,
+    audio_host: Option<AudioStreamHost>,
     bus: Option<Arc<Mutex<CommandBus>>>,
     out_level: Option<Arc<std::sync::atomic::AtomicU32>>,
     /// Per-edge audio levels from the engine (lock-free, block rate). Drives
@@ -3452,9 +3532,11 @@ impl DemoApp {
             last_voices_rev: 0,
             voice_hold_rev: None,
             sample_rate: 48000.0,
+            buffer_frames: crate::assistant::load_buffer_frames(),
+            buffer_size_err: None,
             voice_tx: None,
             voice_retire_rx: None,
-            _audio_stream: None,
+            audio_host: None,
             bus: None,
             out_level: None,
             edge_levels: None,
@@ -4316,11 +4398,12 @@ impl DemoApp {
         sample_rate: f64,
         voice_tx: rtrb::Producer<VoiceMsg>,
         voice_retire_rx: rtrb::Consumer<VoiceBack>,
-        stream: cpal::Stream,
+        audio_host: AudioStreamHost,
         bus: Arc<Mutex<CommandBus>>,
         level: Arc<std::sync::atomic::AtomicU32>,
     ) -> Self {
-        self._audio_stream = Some(stream);
+        self.buffer_frames = audio_host.buffer_frames;
+        self.audio_host = Some(audio_host);
         if let Ok(mut b) = self.hw_direct.bus.lock() { *b = Some(bus.clone()); }
         if self.count_in_enabled || self.count_in_bars != 1 {
             let _ = bus.lock().unwrap().send(Command::SetCountIn {
@@ -4394,6 +4477,46 @@ impl DemoApp {
     fn set_audio_output(&mut self, output: Option<String>) {
         let _ = crate::assistant::save_config_field("audio_output", output.as_deref().unwrap_or(""));
         if let Ok(mut w) = self.wanted_output.lock() { *w = output; }
+    }
+
+    /// Change the audio output buffer size in frames live (reopens the stream
+    /// without losing the engine, voices or rack) and persist in config.json.
+    fn set_buffer_frames(&mut self, frames: u32) -> Result<String, String> {
+        if !crate::bridge::valid_buffer_frames(frames) {
+            let valid: Vec<String> = crate::bridge::BUFFER_SIZE_CHOICES.iter().map(|n| n.to_string()).collect();
+            return Err(format!("invalid buffer size {frames}; choose one of {}", valid.join(", ")));
+        }
+        if let Some(host) = &mut self.audio_host {
+            if let Err(e) = host.set_buffer_frames(frames) {
+                self.buffer_size_err = Some(e.clone());
+                return Err(e);
+            }
+            crate::bridge::set_configured_buffer_frames(frames);
+            crate::engine_info::reset_for_buffer_change();
+            if let Some(t) = &self.node_times {
+                t.reset_peaks();
+            }
+            if let Some(tx) = &self.stream_cmds {
+                let _ = tx.send(crate::audio_out::StreamCmd::Resync);
+            }
+        } else {
+            #[cfg(test)]
+            if let Some(c) = &mut self.test_counters {
+                c.callback_frames = frames;
+                c.configured_frames = frames;
+                (c.render_max_us, c.render_late, c.xruns) = (0, 0, 0);
+            }
+        }
+        self.buffer_frames = frames;
+        self.buffer_size_err = None;
+        let _ = crate::assistant::save_buffer_frames(frames);
+        self.resync_all_audio_in_captures();
+        self.engine_stats_at = f32::NEG_INFINITY;
+        self.stats_timer = 0.0;
+        self.refresh_engine_stats();
+        let sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
+        let ms = frames as f64 / sr * 1000.0;
+        Ok(format!("Buffer size set to {frames} frames ({ms:.1} ms at {:.1} kHz)", sr / 1000.0))
     }
 
     /// Set another app's stream volume/mute (applied by the scan thread).
@@ -5106,6 +5229,10 @@ impl DemoApp {
             },
             "get_engine_info" => "Check engine load".into(),
             "reset_engine_peaks" => "Reset engine peaks".into(),
+            "set_buffer_size" => match args.get("frames").and_then(|v| v.as_u64()) {
+                Some(f) => format!("Buffer size → {f} frames"),
+                None => "Set buffer size".into(),
+            },
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127) as u8;
                 format!("Play {}", note_name(note))
@@ -6168,8 +6295,8 @@ impl DemoApp {
                 }),
                 "cables": self.cables.len(),
                 "fps": self.fps,
-                "buffer_frames": crate::bridge::BUFFER_FRAMES,
-                "buffer_latency_ms": crate::bridge::BUFFER_FRAMES as f64 / 48000.0 * 1000.0,
+                "buffer_frames": self.engine_counters().buffer_frames(),
+                "buffer_latency_ms": self.engine_counters().buffer_frames() as f64 / self.sample_rate.max(1.0) * 1000.0,
                 "xruns": self.engine_counters().xruns,
                 "midi_latency_ms": self.engine_counters().midi_latency_us as f64 / 1000.0,
                 "layout": {
@@ -6207,6 +6334,15 @@ impl DemoApp {
             "reset_engine_peaks" => {
                 self.reset_engine_peaks();
                 "reset: worst render time, late blocks, xruns and each unit's maximum start again from now".into()
+            }
+            "set_buffer_size" => {
+                let Some(frames) = args.get("frames").and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()) else {
+                    return "set_buffer_size needs 'frames' (64, 128, 256, 512, 1024, or 2048)".into();
+                };
+                match self.set_buffer_frames(frames) {
+                    Ok(msg) => msg,
+                    Err(e) => e,
+                }
             }
             "measure_mix" => {
                 if args.get("reset").and_then(|v| v.as_bool()) == Some(true) {
@@ -13808,6 +13944,7 @@ impl DemoApp {
             ToggleAutosave,
             SetCountIn(bool, u8),
             SetAudioOutput(Option<String>),
+            SetBufferSize(u32),
         }
 
         let rect = ui.available_rect_before_wrap();
@@ -13832,6 +13969,9 @@ impl DemoApp {
         let autosave_on = self.autosave.enabled;
         let count_in_enabled = self.count_in_enabled;
         let count_in_bars = self.count_in_bars;
+        let buffer_frames = self.buffer_frames;
+        let buf_sr = if self.sample_rate > 0.0 { self.sample_rate } else { 48000.0 };
+        let live_buffer = self.engine_stats.audio_live.then_some((self.engine_stats.buffer_frames, self.engine_stats.buffer_ms));
         let detected_scale = ui.ctx().pixels_per_point();
         let mut actions: Vec<SettingsAction> = Vec::new();
 
@@ -14172,6 +14312,35 @@ impl DemoApp {
                     Self::stage_hairline(ui);
                     ui.add_space(10.0);
 
+                    let fmt_buf = |f: u32| format!("{f} frames ({:.1} ms)", f as f64 / buf_sr * 1000.0);
+                    let selected_buf = fmt_buf(buffer_frames);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Buffer size").font(theme::medium_font(13.5)).color(theme::INK));
+                        let buf_dd_w = (ui.available_width() - 8.0).clamp(130.0, 200.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            theme::Dropdown::new("dd_settings_buffer_size", &selected_buf)
+                                .width(buf_dd_w)
+                                .popup_min_width(180.0)
+                                .text_size(12.0)
+                                .show_ui(ui, |menu| {
+                                    for &f in crate::bridge::BUFFER_SIZE_CHOICES {
+                                        if menu.item(buffer_frames == f, &fmt_buf(f)) {
+                                            actions.push(SettingsAction::SetBufferSize(f));
+                                        }
+                                    }
+                                });
+                        });
+                    });
+                    ui.label(egui::RichText::new("Lower reduces latency; higher prevents dropouts (xruns).").size(11.5).color(theme::INK_2));
+                    if let Some((live_f, live_ms)) = live_buffer {
+                        if live_f != buffer_frames {
+                            ui.label(egui::RichText::new(format!("Active: {live_f} frames ({live_ms:.1} ms)")).size(11.0).color(theme::INK_2));
+                        }
+                    }
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("UI scale").font(theme::medium_font(13.5)).color(theme::INK));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -14286,6 +14455,10 @@ impl DemoApp {
                 SettingsAction::SetAudioOutput(out) => {
                     self.set_audio_output(out);
                 }
+                SettingsAction::SetBufferSize(frames) => match self.set_buffer_frames(frames) {
+                    Ok(msg) => self.settings_msg = msg,
+                    Err(e) => self.settings_msg = format!("Buffer size failed: {e}"),
+                },
             }
         }
 
@@ -14904,11 +15077,12 @@ impl DemoApp {
     }
 
     /// Keyboard dock height: a share of the WINDOW height (rule 64), never
-    /// below the minimum playable size (header + MIDI strip + keys of at
-    /// least 60 px), and only what the rack can spare (rule 22). Whole
-    /// pixels, so a resize does not jitter the layout.
+    /// below the minimum playable size (header + keys of at least 58 px; the
+    /// MIDI strip sits in the header and beside the keys), and only what the
+    /// rack can spare (rule 22). Whole pixels, so a resize does not jitter
+    /// the layout.
     fn keyboard_dock_h(window_h: f32, avail_h: f32, rack_need_h: f32) -> f32 {
-        const MIN_H: f32 = 164.0;
+        const MIN_H: f32 = 112.0;
         const MAX_H: f32 = 300.0;
         let spare = (avail_h - rack_need_h).max(MIN_H);
         (window_h * 0.2).clamp(MIN_H, MAX_H).min(spare).round()
@@ -14935,7 +15109,7 @@ impl DemoApp {
         let split = self.keys_unit.and_then(|k| self.shown_split(k));
         let octave = self.octave;
         let base = 12 * (octave as usize + 1); // the laptop keys' lowest note
-        let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0, 1.0)));
+        let n_oct = Self::dock_octaves(Rect::from_min_size(Pos2::ZERO, Vec2::new(root.available_width() - 28.0 - KB_WHEELS_W, 1.0)));
         let mut note: Option<usize> = None;
         let mut kb_rect = Rect::NOTHING;
         let mut strip = [Rect::NOTHING; 4];
@@ -14963,79 +15137,46 @@ impl DemoApp {
                             if theme::chip_button(ui, "×", false).on_hover_text("hide the keyboard (V)").clicked() {
                                 self.dock = DockView::None;
                             }
+                            // The MIDI strip's horizontal controls (GitHub #97)
+                            // share the header row; the wheels stand beside the
+                            // keys. A strip row of its own took its height from
+                            // the keys.
+                            ui.add_space(14.0);
+                            self.kb_vel_ui(ui, &mut strip[3]);
+                            ui.add_space(14.0);
+                            let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
+                                .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
+                            strip[2] = sus.rect;
+                            if sus.clicked() {
+                                self.kb_sustain = !self.kb_sustain;
+                                self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
+                                self.kb_strip_pulse(0.85);
+                            }
                         });
-                    },
-                );
-                ui.add_space(4.0);
-                // --- MIDI control strip (GitHub #97) -------------------------
-                // The standard signals a keyboard sends besides notes, laid
-                // out like GarageBand's: pitch bend and modulation wheels,
-                // the sustain pedal, and the velocity slider. All go out as
-                // the Keys source, so the matrix routes them to the same
-                // rigs the played notes reach.
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), 56.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        self.kb_wheel_ui(ui, "PITCH", true, &mut strip[0]);
-                        ui.add_space(10.0);
-                        self.kb_wheel_ui(ui, "MOD", false, &mut strip[1]);
-                        ui.add_space(14.0);
-                        let sus = theme::chip_button(ui, "SUSTAIN", self.kb_sustain)
-                            .on_hover_text("hold pedal (CC 64): the instruments keep released notes until the pedal lifts");
-                        strip[2] = sus.rect;
-                        if sus.clicked() {
-                            self.kb_sustain = !self.kb_sustain;
-                            self.kb_cc(64, if self.kb_sustain { 127 } else { 0 });
-                            self.kb_strip_pulse(0.85);
-                        }
-                        ui.add_space(14.0);
-                        // Velocity: one source of truth — the Keys unit's VEL
-                        // knob, which the laptop keys and clicks already
-                        // scale by (find it by label, rule 92).
-                        let ki = self.keys_idx();
-                        let vel_idx = self.units.get(ki).and_then(|u| u.knob_index("VEL"));
-                        let vel = vel_idx
-                            .and_then(|i| self.units.get(ki).map(|u| u.knobs[i].value))
-                            .unwrap_or(0.8);
-                        let (track, resp) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::click_and_drag());
-                        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
-                        strip[3] = track;
-                        let mut vel_new = vel;
-                        if resp.dragged() || resp.clicked() {
-                            if let Some(pos) = resp.interact_pointer_pos() {
-                                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
-                            }
-                        }
-                        if (vel_new - vel).abs() > f32::EPSILON {
-                            if let Some(i) = vel_idx {
-                                if let Some(u) = self.units.get_mut(ki) {
-                                    // Rule 109: the drawn knob follows at once.
-                                    u.knobs[i].set_immediate(vel_new);
-                                }
-                            }
-                        }
-                        let painter = ui.painter();
-                        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
-                        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-                        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
-                        painter.rect_filled(
-                            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
-                            1.0,
-                            theme::CREAM,
-                        );
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new(format!("VEL {:.2}", vel_new)).size(11.0).color(theme::INK_2));
                     },
                 );
                 ui.add_space(4.0);
                 // Claim the whole remaining area so the panel's measured height
                 // (egui derives the outer rect from the content's min_rect) stays
                 // at the requested size instead of collapsing to the header row.
-                let (r, kb_resp) = ui.allocate_exact_size(
+                // Pitch bend and modulation wheels stand left of the keys, as
+                // tall as the keys (like GarageBand's); all strip signals go out
+                // as the Keys source, so the matrix routes them to the same rigs
+                // the played notes reach.
+                let (area, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), ui.available_height().max(48.0)),
-                    egui::Sense::click(),
+                    egui::Sense::hover(),
                 );
+                let wheel = |i: f32| Rect::from_min_max(
+                    Pos2::new(area.left() + i * (KB_WHEEL_W + 10.0), area.top() + 6.0),
+                    Pos2::new(area.left() + i * (KB_WHEEL_W + 10.0) + KB_WHEEL_W, area.bottom() - 19.0),
+                );
+                self.kb_wheel_ui(ui, wheel(0.0), "PITCH", true);
+                self.kb_wheel_ui(ui, wheel(1.0), "MOD", false);
+                strip[0] = wheel(0.0);
+                strip[1] = wheel(1.0);
+                let r = Rect::from_min_max(Pos2::new(area.left() + KB_WHEELS_W, area.top()), area.max);
+                let kb_resp = ui.interact(r, ui.id().with("dock_keys"), egui::Sense::click());
                 kb_rect = r;
                 let painter = ui.painter().clone();
                 let lit = |semi: usize| note_leds[(base + semi).min(127)] > 0.02;
@@ -15130,61 +15271,101 @@ impl DemoApp {
     /// like a real wheel) or modulation (value 0..=1, holds). Sends only
     /// when the quantized MIDI value moves, so a frame that rounds to the
     /// same bend/CC sends nothing.
-    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, label: &str, spring: bool, rect_out: &mut Rect) {
-        const W: f32 = 26.0;
-        const H: f32 = 40.0;
-        let mut track = Rect::NOTHING;
-        ui.vertical(|ui| {
-            let (t_rect, resp) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::click_and_drag());
-            track = t_rect;
-            // Pointer → value: the track bottom is the rest position (pitch:
-            // -1), the top is the extreme. Absolute, like a real wheel.
-            let mut value = if spring { self.kb_bend } else { self.kb_mod };
-            if resp.dragged() {
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let t = ((t_rect.bottom() - pos.y) / t_rect.height()).clamp(0.0, 1.0);
-                    value = if spring { t * 2.0 - 1.0 } else { t };
-                }
-            } else if spring && resp.drag_stopped() {
-                value = 0.0;
+    fn kb_wheel_ui(&mut self, ui: &mut egui::Ui, t_rect: Rect, label: &str, spring: bool) {
+        // Keyed by what the wheel is, never by where it sits (rule 135).
+        let resp = ui.interact(t_rect, ui.id().with(("kb_wheel", label)), egui::Sense::click_and_drag());
+        // Pointer → value: the track bottom is the rest position (pitch:
+        // -1), the top is the extreme. Absolute, like a real wheel.
+        let mut value = if spring { self.kb_bend } else { self.kb_mod };
+        if resp.dragged() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = ((t_rect.bottom() - pos.y) / t_rect.height()).clamp(0.0, 1.0);
+                value = if spring { t * 2.0 - 1.0 } else { t };
             }
-            if spring {
-                let after = (value * 8191.0).round() as i16;
-                if after != (self.kb_bend * 8191.0).round() as i16 {
-                    self.kb_bend = value;
-                    self.kb_bend_cmd(after);
-                    self.kb_strip_pulse(0.3 + value.abs() * 0.5);
-                }
-            } else {
-                let after = (value * 127.0).round() as u8;
-                if after != (self.kb_mod * 127.0).round() as u8 {
-                    self.kb_mod = value;
-                    self.kb_cc(1, after);
-                    self.kb_strip_pulse(0.3 + value * 0.5);
-                }
+        } else if spring && resp.drag_stopped() {
+            value = 0.0;
+        }
+        if spring {
+            let after = (value * 8191.0).round() as i16;
+            if after != (self.kb_bend * 8191.0).round() as i16 {
+                self.kb_bend = value;
+                self.kb_bend_cmd(after);
+                self.kb_strip_pulse(0.3 + value.abs() * 0.5);
             }
-            let painter = ui.painter().clone();
-            painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
-            painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
-            if spring {
-                // The center detent a pitch wheel returns to.
-                let cy = t_rect.center().y;
-                painter.line_segment(
-                    [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
-                    Stroke::new(1.0, theme::MUTED),
-                );
+        } else {
+            let after = (value * 127.0).round() as u8;
+            if after != (self.kb_mod * 127.0).round() as u8 {
+                self.kb_mod = value;
+                self.kb_cc(1, after);
+                self.kb_strip_pulse(0.3 + value * 0.5);
             }
-            let t = if spring { (value + 1.0) * 0.5 } else { value };
-            let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
-            let thumb = Rect::from_min_size(
-                Pos2::new(t_rect.left() + 3.0, yc - 2.0),
-                Vec2::new(t_rect.width() - 6.0, 4.0),
+        }
+        let painter = ui.painter().clone();
+        painter.rect_filled(t_rect, 2.0, theme::PAPER_SINK);
+        painter.rect_stroke(t_rect, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        if spring {
+            // The center detent a pitch wheel returns to.
+            let cy = t_rect.center().y;
+            painter.line_segment(
+                [Pos2::new(t_rect.left() + 3.0, cy), Pos2::new(t_rect.right() - 3.0, cy)],
+                Stroke::new(1.0, theme::MUTED),
             );
-            painter.rect_filled(thumb, 1.0, theme::CREAM);
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(label).size(9.5).color(theme::INK_2));
-        });
+        }
+        let t = if spring { (value + 1.0) * 0.5 } else { value };
+        let yc = t_rect.bottom() - t.clamp(0.0, 1.0) * t_rect.height();
+        let thumb = Rect::from_min_size(
+            Pos2::new(t_rect.left() + 3.0, yc - 2.0),
+            Vec2::new(t_rect.width() - 6.0, 4.0),
+        );
+        painter.rect_filled(thumb, 1.0, theme::CREAM);
+        painter.text(
+            Pos2::new(t_rect.center().x, t_rect.bottom() + 3.0),
+            egui::Align2::CENTER_TOP,
+            label,
+            egui::FontId::proportional(9.5),
+            theme::INK_2,
+        );
+    }
+
+    /// The strip's velocity track and readout, laid out right to left in the
+    /// dock header. One source of truth: the Keys unit's VEL knob, which the
+    /// laptop keys and clicks already scale by (found by label, rule 92).
+    fn kb_vel_ui(&mut self, ui: &mut egui::Ui, rect_out: &mut Rect) {
+        let ki = self.keys_idx();
+        let vel_idx = self.units.get(ki).and_then(|u| u.knob_index("VEL"));
+        let vel = vel_idx
+            .and_then(|i| self.units.get(ki).map(|u| u.knobs[i].value))
+            .unwrap_or(0.8);
+        // The readout's room first (right to left), its text once the value is known.
+        let (readout, _) = ui.allocate_exact_size(egui::vec2(52.0, 16.0), egui::Sense::hover());
+        ui.add_space(6.0);
+        let (track, resp) = ui.allocate_exact_size(egui::vec2(120.0, 16.0), egui::Sense::click_and_drag());
+        let resp = resp.on_hover_text("note velocity of the on-screen keys and laptop keys");
         *rect_out = track;
+        let mut vel_new = vel;
+        if resp.dragged() || resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                vel_new = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+            }
+        }
+        if (vel_new - vel).abs() > f32::EPSILON {
+            if let Some(i) = vel_idx {
+                if let Some(u) = self.units.get_mut(ki) {
+                    // Rule 109: the drawn knob follows at once.
+                    u.knobs[i].set_immediate(vel_new);
+                }
+            }
+        }
+        let painter = ui.painter();
+        painter.rect_filled(track, 2.0, theme::PAPER_SINK);
+        painter.rect_stroke(track, 2.0, Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+        let fx = track.left() + 2.0 + (track.width() - 4.0) * vel_new;
+        painter.rect_filled(
+            Rect::from_min_max(Pos2::new(track.left() + 2.0, track.top() + 3.0), Pos2::new(fx, track.bottom() - 3.0)),
+            1.0,
+            theme::CREAM,
+        );
+        painter.text(readout.left_center(), egui::Align2::LEFT_CENTER, format!("VEL {vel_new:.2}"), egui::FontId::proportional(11.0), theme::INK_2);
     }
 
     /// Unit index of the Keys source (fallback 0 for a degenerate graph).
@@ -19582,8 +19763,15 @@ impl DemoApp {
 
     fn engine_counters(&self) -> crate::engine_info::EngineCounters {
         #[cfg(test)]
-        if let Some(c) = self.test_counters { return c; }
-        crate::engine_info::EngineCounters::load()
+        if let Some(mut c) = self.test_counters {
+            if c.configured_frames == 0 {
+                c.configured_frames = self.buffer_frames;
+            }
+            return c;
+        }
+        let mut c = crate::engine_info::EngineCounters::load();
+        c.configured_frames = self.buffer_frames;
+        c
     }
 
     /// The engine's load right now, units under their display names.
@@ -19692,7 +19880,10 @@ impl DemoApp {
         let anchor = self.dsp_chip_rect.right_bottom() + Vec2::new(0.0, 6.0);
         let width = WIDTH.min(screen.width() - 16.0 - MARGIN * 2.0);
         let st = self.engine_stats.clone();
+        let configured_buf = self.buffer_frames;
+        let buf_err = self.buffer_size_err.clone();
         let mut reset = false;
+        let mut new_buffer: Option<u32> = None;
         let area = egui::Area::new(egui::Id::unique("engine_info"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::RIGHT_TOP)
@@ -19732,8 +19923,17 @@ impl DemoApp {
                             engine_info_section(ui, w, "Audio session", &[]);
                             if st.sample_rate > 0 {
                                 row(ui, "Sample rate", format!("{} Hz", st.sample_rate), plain);
-                                row(ui, "Buffer size", format!("{} frames", st.buffer_frames), plain);
+                                if let Some(next) = engine_info_buffer_row(ui, w, st.buffer_frames, configured_buf) {
+                                    new_buffer = Some(next);
+                                }
+                                if st.audio_live && st.buffer_frames != configured_buf {
+                                    row(ui, "Requested buffer", format!("{configured_buf} frames"), theme::CREAM_DIM);
+                                }
                                 row(ui, "Buffer duration", format!("{:.2} ms", st.buffer_ms), plain);
+                                if let Some(err) = &buf_err {
+                                    ui.add_space(2.0);
+                                    ui.label(egui::RichText::new(err).size(11.0).color(theme::CLIP_BRIGHT));
+                                }
                             } else {
                                 row(ui, "Output", "no audio output".into(), theme::CREAM_DIM);
                             }
@@ -19787,6 +19987,9 @@ impl DemoApp {
                 });
             });
         self.engine_info_rect = area.response.rect;
+        if let Some(frames) = new_buffer {
+            let _ = self.set_buffer_frames(frames);
+        }
         if reset {
             self.reset_engine_peaks();
             self.refresh_engine_stats();
@@ -19796,6 +19999,7 @@ impl DemoApp {
             .is_some_and(|p| !self.engine_info_rect.contains(p) && !self.dsp_chip_rect.contains(p));
         if pressed_outside {
             self.engine_info_open = false;
+            self.buffer_size_err = None;
         }
     }
 
@@ -19966,7 +20170,7 @@ impl DemoApp {
                 self.audio_in_live.remove(&node);
             }
             // Open on the UI thread (fast cpal open, like the output stream).
-            let Some(cap) = crate::audio_in::open_capture(device.as_deref(), sample_rate, crate::bridge::BUFFER_FRAMES) else {
+            let Some(cap) = crate::audio_in::open_capture(device.as_deref(), sample_rate, self.buffer_frames) else {
                 continue; // no capture available — the meter/tuner stay silent
             };
             // Deliver the engine read end through the side channel.
@@ -19986,6 +20190,19 @@ impl DemoApp {
         self.audio_in_tuners.remove(&node);
         self.audio_in_opened.remove(&node);
         self.audio_in_live.remove(&node);
+        self.sync_audio_in_captures();
+    }
+
+    /// Re-open all active AudioIn captures (e.g. after a buffer-size change so
+    /// `pw-record --latency` matches the new output buffer).
+    fn resync_all_audio_in_captures(&mut self) {
+        if self.audio_in_streams.is_empty() {
+            return;
+        }
+        self.audio_in_streams.clear();
+        self.audio_in_tuners.clear();
+        self.audio_in_opened.clear();
+        self.audio_in_live.clear();
         self.sync_audio_in_captures();
     }
 
@@ -22536,13 +22753,122 @@ fn startup_voices(sample_rate: f64) -> anyhow::Result<(Vec<(u32, ClapVoice)>, Ve
     Ok((voices, mains))
 }
 
+/// Owns the live cpal output stream plus the shared engine handle so the
+/// output stream can be reopened live at a new buffer size without losing
+/// voices, patches, or rack state.
+struct AudioStreamHost {
+    stream: Option<cpal::Stream>,
+    engine: Arc<Mutex<GraphEngine>>,
+    clock_pos: Arc<crate::clocksend::ClockPos>,
+    sample_rate: f64,
+    buffer_frames: u32,
+}
+
+impl AudioStreamHost {
+    /// Drop the current output stream (joining its callback thread) and open a
+    /// new one at `frames`. Falls back to the previous buffer size on error so
+    /// audio stays alive.
+    fn set_buffer_frames(&mut self, frames: u32) -> Result<u32, String> {
+        let prev = self.buffer_frames;
+        // Drop old stream first so the audio callback thread stops cleanly.
+        let _ = self.stream.take();
+        match open_output_stream(self.engine.clone(), self.clock_pos.clone(), Some(self.sample_rate), frames) {
+            Ok((stream, _)) => {
+                self.stream = Some(stream);
+                self.buffer_frames = frames;
+                Ok(frames)
+            }
+            Err(err) => {
+                if let Ok((stream, _)) = open_output_stream(self.engine.clone(), self.clock_pos.clone(), Some(self.sample_rate), prev) {
+                    self.stream = Some(stream);
+                }
+                Err(format!("{err}"))
+            }
+        }
+    }
+}
+
+fn open_output_stream(
+    engine: Arc<Mutex<GraphEngine>>,
+    clock_pos: Arc<crate::clocksend::ClockPos>,
+    expected_rate: Option<f64>,
+    buffer_frames: u32,
+) -> anyhow::Result<(cpal::Stream, usize)> {
+    let host = preferred_host();
+    let device = host
+        .default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let cfg = device.default_output_config()?;
+    let sample_rate = expected_rate.unwrap_or(cfg.sample_rate() as f64);
+    let ch = cfg.channels() as usize;
+    let mut config: cpal::StreamConfig = cfg.into();
+    config.sample_rate = sample_rate as u32;
+    // Default 256 frames @48k = 5.3 ms; user-configurable via Settings / Engine Info.
+    config.buffer_size = cpal::BufferSize::Fixed(buffer_frames);
+    eprintln!(
+        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms)",
+        host.id().name(),
+        device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
+        sample_rate,
+        ch,
+        buffer_frames,
+        buffer_frames as f64 / sample_rate * 1000.0,
+    );
+    let mut rt_tried = false;
+    let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+            // Device output latency for the clock's "Output" compensation.
+            let ts = info.timestamp();
+            let d = ts.playback.duration_since(ts.callback);
+            if !d.is_zero() {
+                clock_pos.publish_out_latency(d.as_nanos() as u64);
+            }
+            // One-time realtime promotion via rtkit (first callback only; the
+            // D-Bus round trip happens once, never in the steady state).
+            // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
+            // render thread ran at normal priority and was preempted by the
+            // UI for up to 26 ms (> the 10.7 ms buffer) → xruns.
+            if !rt_tried {
+                rt_tried = true;
+                pin_current_thread_to_p_cores();
+                if std::env::var_os("KABELSALAT_NO_RT").is_none() {
+                    // Request 1s (clamped to rtkit's RTTimeUSecMax = 200ms) rather
+                    // than one buffer (~5.3ms at 256/48kHz): Surge XT applies
+                    // load_state inside process(), which exceeds 5.3ms and
+                    // otherwise kills the SCHED_RR thread with SIGXCPU.
+                    match audio_thread_priority::promote_current_thread_to_real_time(sample_rate as u32, sample_rate as u32) {
+                        Ok(h) => { _rt_handle = Some(h); eprintln!("audio: render thread promoted to realtime (rtkit)"); }
+                        Err(e) => eprintln!("audio: realtime promotion unavailable ({e}); running at normal priority"),
+                    }
+                }
+            }
+            let t0 = std::time::Instant::now();
+            if let Ok(mut eng) = engine.try_lock() {
+                eng.render(data, ch);
+            } else {
+                data.fill(0.0);
+            }
+            crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), sample_rate);
+        },
+        |e| {
+            crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("audio stream error: {e}");
+        },
+        None,
+    )?;
+    stream.play()?;
+    Ok((stream, ch))
+}
+
 struct BuiltAudio {
     mains: Vec<ClapVoiceMain>,
     controllers: Vec<VoiceController>,
     voice_ids: Vec<u64>,
     voice_tx: rtrb::Producer<VoiceMsg>,
     voice_retire_rx: rtrb::Consumer<VoiceBack>,
-    stream: cpal::Stream,
+    audio_host: AudioStreamHost,
     bus: CommandBus,
     level: Arc<std::sync::atomic::AtomicU32>,
     sample_rate: f64,
@@ -22568,25 +22894,12 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     let sample_rate = cfg.sample_rate() as f64;
     crate::bridge::SAMPLE_RATE.store(sample_rate as u32, std::sync::atomic::Ordering::Relaxed);
     let ch = cfg.channels() as usize;
+    let wanted_buffer = crate::assistant::load_buffer_frames();
+    crate::bridge::set_configured_buffer_frames(wanted_buffer);
     let (voices, mains) = startup_voices(sample_rate)?;
     // Grab RT-safe param controllers BEFORE the voices move into the engine.
     let controllers: Vec<VoiceController> = voices.iter().map(|(_, v)| v.controller()).collect();
     let voice_ids: Vec<u64> = voices.iter().map(|(_, v)| v.voice_id()).collect();
-    let mut config: cpal::StreamConfig = cfg.into();
-    // 256 frames @48k = 5.3 ms. Holds under full CPU load (all cores busy:
-    // 0 xruns, worst render 1.0 ms) because the render thread is promoted to
-    // realtime below; at normal priority even 512 frames underran.
-    config.buffer_size = cpal::BufferSize::Fixed(crate::bridge::BUFFER_FRAMES);
-    eprintln!(
-        "audio: host={} device={} rate={} ch={} buffer={} frames ({:.1} ms) voices={}",
-        host.id().name(),
-        device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into()),
-        sample_rate,
-        ch,
-        crate::bridge::BUFFER_FRAMES,
-        crate::bridge::BUFFER_FRAMES as f64 / sample_rate * 1000.0,
-        voices.len()
-    );
     let (bus, drain) = crate::control::command_bus();
     let mut engine = GraphEngine::new(
         Graph::demo_patch(),
@@ -22609,7 +22922,6 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     // block; the clock thread schedules ticks from it (never per UI frame).
     let clock_pos = crate::clocksend::ClockPos::new();
     engine.set_clock_pos(clock_pos.clone());
-    let clock_pos_cb = clock_pos.clone();
     // System-audio capture: stream the default sink's monitor (e.g. YouTube)
     // into the engine, muted by default (gain 0). Started off the audio thread.
     if let Some(source) = crate::capture::SystemCapture::default_monitor() {
@@ -22647,54 +22959,31 @@ fn build_audio() -> anyhow::Result<BuiltAudio> {
     engine.set_audio_in_channel(audio_in_rx);
     let audio_in_levels = engine.audio_in_levels_handle();
     engine.spawn_lv2_loader();
-    let mut rt_tried = false;
-    let mut _rt_handle: Option<audio_thread_priority::RtPriorityHandle> = None;
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-            // Device output latency for the clock's "Output" compensation.
-            let ts = info.timestamp();
-            let d = ts.playback.duration_since(ts.callback);
-            if !d.is_zero() {
-                clock_pos_cb.publish_out_latency(d.as_nanos() as u64);
-            }
-            // One-time realtime promotion via rtkit (first callback only; the
-            // D-Bus round trip happens once, never in the steady state).
-            // cpal does not promote pipewire-alsa (IOPLUG) streams, so the
-            // render thread ran at normal priority and was preempted by the
-            // UI for up to 26 ms (> the 10.7 ms buffer) → xruns.
-            if !rt_tried {
-                rt_tried = true;
-                pin_current_thread_to_p_cores();
-                if std::env::var_os("KABELSALAT_NO_RT").is_none() {
-                    // Request 1s (clamped to rtkit's RTTimeUSecMax = 200ms) rather
-                    // than one buffer (~5.3ms at 256/48kHz): Surge XT applies
-                    // load_state inside process(), which exceeds 5.3ms and
-                    // otherwise kills the SCHED_RR thread with SIGXCPU.
-                    match audio_thread_priority::promote_current_thread_to_real_time(sample_rate as u32, sample_rate as u32) {
-                        Ok(h) => { _rt_handle = Some(h); eprintln!("audio: render thread promoted to realtime (rtkit)"); }
-                        Err(e) => eprintln!("audio: realtime promotion unavailable ({e}); running at normal priority"),
-                    }
-                }
-            }
-            let t0 = std::time::Instant::now();
-            engine.render(data, ch);
-            crate::bridge::note_render(t0.elapsed(), data.len() / ch.max(1), sample_rate);
-        },
-        |e| {
-            crate::bridge::XRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("audio stream error: {e}");
-        },
-        None,
-    )?;
-    stream.play()?;
+    let engine = Arc::new(Mutex::new(engine));
+    let (stream, active_buffer) = match open_output_stream(engine.clone(), clock_pos.clone(), Some(sample_rate), wanted_buffer) {
+        Ok((s, _)) => (s, wanted_buffer),
+        Err(e) if wanted_buffer != crate::bridge::BUFFER_FRAMES => {
+            eprintln!("audio: buffer size {wanted_buffer} failed ({e}); falling back to {}", crate::bridge::BUFFER_FRAMES);
+            let (s, _) = open_output_stream(engine.clone(), clock_pos.clone(), Some(sample_rate), crate::bridge::BUFFER_FRAMES)?;
+            (s, crate::bridge::BUFFER_FRAMES)
+        }
+        Err(e) => return Err(e),
+    };
+    crate::bridge::set_configured_buffer_frames(active_buffer);
+    let audio_host = AudioStreamHost {
+        stream: Some(stream),
+        engine,
+        clock_pos: clock_pos.clone(),
+        sample_rate,
+        buffer_frames: active_buffer,
+    };
     Ok(BuiltAudio {
         mains,
         controllers,
         voice_ids,
         voice_tx,
         voice_retire_rx,
-        stream,
+        audio_host,
         bus,
         level,
         sample_rate,
@@ -22853,7 +23142,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             voice_ids,
                             voice_tx,
                             voice_retire_rx,
-                            stream,
+                            audio_host,
                             bus,
                             level,
                             sample_rate,
@@ -22908,7 +23197,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                             sample_rate,
                             voice_tx,
                             voice_retire_rx,
-                            stream,
+                            audio_host,
                             bus,
                             level,
                             shared_graph,
@@ -22938,7 +23227,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     sample_rate,
                     voice_tx,
                     voice_retire_rx,
-                    stream,
+                    audio_host,
                     bus,
                     level,
                     shared_graph,
@@ -22970,7 +23259,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                         sample_rate,
                         voice_tx,
                         voice_retire_rx,
-                        stream,
+                        audio_host,
                         bus,
                         level,
                     )
@@ -28306,16 +28595,29 @@ mod ui_polish_agent_tests {
         assert!((h_back - h_small).abs() < 1.0, "and shrinks back: {h_back} vs {h_small}");
         assert!(kb_big.height() > kb_small.height());
         let (h_tiny, kb_tiny) = dock_h(&mut app, Vec2::new(900.0, 500.0));
-        assert!(h_tiny >= 163.0, "minimum dock height: {h_tiny}");
+        assert!(h_tiny >= 111.0, "minimum dock height: {h_tiny}");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).height() >= 40.0, "keys stay playable");
         assert!(DemoApp::dock_key_rect(kb_tiny, 0).width() >= 40.0, "{kb_tiny:?}");
-        // The MIDI strip fits above the keys at every size (GitHub #97).
-        for _ in 0..3 { run_frame(&mut app, &ctx, Vec2::new(760.0, 520.0), vec![]); }
-        let sr = app.kb_strip;
-        assert!(sr.iter().all(|r| r.is_positive() && r.width() > 0.0), "strip laid out: {sr:?}");
-        let kb = app.dock_kb_rect;
-        assert!(sr.iter().all(|r| r.bottom() <= kb.top() + 0.5), "strip stays above the keys: {sr:?} vs {kb:?}");
-        assert!(sr.iter().all(|r| r.top() >= app.dock_rect.top()), "strip inside the dock");
+    }
+
+    /// The MIDI strip (#97) costs the keys no height: only the header row
+    /// sits above them, the wheels stand beside them. The strip once took a
+    /// 56 pt row out of the dock, and the keys shrank from 146 to 86 pt at
+    /// 1600x1000.
+    #[test]
+    fn the_midi_strip_leaves_the_keys_the_dock_height() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.dock = DockView::Keyboard;
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0), Vec2::new(760.0, 520.0), Vec2::new(781.0, 468.0)] {
+            for _ in 0..3 { run_frame(&mut app, &ctx, size, vec![]); }
+            let (dock, kb, sr) = (app.dock_rect, app.dock_kb_rect, app.kb_strip);
+            let key_h = DemoApp::dock_key_rect(kb, 0).height();
+            assert!(kb.top() - dock.top() <= 48.0, "{size:?}: only the header sits above the keys: dock {dock:?}, keys {kb:?}");
+            assert!(key_h >= dock.height() - 64.0, "{size:?}: keys {key_h} pt of a {} pt dock", dock.height());
+            assert!(sr.iter().all(|r| r.is_positive() && dock.contains_rect(*r)), "{size:?}: strip inside the dock: {sr:?}");
+            assert!(sr.iter().all(|r| !r.intersects(kb.shrink(6.0))), "{size:?}: no strip control over the keys: {sr:?} vs {kb:?}");
+        }
     }
 
     /// GitHub #97: the dock's MIDI strip sends the standard keyboard
@@ -30313,6 +30615,27 @@ mod settings_and_dropdown_tests {
             .expect("Count-in toggle").1.center();
         click_at(&mut app, &ctx, size, ci_toggle);
         assert!(app.count_in_enabled);
+    }
+
+    #[test]
+    fn settings_buffer_size_dropdown_changes_buffer_and_updates_status() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Settings;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let trigger = texts.iter()
+            .find(|(t, _)| t == "256 frames (5.3 ms)")
+            .expect("Buffer size dropdown in Settings").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        let opt = texts.iter()
+            .find(|(t, _)| t == "512 frames (10.7 ms)")
+            .expect("512 frames choice in Buffer size dropdown").1.center();
+        click_at(&mut app, &ctx, size, opt);
+        assert_eq!(app.buffer_frames, 512);
+        assert!(app.settings_msg.contains("512 frames"), "{}", app.settings_msg);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t == "512 frames (10.7 ms)"));
     }
 }
 
@@ -32365,6 +32688,117 @@ mod engine_info_tests {
         assert_eq!(app.undo_past.len(), undo_steps);
         let v: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
         assert_eq!((v["render_max_us"].as_u64(), v["late_blocks"].as_u64(), v["xruns"].as_u64()), (Some(0), Some(0), Some(0)), "{v}");
+    }
+
+    #[test]
+    fn engine_info_buffer_size_buttons_step_up_and_down_and_reset_peaks() {
+        let (mut app, ctx) = app_at(EngineCounters { render_max_us: 2310, render_late: 2, xruns: 4, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let chip = app.dsp_chip_rect.center();
+        let texts = click_at(&mut app, &ctx, SIZE, chip);
+        assert!(app.engine_info_open);
+
+        let buf_y = texts.iter().find(|t| t.panel && t.s == "Buffer size").expect("Buffer size row").rect.center().y;
+        let plus = texts.iter()
+            .find(|t| t.panel && t.s == "+" && (t.rect.center().y - buf_y).abs() < 4.0)
+            .expect("+ button on Buffer size row").rect.center();
+        let minus = texts.iter()
+            .find(|t| t.panel && t.s == "\u{2212}" && (t.rect.center().y - buf_y).abs() < 4.0)
+            .expect("- button on Buffer size row").rect.center();
+
+        // Step up: 256 -> 512, duration doubles, xruns reset.
+        let texts = click_at(&mut app, &ctx, SIZE, plus);
+        assert!(app.engine_info_open, "clicking + keeps Engine Info open");
+        assert_eq!(app.buffer_frames, 512);
+        assert!(texts.iter().any(|t| t.panel && t.s == "512 frames"), "shows 512 frames");
+        assert!(texts.iter().any(|t| t.panel && t.s == "10.67 ms"), "duration reflects 512 frames @ 48 kHz");
+        assert_eq!(app.engine_stats.xruns, 0, "buffer change resets xruns");
+
+        // Step down twice: 512 -> 256 -> 128.
+        click_at(&mut app, &ctx, SIZE, minus);
+        assert_eq!(app.buffer_frames, 256);
+        let texts = click_at(&mut app, &ctx, SIZE, minus);
+        assert_eq!(app.buffer_frames, 128);
+        assert!(texts.iter().any(|t| t.panel && t.s == "128 frames"));
+        assert!(texts.iter().any(|t| t.panel && t.s == "2.67 ms"));
+
+        // Step down to min (64), further clicks clamp at 64.
+        click_at(&mut app, &ctx, SIZE, minus);
+        assert_eq!(app.buffer_frames, 64);
+        click_at(&mut app, &ctx, SIZE, minus);
+        assert_eq!(app.buffer_frames, 64);
+    }
+
+    #[test]
+    fn set_buffer_size_tool_validates_updates_and_is_in_all_tables() {
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter()
+            .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(names.iter().any(|n| n == "set_buffer_size"), "assistant tools missing set_buffer_size");
+        assert!(UI_BRIDGE_TOOLS.contains(&"set_buffer_size"), "UI_BRIDGE_TOOLS missing set_buffer_size");
+        assert!(!tool_is_read_only("set_buffer_size") && tool_changes_only_system("set_buffer_size"));
+
+        let (mut app, ctx) = app_at(EngineCounters { xruns: 3, ..counters(22.0) }, SIZE);
+        run_frame(&mut app, &ctx, SIZE, vec![]);
+        let undo_steps = app.undo_past.len();
+
+        let bad = app.exec_tool("set_buffer_size", &serde_json::json!({"frames": 300}));
+        assert!(bad.contains("invalid buffer size"), "{bad}");
+        assert_eq!(app.buffer_frames, 256);
+
+        let missing = app.exec_tool("set_buffer_size", &serde_json::json!({}));
+        assert!(missing.contains("needs 'frames'"), "{missing}");
+
+        let ok = app.exec_tool("set_buffer_size", &serde_json::json!({"frames": 1024}));
+        assert!(ok.contains("1024 frames"), "{ok}");
+        assert_eq!(app.buffer_frames, 1024);
+        assert_eq!(app.undo_past.len(), undo_steps, "buffer size is a system setting, not an undo step");
+
+        let info: serde_json::Value = serde_json::from_str(&app.exec_tool("get_engine_info", &serde_json::json!({}))).unwrap();
+        assert_eq!(info["buffer_frames"], 1024);
+        assert_eq!(info["xruns"], 0);
+
+        let status: serde_json::Value = serde_json::from_str(&app.exec_tool("get_status", &serde_json::json!({}))).unwrap();
+        assert_eq!(status["buffer_frames"], 1024);
+    }
+
+    #[test]
+    #[ignore = "needs real audio device: cargo test --bin kabelsalat live_audio_stream_reopens_at_new_buffer_size -- --ignored --nocapture"]
+    fn live_audio_stream_reopens_at_new_buffer_size() {
+        let host = preferred_host();
+        let device = host.default_output_device().expect("default output device");
+        let sr = device.default_output_config().expect("default config").sample_rate() as f64;
+        let (_bus, drain) = crate::control::command_bus();
+        let engine = Arc::new(Mutex::new(GraphEngine::new(Graph::demo_patch(), drain, sr, Vec::new())));
+        let clock_pos = crate::clocksend::ClockPos::new();
+        let (stream, _) = open_output_stream(engine.clone(), clock_pos.clone(), Some(sr), 256).expect("open 256");
+        let mut audio_host = AudioStreamHost {
+            stream: Some(stream),
+            engine,
+            clock_pos,
+            sample_rate: sr,
+            buffer_frames: 256,
+        };
+        let wait_frames = |want: u32| -> u32 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let got = crate::bridge::RENDER_LAST_FRAMES.load(Ordering::Relaxed);
+                if got == want || std::time::Instant::now() >= deadline {
+                    return got;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        assert_eq!(wait_frames(256), 256, "initial stream renders 256-frame callbacks");
+        for target in [512u32, 128, 1024, 256] {
+            crate::engine_info::reset_for_buffer_change();
+            audio_host.set_buffer_frames(target).expect("reopen at target");
+            let got = wait_frames(target);
+            let xruns = crate::bridge::XRUNS.load(Ordering::Relaxed);
+            eprintln!("reopened at {target} frames -> observed callback {got} frames, xruns={xruns}");
+            assert_eq!(got, target, "stream reopened at {target} frames");
+            assert_eq!(xruns, 0, "0 xruns at {target} frames");
+        }
     }
 
     #[test]

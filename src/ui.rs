@@ -59,7 +59,6 @@ const YELLOW: Color32 = theme::MIDI_BLUE; // MIDI
 const GREEN: Color32 = theme::LIVE_TEAL; // active / playing / sources
 const ORANGE: Color32 = theme::ACCENT; // cable warming
 const CHASSIS: Color32 = theme::DARK_PANEL;
-const RAIL: Color32 = theme::DARK_PANEL_HI;
 const BORDER: Color32 = theme::HAIRLINE_DARK;
 const RING: Color32 = theme::CREAM_DIM;
 const PLUG: Color32 = theme::DARK_PANEL_HI;
@@ -19179,15 +19178,21 @@ impl DemoApp {
         }
     }
 
+    /// The side rails are channels cut into the chassis: a recessed slot
+    /// with a one-pixel edge, spanning exactly the units' rows (top of the
+    /// first plate to bottom of the last), so they sit on the rack's grid.
+    /// Snapped to whole pixels so the edge stays one crisp pixel at any UI
+    /// scale and through the flip. No screws (§4.2).
     fn draw_rails(&self, painter: &egui::Painter) {
-        let xf = &self.xf;
         let RackChrome { pad, rail: w, .. } = self.rack_chrome;
+        let ppp = painter.pixels_per_point();
+        let edge = Stroke::new(1.0 / ppp, theme::RAIL_EDGE);
         let inset = pad * 0.4;
         for side_x in [inset, self.rack_w - inset - w] {
-            let rail = Rect::from_min_size(Pos2::new(side_x, inset), Vec2::new(w, self.rack_h - 2.0 * inset));
-            painter.rect_filled(xf.rect(rail), 4.0, RAIL);
+            let local = Rect::from_x_y_ranges(side_x..=side_x + w, pad..=self.rack_h - pad);
+            let slot = egui::emath::GuiRounding::round_to_pixels(self.xf.rect(local), ppp);
+            painter.rect(slot, 2.0, theme::RAIL_SLOT, edge, egui::StrokeKind::Inside);
         }
-        // No screws — the editorial language has no hardware chrome (§4.2).
     }
 
     /// Text through the flip transform (fades while squashed).

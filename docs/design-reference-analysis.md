@@ -250,7 +250,7 @@ contexts (rack paint vs egui chrome), the role splits as noted.
 | `BG_DEEP #070A12` | `PAPER` | `#F4F3EE` | window base, egui `panel_fill` |
 | `BG_RAISED #0C1120` | `PAPER_SINK` | `#ECEAE3` [derived: paper darkened ~3%] | recessed fields, code bg, stats chip |
 | `SURFACE #121A2E` | `DARK_PANEL` | `#1C1C1C` | rack chassis, help card (egui windows use `PAPER`) |
-| `SURFACE_HI #1B2740` | `DARK_PANEL_HI` | `#232120` [derived warm whisper step] | unit plates, rails, plugs (egui widget fills use `PAPER`/`PAPER_SINK`) |
+| `SURFACE_HI #1B2740` | `DARK_PANEL_HI` | `#232120` [derived warm whisper step] | unit plates, plugs (egui widget fills use `PAPER`/`PAPER_SINK`) |
 | `SCRIM #05070D` | `SCRIM` | `#1C1C1C` (still applied at α 0.62) | help backdrop |
 | `TEXT #E6EDF7` | `INK` / `CREAM` | `#1C1C1C` on paper · `#EFEEE9` on dark | rack paint uses `CREAM`; egui `override_text_color = INK` |
 | `TEXT_DIM #7C8AA5` | `INK_2` / `CREAM_DIM` | `#646464` on paper · `#8E8E8C` on dark | secondary text (both pass 4.5:1, §5) |
@@ -285,7 +285,7 @@ orange text on dark. One pill shape in the whole app (the flip CTA).
 
 ```
 BG→PAPER · YELLOW→MIDI_BLUE · BLUE→ACCENT · GREEN→LIVE_TEAL · PURPLE→ACCENT
-ORANGE→ACCENT (cable warming) · CHASSIS→DARK_PANEL · RAIL→DARK_PANEL_HI
+ORANGE→ACCENT (cable warming) · CHASSIS→DARK_PANEL
 PLATE_FRONT→DARK_PANEL_HI · PLATE_BACK→DARK_PANEL_HI · BORDER→HAIRLINE_DARK
 RING→CREAM_DIM(#8E8E8C) · PLUG→DARK_PANEL_HI · TEXT→CREAM · SUBTEXT→CREAM_DIM
 WHITE→#FFFBFA · BLACK→#1C1C1C
@@ -323,7 +323,9 @@ treatment on dark, and the flip pill's signature detail.
 ### 4.2 Rack chassis (`draw`, lines ~3032–3058)
 - Fill `DARK_PANEL`, **radius 36**, flat (no gradient), **no border**, no top
   highlight. Soft shadow per §4.1. This is the single inverted hero panel.
-- Rails (`draw_rails`): `DARK_PANEL_HI` strips, radius 4. **Remove the screws.**
+- Rails (`draw_rails`): recessed channels, `RAIL_SLOT` `#141312` fill with a
+  1px `RAIL_EDGE` `#2E2C2A` edge, radius 2, pixel-snapped, spanning the units'
+  rows exactly (top of the first plate to bottom of the last). **No screws.**
 
 ### 4.3 Unit plates — front (`draw_front`)
 - Plate: flat `DARK_PANEL_HI`, **radius 8**, no stroke at rest (the whisper tonal

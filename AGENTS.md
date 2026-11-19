@@ -1094,6 +1094,17 @@ Learned so far (2026-11-15, UI polish pass):
     DSP param range changes, check the knob default and every template value
     against it in physical units
     (`the_delay_time_knob_always_gives_an_echo_never_a_comb`).
+158. **Text fields type without the desktop's input method:** a focused
+    egui `TextEdit` sets `PlatformOutput::ime`, eframe then enables Wayland
+    text-input, and every character of every text field waits for the
+    input-method process (fcitx5). With that process stalled, all text fields
+    went dead while the rest of the app reacted (#30; the XWayland build had
+    the same dependency through XIM, and its workaround was dropped with the
+    move to Wayland). `frame_ui` clears `ime` last in the frame unless
+    `KABELSALAT_IME=1`
+    (`a_focused_text_field_types_without_the_desktops_input_method`). Live
+    check: headless sway + fcitx5, type with `wtype`, `kill -STOP` fcitx5,
+    type again.
 
 ## Working on kabelsalat
 

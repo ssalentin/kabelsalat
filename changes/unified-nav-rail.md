@@ -1,2 +1,5 @@
 ### Changed
 - **Unified top bar, Left Rail & Session Library:** merged the permanent second rig strip and the right-side Navigator into one adaptive top bar and one collapsible Left Rail (`Q`). The top bar now always shows the open session name and autosave indicator (clicking opens a quick Save / Sessions / Templates popover, `Ctrl+O`), displays four live workspace views (`Rack`, `Mixer`, `Matrix`, `Plugins`) with `Settings` as an icon button next to `DSP`, and reveals compact inline rig pills (`1 · Name`, numbered pills, `+`) only when the Left Rail is collapsed so performance mode stays clean and taller. Opening the Left Rail (`Q`) shows the full rig, channel, plugin and Aux bus tree with live level bars, MIDI/audio input badges, `+ Rig`, and per-rig `⋯` actions alongside a unified `Library` tab for Sessions, Rig Presets and Starter Templates.
+
+### Fixed
+- **Symbols no longer show as boxes:** the REC dot, arrows, check marks and other UI symbols are drawn with Noto Sans Symbols 2, Math and Symbols behind Noto Sans; Noto is also found in the Debian/Ubuntu and Fedora font folders.

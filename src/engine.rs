@@ -2403,6 +2403,13 @@ impl GraphEngine {
         solo
     }
 
+    /// The last block an effect or bus node rendered (verification): its
+    /// whole buffer, of which the caller reads the frames it asked for.
+    pub fn node_out(&self, node: NodeId) -> Option<&[f32]> {
+        self.dsp.iter().find(|d| d.node == node).map(|d| d.buf.as_slice())
+            .or_else(|| self.lv2.iter().find(|l| l.node == node).map(|l| l.buf.as_slice()))
+    }
+
     /// Read back the MIDI event pending at an LV2 instrument node (verification).
     pub fn lv2_last_note(&self, node: NodeId) -> Option<[u8; 3]> {
         self.lv2.iter().find(|s| s.node == node).and_then(|s| s.plugin.last_midi_event())
@@ -8762,6 +8769,117 @@ pub fn bench() -> anyhow::Result<()> {
         let (med, lo, hi) = median(runs);
         println!("limiter {label:<12} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  hash={hash:016x}");
     }
+    Ok(())
+}
+
+/// `kabelsalat send-test` (issue #5): two rigs with a real Surge XT each send
+/// into one aux bus with a reverb on it. The bus holds the sum of both sends,
+/// a pre-fader send keeps its level when the rig faders move, and the return
+/// is heard with both rig faders closed.
+pub fn send_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, PortRef};
+    use crate::host::ClapVoice;
+    const N: usize = 512;
+    let sr = 48000.0;
+    let (va, _ma) = ClapVoice::new(sr)?;
+    let (vb, _mb) = ClapVoice::new(sr)?;
+    let (mut bus, drain) = command_bus();
+    let mut g = Graph::default();
+    g.reserve(32, 32);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let sa = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE A"));
+    let ma = g.add_node(NodeKind::MasterOut, name_bytes("MASTER A"));
+    let sb = g.add_node(NodeKind::Clap { plugin_id: name_bytes("Surge XT") }, name_bytes("SURGE B"));
+    let mb = g.add_node(NodeKind::MasterOut, name_bytes("MASTER B"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: sa, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: sa, port: 0 }, PortRef { node: ma, port: 0 }, PortKind::Audio);
+    g.connect_with_id(3, PortRef { node: keys, port: 0 }, PortRef { node: sb, port: 0 }, PortKind::Midi);
+    g.connect_with_id(4, PortRef { node: sb, port: 0 }, PortRef { node: mb, port: 0 }, PortKind::Audio);
+    g.set_rig(sb, 1);
+    g.set_rig(mb, 1);
+    let mut engine = GraphEngine::new(g, drain, sr, vec![(sa, va), (sb, vb)]);
+    // The rigs play different notes, so their sum has the power of both
+    // whatever the oscillators' phases: rig A hears the keyboard, rig B a
+    // hardware keyboard.
+    bus.send(Command::SetRigSource { node: sa, keyboard: true, hardware: false });
+    bus.send(Command::SetRigSource { node: sb, keyboard: false, hardware: true });
+    // The bus and its reverb, added and wired the way the app does it.
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Bus), name: name_bytes("VERB"), rig: 0, wire: true });
+    bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Reverb), name: name_bytes("REVERB"), rig: 0, wire: false });
+    let mut out = vec![0.0f32; N * 2];
+    engine.render(&mut out, 2);
+    let find = |e: &GraphEngine, k: DspKind| e.graph().nodes.iter().find(|n| n.kind == NodeKind::Dsp(k.clone())).map(|n| n.id);
+    let aux = find(&engine, DspKind::Bus).ok_or_else(|| anyhow::anyhow!("no bus node"))?;
+    let verb = find(&engine, DspKind::Reverb).ok_or_else(|| anyhow::anyhow!("no reverb node"))?;
+    let ret: Vec<u32> = engine.graph().edges.iter().filter(|e| e.from.node == aux).map(|e| e.id).collect();
+    anyhow::ensure!(ret.len() == 2, "the new bus is wired to its rig's master L and R ({} cables)", ret.len());
+    for id in ret { bus.send(Command::Disconnect(id)); }
+    bus.send(Command::Connect { id: 20, from: PortRef { node: aux, port: 0 }, to: PortRef { node: verb, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::Connect { id: 21, from: PortRef { node: verb, port: 0 }, to: PortRef { node: ma, port: 0 }, kind: PortKind::Audio });
+    bus.send(Command::SetParam { node: verb, param: 0, value: 1.0 }); // fully wet
+    bus.send(Command::NoteOn { note: 48, velocity: 0.9, source: SourceId::Keys });
+    bus.send(Command::NoteOn { note: 55, velocity: 0.9, source: SourceId::Hardware(0) });
+
+    // RMS over about one second of (master output, bus, reverb).
+    let mut measure = |e: &mut GraphEngine| -> (f32, f32, f32) {
+        for _ in 0..20 { e.render(&mut out, 2); }
+        let mut sums = [0.0f64; 3];
+        let blocks = 94;
+        for _ in 0..blocks {
+            e.render(&mut out, 2);
+            sums[0] += out.iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+            for (i, node) in [aux, verb].into_iter().enumerate() {
+                let buf = e.node_out(node).expect("a rendered node");
+                sums[i + 1] += buf[..N * 2].iter().map(|x| (*x as f64).powi(2)).sum::<f64>();
+            }
+        }
+        let rms = |s: f64| (s / (blocks * N * 2) as f64).sqrt() as f32;
+        (rms(sums[0]), rms(sums[1]), rms(sums[2]))
+    };
+    let set = |bus: &mut crate::control::CommandBus, rig: u8, level: f32, pre: bool| {
+        bus.send(Command::SetSend { from: SendSource::Rig(rig), bus: aux, level: Some(level), pre: Some(pre) });
+    };
+    let fader = |bus: &mut crate::control::CommandBus, vol: f32| {
+        for rig in 0..2 { bus.send(Command::SetRigMix { rig, vol: Some(vol), pan: None, mute: None, solo: None }); }
+    };
+
+    let (dry, none, _) = measure(&mut engine);
+    anyhow::ensure!(dry > 1e-3, "two rigs produced no output ({dry})");
+    anyhow::ensure!(none == 0.0, "a bus nobody sends to is not silent ({none})");
+    set(&mut bus, 0, 1.0, false);
+    let (_, only_a, _) = measure(&mut engine);
+    set(&mut bus, 0, 0.0, false);
+    set(&mut bus, 1, 1.0, false);
+    let (_, only_b, _) = measure(&mut engine);
+    set(&mut bus, 0, 1.0, false);
+    let (_, both, wet) = measure(&mut engine);
+    anyhow::ensure!(only_a > 1e-3 && only_b > 1e-3, "a rig's send did not reach the bus (A {only_a}, B {only_b})");
+    let expect = (only_a * only_a + only_b * only_b).sqrt();
+    anyhow::ensure!((both - expect).abs() < expect * 0.2 && both > only_a.max(only_b),
+        "the bus is not the sum of both sends (A {only_a}, B {only_b}, both {both}, expected {expect})");
+    anyhow::ensure!(wet > 1e-3, "the reverb on the bus heard nothing ({wet})");
+    // Post fader: the send follows the rig faders.
+    fader(&mut bus, 0.25);
+    let (_, post_low, _) = measure(&mut engine);
+    anyhow::ensure!((post_low - both * 0.25).abs() < both * 0.25 * 0.2,
+        "a post-fader send did not follow the rig faders ({post_low} vs {})", both * 0.25);
+    // Pre fader: the send level is independent of them.
+    set(&mut bus, 0, 1.0, true);
+    set(&mut bus, 1, 1.0, true);
+    let (_, pre_low, _) = measure(&mut engine);
+    anyhow::ensure!((pre_low - both).abs() < both * 0.2,
+        "a pre-fader send moved with the rig faders ({pre_low} vs {both})");
+    // Both rig faders closed: what is heard is the return alone.
+    fader(&mut bus, 0.0);
+    let (ret_only, pre_closed, _) = measure(&mut engine);
+    anyhow::ensure!((pre_closed - both).abs() < both * 0.2, "closed rig faders changed the pre-fader sends ({pre_closed} vs {both})");
+    anyhow::ensure!(ret_only > 1e-3, "the summed return is not heard with the rig faders closed ({ret_only})");
+    // Send levels are independent of each other: halving one rig's send.
+    set(&mut bus, 1, 0.0, true);
+    let (_, a_pre, _) = measure(&mut engine);
+    anyhow::ensure!((a_pre - only_a).abs() < only_a * 0.2, "rig A's send changed when rig B's closed ({a_pre} vs {only_a})");
+    println!("send-test: OK — bus RMS: rig A {only_a:.4}, rig B {only_b:.4}, both {both:.4} (power sum {expect:.4}); \
+        rig faders at 0.25: post {post_low:.4}, pre {pre_low:.4}; faders closed: bus {pre_closed:.4}, heard return {ret_only:.4} (dry mix was {dry:.4}); reverb out {wet:.4}");
     Ok(())
 }
 

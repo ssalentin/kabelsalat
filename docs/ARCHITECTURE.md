@@ -285,6 +285,23 @@ agents are in [AGENTS.md](../AGENTS.md).
   card's output latency and the audio-input latency are shown as "not
   measured": cpal's `playback − callback` reads 185 ms through pipewire-alsa
   on a one-quantum graph (`audio-in-test`), and no other figure is measured.
+- **2026-11-19** — **Sends and aux buses (#5)**: an aux bus is a node
+  (`DspKind::Bus`) with an OUT jack and no input. What feeds it is the send
+  table (`Command::SetSend`: a rig or a node, a level, pre or post fader),
+  published in `GraphPub::sends`, mirrored by the mixer and saved with the
+  session. The cables from the bus are its insert chain, as on any strip, and
+  what reaches a master from there joins the mix past the rig faders, so a
+  post-fader send is not scaled by its own rig fader twice. A rig's send
+  exists only once the rig is summed, so the render path runs in two passes:
+  sources and their effects, the rig sums (tapped on both sides of the rig
+  fader), then the buses and every effect downstream of one
+  (`mark_after_bus`), then the returns. A bus or a node of its chain cannot
+  send (no feedback, no block of delay anywhere). Mute and solo silence a
+  source's sends in both modes; a bus's solo silences the dry rigs instead of
+  the other sources of its rig. Limits: `MAX_BUSES` 8, `MAX_SENDS` 64, both
+  allocated in the constructor. Not in it: a bus output other than the master
+  (#31) and delay compensation for latent plugins on a bus (#76). Check with
+  `kabelsalat send-test` (two Surge rigs into one reverb bus).
 - **2026-11-15** — **No squished racks** (user): the assistant panel only takes
   the height the rack can spare; big patches keep readable units and pan
   (wheel / trackpad) inside a clipped view with hairline pan indicators.

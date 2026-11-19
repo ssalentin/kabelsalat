@@ -1,0 +1,2 @@
+### Added
+- **Sends and aux buses (#5):** add an aux bus in the mixer and send to it from any rig bus or source strip, before or after that strip's fader. The bus is a full channel with its own fader, pan, mute, solo, meter and insert slots, so several rigs can share one reverb or delay; it returns to the master past the rig faders. Sends are saved with the session and available to the agent (`add_bus`, `set_send`, `get_sends`, `remove_bus`).

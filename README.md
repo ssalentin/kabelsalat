@@ -99,6 +99,21 @@ the session. The assistant and MCP agents do the same with
 
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
+### Mix the other apps and pick your sound card
+The backing track in your browser sits in the same mixer. Under **System
+audio** every other app that is playing gets its own strip, named after the
+app and what it plays, with a live meter, a volume fader and a mute button, so
+you can turn YouTube down under your rig without leaving kabelsalat. At
+**Master out** a menu lists your sound cards: pick your audio interface instead
+of the laptop speakers and the sound moves there at once, without a dropout.
+The choice is remembered for the next start, and **System default** hands the
+sound back to the system's output. The assistant and MCP agents do the same
+(`list_app_streams`, `set_app_stream`, `list_audio_outputs`,
+`set_audio_output`). This needs PipeWire with its Pulse layer (`pactl`,
+`parec`).
+
+<p align="center"><img src="docs/shots/system-audio.png" width="85%" alt="The mixer with a System audio section: a Firefox strip turned down and a muted Spotify strip, each with a meter, beside Master out with the MOTU M2 chosen as the output"/></p>
+
 ### Navigate rigs, channels and plugins
 Press **Q** (or click **Navigator** in the top bar) to open the right-hand
 Navigator panel. Switch between **CHANNELS**, **PLUGINS** and **ALL** to see

@@ -1189,9 +1189,58 @@ struct ToolChip {
 struct TranscriptRun {
     chips: Vec<ToolChip>,
     read_count: usize,
+    /// The newest step's tool calls in words, reads included: what the model
+    /// is looking at while it plans the next step.
+    last_action: Option<String>,
     expanded: bool,
     cost_line: Option<String>,
 }
+
+/// What the transcript says while a turn runs: the activity in words, never
+/// a step counter.
+#[derive(Clone, Debug, PartialEq)]
+struct LiveStatus {
+    /// What the agent is doing now ("Planning the next step").
+    doing: String,
+    /// Smaller print behind it: what it follows, which model, how long.
+    detail: String,
+    /// How far a recording of the master is, 0 to 1.
+    progress: Option<f32>,
+}
+
+impl LiveStatus {
+    fn new(doing: &str, detail: &[&str]) -> Self {
+        let detail: Vec<&str> = detail.iter().copied().filter(|d| !d.is_empty()).collect();
+        Self { doing: doing.to_string(), detail: detail.join(" · "), progress: None }
+    }
+
+    /// A listen: the recording with its progress, then the model's wait.
+    /// `sounding` = the master carries sound right now; a silent recording
+    /// tells the listening model nothing, so the user is asked to play.
+    fn of_listen(stage: Option<&crate::listen::Stage>, now: std::time::Instant, sounding: bool) -> Self {
+        use crate::listen::Stage;
+        match stage {
+            Some(stage @ Stage::Recording { since, secs }) => {
+                let at = now.saturating_duration_since(*since).as_secs_f32().min(*secs);
+                let hint = if sounding { "" } else { "nothing sounds yet: play a few notes" };
+                Self { progress: stage.progress(now), ..Self::new("Listening to the master", &[&format!("{at:.0} of {secs:.0} s"), hint]) }
+            }
+            Some(Stage::Judging { since, model }) => Self::new(
+                "Judging what it heard",
+                &[crate::assistant::short_model(model), &format!("{} s", now.saturating_duration_since(*since).as_secs())],
+            ),
+            None => Self::new("Listening to the master", &["starting"]),
+        }
+    }
+}
+
+/// The master is audible above this momentary loudness (LUFS).
+const SOUNDING_LUFS: f32 = -60.0;
+
+/// Under every OpenRouter key field: where a key comes from and where it goes.
+const OPENROUTER_KEY_HELP: &str = "One key for every model: create it at openrouter.ai/keys. Stored locally (~/.config/kabelsalat/config.json, 0600), sent only to openrouter.ai.";
+/// For someone whose config still holds the key the assistant used before.
+const RETIRED_KEY_NOTE: &str = "The assistant now runs on OpenRouter only. Your DeepSeek key is no longer used; DeepSeek's models are on OpenRouter too.";
 
 /// Maximum tool chips shown in a finished or long run before `"+N more"`.
 const COLLAPSED_RUN_CHIPS: usize = 3;
@@ -1207,6 +1256,8 @@ struct ToolBatch {
     todo: VecDeque<(ToolCall, Option<usize>)>,
     results: Vec<String>,
     waiting: Option<(Waiting, Option<usize>)>,
+    /// The call the batch is on, in words (the live status line).
+    doing: String,
     user_idx: usize,
 }
 
@@ -2250,7 +2301,7 @@ impl SettingsPage {
             SettingsPage::Session => "Session",
             SettingsPage::Display => "Display",
             SettingsPage::Models => "Models",
-            SettingsPage::Keys => "API keys",
+            SettingsPage::Keys => "API key",
         }
     }
 
@@ -2264,7 +2315,7 @@ impl SettingsPage {
             SettingsPage::Session => "How your work is kept and how playback starts.",
             SettingsPage::Display => "How the app moves and how large it is drawn.",
             SettingsPage::Models => "The models the assistant works with. Nothing here changes the sound.",
-            SettingsPage::Keys => "Keys for the model providers, stored locally in ~/.config/kabelsalat/config.json (0600). Saving restarts the assistant.",
+            SettingsPage::Keys => "One OpenRouter key reaches every model the assistant uses. Stored locally in ~/.config/kabelsalat/config.json (0600) and sent only to openrouter.ai. Saving restarts the assistant.",
         }
     }
 }
@@ -2273,8 +2324,9 @@ impl SettingsPage {
 enum SettingsAction {
     ToggleDecide,
     SetModel(crate::llm::Role, String),
-    SaveKey(crate::llm::Endpoint, String),
-    RemoveKey(crate::llm::Endpoint),
+    ToggleAssistant,
+    SaveKey(String),
+    RemoveKey,
     ToggleReduceMotion,
     ToggleAutosave,
     SetCountIn(bool, u8),
@@ -3008,8 +3060,13 @@ struct DemoApp {
     popup_open_at_start: bool,
     settings_decide_input: String,
     settings_act_input: String,
-    settings_deepseek_key: String,
-    settings_openrouter_key: String,
+    /// The top bar's Assistant button, NOTHING while the assistant is off.
+    assistant_chip_rect: Rect,
+    settings_listen_input: String,
+    settings_key_input: String,
+    /// Off = the built-in assistant is out of the app: no top-bar button, no
+    /// dock, no shortcut. MCP and CLI agents are not affected.
+    assistant_enabled: bool,
     settings_msg: String,
     /// The Settings page shown; kept while the app runs.
     settings_page: SettingsPage,
@@ -3554,8 +3611,10 @@ impl DemoApp {
             popup_open_at_start: false,
             settings_decide_input: String::new(),
             settings_act_input: String::new(),
-            settings_deepseek_key: String::new(),
-            settings_openrouter_key: String::new(),
+            assistant_chip_rect: Rect::NOTHING,
+            settings_listen_input: String::new(),
+            settings_key_input: String::new(),
+            assistant_enabled: crate::assistant::load_assistant_enabled(),
             settings_msg: String::new(),
             settings_page: SettingsPage::Audio,
             drag_cursor: None,
@@ -5392,6 +5451,7 @@ impl DemoApp {
                     None => format!("Add {what}"),
                 }
             }
+            "listen" => "Listen to the master".into(),
             "get_graph" => "Read rack graph".into(),
             "get_status" => "Check status".into(),
             "get_rigs" => "List rigs".into(),
@@ -5554,6 +5614,41 @@ impl DemoApp {
         }
     }
 
+    /// What the running turn is doing right now, None when none runs.
+    fn live_status(&self) -> Option<LiveStatus> {
+        use crate::assistant::{short_model, RunPhase};
+        if !self.assistant.busy {
+            return None;
+        }
+        if let Some((waiting, doing)) = self.tool_batch.as_ref().and_then(|b| b.waiting.as_ref().map(|(w, _)| (w, b.doing.as_str()))) {
+            return Some(match waiting {
+                Waiting::Listen(_) => LiveStatus::of_listen(
+                    crate::listen::stage().as_ref(),
+                    std::time::Instant::now(),
+                    self.master_meter.momentary_lufs > SOUNDING_LUFS,
+                ),
+                Waiting::Engine(_) => LiveStatus::new(doing, &["waiting for the engine"]),
+                Waiting::SoundScan { .. } => LiveStatus::new(doing, &["reading the sound library"]),
+            });
+        }
+        let after = self.active_run_user_idx
+            .and_then(|i| self.transcript_runs.get(&i))
+            .and_then(|run| run.last_action.as_deref())
+            .map(|action| format!("after {action}"))
+            .unwrap_or_default();
+        let secs = self.assistant.turn.started.map(|t| format!("{} s", t.elapsed().as_secs())).unwrap_or_default();
+        Some(match &self.assistant.phase {
+            Some(RunPhase::Thinking { model, .. }) => {
+                let doing = if after.is_empty() { "Thinking" } else { "Planning the next step" };
+                LiveStatus::new(doing, &[&after, short_model(model), &secs])
+            }
+            // Jev's plans run their steps without another model call.
+            Some(RunPhase::Deciding) if !after.is_empty() => LiveStatus::new("Carrying out the plan", &[&after, "Jev", &secs]),
+            Some(RunPhase::Deciding) => LiveStatus::new("Reading your request", &["Jev", &secs]),
+            None => LiveStatus::new("Starting", &[&secs]),
+        })
+    }
+
     fn finalize_active_run(&mut self) {
         let Some(user_idx) = self.active_run_user_idx.take() else { return };
         let base_cost = self.assistant.turn.summary().or_else(|| {
@@ -5581,15 +5676,15 @@ impl DemoApp {
                 self.assistant.history.iter().rposition(|l| l.role == "user").unwrap_or(0)
             });
             self.active_run_user_idx = Some(user_idx);
-            let mut entries = Vec::with_capacity(batch.len());
-            for call in &batch {
-                if tool_is_read_only(&call.name) {
-                    entries.push(None);
-                } else {
-                    entries.push(Some(self.human_tool_label(&call.name, &call.args)));
-                }
-            }
+            let labels: Vec<String> = batch.iter().map(|call| self.human_tool_label(&call.name, &call.args)).collect();
+            let entries: Vec<Option<String>> = batch.iter().zip(&labels)
+                .map(|(call, label)| (!tool_is_read_only(&call.name)).then(|| label.clone()))
+                .collect();
             let run = self.transcript_runs.entry(user_idx).or_default();
+            run.last_action = labels.last().map(|last| match labels.len() {
+                1 => last.clone(),
+                n => format!("{last} and {} more", n - 1),
+            });
             let mut todo = VecDeque::with_capacity(batch.len());
             for (call, label) in batch.into_iter().zip(entries) {
                 let chip_idx = match label {
@@ -5609,6 +5704,7 @@ impl DemoApp {
                 todo,
                 results: Vec::new(),
                 waiting: None,
+                doing: String::new(),
                 user_idx,
             });
         }
@@ -5641,6 +5737,7 @@ impl DemoApp {
                 }
             }
             while let Some((call, chip_idx)) = batch.todo.pop_front() {
+                batch.doing = self.human_tool_label(&call.name, &call.args);
                 if SOUND_TOOLS.contains(&call.name.as_str()) && self.sound_scan_running(&call.args) {
                     batch.waiting = Some((Waiting::SoundScan { call, deadline: std::time::Instant::now() + SOUND_SCAN_WAIT }, chip_idx));
                     self.tool_batch = Some(batch);
@@ -5943,9 +6040,21 @@ impl DemoApp {
     /// the chat field to take keyboard focus on the next frame, so the agent
     /// owns the computer keyboard instead of the laptop piano.
     fn toggle_dock(&mut self, d: DockView) {
+        if d == DockView::Assistant && !self.assistant_enabled {
+            return;
+        }
         self.dock = if self.dock == d { DockView::None } else { d };
         if self.dock == DockView::Assistant {
             self.focus_chat_request = true;
+        }
+    }
+
+    /// Switch the built-in assistant on or off. Off closes its dock; a turn
+    /// that is still running finishes, so no tool call is left unanswered.
+    fn set_assistant_enabled(&mut self, on: bool) {
+        self.assistant_enabled = on;
+        if !on && self.dock == DockView::Assistant {
+            self.dock = DockView::None;
         }
     }
 
@@ -12568,10 +12677,33 @@ impl DemoApp {
                                     {
                                         dock = Some(DockView::Keyboard);
                                     }
-                                    if theme::chip_button(ui, ai_lbl, self.assistant_open())
-                                        .on_hover_text("Assistant · key C").clicked()
-                                    {
-                                        dock = Some(DockView::Assistant);
+                                    if self.assistant_enabled {
+                                        let listening = crate::listen::stage();
+                                        let tip = match (&listening, self.assistant.busy) {
+                                            (Some(_), _) => "Assistant · listening to the master · key C",
+                                            (None, true) => "Assistant · working · key C",
+                                            (None, false) => "Assistant · key C",
+                                        };
+                                        let chip = theme::chip_button(ui, ai_lbl, self.assistant_open()).on_hover_text(tip);
+                                        // The dock may show the keyboard while a turn runs:
+                                        // the button itself says the assistant is at work,
+                                        // and how far a recording of the master is.
+                                        if self.assistant.busy || listening.is_some() {
+                                            let pulse = if self.reduce_motion { 0.9 } else { 0.55 + 0.45 * ((self.ui_time * 5.5).sin() * 0.5 + 0.5) };
+                                            ui.painter().rect_stroke(chip.rect, 2.0, Stroke::new(1.2, theme::alpha(theme::AGENT_COLOR, pulse)), egui::StrokeKind::Inside);
+                                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                                        }
+                                        if let Some(progress) = listening.and_then(|s| s.progress(std::time::Instant::now())) {
+                                            let mut bar = Rect::from_min_max(Pos2::new(chip.rect.left(), chip.rect.bottom() - 3.0), chip.rect.max);
+                                            bar.set_width(chip.rect.width() * progress);
+                                            ui.painter().rect_filled(bar, 1.0, theme::AGENT_COLOR);
+                                        }
+                                        self.assistant_chip_rect = chip.rect;
+                                        if chip.clicked() {
+                                            dock = Some(DockView::Assistant);
+                                        }
+                                    } else {
+                                        self.assistant_chip_rect = Rect::NOTHING;
                                     }
                                 });
                             }).response.rect;
@@ -14161,13 +14293,7 @@ impl DemoApp {
         match role {
             crate::llm::Role::Decide => &mut self.settings_decide_input,
             crate::llm::Role::Act => &mut self.settings_act_input,
-        }
-    }
-
-    fn settings_key_input_mut(&mut self, endpoint: crate::llm::Endpoint) -> &mut String {
-        match endpoint {
-            crate::llm::Endpoint::DeepSeek => &mut self.settings_deepseek_key,
-            crate::llm::Endpoint::OpenRouter => &mut self.settings_openrouter_key,
+            crate::llm::Role::Listen => &mut self.settings_listen_input,
         }
     }
 
@@ -14243,7 +14369,7 @@ impl DemoApp {
     /// One line per page for the rail: what is set there now, and a warning
     /// colour when the page holds something the user has to fix.
     fn settings_summaries(&self, ppp: f32) -> [(String, Color32); 5] {
-        use crate::llm::{Endpoint, Role};
+        use crate::llm::Role;
         let ok = theme::CREAM_DIM;
         let warn = theme::ACCENT_BRIGHT;
         let wanted = self.wanted_output.lock().ok().and_then(|w| w.clone());
@@ -14257,15 +14383,21 @@ impl DemoApp {
                 .unwrap_or(raw),
         };
         let on_off = |on: bool| if on { "on" } else { "off" };
-        let keys = self.assistant.keys();
-        let act = self.assistant.route_for(Role::Act);
-        let models = if keys.has(act.endpoint) {
-            (format!("{} · Jev {}", act.model, on_off(self.assistant.decide_enabled())), ok)
+        let act = crate::assistant::short_model(&self.assistant.model_for(Role::Act)).to_string();
+        let has_key = self.assistant.key_set;
+        // A switched-off assistant needs nothing fixed: no warning colour.
+        let models = if !self.assistant_enabled {
+            ("assistant off".to_string(), ok)
+        } else if has_key {
+            (format!("{act} · Jev {}", on_off(self.assistant.decide_enabled())), ok)
         } else {
-            (format!("{} · no key", act.model), warn)
+            (format!("{act} · no key"), warn)
         };
-        let set = [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().filter(|e| keys.has(**e)).count();
-        let keys_line = if set == 0 { ("no key set".to_string(), warn) } else { (format!("{set} of 2 set"), ok) };
+        let keys_line = match (has_key, self.assistant_enabled) {
+            (true, _) => ("OpenRouter key set".to_string(), ok),
+            (false, true) => ("no key set".to_string(), warn),
+            (false, false) => ("no key set".to_string(), ok),
+        };
         [
             (format!("{} frames · {out}", self.buffer_frames), ok),
             (format!("autosave {} · count-in {}", on_off(self.autosave.enabled), on_off(self.count_in_enabled)), ok),
@@ -14557,17 +14689,22 @@ impl DemoApp {
 
     fn settings_models_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
         use crate::llm::Role;
-        let keys = self.assistant.keys();
+        let has_key = self.assistant.key_set;
         let decide_on = self.assistant.decide_enabled();
-        for (idx, role) in Role::ALL.iter().copied().enumerate() {
-            if idx > 0 {
-                Self::settings_gap(ui);
+        let enabled = self.assistant_enabled;
+        Self::settings_row(ui, "Assistant", "Shows the assistant in the top bar and the dock (key C). Off takes it out of the app; MCP and CLI agents keep working.", |ui| {
+            if theme::chip_button(ui, if enabled { "On" } else { "Off" }, enabled).clicked() {
+                actions.push(SettingsAction::ToggleAssistant);
             }
-            let route = self.assistant.route_for(role);
-            let choices = crate::assistant::role_model_choices(role, keys, &route.model);
+        });
+        for role in Role::ALL {
+            Self::settings_gap(ui);
+            let model = self.assistant.model_for(role);
+            let choices = crate::assistant::role_model_choices(role, &model);
             let desc = match role {
                 Role::Decide => "Classifies simple requests into direct tool plans before the chat model runs.",
                 Role::Act => "Handles conversation, questions, and multi-step rack edits.",
+                Role::Listen => "Hears a recording of the master when the assistant checks a sound. Needs a model that takes audio.",
             };
             ui.horizontal(|ui| {
                 ui.set_min_height(26.0); // rule 117
@@ -14598,13 +14735,13 @@ impl DemoApp {
             let mut picked: Option<String> = None;
             let mut apply_other = false;
             let mut dropdown = |ui: &mut egui::Ui| {
-                theme::Dropdown::new(("dd_settings_model", role.model_field()), &route.model)
+                theme::Dropdown::new(("dd_settings_model", role.model_field()), &model)
                     .width(dd_w)
                     .popup_min_width(240.0)
                     .text_size(12.0)
                     .show_ui(ui, |menu| {
                         for m in &choices {
-                            if menu.item(*m == route.model, m) {
+                            if menu.item(*m == model, m) {
                                 picked = Some(m.clone());
                             }
                         }
@@ -14612,7 +14749,7 @@ impl DemoApp {
             };
             let mut other_id = |ui: &mut egui::Ui, app: &mut Self| {
                 let field_w = ui.available_width() - theme::chip_button_width(ui, "Apply") - gap - RECESSED_INPUT_CHROME;
-                let edit = Self::recessed_input(ui, app.settings_role_input_mut(role), field_w.max(60.0), "other model id…");
+                let edit = Self::recessed_input(ui, app.settings_role_input_mut(role), field_w.max(60.0), "any OpenRouter model id…");
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                     apply_other = true;
                 }
@@ -14643,7 +14780,6 @@ impl DemoApp {
             }
 
             ui.add_space(6.0);
-            let spec = route.endpoint.spec();
             let in_use = role != Role::Decide || decide_on;
             // One galley for the whole status line: it wraps inside the
             // column as a unit instead of as overlapping labels (rule 100).
@@ -14654,100 +14790,89 @@ impl DemoApp {
             if !in_use {
                 part("Effective route: Off · chat model handles requests", theme::INK_2);
             } else {
-                part(&format!("Route: {} · {}", spec.label, route.model), theme::CREAM_META);
-                if keys.has(route.endpoint) {
-                    part(&format!("  ·  {} key set", spec.label), theme::LIVE_TEAL);
+                part(&format!("Route: {} · {model}", crate::llm::PROVIDER), theme::CREAM_META);
+                if has_key {
+                    part("  ·  key set", theme::LIVE_TEAL);
                 } else {
-                    part(&format!("  ·  {} key not set", spec.label), theme::ACCENT_BRIGHT);
-                }
-                if role == Role::Decide && spec.decisions_url.is_none() {
-                    part("  ·  endpoint has no decisions API", theme::ACCENT_BRIGHT);
+                    part("  ·  key not set", theme::ACCENT_BRIGHT);
                 }
             }
             ui.add(egui::Label::new(status).wrap());
-            if in_use && !keys.has(route.endpoint) {
-                ui.add_space(6.0);
-                if theme::chip_button(ui, &format!("Set {} key", spec.label), false).clicked() {
-                    self.settings_page = SettingsPage::Keys;
-                }
+        }
+        if !has_key {
+            ui.add_space(10.0);
+            if theme::chip_button(ui, &format!("Set {} key", crate::llm::PROVIDER), false).clicked() {
+                self.settings_page = SettingsPage::Keys;
             }
         }
     }
 
     fn settings_keys_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<SettingsAction>) {
-        use crate::llm::Endpoint;
-        let keys = self.assistant.keys();
-        for (idx, endpoint) in [Endpoint::DeepSeek, Endpoint::OpenRouter].iter().copied().enumerate() {
-            if idx > 0 {
-                Self::settings_gap(ui);
-            }
-            let spec = endpoint.spec();
-            let is_set = keys.has(endpoint);
-            ui.horizontal(|ui| {
-                ui.set_min_height(22.0); // rule 117
-                ui.label(egui::RichText::new(spec.label).font(theme::medium_font(14.0)).color(theme::INK));
-                ui.add_space(6.0);
-                let (status, col) = if is_set { ("set", theme::LIVE_TEAL) } else { ("not set", theme::CREAM_DIM) };
-                ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(spec.key_field).size(11.0).color(theme::INK_2));
-            });
+        let is_set = self.assistant.key_set;
+        ui.horizontal(|ui| {
+            ui.set_min_height(22.0); // rule 117
+            ui.label(egui::RichText::new(crate::llm::PROVIDER).font(theme::medium_font(14.0)).color(theme::INK));
             ui.add_space(6.0);
+            let (status, col) = if is_set { ("set", theme::LIVE_TEAL) } else { ("not set", theme::CREAM_DIM) };
+            ui.label(egui::RichText::new(status).font(theme::medium_font(12.0)).color(col));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(crate::llm::KEY_FIELD).size(11.0).color(theme::INK_2));
+        });
+        ui.add_space(6.0);
 
-            let field_w = (ui.available_width()
-                - theme::primary_button_width(ui, "Save")
-                - theme::chip_button_width(ui, "Remove")
-                - ui.spacing().item_spacing.x * 2.0
-                - RECESSED_INPUT_CHROME)
-                .clamp(60.0, 320.0);
-            let hint = match endpoint {
-                Endpoint::DeepSeek => "sk-…",
-                Endpoint::OpenRouter => "sk-or-…",
-            };
-            let mut do_save = false;
-            let mut do_remove = false;
-            ui.horizontal(|ui| {
-                let buf = self.settings_key_input_mut(endpoint);
-                let edit = egui::Frame::new()
-                    .fill(theme::PAPER_SINK)
-                    .stroke(Stroke::new(1.0, theme::HAIRLINE))
-                    .corner_radius(2.0)
-                    .inner_margin(egui::Margin::symmetric(8, 5))
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(buf)
-                                .id_salt(("settings_api_key", spec.key_field))
-                                .password(true)
-                                .frame(egui::Frame::NONE)
-                                .desired_width(field_w)
-                                .hint_text(hint),
-                        )
-                    })
-                    .inner;
-                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                    do_save = true;
+        let field_w = (ui.available_width()
+            - theme::primary_button_width(ui, "Save")
+            - theme::chip_button_width(ui, "Remove")
+            - ui.spacing().item_spacing.x * 2.0
+            - RECESSED_INPUT_CHROME)
+            .clamp(60.0, 320.0);
+        let mut do_save = false;
+        let mut do_remove = false;
+        ui.horizontal(|ui| {
+            let edit = egui::Frame::new()
+                .fill(theme::PAPER_SINK)
+                .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                .corner_radius(2.0)
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_key_input)
+                            .id_salt(("settings_api_key", crate::llm::KEY_FIELD))
+                            .password(true)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(field_w)
+                            .hint_text("sk-or-…"),
+                    )
+                })
+                .inner;
+            if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                do_save = true;
+            }
+            if theme::primary_button(ui, "Save").clicked() {
+                do_save = true;
+            }
+            ui.add_enabled_ui(is_set, |ui| {
+                if theme::danger_button(ui, "Remove", false).clicked() {
+                    do_remove = true;
                 }
-                if theme::primary_button(ui, "Save").clicked() {
-                    do_save = true;
-                }
-                ui.add_enabled_ui(is_set, |ui| {
-                    if theme::danger_button(ui, "Remove", false).clicked() {
-                        do_remove = true;
-                    }
-                });
             });
-            if do_save {
-                let buf = self.settings_key_input_mut(endpoint);
-                let val = buf.trim().to_string();
-                if !val.is_empty() {
-                    buf.clear();
-                    actions.push(SettingsAction::SaveKey(endpoint, val));
-                }
+        });
+        ui.add_space(8.0);
+        ui.add(egui::Label::new(egui::RichText::new(OPENROUTER_KEY_HELP).size(11.5).color(theme::INK_2)).wrap());
+        if self.assistant.retired_key && !is_set {
+            ui.add_space(6.0);
+            ui.add(egui::Label::new(egui::RichText::new(RETIRED_KEY_NOTE).size(11.5).color(theme::ACCENT_BRIGHT)).wrap());
+        }
+        if do_save {
+            let val = self.settings_key_input.trim().to_string();
+            if !val.is_empty() {
+                self.settings_key_input.clear();
+                actions.push(SettingsAction::SaveKey(val));
             }
-            if do_remove {
-                self.settings_key_input_mut(endpoint).clear();
-                actions.push(SettingsAction::RemoveKey(endpoint));
-            }
+        }
+        if do_remove {
+            self.settings_key_input.clear();
+            actions.push(SettingsAction::RemoveKey);
         }
     }
 
@@ -14761,16 +14886,26 @@ impl DemoApp {
             SettingsAction::SetModel(role, m) => {
                 self.settings_msg = self.assistant.set_role_model(role, &m);
             }
-            SettingsAction::SaveKey(endpoint, key) => {
-                let label = endpoint.spec().label;
-                self.settings_msg = match self.assistant.save_api_key(endpoint, &key) {
+            SettingsAction::ToggleAssistant => {
+                let on = !self.assistant_enabled;
+                self.set_assistant_enabled(on);
+                let saved = crate::assistant::save_assistant_enabled(on);
+                self.settings_msg = match (saved, on) {
+                    (Err(e), _) => format!("Saving the assistant setting failed: {e}"),
+                    (Ok(()), true) => "Assistant on · open it with C or the top bar".into(),
+                    (Ok(()), false) => "Assistant off · hidden from the top bar and the dock".into(),
+                };
+            }
+            SettingsAction::SaveKey(key) => {
+                let label = crate::llm::PROVIDER;
+                self.settings_msg = match self.assistant.save_api_key(&key) {
                     Ok(()) => format!("{label} key saved · assistant restarted"),
                     Err(e) => format!("Save {label} key failed: {e}"),
                 };
             }
-            SettingsAction::RemoveKey(endpoint) => {
-                let label = endpoint.spec().label;
-                self.settings_msg = match self.assistant.remove_api_key(endpoint) {
+            SettingsAction::RemoveKey => {
+                let label = crate::llm::PROVIDER;
+                self.settings_msg = match self.assistant.remove_api_key() {
                     Ok(()) => format!("{label} key removed"),
                     Err(e) => format!("Remove {label} key failed: {e}"),
                 };
@@ -14862,6 +14997,16 @@ impl DemoApp {
             let x = rect.left() + 4.0 + i as f32 * 6.5;
             p.circle_filled(Pos2::new(x, rect.center().y), 2.2 + 0.5 * wave, theme::alpha(theme::AGENT_COLOR, a));
         }
+    }
+
+    /// How far a recording of the master is: a bar that fills once.
+    fn paint_listen_progress(ui: &mut egui::Ui, progress: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 6.0), egui::Sense::hover());
+        let p = ui.painter();
+        p.rect_filled(rect, 3.0, theme::DARK_PANEL_HI);
+        let mut done = rect;
+        done.set_width(rect.width() * progress.clamp(0.0, 1.0));
+        p.rect_filled(done, 3.0, theme::AGENT_COLOR);
     }
 
     fn tool_chip_ui(ui: &mut egui::Ui, chip: &ToolChip, ui_time: f32, reduce_motion: bool) {
@@ -15039,6 +15184,7 @@ impl DemoApp {
                 let main_w = if two_col { (avail_w - side_w - 25.0).round().max(340.0) } else { avail_w };
                 let entities = self.chat_entities();
                 let confirm_prompt = self.pending_confirm.as_ref().map(|p| (p.label.clone(), p.tool == "delete_rig"));
+                let live = self.live_status();
 
                 let draw_main = |ui: &mut egui::Ui,
                                  key_input: &mut String,
@@ -15052,7 +15198,7 @@ impl DemoApp {
                                  focus_chat: &mut bool| {
                     if !assistant.key_set {
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new("Connect DeepSeek (BYOK)").font(theme::medium_font(13.5)).color(theme::INK));
+                            ui.label(egui::RichText::new("Connect OpenRouter (bring your own key)").font(theme::medium_font(13.5)).color(theme::INK));
                             ui.add_space(4.0);
                             let row = ui.horizontal(|ui| {
                                 let field_w = (ui.available_width() - 104.0).clamp(120.0, 380.0);
@@ -15061,12 +15207,12 @@ impl DemoApp {
                                         .id_salt("assistant_key_input")
                                         .password(true)
                                         .desired_width(field_w)
-                                        .hint_text("sk-…"),
+                                        .hint_text("sk-or-…"),
                                 );
                                 if *focus_chat { key_resp.request_focus(); *focus_chat = false; }
                                 if theme::primary_button(ui, "Save key").clicked() && !key_input.trim().is_empty() {
                                     let k = key_input.trim().to_string();
-                                    match assistant.save_api_key(crate::llm::Endpoint::DeepSeek, &k) {
+                                    match assistant.save_api_key(&k) {
                                         Ok(()) => key_input.clear(),
                                         Err(e) => assistant.history.push(ChatLine {
                                             role: "error".into(),
@@ -15077,13 +15223,10 @@ impl DemoApp {
                             });
                             *input_rect = row.response.rect;
                             ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(
-                                    "Stored locally (~/.config/kabelsalat/config.json, 0600). Sent only to api.deepseek.com.",
-                                )
-                                .size(11.5)
-                                .color(theme::INK_2),
-                            );
+                            ui.add(egui::Label::new(egui::RichText::new(OPENROUTER_KEY_HELP).size(11.5).color(theme::INK_2)).wrap());
+                            if assistant.retired_key {
+                                ui.add(egui::Label::new(egui::RichText::new(RETIRED_KEY_NOTE).size(11.5).color(theme::ACCENT_BRIGHT)).wrap());
+                            }
                             for line in assistant.history.iter().filter(|l| l.role == "error") {
                                 ui.label(egui::RichText::new(&line.text).size(12.0).color(theme::CLIP_BRIGHT));
                             }
@@ -15199,11 +15342,17 @@ impl DemoApp {
                                     }
                                 }
                             }
-                            if assistant.busy {
+                            if let Some(live) = &live {
                                 ui.horizontal(|ui| {
                                     ui.add_space(TRANSCRIPT_TEXT_INDENT);
                                     Self::paint_busy_dots(ui, ui_time, reduce_motion);
-                                    ui.label(egui::RichText::new(assistant.phase_label()).size(12.0).color(theme::AGENT_TEXT));
+                                    ui.label(egui::RichText::new(&live.doing).size(12.0).color(theme::AGENT_TEXT));
+                                    if let Some(progress) = live.progress {
+                                        Self::paint_listen_progress(ui, progress);
+                                    }
+                                    if !live.detail.is_empty() {
+                                        ui.add(egui::Label::new(egui::RichText::new(&live.detail).size(11.0).color(theme::CREAM_META)).truncate());
+                                    }
                                 });
                             }
                             if !assistant.busy || demo_agent_hold {
@@ -21374,6 +21523,14 @@ impl DemoApp {
                 return;
             }
         }
+        // A listen replaces the hint while it runs: the dock may show the
+        // keyboard, and what is played now is what gets judged.
+        if let Some(stage) = crate::listen::stage() {
+            let live = LiveStatus::of_listen(Some(&stage), std::time::Instant::now(), self.master_meter.momentary_lufs > SOUNDING_LUFS);
+            let ng = painter.layout_no_wrap(format!("{} · {}", live.doing, live.detail), FontId::proportional(12.5), theme::AGENT_TEXT);
+            painter.galley(pos, ng, theme::AGENT_TEXT);
+            return;
+        }
         let hint_right = pos.x + g.size().x;
         painter.galley(pos, g.clone(), theme::INK_2);
         // Info line fallback (narrow window): right-aligned on the hint row,
@@ -22965,8 +23122,7 @@ const EVAL_TURN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24
 
 fn run_eval_task(task: &EvalTask, model: &str, jev: bool, plugins: &EvalPlugins) -> anyhow::Result<EvalRun> {
     let mut rig = EvalRig::new(Assistant::with_model(model, jev), plugins)?;
-    let endpoint = crate::llm::Route::for_model(model).endpoint.spec();
-    anyhow::ensure!(rig.app.assistant.key_set, "{model} needs {}'s key ({}) in {}", endpoint.label, endpoint.key_field, crate::assistant::config_path().display());
+    anyhow::ensure!(rig.app.assistant.key_set, "{model} needs an {} key ({}) in {}", crate::llm::PROVIDER, crate::llm::KEY_FIELD, crate::assistant::config_path().display());
     rig.load(task.start)?;
     rig.app.submit_chat(task.prompt.to_string());
     let sent = std::time::Instant::now();
@@ -23021,7 +23177,7 @@ fn eval_median(mut xs: Vec<f64>) -> f64 {
 pub fn run_agent_eval() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let model = opt("--model").unwrap_or_else(|| crate::llm::Route::configured(crate::llm::Role::Act).model);
+    let model = opt("--model").unwrap_or_else(|| crate::llm::Role::Act.model());
     let runs: usize = opt("--runs").map(|r| r.parse()).transpose()?.unwrap_or(1).max(1);
     let only = opt("--task");
     let jev = !args.iter().any(|a| a == "--no-jev");
@@ -23030,7 +23186,7 @@ pub fn run_agent_eval() -> anyhow::Result<()> {
         EVAL_TASKS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "));
     let plugins: EvalPlugins = (list_clap_plugins(), lv2_discover());
 
-    let front = if jev { crate::llm::Route::configured(crate::llm::Role::Decide).model } else { "none".into() };
+    let front = if jev { crate::llm::Role::Decide.model() } else { "none".into() };
     println!("agent-eval: decisions {front} · acting model {model} · {} task(s) x {runs} run(s)", tasks.len());
     let mut results: Vec<(&EvalTask, Vec<EvalRun>)> = Vec::new();
     for task in tasks {
@@ -23470,8 +23626,9 @@ impl DemoApp {
                     ToolChip { label: self.human_tool_label("set_bpm", &serde_json::json!({"bpm": 112})), state: ToolChipState::Done },
                 ],
                 read_count: 2,
+                last_action: None,
                 expanded: false,
-                cost_line: Some("2 steps · 1.1 s · deepseek-chat · 2 reads".into()),
+                cost_line: Some("2 steps · 1.1 s · claude-haiku-5.5 · 2 reads".into()),
             },
         );
         self.assistant.history.push(ChatLine {
@@ -23490,14 +23647,16 @@ impl DemoApp {
                     ToolChip { label: self.human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2})), state: ToolChipState::Running },
                 ],
                 read_count: 1,
+                last_action: Some(self.human_tool_label("connect", &serde_json::json!({"from_node": 1, "to_node": 2}))),
                 expanded: true,
                 cost_line: None,
             },
         );
+        self.active_run_user_idx = Some(2);
         self.assistant.busy = true;
         self.assistant.phase = Some(crate::assistant::RunPhase::Thinking {
             step: 2,
-            model: "deepseek-chat".into(),
+            model: crate::llm::Role::Act.default_model().into(),
         });
         self.pending_confirm = Some(PendingConfirm {
             tool: "delete_rig".into(),
@@ -24999,8 +25158,8 @@ mod rig_switch_tests {
     fn model_switch_and_context_header() {
         let (mut app, _ctx) = two_rigs();
         let before = app.assistant.history.len();
-        app.submit_chat("/model deepseek-reasoner".into());
-        assert_eq!(app.assistant.model(), "deepseek-reasoner");
+        app.submit_chat("/model anthropic/claude-sonnet-5.5".into());
+        assert_eq!(app.assistant.model(), "anthropic/claude-sonnet-5.5");
         assert!(!app.assistant.busy, "a /model command is local, nothing sent");
         assert_eq!(app.assistant.history.len(), before + 1);
         app.set_active_rig(1);
@@ -29513,7 +29672,7 @@ mod ui_polish_agent_tests {
     }
 
     #[test]
-    fn step2_live_status_shows_phase_and_route() {
+    fn the_live_status_says_what_the_agent_does_never_a_step_number() {
         use crate::assistant::{FromWorker, RunPhase};
         let mut app = DemoApp::new_with_sink(None);
         app.assistant.key_set = true;
@@ -29524,17 +29683,24 @@ mod ui_polish_agent_tests {
         theme::install_fonts(&ctx);
         let size = Vec2::new(781.0, 950.0);
 
-        for (phase, expected) in [
-            (RunPhase::Deciding, "Jev · deciding"),
-            (RunPhase::Thinking { step: 2, model: "deepseek-chat".into() }, "DeepSeek · step 2"),
+        let thinking = |step| RunPhase::Thinking { step, model: "anthropic/claude-haiku-5.5".into() };
+        for (phase, after, doing, detail) in [
+            (RunPhase::Deciding, None, "Reading your request", "Jev"),
+            (thinking(1), None, "Thinking", "claude-haiku-5.5"),
+            (thinking(2), Some("Read rack graph"), "Planning the next step", "after Read rack graph · claude-haiku-5.5"),
+            (RunPhase::Deciding, Some("Add Reverb"), "Carrying out the plan", "after Add Reverb · Jev"),
         ] {
             app.assistant.phase = Some(phase);
+            app.active_run_user_idx = Some(0);
+            app.transcript_runs.entry(0).or_default().last_action = after.map(str::to_string);
             let texts = run_frame(&mut app, &ctx, size, vec![]);
             assert_eq!(
-                texts.iter().filter(|(t, _)| t == expected).count(),
+                texts.iter().filter(|(t, _)| t == doing).count(),
                 1,
-                "expected exactly one phase '{expected}' in UI, got {texts:?}"
+                "expected exactly one '{doing}' in UI, got {texts:?}"
             );
+            assert!(texts.iter().any(|(t, _)| t.starts_with(detail)), "'{doing}' is followed by '{detail}': {texts:?}");
+            assert!(texts.iter().all(|(t, _)| !t.contains("step 1") && !t.contains("step 2")), "no step counter: {texts:?}");
             assert!(
                 texts.iter().all(|(t, _)| !t.contains("thinking…")),
                 "static thinking… text must be gone: {texts:?}"
@@ -29574,6 +29740,7 @@ mod ui_polish_agent_tests {
             TranscriptRun {
                 chips,
                 read_count: 0,
+                last_action: None,
                 expanded: false,
                 cost_line: Some("2 steps · 1.4 s · deepseek-chat".into()),
             },
@@ -29797,9 +29964,10 @@ mod ui_polish_agent_tests {
         assert!(texts.iter().any(|(t, _)| t.contains("Split keys → C4")), "missing finished chip: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Mix Rig A")), "chip must use rig display name: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t == "+1 more"), "missing collapsed chip button: {texts:?}");
-        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · deepseek-chat · 2 reads"), "missing cost line: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == "2 steps · 1.1 s · claude-haiku-5.5 · 2 reads"), "missing cost line: {texts:?}");
         // Running run: animated status label + running chip (no static "thinking…", no duplicate live status, no read-only chips).
-        assert_eq!(texts.iter().filter(|(t, _)| t == "DeepSeek · step 2").count(), 1, "live phase label must appear once: {texts:?}");
+        assert_eq!(texts.iter().filter(|(t, _)| t == "Planning the next step").count(), 1, "live status must appear once: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.starts_with("after Wire 1 → 2 · claude-haiku-5.5")), "the status names what the step follows: {texts:?}");
         assert!(texts.iter().any(|(t, _)| t.contains("Wire 1 → 2")), "missing running chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("Read rack graph")), "read-only step must not appear as chip: {texts:?}");
         assert!(texts.iter().all(|(t, _)| !t.contains("thinking…")), "static thinking… text remains: {texts:?}");
@@ -31046,14 +31214,14 @@ mod settings_and_dropdown_tests {
         let size = Vec2::new(1280.0, 900.0);
 
         let (texts, _, _) = warm(&mut app, &ctx, size);
-        let trigger = texts.iter().find(|(t, _)| t == "chat: deepseek-chat").expect("assistant model trigger").1.center();
+        let trigger = texts.iter().find(|(t, _)| *t == format!("chat: {}", crate::llm::Role::Act.default_model())).expect("assistant model trigger").1.center();
         let (texts, fg_rects, _) = open_dropdown(&mut app, &ctx, size, trigger);
         assert!(egui::Popup::is_any_open(&ctx));
         assert!(fg_rects.iter().any(|(_, f)| *f == theme::DARK_PANEL), "assistant dropdown uses DARK_PANEL: {fg_rects:?}");
         assert!(!fg_rects.iter().any(|(_, f)| *f == Color32::BLACK), "no default black popup fill");
-        let reasoner = texts.iter().find(|(t, _)| t == "deepseek-reasoner").unwrap().1.center();
-        click_at(&mut app, &ctx, size, reasoner);
-        assert_eq!(app.assistant.model(), "deepseek-reasoner");
+        let flash = texts.iter().find(|(t, _)| t == crate::llm::DEEPSEEK_FLASH).unwrap().1.center();
+        click_at(&mut app, &ctx, size, flash);
+        assert_eq!(app.assistant.model(), crate::llm::DEEPSEEK_FLASH);
         assert!(!egui::Popup::is_any_open(&ctx));
 
         app.dock = DockView::None;
@@ -31110,7 +31278,7 @@ mod settings_and_dropdown_tests {
         run_frame(&mut app, &ctx, size, key(Key::Comma));
         assert_eq!(app.stage_view, StageView::Settings);
         let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
-        let hint_pos = texts.iter().find(|(t, _)| t == "other model id…").expect("other model id input").1.center();
+        let hint_pos = texts.iter().find(|(t, _)| t == "any OpenRouter model id…").expect("other model id input").1.center();
         click_at(&mut app, &ctx, size, hint_pos);
         let mut ev = key(Key::Comma);
         ev.push(egui::Event::Text(",".into()));
@@ -31120,21 +31288,18 @@ mod settings_and_dropdown_tests {
     }
 
     #[test]
-    fn settings_api_keys_never_render_key_text_and_update_status() {
+    fn the_settings_api_key_is_never_rendered_and_updates_its_status() {
         let mut app = DemoApp::new_with_sink(None);
         app.stage_view = StageView::Settings;
-        let fake_ds = "sk-fake-deepseek-secret-9942";
-        let fake_or = "sk-or-fake-openrouter-secret-7731";
-        app.settings_deepseek_key = fake_ds.into();
-        app.settings_openrouter_key = fake_or.into();
+        app.settings_key_input = "sk-or-fake-openrouter-secret-7731".into();
 
         let ctx = egui::Context::default();
         for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0)] {
-            let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "API keys");
+            let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "API key");
             for (t, _) in &texts {
-                assert!(!t.contains("9942") && !t.contains("deepseek-secret"), "painted text leaked key: {t}");
                 assert!(!t.contains("7731") && !t.contains("openrouter-secret"), "painted text leaked key: {t}");
             }
+            assert!(texts.iter().all(|(t, _)| t != "DeepSeek"), "{size:?}: one provider, one key: {texts:?}");
             if size.y >= 800.0 {
                 assert!(texts.iter().any(|(t, _)| t == "not set"));
             }
@@ -31142,20 +31307,198 @@ mod settings_and_dropdown_tests {
 
         let size = Vec2::new(1280.0, 900.0);
         let (texts, _, _) = warm(&mut app, &ctx, size);
-        let mut save_btns: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Save").map(|(_, r)| *r).collect();
-        save_btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        assert_eq!(save_btns.len(), 2, "Save buttons for DeepSeek and OpenRouter");
+        let save_btns: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Save").map(|(_, r)| *r).collect();
+        assert_eq!(save_btns.len(), 1, "one key, one Save button");
         click_at(&mut app, &ctx, size, save_btns[0].center());
-        click_at(&mut app, &ctx, size, save_btns[1].center());
 
-        assert!(app.assistant.keys().deepseek && app.assistant.keys().openrouter);
-        assert!(app.settings_deepseek_key.is_empty() && app.settings_openrouter_key.is_empty());
+        assert!(app.assistant.key_set);
+        assert!(app.settings_key_input.is_empty());
 
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         for (t, _) in &texts {
-            assert!(!t.contains("9942") && !t.contains("7731"), "key leaked after save: {t}");
+            assert!(!t.contains("7731"), "key leaked after save: {t}");
         }
         assert!(texts.iter().any(|(t, _)| t == "set"));
+    }
+
+    /// Someone who used the assistant with a DeepSeek key learns why it asks
+    /// for a key again; nobody else is told about DeepSeek.
+    #[test]
+    fn a_leftover_deepseek_key_is_explained_where_the_new_key_is_asked_for() {
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        for retired in [false, true] {
+            let mut app = DemoApp::new_with_sink(None);
+            app.assistant.retired_key = retired;
+            app.dock = DockView::Assistant;
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            assert!(texts.iter().any(|(t, _)| t.starts_with("Connect OpenRouter")), "{texts:?}");
+            assert_eq!(texts.iter().any(|(t, _)| t.contains("DeepSeek key is no longer used")), retired, "dock, retired {retired}: {texts:?}");
+            app.dock = DockView::None;
+            app.stage_view = StageView::Settings;
+            let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "API key");
+            assert_eq!(texts.iter().any(|(t, _)| t.contains("DeepSeek key is no longer used")), retired, "settings, retired {retired}: {texts:?}");
+        }
+    }
+
+    /// Switched off, the assistant is out of the app: no top-bar button, no
+    /// dock, no shortcut. Settings brings it back.
+    #[test]
+    fn the_assistant_can_be_switched_off_and_on_in_settings() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t == "Assistant"), "the top bar offers the assistant: {texts:?}");
+        assert!(app.assistant_chip_rect.is_positive());
+
+        app.stage_view = StageView::Settings;
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
+        let toggle = |texts: &[(String, Rect)], app: &DemoApp, label: &str| {
+            let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+            let title = texts.iter().find(|(t, r)| t == "Assistant" && inner.contains(r.center())).expect("the Assistant row").1;
+            texts.iter().find(|(t, r)| t == label && (r.center().y - title.center().y).abs() < 20.0).expect("its switch").1.center()
+        };
+        let switch = toggle(&texts, &app, "On");
+        click_at(&mut app, &ctx, size, switch);
+        assert!(!app.assistant_enabled);
+        assert_eq!(app.dock, DockView::None, "switching it off closes its dock");
+
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(!app.assistant_chip_rect.is_positive(), "no top-bar button");
+        assert!(texts.iter().any(|(t, _)| t == "assistant off"), "the rail says so: {texts:?}");
+        app.stage_view = StageView::Rack;
+        for k in [Key::C, Key::F12] {
+            run_frame(&mut app, &ctx, size, key(k));
+            assert_eq!(app.dock, DockView::None, "{k:?} does not open a switched-off assistant");
+        }
+        run_frame(&mut app, &ctx, size, key(Key::V));
+        assert_eq!(app.dock, DockView::Keyboard, "the keyboard dock is untouched");
+
+        app.stage_view = StageView::Settings;
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
+        let switch = toggle(&texts, &app, "Off");
+        click_at(&mut app, &ctx, size, switch);
+        assert!(app.assistant_enabled);
+        run_frame(&mut app, &ctx, size, vec![]);
+        assert!(app.assistant_chip_rect.is_positive(), "the button is back");
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat agent_mode_shots -- --ignored"]
+    fn agent_mode_shots() {
+        use crate::listen::Stage;
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let size = Vec2::new(1280.0, 800.0);
+        let listening = |app: &mut DemoApp, stage: Stage| {
+            app.assistant.key_set = true;
+            app.assistant.history.push(ChatLine { role: "user".into(), text: "Does the lead sound bright and heroic?".into() });
+            app.assistant.busy = true;
+            app.active_run_user_idx = Some(0);
+            let run = app.transcript_runs.entry(0).or_default();
+            run.chips.push(ToolChip { label: "Play C4".into(), state: ToolChipState::Done });
+            // The sender is kept alive by leaking it: the shot never answers.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::mem::forget(tx);
+            app.tool_batch = Some(ToolBatch {
+                todo: VecDeque::new(),
+                results: Vec::new(),
+                waiting: Some((Waiting::Listen(rx), None)),
+                doing: "Listen to the master".into(),
+                user_idx: 0,
+            });
+            crate::listen::set_stage(Some(stage));
+        };
+        let ago = |secs: f32| std::time::Instant::now() - std::time::Duration::from_secs_f32(secs);
+        // A fresh app per image (rule 148).
+        for name in ["thinking", "listening", "listening-keyboard", "judging", "no-key", "settings-models", "settings-key", "assistant-off"] {
+            let mut app = DemoApp::new_with_sink(None);
+            crate::listen::set_stage(None);
+            match name {
+                "thinking" => app.stage_demo_agent(false),
+                "listening" => {
+                    listening(&mut app, Stage::Recording { since: ago(2.4), secs: 4.0 });
+                    app.dock = DockView::Assistant;
+                }
+                "listening-keyboard" => {
+                    listening(&mut app, Stage::Recording { since: ago(2.4), secs: 4.0 });
+                    app.dock = DockView::Keyboard;
+                }
+                "judging" => {
+                    listening(&mut app, Stage::Judging { since: ago(1.2), model: crate::llm::Role::Listen.default_model().into() });
+                    app.dock = DockView::Assistant;
+                }
+                "no-key" => {
+                    app.assistant.retired_key = true;
+                    app.dock = DockView::Assistant;
+                }
+                "settings-models" | "settings-key" => {
+                    app.assistant.key_set = name == "settings-models";
+                    app.stage_view = StageView::Settings;
+                    app.settings_page = if name == "settings-models" { SettingsPage::Models } else { SettingsPage::Keys };
+                }
+                _ => {
+                    app.set_assistant_enabled(false);
+                    app.stage_view = StageView::Settings;
+                    app.settings_page = SettingsPage::Models;
+                }
+            }
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
+        }
+        crate::listen::set_stage(None);
+    }
+
+    /// While the master is recorded the transcript shows how far it is and
+    /// asks for sound when there is none; then it names the model's wait.
+    #[test]
+    fn a_listen_shows_its_recording_progress_and_then_the_judging_model() {
+        use crate::listen::Stage;
+        let now = std::time::Instant::now();
+        let start = now - std::time::Duration::from_secs(1);
+        let recording = Stage::Recording { since: start, secs: 4.0 };
+        let silent = LiveStatus::of_listen(Some(&recording), now, false);
+        assert_eq!(silent.doing, "Listening to the master");
+        assert_eq!(silent.detail, "1 of 4 s · nothing sounds yet: play a few notes");
+        assert!((silent.progress.unwrap() - 0.25).abs() < 0.01, "{silent:?}");
+        assert_eq!(LiveStatus::of_listen(Some(&recording), now, true).detail, "1 of 4 s");
+        let late = LiveStatus::of_listen(Some(&recording), now + std::time::Duration::from_secs(9), true);
+        assert_eq!((late.detail.as_str(), late.progress), ("4 of 4 s", Some(1.0)), "a recording never runs past its end");
+        let judging = LiveStatus::of_listen(Some(&Stage::Judging { since: start, model: "google/gemini-3.8-flash".into() }), now, true);
+        assert_eq!((judging.doing.as_str(), judging.detail.as_str(), judging.progress), ("Judging what it heard", "gemini-3.8-flash · 1 s", None));
+
+        // In the app: the dock's status line and the top-bar button both show it.
+        let mut app = DemoApp::new_with_sink(None);
+        app.assistant.key_set = true;
+        app.dock = DockView::Assistant;
+        app.assistant.history.push(ChatLine { role: "user".into(), text: "Is it bright?".into() });
+        app.assistant.busy = true;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.tool_batch = Some(ToolBatch {
+            todo: VecDeque::new(),
+            results: Vec::new(),
+            waiting: Some((Waiting::Listen(rx), None)),
+            doing: "Listen to the master".into(),
+            user_idx: 0,
+        });
+        crate::listen::set_stage(Some(Stage::Recording { since: std::time::Instant::now(), secs: 4.0 }));
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert_eq!(texts.iter().filter(|(t, _)| t == "Listening to the master").count(), 1, "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.starts_with("0 of 4 s")), "{texts:?}");
+        app.dock = DockView::Keyboard;
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(texts.iter().any(|(t, _)| t.starts_with("Listening to the master · 0 of 4 s")), "the rack's hint line says it while the dock shows the keyboard: {texts:?}");
+        app.dock = DockView::Assistant;
+        crate::listen::set_stage(Some(Stage::Judging { since: std::time::Instant::now(), model: "google/gemini-3.8-flash".into() }));
+        let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(texts.iter().any(|(t, _)| t == "Judging what it heard"), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t.starts_with("gemini-3.8-flash")), "{texts:?}");
+        crate::listen::set_stage(None);
     }
 
     /// #65: the "New <plugin> rig" confirmation shared the header row with
@@ -31219,12 +31562,11 @@ mod settings_and_dropdown_tests {
 
         let size = Vec2::new(1280.0, 900.0);
         let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
-        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::DEEPSEEK_CHAT).expect("Act model dropdown").1.center();
+        let act_dd = texts.iter().find(|(t, _)| t == crate::llm::Role::Act.default_model()).expect("Act model dropdown").1.center();
         let (texts, _, _) = open_dropdown(&mut app, &ctx, size, act_dd);
-        let opus = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("OpenRouter choice in Act dropdown").1.center();
+        let opus = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("a choice in the Act dropdown").1.center();
         click_at(&mut app, &ctx, size, opus);
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, crate::llm::CLAUDE_OPUS);
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).endpoint, crate::llm::Endpoint::OpenRouter);
+        assert_eq!(app.assistant.model_for(crate::llm::Role::Act), crate::llm::CLAUDE_OPUS);
 
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         let act_dd = texts.iter().find(|(t, _)| t == crate::llm::CLAUDE_OPUS).expect("Act dropdown").1.center();
@@ -31238,9 +31580,9 @@ mod settings_and_dropdown_tests {
         let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
         let mut applies: Vec<Rect> = texts.iter().filter(|(t, _)| t == "Apply").map(|(_, r)| *r).collect();
         applies.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        assert_eq!(applies.len(), 2);
+        assert_eq!(applies.len(), 3, "decide, act, listen");
         click_at(&mut app, &ctx, size, applies[1].center());
-        assert_eq!(app.assistant.route_for(crate::llm::Role::Act).model, "openai/gpt-5.4");
+        assert_eq!(app.assistant.model_for(crate::llm::Role::Act), "openai/gpt-5.4");
 
         assert!(app.assistant.decide_enabled());
         assert!(!app.reduce_motion);
@@ -31278,7 +31620,7 @@ mod settings_and_dropdown_tests {
     #[test]
     fn agent_settings_have_their_own_pages_apart_from_the_app_settings() {
         let app_only = ["Audio output", "Buffer size", "Autosave sessions", "Count-in", "Reduce motion", "UI scale"];
-        let agent_only = ["Decisions (Jev)", "Chat model", "DeepSeek", "OpenRouter", "ASSISTANT ONLY"];
+        let agent_only = ["Decisions (Jev)", "Chat model", "Listening model", "OpenRouter", "ASSISTANT ONLY"];
         for (size, rail) in [(Vec2::new(1280.0, 900.0), true), (Vec2::new(781.0, 468.0), false)] {
             let mut app = DemoApp::new_with_sink(None);
             app.stage_view = StageView::Settings;
@@ -31327,16 +31669,17 @@ mod settings_and_dropdown_tests {
 
     /// A model whose provider has no key offers a way to that key.
     #[test]
-    fn a_model_without_its_key_leads_to_the_api_keys_page() {
+    fn models_without_a_key_lead_to_the_api_key_page() {
         let mut app = DemoApp::new_with_sink(None);
         app.stage_view = StageView::Settings;
         let ctx = egui::Context::default();
         let size = Vec2::new(1280.0, 900.0);
         let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Models");
-        assert!(texts.iter().any(|(t, _)| *t == format!("{} \u{b7} no key", crate::llm::DEEPSEEK_CHAT)), "the rail warns: {texts:?}");
-        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Set DeepSeek key");
+        let act = crate::assistant::short_model(crate::llm::Role::Act.default_model());
+        assert!(texts.iter().any(|(t, _)| *t == format!("{act} \u{b7} no key")), "the rail warns: {texts:?}");
+        let (texts, _, _) = open_settings_page(&mut app, &ctx, size, "Set OpenRouter key");
         assert_eq!(app.settings_page, SettingsPage::Keys);
-        assert!(texts.iter().any(|(t, _)| t == "sk-\u{2026}"), "the DeepSeek key field is shown");
+        assert!(texts.iter().any(|(t, _)| t == "sk-or-\u{2026}"), "the key field is shown");
     }
 
     #[test]

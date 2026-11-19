@@ -511,7 +511,7 @@ Learned so far (2026-11-15, UI polish pass):
 85. **Destructive confirms use `theme::danger_button(..., false)` (`DANGER_BG` + `CLIP_RED` border + `CLIP_BRIGHT` text), never `theme::primary_button`:**
     `ACCENT_DEEP` belongs to non-destructive CTAs like `Send`; destructive confirms (`delete_rig`) must stay visually distinct (`agent_panel_defect1_danger_confirm_differs_from_send`).
 86. **Live agent status renders once under the running transcript turn, and read-only steps stay out of action chips:**
-    duplicating `phase_label()` in the header repeats the model route twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
+    duplicating the `live_status()` line in the header repeats the model twice, and `tool_is_read_only` steps belong in `read_count` / the cost line, never as action chips (`agent_panel_defect4_read_only_tools_omitted_from_chip_row`).
 87. **Transcript controls indent by `TRANSCRIPT_TEXT_INDENT`:**
     align `Confirm`/`Cancel` to the message text column (`78.0` px) (`agent_panel_defect6_confirm_aligns_with_the_transcript_column`).
 88. **A key shows lit for as long as it is held, from every source:** only

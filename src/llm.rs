@@ -1,56 +1,32 @@
-//! One LLM client for the agent: where a request goes (endpoint + model per
-//! role) and how it survives a flaky network (classified errors, retries).
+//! One LLM client for the agent. Every request goes to OpenRouter: one key
+//! reaches every model, and each role (decide, act, listen) names its own.
+//! Requests survive a flaky network (classified errors, retries).
 //!
-//! Keys live in ~/.config/kabelsalat/config.json and are only ever sent to
-//! the endpoint they belong to.
+//! The key lives in ~/.config/kabelsalat/config.json and is only ever sent
+//! to openrouter.ai.
 
 use std::time::Duration;
 
 use serde_json::Value;
 
-/// An OpenAI-compatible chat-completions service.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Endpoint {
-    OpenRouter,
-    DeepSeek,
+/// The provider's name in messages the user reads.
+pub const PROVIDER: &str = "OpenRouter";
+const CHAT_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// Where decisions models (typed questions in, probabilities out) are asked.
+const DECISIONS_URL: &str = "https://openrouter.ai/api/alpha/decisions";
+/// The config.json field that holds the API key.
+pub const KEY_FIELD: &str = "openrouter_api_key";
+/// The key field of the direct DeepSeek endpoint the assistant used before
+/// it moved to OpenRouter. Never sent anywhere: it is only read to tell its
+/// owner why the assistant asks for a key again.
+pub const RETIRED_KEY_FIELD: &str = "deepseek_api_key";
+
+/// The key from config.json (None in tests, rule 37).
+pub fn key() -> Option<String> {
+    crate::assistant::load_config_str(KEY_FIELD)
 }
 
-pub struct EndpointSpec {
-    pub label: &'static str,
-    /// Chat completions live at `{base_url}/chat/completions`.
-    pub base_url: &'static str,
-    /// Where decisions models (typed questions in, probabilities out) are
-    /// asked; None when the endpoint has none.
-    pub decisions_url: Option<&'static str>,
-    /// The config.json field that holds this endpoint's API key.
-    pub key_field: &'static str,
-}
-
-impl Endpoint {
-    pub fn spec(self) -> EndpointSpec {
-        match self {
-            Endpoint::OpenRouter => EndpointSpec {
-                label: "OpenRouter",
-                base_url: "https://openrouter.ai/api/v1",
-                decisions_url: Some("https://openrouter.ai/api/alpha/decisions"),
-                key_field: "openrouter_api_key",
-            },
-            Endpoint::DeepSeek => EndpointSpec {
-                label: "DeepSeek",
-                base_url: "https://api.deepseek.com",
-                decisions_url: None,
-                key_field: "deepseek_api_key",
-            },
-        }
-    }
-
-    /// This endpoint's key from config.json (None in tests, rule 37).
-    pub fn key(self) -> Option<String> {
-        crate::assistant::load_config_str(self.spec().key_field)
-    }
-}
-
-/// What a model is asked to do. Each role has its own route.
+/// What a model is asked to do. Each role has its own model.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     /// Decide: a decisions model (Jev) answers typed questions about the
@@ -59,16 +35,32 @@ pub enum Role {
     /// Act: a chat model reads the request and calls tools, for everything
     /// the decision alone does not settle.
     Act,
+    /// Listen: an audio-capable model hears a recording of the master and
+    /// writes what it heard (the `listen` tool).
+    Listen,
 }
 
+/// OpenRouter's alias for the newest Jev, TypeSafe's decisions model.
+pub const JEV: &str = "~typesafe/jev-latest";
+/// A chat-model router that runs on Jev: it picks a chat model per request.
+pub const JEV_ROUTER: &str = "typesafe/jev-router";
+pub const CLAUDE_HAIKU: &str = "anthropic/claude-haiku-5.5";
+pub const CLAUDE_SONNET: &str = "anthropic/claude-sonnet-5.5";
+pub const CLAUDE_OPUS: &str = "anthropic/claude-opus-5.5";
+pub const GEMINI_FLASH: &str = "google/gemini-3.8-flash";
+/// OpenRouter's alias for DeepSeek's newest fast chat model.
+pub const DEEPSEEK_FLASH: &str = "~deepseek/deepseek-flash-latest";
+pub const GPT_LUNA: &str = "openai/gpt-5.6-luna";
+
 impl Role {
-    pub const ALL: [Role; 2] = [Role::Decide, Role::Act];
+    pub const ALL: [Role; 3] = [Role::Decide, Role::Act, Role::Listen];
 
     /// The config.json field that overrides this role's model.
     pub fn model_field(self) -> &'static str {
         match self {
             Role::Decide => "agent_decide_model",
             Role::Act => "agent_act_model",
+            Role::Listen => "agent_listen_model",
         }
     }
 
@@ -76,78 +68,45 @@ impl Role {
         match self {
             Role::Decide => "Decisions (Jev)",
             Role::Act => "Chat model",
+            Role::Listen => "Listening model",
         }
+    }
+
+    /// The model a role runs on when config.json names none.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Role::Decide => JEV,
+            Role::Act => CLAUDE_HAIKU,
+            Role::Listen => GEMINI_FLASH,
+        }
+    }
+
+    /// The models Settings offers for this role, the default first. Any
+    /// other OpenRouter id can be typed.
+    pub fn offered(self) -> &'static [&'static str] {
+        match self {
+            Role::Decide => &[JEV],
+            Role::Act => &[CLAUDE_HAIKU, DEEPSEEK_FLASH, GEMINI_FLASH, GPT_LUNA, CLAUDE_SONNET, CLAUDE_OPUS, JEV_ROUTER],
+            Role::Listen => &[GEMINI_FLASH],
+        }
+    }
+
+    /// This role's model: `configured` when OpenRouter can route it, else
+    /// the default.
+    pub fn resolve(self, configured: Option<&str>) -> String {
+        configured.filter(|id| routable(id)).unwrap_or(self.default_model()).to_string()
+    }
+
+    /// The model config.json asks for.
+    pub fn model(self) -> String {
+        self.resolve(crate::assistant::load_config_str(self.model_field()).as_deref())
     }
 }
 
-/// Where a role's requests go.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Route {
-    pub endpoint: Endpoint,
-    pub model: String,
-}
-
-/// OpenRouter's alias for the newest Jev, TypeSafe's decisions model.
-pub const JEV: &str = "~typesafe/jev-latest";
-/// A chat-model router that runs on Jev: the acting model for users who
-/// have only an OpenRouter key.
-pub const JEV_ROUTER: &str = "typesafe/jev-router";
-pub const DEEPSEEK_CHAT: &str = "deepseek-chat";
-pub const GEMINI_FLASH: &str = "google/gemini-3.8-flash";
-pub const CLAUDE_OPUS: &str = "anthropic/claude-opus-5.5";
-
-impl Route {
-    /// The endpoint follows the id's shape: OpenRouter ids are
-    /// "vendor/model", DeepSeek's own ids have no slash.
-    pub fn for_model(model: &str) -> Route {
-        let endpoint = if model.contains('/') { Endpoint::OpenRouter } else { Endpoint::DeepSeek };
-        Route { endpoint, model: model.to_string() }
-    }
-
-    /// A role's route: the configured model, else the default. Decisions go
-    /// to Jev. Acting stays on DeepSeek's chat model when its key exists
-    /// (measured faster per step than the Jev router's picks) and uses the
-    /// router when OpenRouter's key is the only one.
-    pub fn resolve(role: Role, model_override: Option<&str>, keys: Keys) -> Route {
-        if let Some(model) = model_override {
-            return Route::for_model(model);
-        }
-        match role {
-            Role::Decide => Route::for_model(JEV),
-            Role::Act if keys.openrouter && !keys.deepseek => Route::for_model(JEV_ROUTER),
-            Role::Act => Route::for_model(DEEPSEEK_CHAT),
-        }
-    }
-
-    /// The route config.json asks for.
-    pub fn configured(role: Role) -> Route {
-        let model = crate::assistant::load_config_str(role.model_field());
-        let keys = Keys { openrouter: Endpoint::OpenRouter.key().is_some(), deepseek: Endpoint::DeepSeek.key().is_some() };
-        Route::resolve(role, model.as_deref(), keys)
-    }
-}
-
-/// Which endpoints config.json has a key for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Keys {
-    pub openrouter: bool,
-    pub deepseek: bool,
-}
-
-impl Keys {
-    pub fn has(self, endpoint: Endpoint) -> bool {
-        match endpoint {
-            Endpoint::OpenRouter => self.openrouter,
-            Endpoint::DeepSeek => self.deepseek,
-        }
-    }
-
-    pub fn set(&mut self, endpoint: Endpoint, present: bool) {
-        match endpoint {
-            Endpoint::OpenRouter => self.openrouter = present,
-            Endpoint::DeepSeek => self.deepseek = present,
-        }
-    }
+/// OpenRouter ids are "vendor/model". An id without a vendor ("deepseek-chat")
+/// is left over from the direct DeepSeek endpoint and reaches nothing here.
+pub fn routable(id: &str) -> bool {
+    id.contains('/')
 }
 
 /// Why a request failed, by what the caller can do about it.
@@ -295,7 +254,7 @@ fn retry_wait(next: u32, retry_after: Option<Duration>) -> Duration {
 }
 
 /// The JSON body of a successful answer, or why there is none.
-fn classify(label: &str, reply: Result<Reply, String>) -> Result<Value, LlmError> {
+fn classify(reply: Result<Reply, String>) -> Result<Value, LlmError> {
     let reply = reply.map_err(|message| LlmError::Transient { message, retry_after: None })?;
     let body: Option<Value> = serde_json::from_str(&reply.body).ok();
     let api_message = body.as_ref()
@@ -309,13 +268,13 @@ fn classify(label: &str, reply: Result<Reply, String>) -> Result<Value, LlmError
         status => status,
     };
     match code {
-        200..=299 => body.ok_or_else(|| LlmError::Request(format!("{label} sent an answer that is not JSON"))),
-        401 | 403 => Err(LlmError::Auth(format!("{label} refused the API key ({code}): {api_message}"))),
+        200..=299 => body.ok_or_else(|| LlmError::Request(format!("{PROVIDER} sent an answer that is not JSON"))),
+        401 | 403 => Err(LlmError::Auth(format!("{PROVIDER} refused the API key ({code}): {api_message}"))),
         408 | 429 | 500..=599 => Err(LlmError::Transient {
-            message: format!("{label} is busy ({code}): {api_message}"),
+            message: format!("{PROVIDER} is busy ({code}): {api_message}"),
             retry_after: reply.retry_after.map(Duration::from_secs),
         }),
-        _ => Err(LlmError::Request(format!("{label} rejected the request ({code}): {api_message}"))),
+        _ => Err(LlmError::Request(format!("{PROVIDER} rejected the request ({code}): {api_message}"))),
     }
 }
 
@@ -331,11 +290,11 @@ impl<T: Transport> Client<T> {
     /// POST `body` and return the answer's JSON with the attempts it took.
     /// Transient failures are retried up to `MAX_ATTEMPTS` times; the last
     /// error is returned.
-    fn post(&mut self, label: &str, url: &str, key: &str, body: &Value) -> Result<(Value, u32), LlmError> {
+    fn post(&mut self, url: &str, key: &str, body: &Value) -> Result<(Value, u32), LlmError> {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            match classify(label, self.transport.post(url, key, body)) {
+            match classify(self.transport.post(url, key, body)) {
                 Ok(answer) => return Ok((answer, attempts)),
                 Err(LlmError::Transient { retry_after, .. }) if attempts < MAX_ATTEMPTS => {
                     self.transport.sleep(retry_wait(attempts + 1, retry_after));
@@ -345,29 +304,25 @@ impl<T: Transport> Client<T> {
         }
     }
 
-    /// One chat completion on `route`. `body` carries messages and tools;
-    /// the route's model is filled in.
-    pub fn chat(&mut self, route: &Route, key: &str, mut body: Value) -> Result<Completion, LlmError> {
-        let spec = route.endpoint.spec();
-        body["model"] = Value::String(route.model.clone());
+    /// One chat completion by `model`. `body` carries messages and tools.
+    pub fn chat(&mut self, model: &str, key: &str, mut body: Value) -> Result<Completion, LlmError> {
+        body["model"] = Value::String(model.to_string());
         let started = std::time::Instant::now();
-        let (answer, attempts) = self.post(spec.label, &format!("{}/chat/completions", spec.base_url), key, &body)?;
+        let (answer, attempts) = self.post(CHAT_URL, key, &body)?;
         let message = answer.pointer("/choices/0/message").cloned()
-            .ok_or_else(|| LlmError::Request(format!("{} sent an answer without a message", spec.label)))?;
+            .ok_or_else(|| LlmError::Request(format!("{PROVIDER} sent an answer without a message")))?;
         Ok(Completion { message, model: model_of(&answer), ms: started.elapsed().as_millis() as u64, attempts })
     }
 
-    /// Ask a decisions model typed `questions` (noul, choice, score) about
-    /// `request`: one request, one probability-backed answer per question.
-    pub fn decide(&mut self, route: &Route, key: &str, request: &str, questions: Value) -> Result<Decisions, LlmError> {
-        let spec = route.endpoint.spec();
-        let url = spec.decisions_url
-            .ok_or_else(|| LlmError::Request(format!("{} has no decisions endpoint (model {})", spec.label, route.model)))?;
-        let body = serde_json::json!({ "model": route.model, "state": request, "questions": questions });
+    /// Ask the decisions model `model` typed `questions` (noul, choice,
+    /// score) about `request`: one request, one probability-backed answer
+    /// per question.
+    pub fn decide(&mut self, model: &str, key: &str, request: &str, questions: Value) -> Result<Decisions, LlmError> {
+        let body = serde_json::json!({ "model": model, "state": request, "questions": questions });
         let started = std::time::Instant::now();
-        let (answer, attempts) = self.post(spec.label, url, key, &body)?;
+        let (answer, attempts) = self.post(DECISIONS_URL, key, &body)?;
         let answers = answer.get("answers").and_then(|a| a.as_object())
-            .ok_or_else(|| LlmError::Request(format!("{} sent a decision without answers", spec.label)))?
+            .ok_or_else(|| LlmError::Request(format!("{PROVIDER} sent a decision without answers")))?
             .iter().map(|(key, a)| (key.clone(), parse_answer(a))).collect();
         Ok(Decisions { answers, model: model_of(&answer), ms: started.elapsed().as_millis() as u64, attempts })
     }
@@ -440,20 +395,18 @@ mod tests {
 
     fn chat(replies: Vec<Result<Reply, String>>) -> (Result<Completion, LlmError>, FakeTransport) {
         let probe = FakeTransport::new(replies);
-        let out = Client::new(probe.clone()).chat(&Route::for_model(JEV_ROUTER), "k", json!({"messages": []}));
+        let out = Client::new(probe.clone()).chat(JEV_ROUTER, "k", json!({"messages": []}));
         (out, probe)
     }
 
-    const BOTH: Keys = Keys { openrouter: true, deepseek: true };
-    const ONLY_OPENROUTER: Keys = Keys { openrouter: true, deepseek: false };
-    const NONE: Keys = Keys { openrouter: false, deepseek: false };
-
     #[test]
-    fn each_role_has_its_default_route() {
-        assert_eq!(Route::resolve(Role::Decide, None, BOTH), Route { endpoint: Endpoint::OpenRouter, model: "~typesafe/jev-latest".into() });
-        assert_eq!(Route::resolve(Role::Act, None, BOTH), Route { endpoint: Endpoint::DeepSeek, model: DEEPSEEK_CHAT.into() });
-        assert_eq!(Route::resolve(Role::Act, None, ONLY_OPENROUTER), Route { endpoint: Endpoint::OpenRouter, model: JEV_ROUTER.into() });
-        assert_eq!(Route::resolve(Role::Act, None, NONE).endpoint, Endpoint::DeepSeek, "the key box asks for a DeepSeek key");
+    fn each_role_has_its_default_model_and_all_of_them_are_on_openrouter() {
+        assert_eq!(Role::Decide.resolve(None), "~typesafe/jev-latest");
+        for role in Role::ALL {
+            assert!(routable(role.default_model()), "{role:?}");
+            assert_eq!(role.offered()[0], role.default_model(), "{role:?}: the default leads the list");
+            assert!(role.offered().iter().all(|id| routable(id)), "{role:?}");
+        }
     }
 
     #[test]
@@ -466,7 +419,7 @@ mod tests {
             "id":"gen-dec-1","model":"typesafe/jev-1.13-20260917","provider":"TypeSafe","usage":{"cost":0.00002,"input_tokens":476,"output_tokens":70}}"#;
         let probe = FakeTransport::new(vec![status(503, "{}"), status(200, body)]);
         let out = Client::new(probe.clone())
-            .decide(&Route::for_model(JEV), "k", "My checkout page is blank.", json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
+            .decide(JEV, "k", "My checkout page is blank.", json!({"is_bug": {"type": "noul", "instructions": "A defect?"}}))
             .unwrap();
         assert_eq!(out.answers["is_bug"], Answer::Noul(0.96));
         assert_eq!(out.choice("team"), Some(("payments", 0.84)));
@@ -480,22 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_needs_an_endpoint_that_has_decisions() {
-        let probe = FakeTransport::new(vec![]);
-        let out = Client::new(probe.clone()).decide(&Route::for_model(DEEPSEEK_CHAT), "k", "x", json!({}));
-        assert!(matches!(out, Err(LlmError::Request(m)) if m.contains("no decisions endpoint")));
-        assert!(probe.requests().is_empty());
+    fn a_configured_model_overrides_the_default_unless_openrouter_cannot_route_it() {
+        assert_eq!(Role::Act.resolve(Some("anthropic/claude-opus-5.5")), "anthropic/claude-opus-5.5");
+        assert_eq!(Role::Act.resolve(Some("deepseek-chat")), Role::Act.default_model(), "an id of the retired DeepSeek endpoint");
+        assert_eq!(Role::Listen.resolve(Some("deepseek-reasoner")), Role::Listen.default_model());
     }
 
     #[test]
-    fn a_configured_model_overrides_the_default_and_picks_its_endpoint() {
-        assert_eq!(Route::resolve(Role::Act, Some("deepseek-reasoner"), ONLY_OPENROUTER).endpoint, Endpoint::DeepSeek);
-        let r = Route::resolve(Role::Act, Some("anthropic/claude-opus-5.5"), NONE);
-        assert_eq!((r.endpoint, r.model.as_str()), (Endpoint::OpenRouter, "anthropic/claude-opus-5.5"));
-    }
-
-    #[test]
-    fn a_request_goes_to_the_routes_endpoint_with_its_model_and_key() {
+    fn a_request_goes_to_openrouter_with_its_model_and_key() {
         let (out, t) = chat(vec![text("anthropic/claude-opus-5.5", "hi")]);
         let out = out.unwrap();
         assert_eq!(out.model, "anthropic/claude-opus-5.5", "the router's pick is reported");

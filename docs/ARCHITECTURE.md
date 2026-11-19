@@ -309,6 +309,14 @@ agents are in [AGENTS.md](../AGENTS.md).
   card's output latency and the audio-input latency are shown as "not
   measured": cpal's `playback − callback` reads 185 ms through pipewire-alsa
   on a one-quantum graph (`audio-in-test`), and no other figure is measured.
+- **2026-11-19** — **The assistant runs on OpenRouter only** (user): one key
+  (`openrouter_api_key`) reaches every model, so `llm` has no endpoint or
+  key table any more: a role (`Decide`, `Act`, `Listen`) is a model id, and an
+  id without a vendor (left from the direct DeepSeek endpoint) falls back to
+  the role's default. `assistant_enabled` in config.json takes the assistant
+  out of the UI. The live status line is derived in one place
+  (`DemoApp::live_status`) from the worker's phase, the tool batch and
+  `listen::stage()`, the process-wide stage of the one master recording.
 - **2026-11-19** — **Sends and aux buses (#5)**: an aux bus is a node
   (`DspKind::Bus`) with an OUT jack and no input. What feeds it is the send
   table (`Command::SetSend`: a rig or a node, a level, pre or post fader),

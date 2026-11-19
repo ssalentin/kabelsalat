@@ -35,6 +35,7 @@ pub fn build_processor(kind: &DspKind, sample_rate: f64) -> Box<dyn Processor> {
         DspKind::Delay => Box::new(Delay::new(sample_rate)),
         DspKind::Reverb => Box::new(Reverb::new(sample_rate)),
         DspKind::Metronome => Box::new(Metronome),
+        DspKind::Bus => Box::new(BusFader::new(sample_rate)),
     }
 }
 
@@ -155,6 +156,50 @@ impl Processor for Gain {
     fn param_name(&self, id: u32) -> &'static str {
         match id {
             0 => "gain",
+            _ => "unknown",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bus fader
+// ---------------------------------------------------------------------------
+
+/// An aux bus's fader (issue #5). Param 0 is the linear gain itself (0..=1,
+/// 1 = unity), the same scale the mixer's dB faders ride, slewed like Gain.
+pub struct BusFader {
+    amp: Slew,
+}
+
+impl BusFader {
+    pub fn new(sample_rate: f64) -> Self {
+        Self { amp: Slew::new(sample_rate, 10.0, 1.0) }
+    }
+}
+
+impl Processor for BusFader {
+    fn process(&mut self, io: &mut [f32], frames: usize) {
+        let n = frame_count(io, frames);
+        for f in 0..n {
+            let g = self.amp.next();
+            io[2 * f] *= g;
+            io[2 * f + 1] *= g;
+        }
+    }
+
+    fn set_param(&mut self, id: u32, value: f32) {
+        if id == 0 {
+            self.amp.set(clamp01(value));
+        }
+    }
+
+    fn param_count(&self) -> u32 {
+        1
+    }
+
+    fn param_name(&self, id: u32) -> &'static str {
+        match id {
+            0 => "level",
             _ => "unknown",
         }
     }
@@ -1464,6 +1509,7 @@ mod tests {
             (DspKind::Delay, 5),
             (DspKind::Reverb, 4),
             (DspKind::Metronome, 0),
+            (DspKind::Bus, 1),
         ];
         for (kind, count) in kinds {
             let mut p = build_processor(&kind, SR);
@@ -1545,6 +1591,7 @@ mod tests {
             DspKind::Delay,
             DspKind::Reverb,
             DspKind::Metronome,
+            DspKind::Bus,
         ];
         // Everything (nodes + buffers) is built before the measurement window.
         let mut nodes: Vec<Box<dyn Processor>> =

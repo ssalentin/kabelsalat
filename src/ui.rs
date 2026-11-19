@@ -30,7 +30,8 @@ use eframe::egui::{
 
 use crate::assistant::{Assistant, ChatLine, ToolCall};
 use crate::control::{
-    name_bytes, name_str, split_port, AudioInChannel, Command, CommandBus, DspKind, Graph, Lv2Uri,
+    name_bytes, name_str, split_port, AudioInChannel, AuxSend, Command, CommandBus, DspKind, Graph, Lv2Uri,
+    SendSource,
     Node, NodeKind, PortKind as CPortKind, PortRef, DEFAULT_SPLIT,
 };
 use crate::engine::{
@@ -1019,6 +1020,20 @@ fn remap_session(
     for (&old, label) in s.strip_knobs() {
         if let Some(node) = remap(old) { ns.set_strip_knob(node, label.clone()); }
     }
+    // Sends (issue #5) follow their bus and their source: a node by its id, a
+    // rig by where its nodes went (a deleted rig takes its sends along).
+    let rig_of = |old: u8| -> Option<u8> {
+        let n = s.graph.nodes.iter().find(|n| n.rig == old)?;
+        ns.graph.node(remap(n.id)?).map(|n| n.rig)
+    };
+    let sends: Vec<AuxSend> = s.sends().iter().filter_map(|x| {
+        let from = match x.from {
+            SendSource::Rig(r) => SendSource::Rig(rig_of(r)?),
+            SendSource::Node(n) => SendSource::Node(remap(n)?),
+        };
+        Some(AuxSend { from, bus: remap(x.bus)?, ..*x })
+    }).collect();
+    ns.set_sends(sends);
     ns
 }
 
@@ -1587,6 +1602,13 @@ fn make_unit(node: &Node) -> Unit {
             // the audio cable no longer crosses the MIDI jack (vision review).
             vec![(Dir::In, 1, 0.22, "MIDI IN"), (Dir::Out, 0, 0.48, "OUT"), (Dir::In, 0, 0.74, "IN")],
         ),
+        // An aux bus (issue #5) has no input jack: sends feed it, and the
+        // cables from its OUT are its insert chain and its return.
+        NodeKind::Dsp(DspKind::Bus) => (
+            UnitKind::Dsp(DspKind::Bus), "aux bus · fed by sends".into(),
+            vec![], vec![PortKind::Audio],
+            vec![(Dir::Out, 0, 0.62, "OUT")],
+        ),
         NodeKind::Dsp(kind) => {
             let sub: &str = match kind {
                 DspKind::Reverb => "reverb",
@@ -1597,7 +1619,7 @@ fn make_unit(node: &Node) -> Unit {
                 DspKind::Saturation => "saturation",
                 DspKind::Pan => "panner",
                 DspKind::Metronome => "metronome · transport click",
-                DspKind::Delay => unreachable!(),
+                DspKind::Delay | DspKind::Bus => unreachable!(),
             };
             (
                 UnitKind::Dsp(kind.clone()), sub.into(),
@@ -2125,6 +2147,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "rename_strip", "set_strip_color", "move_strip", "collapse_strip",
     "get_engine_info", "reset_engine_peaks",
     "get_strip_knobs", "set_strip_knob",
+    "add_bus", "remove_bus", "set_send", "get_sends",
     "list_channels",
     "get_midi_clock", "set_midi_clock",
     "get_master_target", "set_master_target",
@@ -2606,6 +2629,17 @@ struct DemoApp {
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
     strips: Vec<StripUiRow>,
+    /// Sends into aux buses (issue #5): the mirror of the engine's table.
+    sends: Vec<AuxSend>,
+    /// A local send edit is on its way: the engine's older table waits.
+    ui_send_grace: f32,
+    /// A send knob being dragged: its send and the fader position so far.
+    send_drag: Option<((SendSource, u32), f32)>,
+    /// This frame's send rows: (source, bus, level knob, PRE tag).
+    mixer_send_rects: Vec<(SendSource, u32, Rect, Rect)>,
+    /// A bus edit asked for during a mixer frame, applied after its layout
+    /// (rule 32).
+    pending_bus_edit: Option<BusEdit>,
     /// Source strip display order (#77), flat across rigs: a rig's strips are
     /// the entries whose node is in that rig, in this order; unlisted nodes
     /// follow in unit order.
@@ -3066,6 +3100,11 @@ impl DemoApp {
             rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
             strips: Vec::new(),
+            sends: Vec::new(),
+            ui_send_grace: -1.0,
+            send_drag: None,
+            mixer_send_rects: Vec::new(),
+            pending_bus_edit: None,
             strip_order: Vec::new(),
             strip_knobs: std::collections::BTreeMap::new(),
             ui_strip_grace: std::collections::HashMap::new(),
@@ -4198,6 +4237,11 @@ impl DemoApp {
                 }
             }
             self.rig_mix = g.mix;
+            // Sends (issue #5): the engine's table is the truth (rule 33),
+            // once a local edit's echo is back.
+            if now >= self.ui_send_grace {
+                self.sends = g.sends.iter().copied().filter(|x| x.bus != u32::MAX).collect();
+            }
             // Strip mirror (#73/#74): adopt the engine's per-node table the
             // same way (rule 33) — a remote SetStripMix/SetStripBypass shows
             // in the mixer without a rebuild. UI-side echoes are inside
@@ -4772,6 +4816,13 @@ impl DemoApp {
             "set_node_bypass" => {
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 format!("Bypass {}", self.unit_display_name(node))
+            }
+            "add_bus" => "Add aux bus".into(),
+            "remove_bus" => "Remove aux bus".into(),
+            "get_sends" => "Read sends".into(),
+            "set_send" => {
+                let bus = args.get("bus").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                format!("Send → {}", self.unit_display_name(bus))
             }
             "add_insert" => format!(
                 "Insert → {}",
@@ -5364,6 +5415,7 @@ impl DemoApp {
                 s.set_strip_knob(node, label.clone());
             }
         }
+        s.set_sends(self.sends.clone());
         Ok(s)
     }
 
@@ -5577,6 +5629,7 @@ impl DemoApp {
         self.strips = s.strips().iter().map(StripUiRow::from_saved).collect();
         self.strip_order = s.strip_order().to_vec();
         self.strip_knobs = s.strip_knobs().clone();
+        self.sends = s.sends().to_vec();
         self.mixer_knob_drag = None;
         self.send_all_strip_state();
         // The loudness target the session was saved with (#12). A session
@@ -5737,6 +5790,7 @@ impl DemoApp {
         let merged = crate::control::merge_rigs(&rigs);
         self.build_rack(&merged, &[]);
         self.strips.clear();
+        self.sends.clear();
         self.strip_order.clear();
         self.strip_knobs.clear();
         self.mixer_knob_drag = None;
@@ -6567,6 +6621,58 @@ impl DemoApp {
                 self.agent_activity.record(origin, format!("Source mix → {}", self.unit_display_name(node)), vec![node], now);
                 format!("{} (node {node}): pan {:.2} mute {} solo {} — solo mutes the other sources of its rig", self.unit_display_name(node), row.pan, row.mute, row.solo)
             }
+            "add_bus" => {
+                // An aux bus (issue #5), returning into `rig`'s master.
+                let rig = args.get("rig").and_then(|v| v.as_u64()).map(|r| r as usize).unwrap_or(self.active_rig);
+                let name = args.get("name").and_then(|v| v.as_str());
+                match self.add_bus(name, rig.min(255) as u8) {
+                    Ok(node) => {
+                        self.agent_activity.touch_node(node, now);
+                        self.agent_activity.record(origin, format!("Aux bus → {}", self.unit_display_name(node)), vec![node], now);
+                        format!("added aux bus '{}' (node {node}, rig {rig}): it returns to Master out past the rig faders. Send into it with set_send (bus {node}); put effects on it with add_insert (source {node}); its fader is its LEVEL knob, its pan/mute/solo are set_strip_mix", self.unit_display_name(node))
+                    }
+                    Err(e) => format!("add_bus NOT applied: {e}"),
+                }
+            }
+            "remove_bus" => {
+                let bus = args.get("bus").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                if !self.bus_units().iter().any(|&u| self.units[u].node_id == bus) {
+                    return format!("node {bus} is not an aux bus (get_sends lists them)");
+                }
+                match self.remove_bus(bus) {
+                    Ok(msg) => {
+                        self.agent_activity.record(origin, msg.clone(), vec![], now);
+                        msg
+                    }
+                    Err(e) => format!("remove_bus NOT applied: {e}"),
+                }
+            }
+            "set_send" => {
+                // One send into an aux bus (issue #5), from a rig or a node.
+                let bus = args.get("bus").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
+                let from = match (args.get("rig").and_then(|v| v.as_u64()), args.get("node").and_then(|v| v.as_u64())) {
+                    (Some(r), None) => SendSource::Rig(r.min(255) as u8),
+                    (None, Some(n)) => SendSource::Node(n as u32),
+                    _ => return "set_send needs exactly one source: rig (0-based index, the whole rig at its rig bus) or node (one source's node id)".into(),
+                };
+                let level = args.get("level").and_then(|v| v.as_f64()).map(|l| l as f32);
+                let pre = args.get("pre").and_then(|v| v.as_bool());
+                match self.set_send(from, bus, level, pre) {
+                    Ok(x) => {
+                        if self.graph_pub.is_some() { self.pending_agent_origin = Some((origin, now + 1.0)); }
+                        let who = match from {
+                            SendSource::Rig(r) => self.rig_name(r as usize),
+                            SendSource::Node(n) => self.unit_display_name(n),
+                        };
+                        self.agent_activity.touch_node(bus, now);
+                        self.agent_activity.record(origin, format!("Send {who} → {}", self.unit_display_name(bus)), vec![bus], now);
+                        format!("send {who} → {} (bus {bus}): level {:.2} ({}), {} fader", self.unit_display_name(bus), x.level,
+                            db_readout(x.level), if x.pre { "pre" } else { "post" })
+                    }
+                    Err(e) => format!("set_send NOT applied: {e}"),
+                }
+            }
+            "get_sends" => self.sends_json().to_string(),
             "set_node_bypass" => {
                 // Insert bypass (#74): the FX passes its input through.
                 let node = args.get("node").and_then(|v| v.as_u64()).unwrap_or(u64::MAX) as u32;
@@ -8546,6 +8652,24 @@ impl DemoApp {
     /// (rule 51).
     fn apply_mix_cc(&mut self, node: u32, ctl: MixControl, norm: f64, resend: bool) {
         let e = ctl.edit(norm);
+        if let Some((slot, level)) = e.send {
+            // A send level (issue #5): the strip's send into that slot's bus.
+            let Some(bus) = self.base_graph.bus_at(slot as usize) else { return };
+            let from = match self.rig_of_bus_node(node) {
+                Some(rig) => SendSource::Rig(rig as u8),
+                None => SendSource::Node(node),
+            };
+            if resend {
+                let _ = self.set_send(from, bus, Some(level), None);
+            } else if self.units.iter().any(|u| u.node_id == node) {
+                let mut x = self.send_of(from, bus);
+                x.level = level;
+                self.sends.retain(|o| !(o.from == from && o.bus == bus));
+                if !x.is_default() { self.sends.push(x); }
+                self.ui_send_grace = self.ui_time + 0.6;
+            }
+            return;
+        }
         if let Some(rig) = self.rig_of_bus_node(node) {
             let m = &mut self.rig_mix[rig.min(7)];
             if let Some(v) = e.vol { m.vol = v; }
@@ -9163,6 +9287,126 @@ impl DemoApp {
             self.send_strip_mix(node);
             self.send_strip_bypass(node);
         }
+        // Sends too; those a load left without their bus or source are gone.
+        self.sends.retain(|x| {
+            let has = |n: u32| self.units.iter().any(|u| u.node_id == n);
+            has(x.bus) && match x.from {
+                SendSource::Rig(r) => self.units.iter().any(|u| u.rig == r),
+                SendSource::Node(n) => has(n),
+            }
+        });
+        self.ui_send_grace = self.ui_time + 0.6;
+        if let Some(bus) = &self.bus {
+            let mut bus = bus.lock().unwrap();
+            for x in &self.sends {
+                let _ = bus.send(Command::SetSend { from: x.from, bus: x.bus, level: Some(x.level), pre: Some(x.pre) });
+            }
+        }
+    }
+
+    // -- sends and aux buses (issue #5) -------------------------------------
+
+    /// The aux buses, in unit order.
+    fn bus_units(&self) -> Vec<usize> {
+        self.units.iter().enumerate()
+            .filter(|(_, u)| matches!(u.node_kind, UnitKind::Dsp(DspKind::Bus)))
+            .map(|(i, _)| i).collect()
+    }
+
+    /// One send as the mixer shows it (closed when nobody set it).
+    fn send_of(&self, from: SendSource, bus: u32) -> AuxSend {
+        self.sends.iter().find(|x| x.from == from && x.bus == bus).copied()
+            .unwrap_or(AuxSend { from, bus, level: 0.0, pre: false })
+    }
+
+    /// Set one send, in the mirror and in the engine (rule 25). Omitted
+    /// fields keep their value. Refuses what the engine would ignore.
+    fn set_send(&mut self, from: SendSource, bus: u32, level: Option<f32>, pre: Option<bool>) -> Result<AuxSend, String> {
+        let g = self.mirror_graph();
+        if !g.is_bus(bus) {
+            return Err(format!("node {bus} is not an aux bus (add_bus makes one; get_sends lists them)"));
+        }
+        match from {
+            SendSource::Rig(r) if r as usize >= self.rig_count() => {
+                return Err(format!("no rig {r} (rigs are 0..{})", self.rig_count().saturating_sub(1)));
+            }
+            SendSource::Node(n) if g.node(n).is_none() => return Err(format!("no unit with node id {n} (see get_graph)")),
+            SendSource::Node(n) if g.is_bus(n) || g.after_bus(n) => {
+                return Err(format!("node {n} is a bus or one of a bus's inserts: it cannot send into a bus (feedback)"));
+            }
+            _ => {}
+        }
+        let mut x = self.send_of(from, bus);
+        if let Some(l) = level { x.level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
+        if let Some(p) = pre { x.pre = p; }
+        self.sends.retain(|o| !(o.from == from && o.bus == bus));
+        if !x.is_default() { self.sends.push(x); }
+        self.ui_send_grace = self.ui_time + 0.6;
+        if let Some(b) = &self.bus {
+            let _ = b.lock().unwrap().send(Command::SetSend { from, bus, level: Some(x.level), pre: Some(x.pre) });
+        }
+        Ok(x)
+    }
+
+    /// Add an aux bus to `rig`, returning straight into that rig's master
+    /// (the return passes the rig faders). The same graph-edit reload as an
+    /// insert edit. Returns the new bus's node id.
+    fn add_bus(&mut self, name: Option<&str>, rig: u8) -> Result<u32, String> {
+        if rig as usize >= self.rig_count() {
+            return Err(format!("no rig {rig} (rigs are 0..{})", self.rig_count().saturating_sub(1)));
+        }
+        if self.bus_units().len() >= crate::engine::MAX_BUSES {
+            return Err(format!("at most {} aux buses", crate::engine::MAX_BUSES));
+        }
+        let used: Vec<String> = self.units.iter().map(|u| u.name.to_uppercase()).collect();
+        let name = name.map(|n| n.trim().chars().take(24).collect::<String>()).filter(|n| !n.is_empty())
+            .or_else(|| (b'A'..=b'Z').map(|c| format!("BUS {}", c as char)).find(|n| !used.contains(n)))
+            .unwrap_or_else(|| "BUS".into());
+        if used.contains(&name.to_uppercase()) {
+            return Err(format!("a unit is already called '{name}' — pick another name"));
+        }
+        let mut g = self.mirror_graph();
+        let node = g.add_node(NodeKind::Dsp(DspKind::Bus), name_bytes(&name));
+        g.set_rig(node, rig);
+        if g.wire_bus(node) == 0 {
+            return Err(format!("rig {rig} has no master out for the bus to return to"));
+        }
+        self.reload_with_graph(g)?;
+        // The canonical remap may have renumbered it: find it by its name.
+        self.units.iter().find(|u| matches!(u.node_kind, UnitKind::Dsp(DspKind::Bus)) && u.name.eq_ignore_ascii_case(&name))
+            .map(|u| u.node_id)
+            .ok_or_else(|| "the bus did not survive the reload".to_string())
+    }
+
+    /// Remove an aux bus with its inserts and every send into it.
+    fn remove_bus(&mut self, bus: u32) -> Result<String, String> {
+        let unit = self.units.iter().position(|u| u.node_id == bus && matches!(u.node_kind, UnitKind::Dsp(DspKind::Bus)))
+            .ok_or_else(|| format!("node {bus} is not an aux bus"))?;
+        let name = sentence_case(&self.units[unit].name);
+        let chain: Vec<u32> = self.strip_chain(unit).unwrap_or_default().iter().map(|&u| self.units[u].node_id).collect();
+        let mut g = self.mirror_graph();
+        for n in chain { g.remove_node(n); }
+        g.remove_node(bus);
+        self.sends.retain(|x| x.bus != bus);
+        self.reload_with_graph(g)?;
+        Ok(format!("Removed {name} and its sends"))
+    }
+
+    /// The patch as the rack shows it right now: the base graph's nodes and
+    /// the living cables.
+    fn mirror_graph(&self) -> Graph {
+        let mut g = self.base_graph.clone();
+        g.edges.clear();
+        for c in &self.cables {
+            if c.dying >= 0.0 { continue; }
+            let (Some(sn), Some(dn)) = (
+                self.units.get(c.src).map(|u| u.node_id),
+                self.units.get(c.dst).map(|u| u.node_id),
+            ) else { continue };
+            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
+            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
+        }
+        g
     }
 
     /// The strips of one rig in display order (#77): `strip_order` first,
@@ -9875,6 +10119,30 @@ impl DemoApp {
     }
 
     /// Every rig for the agent: index, name, device, units (node ids), mix.
+    /// Aux buses and the sends into them (issue #5), for agents.
+    fn sends_json(&self) -> serde_json::Value {
+        let buses: Vec<serde_json::Value> = self.bus_units().iter().map(|&u| {
+            let unit = &self.units[u];
+            let row = self.strip_row(unit.node_id);
+            let level = unit.knob_index("LEVEL").map(|k| unit.knobs[k].value).unwrap_or(1.0);
+            let inserts: Option<Vec<serde_json::Value>> = self.strip_chain(u).map(|c| c.iter()
+                .map(|&f| serde_json::json!({"node": self.units[f].node_id, "name": sentence_case(&self.units[f].name)})).collect());
+            serde_json::json!({
+                "bus": unit.node_id, "name": sentence_case(&unit.name), "rig": unit.rig,
+                "level": level, "pan": row.pan, "mute": row.mute, "solo": row.solo,
+                "inserts": inserts, "meter": self.strip_audio_level(u),
+            })
+        }).collect();
+        let sends: Vec<serde_json::Value> = self.sends.iter().map(|x| {
+            let from = match x.from {
+                SendSource::Rig(r) => serde_json::json!({"rig": r, "name": self.rig_name(r as usize)}),
+                SendSource::Node(n) => serde_json::json!({"node": n, "name": self.unit_display_name(n)}),
+            };
+            serde_json::json!({"from": from, "bus": x.bus, "level": x.level, "db": db_readout(x.level), "pre": x.pre})
+        }).collect();
+        serde_json::json!({"buses": buses, "sends": sends, "max_buses": crate::engine::MAX_BUSES})
+    }
+
     fn rigs_json(&self) -> serde_json::Value {
         let rigs: Vec<serde_json::Value> = (0..self.rig_count()).map(|r| {
             let m = self.rig_mix[r.min(7)];
@@ -11633,17 +11901,7 @@ impl DemoApp {
             .map(|u| u.node_id)
             .or_else(|| masters.first().copied())
             .ok_or("no master out to insert into")?;
-        let mut g = self.base_graph.clone();
-        g.edges.clear();
-        for c in &self.cables {
-            if c.dying >= 0.0 { continue; }
-            let (Some(sn), Some(dn)) = (
-                self.units.get(c.src).map(|u| u.node_id),
-                self.units.get(c.dst).map(|u| u.node_id),
-            ) else { continue };
-            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
-            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
-        }
+        let mut g = self.mirror_graph();
         let mut fx: Vec<u32> = self.master_chain().iter().map(|&u| self.units[u].node_id).collect();
         let old_fx = fx.clone();
         let rig = g.node(start).map(|n| n.rig).unwrap_or(0);
@@ -11684,17 +11942,7 @@ impl DemoApp {
     /// linear FX chain in node ids, and the chain's single tail node (the rig
     /// master; None = custom wiring — callers show it instead of guessing).
     fn strip_chain_graph(&self, source: u32) -> Result<(Graph, Vec<u32>, Option<u32>), String> {
-        let mut g = self.base_graph.clone();
-        g.edges.clear();
-        for c in &self.cables {
-            if c.dying >= 0.0 { continue; }
-            let (Some(sn), Some(dn)) = (
-                self.units.get(c.src).map(|u| u.node_id),
-                self.units.get(c.dst).map(|u| u.node_id),
-            ) else { continue };
-            let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
-            g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
-        }
+        let mut g = self.mirror_graph();
         let unit = self.units.iter().position(|u| u.node_id == source)
             .ok_or_else(|| format!("no strip with node {source}"))?;
         let Some(fx_units) = self.strip_chain(unit) else {
@@ -16017,6 +16265,8 @@ impl DemoApp {
                 UnitKind::Clap => true,
                 UnitKind::AudioIn => true,
                 UnitKind::Keys | UnitKind::Master | UnitKind::MidiFx | UnitKind::Arp => false,
+                // Aux buses have their own group (`bus_units`).
+                UnitKind::Dsp(DspKind::Bus) => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })
@@ -16090,6 +16340,8 @@ impl DemoApp {
         self.mixer_meter_rects.clear();
         self.mixer_quick_knob_rects.clear();
         self.mixer_learn_rects.clear();
+        self.mixer_send_rects.clear();
+        let buses = self.bus_units();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
         let app_streams = self.app_streams_shown();
@@ -16135,8 +16387,11 @@ impl DemoApp {
                     .filter(|&u| !self.strip_row(self.units[u].node_id).collapsed)
                     .map(|u| self.strip_chain(u).map_or(0, |c| c.len()))
                     .max().unwrap_or(0)
-                    .max(self.master_chain().len());
-                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32;
+                    .max(self.master_chain().len())
+                    .max(buses.iter().map(|&u| self.strip_chain(u).map_or(0, |c| c.len())).max().unwrap_or(0));
+                // Send rows (issue #5): a heading and one row per bus.
+                let sends_h = if buses.is_empty() { 0.0 } else { 18.0 + (SLOT_H + 3.0) * buses.len() as f32 };
+                let overhead = 240.0 + (SLOT_H + 3.0) * max_inserts as f32 + sends_h;
                 let fader_h = (view_h - overhead).clamp(64.0, 480.0);
                 let h = view_h.max(fader_h + overhead);
                 ui.horizontal_top(|ui| {
@@ -16153,7 +16408,13 @@ impl DemoApp {
                             s_w + STRIP_W + gap
                         }).sum();
                         let sys = if app_streams.is_empty() { 0.0 } else { app_streams.len() as f32 * (STRIP_W + gap) + 15.0 + gap };
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + sys + 152.0 + LOUDNESS_W + 3.0 * gap;
+                        let buses_w: f32 = if buses.is_empty() { 0.0 } else {
+                            15.0 + gap + buses.iter().map(|&u| {
+                                let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                w + gap
+                            }).sum::<f32>()
+                        };
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + 152.0 + LOUDNESS_W + 3.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -16198,6 +16459,31 @@ impl DemoApp {
                                             }
                                             // The rig bus: engine per-rig mix.
                                             self.rig_bus_strip_ui(ui, rig, fader_h);
+                                        });
+                                    });
+                                }
+                                // Aux buses (issue #5): what the sends feed, each a
+                                // full strip, returning to Master out.
+                                if !buses.is_empty() {
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
+                                    ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE));
+                                    ui.vertical(|ui| {
+                                        let gap = ui.spacing().item_spacing.x;
+                                        let group_w = buses.iter().map(|&u| {
+                                            let w = if self.strip_row(self.units[u].node_id).collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
+                                            w + gap
+                                        }).sum::<f32>() - gap;
+                                        ui.allocate_ui_with_layout(egui::vec2(group_w, 36.0), egui::Layout::top_down(egui::Align::Center), |ui| {
+                                            ui.label(egui::RichText::new("Aux buses").font(theme::medium_font(14.0)).color(theme::INK));
+                                            theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.14, theme::CREAM_DIM);
+                                        });
+                                        let (rule, _) = ui.allocate_exact_size(egui::vec2(group_w, 5.0), egui::Sense::hover());
+                                        ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
+                                        ui.add_space(4.0);
+                                        ui.horizontal_top(|ui| {
+                                            for &unit in &buses {
+                                                self.source_strip_ui(ui, unit, fader_h, &mut edits);
+                                            }
                                         });
                                     });
                                 }
@@ -16284,6 +16570,13 @@ impl DemoApp {
             } else if let Err(msg) = res {
                 self.session_msg = msg;
             }
+        }
+        if let Some(e) = self.pending_bus_edit.take() {
+            self.session_msg = match e {
+                BusEdit::Add => self.add_bus(None, self.active_rig as u8)
+                    .map(|node| format!("Added {} — send to it from any strip", self.unit_display_name(node))),
+                BusEdit::Remove(node) => self.remove_bus(node),
+            }.unwrap_or_else(|e| e);
         }
         if let Some(r) = switch { self.set_active_rig(r); }
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
@@ -16380,6 +16673,7 @@ impl DemoApp {
         // own level knob, pan/mute/solo are the strip's.
         let fader_dest: Option<CcDest> = knob.and_then(|k| self.units[unit].knobs[k].cc_target()).map(|(p, t)| (node, p, t));
         let [pan_dest, mute_dest, solo_dest] = [MixControl::Pan, MixControl::Mute, MixControl::Solo].map(|c| (node, c.param(), CcTarget::Mix));
+        let is_bus = matches!(self.units[unit].node_kind, UnitKind::Dsp(DspKind::Bus));
         let collapsed = row.collapsed;
         let w = if collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
         let level = self.strip_audio_level(unit);
@@ -16475,17 +16769,25 @@ impl DemoApp {
                 let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
                 let (knob_rect, plate_rect) = strip_slot_rects(sr);
                 ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
-                let plate_label = source_patch.clone().unwrap_or_else(|| sentence_case(&sub));
-                let caption = self.quick_knob_caption(unit);
+                let plate_label = if is_bus { "Aux bus".to_string() } else { source_patch.clone().unwrap_or_else(|| sentence_case(&sub)) };
+                // A bus's plate removes it (× on hover), like an insert row.
+                let plate = ui.interact(plate_rect, egui::Id::new(("strip_src_plate", node)), egui::Sense::click());
+                let removing = is_bus && plate.hovered();
+                let caption = if removing { None } else { self.quick_knob_caption(unit) };
                 paint_slot_texts(ui.painter(), plate_rect, plate_rect.left() + PLATE_PAD_X + 2.0, &plate_label,
                     caption.as_deref(), theme::CREAM, theme::CREAM_MID);
                 self.strip_quick_knob_ui(ui, knob_rect, unit, false);
                 let tip = match &source_patch {
+                    _ if is_bus => "fed by the SENDS rows of the other strips · click: remove this bus, its inserts and its sends".to_string(),
                     Some(p) => format!("{} · {p}", sentence_case(&sub)),
                     None => sentence_case(&sub),
                 };
-                ui.interact(plate_rect, egui::Id::new(("strip_src_plate", node)), egui::Sense::hover())
-                    .on_hover_text(tip);
+                if removing {
+                    ui.painter().text(Pos2::new(plate_rect.right() - 9.0, plate_rect.center().y), egui::Align2::CENTER_CENTER,
+                        "×", egui::FontId::proportional(13.0), theme::CREAM_DIM);
+                    if plate.clicked() { self.pending_bus_edit = Some(BusEdit::Remove(node)); }
+                }
+                plate.on_hover_text(tip);
                 // Insert slots (#74/#107): a view of the cable chain.
                 let chain = self.strip_chain(unit);
                 self.insert_rows_ui(ui, Some(node), chain.as_deref(), edits);
@@ -16533,11 +16835,15 @@ impl DemoApp {
                     }
                     let sr = strip_ms_button(ui, &mut ms, 'S');
                     self.mixer_learn_ui(ui, &sr, sr.rect, Some(solo_dest));
-                    if sr.on_hover_text("solo this source (within its rig) · right-click: MIDI learn").clicked() {
+                    let solo_tip = if is_bus { "solo this bus: only the returns play · right-click: MIDI learn" } else { "solo this source (within its rig) · right-click: MIDI learn" };
+                    if sr.on_hover_text(solo_tip).clicked() {
                         self.with_strip_row(node, |r| r.solo = ms.solo);
                         self.send_strip_mix(node);
                     }
                 });
+                if !is_bus {
+                    self.send_rows_ui(ui, SendSource::Node(node));
+                }
             }
         });
         let rect = strip.response.rect;
@@ -16620,6 +16926,7 @@ impl DemoApp {
                     .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
                 if ui.add(rb).on_hover_text("arm this rig's post-fader stem for recording").clicked() { arm_toggle = true; }
             });
+            self.send_rows_ui(ui, SendSource::Rig(rig as u8));
         });
         if arm_toggle {
             self.set_record_arm(Some(rig), !armed);
@@ -16777,6 +17084,15 @@ impl DemoApp {
                 .corner_radius(2.0).min_size(egui::vec2(58.0, 22.0));
             if ui.add(rmb).on_hover_text("arm the master mix for recording").clicked() {
                 self.set_record_arm(None, !arm_m);
+            }
+            // Aux buses return here; a new one is added here (issue #5). In
+            // this column it costs the strips no width.
+            ui.add_space(6.0);
+            if theme::chip_button(ui, "+ Aux bus", false)
+                .on_hover_text("add an aux bus: rigs and sources send into it, its inserts run on the sum, and it returns to Master out past the rig faders")
+                .clicked()
+            {
+                self.pending_bus_edit = Some(BusEdit::Add);
             }
         });
         if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
@@ -16961,6 +17277,95 @@ impl DemoApp {
         let tip_name = full_name.as_deref().unwrap_or(&label);
         let cur_v = self.units[unit].knobs[ki].value;
         resp.on_hover_text(format!("{tip_name}: {cur_v:.2} · drag to adjust · double-click: reset · right-click: assign knob"));
+    }
+
+    /// Send rows (issue #5) under a strip: one per aux bus. The knob is the
+    /// send level on the faders' dB curve (drag; double-click: off or 0 dB),
+    /// the plate names the bus and the level, and the PRE tag taps the
+    /// signal before this strip's fader instead of after it.
+    fn send_rows_ui(&mut self, ui: &mut egui::Ui, from: SendSource) {
+        let buses: Vec<(u32, String)> = self.bus_units().iter()
+            .map(|&u| (self.units[u].node_id, sentence_case(&self.units[u].name))).collect();
+        if buses.is_empty() { return; }
+        ui.add_space(4.0);
+        theme::tracked_label(ui, "SENDS", 9.0, 0.12, theme::INK_2);
+        let w = ui.available_width();
+        for (bus, name) in buses {
+            let x = self.send_of(from, bus);
+            let key = (from, bus);
+            let (sr, _) = ui.allocate_exact_size(egui::vec2(w, SLOT_H), egui::Sense::hover());
+            let (knob_rect, plate_rect) = strip_slot_rects(sr);
+            let tag = Rect::from_min_max(plate_rect.left_top(), Pos2::new(plate_rect.left() + PLATE_PAD_X + 20.0, plate_rect.bottom()));
+            let tresp = ui.interact(tag, egui::Id::new(("send_pre", key)), egui::Sense::click());
+            let kresp = ui.interact(knob_rect, egui::Id::new(("send_level", key)), egui::Sense::click_and_drag());
+            self.mixer_send_rects.push((from, bus, knob_rect, tag));
+            // MIDI learn (#75): the send level is a mixer control of this
+            // strip, named by the bus's slot.
+            let strip_node = match from {
+                SendSource::Rig(r) => self.rig_bus_node(r as usize),
+                SendSource::Node(n) => Some(n),
+            };
+            let learn: Option<CcDest> = strip_node.zip(self.base_graph.bus_slot(bus))
+                .filter(|(_, slot)| *slot < MixControl::SEND_SLOTS as usize)
+                .map(|(n, slot)| (n, MixControl::Send(slot as u8).param(), CcTarget::Mix));
+            self.mixer_learn_ui(ui, &kresp, knob_rect, learn);
+            let cc_tag = self.cc_tag(learn);
+            let on = x.level > 0.0;
+            ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
+            ui.painter().text(Pos2::new(plate_rect.left() + PLATE_PAD_X, plate_rect.center().y), egui::Align2::LEFT_CENTER,
+                "PRE", theme::medium_font(8.0), if x.pre { theme::LIVE_TEAL } else { theme::MUTED });
+            // While learning the caption says so; a bound send names its CC
+            // in the hover text and wears the MIDI outline.
+            let caption = if cc_tag.as_deref() == Some("LEARN") { "LEARN".to_string() } else { send_readout(x.level) };
+            paint_slot_texts(ui.painter(), plate_rect, tag.right() + 2.0, &name, Some(&caption),
+                if on { theme::CREAM } else { theme::CREAM_DIM },
+                if cc_tag.as_deref() == Some("LEARN") { theme::MIDI_BLUE } else { theme::CREAM_MID });
+            let mut level = None;
+            if kresp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical); }
+            if kresp.dragged() {
+                let pos = match self.send_drag {
+                    Some((k, p)) if k == key => p,
+                    _ => fader_pos(x.level),
+                };
+                let pos = (pos - kresp.drag_delta().y * 0.006).clamp(0.0, 1.0);
+                self.send_drag = Some((key, pos));
+                level = Some(if pos > UNITY_DETENT_POS { 1.0 } else { fader_gain(pos) });
+            }
+            if kresp.drag_stopped() && self.send_drag.is_some_and(|(k, _)| k == key) {
+                self.send_drag = None;
+            }
+            if kresp.double_clicked() {
+                self.send_drag = None;
+                level = Some(if on { 0.0 } else { 1.0 });
+            }
+            let hot = kresp.hovered() || kresp.dragged();
+            paint_knob_dial(
+                ui.painter(),
+                |l| l.to_pos2(),
+                knob_rect.center().to_vec2(),
+                Vec2::splat(QUICK_KNOB_R),
+                fader_pos(level.unwrap_or(x.level)),
+                kresp.hovered(),
+                kresp.dragged(),
+                if hot { TEXT } else if on { BORDER } else { theme::MUTED },
+                if on { theme::ACCENT } else { theme::CREAM_DIM },
+                QUICK_KNOB_ARC_GAP,
+                1.4,
+            );
+            let bound = cc_tag.filter(|t| t != "LEARN").map(|t| format!(" · {t}")).unwrap_or_default();
+            kresp.on_hover_text(format!("send to {name}: {}{bound} · drag · double-click: off / 0 dB · right-click: MIDI learn", db_readout(x.level)));
+            let pre = tresp.clicked().then_some(!x.pre);
+            tresp.on_hover_text(if x.pre {
+                "pre fader: this send keeps its level when the fader moves · click: post fader"
+            } else {
+                "post fader: this send follows the fader · click: pre fader"
+            });
+            if level.is_some() || pre.is_some() {
+                if let Err(e) = self.set_send(from, bus, level, pre) {
+                    self.session_msg = e;
+                }
+            }
+        }
     }
 
     /// Insert slots (#74/#107): a view of the strip's cable chain. A linear
@@ -19649,6 +20054,20 @@ impl StripUiRow {
         });
         Self { node: s.node, pan: s.pan, mute: s.mute, solo: s.solo, bypass: s.bypass, color, collapsed: s.collapsed }
     }
+}
+
+/// A bus edit from the mixer (issue #5): the rack reloads with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BusEdit {
+    Add,
+    Remove(u32),
+}
+
+/// A send row's level text: dB without the unit, "off" when closed.
+fn send_readout(level: f32) -> String {
+    if level <= 0.0 { "off".into() }
+    else if level >= 1.0 { "0 dB".into() }
+    else { db_readout(level).trim_end_matches(" dB").to_string() }
 }
 
 /// One insert-slot edit (#74/#77), as the mixer strip and the agent tools
@@ -28864,6 +29283,222 @@ mod mixer_parity_tests {
         }
     }
 
+    // ---- #5: sends and aux buses ------------------------------------------
+
+    /// Two rigs with an aux bus in the first one, the mixer open.
+    fn app_with_bus() -> (DemoApp, egui::Context, u32) {
+        let (mut app, ctx) = app_with(Rack::TwoRigs);
+        let out = app.exec_tool("add_bus", &serde_json::json!({ "rig": 0 }));
+        assert!(out.starts_with("added aux bus 'Bus A'"), "{out}");
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).expect("a bus unit");
+        open_mixer(&mut app, &ctx);
+        (app, ctx, bus)
+    }
+
+    fn a_source(app: &DemoApp, rig: u8) -> u32 {
+        app.units.iter().find(|u| u.rig == rig && matches!(u.node_kind, UnitKind::Clap)).expect("a synth").node_id
+    }
+
+    #[test]
+    fn an_aux_bus_is_a_strip_of_its_own_and_every_other_strip_gets_a_send_row() {
+        let (app, _ctx, bus) = app_with_bus();
+        let unit = app.units.iter().position(|u| u.node_id == bus).unwrap();
+        assert_eq!(app.units[unit].rig, 0);
+        // It returns to its rig's master, and has no input jack to cable into.
+        let master = app.units.iter().position(|u| u.rig == 0 && matches!(u.node_kind, UnitKind::Master)).unwrap();
+        assert!(app.cables.iter().any(|c| c.src == unit && c.dst == master && c.kind == PortKind::Audio), "the return cable");
+        assert!(app.units[unit].jacks.iter().all(|j| j.dir == Dir::Out), "sends feed it, not cables");
+        assert_eq!(app.strip_chain(unit), Some(vec![]), "an empty insert chain, ready for add_insert");
+        // Not a source of its rig; a strip of the buses group.
+        assert!(!app.rig_strip_sources(0).contains(&unit));
+        assert!(app.mixer_strip_rects.iter().any(|(_, n, _)| *n == bus), "the bus strip is drawn");
+        // One send row per rig bus and per source, none on the bus itself.
+        let rows: Vec<SendSource> = app.mixer_send_rects.iter().map(|(from, b, _, _)| { assert_eq!(*b, bus); *from }).collect();
+        for from in [SendSource::Rig(0), SendSource::Rig(1), SendSource::Node(a_source(&app, 0)), SendSource::Node(a_source(&app, 1))] {
+            assert!(rows.contains(&from), "a send row for {from:?} in {rows:?}");
+        }
+        assert!(!rows.contains(&SendSource::Node(bus)));
+        // Each row sits inside its strip (rule 124: nothing painted outside).
+        assert!(!app.mixer_send_rects.is_empty());
+        for (from, _, knob, tag) in &app.mixer_send_rects {
+            if let SendSource::Node(n) = from {
+                let (_, _, strip) = app.mixer_strip_rects.iter().find(|(_, node, _)| node == n).expect("its strip");
+                assert!(strip.contains_rect(*knob) && strip.contains_rect(*tag), "{from:?}: {knob:?} {tag:?} in {strip:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_send_row_is_played_by_pointer_and_reaches_the_engine() {
+        // The app drives a real engine: what the knob sets is what the engine
+        // publishes back (rules 25 and 33).
+        let (mut app, ctx, _) = app_with_bus();
+        let (ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(app.base_graph.clone(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        app.bus = Some(Arc::new(Mutex::new(ebus)));
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).unwrap();
+        let from = SendSource::Rig(1);
+        let row = |app: &DemoApp| app.mixer_send_rects.iter().copied().find(|(f, _, _, _)| *f == from).expect("rig 2's send row");
+        // Drag the knob up a little: an open send below unity.
+        let (_, _, knob, _) = row(&app);
+        for ev in drag(knob.center(), knob.center() - egui::vec2(0.0, 100.0), 6) { frame(&mut app, &ctx, ev); }
+        let x = app.send_of(from, bus);
+        assert!(x.level > 0.01 && x.level < 1.0 && !x.pre, "an open post-fader send: {x:?}");
+        // All the way up lands on the 0 dB detent.
+        let (_, _, knob, tag) = row(&app);
+        for ev in drag(knob.center(), knob.center() - egui::vec2(0.0, 200.0), 6) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.send_of(from, bus).level, 1.0);
+        // The PRE tag switches the tap point.
+        for ev in click(tag.center()) { frame(&mut app, &ctx, ev); }
+        assert_eq!(app.send_of(from, bus), AuxSend { from, bus, level: 1.0, pre: true });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let published: Vec<AuxSend> = pub_.lock().unwrap().sends.iter().copied().filter(|x| x.bus != u32::MAX).collect();
+        assert_eq!(published, vec![AuxSend { from, bus, level: 1.0, pre: true }], "the engine holds the same send");
+        // A remote edit (MCP, CLI) reaches the mirror once the echo grace is over.
+        app.bus.as_ref().unwrap().lock().unwrap().send(Command::SetSend { from: SendSource::Rig(0), bus, level: Some(0.25), pre: None });
+        engine.render(&mut buf, 2);
+        app.graph_pub = Some(pub_);
+        app.ui_send_grace = -1.0;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.send_of(SendSource::Rig(0), bus).level, 0.25, "the mirror adopted the engine's table");
+        assert_eq!(app.send_of(from, bus).level, 1.0);
+    }
+
+    #[test]
+    fn the_send_tools_set_list_and_refuse() {
+        let (mut app, _ctx, bus) = app_with_bus();
+        let src = a_source(&app, 1);
+        let out = app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "rig": 1, "level": 0.5, "pre": true }));
+        assert!(out.contains("level 0.50") && out.contains("pre fader"), "{out}");
+        let out = app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "node": src, "level": 1.0 }));
+        assert!(out.contains("0 dB") && out.contains("post fader"), "{out}");
+        // Omitted fields keep their value.
+        app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "rig": 1, "level": 0.25 }));
+        assert_eq!(app.send_of(SendSource::Rig(1), bus), AuxSend { from: SendSource::Rig(1), bus, level: 0.25, pre: true });
+        let listed: serde_json::Value = serde_json::from_str(&app.exec_tool("get_sends", &serde_json::json!({}))).unwrap();
+        assert_eq!(listed["buses"][0]["bus"], bus);
+        assert_eq!(listed["buses"][0]["name"], "Bus A");
+        assert_eq!(listed["sends"].as_array().unwrap().len(), 2, "{listed}");
+        // Refusals say why (rule 77), and change nothing.
+        for (args, why) in [
+            (serde_json::json!({ "bus": src, "rig": 0, "level": 1.0 }), "is not an aux bus"),
+            (serde_json::json!({ "bus": bus, "level": 1.0 }), "exactly one source"),
+            (serde_json::json!({ "bus": bus, "rig": 0, "node": src }), "exactly one source"),
+            (serde_json::json!({ "bus": bus, "rig": 7, "level": 1.0 }), "no rig 7"),
+            (serde_json::json!({ "bus": bus, "node": bus, "level": 1.0 }), "cannot send into a bus"),
+        ] {
+            let out = app.exec_tool("set_send", &args);
+            assert!(out.contains("NOT applied") || out.contains("exactly one"), "{args}: {out}");
+            assert!(out.contains(why), "{args}: {out}");
+        }
+        assert_eq!(app.sends.len(), 2);
+        // An insert of the bus cannot send either (it would feed itself).
+        let out = app.exec_tool("add_insert", &serde_json::json!({ "source": bus, "kind": "dsp", "dsp": "reverb" }));
+        assert!(!out.contains("NOT") && !out.contains("custom"), "{out}");
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).unwrap();
+        let unit = app.units.iter().position(|u| u.node_id == bus).unwrap();
+        let verb = app.strip_chain(unit).expect("a linear chain")[0];
+        let verb = app.units[verb].node_id;
+        let out = app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "node": verb, "level": 1.0 }));
+        assert!(out.contains("cannot send into a bus"), "{out}");
+        // Every tool the prompt names exists (rule 6) and is served to MCP (rule 66).
+        let names: Vec<String> = crate::assistant::tools().as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        for t in ["add_bus", "set_send", "get_sends", "remove_bus"] {
+            assert!(names.iter().any(|n| n == t), "assistant::tools() has {t}");
+            assert!(UI_BRIDGE_TOOLS.contains(&t), "the bridge serves {t}");
+        }
+        // Removing the bus takes its insert and its sends along.
+        let out = app.exec_tool("remove_bus", &serde_json::json!({ "bus": bus }));
+        assert!(out.starts_with("Removed Bus A"), "{out}");
+        assert!(app.bus_units().is_empty() && app.sends.is_empty());
+        assert!(!app.units.iter().any(|u| u.name == "REVERB"), "the bus's insert went with it");
+    }
+
+    #[test]
+    fn sends_survive_a_session_round_trip_an_undo_and_a_rig_delete() {
+        // Rules 44, 59, 65: non-default values, through every reload path.
+        let (mut app, _ctx) = app_with(Rack::TwoRigs);
+        // The bus lives in the SECOND rig, so deleting the first renumbers it.
+        app.exec_tool("add_bus", &serde_json::json!({ "rig": 1, "name": "Verb" }));
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).unwrap();
+        let src_b = a_source(&app, 1);
+        app.set_send(SendSource::Rig(0), bus, Some(0.5), Some(false)).unwrap();
+        app.set_send(SendSource::Rig(1), bus, Some(0.25), Some(true)).unwrap();
+        app.set_send(SendSource::Node(src_b), bus, Some(0.75), Some(true)).unwrap();
+        let want = app.sends.clone();
+        assert_eq!(want.len(), 3);
+
+        // Through the session FILE (rule 54: the app reads what it writes).
+        let dir = std::env::temp_dir().join(format!("ksalat-sends-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("sends.kabelsalat");
+        app.capture_session("sends").unwrap().save(&pkg).expect("the session saves");
+        let loaded = crate::session::Session::load(&pkg).expect("and loads");
+        let _ = std::fs::remove_dir_all(&dir);
+        app.load_demo_patch();
+        assert!(app.sends.is_empty(), "another patch has no sends");
+        app.apply_session(&loaded).unwrap();
+        assert_eq!(app.sends, want, "the sends survived save and load");
+
+        // Undo restores them after a later job changed them.
+        app.undo_job = None; // a new job
+        app.note_agent_change(AgentOrigin::Assistant);
+        app.set_send(SendSource::Rig(0), bus, Some(0.0), None).unwrap();
+        app.set_send(SendSource::Rig(1), bus, None, Some(false)).unwrap();
+        assert_ne!(app.sends, want);
+        let out = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(out.contains("undid"), "{out}");
+        let mut got = app.sends.clone();
+        got.sort_by_key(|x| format!("{:?}", x.from));
+        let mut sorted = want.clone();
+        sorted.sort_by_key(|x| format!("{:?}", x.from));
+        assert_eq!(got, sorted, "undo restored level and pre of every send");
+
+        // Deleting the first rig: its send goes, the others follow the bus
+        // and the source to their new ids, and rig 2 is now rig 1.
+        app.edit_rigs(Some(0));
+        let bus = app.bus_units().first().map(|&u| app.units[u].node_id).expect("the bus is still there");
+        let src = a_source(&app, 0);
+        let mut got = app.sends.clone();
+        got.sort_by_key(|x| format!("{:?}", x.from));
+        assert_eq!(got, vec![
+            AuxSend { from: SendSource::Node(src), bus, level: 0.75, pre: true },
+            AuxSend { from: SendSource::Rig(0), bus, level: 0.25, pre: true },
+        ]);
+    }
+
+    /// The mixer with an aux bus, a reverb on it and sends from two rigs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat send_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn send_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh app per image (rule 148).
+        let rack = || {
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.exec_tool("add_bus", &serde_json::json!({ "rig": 0, "name": "Verb" }));
+            let bus = app.bus_units().first().map(|&u| app.units[u].node_id).unwrap();
+            app.exec_tool("add_insert", &serde_json::json!({ "source": bus, "kind": "dsp", "dsp": "reverb" }));
+            let bus = app.bus_units().first().map(|&u| app.units[u].node_id).unwrap();
+            app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "rig": 0, "level": 0.5 }));
+            app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "rig": 1, "level": 0.25, "pre": true }));
+            app.exec_tool("set_send", &serde_json::json!({ "bus": bus, "node": a_source(&app, 1), "level": 1.0 }));
+            app
+        };
+        for (w, h) in [(1600.0, 1000.0), (781.0, 950.0)] {
+            let mut app = rack();
+            app.stage_view = StageView::Mixer;
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("sends-{w}x{h}.png")));
+            let mut app = rack();
+            super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(format!("sends-rack-{w}x{h}.png")));
+        }
+    }
+
     // ---- #74: insert slots (a view of the cable chain) -------------------
 
     #[test]
@@ -29819,6 +30454,45 @@ mod mixer_midi_learn_tests {
     }
 
     #[test]
+    fn a_send_level_learns_a_cc_and_follows_it() {
+        // Issue #5 on top of #75: a send level is a mixer control too.
+        let (mut app, ctx, mut drain) = mixer_app();
+        let bus_node = app.add_bus(None, 0).expect("an aux bus");
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        sent(&mut drain);
+        let master = app.rig_bus_node(0).unwrap();
+        let send = (master, MixControl::Send(0).param(), CcTarget::Mix);
+        let from = SendSource::Rig(0);
+
+        let pos = at(&app, send);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == send), "right-click arms MIDI learn");
+        assert!(texts.iter().any(|t| t == "LEARN"), "the send row says LEARN: {texts:?}");
+
+        cc(&mut app, &ctx, 2, 20, 64);
+        assert!(app.cc_learn.is_none(), "the CC completed the learn");
+        assert_eq!(mapping(&app, 2, send).map(|m| m.cc), Some(20));
+        assert_eq!(app.send_of(from, bus_node).level, 64.0 / 127.0, "the send moves on screen (rule 109)");
+        let cmds = sent(&mut drain);
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { cc: 20, target: CcTarget::Mix, dest, .. } if *dest == master)),
+            "the binding goes to the engine: {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetSend { from: SendSource::Rig(0), bus, level: Some(l), .. }
+            if *bus == bus_node && *l == 64.0 / 127.0)), "one catch-up SetSend (rule 51): {cmds:?}");
+
+        // From then on the engine applies the CC; the app only follows.
+        cc(&mut app, &ctx, 2, 20, 127);
+        assert_eq!(app.send_of(from, bus_node).level, 1.0);
+        assert!(!sent(&mut drain).iter().any(|c| matches!(c, Command::SetSend { .. })), "no echo back to the engine");
+        // The rig's fader, on the same node, did not take the binding.
+        assert_eq!(app.rig_mix[0].vol, 1.0);
+        // An agent binds one by name.
+        let src = first_source(&app);
+        let out = app.exec_tool("set_cc_map", &serde_json::json!({ "node": src, "source": "hw:2", "cc": 21, "mix": "send1" }));
+        assert!(out.contains("\"target\":\"mix\""), "{out}");
+        assert_eq!(mapping(&app, 2, (src, MixControl::Send(0).param(), CcTarget::Mix)).map(|m| m.cc), Some(21));
+    }
+
+    #[test]
     fn mute_solo_and_pan_learn_on_the_bus_and_on_a_source_strip() {
         let (mut app, ctx, mut drain) = mixer_app();
         let node = first_source(&app);
@@ -30072,7 +30746,7 @@ mod mixer_midi_learn_tests {
         // A source strip has no fader of its own; the answer says what to bind.
         let refused = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "mix": "vol"}));
         assert!(refused.contains("LEVEL") && app.rule_edits.get(&(SourceId::Hardware(0), node)).is_none(), "{refused}");
-        let bad = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "target": "mix", "param": 9}));
+        let bad = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "target": "mix", "param": 99}));
         assert!(bad.contains("no mixer control"), "{bad}");
         // learn_cc arms the same learn a right-click does.
         let armed = app.exec_tool("learn_cc", &serde_json::json!({"node": node, "mix": "solo"}));

@@ -1193,7 +1193,7 @@ Learned so far (2026-11-15, UI polish pass):
   CLI self-tests with real plugins: `audio-test`, `host-test`, `preset-test`, `clap-scan-test`,
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
-  `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `send-test`, `cc-map-test`,
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,

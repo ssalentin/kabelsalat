@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 use crate::bridge;
 use crate::control::{
     self, merge_rigs, name_bytes, name_str, Command, CommandBus, DspKind, EdgeId, Graph, NodeId,
-    NodeKind, PortKind, PortRef, Rig, RigSnapshot,
+    NodeKind, PortKind, PortRef, Rig, RigSnapshot, SendSource,
 };
 use crate::engine::{GraphEngine, GraphPub};
 use crate::host::{ClapVoice, ClapVoiceMain};
@@ -561,7 +561,7 @@ struct SetCcMapArgs {
     target: Option<String>,
     /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
     knob: Option<String>,
-    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo". On a rig's Master out node it is that rig's bus; on a source node the source strip's pan, mute or solo. Resolves `param` + `target` ("mix").
+    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo" | "send1".."send8" (the send level into the 1st..8th aux bus, see get_sends). On a rig's Master out node it is that rig's bus; on a source node the source strip's pan, mute, solo or send. Resolves `param` + `target` ("mix").
     mix: Option<String>,
     /// Lowest parameter value the controller reaches (0..1, default 0).
     min: Option<f32>,
@@ -650,6 +650,42 @@ struct SetStripMixArgs {
     /// Solo — within the node's rig (omit to keep).
     solo: Option<bool>,
 }
+
+/// Arguments for `add_bus` (issue #5).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AddBusArgs {
+    /// Up to 24 characters; default "BUS A", "BUS B", ….
+    name: Option<String>,
+    /// The rig whose rack shows the bus unit (0-based; default 0, in the
+    /// running app the rig in view).
+    rig: Option<u8>,
+}
+
+/// Arguments for `set_send` (issue #5).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetSendArgs {
+    /// The aux bus's node id (add_bus / get_sends).
+    bus: NodeId,
+    /// Source: a whole rig (0-based index), tapped at its rig bus. Give rig OR node.
+    rig: Option<u8>,
+    /// Source: one node (an instrument, an audio input, an effect). Give rig OR node.
+    node: Option<NodeId>,
+    /// Linear gain 0..1 (1 = 0 dB, 0 = off; omit to keep).
+    level: Option<f32>,
+    /// true = tapped before the source's fader (omit to keep; default post).
+    pre: Option<bool>,
+}
+
+/// Arguments for `remove_bus` (issue #5).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoveBusArgs {
+    /// The aux bus's node id.
+    bus: NodeId,
+}
+
+/// Arguments for `get_sends` (issue #5).
+#[derive(Debug, Deserialize, JsonSchema)]
+struct GetSendsArgs {}
 
 /// Arguments for `set_node_bypass` (#74).
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -930,6 +966,7 @@ fn dsp_kind_str(k: &DspKind) -> &'static str {
         DspKind::Delay => "delay",
         DspKind::Reverb => "reverb",
         DspKind::Metronome => "metronome",
+        DspKind::Bus => "bus",
     }
 }
 
@@ -944,6 +981,7 @@ fn parse_dsp_kind(s: &str) -> Result<DspKind, String> {
         "delay" => Ok(DspKind::Delay),
         "reverb" => Ok(DspKind::Reverb),
         "metronome" => Ok(DspKind::Metronome),
+        "bus" => Ok(DspKind::Bus),
         other => Err(format!("unknown dsp kind '{other}'")),
     }
 }
@@ -1469,6 +1507,8 @@ impl McpServer {
             // An arp and a MIDI strip are inserted between the rig's Keys and
             // its synth(s) like an instrument is wired into its rig.
             NodeKind::Arp | NodeKind::MidiFx { .. } => true,
+            // An aux bus comes wired to its rig's master (see add_bus).
+            NodeKind::Dsp(DspKind::Bus) => true,
             _ => false,
         };
         if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire }) {
@@ -1484,6 +1524,9 @@ impl McpServer {
                 }
                 Some(NodeKind::MidiFx { .. }) => {
                     st.graph.wire_midi_fx(id);
+                }
+                Some(NodeKind::Dsp(DspKind::Bus)) => {
+                    st.graph.wire_bus(id);
                 }
                 _ => {
                     let _ = st.graph.wire_instrument(id);
@@ -2065,7 +2108,7 @@ impl McpServer {
         // target='mix' with a bare param must name a control of that strip.
         if let (crate::matrix::CcTarget::Mix, Some(p)) = (target, param) {
             let fits = crate::matrix::MixControl::from_param(p)
-                .ok_or_else(|| format!("no mixer control {p}: pass mix='vol'|'pan'|'mute'|'solo'"))
+                .ok_or_else(|| format!("no mixer control {p}: pass mix='vol'|'pan'|'mute'|'solo'|'send1'..'send8'"))
                 .and_then(|c| c.fits(matches!(node_kind, NodeKind::MasterOut)).map_err(String::from));
             if let Err(e) = fits {
                 return tool_err(e);
@@ -2454,6 +2497,111 @@ impl McpServer {
             return tool_err(e);
         }
         ok_json(json!({"node": args.node, "pan": args.pan, "mute": args.mute, "solo": args.solo}))
+    }
+
+    /// Add an aux bus (issue #5).
+    #[tool(name = "add_bus", description = "Add an aux bus (send/return, issue #5): a mixer channel that rigs and sources SEND into (set_send) instead of being cabled to it. Its inserts (the effects cabled from its OUT) run on the sum of what was sent, and what reaches a master from there returns to the mix past the rig faders. Its fader is its LEVEL knob (param 0, linear gain); pan/mute/solo are set_strip_mix on its node. The bus is wired to its rig's Master L and R. Returns the bus's node id.")]
+    fn add_bus(&self, Parameters(args): Parameters<AddBusArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("add_bus", json!({"name": args.name, "rig": args.rig}));
+        }
+        let rig = args.rig.unwrap_or(0);
+        if !st.graph.nodes.iter().any(|n| n.rig == rig && matches!(n.kind, NodeKind::MasterOut)) {
+            return tool_err(format!("rig {rig} has no master out for the bus to return to (see get_rigs)"));
+        }
+        let buses = st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).count();
+        if buses >= crate::engine::MAX_BUSES {
+            return tool_err(format!("at most {} aux buses", crate::engine::MAX_BUSES));
+        }
+        let label = args.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(24).collect::<String>())
+            .unwrap_or_else(|| format!("BUS {}", (b'A' + buses as u8) as char));
+        let name = name_bytes(&label);
+        let kind = NodeKind::Dsp(DspKind::Bus);
+        if let Err(e) = send_cmd(&mut st, Command::AddNode { kind: kind.clone(), name, rig, wire: true }) {
+            return tool_err(e);
+        }
+        let id = st.graph.add_node(kind, name);
+        st.graph.set_rig(id, rig);
+        let before = st.graph.edges.len();
+        st.graph.wire_bus(id);
+        let cables: Vec<u32> = st.graph.edges[before..].iter().map(|e| e.id).collect();
+        ok_json(json!({"bus": id, "name": label, "rig": rig, "cables": cables}))
+    }
+
+    /// Set one send into an aux bus (issue #5).
+    #[tool(name = "set_send", description = "Set one send into an aux bus (issue #5): how much of a whole rig (rig = 0-based index, tapped at its rig bus) OR of one source (node = its node id) goes to `bus` (an aux bus's node id from add_bus / get_sends). level 0..1 is a linear gain (1 = 0 dB, 0.5 = -6 dB, 0 = off). pre=true taps before the source's fader, so the send keeps its level when the fader moves; pre=false (default) follows the fader. A muted or soloed-out source sends nothing. Omitted fields keep their value. A bus or one of its inserts cannot send into a bus. Resets on graph loads (the running app re-sends what its session holds).")]
+    fn set_send(&self, Parameters(args): Parameters<SetSendArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("set_send", json!({
+                "bus": args.bus, "rig": args.rig, "node": args.node, "level": args.level, "pre": args.pre,
+            }));
+        }
+        let from = match (args.rig, args.node) {
+            (Some(r), None) => SendSource::Rig(r),
+            (None, Some(n)) => SendSource::Node(n),
+            _ => return tool_err("set_send needs exactly one source: rig (0-based index) or node (a node id)"),
+        };
+        if !st.graph.is_bus(args.bus) {
+            return tool_err(format!("node {} is not an aux bus (add_bus makes one; get_sends lists them)", args.bus));
+        }
+        match from {
+            SendSource::Rig(r) if !st.graph.nodes.iter().any(|n| n.rig == r) => {
+                return tool_err(format!("no rig {r} (see get_rigs)"));
+            }
+            SendSource::Node(n) if st.graph.node(n).is_none() => return tool_err(format!("no node {n} in the patch (see get_graph)")),
+            SendSource::Node(n) if st.graph.is_bus(n) || st.graph.after_bus(n) => {
+                return tool_err(format!("node {n} is a bus or one of a bus's inserts: it cannot send into a bus (feedback)"));
+            }
+            _ => {}
+        }
+        if let Err(e) = send_cmd(&mut st, Command::SetSend { from, bus: args.bus, level: args.level, pre: args.pre }) {
+            return tool_err(e);
+        }
+        ok_json(json!({"bus": args.bus, "rig": args.rig, "node": args.node, "level": args.level, "pre": args.pre}))
+    }
+
+    /// List aux buses and sends (issue #5).
+    #[tool(name = "get_sends", description = "List the aux buses (node id, name, rig) and every send into them (from a rig or a node, level as linear gain, pre/post fader), as the engine holds them. In the running app (mcp --attach) each bus also shows its level, pan, mute, solo, inserts and meter.")]
+    fn get_sends(&self, Parameters(_args): Parameters<GetSendsArgs>) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("get_sends", json!({}));
+        }
+        let buses: Vec<Value> = st.graph.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))
+            .map(|n| json!({"bus": n.id, "name": name_str(&n.name), "rig": n.rig})).collect();
+        let sends: Vec<Value> = st.graph_pub.as_ref().and_then(|p| p.lock().ok().map(|g| g.sends)).iter().flatten()
+            .filter(|x| x.bus != NodeId::MAX)
+            .map(|x| {
+                let from = match x.from {
+                    SendSource::Rig(r) => json!({"rig": r}),
+                    SendSource::Node(n) => json!({"node": n}),
+                };
+                json!({"from": from, "bus": x.bus, "level": x.level, "pre": x.pre})
+            }).collect();
+        ok_json(json!({"buses": buses, "sends": sends, "max_buses": crate::engine::MAX_BUSES}))
+    }
+
+    /// Remove an aux bus (issue #5).
+    #[tool(name = "remove_bus", description = "Remove an aux bus and every send into it (issue #5). In the running app (mcp --attach) its inserts go with it and undo brings it back; headless, remove its insert nodes with remove_node.")]
+    fn remove_bus(&self, Parameters(args): Parameters<RemoveBusArgs>) -> Result<CallToolResult, McpError> {
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            drop(st);
+            return Self::ui_bridge_tool("remove_bus", json!({"bus": args.bus}));
+        }
+        if !st.graph.is_bus(args.bus) {
+            return tool_err(format!("node {} is not an aux bus (get_sends lists them)", args.bus));
+        }
+        if let Err(e) = send_cmd(&mut st, Command::RemoveNode(args.bus)) {
+            return tool_err(e);
+        }
+        st.graph.remove_node(args.bus);
+        ok_json(json!({"removed": args.bus}))
     }
 
     /// Bypass one effect node (#74).

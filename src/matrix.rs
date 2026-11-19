@@ -228,6 +228,9 @@ pub enum MixControl {
     Pan,
     Mute,
     Solo,
+    /// The strip's send level into the aux bus in this slot (issue #5): the
+    /// `slot`-th bus of the patch (`Graph::bus_at`), below `SEND_SLOTS`.
+    Send(u8),
 }
 
 /// What one controller value sets on a strip: the fields of
@@ -238,9 +241,21 @@ pub struct MixEdit {
     pub pan: Option<f32>,
     pub mute: Option<bool>,
     pub solo: Option<bool>,
+    /// (bus slot, level): the strip's send into that bus.
+    pub send: Option<(u8, f32)>,
 }
 
+const SEND_NAMES: [(&str, &str); MixControl::SEND_SLOTS as usize] = [
+    ("send1", "Send 1"), ("send2", "Send 2"), ("send3", "Send 3"), ("send4", "Send 4"),
+    ("send5", "Send 5"), ("send6", "Send 6"), ("send7", "Send 7"), ("send8", "Send 8"),
+];
+
 impl MixControl {
+    /// Send slots a binding can name: one per aux bus the engine serves.
+    pub const SEND_SLOTS: u8 = 8;
+    /// The first send's param; the fixed controls sit below it.
+    const SEND_PARAM: ParamId = 4;
+
     pub const ALL: [MixControl; 4] = [MixControl::Vol, MixControl::Pan, MixControl::Mute, MixControl::Solo];
 
     pub fn param(self) -> ParamId {
@@ -249,10 +264,14 @@ impl MixControl {
             MixControl::Pan => 1,
             MixControl::Mute => 2,
             MixControl::Solo => 3,
+            MixControl::Send(slot) => Self::SEND_PARAM + slot as ParamId,
         }
     }
 
     pub fn from_param(param: ParamId) -> Option<Self> {
+        if (Self::SEND_PARAM..Self::SEND_PARAM + Self::SEND_SLOTS as ParamId).contains(&param) {
+            return Some(MixControl::Send((param - Self::SEND_PARAM) as u8));
+        }
         Self::ALL.into_iter().find(|c| c.param() == param)
     }
 
@@ -262,6 +281,7 @@ impl MixControl {
             MixControl::Pan => "pan",
             MixControl::Mute => "mute",
             MixControl::Solo => "solo",
+            MixControl::Send(slot) => SEND_NAMES[(slot % Self::SEND_SLOTS) as usize].0,
         }
     }
 
@@ -272,6 +292,7 @@ impl MixControl {
             MixControl::Pan => "Pan",
             MixControl::Mute => "Mute",
             MixControl::Solo => "Solo",
+            MixControl::Send(slot) => SEND_NAMES[(slot % Self::SEND_SLOTS) as usize].1,
         }
     }
 
@@ -286,8 +307,11 @@ impl MixControl {
             "volume" | "fader" | "level" => "vol",
             other => other,
         };
+        if let Some(slot) = SEND_NAMES.iter().position(|(n, _)| *n == q) {
+            return Ok(MixControl::Send(slot as u8));
+        }
         Self::ALL.into_iter().find(|c| c.as_str() == q)
-            .ok_or_else(|| format!("unknown mixer control '{name}' (expected 'vol', 'pan', 'mute' or 'solo')"))
+            .ok_or_else(|| format!("unknown mixer control '{name}' (expected 'vol', 'pan', 'mute', 'solo' or 'send1'..'send8': the send into the 1st..8th aux bus)"))
     }
 
     /// Whether a strip has this control: only a rig bus has its own fader.
@@ -315,6 +339,7 @@ impl MixControl {
             }
             MixControl::Mute => MixEdit { mute: Some(on), ..MixEdit::default() },
             MixControl::Solo => MixEdit { solo: Some(on), ..MixEdit::default() },
+            MixControl::Send(slot) => MixEdit { send: Some((slot, v as f32)), ..MixEdit::default() },
         }
     }
 }
@@ -1316,5 +1341,14 @@ mod tests {
         assert_eq!(at(MixControl::Mute, 127), MixEdit { mute: Some(true), ..MixEdit::default() });
         assert!(MixControl::Vol.fits(false).is_err() && MixControl::Vol.fits(true).is_ok());
         assert!(MixControl::Pan.fits(false).is_ok());
+        // Sends (issue #5): one control per bus slot, on a rig bus and on a source.
+        for slot in 0..MixControl::SEND_SLOTS {
+            let c = MixControl::Send(slot);
+            assert_eq!(MixControl::from_param(c.param()), Some(c));
+            assert_eq!(MixControl::parse(c.as_str()), Ok(c));
+            assert!(c.fits(true).is_ok() && c.fits(false).is_ok() && !c.is_switch());
+        }
+        assert_eq!(MixControl::from_param(MixControl::Send(MixControl::SEND_SLOTS - 1).param() + 1), None);
+        assert_eq!(at(MixControl::Send(2), 127), MixEdit { send: Some((2, 1.0)), ..MixEdit::default() });
     }
 }

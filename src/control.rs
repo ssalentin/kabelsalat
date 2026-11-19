@@ -84,6 +84,39 @@ pub enum DspKind {
     /// output to a master to hear it. No native params (BPM comes from the
     /// transport's SetBpm command).
     Metronome,
+    /// Aux bus (issue #5): a mixer channel fed by sends (`Command::SetSend`),
+    /// not by cables. Its OUT is a normal audio jack: the cables from it are
+    /// its insert chain, and whatever reaches a master from there returns to
+    /// the main mix past the rig faders. Param 0 = its fader (linear gain).
+    Bus,
+}
+
+/// Where a send taps its signal (issue #5): a whole rig at its rig bus, or
+/// one node at its own output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendSource {
+    Rig(u8),
+    Node(NodeId),
+}
+
+/// One send (issue #5): `level` (linear gain, 0..=1) of `from` into the aux
+/// bus node `bus`. `pre` taps before the source's fader and pan, so the send
+/// keeps its level when the fader moves; mute and solo silence it either way.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AuxSend {
+    pub from: SendSource,
+    pub bus: NodeId,
+    pub level: f32,
+    #[serde(default)]
+    pub pre: bool,
+}
+
+impl AuxSend {
+    /// A send that does nothing and remembers nothing: not worth an entry.
+    pub fn is_default(&self) -> bool {
+        self.level <= 0.0 && !self.pre
+    }
 }
 
 /// Which device channels an `AudioIn` node turns into its stereo OUT. A guitar
@@ -456,6 +489,54 @@ impl Graph {
             }
         }
         added
+    }
+
+    /// Plug an aux bus (issue #5) into its rig's Master L and R: the return.
+    /// Returns how many cables it added.
+    pub fn wire_bus(&mut self, node: NodeId) -> usize {
+        let Some(rig) = self.node(node).map(|n| n.rig) else { return 0 };
+        let Some(master) = self.nodes.iter().find(|n| n.rig == rig && matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id) else { return 0 };
+        let mut added = 0;
+        for port in 0..2u8 {
+            let id = self.edges.iter().map(|e| e.id + 1).max().unwrap_or(1);
+            if self.connect_with_id(id, PortRef { node, port: 0 }, PortRef { node: master, port }, PortKind::Audio) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// The aux bus in send slot `slot`: the patch's buses in node order.
+    /// A learned send binding names its bus this way (`MixControl::Send`).
+    pub fn bus_at(&self, slot: usize) -> Option<NodeId> {
+        self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).nth(slot).map(|n| n.id)
+    }
+
+    /// The send slot of an aux bus (see [`Graph::bus_at`]).
+    pub fn bus_slot(&self, bus: NodeId) -> Option<usize> {
+        self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).position(|n| n.id == bus)
+    }
+
+    /// Is this node an aux bus (issue #5)?
+    pub fn is_bus(&self, node: NodeId) -> bool {
+        self.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))
+    }
+
+    /// Is this node part of a bus's insert chain: an audio path leads from a
+    /// bus to it without crossing a master? Such nodes run after the rig
+    /// sums, so they cannot be send sources themselves.
+    pub fn after_bus(&self, node: NodeId) -> bool {
+        let mut seen: Vec<NodeId> = Vec::new();
+        let mut todo: Vec<NodeId> = self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).map(|n| n.id).collect();
+        while let Some(n) = todo.pop() {
+            for e in self.edges.iter().filter(|e| e.kind == PortKind::Audio && e.from.node == n) {
+                let to = e.to.node;
+                if seen.contains(&to) || self.node(to).is_some_and(|t| matches!(t.kind, NodeKind::MasterOut)) { continue; }
+                seen.push(to);
+                todo.push(to);
+            }
+        }
+        seen.contains(&node)
     }
 
     pub fn disconnect(&mut self, id: EdgeId) {
@@ -888,6 +969,17 @@ pub enum Command {
         pan: Option<f32>,
         mute: Option<bool>,
         solo: Option<bool>,
+    },
+    /// One send into an aux bus (issue #5): `from` (a rig or a node) feeds
+    /// the `DspKind::Bus` node `bus` at `level` (linear gain 0..=1), tapped
+    /// before (`pre`) or after the source's fader. Omitted fields keep their
+    /// value. Ignored when `bus` is no bus or `from` is itself a bus or part
+    /// of a bus's insert chain (no feedback). Resets on graph loads.
+    SetSend {
+        from: SendSource,
+        bus: NodeId,
+        level: Option<f32>,
+        pre: Option<bool>,
     },
     /// Bypass one effect node (#74): a bypassed FX passes its input through
     /// unchanged (its knob values are kept). Resets on graph loads.

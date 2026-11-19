@@ -690,6 +690,10 @@ fn system_prompt() -> String {
      before the fixed limiter). rename_strip / set_strip_color / move_strip / collapse_strip \
      shape the strip itself; get_strip_knobs / set_strip_knob read or assign each slot's \
      quick knob; faders are dB with double-click at 0 dB. \
+     - Sends (a shared reverb or delay for several rigs): add_bus makes an aux bus, \
+     add_insert with source = the bus node puts the effect on it (set that effect fully \
+     wet), set_send sends a rig (rig=) or one source (node=) into it at a level, pre or \
+     post fader; get_sends lists buses and sends. Never cable into a bus: it has no input. \
      Wire only nodes of the same rig. Every rig sounds at once. A tool's rig argument is \
      the 0-based index: the user's \"rig 1\" is rig=0, \"rig 2\" is rig=1.\n\
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
@@ -883,17 +887,17 @@ pub(crate) fn tools() -> Value {
         {"type":"function","function":{
             "name":"set_cc_map",
             "description":"Bind ONE MIDI CC (0..127) on source ('keys' | 'hw:<device index>') → dest node to a parameter id or rack knob (target: 'plugin' (default) | 'knob', or knob: 'LEVEL'|'MIX'|'VOLUME' or a main control's name from list_params). Optional min/max (0..1, default 0 and 1) limit how far the controller moves the parameter: its whole travel spans min..max (e.g. a pedal on organ drive that must not go past 60 %: max 0.6). A MIXER control binds with mix: 'vol' | 'pan' | 'mute' | 'solo' instead: on a rig's Master out node it is that rig's bus (fader, pan, mute, solo); on a source node it is the source strip's pan, mute or solo (a source's fader is knob 'LEVEL', the master fader knob 'VOLUME' on a Master out node). Mute and solo are on in the upper half of the controller's travel. Omit param/knob/mix to unbind that CC.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"min":{"type":"number"},"max":{"type":"number"}},"required":["node","source","cc"]}
         }},
         {"type":"function","function":{
             "name":"clear_cc_map",
             "description":"Clear one CC binding (when cc is given) or matching bindings (filtered by optional target/knob, or ALL when omitted) on source → node.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]}},"required":["node","source"]}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"cc":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]}},"required":["node","source"]}
         }},
         {"type":"function","function":{
             "name":"learn_cc",
             "description":"Arm MIDI-learn for (node, param/target or knob) on source ('keys' = default, any hardware device, records sender | 'hw:<d>') so the next incoming hardware CC binds to it. Pass cancel=true to disarm.",
-            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo"]},"cancel":{"type":"boolean"}}}
+            "parameters":{"type":"object","properties":{"node":{"type":"integer"},"source":{"type":"string"},"param":{"type":"integer"},"target":{"type":"string","enum":["plugin","knob","mix"]},"knob":{"type":"string"},"mix":{"type":"string","enum":["vol","pan","mute","solo","send1","send2","send3","send4","send5","send6","send7","send8"]},"cancel":{"type":"boolean"}}}
         }},
         {"type":"function","function":{
             "name":"set_rig_mix",
@@ -904,6 +908,26 @@ pub(crate) fn tools() -> Value {
             "name":"set_strip_mix",
             "description":"Per-SOURCE mixer (#73): pan -1..1, mute, solo on ONE instrument/audio-in/generator node, applied at the node's own output (its FX chain and the rig bus follow). Solo scope is WITHIN the node's rig: a soloed source mutes only the other sources of that rig. Omitted fields keep their value. Example: node 1 pan -0.5 mute false.",
             "parameters":{"type":"object","properties":{"node":{"type":"integer","description":"Source node id (get_graph)"},"pan":{"type":"number"},"mute":{"type":"boolean"},"solo":{"type":"boolean"}},"required":["node"]}
+        }},
+        {"type":"function","function":{
+            "name":"add_bus",
+            "description":"Add an aux bus (send/return): a mixer channel that rigs and sources SEND into (set_send) instead of being cabled to it. Its inserts run on the sum of what was sent (a shared reverb or delay: add_insert with source = the bus node), and it returns to Master out past the rig faders. Its fader is its LEVEL knob; pan/mute/solo are set_strip_mix on its node. rig = the rig whose rack shows the bus unit (0-based; default: the rig in view). Returns the bus's node id.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","description":"Up to 24 characters; default Bus A, Bus B, …"},"rig":{"type":"integer"}},"required":[]}
+        }},
+        {"type":"function","function":{
+            "name":"set_send",
+            "description":"Set one send into an aux bus: how much of a whole rig (rig = 0-based index, tapped at its rig bus) OR of one source (node = its node id) goes to bus (the bus's node id from add_bus / get_sends). level 0..1 is a linear gain (1 = 0 dB, 0.5 = -6 dB, 0 = off). pre=true taps before the fader, so the send keeps its level when the fader moves; pre=false (default) follows the fader. A muted source sends nothing. Omitted fields keep their value. Example: rig 1, bus 9, level 0.5.",
+            "parameters":{"type":"object","properties":{"bus":{"type":"integer","description":"Aux bus node id"},"rig":{"type":"integer","description":"Source rig (0-based); give rig OR node"},"node":{"type":"integer","description":"Source node id; give rig OR node"},"level":{"type":"number"},"pre":{"type":"boolean"}},"required":["bus"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_sends",
+            "description":"List the aux buses (node id, name, rig, level, pan, mute, solo, inserts, meter) and every send into them (from a rig or a node, level, dB, pre/post fader).",
+            "parameters":{"type":"object","properties":{},"required":[]}
+        }},
+        {"type":"function","function":{
+            "name":"remove_bus",
+            "description":"Remove an aux bus with its inserts and every send into it (undo brings it back).",
+            "parameters":{"type":"object","properties":{"bus":{"type":"integer","description":"Aux bus node id"}},"required":["bus"]}
         }},
         {"type":"function","function":{
             "name":"set_node_bypass",

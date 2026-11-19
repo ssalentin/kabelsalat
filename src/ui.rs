@@ -42,7 +42,7 @@ use crate::host::{
 };
 use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
-use crate::matrix::SourceId;
+use crate::matrix::{CcTarget, MixControl, SourceId};
 use crate::rope::{self, Rope};
 use crate::session::Template;
 use crate::theme;
@@ -1221,7 +1221,14 @@ struct KnobMenu {
     param: u32,
     target: crate::matrix::CcTarget,
     pos: Pos2,
+    /// The view it was opened in; it closes when the view changes.
+    stage: StageView,
 }
+
+/// What a CC binding drives: destination node, param and target space. A
+/// rack knob and a mixer control (#75) are each one of these, so MIDI learn,
+/// the menu and the bindings table treat them alike.
+type CcDest = (u32, u32, crate::matrix::CcTarget);
 
 /// The Keys-face scale picker, opened from the SCALE chip's readout:
 /// which Keys unit, at which screen position.
@@ -2603,6 +2610,9 @@ struct DemoApp {
     mixer_meter_rects: Vec<(u32, Rect)>,
     /// Last frame's quick-knob rects in the mixer stage: (node_id, rect).
     mixer_quick_knob_rects: Vec<(u32, Rect)>,
+    /// Every MIDI-learnable mixer control drawn this frame (#75): what it
+    /// binds and where it is.
+    mixer_learn_rects: Vec<(CcDest, Rect)>,
     /// Active drag on a mixer quick knob: (node_id, knob_idx, unquantized value).
     mixer_knob_drag: Option<(u32, usize, f32)>,
     /// The strip being dragged to reorder (#77): (node, rig).
@@ -3040,6 +3050,7 @@ impl DemoApp {
             mixer_strip_rects_prev: Vec::new(),
             mixer_meter_rects: Vec::new(),
             mixer_quick_knob_rects: Vec::new(),
+            mixer_learn_rects: Vec::new(),
             mixer_knob_drag: None,
             mixer_strip_drag: None,
             strip_rename: None,
@@ -6233,12 +6244,9 @@ impl DemoApp {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                let param = match args.get("knob").and_then(|v| v.as_str()) {
-                    Some(k) => match self.resolve_unit_knob(node, k) {
-                        Ok((p, t)) => { target = t; Some(p) }
-                        Err(e) => return e,
-                    },
-                    None => args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32),
+                let param = match self.tool_cc_param(node, args, &mut target) {
+                    Ok(p) => p,
+                    Err(e) => return e,
                 };
                 let bound = |key: &str, default: f64| match args.get(key) {
                     None | Some(serde_json::Value::Null) => Ok(default),
@@ -6278,12 +6286,16 @@ impl DemoApp {
                     },
                     None => None,
                 };
-                let knob_filter = match args.get("knob").and_then(|v| v.as_str()) {
-                    Some(k) => match self.resolve_unit_knob(node, k) {
+                let knob_filter = match (args.get("mix").and_then(|v| v.as_str()), args.get("knob").and_then(|v| v.as_str())) {
+                    (Some(m), _) => match self.resolve_mix_control(node, m) {
+                        Ok(p) => Some((p, CcTarget::Mix)),
+                        Err(e) => return e,
+                    },
+                    (None, Some(k)) => match self.resolve_unit_knob(node, k) {
                         Ok(pair) => Some(pair),
                         Err(e) => return e,
                     },
-                    None => None,
+                    (None, None) => None,
                 };
                 if let Some(cc) = args.get("cc").and_then(|v| v.as_u64()) {
                     if cc > 127 { return "cc must be 0..=127".into(); }
@@ -6337,6 +6349,7 @@ impl DemoApp {
                             let name = match m.target {
                                 crate::matrix::CcTarget::Knob => self.knob_param_label(node, m.param),
                                 crate::matrix::CcTarget::PluginParam => choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.clone()),
+                                crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param),
                             };
                             serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name, "range": m.scale.range_json()})
                         }).collect();
@@ -6413,17 +6426,12 @@ impl DemoApp {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                let param = match args.get("knob").and_then(|v| v.as_str()) {
-                    Some(k) => match self.resolve_unit_knob(node, k) {
-                        Ok((p, t)) => { target = t; p }
-                        Err(e) => return e,
-                    },
-                    None => match args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32) {
-                        Some(p) => p,
-                        None => return "learn_cc needs 'param' or 'knob'".into(),
-                    },
+                let param = match self.tool_cc_param(node, args, &mut target) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return "learn_cc needs 'param', 'knob' or 'mix'".into(),
+                    Err(e) => return e,
                 };
-                let replace_existing = target == crate::matrix::CcTarget::Knob || args.get("knob").is_some();
+                let replace_existing = target != crate::matrix::CcTarget::PluginParam || args.get("knob").is_some();
                 self.cc_learn = Some(CcLearn { source: src, dest: node, param, target, replace_existing });
                 serde_json::json!({"armed": true, "node": node, "source": Self::source_str(src), "param": param, "target": target.as_str()}).to_string()
             }
@@ -8313,12 +8321,155 @@ impl DemoApp {
     }
 
     fn parse_cc_target(target: Option<&str>) -> Result<crate::matrix::CcTarget, String> {
-        match target.map(str::trim).map(str::to_lowercase).as_deref() {
-            None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => {
-                Ok(crate::matrix::CcTarget::PluginParam)
-            }
-            Some("knob") => Ok(crate::matrix::CcTarget::Knob),
-            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin' or 'knob')")),
+        CcTarget::parse(target)
+    }
+
+    /// The Master unit's node of `rig`: where that rig bus's mixer bindings
+    /// live (`CcTarget::Mix`), so they follow the rig through every reload.
+    fn rig_bus_node(&self, rig: usize) -> Option<u32> {
+        let n = self.rig_count();
+        self.units.iter()
+            .find(|u| matches!(u.node_kind, UnitKind::Master) && (n <= 1 || u.rig as usize == rig))
+            .map(|u| u.node_id)
+    }
+
+    /// The rig whose bus `node` stands for, when it is a Master unit.
+    fn rig_of_bus_node(&self, node: u32) -> Option<usize> {
+        let n = self.rig_count();
+        self.units.iter()
+            .find(|u| u.node_id == node && matches!(u.node_kind, UnitKind::Master))
+            .map(|u| if n <= 1 { 0 } else { u.rig as usize })
+    }
+
+    /// The param an agent tool's arguments name on `node`: `mix` (a mixer
+    /// control), `knob` (a rack knob or main control) or a bare `param`.
+    /// `mix` and `knob` also decide the target.
+    fn tool_cc_param(&self, node: u32, args: &serde_json::Value, target: &mut CcTarget) -> Result<Option<u32>, String> {
+        let text = |key: &str| args.get(key).and_then(|v| v.as_str());
+        let param = if let Some(m) = text("mix") {
+            *target = CcTarget::Mix;
+            Some(self.resolve_mix_control(node, m)?)
+        } else if let Some(k) = text("knob") {
+            let (p, t) = self.resolve_unit_knob(node, k)?;
+            *target = t;
+            Some(p)
+        } else {
+            args.get("param").and_then(|v| v.as_u64()).map(|p| p as u32)
+        };
+        // target "mix" with a bare param: it must name a control of that strip.
+        if let (CcTarget::Mix, Some(p)) = (*target, param) {
+            let ctl = MixControl::from_param(p).ok_or_else(|| format!("no mixer control {p}: pass mix 'vol', 'pan', 'mute' or 'solo'"))?;
+            ctl.fits(self.rig_of_bus_node(node).is_some())?;
+        }
+        Ok(param)
+    }
+
+    fn mix_param_label(param: u32) -> Option<String> {
+        MixControl::from_param(param).map(|c| format!("{} (mixer)", c.label()))
+    }
+
+    /// The param of the mixer control an agent tool names on `node`
+    /// (`mix: "vol" | "pan" | "mute" | "solo"`).
+    fn resolve_mix_control(&self, node: u32, mix: &str) -> Result<u32, String> {
+        let ctl = MixControl::parse(mix)?;
+        ctl.fits(self.rig_of_bus_node(node).is_some())?;
+        Ok(ctl.param())
+    }
+
+    /// What a binding drives, for a menu title or a tool answer.
+    fn cc_dest_title(&self, (node, param, target): CcDest) -> Option<String> {
+        let u = self.units.iter().find(|u| u.node_id == node)?;
+        if target == CcTarget::Mix {
+            let ctl = MixControl::from_param(param)?;
+            let strip = match self.rig_of_bus_node(node) {
+                Some(rig) => format!("{} bus", self.rig_name(rig)),
+                None => sentence_case(&u.name),
+            };
+            return Some(format!("{strip} · {}", ctl.label()));
+        }
+        let k = u.knobs.iter().find(|k| k.cc_target() == Some((param, target)))?;
+        Some(format!("{} · {}", sentence_case(&u.name), k.label))
+    }
+
+    /// Right-click on a learnable control, a rack knob or a mixer control:
+    /// arm MIDI learn; on a bound control, or on the one being learned, open
+    /// its menu (learning keeps running until the menu decides, #20).
+    fn cc_right_click(&mut self, (node, param, target): CcDest, pos: Pos2) {
+        let same_learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target);
+        let menu = KnobMenu { node, param, target, pos, stage: self.stage_view };
+        if same_learning {
+            self.knob_menu = Some(menu);
+        } else if self.knob_cc_binding(node, param, target).is_some() {
+            self.cc_learn = None;
+            self.knob_menu = Some(menu);
+        } else {
+            self.knob_menu = None;
+            self.cc_learn = Some(CcLearn { source: SourceId::Keys, dest: node, param, target, replace_existing: true });
+        }
+    }
+
+    /// One mixer control's part in MIDI learn (#75), the rack knobs' flow:
+    /// right-click arms it, the next hardware CC binds it, a right-click on
+    /// a bound control opens the menu. `mark` gets a pulsing outline while
+    /// learning and a MIDI-blue one once bound.
+    fn mixer_learn_ui(&mut self, ui: &egui::Ui, resp: &egui::Response, mark: Rect, dest: Option<CcDest>) {
+        let Some(dest) = dest else { return };
+        self.mixer_learn_rects.push((dest, resp.rect));
+        if resp.secondary_clicked() {
+            self.cc_right_click(dest, resp.interact_pointer_pos().unwrap_or(mark.center()));
+        }
+        let (node, param, target) = dest;
+        if self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target) {
+            let pulse = 0.5 + 0.5 * (self.ui_time * 6.0).sin();
+            let col = mix(theme::MIDI_BLUE, theme::CABLE_CYAN, pulse);
+            ui.painter().rect_stroke(mark.expand(2.0), 3.0, Stroke::new(1.8, alpha(col, 0.70 + 0.30 * pulse)), egui::StrokeKind::Outside);
+        } else if self.knob_cc_binding(node, param, target).is_some() {
+            ui.painter().rect_stroke(mark.expand(2.0), 3.0, Stroke::new(1.0, theme::MIDI_BLUE), egui::StrokeKind::Outside);
+        }
+    }
+
+    /// The tag a learnable control shows: "LEARN" while armed, its "CC n"
+    /// once bound.
+    fn cc_tag(&self, dest: Option<CcDest>) -> Option<String> {
+        let (node, param, target) = dest?;
+        if self.cc_learn.as_ref().is_some_and(|l| l.dest == node && l.param == param && l.target == target) {
+            return Some("LEARN".into());
+        }
+        self.knob_cc_binding(node, param, target).map(|(_, cc)| format!("CC {cc}"))
+    }
+
+    /// A fader's dB readout with its MIDI tag behind it (one label of two
+    /// colours, rule 100).
+    fn fader_readout_ui(&self, ui: &mut egui::Ui, gain: f32, size: f32, dest: Option<CcDest>) -> egui::Response {
+        let font = egui::FontId::monospace(size);
+        let mut job = egui::text::LayoutJob::default();
+        job.append(&db_readout(gain), 0.0, egui::TextFormat::simple(font.clone(), theme::CREAM_MID));
+        if let Some(tag) = self.cc_tag(dest) {
+            job.append(&format!(" · {tag}"), 0.0, egui::TextFormat::simple(font, theme::MIDI_BLUE));
+        }
+        ui.label(job)
+    }
+
+    /// A hardware CC on a mixer binding moves the strip the mixer draws
+    /// (rule 109). The engine applied it already; `resend` is for the CC that
+    /// completed a learn, which the engine saw before the binding existed
+    /// (rule 51).
+    fn apply_mix_cc(&mut self, node: u32, ctl: MixControl, norm: f64, resend: bool) {
+        let e = ctl.edit(norm);
+        if let Some(rig) = self.rig_of_bus_node(node) {
+            let m = &mut self.rig_mix[rig.min(7)];
+            if let Some(v) = e.vol { m.vol = v; }
+            if let Some(p) = e.pan { m.pan = p; }
+            if let Some(b) = e.mute { m.mute = b; }
+            if let Some(b) = e.solo { m.solo = b; }
+            if resend { self.send_rig_mix(rig); }
+        } else if ctl.fits(false).is_ok() && self.units.iter().any(|u| u.node_id == node) {
+            self.with_strip_row(node, |row| {
+                if let Some(p) = e.pan { row.pan = p; }
+                if let Some(b) = e.mute { row.mute = b; }
+                if let Some(b) = e.solo { row.solo = b; }
+            });
+            if resend { self.send_strip_mix(node); }
         }
     }
 
@@ -8367,6 +8518,12 @@ impl DemoApp {
     /// unit, plugin and knob targets reach the same engine param
     /// (`apply_engine_param`), so the agent's `param: 0` is the learned CUTOFF.
     fn binds_knob(&self, node_id: u32, m: &crate::matrix::CcMapping, param: u32, target: crate::matrix::CcTarget) -> bool {
+        // A mixer control shares its node with the unit's knobs and params,
+        // and its param numbers with them: only its own target is the same
+        // binding.
+        if m.target == CcTarget::Mix || target == CcTarget::Mix {
+            return m.target == target && m.param == param;
+        }
         let is_clap = self.units.iter().any(|u| u.node_id == node_id && matches!(u.node_kind, UnitKind::Clap));
         m.param == param && (m.target == target || !is_clap)
     }
@@ -8412,6 +8569,7 @@ impl DemoApp {
     /// engine saw it before the binding existed, so publish must catch it up.
     fn apply_cc_to_knobs(&mut self, src: SourceId, ch: u8, cc: u8, val: u8, resend: bool) {
         let hold_until = self.ui_time + READBACK_HOLD_SECS;
+        let mut mixer: Vec<(u32, MixControl, f64)> = Vec::new();
         for ((rule_src, dest), edit) in &self.rule_edits {
             if *rule_src != src || !edit.enabled { continue; }
             if let Some(rule_ch) = edit.channel {
@@ -8419,6 +8577,12 @@ impl DemoApp {
             }
             for m in &edit.cc_map {
                 if m.cc != cc { continue; }
+                if m.target == CcTarget::Mix {
+                    if let Some(ctl) = MixControl::from_param(m.param) {
+                        mixer.push((*dest, ctl, m.scale.norm(val)));
+                    }
+                    continue;
+                }
                 let norm = m.scale.norm(val) as f32;
                 for u in &mut self.units {
                     if u.node_id != *dest { continue; }
@@ -8443,6 +8607,9 @@ impl DemoApp {
                     }
                 }
             }
+        }
+        for (node, ctl, norm) in mixer {
+            self.apply_mix_cc(node, ctl, norm, resend);
         }
     }
 
@@ -8672,6 +8839,8 @@ impl DemoApp {
                     .find(|(id, _)| *id == m.param)
                     .map(|(_, n)| n.clone())
                     .unwrap_or_else(|| format!("Param {}", m.param)),
+                crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param)
+                    .unwrap_or_else(|| format!("Mixer {}", m.param)),
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
@@ -15222,28 +15391,7 @@ impl DemoApp {
                     let node_id = self.units[unit].node_id;
                     let target = self.units[unit].knobs[idx].cc_target();
                     if let Some((param, tgt)) = target {
-                        let same_learning = self.cc_learn.as_ref().is_some_and(|l| {
-                            l.dest == node_id && l.param == param && l.target == tgt
-                        });
-                        let menu = KnobMenu { node: node_id, param, target: tgt, pos: s };
-                        if same_learning {
-                            // Learning keeps running until the menu decides:
-                            // Cancel MIDI learn, or Reset (#20 — the only way
-                            // to reset an unbound knob without the global R).
-                            self.knob_menu = Some(menu);
-                        } else if self.knob_cc_binding(node_id, param, tgt).is_some() {
-                            self.cc_learn = None;
-                            self.knob_menu = Some(menu);
-                        } else {
-                            self.knob_menu = None;
-                            self.cc_learn = Some(CcLearn {
-                                source: SourceId::Keys,
-                                dest: node_id,
-                                param,
-                                target: tgt,
-                                replace_existing: true,
-                            });
-                        }
+                        self.cc_right_click((node_id, param, tgt), s);
                     } else {
                         self.knob_menu = None;
                         self.units[unit].knobs[idx].value = self.units[unit].knobs[idx].default;
@@ -15851,6 +15999,7 @@ impl DemoApp {
         self.mixer_strip_rects_prev = std::mem::take(&mut self.mixer_strip_rects);
         self.mixer_meter_rects.clear();
         self.mixer_quick_knob_rects.clear();
+        self.mixer_learn_rects.clear();
         let mut switch: Option<usize> = None;
         // System audio (#31): other apps' streams + the output choice.
         let app_streams = self.app_streams_shown();
@@ -15863,6 +16012,14 @@ impl DemoApp {
         // not yet a click outside it, and a pick joins `edits` before they
         // apply below.
         if !help {
+            // The MIDI menu of a mixer control (#75) closes on a press
+            // outside it; the strips below may open it again this frame.
+            if self.knob_menu.is_some() {
+                let menu = self.knob_menu_rect;
+                if ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !menu.contains(p))) {
+                    self.knob_menu = None;
+                }
+            }
             self.strip_rename_modal(&ctx);
             self.strip_palette_ui(&ctx);
             self.insert_picker_ui(&ctx, &mut edits);
@@ -15988,7 +16145,7 @@ impl DemoApp {
                                                     // same peak hold + clip as the patch strips (#72).
                                                     let level = crate::audio_out::stream_level(&self.stream_levels, st.index);
                                                     let key = app_stream_key(st.index);
-                                                    let fr = self.strip_fader_ui(ui, key, &mut v, level, fader_h);
+                                                    let fr = self.strip_fader_ui(ui, key, &mut v, level, fader_h, None);
                                                     ui.interact(fr, egui::Id::unique(("app_stream_tip", st.index)), egui::Sense::hover())
                                                         .on_hover_text(format!("{} — {}", st.app, title));
                                                     if (v - shown).abs() > 1e-4 { stream_changes.push((st.index, Some(v), None)); }
@@ -16048,6 +16205,10 @@ impl DemoApp {
         let knob = self.units[unit].knobs.iter().position(|k| k.param.is_some()
             && matches!(k.label.as_str(), "LEVEL" | "GAIN" | "VOLUME" | "VOL"));
         let row = self.strip_row(node);
+        // What MIDI learn binds on this strip (#75): the fader is the unit's
+        // own level knob, pan/mute/solo are the strip's.
+        let fader_dest: Option<CcDest> = knob.and_then(|k| self.units[unit].knobs[k].cc_target()).map(|(p, t)| (node, p, t));
+        let [pan_dest, mute_dest, solo_dest] = [MixControl::Pan, MixControl::Mute, MixControl::Solo].map(|c| (node, c.param(), CcTarget::Mix));
         let collapsed = row.collapsed;
         let w = if collapsed { STRIP_COLLAPSED_W } else { STRIP_W };
         let level = self.strip_audio_level(unit);
@@ -16120,11 +16281,15 @@ impl DemoApp {
                 let mut ms = row;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
-                    if strip_ms_button(ui, &mut ms, 'M').clicked() {
+                    let mr = strip_ms_button(ui, &mut ms, 'M');
+                    self.mixer_learn_ui(ui, &mr, mr.rect, Some(mute_dest));
+                    if mr.clicked() {
                         self.with_strip_row(node, |r| r.mute = ms.mute);
                         self.send_strip_mix(node);
                     }
-                    if strip_ms_button(ui, &mut ms, 'S').clicked() {
+                    let sr = strip_ms_button(ui, &mut ms, 'S');
+                    self.mixer_learn_ui(ui, &sr, sr.rect, Some(solo_dest));
+                    if sr.clicked() {
                         self.with_strip_row(node, |r| r.solo = ms.solo);
                         self.send_strip_mix(node);
                     }
@@ -16158,7 +16323,7 @@ impl DemoApp {
                 if let Some(k) = knob {
                     let old = self.units[unit].knobs[k].value;
                     let mut g = old;
-                    self.strip_fader_ui(ui, node, &mut g, level, fader_h);
+                    self.strip_fader_ui(ui, node, &mut g, level, fader_h, fader_dest);
                     if (g - old).abs() > f32::EPSILON { gain = Some(g); }
                     readout = g;
                 } else {
@@ -16168,7 +16333,7 @@ impl DemoApp {
                     readout = 0.0;
                 }
                 // Readout + pan + M/S (#73).
-                ui.label(egui::RichText::new(db_readout(readout)).size(10.5).monospace().color(theme::CREAM_MID))
+                self.fader_readout_ui(ui, readout, 10.5, fader_dest)
                     .on_hover_text("this source's level · double-click the fader: 0 dB");
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
@@ -16178,7 +16343,8 @@ impl DemoApp {
                     let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
                         .custom_formatter(|v, _| pan_text(v as f32))
                         .custom_parser(parse_pan)));
-                    if r.on_hover_text("source pan (L −1 … +1 R) · drag").changed() {
+                    self.mixer_learn_ui(ui, &r, r.rect, Some(pan_dest));
+                    if r.on_hover_text("source pan (L −1 … +1 R) · drag · right-click: MIDI learn").changed() {
                         self.with_strip_row(node, |rw| rw.pan = p);
                         self.send_strip_mix(node);
                     }
@@ -16188,11 +16354,15 @@ impl DemoApp {
                 ui.horizontal(|ui| {
                     ui.add_space(((w - 46.0) * 0.5).max(4.0));
                     ui.spacing_mut().item_spacing.x = 4.0;
-                    if strip_ms_button(ui, &mut ms, 'M').on_hover_text("mute this source").clicked() {
+                    let mr = strip_ms_button(ui, &mut ms, 'M');
+                    self.mixer_learn_ui(ui, &mr, mr.rect, Some(mute_dest));
+                    if mr.on_hover_text("mute this source · right-click: MIDI learn").clicked() {
                         self.with_strip_row(node, |r| r.mute = ms.mute);
                         self.send_strip_mix(node);
                     }
-                    if strip_ms_button(ui, &mut ms, 'S').on_hover_text("solo this source (within its rig)").clicked() {
+                    let sr = strip_ms_button(ui, &mut ms, 'S');
+                    self.mixer_learn_ui(ui, &sr, sr.rect, Some(solo_dest));
+                    if sr.on_hover_text("solo this source (within its rig) · right-click: MIDI learn").clicked() {
                         self.with_strip_row(node, |r| r.solo = ms.solo);
                         self.send_strip_mix(node);
                     }
@@ -16231,14 +16401,17 @@ impl DemoApp {
         let old = (m.vol, m.pan, m.mute, m.solo);
         let armed = self.arm_rigs[rig.min(7)];
         let mut arm_toggle = false;
+        // What MIDI learn binds on this bus (#75), keyed by the rig's Master node.
+        let dest = |app: &Self, c: MixControl| app.rig_bus_node(rig).map(|n| (n, c.param(), CcTarget::Mix));
+        let [vol_dest, pan_dest, mute_dest, solo_dest] = MixControl::ALL.map(|c| dest(self, c));
         let bus_resp = ui.allocate_ui_with_layout(egui::vec2(STRIP_W, 10.0), egui::Layout::top_down(egui::Align::Center), |ui| {
             ui.set_width(STRIP_W);
             ui.label(egui::RichText::new("Rig bus").size(13.0).strong().color(theme::INK));
             theme::tracked_label(ui, "→ MASTER OUT", 9.0, 0.12, theme::INK_2);
             ui.add_space(8.0);
-            let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h);
+            let fr = self.strip_fader_ui(ui, rig_strip_key(rig), &mut vol, level, fader_h, vol_dest);
             self.mixer_fader_rects.push(fr);
-            ui.label(egui::RichText::new(db_readout(vol)).size(10.5).monospace().color(theme::CREAM_MID))
+            self.fader_readout_ui(ui, vol, 10.5, vol_dest)
                 .on_hover_text("this rig's level · double-click the fader: 0 dB");
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -16248,7 +16421,8 @@ impl DemoApp {
                 let r = drag_only(ui.add(egui::DragValue::new(&mut p).range(-1.0..=1.0).speed(0.02)
                     .custom_formatter(|v, _| pan_text(v as f32))
                     .custom_parser(parse_pan)));
-                if r.on_hover_text("rig pan (L −1 … +1 R) · drag").changed() { m.pan = p; }
+                self.mixer_learn_ui(ui, &r, r.rect, pan_dest);
+                if r.on_hover_text("rig pan (L −1 … +1 R) · drag · right-click: MIDI learn").changed() { m.pan = p; }
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -16259,12 +16433,16 @@ impl DemoApp {
                         .color(if m.mute { theme::DARK_PANEL } else { theme::CREAM_MID }))
                     .fill(if m.mute { theme::CHIP_ON } else { theme::DARK_PANEL_HI })
                     .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                if ui.add(mb).on_hover_text("mute this rig").clicked() { m.mute = !m.mute; }
+                let mr = ui.add(mb);
+                self.mixer_learn_ui(ui, &mr, mr.rect, mute_dest);
+                if mr.on_hover_text("mute this rig · right-click: MIDI learn").clicked() { m.mute = !m.mute; }
                 let sb = egui::Button::new(egui::RichText::new("S").size(11.0)
                         .color(if m.solo { theme::DARK_PANEL } else { theme::CREAM_MID }))
                     .fill(if m.solo { theme::LIVE_TEAL } else { theme::DARK_PANEL_HI })
                     .corner_radius(2.0).min_size(egui::vec2(26.0, 22.0));
-                if ui.add(sb).on_hover_text("solo this rig").clicked() { m.solo = !m.solo; }
+                let sr = ui.add(sb);
+                self.mixer_learn_ui(ui, &sr, sr.rect, solo_dest);
+                if sr.on_hover_text("solo this rig · right-click: MIDI learn").clicked() { m.solo = !m.solo; }
                 let rb = egui::Button::new(egui::RichText::new("R").size(11.0)
                         .color(if armed { theme::ON_ACCENT } else { theme::CREAM_MID }))
                     .fill(if armed { theme::ACCENT_DEEP } else { theme::DARK_PANEL_HI })
@@ -16309,6 +16487,8 @@ impl DemoApp {
             && (n <= 1 || u.rig == self.active_rig as u8))
             .and_then(|mi| self.units[mi].knob_index("VOLUME").map(|k| (mi, k)));
         let mut gain = master_knob.map(|(mi, k)| self.units[mi].knobs[k].value);
+        let fader_dest: Option<CcDest> = master_knob
+            .and_then(|(mi, k)| self.units[mi].knobs[k].cc_target().map(|(p, t)| (self.units[mi].node_id, p, t)));
         ui.vertical(|ui| {
             ui.set_width(152.0);
             theme::section_label(ui, "Master out");
@@ -16397,8 +16577,9 @@ impl DemoApp {
                     let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
                     ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
                     ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
+                    self.mixer_learn_ui(ui, &resp, cap, fader_dest);
                 }
-                resp.on_hover_text("master volume · double-click: 0 dB");
+                resp.on_hover_text("master volume · double-click: 0 dB · right-click: MIDI learn");
             }
             // The ends first; a mark too close to one already drawn is left out
             // (a short meter put "0 dB", "−6" and "−12" on top of each other).
@@ -16412,7 +16593,7 @@ impl DemoApp {
                     label, egui::FontId::monospace(9.5), theme::CREAM_DIM);
             }
             ui.add_space(6.0);
-            ui.label(egui::RichText::new(db_readout(gain.unwrap_or(0.75))).size(11.0).monospace().color(theme::CREAM_MID))
+            self.fader_readout_ui(ui, gain.unwrap_or(0.75), 11.0, fader_dest)
                 .on_hover_text("master volume · the last stage is the limiter, then warmth");
             let rigs = if n == 1 { "1 rig".to_string() } else { format!("sum of {n} rigs") };
             ui.label(egui::RichText::new(rigs).size(11.0).color(theme::INK_2))
@@ -16435,7 +16616,7 @@ impl DemoApp {
     /// The dB fader + its meter, shared by every strip (#72). `gain` is the
     /// fader's value; the meter shows `level` with a ~1.5 s peak hold and a
     /// clip light that stays lit until clicked. Returns the fader's rect.
-    fn strip_fader_ui(&mut self, ui: &mut egui::Ui, key: u32, gain: &mut f32, level: f32, fader_h: f32) -> Rect {
+    fn strip_fader_ui(&mut self, ui: &mut egui::Ui, key: u32, gain: &mut f32, level: f32, fader_h: f32, learn: Option<CcDest>) -> Rect {
         let (r, resp) = ui.allocate_exact_size(egui::vec2(48.0, fader_h), egui::Sense::click_and_drag());
         let fr = Rect::from_min_size(r.min, egui::vec2(30.0, fader_h));
         let mr = Rect::from_min_size(Pos2::new(r.right() - 8.0, r.top() + 8.0), egui::vec2(6.0, fader_h - 8.0));
@@ -16486,7 +16667,12 @@ impl DemoApp {
         let cap = Rect::from_center_size(Pos2::new(fr.center().x, y), egui::vec2(26.0, cap_h));
         ui.painter().rect_filled(cap, 2.0, if resp.dragged() || resp.hovered() { theme::CREAM } else { theme::CHIP_ON });
         ui.painter().line_segment([Pos2::new(cap.left() + 4.0, y), Pos2::new(cap.right() - 4.0, y)], Stroke::new(1.0, theme::DARK_PANEL));
-        resp.on_hover_text("drag to set · double-click: 0 dB (unity)");
+        self.mixer_learn_ui(ui, &resp, cap, learn);
+        resp.on_hover_text(if learn.is_some() {
+            "drag to set · double-click: 0 dB (unity) · right-click: MIDI learn"
+        } else {
+            "drag to set · double-click: 0 dB (unity)"
+        });
         fr
     }
 
@@ -18233,24 +18419,30 @@ impl DemoApp {
             app.knob_menu = None;
             app.knob_menu_rect = Rect::NOTHING;
         };
-        if self.stage_view != StageView::Rack || self.side != Side::Front {
+        let shown = match self.stage_view {
+            StageView::Rack => self.side == Side::Front,
+            StageView::Mixer => true,
+            _ => false,
+        };
+        if !shown || self.stage_view != menu.stage {
             return close(self);
         }
-        let Some((unit, idx)) = self.knob_menu_target(&menu) else { return close(self) };
         let (node_id, param, target) = (menu.node, menu.param, menu.target);
+        // A mixer control (#75) has a binding and no knob: no value to reset.
+        let knob = self.knob_menu_target(&menu);
+        let Some(title) = self.cc_dest_title((node_id, param, target)) else { return close(self) };
         let learning = self.cc_learn.as_ref().is_some_and(|l| l.dest == node_id && l.param == param && l.target == target);
         let mapping = self.knob_cc_mapping(node_id, param, target);
         let binding = mapping.map(|(src, m)| (src, m.cc));
         if binding.is_none() && !learning {
             return close(self);
         }
-        let u = &self.units[unit];
-        let title = format!("{} · {}", sentence_case(&u.name), u.knobs[idx].label);
         let mut relearn = false;
         let mut cancel_learn = false;
         let mut clear = false;
         let mut reset_val = false;
-        let ranged = mapping.filter(|(_, m)| m.scale.is_continuous() && !learning);
+        let switch = target == CcTarget::Mix && MixControl::from_param(param).is_some_and(|c| c.is_switch());
+        let ranged = mapping.filter(|(_, m)| m.scale.is_continuous() && !learning && !switch);
         let (mut lo_pct, mut hi_pct) = ranged.map_or((0.0, 100.0), |(_, m)| {
             let (lo, hi) = m.scale.bounds();
             ((lo * 100.0).round(), (hi * 100.0).round())
@@ -18322,9 +18514,11 @@ impl DemoApp {
                                 clear = true;
                             }
                         }
-                        ui.add_space(4.0);
-                        if theme::chip_button(ui, "Reset to default", false).clicked() {
-                            reset_val = true;
+                        if knob.is_some() {
+                            ui.add_space(4.0);
+                            if theme::chip_button(ui, "Reset to default", false).clicked() {
+                                reset_val = true;
+                            }
                         }
                     });
             });
@@ -18353,7 +18547,7 @@ impl DemoApp {
         }
         if clear {
             self.clear_knob_bindings(node_id, param, target);
-        } else if reset_val {
+        } else if let (true, Some((unit, idx))) = (reset_val, knob) {
             let k = &mut self.units[unit].knobs[idx];
             k.set_immediate(k.default);
         }
@@ -24482,7 +24676,7 @@ mod split_bpm_tests {
         let surge_unit = 1usize;
         let level_idx = app.units[surge_unit].knob_index("LEVEL").unwrap();
         let node = app.units[surge_unit].node_id;
-        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO };
+        let menu = KnobMenu { node, param: P_LEVEL, target: crate::matrix::CcTarget::Knob, pos: Pos2::ZERO, stage: StageView::Rack };
         assert_eq!(app.knob_menu_target(&menu), Some((surge_unit, level_idx)));
         app.units.swap(0, surge_unit);
         assert_eq!(app.knob_menu_target(&menu), Some((0, level_idx)), "follows the unit to its new index");
@@ -28729,7 +28923,7 @@ mod mixer_parity_tests {
             let wi = app.units[m].knob_index("WARM").unwrap();
             let (param, target) = app.units[m].knobs[wi].cc_target().unwrap();
             let pos = app.xf.p(app.knob_center(m, wi));
-            app.knob_menu = Some(KnobMenu { node, param, target, pos });
+            app.knob_menu = Some(KnobMenu { node, param, target, pos, stage: StageView::Rack });
             super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
         }
     }
@@ -29202,6 +29396,440 @@ mod mixer_parity_tests {
 }
 
 /// Skipped when Surge XT is not installed.
+/// #75: MIDI learn on the mixer's faders, pan, mute and solo.
+#[cfg(test)]
+mod mixer_midi_learn_tests {
+    use super::*;
+
+    const SIZE: Vec2 = Vec2::new(1600.0, 1000.0);
+
+    fn frame(app: &mut DemoApp, ctx: &egui::Context, events: Vec<egui::Event>) -> Vec<String> {
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, SIZE));
+        raw.events = events;
+        // Popups fade in: read their paint past the animation (rule 101).
+        raw.time = Some(app.ui_time as f64 + 1.0);
+        eframe::App::raw_input_hook(app, ctx, &mut raw);
+        let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+        out.textures_delta.clear(); // rule 11
+        fn walk(shape: &Shape, texts: &mut Vec<String>) {
+            match shape {
+                Shape::Text(t) => texts.push(t.galley.text().to_owned()),
+                Shape::Vec(v) => for s in v { walk(s, texts) },
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for cs in &out.shapes { walk(&cs.shape, &mut texts); }
+        texts
+    }
+
+    fn press(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2, button: egui::PointerButton) -> Vec<String> {
+        let b = |pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: Modifiers::NONE };
+        frame(app, ctx, vec![egui::Event::PointerMoved(pos)]);
+        frame(app, ctx, vec![b(true)]);
+        frame(app, ctx, vec![b(false)]);
+        frame(app, ctx, vec![])
+    }
+
+    fn rclick(app: &mut DemoApp, ctx: &egui::Context, pos: Pos2) -> Vec<String> {
+        press(app, ctx, pos, egui::PointerButton::Secondary)
+    }
+
+    fn cc(app: &mut DemoApp, ctx: &egui::Context, dev: u32, cc: u8, value: u8) -> Vec<String> {
+        app.hw_cc_queue.lock().unwrap().push_back((SourceId::Hardware(dev), 0, cc, value));
+        frame(app, ctx, vec![])
+    }
+
+    /// The demo rack in the mixer view, with a command bus to read.
+    fn mixer_app() -> (DemoApp, egui::Context, crate::control::CommandDrain) {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_demo_patch();
+        let (bus, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        let ctx = egui::Context::default();
+        app.stage_view = StageView::Mixer;
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        drain.drain(|_| {});
+        (app, ctx, drain)
+    }
+
+    fn sent(drain: &mut crate::control::CommandDrain) -> Vec<Command> {
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        cmds
+    }
+
+    /// Where the mixer drew the control that binds `dest`.
+    fn at(app: &DemoApp, dest: CcDest) -> Pos2 {
+        app.mixer_learn_rects.iter().find(|(d, _)| *d == dest).map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("the mixer draws no control for {dest:?}: {:?}", app.mixer_learn_rects))
+    }
+
+    fn bus(app: &DemoApp, rig: usize, c: MixControl) -> CcDest {
+        (app.rig_bus_node(rig).expect("the rig's Master node"), c.param(), CcTarget::Mix)
+    }
+
+    fn first_source(app: &DemoApp) -> u32 {
+        app.mixer_strip_rects.first().expect("a source strip").1
+    }
+
+    fn mapping(app: &DemoApp, dev: u32, dest: CcDest) -> Option<crate::matrix::CcMapping> {
+        app.rule_edits.get(&(SourceId::Hardware(dev), dest.0))
+            .and_then(|e| e.cc_map.iter().find(|m| m.param == dest.1 && m.target == dest.2).copied())
+    }
+
+    #[test]
+    fn a_rig_bus_fader_learns_a_cc_and_follows_it() {
+        let (mut app, ctx, mut drain) = mixer_app();
+        let fader = bus(&app, 0, MixControl::Vol);
+        let master = fader.0;
+
+        // Right-click arms the learn and the strip says so.
+        let pos = at(&app, fader);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == fader), "right-click arms MIDI learn");
+        assert!(texts.iter().any(|t| t.ends_with("· LEARN")), "the fader's readout shows LEARN: {texts:?}");
+
+        // The next hardware CC binds it, and that CC is applied (rule 51).
+        let texts = cc(&mut app, &ctx, 2, 7, 64);
+        assert!(app.cc_learn.is_none(), "the CC completed the learn");
+        assert_eq!(mapping(&app, 2, fader).map(|m| m.cc), Some(7));
+        assert_eq!(app.rig_mix[0].vol, 64.0 / 127.0, "the fader moves on screen (rule 109)");
+        assert!(texts.iter().any(|t| t.ends_with("· CC 7")), "the fader's readout shows its CC: {texts:?}");
+        let cmds = sent(&mut drain);
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap {
+            source: SourceId::Hardware(2), dest, cc: 7, param: Some(0), target: CcTarget::Mix, ..
+        } if *dest == master)), "the binding goes to the engine: {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetRigMix { rig: 0, vol: Some(v), .. } if *v == 64.0 / 127.0)),
+            "the engine saw the CC before the binding: one catch-up SetRigMix: {cmds:?}");
+
+        // From then on the engine applies the CC itself; the app only follows.
+        cc(&mut app, &ctx, 2, 7, 127);
+        assert_eq!(app.rig_mix[0].vol, 1.0);
+        let cmds = sent(&mut drain);
+        assert!(!cmds.iter().any(|c| matches!(c, Command::SetRigMix { .. })), "no echo back to the engine: {cmds:?}");
+
+        // Another device's CC 7, and another CC of this device, move nothing.
+        cc(&mut app, &ctx, 0, 7, 0);
+        cc(&mut app, &ctx, 2, 8, 0);
+        assert_eq!(app.rig_mix[0].vol, 1.0);
+        // The Master unit's own knobs share the node and the param numbers:
+        // none of them took the binding.
+        let m = app.master_idx().unwrap();
+        assert!(app.units[m].knobs.iter().filter_map(|k| k.cc_target())
+            .all(|(p, t)| app.knob_cc_binding(master, p, t).is_none()), "no rack knob shows the mixer's binding");
+    }
+
+    #[test]
+    fn mute_solo_and_pan_learn_on_the_bus_and_on_a_source_strip() {
+        let (mut app, ctx, mut drain) = mixer_app();
+        let node = first_source(&app);
+        let strip = |c: MixControl| (node, c.param(), CcTarget::Mix);
+        let learn = |app: &mut DemoApp, dest: CcDest, cc_num: u8, value: u8| {
+            let pos = at(app, dest);
+            rclick(app, &ctx, pos);
+            assert!(app.cc_learn.is_some(), "right-click arms {dest:?}");
+            cc(app, &ctx, 1, cc_num, value);
+            assert!(app.cc_learn.is_none() && mapping(app, 1, dest).is_some_and(|m| m.cc == cc_num), "{dest:?} is bound to CC {cc_num}");
+        };
+        // Rig bus: a button that latches at 127 mutes, its release unmutes.
+        let mute = bus(&app, 0, MixControl::Mute);
+        learn(&mut app, mute, 20, 127);
+        assert!(app.rig_mix[0].mute, "the CC that completed the learn mutes the rig");
+        assert!(sent(&mut drain).iter().any(|c| matches!(c, Command::SetRigMix { rig: 0, mute: Some(true), .. })));
+        cc(&mut app, &ctx, 1, 20, 0);
+        assert!(!app.rig_mix[0].mute);
+        let solo = bus(&app, 0, MixControl::Solo);
+        learn(&mut app, solo, 21, 127);
+        assert!(app.rig_mix[0].solo && !app.rig_mix[0].mute, "solo is its own binding");
+        let pan = bus(&app, 0, MixControl::Pan);
+        learn(&mut app, pan, 22, 0);
+        assert_eq!(app.rig_mix[0].pan, -1.0);
+        cc(&mut app, &ctx, 1, 22, 64);
+        assert_eq!(app.rig_mix[0].pan, 0.0, "controller value 64 is the centre");
+        sent(&mut drain);
+
+        // Source strip: pan, mute and solo are the strip's own.
+        learn(&mut app, strip(MixControl::Pan), 30, 127);
+        assert_eq!(app.strip_row(node).pan, 1.0);
+        let cmds = sent(&mut drain);
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetStripMix { node: n, pan: Some(p), .. } if *n == node && *p == 1.0)),
+            "one catch-up SetStripMix: {cmds:?}");
+        learn(&mut app, strip(MixControl::Mute), 31, 127);
+        learn(&mut app, strip(MixControl::Solo), 32, 127);
+        let row = app.strip_row(node);
+        assert!(row.mute && row.solo);
+        sent(&mut drain);
+        cc(&mut app, &ctx, 1, 31, 0);
+        assert!(!app.strip_row(node).mute && app.strip_row(node).solo);
+        assert!(!sent(&mut drain).iter().any(|c| matches!(c, Command::SetStripMix { .. })), "a bound CC is not echoed back");
+        assert_eq!(app.rig_mix[0].pan, 0.0, "the strip's bindings leave the bus alone");
+    }
+
+    /// A source's fader is its LEVEL knob and the master fader the master's
+    /// VOLUME: one binding, shown on the strip and on the rack knob (rule 156).
+    #[test]
+    fn source_and_master_faders_learn_as_their_rack_knob() {
+        let (mut app, ctx, mut drain) = mixer_app();
+        let node = first_source(&app);
+        let unit = app.units.iter().position(|u| u.node_id == node).unwrap();
+        let level = app.units[unit].knob_index("LEVEL").unwrap();
+        let (param, target) = app.units[unit].knobs[level].cc_target().unwrap();
+        let pos = at(&app, (node, param, target));
+        rclick(&mut app, &ctx, pos);
+        let texts = cc(&mut app, &ctx, 3, 12, 32);
+        assert_eq!(app.knob_cc_binding(node, param, target), Some((SourceId::Hardware(3), 12)), "the rack knob carries the binding");
+        assert!((app.units[unit].knobs[level].display_value - 32.0 / 127.0).abs() < 1e-6, "the knob and the fader follow");
+        assert!(texts.iter().any(|t| t.ends_with("· CC 12")), "{texts:?}");
+        assert!(sent(&mut drain).iter().any(|c| matches!(c, Command::SetParam { node: n, .. } if *n == node)), "catch-up SetParam (rule 51)");
+
+        let m = app.master_idx().unwrap();
+        let vol = app.units[m].knob_index("VOLUME").unwrap();
+        let (param, target) = app.units[m].knobs[vol].cc_target().unwrap();
+        let master = app.units[m].node_id;
+        let pos = at(&app, (master, param, target));
+        rclick(&mut app, &ctx, pos);
+        cc(&mut app, &ctx, 3, 13, 127);
+        assert_eq!(app.knob_cc_binding(master, param, target), Some((SourceId::Hardware(3), 13)));
+        assert!((app.units[m].knobs[vol].display_value - 1.0).abs() < 1e-6);
+        // The bus fader on the same node is still unbound.
+        assert!(mapping(&app, 3, bus(&app, 0, MixControl::Vol)).is_none());
+    }
+
+    fn menu_buttons(ctx: &egui::Context) -> Vec<Rect> {
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("knob_midi_menu"));
+        ctx.viewport(|v| {
+            let mut btns: Vec<Rect> = v.prev_pass.widgets.get_layer(layer)
+                .filter(|w| w.sense.senses_click() && !w.sense.senses_drag() && w.sense.is_focusable())
+                .map(|w| w.rect)
+                .collect();
+            btns.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            btns
+        })
+    }
+
+    #[test]
+    fn the_menu_of_a_mixer_control_cancels_relearns_and_clears() {
+        let (mut app, ctx, _drain) = mixer_app();
+        let mute = bus(&app, 0, MixControl::Mute);
+        let pos = at(&app, mute);
+        // Armed; a second right-click opens the menu, which can cancel.
+        rclick(&mut app, &ctx, pos);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert!(app.knob_menu.is_some() && app.cc_learn.is_some(), "the second right-click opens the menu");
+        assert!(texts.iter().any(|t| t == "Cancel MIDI learn"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.ends_with("bus · Mute")), "the menu names the control: {texts:?}");
+        assert!(!texts.iter().any(|t| t == "Reset to default"), "a mixer control has no knob to reset: {texts:?}");
+        let cancel = menu_buttons(&ctx)[0].center();
+        press(&mut app, &ctx, cancel, egui::PointerButton::Primary);
+        assert!(app.cc_learn.is_none() && app.knob_menu.is_none(), "Cancel MIDI learn disarms");
+
+        // Esc cancels a learn before it leaves the mixer.
+        rclick(&mut app, &ctx, pos);
+        frame(&mut app, &ctx, vec![
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE },
+            egui::Event::Key { key: Key::Escape, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE },
+        ]);
+        assert!(app.cc_learn.is_none() && app.stage_view == StageView::Mixer, "Esc cancels the learn and stays in the mixer");
+
+        // Bound: right-click opens the menu; a switch has no range to edit.
+        rclick(&mut app, &ctx, pos);
+        cc(&mut app, &ctx, 1, 20, 127);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert!(app.knob_menu.is_some() && app.cc_learn.is_none());
+        assert!(texts.iter().any(|t| t.starts_with("CC 20")), "the menu shows the binding: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Clear MIDI map") && texts.iter().any(|t| t == "MIDI learn again"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == " %"), "a switch has no controller range: {texts:?}");
+        // A press elsewhere closes it and changes nothing.
+        press(&mut app, &ctx, Pos2::new(40.0, 600.0), egui::PointerButton::Primary);
+        assert!(app.knob_menu.is_none() && mapping(&app, 1, mute).is_some(), "a click outside closes the menu");
+        // Clear MIDI map removes the binding.
+        rclick(&mut app, &ctx, pos);
+        let clear = menu_buttons(&ctx)[1].center();
+        press(&mut app, &ctx, clear, egui::PointerButton::Primary);
+        assert!(mapping(&app, 1, mute).is_none() && app.knob_menu.is_none(), "Clear MIDI map unbinds");
+
+        // A fader's menu has the controller range, like a knob's.
+        let fader = bus(&app, 0, MixControl::Vol);
+        let pos = at(&app, fader);
+        rclick(&mut app, &ctx, pos);
+        cc(&mut app, &ctx, 1, 7, 100);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert_eq!(texts.iter().filter(|t| *t == " %").count(), 2, "the MIN and MAX range fields: {texts:?}");
+    }
+
+    /// Rule 111 for the mixer: a binding lives on the rig's Master node, so
+    /// it survives an agent edit and follows its rig through a rig delete.
+    #[test]
+    fn mixer_bindings_survive_an_agent_edit_and_follow_their_rig() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_multi_rig_demo();
+        let ctx = egui::Context::default();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let (mut ebus, edrain) = crate::control::command_bus();
+        let mut engine = crate::engine::GraphEngine::new(Graph::default(), edrain, 48000.0, vec![]);
+        let pub_ = Arc::new(Mutex::new(crate::engine::GraphPub::default()));
+        engine.set_graph_pub(pub_.clone());
+        engine.set_rig_snapshot(app.rig_snapshot.clone());
+        app.graph_pub = Some(pub_.clone());
+        // The engine plays what the app shows: load it the way the app does.
+        app.edit_rigs(None);
+        let mut pump = |app: &mut DemoApp, drain: &mut crate::control::CommandDrain, n: usize| {
+            for _ in 0..n {
+                frame(app, &ctx, vec![]);
+                drain.drain(|c| { ebus.send(c); });
+                let mut buf = vec![0.0f32; 64 * 2];
+                engine.render(&mut buf, 2);
+            }
+        };
+        pump(&mut app, &mut drain, 4);
+        assert_eq!(app.rig_count(), 3);
+        let dev = SourceId::Hardware(1);
+        let (bus_b, _, _) = bus(&app, 1, MixControl::Vol);
+        app.set_cc_binding(dev, bus_b, 7, Some(MixControl::Vol.param()), CcTarget::Mix);
+        app.set_cc_binding(dev, bus_b, 8, Some(MixControl::Mute.param()), CcTarget::Mix);
+        pump(&mut app, &mut drain, 3);
+        let bound = |app: &DemoApp, rig: usize| {
+            let dest = bus(app, rig, MixControl::Vol);
+            mapping(app, 1, dest).map(|m| m.cc) == Some(7)
+                && mapping(app, 1, (dest.0, MixControl::Mute.param(), CcTarget::Mix)).map(|m| m.cc) == Some(8)
+        };
+        assert!(bound(&app, 1));
+
+        // An agent edit: the engine publishes, the app rebuilds from it.
+        assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::AddNode {
+            kind: NodeKind::Dsp(DspKind::Delay), name: name_bytes("DELAY X"), rig: 0, wire: false }));
+        pump(&mut app, &mut drain, 4);
+        assert!(app.base_graph.nodes.iter().any(|n| n.name == name_bytes("DELAY X")), "the agent edit was adopted");
+        assert!(bound(&app, 1), "the bindings survive the agent edit");
+
+        // The hardware fader moves rig B's bus: in the engine (which the
+        // device reaches first) and in the mixer.
+        assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::Cc { source: dev, channel: 0, cc: 7, value: 32 }));
+        app.hw_cc_queue.lock().unwrap().push_back((dev, 0, 7, 32));
+        pump(&mut app, &mut drain, 2);
+        assert_eq!(app.rig_mix[1].vol, 32.0 / 127.0);
+        assert_eq!(pub_.lock().unwrap().mix[1].vol, 32.0 / 127.0, "the engine plays what the mixer shows");
+        assert_eq!(app.rig_mix[0].vol, 1.0);
+
+        // Rig A goes: rig B is now the first rig, and its bindings came along.
+        app.edit_rigs(Some(0));
+        pump(&mut app, &mut drain, 4);
+        assert_eq!(app.rig_count(), 2);
+        assert!(bound(&app, 0), "the bindings follow their rig");
+        assert!(!bound(&app, 1));
+        assert!(app.bus.as_ref().unwrap().lock().unwrap().send(Command::Cc { source: dev, channel: 0, cc: 8, value: 127 }));
+        app.hw_cc_queue.lock().unwrap().push_back((dev, 0, 8, 127));
+        pump(&mut app, &mut drain, 2);
+        assert!(app.rig_mix[0].mute && !app.rig_mix[1].mute, "the mute button still drives its own rig");
+        assert!(pub_.lock().unwrap().mix[0].mute, "in the engine too");
+    }
+
+    #[test]
+    fn mixer_bindings_survive_a_session_round_trip() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.load_demo_patch();
+        let dev = SourceId::Hardware(4);
+        let fader = bus(&app, 0, MixControl::Vol);
+        let src = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.set_cc_scaled(dev, fader.0, 7, Some(fader.1), CcTarget::Mix, crate::matrix::CcScale::range(0.0, 0.8));
+        app.set_cc_binding(dev, src, 10, Some(MixControl::Pan.param()), CcTarget::Mix);
+        let saved = app.capture_session("mixer cc").unwrap();
+        let json = serde_json::to_string(&saved.matrix()).unwrap();
+        assert!(json.contains("\"Mix\""), "the session holds the mixer bindings: {json}");
+        let mut reloaded = crate::session::Session::new("mixer cc", saved.graph.clone());
+        reloaded.set_matrix(serde_json::from_str(&json).unwrap());
+
+        let mut fresh = DemoApp::new_with_sink(None);
+        let (bus_tx, mut drain) = crate::control::command_bus();
+        fresh.bus = Some(Arc::new(Mutex::new(bus_tx)));
+        fresh.apply_session(&reloaded).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 { frame(&mut fresh, &ctx, vec![]); }
+        let fader = bus(&fresh, 0, MixControl::Vol);
+        assert_eq!(mapping(&fresh, 4, fader).map(|m| (m.cc, m.scale)), Some((7, crate::matrix::CcScale::range(0.0, 0.8))),
+            "the fader's binding and its range are restored");
+        let src = fresh.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        assert_eq!(mapping(&fresh, 4, (src, MixControl::Pan.param(), CcTarget::Mix)).map(|m| m.cc), Some(10));
+        let cmds = sent(&mut drain);
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { cc: 7, target: CcTarget::Mix, .. })),
+            "the load sends the bindings to the engine: {cmds:?}");
+        // The restored range holds: the fader's full travel ends at 80 %.
+        cc(&mut fresh, &ctx, 4, 7, 127);
+        assert!((fresh.rig_mix[0].vol - 102.0 / 127.0).abs() < 1e-6, "{}", fresh.rig_mix[0].vol);
+    }
+
+    #[test]
+    fn agent_tools_bind_learn_list_and_clear_mixer_controls() {
+        let (mut app, ctx, mut drain) = mixer_app();
+        let master = app.rig_bus_node(0).unwrap();
+        let node = first_source(&app);
+        let out = app.exec_tool("set_cc_map", &serde_json::json!({"node": master, "source": "hw:0", "cc": 7, "mix": "vol", "max": 0.5}));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|_| panic!("{out}"));
+        assert_eq!((&v["target"], &v["param"]), (&serde_json::json!("mix"), &serde_json::json!(0)), "{out}");
+        assert!(sent(&mut drain).iter().any(|c| matches!(c, Command::MatrixCcMap { cc: 7, target: CcTarget::Mix, .. })));
+        cc(&mut app, &ctx, 0, 7, 127);
+        assert!((app.rig_mix[0].vol - 64.0 / 127.0).abs() < 1e-6, "max 0.5 holds the fader at half: {}", app.rig_mix[0].vol);
+        // A source strip has no fader of its own; the answer says what to bind.
+        let refused = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "mix": "vol"}));
+        assert!(refused.contains("LEVEL") && app.rule_edits.get(&(SourceId::Hardware(0), node)).is_none(), "{refused}");
+        let bad = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "target": "mix", "param": 9}));
+        assert!(bad.contains("no mixer control"), "{bad}");
+        // learn_cc arms the same learn a right-click does.
+        let armed = app.exec_tool("learn_cc", &serde_json::json!({"node": node, "mix": "solo"}));
+        assert!(armed.contains("\"armed\":true") && armed.contains("\"mix\""), "{armed}");
+        cc(&mut app, &ctx, 0, 33, 127);
+        assert!(app.strip_row(node).solo, "the learned CC solos the source");
+        let listed = app.exec_tool("list_cc_maps", &serde_json::json!({}));
+        assert!(listed.contains("Fader (mixer)") && listed.contains("Solo (mixer)"), "{listed}");
+        let cleared = app.exec_tool("clear_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "mix": "solo"}));
+        assert!(app.rule_edits.get(&(SourceId::Hardware(0), node)).is_none(), "{cleared}");
+        assert!(mapping(&app, 0, bus(&app, 0, MixControl::Vol)).is_some(), "the bus fader keeps its binding");
+    }
+
+    /// A learned mixer at 1600x1000 and at the default window, as PNGs:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_midi_learn_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn mixer_midi_learn_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, size, learning) in [
+            ("mixer-learned", SIZE, false),
+            ("mixer-learning", SIZE, true),
+            ("mixer-learned-781", Vec2::new(781.0, 950.0), false),
+        ] {
+            // A fresh app per image (rule 148).
+            let mut app = DemoApp::new_with_sink(None);
+            app.load_multi_rig_demo();
+            app.stage_view = StageView::Mixer;
+            let dev = SourceId::Hardware(0);
+            // Rig A's bus is learned throughout; rig B's fader is learned,
+            // or waits for its controller in the "learning" image.
+            for rig in 0..2 {
+                let node = app.rig_bus_node(rig).unwrap();
+                for (c, cc) in [(MixControl::Vol, 7), (MixControl::Mute, 20)] {
+                    if learning && rig == 1 && c == MixControl::Vol { continue; }
+                    app.set_cc_binding(dev, node, cc + rig as u8, Some(c.param()), CcTarget::Mix);
+                }
+            }
+            let src = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+            app.set_cc_binding(dev, src, 10, Some(MixControl::Pan.param()), CcTarget::Mix);
+            // Where the controllers stand.
+            for (cc, value) in [(7, 96), (8, 64), (21, 127), (10, 30)] {
+                app.apply_cc_to_knobs(dev, 0, cc, value, false);
+            }
+            if learning {
+                let node = app.rig_bus_node(1).unwrap();
+                app.cc_learn = Some(CcLearn { source: SourceId::Keys, dest: node, param: MixControl::Vol.param(), target: CcTarget::Mix, replace_existing: true });
+            }
+            super::offline_shots::shot(&mut app, size, &dir.join(format!("{name}.png")));
+        }
+    }
+}
+
 #[cfg(test)]
 mod engine_info_tests {
     use super::*;

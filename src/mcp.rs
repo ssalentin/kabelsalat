@@ -485,6 +485,16 @@ struct SetRecordArmArgs {
     armed: Option<bool>,
 }
 
+/// Arguments for `set_master_target`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetMasterTargetArgs {
+    /// A named target: spotify, youtube or tidal (-14 LUFS), apple (-16),
+    /// club (-8), or off (no target).
+    target: Option<String>,
+    /// Target integrated loudness in LUFS (-36 to -6), instead of `target`.
+    lufs: Option<f64>,
+}
+
 /// Arguments for `measure_mix`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct MeasureMixArgs {
@@ -1255,6 +1265,12 @@ impl McpServer {
             .and_then(|p| p.lock().ok())
             .map(|g| serde_json::to_value(g.meter).unwrap_or_else(|_| json!(null)))
             .unwrap_or_else(|| json!(null));
+        let master_target = st
+            .graph_pub
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map(|g| g.master_target.readout(&g.meter))
+            .unwrap_or_else(|| json!(null));
         let counters = crate::engine_info::EngineCounters::load();
         ok_json(json!({
             "nodes": st.graph.nodes.len(),
@@ -1276,6 +1292,7 @@ impl McpServer {
             "rigs": rig_count,
             "active_rig": active_rig,
             "meter": meter,
+            "master_target": master_target,
         }))
     }
 
@@ -1357,6 +1374,44 @@ impl McpServer {
             .map(|g| serde_json::to_value(g.meter).unwrap_or_else(|_| json!(null)))
             .unwrap_or_else(|| json!(null));
         ok_json(meter)
+    }
+
+    /// Loudness target of the master (#12).
+    #[tool(name = "set_master_target", description = "Master the mix to a loudness: give target (spotify, youtube or tidal = -14 LUFS, apple = -16, club = -8, off = no target) or lufs (a number, -36 to -6). The engine trims the level in front of the master limiter by the difference to the integrated loudness measured so far, and holds the true peak under -1 dBTP. Sound must have played first; the result gives the loudness before and the trim. Let sound play, read the loudness after with get_master_target, and call set_master_target again with the same target to correct what is still off. Setting a target restarts measure_mix's integrated loudness.")]
+    fn set_master_target(&self, Parameters(args): Parameters<SetMasterTargetArgs>) -> Result<CallToolResult, McpError> {
+        let lufs = match crate::meter::parse_target(args.target.as_deref(), args.lufs) {
+            Ok(l) => l,
+            Err(e) => return tool_err(e),
+        };
+        let mut st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("set_master_target", json!({"target": args.target, "lufs": args.lufs}));
+        }
+        // What the engine will hold: the same `matched` on the same reading.
+        let Some((target, meter)) = st.graph_pub.as_ref().and_then(|p| p.lock().ok()).map(|g| (g.master_target, g.meter)) else {
+            return tool_err("no engine");
+        };
+        if let Err(e) = send_cmd(&mut st, Command::SetMasterTarget { lufs }) {
+            return tool_err(e);
+        }
+        let next = match lufs {
+            Some(l) => target.matched(l, meter.integrated_lufs.is_finite().then_some(meter.integrated_lufs)),
+            None => crate::meter::MasterTarget::OFF,
+        };
+        ok_json(next.readout(&crate::meter::MeterSnapshot::default()))
+    }
+
+    #[tool(name = "get_master_target", description = "Read the master's loudness target and its before/after readout: target_lufs, gain_db (the trim in front of the limiter), before_lufs (the mix without the trim), after_lufs (integrated loudness measured since the trim was set; null until sound played), true_peak_dbtp with true_peak_ok (ceiling -1 dBTP), guard_db and a status line.")]
+    fn get_master_target(&self) -> Result<CallToolResult, McpError> {
+        let st = self.state.lock().unwrap();
+        if matches!(st.backend, Backend::Remote) {
+            return Self::ui_bridge_tool("get_master_target", json!({}));
+        }
+        let readout = st.graph_pub.as_ref().and_then(|p| p.lock().ok()).map(|g| g.master_target.readout(&g.meter));
+        match readout {
+            Some(r) => ok_json(r),
+            None => tool_err("no engine"),
+        }
     }
 
     /// Add a node to the patch.
@@ -3326,6 +3381,34 @@ mod tests {
         bridge::XRUNS.store(5, Ordering::Relaxed);
         tool_json(&server.reset_engine_peaks());
         assert_eq!(tool_json(&server.get_engine_info())["xruns"], 0, "a reset zeroes the xrun count");
+    }
+
+    #[test]
+    fn headless_set_master_target_reaches_the_engine_and_reads_back() {
+        let (server, mut engine) = local_server();
+        let mut buf = vec![0.0f32; 256 * 2];
+        let mut render = |engine: &mut GraphEngine| for _ in 0..4 { engine.render(&mut buf, 2) };
+        render(&mut engine);
+        assert!(tool_json(&server.get_master_target())["target_lufs"].is_null());
+        // Nothing sounds in the demo patch: the target is stored, the answer says why nothing moved.
+        let set = tool_json(&server.set_master_target(Parameters(SetMasterTargetArgs { target: Some("apple".into()), lufs: None })));
+        assert_eq!(set["target_lufs"], -16.0);
+        assert!(set["status"].as_str().unwrap().contains("no sound was measured"), "{set}");
+        render(&mut engine);
+        assert_eq!(engine.master_target().lufs, Some(-16.0), "the engine holds it");
+        let read = tool_json(&server.get_master_target());
+        assert_eq!((read["target_lufs"].as_f64(), read["gain_db"].as_f64()), (Some(-16.0), Some(0.0)), "{read}");
+        assert_eq!(tool_json(&server.get_status())["master_target"]["target_lufs"], -16.0);
+        // A number, off, and what is refused.
+        tool_json(&server.set_master_target(Parameters(SetMasterTargetArgs { target: None, lufs: Some(-11.5) })));
+        render(&mut engine);
+        assert_eq!(engine.master_target().lufs, Some(-11.5));
+        tool_json(&server.set_master_target(Parameters(SetMasterTargetArgs { target: Some("off".into()), lufs: None })));
+        render(&mut engine);
+        assert_eq!(engine.master_target(), crate::meter::MasterTarget::OFF);
+        let bad = server.set_master_target(Parameters(SetMasterTargetArgs { target: Some("loud".into()), lufs: None }));
+        let bad = serde_json::to_value(bad.as_ref().unwrap()).unwrap();
+        assert_eq!(bad["isError"], true, "{bad}");
     }
 
     /// Local-backend server with a real (voice-less) engine the test drains

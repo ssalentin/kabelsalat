@@ -38,8 +38,9 @@ const HIST_CAP: usize = 2048;
 /// Gating-block ring capacity (2048 * 400 ms = ~13 minutes of integration).
 const GATE_CAP: usize = 2048;
 
-/// True-peak polyphase interpolator: 4 phases × 8 taps (32-tap prototype).
-const TP_TAPS: usize = 8;
+/// True-peak polyphase interpolator: 4 phases × 12 taps (the 48-tap size
+/// BS.1770 Annex 2 uses).
+const TP_TAPS: usize = 12;
 
 /// The numbers the agent reads for `measure_mix` / `get_status`. `Copy` so it
 /// moves into `GraphPub` without clone machinery. LUFS/band values are `f32`
@@ -53,8 +54,11 @@ pub struct MeterSnapshot {
     /// Gated integrated loudness since the last reset (LUFS). `NaN` until at
     /// least one gating block clears the absolute gate.
     pub integrated_lufs: f32,
-    /// True peak (dBTP, relative to full scale).
+    /// True peak of the most recent block (dBTP, relative to full scale).
     pub true_peak_db: f32,
+    /// Highest true peak since the last reset (dBTP).
+    #[serde(default = "db_floor_f32")]
+    pub true_peak_max_db: f32,
     /// Stereo correlation of the < 120 Hz band, -1..1.
     pub low_end_corr: f32,
     /// `true` = low-end is phase-compatible (mono-safe); `false` = the bass is
@@ -71,11 +75,238 @@ impl Default for MeterSnapshot {
             short_term_lufs: f32::NAN,
             integrated_lufs: f32::NAN,
             true_peak_db: DB_FLOOR as f32,
+            true_peak_max_db: DB_FLOOR as f32,
             low_end_corr: 1.0,
             low_end_mono: true,
             band_db: [DB_FLOOR as f32; 4],
         }
     }
+}
+
+fn db_floor_f32() -> f32 {
+    DB_FLOOR as f32
+}
+
+/// Named loudness targets (integrated LUFS): the one table the assistant
+/// tool, MCP and the Master's menu read. Streaming services normalize to
+/// these; "club" is a loud master for a PA.
+pub const TARGET_PRESETS: &[(&str, &str, f32)] = &[
+    ("spotify", "Spotify", -14.0),
+    ("youtube", "YouTube", -14.0),
+    ("tidal", "Tidal", -14.0),
+    ("apple", "Apple Music", -16.0),
+    ("club", "Club", -8.0),
+];
+/// Targets outside this range are clamped: below it is not a master level,
+/// above it the −1 dBTP ceiling leaves no room.
+pub const TARGET_RANGE_LUFS: (f32, f32) = (-36.0, -6.0);
+/// The pre-limiter trim a target may apply, either way (dB).
+pub const TARGET_GAIN_RANGE_DB: f32 = 24.0;
+/// The least loudness per dB of trim (LU/dB) a match still follows: a step
+/// is at most three times what is missing, and a raise that yielded less
+/// than this means the limiter has nothing more to give.
+const MIN_YIELD: f32 = 1.0 / 3.0;
+/// The true-peak ceiling a target holds (dBTP).
+pub const TRUE_PEAK_CEILING_DB: f32 = -1.0;
+/// The true-peak guard never turns the output down further than this (dB).
+pub const GUARD_FLOOR_DB: f32 = -12.0;
+
+/// The master's loudness target and what it did (#12). `Copy`, published in
+/// `GraphPub` like the meter and saved with a session.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MasterTarget {
+    /// Target integrated loudness; `None` = no target, the chain is as before.
+    pub lufs: Option<f32>,
+    /// Trim in front of the master limiter (dB).
+    pub gain_db: f32,
+    /// Integrated loudness of the mix without the trim; `None` until sound
+    /// was measured.
+    pub before_lufs: Option<f32>,
+    /// How far the true-peak guard turned the output down (dB, ≤ 0).
+    #[serde(default)]
+    pub guard_db: f32,
+    /// The trim and the loudness measured under it at the previous match:
+    /// with the current pair it tells how much of an added dB the limiter
+    /// lets through, which sizes the next step.
+    #[serde(default)]
+    pub last_point: Option<(f32, f32)>,
+    /// The last match found the limiter giving back almost nothing for more
+    /// trim: this mix is as loud as the chain lets it get, the target is out
+    /// of reach at this master VOLUME.
+    #[serde(default)]
+    pub limited: bool,
+}
+
+impl Default for MasterTarget {
+    fn default() -> Self {
+        Self::OFF
+    }
+}
+
+impl MasterTarget {
+    pub const OFF: Self = Self { lufs: None, gain_db: 0.0, before_lufs: None, guard_db: 0.0, last_point: None, limited: false };
+
+    /// The state after aiming at `lufs`, given the integrated loudness
+    /// `measured` under the current trim (`None` = no sound measured since
+    /// the trim last changed). The trim moves by what is missing, so a second
+    /// call corrects what the limiter took off the first one; "before" stays
+    /// the loudness of the untrimmed mix.
+    ///
+    /// Into the limiter a dB of trim is less than a LU of loudness (a loud
+    /// target measured 0.4 LU per dB), so a step is divided by the yield the
+    /// previous step had. Without that, "club" was still 1.3 LU short after
+    /// four matches.
+    pub fn matched(self, lufs: f32, measured: Option<f32>) -> Self {
+        let lufs = lufs.clamp(TARGET_RANGE_LUFS.0, TARGET_RANGE_LUFS.1);
+        let (gain_db, before_lufs, last_point, limited) = match (measured, self.before_lufs) {
+            (Some(m), before) => {
+                let before = before.or(Some(m - self.gain_db));
+                let here = Some((self.gain_db, m));
+                match self.step_yield(m) {
+                    // More trim would only be more limiting: stay, and keep
+                    // the earlier point so a louder mix (VOLUME up) is seen.
+                    Some(y) if y < MIN_YIELD && lufs > m + 0.5 => (self.gain_db, before, self.last_point, true),
+                    y => {
+                        let lu_per_db = y.unwrap_or(1.0).clamp(MIN_YIELD, 1.0);
+                        (self.gain_db + (lufs - m) / lu_per_db, before, here, false)
+                    }
+                }
+            }
+            (None, Some(before)) => (lufs - before, Some(before), None, false),
+            (None, None) => (0.0, None, None, false),
+        };
+        Self {
+            lufs: Some(lufs),
+            gain_db: gain_db.clamp(-TARGET_GAIN_RANGE_DB, TARGET_GAIN_RANGE_DB),
+            before_lufs,
+            // The guard stays: it is part of what was measured, so the trim
+            // makes up for it and repeated matches converge.
+            guard_db: self.guard_db,
+            last_point,
+            limited,
+        }
+    }
+
+    /// Loudness gained per dB of trim since the previous match (LU/dB), with
+    /// `m` measured under the current trim. `None` when the trim was not
+    /// raised by at least 1 dB since, or when the loudness FELL although the
+    /// trim rose: then the playing changed, and that says nothing about the
+    /// limiter.
+    fn step_yield(&self, m: f32) -> Option<f32> {
+        let (gain, loudness) = self.last_point?;
+        let step = self.gain_db - gain;
+        if step < 1.0 || m < loudness - 0.5 {
+            return None;
+        }
+        Some((m - loudness) / step)
+    }
+
+    /// The trim cannot go further up and the target is still not reached:
+    /// the limiter and the master volume cap this mix below it.
+    pub fn at_limit(&self) -> bool {
+        self.limited || self.gain_db >= TARGET_GAIN_RANGE_DB
+    }
+
+    /// Linear factors of the trim (before the limiter) and the guard (after
+    /// the chain).
+    pub fn gains(&self) -> (f32, f32) {
+        (db_amp(self.gain_db), db_amp(self.guard_db))
+    }
+
+    /// The preset names that mean this target ("spotify/youtube/tidal").
+    pub fn preset_names(&self) -> Option<String> {
+        let lufs = self.lufs?;
+        let names: Vec<&str> = TARGET_PRESETS.iter().filter(|p| p.2 == lufs).map(|p| p.0).collect();
+        (!names.is_empty()).then(|| names.join("/"))
+    }
+
+    /// The before/after readout every frontend shows (tool results,
+    /// `get_status`, the Master's menu): the target, the trim, the loudness
+    /// before, and what `meter` measured since the trim was set.
+    pub fn readout(&self, meter: &MeterSnapshot) -> serde_json::Value {
+        // Rounded as f64: an f32 tenth prints as -14.199999809.
+        let round = |v: f32| (v as f64 * 10.0).round() / 10.0;
+        let Some(lufs) = self.lufs else {
+            return serde_json::json!({
+                "target_lufs": null,
+                "status": "no loudness target: the master chain is unchanged",
+                "presets": preset_list(),
+            });
+        };
+        let after = meter.integrated_lufs.is_finite().then_some(meter.integrated_lufs);
+        let tp = (meter.true_peak_max_db > DB_FLOOR as f32).then_some(meter.true_peak_max_db);
+        let status = match (self.before_lufs, after) {
+            (None, _) => format!(
+                "target {lufs:.1} LUFS is stored, but no sound was measured yet: play, then set the target again"
+            ),
+            (Some(b), None) => format!(
+                "trim {:+.1} dB set from {b:.1} LUFS; play to measure the result, then read it with get_master_target",
+                self.gain_db
+            ),
+            (Some(b), Some(a)) if (a - lufs).abs() <= 0.5 => format!("on target: {b:.1} LUFS before, {a:.1} LUFS now"),
+            (Some(b), Some(a)) if self.at_limit() && a < lufs => format!(
+                "{b:.1} LUFS before, {a:.1} LUFS now: this mix does not get louder than that under the master limiter at the current master VOLUME; more trim would only add distortion. Raise the Master's VOLUME, then set the target again"
+            ),
+            (Some(b), Some(a)) => format!(
+                "{b:.1} LUFS before, {a:.1} LUFS now, {:+.1} LU off the target: set the target again to refine",
+                a - lufs
+            ),
+        };
+        serde_json::json!({
+            "target_lufs": lufs,
+            "preset": self.preset_names(),
+            "gain_db": round(self.gain_db),
+            "before_lufs": self.before_lufs.map(round),
+            "after_lufs": after.map(round),
+            "true_peak_dbtp": tp.map(round),
+            "true_peak_ceiling_dbtp": TRUE_PEAK_CEILING_DB,
+            "true_peak_ok": tp.map(|t| t <= TRUE_PEAK_CEILING_DB + 0.05),
+            "guard_db": round(self.guard_db),
+            "status": status,
+        })
+    }
+}
+
+fn preset_list() -> String {
+    let mut out: Vec<String> = TARGET_PRESETS.iter().map(|p| format!("{} {}", p.0, p.2)).collect();
+    out.push("or lufs=<number>".into());
+    out.join(", ")
+}
+
+/// What a `set_master_target` call asks for: a preset name, "off", or a
+/// number. `Ok(None)` = turn the target off.
+pub fn parse_target(preset: Option<&str>, lufs: Option<f64>) -> Result<Option<f32>, String> {
+    if let Some(l) = lufs {
+        if !l.is_finite() {
+            return Err("lufs must be a number".into());
+        }
+        let (lo, hi) = TARGET_RANGE_LUFS;
+        if (l as f32) < lo || (l as f32) > hi {
+            return Err(format!("lufs {l} is outside {lo}..{hi} LUFS"));
+        }
+        return Ok(Some(l as f32));
+    }
+    let Some(name) = preset else {
+        return Err(format!("give target (a preset or off) or lufs: {}", preset_list()));
+    };
+    let name = name.trim().to_lowercase();
+    if matches!(name.as_str(), "off" | "none" | "") {
+        return Ok(None);
+    }
+    if let Some(p) = TARGET_PRESETS.iter().find(|p| name == p.0 || name == p.1.to_lowercase()) {
+        return Ok(Some(p.2));
+    }
+    // A model may send the number as text ("-14", "-14 LUFS").
+    if let Ok(l) = name.trim_end_matches("lufs").trim().replace('\u{2212}', "-").parse::<f64>() {
+        return parse_target(None, Some(l));
+    }
+    Err(format!("unknown target '{name}': {}", preset_list()))
+}
+
+/// Linear amplitude of a dB value.
+#[inline]
+pub fn db_amp(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
 }
 
 /// A normalized biquad (a0 = 1), coefficients `[b0, b1, b2, a1, a2]`.
@@ -213,22 +444,28 @@ struct TruePeak {
 
 impl TruePeak {
     fn new() -> Self {
-        // 32-tap prototype, low-pass at 0.25 of the 4x Nyquist, Hann window.
-        // Interpolation gain ×4 keeps full-scale amplitude.
-        let total = TP_TAPS * 4;
-        let center = (total as f64 - 1.0) / 2.0;
-        let fc = 0.25;
-        let mut h = [0.0f64; 32];
+        // Windowed-sinc prototype at the 4x rate with its cutoff at the
+        // ORIGINAL Nyquist (sinc(d / 4)), split into 4 phases. Each phase is
+        // normalized to unity gain, so a tone reads its own amplitude. The
+        // first version used sinc(d): no interpolator at all, a half-scale
+        // sine read 0.62.
+        const TOTAL: usize = TP_TAPS * 4;
+        let center = (TOTAL as f64 - 1.0) / 2.0;
+        let mut h = [0.0f64; TOTAL];
         for (k, slot) in h.iter_mut().enumerate() {
-            let d = k as f64 - center;
-            let sinc = if d == 0.0 { 1.0 } else { (PI * d).sin() / (PI * d) };
-            let win = 0.5 - 0.5 * (2.0 * PI * k as f64 / total as f64).cos();
-            *slot = 4.0 * 2.0 * fc * sinc * win;
+            let x = PI * (k as f64 - center) / 4.0;
+            let sinc = if x == 0.0 { 1.0 } else { x.sin() / x };
+            let win = 0.5 - 0.5 * (2.0 * PI * k as f64 / (TOTAL as f64 - 1.0)).cos();
+            *slot = sinc * win;
         }
         let mut phase = [[0.0f64; TP_TAPS]; 4];
-        for p in 0..4 {
-            for t in 0..TP_TAPS {
-                phase[p][t] = h[p + 4 * t];
+        for (p, taps) in phase.iter_mut().enumerate() {
+            for (t, tap) in taps.iter_mut().enumerate() {
+                *tap = h[p + 4 * t];
+            }
+            let sum: f64 = taps.iter().sum();
+            for tap in taps.iter_mut() {
+                *tap /= sum;
             }
         }
         Self {
@@ -295,7 +532,8 @@ pub struct MasterMeter {
     hist: Box<[BlockStat; HIST_CAP]>,
     hist_head: usize,
     hist_len: usize,
-    // Gating-block ring (integrated loudness).
+    // Gating-block ring (integrated loudness): each 400 ms block's summed
+    // K-weighted mean square. BS.1770 averages energy, never dB values.
     gate: Box<[f64; GATE_CAP]>,
     gate_head: usize,
     gate_len: usize,
@@ -306,6 +544,8 @@ pub struct MasterMeter {
     true_peak: TruePeak,
     /// Most recent block's oversampled (true) peak, held for `snapshot()`.
     true_peak_block: f64,
+    /// Highest block peak since the last reset.
+    true_peak_max: f64,
 }
 
 impl MasterMeter {
@@ -329,7 +569,7 @@ impl MasterMeter {
             hist: Box::new([BlockStat::ZERO; HIST_CAP]),
             hist_head: 0,
             hist_len: 0,
-            gate: Box::new([-1.0e6; GATE_CAP]),
+            gate: Box::new([0.0; GATE_CAP]),
             gate_head: 0,
             gate_len: 0,
             gate_acc_l: 0.0,
@@ -337,6 +577,7 @@ impl MasterMeter {
             gate_acc_n: 0,
             true_peak: TruePeak::new(),
             true_peak_block: 0.0,
+            true_peak_max: 0.0,
         }
     }
 
@@ -373,6 +614,7 @@ impl MasterMeter {
         }
         self.push_block(acc);
         self.true_peak_block = self.true_peak.take();
+        self.true_peak_max = self.true_peak_max.max(self.true_peak_block);
         // Feed the gating accumulator; close a 400 ms block when full.
         self.gate_acc_l += acc.k_l;
         self.gate_acc_r += acc.k_r;
@@ -380,8 +622,7 @@ impl MasterMeter {
         let gate_samples = (GATE_SECS * self.sample_rate) as u32;
         if self.gate_acc_n >= gate_samples {
             let n = self.gate_acc_n as f64;
-            let lufs = loudness_2ch(self.gate_acc_l / n, self.gate_acc_r / n);
-            self.push_gate(lufs);
+            self.push_gate((self.gate_acc_l + self.gate_acc_r) / n);
             self.gate_acc_l = 0.0;
             self.gate_acc_r = 0.0;
             self.gate_acc_n = 0;
@@ -401,7 +642,7 @@ impl MasterMeter {
         self.gate_acc_n += acc.n;
         let gate_samples = (GATE_SECS * self.sample_rate) as u32;
         if self.gate_acc_n >= gate_samples {
-            self.push_gate(loudness_2ch(0.0, 0.0));
+            self.push_gate((self.gate_acc_l + self.gate_acc_r) / self.gate_acc_n as f64);
             self.gate_acc_l = 0.0;
             self.gate_acc_r = 0.0;
             self.gate_acc_n = 0;
@@ -417,8 +658,8 @@ impl MasterMeter {
         }
     }
 
-    fn push_gate(&mut self, lufs: f64) {
-        self.gate[self.gate_head] = lufs;
+    fn push_gate(&mut self, energy: f64) {
+        self.gate[self.gate_head] = energy;
         self.gate_head = (self.gate_head + 1) % GATE_CAP;
         if self.gate_len < GATE_CAP {
             self.gate_len += 1;
@@ -445,37 +686,40 @@ impl MasterMeter {
         loudness_2ch(k_l / n.max(1) as f64, k_r / n.max(1) as f64)
     }
 
-    /// Gated integrated loudness (NaN = not enough above-gate data).
+    /// Gated integrated loudness (NaN = not enough above-gate data): the
+    /// mean ENERGY of the gating blocks above the absolute gate and above
+    /// the relative gate (10 LU under their mean), as BS.1770 defines it.
+    /// Averaging the blocks' LUFS values instead read dynamic material low
+    /// (a loud and a 10 LU quieter block: −5.0 instead of −2.6 LU re loud).
     pub fn integrated_lufs(&self) -> f64 {
-        let mut sum = 0.0f64;
-        let mut n = 0usize;
-        for step in 0..self.gate_len {
-            let idx = (self.gate_head + GATE_CAP - 1 - step) % GATE_CAP;
-            let l = self.gate[idx];
-            if l > ABS_GATE_LU {
-                sum += l;
-                n += 1;
+        let abs_gate = 10f64.powf((ABS_GATE_LU - LUFS_OFFSET) / 10.0);
+        let blocks = &self.gate[..self.gate_len];
+        let mean_above = |floor: f64| {
+            let (mut sum, mut n) = (0.0f64, 0usize);
+            for &z in blocks {
+                if z > abs_gate && z > floor {
+                    sum += z;
+                    n += 1;
+                }
             }
+            (n > 0).then(|| sum / n as f64)
+        };
+        let Some(ungated) = mean_above(0.0) else { return f64::NAN };
+        let rel_gate = ungated * 10f64.powf(REL_GATE_LU / 10.0);
+        match mean_above(rel_gate) {
+            Some(z) => LUFS_OFFSET + 10.0 * z.log10(),
+            None => f64::NAN,
         }
-        if n == 0 {
-            return f64::NAN;
-        }
-        let rel = sum / n as f64 + REL_GATE_LU;
-        let mut gsum = 0.0f64;
-        let mut gn = 0usize;
-        for step in 0..self.gate_len {
-            let idx = (self.gate_head + GATE_CAP - 1 - step) % GATE_CAP;
-            let l = self.gate[idx];
-            if l > ABS_GATE_LU && l > rel {
-                gsum += l;
-                gn += 1;
-            }
-        }
-        if gn == 0 {
-            f64::NAN
-        } else {
-            gsum / gn as f64
-        }
+    }
+
+    /// Seconds of gating blocks the integrated loudness currently rests on.
+    pub fn integrated_secs(&self) -> f64 {
+        self.gate_len as f64 * GATE_SECS
+    }
+
+    /// The most recent block's true peak as a linear amplitude.
+    pub fn block_true_peak(&self) -> f64 {
+        self.true_peak_block
     }
 
     /// Low-end (< 120 Hz) stereo correlation from a short trailing window.
@@ -540,7 +784,8 @@ impl MasterMeter {
             momentary_lufs: self.window_lufs(MOMENTARY_SECS) as f32,
             short_term_lufs: self.window_lufs(SHORT_TERM_SECS) as f32,
             integrated_lufs: self.integrated_lufs() as f32,
-            true_peak_db: to_db(self.true_peak_block) as f32,
+            true_peak_db: amp_db(self.true_peak_block) as f32,
+            true_peak_max_db: amp_db(self.true_peak_max) as f32,
             low_end_corr: corr as f32,
             low_end_mono: mono,
             band_db: [
@@ -553,6 +798,7 @@ impl MasterMeter {
     }
 
     /// Restart integration (clear all windows/gates/state) — `ResetMeter`.
+    /// Runs on the audio thread: clears in place, never allocates.
     pub fn reset(&mut self) {
         self.k_l_shelf.clear();
         self.k_l_hp.clear();
@@ -565,10 +811,10 @@ impl MasterMeter {
         self.band2_hp.clear();
         self.band2_lp.clear();
         self.band3_hp.clear();
-        self.hist = Box::new([BlockStat::ZERO; HIST_CAP]);
+        self.hist.fill(BlockStat::ZERO);
         self.hist_head = 0;
         self.hist_len = 0;
-        self.gate = Box::new([-1.0e6; GATE_CAP]);
+        self.gate.fill(0.0);
         self.gate_head = 0;
         self.gate_len = 0;
         self.gate_acc_l = 0.0;
@@ -576,6 +822,7 @@ impl MasterMeter {
         self.gate_acc_n = 0;
         self.true_peak.clear();
         self.true_peak_block = 0.0;
+        self.true_peak_max = 0.0;
     }
 }
 
@@ -587,6 +834,16 @@ fn loudness_2ch(ms_l: f64, ms_r: f64) -> f64 {
         return DB_FLOOR;
     }
     LUFS_OFFSET + 10.0 * sum.log10()
+}
+
+/// dB of a linear AMPLITUDE (a peak): 20·log10. `to_db` is for mean squares.
+#[inline]
+fn amp_db(x: f64) -> f64 {
+    if x <= 1e-6 {
+        DB_FLOOR
+    } else {
+        20.0 * x.log10()
+    }
 }
 
 #[inline]
@@ -727,6 +984,112 @@ mod tests {
         let snap = out_phase.snapshot();
         assert!(!snap.low_end_mono, "out-of-phase bass must be flagged");
         assert!(snap.low_end_corr < -0.5, "corr {:?} should be strongly negative", snap.low_end_corr);
+    }
+
+    #[test]
+    fn integrated_loudness_averages_energy_not_db() {
+        // 2 s at −20 LUFS, then 2 s at −30: the mean energy is
+        // 10·log10((1 + 0.1) / 2) = −2.6 LU under the loud half. Averaging
+        // the blocks' dB values read −25.
+        let mut met = MasterMeter::new(SR);
+        feed_many(&mut met, &sine(997.0, 0.1, (SR * 2.0) as usize, 0.0), 2);
+        feed_many(&mut met, &sine(997.0, 0.1 * 10f64.powf(-0.5), (SR * 2.0) as usize, 0.0), 2);
+        let i = met.integrated_lufs();
+        assert!((i + 22.6).abs() < 0.3, "integrated {i} != -22.6");
+    }
+
+    #[test]
+    fn true_peak_of_a_half_scale_sine_reads_minus_6_dbtp() {
+        // A peak is an amplitude: 20·log10. It was 10·log10 (−3 for 0.5).
+        let mut met = MasterMeter::new(SR);
+        feed_many(&mut met, &sine(997.0, 0.5, (SR * 0.5) as usize, 0.0), 2);
+        let snap = met.snapshot();
+        assert!((snap.true_peak_db + 6.02).abs() < 0.2, "block true peak {}", snap.true_peak_db);
+        assert!((snap.true_peak_max_db + 6.02).abs() < 0.2, "held true peak {}", snap.true_peak_max_db);
+        // The hold keeps the highest peak through a quieter passage.
+        feed_many(&mut met, &sine(997.0, 0.05, (SR * 0.5) as usize, 0.0), 2);
+        let snap = met.snapshot();
+        assert!(snap.true_peak_db < -20.0 && (snap.true_peak_max_db + 6.02).abs() < 0.2, "{snap:?}");
+        met.reset();
+        assert!(met.snapshot().true_peak_max_db <= -119.0, "reset clears the hold");
+    }
+
+    #[test]
+    fn a_target_trims_by_what_is_missing_and_keeps_the_before() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        // First aim: the whole difference, and "before" is what was measured.
+        let t = MasterTarget::OFF.matched(-14.0, Some(-20.0));
+        assert_eq!((t.lufs, t.gain_db, t.before_lufs), (Some(-14.0), 6.0, Some(-20.0)));
+        // The limiter let 4 of the 6 dB through: the 2 LU still missing take
+        // 3 dB at that yield. "Before" stays the untrimmed mix.
+        let t2 = t.matched(-14.0, Some(-16.0));
+        assert!(near(t2.gain_db, 9.0) && t2.before_lufs == Some(-20.0), "{t2:?}");
+        // On target: nothing moves.
+        let t3 = t2.matched(-14.0, Some(-14.0));
+        assert!(near(t3.gain_db, 9.0), "{t3:?}");
+        // 6 dB of trim made it 1 LU louder: the limiter is the ceiling. No
+        // more trim, and the readout says why.
+        let stuck = t.matched(-14.0, Some(-19.0));
+        assert!(near(stuck.gain_db, 6.0) && stuck.limited && stuck.at_limit(), "{stuck:?}");
+        let mut m = MeterSnapshot::default();
+        m.integrated_lufs = -19.0;
+        assert!(stuck.readout(&m)["status"].as_str().unwrap().contains("Raise the Master's VOLUME"), "{}", stuck.readout(&m));
+        // The player turned the master up: the same match moves again.
+        let freed = stuck.matched(-14.0, Some(-16.0));
+        assert!(!freed.limited && near(freed.gain_db, 6.0 + 2.0 / (4.0 / 6.0)), "{freed:?}");
+        // Softer playing after a raise is no verdict on the limiter: a plain step.
+        let softer = t.matched(-14.0, Some(-24.0));
+        assert!(!softer.limited && near(softer.gain_db, 16.0), "{softer:?}");
+        // Coming down needs no yield: the limiter lets go at once or not, the
+        // step stays bounded.
+        let down = t2.matched(-20.0, Some(-14.0));
+        assert!(down.gain_db < t2.gain_db && down.gain_db >= t2.gain_db - 18.0, "{down:?}");
+        // A new target with nothing played since: from the known "before".
+        let t4 = t2.matched(-16.0, None);
+        assert_eq!((t4.lufs, t4.gain_db, t4.before_lufs), (Some(-16.0), 4.0, Some(-20.0)));
+        // No sound at all yet: the target is stored, the chain untouched.
+        let waiting = MasterTarget::OFF.matched(-14.0, None);
+        assert_eq!((waiting.gain_db, waiting.before_lufs), (0.0, None));
+        assert_eq!(waiting.gains(), (1.0, 1.0), "a trim of 0 dB is exactly unity");
+        // The trim and the target are bounded.
+        assert_eq!(MasterTarget::OFF.matched(-14.0, Some(-60.0)).gain_db, TARGET_GAIN_RANGE_DB);
+        assert_eq!(MasterTarget::OFF.matched(0.0, Some(-20.0)).lufs, Some(TARGET_RANGE_LUFS.1));
+    }
+
+    #[test]
+    fn targets_parse_from_presets_numbers_and_off() {
+        assert_eq!(parse_target(Some("spotify"), None), Ok(Some(-14.0)));
+        assert_eq!(parse_target(Some("YouTube"), None), Ok(Some(-14.0)));
+        assert_eq!(parse_target(Some("Apple Music"), None), Ok(Some(-16.0)));
+        assert_eq!(parse_target(Some("club"), None), Ok(Some(-8.0)));
+        assert_eq!(parse_target(Some("off"), None), Ok(None));
+        assert_eq!(parse_target(None, Some(-12.5)), Ok(Some(-12.5)));
+        assert_eq!(parse_target(Some("-14 LUFS"), None), Ok(Some(-14.0)));
+        assert_eq!(parse_target(Some("\u{2212}9"), None), Ok(Some(-9.0)));
+        assert!(parse_target(None, Some(3.0)).unwrap_err().contains("outside"));
+        assert!(parse_target(Some("loud"), None).unwrap_err().contains("spotify"));
+        assert!(parse_target(None, None).is_err());
+    }
+
+    #[test]
+    fn the_readout_names_before_after_and_the_true_peak() {
+        let t = MasterTarget::OFF.matched(-14.0, Some(-20.5));
+        let mut m = MeterSnapshot::default();
+        let waiting = t.readout(&m);
+        assert_eq!(waiting["before_lufs"], -20.5);
+        assert!(waiting["after_lufs"].is_null() && waiting["true_peak_ok"].is_null(), "{waiting}");
+        assert_eq!(waiting["preset"], "spotify/youtube/tidal");
+        m.integrated_lufs = -14.2;
+        m.true_peak_max_db = -1.3;
+        let done = t.readout(&m);
+        assert_eq!((done["after_lufs"].as_f64(), done["true_peak_ok"].as_bool()), (Some(-14.2), Some(true)), "{done}");
+        assert!(done["status"].as_str().unwrap().starts_with("on target"), "{done}");
+        m.integrated_lufs = -15.6;
+        m.true_peak_max_db = -0.2;
+        let off = t.readout(&m);
+        assert_eq!(off["true_peak_ok"], false);
+        assert!(off["status"].as_str().unwrap().contains("set the target again"), "{off}");
+        assert!(MasterTarget::OFF.readout(&m)["target_lufs"].is_null());
     }
 
     #[test]

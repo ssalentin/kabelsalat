@@ -23,7 +23,7 @@ use crate::dsp::{build_processor, Processor};
 use crate::host::ClapVoice;
 use crate::matrix::{CcMapping, CcTarget, Matrix, MidiMsg, Rule, SourceId};
 use crate::capture::SystemCapture;
-use crate::meter::{MasterMeter, MeterSnapshot};
+use crate::meter::{MasterMeter, MasterTarget, MeterSnapshot};
 use crate::player::{read_frame, PlayerCfg, PlayerData};
 use crate::record::RecorderTap;
 use crate::transport::{CountInConfig, MasterClock, Transport};
@@ -837,6 +837,7 @@ impl Default for GraphPub {
             player_rev: 0,
             meter: MeterSnapshot::default(),
             meter_rev: 0,
+            master_target: MasterTarget::OFF,
         }
     }
 }
@@ -954,6 +955,9 @@ pub struct GraphPub {
     /// `meter_rev` every render block via a non-blocking `try_lock` (rule 33).
     pub meter: MeterSnapshot,
     pub meter_rev: u64,
+    /// The master's loudness target and its trim (#12), published with the
+    /// meter (same `meter_rev`).
+    pub master_target: MasterTarget,
 }
 
 fn write_voices(g: &mut GraphPub, voices: &[VoiceSlot]) {
@@ -1043,6 +1047,8 @@ pub struct GraphEngine {
     /// Master bus limiter (zero latency) in front of the warmth stage: many
     /// voices at once drove `tanh` into hard, buzzing saturation.
     master_lim: MasterLimiter,
+    /// The loudness target the trim and guard in `master_lim` come from.
+    master_target: MasterTarget,
     /// Organ (setBfree) knob values that arrived before the node's LV2
     /// instance was live (it loads on its own thread, rule 46); replayed by
     /// `attach_lv2`. Fixed size: no allocation on the audio thread.
@@ -1254,6 +1260,7 @@ impl GraphEngine {
             master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
+            master_target: MasterTarget::OFF,
             organ_pending: [None; 8],
             lv2_pending: [None; 8],
             transport: Transport::stopped(96.0),
@@ -1966,6 +1973,8 @@ impl GraphEngine {
     /// master from the stems with it, sample for sample.
     pub fn master_chain_from_silence(&self, sum: &[f32]) -> Vec<f32> {
         let mut lim = MasterLimiter::new(self.sample_rate);
+        let (pre, post) = self.master_target.gains();
+        lim.snap_trim(pre, post);
         let drive = 1.0 + self.master_warm * 3.0;
         let mut out = Vec::with_capacity(sum.len());
         for f in sum.chunks_exact(2) {
@@ -2085,7 +2094,45 @@ impl GraphEngine {
         let Some(p) = &self.graph_pub else { return };
         if let Ok(mut g) = p.try_lock() {
             g.meter = self.meter.snapshot();
+            g.master_target = self.master_target;
             g.meter_rev = g.meter_rev.wrapping_add(1);
+        }
+    }
+
+    /// The master's loudness target as the engine holds it (self-tests).
+    pub fn master_target(&self) -> MasterTarget {
+        self.master_target
+    }
+
+    /// Take over a loudness target: its trim and guard reach the limiter
+    /// (slewed there, no click) and the meter starts over, so the integrated
+    /// loudness and the peak hold read what this setting does.
+    fn apply_master_target(&mut self, target: MasterTarget) {
+        self.master_target = target;
+        let (pre, post) = target.gains();
+        self.master_lim.set_trim(pre, post);
+        self.meter.reset();
+        self.publish_meter();
+    }
+
+    /// Hold the true peak under the target's ceiling: when the block just
+    /// metered went over, turn the output down by the excess. It acts after
+    /// the over was heard once (no lookahead on the master, rule 49) and
+    /// only ever turns down; a new target starts it again from 0 dB.
+    fn guard_true_peak(&mut self, post_at_block_start: f32) {
+        use crate::meter::{db_amp, GUARD_FLOOR_DB, TRUE_PEAK_CEILING_DB};
+        if self.master_target.lufs.is_none() { return; }
+        let tp = self.meter.block_true_peak() as f32;
+        if tp <= db_amp(TRUE_PEAK_CEILING_DB) { return; }
+        // The guard still slews towards an earlier correction: judge the
+        // peak as it was before any guard gain, by the gain the block began
+        // with (the highest of the block, so this never over-corrects).
+        let unguarded = tp / post_at_block_start.max(1e-3);
+        let need = (db_amp(TRUE_PEAK_CEILING_DB - 0.1) / unguarded).max(db_amp(GUARD_FLOOR_DB));
+        let (pre, post) = self.master_target.gains();
+        if need < post {
+            self.master_target.guard_db = 20.0 * need.log10();
+            self.master_lim.set_trim(pre, need);
         }
     }
 
@@ -3769,6 +3816,21 @@ impl GraphEngine {
                 self.meter.reset();
                 self.publish_meter();
             }
+            Command::SetMasterTarget { lufs: None } => {
+                if self.master_target != MasterTarget::OFF {
+                    self.apply_master_target(MasterTarget::OFF);
+                }
+            }
+            Command::SetMasterTarget { lufs: Some(lufs) } => {
+                let measured = self.meter.integrated_lufs();
+                let measured = measured.is_finite().then_some(measured as f32);
+                self.apply_master_target(self.master_target.matched(lufs, measured));
+            }
+            Command::RestoreMasterTarget { target } => {
+                if self.master_target != target {
+                    self.apply_master_target(target);
+                }
+            }
         }
     }
 
@@ -4438,6 +4500,7 @@ impl GraphEngine {
             let drive = 1.0 + self.master_warm * 3.0;
             let vol = self.master_vol;
             let lim = &mut self.master_lim;
+            let post_at_block_start = lim.post;
             for (i, frame) in data.chunks_mut(ch).enumerate() {
                 let (l, r) = lim.process(acc[i * 2], acc[i * 2 + 1], drive, vol);
                 peak = peak.max(l.abs()).max(r.abs());
@@ -4460,6 +4523,7 @@ impl GraphEngine {
             // Meter tap: loudness/true-peak/bands (Bravo 1) on the same final
             // output the user hears.
             self.meter.process(data, ch);
+            self.guard_true_peak(post_at_block_start);
         } else {
             // No master wired: the output is silent. Keep the loudness windows
             // honest (they must decay, not hold stale energy).
@@ -4512,6 +4576,14 @@ struct MasterLimiter {
     dc_pole: f32,
     /// `makeup(DRIVE_REF)`, constant.
     makeup_ref: f32,
+    /// Loudness-target trim in front of the limiter and true-peak guard
+    /// after the knee (#12): the gain in use and the one it slews to. Both
+    /// are exactly 1.0 without a target, which leaves every sample as it was.
+    pre: f32,
+    pre_to: f32,
+    post: f32,
+    post_to: f32,
+    trim_slew: f32,
 }
 
 impl MasterLimiter {
@@ -4558,7 +4630,34 @@ impl MasterLimiter {
             dc: [(0.0, 0.0); 2],
             dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
             makeup_ref: Self::makeup(Self::DRIVE_REF),
+            pre: 1.0, pre_to: 1.0, post: 1.0, post_to: 1.0,
+            trim_slew: 1.0 - coef(Self::TRIM_SLEW_SECS),
         }
+    }
+
+    /// Time constant of a trim change: long enough not to click, short
+    /// enough that the guard catches the next peak.
+    const TRIM_SLEW_SECS: f64 = 0.005;
+
+    /// Aim the trim (before the limiter) and the guard (after the knee).
+    fn set_trim(&mut self, pre: f32, post: f32) {
+        self.pre_to = pre;
+        self.post_to = post;
+    }
+
+    /// Start with the trim already in place (an offline rebuild of the chain).
+    fn snap_trim(&mut self, pre: f32, post: f32) {
+        self.set_trim(pre, post);
+        self.pre = pre;
+        self.post = post;
+    }
+
+    /// One slew step; lands exactly on `to`, so a settled trim costs nothing
+    /// and a trim of 1.0 is the identity.
+    #[inline]
+    fn slew(cur: f32, to: f32, k: f32) -> f32 {
+        let next = cur + (to - cur) * k;
+        if (next - to).abs() < 1e-5 { to } else { next }
     }
 
     /// Corner of the master's DC blocker: far below any note (the lowest
@@ -4578,8 +4677,10 @@ impl MasterLimiter {
         y
     }
 
-    /// The whole master chain for one stereo frame: DC blocker → limiter → `tanh(drive)`
-    /// warmth → loudness match → volume → knee. WARM colours, it does not
+    /// The whole master chain for one stereo frame: DC blocker → target trim
+    /// → limiter → `tanh(drive)` warmth → loudness match → volume → knee →
+    /// true-peak guard. The trim sits before the limiter (rule 49): a target
+    /// that asks for more level is limited, never clipped. WARM colours, it does not
     /// turn up: below the ceiling `tanh` is almost linear, so a make-up that
     /// only pins the full-scale peak (`makeup(drive)`) left quiet playing
     /// +7.7 dB louder at WARM 100 % than at 0 %. The output is held at the
@@ -4588,6 +4689,9 @@ impl MasterLimiter {
     #[inline]
     fn process(&mut self, l: f32, r: f32, drive: f32, vol: f32) -> (f32, f32) {
         let (l, r) = (self.block_dc(0, l), self.block_dc(1, r));
+        if self.pre != self.pre_to { self.pre = Self::slew(self.pre, self.pre_to, self.trim_slew); }
+        if self.post != self.post_to { self.post = Self::slew(self.post, self.post_to, self.trim_slew); }
+        let (l, r) = (l * self.pre, r * self.pre);
         let g = self.gain_for(l, r);
         let (l, r) = (l * g, r * g);
         let (yl, yr) = ((l * drive).tanh(), (r * drive).tanh());
@@ -4605,7 +4709,7 @@ impl MasterLimiter {
         // note's first samples; the floor only keeps silence finite.
         let auto = ((self.ms_ref + 1e-12) / (self.ms_cur + 1e-12)).sqrt();
         let k = auto * vol;
-        (Self::knee(yl * k), Self::knee(yr * k))
+        (Self::knee(yl * k) * self.post, Self::knee(yr * k) * self.post)
     }
 
     fn gain_for(&mut self, l: f32, r: f32) -> f32 {
@@ -4673,6 +4777,136 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
+
+#[cfg(test)]
+mod master_target_tests {
+    use super::{GraphEngine, GraphPub, MasterLimiter};
+    use crate::control::{command_bus, name_bytes, Command, DspKind, Graph, NodeKind, PortKind, PortRef};
+    use crate::meter::MasterTarget;
+
+    fn sine(i: usize, amp: f32) -> f32 {
+        (i as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() * amp
+    }
+
+    #[test]
+    fn the_trim_sits_before_the_limiter_and_comes_in_without_a_step() {
+        let (mut plain, mut trimmed) = (MasterLimiter::new(48000.0), MasterLimiter::new(48000.0));
+        trimmed.set_trim(2.0, 1.0);
+        let (mut sum_plain, mut sum_trim) = (0.0f64, 0.0f64);
+        for i in 0..48000 {
+            let x = sine(i, 0.05);
+            let (a, _) = plain.process(x, x, MasterLimiter::DRIVE_REF, 1.0);
+            let (b, _) = trimmed.process(x, x, MasterLimiter::DRIVE_REF, 1.0);
+            if i < 4 { assert!((a - b).abs() < 1e-3, "the trim slews in, no step at sample {i}: {a} vs {b}"); }
+            if i >= 24000 {
+                sum_plain += (a * a) as f64;
+                sum_trim += (b * b) as f64;
+            }
+        }
+        let gain_db = 10.0 * (sum_trim / sum_plain).log10();
+        assert!((gain_db - 6.02).abs() < 0.2, "a x2 trim on a quiet signal is +6 dB: {gain_db}");
+        // A trim that asks for more than the ceiling is limited, never clipped.
+        let mut hot = MasterLimiter::new(48000.0);
+        hot.snap_trim(8.0, 1.0);
+        let peak = (0..48000).map(|i| hot.process(sine(i, 0.6), sine(i, 0.6), MasterLimiter::DRIVE_REF, 1.0).0.abs()).fold(0.0f32, f32::max);
+        assert!(peak <= MasterLimiter::OUT_PEAK + 1e-6, "the chain's ceiling holds under a +18 dB trim: {peak}");
+        // The guard is plain gain after the knee.
+        let mut guarded = MasterLimiter::new(48000.0);
+        guarded.snap_trim(8.0, 0.5);
+        let peak_g = (0..48000).map(|i| guarded.process(sine(i, 0.6), sine(i, 0.6), MasterLimiter::DRIVE_REF, 1.0).0.abs()).fold(0.0f32, f32::max);
+        assert!((peak_g - peak * 0.5).abs() < 1e-4, "{peak_g} vs {peak}");
+    }
+
+    /// A metronome into the master: a steady, repeatable source.
+    fn click_engine() -> (GraphEngine, crate::control::CommandBus, std::sync::Arc<std::sync::Mutex<GraphPub>>) {
+        let mut g = Graph::default();
+        let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("CLICK"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        g.connect_with_id(1, PortRef { node: metro, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+        let (mut bus, drain) = command_bus();
+        let mut engine = GraphEngine::new(g, drain, 48000.0, vec![]);
+        let graph_pub = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        engine.set_graph_pub(graph_pub.clone());
+        bus.send(Command::SetBpm { bpm: 240.0 });
+        bus.send(Command::SetNodePlaying { node: metro, playing: true });
+        (engine, bus, graph_pub)
+    }
+
+    fn play(engine: &mut GraphEngine, secs: f64) {
+        let mut buf = vec![0.0f32; 256 * 2];
+        for _ in 0..(secs * 48000.0 / 256.0) as usize { engine.render(&mut buf, 2); }
+    }
+
+    #[test]
+    fn a_target_moves_the_measured_loudness_to_it_and_off_puts_it_back() {
+        let (mut engine, mut bus, graph_pub) = click_engine();
+        play(&mut engine, 4.0);
+        let before = engine.meter.integrated_lufs() as f32;
+        assert!(before.is_finite(), "the clicks are measured: {before}");
+        let target = before + 3.0;
+        bus.send(Command::SetMasterTarget { lufs: Some(target) });
+        play(&mut engine, 0.1);
+        let t = engine.master_target();
+        assert_eq!(t.lufs, Some(target));
+        assert!((t.gain_db - 3.0).abs() < 1e-3 && (t.before_lufs.unwrap() - before).abs() < 1e-3, "{t:?}");
+        assert_eq!(graph_pub.lock().unwrap().master_target, t, "published for every frontend (rule 33)");
+        play(&mut engine, 4.0);
+        let after = engine.meter.integrated_lufs() as f32;
+        assert!((after - target).abs() < 0.5, "after {after} LUFS, target {target} (before {before})");
+        // The same state again is no change: the measurement goes on.
+        bus.send(Command::RestoreMasterTarget { target: t });
+        play(&mut engine, 0.1);
+        assert!(engine.meter.integrated_lufs().is_finite(), "restoring what is already set must not reset the meter");
+        // Off: the chain is as it was.
+        bus.send(Command::SetMasterTarget { lufs: None });
+        play(&mut engine, 4.0);
+        assert_eq!(engine.master_target(), MasterTarget::OFF);
+        let off = engine.meter.integrated_lufs() as f32;
+        assert!((off - before).abs() < 0.3, "off {off} LUFS, before {before}");
+        // A saved target comes back as it was, without measuring.
+        let saved = MasterTarget { lufs: Some(-20.0), gain_db: -4.0, before_lufs: Some(-16.0), guard_db: -0.5, last_point: None, limited: false };
+        bus.send(Command::RestoreMasterTarget { target: saved });
+        play(&mut engine, 4.0);
+        assert_eq!(engine.master_target(), saved);
+        let restored = engine.meter.integrated_lufs() as f32;
+        assert!((restored - (before - 4.5)).abs() < 0.3, "trim and guard are both in the sound: {restored} vs {before}");
+    }
+
+    #[test]
+    fn a_target_without_any_sound_is_stored_and_changes_nothing() {
+        let (mut engine, mut bus, _pub) = click_engine();
+        bus.send(Command::SetMasterTarget { lufs: Some(-14.0) });
+        play(&mut engine, 0.05);
+        let t = engine.master_target();
+        assert_eq!((t.lufs, t.gain_db, t.before_lufs), (Some(-14.0), 0.0, None));
+    }
+
+    #[test]
+    fn the_guard_turns_the_output_down_by_a_true_peak_over() {
+        let (mut engine, mut bus, _pub) = click_engine();
+        // fs/4 at 45 degrees: sample peak 0.85, true peak 1.2 (+1.6 dBTP).
+        let over: Vec<f32> = (0..512).flat_map(|i| {
+            let s = 1.2 * (std::f32::consts::FRAC_PI_2 * i as f32 + std::f32::consts::FRAC_PI_4).sin();
+            [s, s]
+        }).collect();
+        // Without a target the chain is untouched.
+        engine.meter.process(&over, 2);
+        engine.guard_true_peak(1.0);
+        assert_eq!(engine.master_target().guard_db, 0.0);
+        bus.send(Command::RestoreMasterTarget { target: MasterTarget { lufs: Some(-14.0), gain_db: 0.0, before_lufs: Some(-14.0), guard_db: 0.0, last_point: None, limited: false } });
+        play(&mut engine, 0.05);
+        engine.meter.process(&over, 2);
+        engine.guard_true_peak(1.0);
+        let g = engine.master_target().guard_db;
+        assert!((g + 2.7).abs() < 0.3, "+1.6 dBTP is brought to -1.1 dBTP: guard {g} dB");
+        // The same over through the guard already in place asks for no more.
+        let guarded: Vec<f32> = over.iter().map(|s| s * crate::meter::db_amp(g)).collect();
+        engine.meter.process(&guarded, 2); // the louder block leaves the detector's history
+        engine.meter.process(&guarded, 2);
+        engine.guard_true_peak(crate::meter::db_amp(g));
+        assert!((engine.master_target().guard_db - g).abs() < 1e-6, "a held peak does not ratchet further");
+    }
+}
 
 #[cfg(test)]
 mod master_limiter_tests {
@@ -8212,6 +8446,127 @@ fn lv2_main_controls_check(name: &str, uri: &str) -> anyhow::Result<()> {
     let moved = engine.lv2_control_value(inst, c.id as usize).unwrap_or(f32::NAN);
     println!("main-controls-test: {name}: moved '{}' (control {}): start {start:.4} -> knob at {:.0}% {moved:.4}", c.name, c.id, norm * 100.0);
     anyhow::ensure!((moved as f64 - c.plain(norm)).abs() < (c.max - c.min) * 1e-3, "SetParam did not move '{}': wanted {}, plugin port reads {moved}", c.name, c.plain(norm));
+    Ok(())
+}
+
+/// `kabelsalat target-test`: the master's loudness target on REAL audio (#12).
+/// A Surge voice plays the same phrase before and after each target; the
+/// integrated loudness must land on the target and the true peak must stay
+/// under −1 dBTP, through the engine's own commands and meter.
+pub fn target_test() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    use crate::host::ClapVoice;
+    use crate::matrix::SourceId;
+    use crate::meter::{TARGET_PRESETS, TRUE_PEAK_CEILING_DB};
+
+    const SR: f64 = 48000.0;
+    const BLOCK: usize = 256;
+    const PHRASE_SECS: f64 = 8.0;
+
+    let (voice, _main) = ClapVoice::new(SR)?;
+    let mut g = Graph::default();
+    g.reserve(8, 8);
+    let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes("org.surge-synth-team.surge-xt") }, name_bytes("SYNTH"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+    g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
+    g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);
+    let (mut bus, drain) = command_bus();
+    let mut engine = GraphEngine::new(g, drain, SR, vec![(synth, voice)]);
+    let mut buf = vec![0.0f32; BLOCK * 2];
+    engine.render(&mut buf, 2); // Surge applies its init patch on the audio thread
+
+    // One phrase: four chords, 1.6 s held and 0.4 s apart, loud and soft.
+    let chords: [(&[u8], f32); 4] = [(&[48, 60, 64, 67], 0.9), (&[53, 60, 65, 69], 0.6), (&[55, 59, 62, 67], 0.9), (&[45, 60, 64, 69], 0.5)];
+    let mut phrase = |engine: &mut GraphEngine, bus: &mut crate::control::CommandBus| {
+        let blocks = |secs: f64| (secs * SR / BLOCK as f64) as usize;
+        let per_chord = PHRASE_SECS / chords.len() as f64;
+        for (notes, velocity) in chords {
+            for &note in notes { bus.send(Command::NoteOn { note, velocity, source: SourceId::Keys }); }
+            for _ in 0..blocks(per_chord * 0.8) { engine.render(&mut buf, 2); }
+            for &note in notes { bus.send(Command::NoteOff { note, source: SourceId::Keys }); }
+            for _ in 0..blocks(per_chord * 0.2) { engine.render(&mut buf, 2); }
+        }
+    };
+
+    phrase(&mut engine, &mut bus);
+    let untouched = engine.meter_snapshot();
+    anyhow::ensure!(untouched.integrated_lufs.is_finite(), "the phrase must be measured");
+    println!(
+        "target-test: no target: {:.2} LUFS integrated, true peak {:.2} dBTP",
+        untouched.integrated_lufs, untouched.true_peak_max_db
+    );
+
+    let mut targets: Vec<(String, f32)> = Vec::new();
+    for &(name, _, lufs) in TARGET_PRESETS {
+        if !targets.iter().any(|t| t.1 == lufs) { targets.push((name.to_string(), lufs)); }
+    }
+    targets.push(("number".into(), -23.0));
+    let mut failed = Vec::new();
+    // Aim, play, read; "Match" again until it is on target or the limiter
+    // has no more to give. Then a fresh measurement of the same phrase,
+    // with the guard settled: what a listener gets from now on.
+    type Phrase<'a> = &'a mut dyn FnMut(&mut GraphEngine, &mut crate::control::CommandBus);
+    let mut aim = |phrase: Phrase, engine: &mut GraphEngine, bus: &mut crate::control::CommandBus, name: &str, lufs: f32| {
+        let mut tries = 0;
+        let (after, target) = loop {
+            tries += 1;
+            bus.send(Command::SetMasterTarget { lufs: Some(lufs) });
+            phrase(engine, bus);
+            let after = engine.meter_snapshot();
+            let t = engine.master_target();
+            let capped = t.at_limit() && after.integrated_lufs < lufs;
+            if (after.integrated_lufs - lufs).abs() <= 0.5 || tries == 6 || capped { break (after, t); }
+        };
+        bus.send(Command::ResetMeter);
+        phrase(engine, bus);
+        let settled = engine.meter_snapshot();
+        // The same phrase reads up to 0.4 LU apart from one play to the next
+        // (Surge's oscillators run free), so the replay gets that much more.
+        let on_target = (settled.integrated_lufs - lufs).abs() <= 0.9;
+        let peak_ok = settled.true_peak_max_db <= TRUE_PEAK_CEILING_DB + 0.05;
+        println!(
+            "target-test: {name:<12} {lufs:>6.1} LUFS: before {:.2} -> after {:.2} LUFS (settled {:.2}), trim {:+.2} dB, guard {:+.2} dB, true peak {:.2} dBTP, {tries} match(es){}{}",
+            target.before_lufs.unwrap_or(f32::NAN), after.integrated_lufs, settled.integrated_lufs,
+            target.gain_db, engine.master_target().guard_db, settled.true_peak_max_db,
+            if on_target { "" } else if target.at_limit() { " — the limiter's ceiling, and the readout says so" } else { " — OFF TARGET" },
+            if peak_ok { "" } else { " — TRUE PEAK OVER" },
+        );
+        if !peak_ok { failed.push(format!("{name}: true peak {:.2} dBTP", settled.true_peak_max_db)); }
+        if !on_target && !target.at_limit() { failed.push(format!("{name}: {:.2} LUFS for {lufs}", settled.integrated_lufs)); }
+        if !on_target && target.at_limit() && !target.readout(&settled)["status"].as_str().is_some_and(|s| s.contains("VOLUME")) {
+            failed.push(format!("{name}: an unreachable target must say so: {}", target.readout(&settled)));
+        }
+        (on_target, target)
+    };
+    for (name, lufs) in targets {
+        let (on_target, target) = aim(&mut phrase, &mut engine, &mut bus, &name, lufs);
+        anyhow::ensure!(
+            (target.before_lufs.unwrap_or(f32::NAN) - untouched.integrated_lufs).abs() < 0.5,
+            "'before' must stay the untrimmed mix: {:?} vs {}", target.before_lufs, untouched.integrated_lufs
+        );
+        if !on_target {
+            // What the readout tells the player to do: master VOLUME up.
+            bus.send(Command::SetParam { node: master, param: P_VOL, value: 1.0 });
+            let (reached, _) = aim(&mut phrase, &mut engine, &mut bus, &format!("{name} @100%"), lufs);
+            anyhow::ensure!(reached, "{name}: {lufs} LUFS must be in reach with the master VOLUME at 100 %");
+            bus.send(Command::SetParam { node: master, param: P_VOL, value: 0.75 });
+            bus.send(Command::SetMasterTarget { lufs: None });
+            phrase(&mut engine, &mut bus);
+        }
+    }
+    anyhow::ensure!(failed.is_empty(), "targets missed: {failed:?}");
+
+    // Off: the mix is as loud as before any target.
+    bus.send(Command::SetMasterTarget { lufs: None });
+    phrase(&mut engine, &mut bus);
+    let off = engine.meter_snapshot();
+    anyhow::ensure!(
+        (off.integrated_lufs - untouched.integrated_lufs).abs() < 0.5,
+        "off must restore the untouched loudness: {} vs {}", off.integrated_lufs, untouched.integrated_lufs
+    );
+    println!("target-test: off: {:.2} LUFS (untouched {:.2})", off.integrated_lufs, untouched.integrated_lufs);
+    println!("target-test: OK");
     Ok(())
 }
 

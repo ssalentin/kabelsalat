@@ -195,15 +195,31 @@ pub fn next_bar_beats(beats: f64) -> f64 {
 }
 
 /// Note-onset strength of a stereo-interleaved signal: the rising part of
-/// its RMS envelope, one value per `ONSET_HOP` frames.
+/// its RMS envelope, one value per `ONSET_HOP` frames. The envelope at a hop
+/// is the RMS of the `ONSET_WINDOW_HOPS` hops that end there, so a rise shows
+/// at its own hop and the few after it, never before.
 fn onset_strength(samples: &[f32]) -> Vec<f64> {
-    let env: Vec<f64> = samples
+    let power: Vec<f64> = samples
         .chunks(ONSET_HOP * 2)
-        .map(|c| (c.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / c.len() as f64).sqrt())
+        .map(|c| c.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / c.len() as f64)
+        .collect();
+    let env: Vec<f64> = (0..power.len())
+        .map(|i| {
+            let window = &power[i.saturating_sub(ONSET_WINDOW_HOPS - 1)..=i];
+            (window.iter().sum::<f64>() / window.len() as f64).sqrt()
+        })
         .collect();
     env.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect()
 }
 const ONSET_HOP: usize = 64;
+/// 21.3 ms: longer than a cycle of the held chord's lowest tone. An envelope
+/// over one hop (1.3 ms) followed the waveform itself, so most "onsets" were
+/// waveform cycles weighted by loudness, the gates' grid reached a coherence
+/// of only 0.27, and a harmonic of the 16-step loudness pattern (2.48 Hz at
+/// 120 BPM) came within 0.5 % of it: `transport-test` failed 4 of 74 runs
+/// (#18). Over this window the grid reaches 0.7 and nothing below it 0.47 of
+/// that (160 recorded real runs).
+const ONSET_WINDOW_HOPS: usize = 16;
 
 /// How well the onsets sit on a `hz` grid: |Σ o·e^(iωt)| / Σ o, 1 when
 /// every onset is on it. Only onset *times* count, so Surge's per-note
@@ -219,11 +235,10 @@ fn grid_coherence(onsets: &[f64], sample_rate: f64, hz: f64) -> f64 {
     (re * re + im * im).sqrt() / total
 }
 
-/// Rate (Hz) of the grid the onsets sit on, between 1 and 20 Hz: the most
-/// coherent rate, stepped down to its lowest whole divisor that is about as
-/// coherent (onsets on a 4 Hz grid sit on 8 Hz too). Only divisors: "the
-/// lowest rate near the best" also caught harmonics of the 16-step pattern
-/// 20 Hz whose coherence is about as high as any (multiples match too).
+/// Rate (Hz) of the grid the onsets sit on, between 1 and 20 Hz: the lowest
+/// rate whose coherence is a local peak within 10 % of the best. Not the
+/// best itself, because onsets on a 4 Hz grid sit on 8 Hz too and either may
+/// score higher.
 fn onset_grid_hz(onsets: &[f64], sample_rate: f64) -> f64 {
     const STEP_HZ: f64 = 0.005;
     let scores: Vec<f64> = (0..)
@@ -332,9 +347,8 @@ pub fn run_test() -> anyhow::Result<()> {
         let hz = onset_grid_hz(&onsets, SR);
         bus.send(Command::TransportStop);
         let steps = hz * 60.0 / bpm as f64;
-        // A rare failure read 1.24 steps per beat (#18) and has not recurred
-        // in 70+ runs: keep the evidence. `KABELSALAT_ONSET_DUMP=<dir>` saves
-        // every run for `grid_estimators_on_dumped_real_onsets`.
+        // A failing check keeps its onsets; `KABELSALAT_ONSET_DUMP=<dir>`
+        // saves every run for `grid_estimators_on_dumped_real_onsets`.
         let dump_dir = std::env::var_os("KABELSALAT_ONSET_DUMP")
             .map(std::path::PathBuf::from)
             .or_else(|| ((steps - 4.0).abs() >= 0.04).then(std::env::temp_dir));
@@ -467,6 +481,42 @@ mod tests {
     use super::*;
 
     const SR: f64 = 48000.0;
+
+    /// A low chord gated on an 8 Hz grid with Gate Chord's step pattern:
+    /// the onsets are the gates, not the cycles of the chord's waveform (#18).
+    #[test]
+    fn onsets_of_a_gated_low_chord_sit_on_the_gate_grid() {
+        const STEP_HZ: f64 = 8.0;
+        let mut samples = Vec::new();
+        for i in 0..(14.0 * SR) as usize {
+            let t = i as f64 / SR;
+            let step = (t * STEP_HZ) as usize;
+            let in_step = t - step as f64 / STEP_HZ;
+            let gate = if GATE_CHORD_SOUNDING >> (step % 16) & 1 == 1 {
+                (in_step / 0.002).min(1.0) * (-in_step * 12.0).exp() * (0.5 + 0.5 * ((step * 7) % 16) as f64 / 16.0)
+            } else {
+                0.0
+            };
+            let chord: f64 = [130.81, 131.4, 164.81, 165.5, 196.0, 196.9]
+                .iter()
+                .map(|hz| (std::f64::consts::TAU * hz * t).sin())
+                .sum();
+            let x = (gate * chord / 6.0) as f32;
+            samples.extend([x, x]);
+        }
+        let onsets = onset_strength(&samples);
+        let on_grid = grid_coherence(&onsets, SR, STEP_HZ);
+        let (rival, rival_hz) = (0..1370)
+            .map(|i| 1.0 + i as f64 * 0.005)
+            .map(|hz| (grid_coherence(&onsets, SR, hz), hz))
+            .fold((0.0, 0.0), |a, b| if b.0 > a.0 { b } else { a });
+        assert!(
+            rival < 0.6 * on_grid,
+            "the 8 Hz gate grid scores {on_grid:.3}, {rival_hz:.3} Hz below it {rival:.3}"
+        );
+        let hz = onset_grid_hz(&onsets, SR);
+        assert!((hz - STEP_HZ).abs() < 0.04, "grid read as {hz:.3} Hz");
+    }
 
     #[test]
     fn beats_advance_with_tempo_while_playing() {

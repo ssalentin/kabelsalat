@@ -167,6 +167,9 @@ chmod +x kabelsalat-*.AppImage
 Older versions and the other packages are on the
 [releases page](https://github.com/ssalentin/kabelsalat/releases).
 
+Text fields read the keyboard directly, not through an input method. To
+write Chinese, Japanese or Korean, start it with `KABELSALAT_IME=1`.
+
 It runs unsandboxed, so it finds the CLAP/LV2 plugins installed on your system
 and gets realtime audio priority like a native install. Install the plugins
 from your distribution (`surge-xt` for the default synth).

@@ -2527,6 +2527,9 @@ struct DemoApp {
     /// Set when the assistant opens: the chat field takes focus on the next
     /// frame so typing goes to the agent instead of the laptop piano.
     focus_chat_request: bool,
+    /// Text fields type through the desktop's input method (fcitx, ibus) only
+    /// when `KABELSALAT_IME` asks for it (#30, rule 158).
+    system_ime: bool,
     /// `--demo-agent` screenshot hook: keeps the demo agent's touch fresh every
     /// frame so the rack highlight stays visible instead of fading after 2.6s.
     demo_agent_hold: bool,
@@ -3001,6 +3004,7 @@ impl DemoApp {
             mixer_fader_rects: Vec::new(),
             dock: DockView::None,
             focus_chat_request: false,
+            system_ime: system_ime_wanted(std::env::var_os("KABELSALAT_IME").as_deref()),
             demo_agent_hold: false,
             reduce_motion: crate::assistant::load_reduce_motion(),
             fading_units: Vec::new(),
@@ -18885,6 +18889,13 @@ fn p_side(unit: usize, app: &DemoApp) -> f32 {
     if x < app.rack_w / 2.0 { -1.0 } else { 1.0 }
 }
 
+/// `KABELSALAT_IME=1` routes text input through the desktop's input method,
+/// for scripts that need one to compose (Chinese, Japanese, Korean). Without
+/// it the keyboard layout types directly, dead keys and Compose included.
+fn system_ime_wanted(var: Option<&std::ffi::OsStr>) -> bool {
+    var.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// Is the user typing into a text field (chat, API key, search, a DragValue
 /// in edit mode)? Only then do rack shortcuts yield. Not
 /// `egui_wants_keyboard_input()`: that is true for ANY focused widget.
@@ -19601,6 +19612,13 @@ impl DemoApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(15));
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
+
+        // Last in the frame, after every text field had its turn (#30): a
+        // focused field asks for the input method through this output, and
+        // then every typed character waits for that process to answer.
+        if !self.system_ime {
+            ctx.output_mut(|o| o.ime = None);
         }
     }
 
@@ -26090,6 +26108,39 @@ mod ui_polish_agent_tests {
         }
         assert_eq!(app.chat_input, "cv", "letters reach the chat");
         assert_eq!(app.dock, DockView::Assistant, "typing does not swap the dock");
+    }
+
+    /// #30: every text field went dead while the rest of the app reacted. A
+    /// focused field asked for the desktop's input method, so its characters
+    /// came only when that process answered.
+    #[test]
+    fn a_focused_text_field_types_without_the_desktops_input_method() {
+        let asks_for_ime = |system_ime: bool| {
+            let mut app = DemoApp::new_with_sink(None);
+            app.assistant.key_set = true;
+            app.system_ime = system_ime;
+            app.dock = DockView::Assistant;
+            app.focus_chat_request = true;
+            let ctx = egui::Context::default();
+            let mut asked = false;
+            for _ in 0..3 {
+                let mut raw = egui::RawInput::default();
+                raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1000.0)));
+                let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+                out.textures_delta.clear();
+                asked = out.platform_output.ime.is_some();
+            }
+            assert!(ctx.text_edit_focused(), "the chat field has the focus");
+            asked
+        };
+        assert!(!asks_for_ime(false), "a focused field leaves the input method off");
+        assert!(asks_for_ime(true), "KABELSALAT_IME=1 keeps the input method");
+
+        let os = |s: &'static str| Some(std::ffi::OsStr::new(s));
+        assert!(!system_ime_wanted(None));
+        assert!(!system_ime_wanted(os("")));
+        assert!(!system_ime_wanted(os("0")));
+        assert!(system_ime_wanted(os("1")));
     }
 
     /// #23: the keyboard dock follows the window height both ways (it kept

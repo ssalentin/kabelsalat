@@ -635,8 +635,9 @@ fn system_prompt() -> String {
      - Destructive tools (delete_rig, install_instrument): call them WITHOUT confirm first; \
      the chat then shows Confirm / Cancel buttons. Ask the user in one short sentence and \
      wait — their click runs or cancels it.\n\
-     UI shortcuts the user can press: F5/F6/F7 load starter templates (Lead+Reverb, \
-     Drums+Bass, Ambient Pad), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
+     UI shortcuts the user can press: F5/F6/F7 load the Cathedral, Jazz and Rock organ \
+     templates, Shift+F5/F6/F7 the Guitar Rig, Ambient Pad and Synth Lead (a template \
+     whose plugins are missing is greyed out with an Install button), F8 restores the demo, F9 opens the plugin browser, F2/F3 \
      embed the Surge editor.\n\n\
      WORK IN FEW STEPS: every round trip costs the user seconds. Call several \
      tools in ONE step when they do not need each other's results (e.g. every \
@@ -1030,8 +1031,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"load_template",
-            "description":"Load a starter template (rebuilds the patch). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; the player plugs a guitar or mic into the Audio In unit, whose face also carries the tuner) | demo | multi_rig (two independent rigs, switch view with 1-9).",
-            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["lead_reverb","drums_bass","ambient_pad","guitar_rig","demo","multi_rig"]}},"required":["name"]}
+            "description":"Load a starter template (rebuilds the patch). name: cathedral_organ (Aeolus pipe organ, full stops, cathedral reverb) | jazz_organ (setBfree tonewheel, percussion, slow Leslie) | rock_organ (setBfree through the Guitarix amp + cabinet) | ambient_pad (Surge pad → delay → reverb) | synth_lead (Surge lead → slap delay → reverb) | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master; the player plugs a guitar or mic into the Audio In unit, whose face also carries the tuner) | demo | multi_rig (two independent rigs, switch view with 1-9). The result names any plugins the template needs that are not installed: offer install_instrument for them.",
+            "parameters":{"type":"object","properties":{"name":{"type":"string","enum":["cathedral_organ","jazz_organ","rock_organ","ambient_pad","synth_lead","guitar_rig","demo","multi_rig"]}},"required":["name"]}
         }},
         {"type":"function","function":{
             "name":"add_node",

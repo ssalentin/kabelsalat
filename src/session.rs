@@ -1280,16 +1280,23 @@ impl History {
 // ---------------------------------------------------------------------------
 
 /// One-click starting points. Each builds a pre-wired, playable [`Graph`]
-/// from the existing node kinds plus sensible default knob values.
+/// from a small hand-picked set of plugins ([`Template::plugins`], catalog
+/// ids) plus the built-in DSP units, with sensible default knob values and
+/// plugin states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Template {
-    /// Singing lead through a lush reverb, dry path kept for clarity.
-    LeadReverb,
-    /// Two Surge layers (drums + bass) on one keyboard, each with its own
-    /// tone control. Key splits arrive with the MIDI matrix (task-9).
-    DrumsBass,
-    /// Slow pad into long delay and big reverb — instant atmosphere.
+    /// Aeolus with the full organ drawn, in a cathedral-sized reverb.
+    CathedralOrgan,
+    /// setBfree with the classic jazz registration (88 8000 000), percussion
+    /// and a slow Leslie, in a small club room.
+    JazzOrgan,
+    /// setBfree with every drawbar out, driven through the Guitarix amp and
+    /// cabinet: the rock organ sound.
+    RockOrgan,
+    /// Slow Surge pad into long delay and big reverb — instant atmosphere.
     AmbientPad,
+    /// Singing Surge lead through a slap delay and reverb, dry path kept.
+    SynthLead,
     /// GarageBand's guitar story (issue #92): a live input through stomps
     /// into an amp and cabinet. Audio In picks the input device on its face
     /// (default = PipeWire's default source) and carries the tuner.
@@ -1297,10 +1304,12 @@ pub enum Template {
 }
 
 impl Template {
-    pub const ALL: [Template; 4] = [
-        Template::LeadReverb,
-        Template::DrumsBass,
+    pub const ALL: [Template; 6] = [
+        Template::CathedralOrgan,
+        Template::JazzOrgan,
+        Template::RockOrgan,
         Template::AmbientPad,
+        Template::SynthLead,
         Template::GuitarRig,
     ];
 
@@ -1311,12 +1320,64 @@ impl Template {
         matches!(self, Template::GuitarRig)
     }
 
+    /// The name the agent tools take (`load_template`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Template::CathedralOrgan => "cathedral_organ",
+            Template::JazzOrgan => "jazz_organ",
+            Template::RockOrgan => "rock_organ",
+            Template::AmbientPad => "ambient_pad",
+            Template::SynthLead => "synth_lead",
+            Template::GuitarRig => "guitar_rig",
+        }
+    }
+
+    /// A template by [`Template::id`] or a short alias, any case.
+    pub fn from_name(name: &str) -> Option<Template> {
+        let name = name.trim().to_lowercase();
+        let alias = match name.as_str() {
+            "cathedral" | "church" | "church_organ" | "pipe_organ" => Template::CathedralOrgan,
+            "jazz" | "jazz_rig" => Template::JazzOrgan,
+            "rock" => Template::RockOrgan,
+            "ambient" | "pad" => Template::AmbientPad,
+            "lead" | "lead_reverb" => Template::SynthLead,
+            "guitar" => Template::GuitarRig,
+            _ => return Template::ALL.into_iter().find(|t| t.id() == name),
+        };
+        Some(alias)
+    }
+
     pub fn title(self) -> &'static str {
         match self {
-            Template::LeadReverb => "Lead + Reverb",
-            Template::DrumsBass => "Drums + Bass",
+            Template::CathedralOrgan => "Cathedral Organ",
+            Template::JazzOrgan => "Jazz Organ",
+            Template::RockOrgan => "Rock Organ",
             Template::AmbientPad => "Ambient Pad",
+            Template::SynthLead => "Synth Lead",
             Template::GuitarRig => "Guitar Rig",
+        }
+    }
+
+    /// One line for the template list: the signal chain.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Template::CathedralOrgan => "Pipe organ, full stops, cathedral reverb",
+            Template::JazzOrgan => "Tonewheel 88 8000 000, percussion, slow Leslie",
+            Template::RockOrgan => "Tonewheel, all drawbars, through a cranked amp",
+            Template::AmbientPad => "Surge pad, long delay, big reverb",
+            Template::SynthLead => "Surge lead, slap delay, reverb",
+            Template::GuitarRig => "Live input, stomps, amp, cabinet",
+        }
+    }
+
+    /// Catalog ids (`catalog::find`) of the plugins the template needs.
+    pub fn plugins(self) -> &'static [&'static str] {
+        match self {
+            Template::CathedralOrgan => &["aeolus"],
+            Template::JazzOrgan => &["setbfree"],
+            Template::RockOrgan => &["setbfree", "guitarix"],
+            Template::AmbientPad | Template::SynthLead => &["surge-xt"],
+            Template::GuitarRig => &["guitarix"],
         }
     }
 
@@ -1325,20 +1386,25 @@ impl Template {
         self.build().0
     }
 
-    /// A ready-to-play session: patch + default knob values.
+    /// A ready-to-play session: patch + default knob values + plugin states.
     pub fn session(self) -> Session {
-        let (graph, defaults) = self.build();
+        let (graph, defaults, states) = self.build();
         let mut s = Session::new(self.title(), graph);
         for (node, param, value) in defaults {
             s.set_param(node, param, value);
         }
+        for (node, plugin_id, data) in states {
+            s.set_plugin_state(node, plugin_id, data);
+        }
         s
     }
 
-    fn build(self) -> (Graph, Vec<(NodeId, ParamId, f64)>) {
+    #[allow(clippy::type_complexity)]
+    fn build(self) -> (Graph, Vec<(NodeId, ParamId, f64)>, Vec<(NodeId, &'static str, Vec<u8>)>) {
         let mut g = Graph::default();
         g.reserve(64, 256);
         let mut defaults = Vec::new();
+        let mut states = Vec::new();
         // Templates pick their own edge ids (Graph's counter is private to
         // the control plane); sequential ids are unique by construction.
         let mut eid: EdgeId = 1;
@@ -1357,41 +1423,91 @@ impl Template {
         };
 
         match self {
-            Template::LeadReverb => {
+            Template::CathedralOrgan => {
+                let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+                let organ = g.add_node(
+                    NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) },
+                    name_bytes("PIPE ORGAN"),
+                );
+                let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("CATHEDRAL"));
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+                link(&mut g, keys, organ, 0, PortKind::Midi);
+                link(&mut g, organ, verb, 0, PortKind::Audio);
+                link(&mut g, verb, master, 0, PortKind::Audio);
+                let full = crate::aeolus::REGISTRATIONS
+                    .iter()
+                    .find(|r| r.name == "Full Organ")
+                    .expect("Aeolus has a Full Organ registration");
+                states.push((organ, crate::aeolus::AEOLUS_ID, crate::aeolus::state(full)));
+                defaults.extend([
+                    (organ, P_LEVEL, 0.8),
+                    (verb, 0, 0.7), // reverb mix (param table: task-7)
+                    (master, P_VOL, 0.75),
+                    (master, P_WARM, 0.0),
+                ]);
+            }
+            Template::JazzOrgan | Template::RockOrgan => {
+                let rock = self == Template::RockOrgan;
+                let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
+                let organ = g.add_node(
+                    NodeKind::Lv2 { uri: Lv2Uri::new(crate::organ::B_SYNTH) },
+                    name_bytes("TONEWHEEL"),
+                );
+                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+                link(&mut g, keys, organ, 0, PortKind::Midi);
+                // Jazz: 88 8000 000 with third-harmonic percussion and the
+                // Leslie on its slow chorale. Rock: every drawbar out, the
+                // Leslie fast, the organ's own overdrive up.
+                let bars: [u8; crate::organ::DRAWBARS] =
+                    if rock { [8; crate::organ::DRAWBARS] } else { crate::organ::DEFAULT_DRAWBARS };
+                for (i, &pos) in bars.iter().enumerate() {
+                    defaults.push((organ, crate::organ::drawbar_param(i), f64::from(crate::organ::drawbar_value(pos))));
+                }
+                let (leslie, perc, drive, room) = if rock { (1.0, 0.0, 0.6, 0.15) } else { (0.5, 0.5, 0.0, 0.25) };
+                defaults.extend([
+                    (organ, crate::organ::P_LESLIE, leslie),
+                    (organ, crate::organ::P_PERC, perc),
+                    (organ, crate::organ::P_DRIVE, drive),
+                    (organ, crate::organ::P_REVERB, room),
+                    (master, P_VOL, 0.75),
+                    (master, P_WARM, if rock { 0.2 } else { 0.1 }),
+                ]);
+                if rock {
+                    let amp = g.add_node(
+                        NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::AMP) },
+                        name_bytes("AMP"),
+                    );
+                    let cab = g.add_node(
+                        NodeKind::Lv2 { uri: Lv2Uri::new(crate::guitar::CABINET) },
+                        name_bytes("CABINET"),
+                    );
+                    link(&mut g, organ, amp, 0, PortKind::Audio);
+                    link(&mut g, amp, cab, 0, PortKind::Audio);
+                    link(&mut g, cab, master, 0, PortKind::Audio);
+                    defaults.extend([
+                        (amp, crate::guitar::AMP_DRIVE_CTRL as ParamId, 0.7),
+                        (amp, crate::guitar::AMP_PREGAIN_CTRL as ParamId, 0.5),
+                    ]);
+                } else {
+                    link(&mut g, organ, master, 0, PortKind::Audio);
+                }
+            }
+            Template::SynthLead => {
                 let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
                 let lead = g.add_node(surge(), name_bytes("LEAD"));
+                let delay = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("SLAP DELAY"));
                 let verb = g.add_node(NodeKind::Dsp(DspKind::Reverb), name_bytes("REVERB"));
                 let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
                 link(&mut g, keys, lead, 0, PortKind::Midi);
-                link(&mut g, lead, verb, 0, PortKind::Audio);
+                link(&mut g, lead, delay, 0, PortKind::Audio);
+                link(&mut g, delay, verb, 0, PortKind::Audio);
                 link(&mut g, verb, master, 0, PortKind::Audio);
                 link(&mut g, lead, master, 1, PortKind::Audio); // dry
                 defaults.extend([
                     (lead, P_LEVEL, 0.85),
+                    (delay, P_TIME, 0.25),
+                    (delay, P_MIX, 0.25),
                     (verb, 0, 0.35), // reverb mix (param table: task-7)
-                    (master, P_VOL, 0.75),
-                    (master, P_WARM, 0.1),
-                ]);
-            }
-            Template::DrumsBass => {
-                let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-                let drums = g.add_node(surge(), name_bytes("DRUMS"));
-                let bass = g.add_node(surge(), name_bytes("BASS"));
-                let drum_gain = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("DRUM LEVEL"));
-                let bass_filter = g.add_node(NodeKind::Dsp(DspKind::Filter), name_bytes("BASS FILTER"));
-                let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
-                // Layered on one keyboard for now; splits/layers via task-9.
-                link(&mut g, keys, drums, 0, PortKind::Midi);
-                link(&mut g, keys, bass, 0, PortKind::Midi);
-                link(&mut g, drums, drum_gain, 0, PortKind::Audio);
-                link(&mut g, drum_gain, master, 0, PortKind::Audio);
-                link(&mut g, bass, bass_filter, 0, PortKind::Audio);
-                link(&mut g, bass_filter, master, 1, PortKind::Audio);
-                defaults.extend([
-                    (drums, P_LEVEL, 0.9),
-                    (bass, P_LEVEL, 0.8),
-                    (drum_gain, 0, 0.9),   // gain (param table: task-7)
-                    (bass_filter, 0, 0.45), // cutoff (param table: task-7)
                     (master, P_VOL, 0.75),
                     (master, P_WARM, 0.1),
                 ]);
@@ -1464,7 +1580,7 @@ impl Template {
                 ]);
             }
         }
-        (g, defaults)
+        (g, defaults, states)
     }
 }
 
@@ -1507,7 +1623,7 @@ mod tests {
     }
 
     fn sample_session() -> Session {
-        let mut s = Template::LeadReverb.session();
+        let mut s = Template::SynthLead.session();
         s.name = "Round Trip".into();
         s.set_param(1, P_LEVEL, 0.42); // overwrite a default
         s.set_matrix(Some(json!({"routes": [{"from": "keys", "to": 1, "transpose": -12}]})));
@@ -1729,7 +1845,7 @@ mod tests {
 
     #[test]
     fn undo_redo_restores_graph_params_and_matrix() {
-        let mut s = Template::LeadReverb.session();
+        let mut s = Template::SynthLead.session();
         let mut h = History::new();
         let start = content(&s);
 
@@ -1825,7 +1941,8 @@ mod tests {
             let inputs: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::AudioIn { .. })).map(|n| n.id).collect();
             let synths: Vec<NodeId> = g.nodes.iter()
-                .filter(|n| matches!(n.kind, NodeKind::Clap { .. })).map(|n| n.id).collect();
+                .filter(|n| matches!(n.kind, NodeKind::Clap { .. }) || crate::organ::is_organ(&n.kind))
+                .map(|n| n.id).collect();
             let masters: Vec<NodeId> = g.nodes.iter()
                 .filter(|n| matches!(n.kind, NodeKind::MasterOut)).map(|n| n.id).collect();
             assert!(!masters.is_empty());
@@ -1869,6 +1986,50 @@ mod tests {
             let loaded = Session::load(&pkg).unwrap();
             assert_eq!(content(&s), content(&loaded));
             let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn templates_name_their_plugins_and_answer_to_their_ids() {
+        for t in Template::ALL {
+            assert!(!t.plugins().is_empty(), "{} needs a plugin", t.title());
+            for id in t.plugins() {
+                assert!(crate::catalog::find(id).is_some(), "{}: '{id}' is not in the catalog", t.title());
+            }
+            assert_eq!(Template::from_name(t.id()), Some(t));
+            assert_eq!(Template::from_name(&t.id().to_uppercase()), Some(t));
+        }
+        assert_eq!(Template::from_name("church"), Some(Template::CathedralOrgan));
+        assert_eq!(Template::from_name("jazz"), Some(Template::JazzOrgan));
+        assert_eq!(Template::from_name("drums_bass"), None);
+    }
+
+    #[test]
+    fn the_cathedral_organ_starts_with_the_full_organ_drawn() {
+        let s = Template::CathedralOrgan.session();
+        let organ = s.graph.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Clap { .. })).unwrap();
+        let st = s.plugin_state(organ.id).expect("the organ carries a registration");
+        assert_eq!(st.plugin_id, crate::aeolus::AEOLUS_ID);
+        let full = crate::aeolus::REGISTRATIONS.iter().find(|r| r.name == "Full Organ").unwrap();
+        assert_eq!(crate::aeolus::drawn(&st.data), crate::aeolus::drawn(&crate::aeolus::state(full)));
+        assert_ne!(crate::aeolus::drawn(&st.data), crate::aeolus::drawn(&crate::aeolus::initial_state(crate::aeolus::AEOLUS_ID).unwrap()));
+    }
+
+    #[test]
+    fn the_organ_templates_set_their_registrations() {
+        let bars = |t: Template| -> Vec<u8> {
+            let s = t.session();
+            let organ = s.graph.nodes.iter().find(|n| crate::organ::is_organ(&n.kind)).unwrap().id;
+            (0..crate::organ::DRAWBARS)
+                .map(|i| crate::organ::drawbar_position(s.param(organ, crate::organ::drawbar_param(i)).unwrap() as f32))
+                .collect()
+        };
+        assert_eq!(bars(Template::JazzOrgan), vec![8, 8, 8, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bars(Template::RockOrgan), vec![8; 9]);
+        // The rock organ runs through the guitar amp and cabinet.
+        let g = Template::RockOrgan.graph();
+        for uri in [crate::guitar::AMP, crate::guitar::CABINET] {
+            assert!(g.nodes.iter().any(|n| matches!(&n.kind, NodeKind::Lv2 { uri: u } if u.as_str() == uri)), "{uri}");
         }
     }
 

@@ -801,6 +801,25 @@ pub fn installed(entry: &CatalogEntry, scan: &ScanSet, roots: &[&Path]) -> bool 
     scan_installed(entry, scan) || bundle_installed(entry, roots)
 }
 
+/// The catalog entries among `ids` that `installed` says are missing, in
+/// `ids` order (ids the catalog does not know are skipped; the template
+/// tests check every id resolves).
+pub fn missing(ids: &[&str], installed: impl Fn(&CatalogEntry) -> bool) -> Vec<&'static CatalogEntry> {
+    ids.iter().filter_map(|id| find(id)).filter(|e| !installed(e)).collect()
+}
+
+/// One sentence telling the user what to install: "Needs Aeolus and
+/// Guitarix — install them from Plugins (F9)."
+pub fn install_hint(missing: &[&CatalogEntry]) -> String {
+    let names: Vec<&str> = missing.iter().map(|e| e.name).collect();
+    let (list, them) = match names.as_slice() {
+        [] => return String::new(),
+        [one] => (one.to_string(), "it"),
+        [rest @ .., last] => (format!("{} and {last}", rest.join(", ")), "them"),
+    };
+    format!("Needs {list} — install {them} from Plugins (F9).")
+}
+
 /// One shell command the install worker runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallCommand {
@@ -1627,5 +1646,15 @@ mod tests {
             cmds[6].argv,
             ["cp", "-r", "/c/airwindows/unpacked/awcons-products/Airwindows Consolidated.clap", "/home/u/.clap/"]
         );
+    }
+
+    #[test]
+    fn missing_lists_what_is_not_installed_and_the_hint_names_it() {
+        let missing = missing(&["setbfree", "surge-xt", "guitarix"], |e| e.id == "surge-xt");
+        assert_eq!(missing.iter().map(|e| e.id).collect::<Vec<_>>(), ["setbfree", "guitarix"]);
+        assert_eq!(install_hint(&missing), "Needs setBfree and Guitarix — install them from Plugins (F9).");
+        assert_eq!(install_hint(&missing[..1]), "Needs setBfree — install it from Plugins (F9).");
+        assert_eq!(install_hint(&[]), "");
+        assert!(super::missing(&["aeolus"], |_| true).is_empty());
     }
 }

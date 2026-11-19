@@ -460,8 +460,10 @@ The graph is presented as a **rack of labeled hardware-style units** (Reason):
   knob mirrors what the app sent (the engine does not publish port values).
 - **Big, friendly controls:** touch-sized targets, rounded cards, playful visual
   feedback — instruments and cables react visibly when played.
-- **Templates:** one-click starting points ("Lead + Reverb", "Drums + Bass",
-  "Ambient Pad") so the graph is never a blank page of fear.
+- **Templates:** one-click starting points ("Cathedral Organ", "Jazz Organ",
+  "Rock Organ", "Ambient Pad", "Synth Lead", "Guitar Rig") so the graph is
+  never a blank page of fear. Each names the catalog plugins it needs; one
+  whose plugins are missing is greyed out with an Install button.
 - **No manual required:** sensible defaults everywhere, `?` shortcut overlay,
   discoverable interactions, errors explained in plain language in-window.
 - **One big record button** (P2): count-in, then immediate playback of the take.

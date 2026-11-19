@@ -186,20 +186,13 @@ struct InstallInstrumentArgs {
 /// Arguments for `load_template`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct LoadTemplateArgs {
-    /// Template name: lead_reverb | drums_bass | ambient_pad | guitar_rig | demo | multi_rig.
+    /// Template name: cathedral_organ | jazz_organ | rock_organ | ambient_pad | synth_lead | guitar_rig | demo | multi_rig.
     name: String,
 }
 
-/// Resolve a template name (same aliases the app's tool takes).
-fn template_by_name(name: &str) -> Option<crate::session::Template> {
-    use crate::session::Template;
-    Some(match name.to_lowercase().as_str() {
-        "lead_reverb" | "lead" => Template::LeadReverb,
-        "drums_bass" | "drums" => Template::DrumsBass,
-        "ambient_pad" | "ambient" | "pad" => Template::AmbientPad,
-        "guitar_rig" | "guitar" => Template::GuitarRig,
-        _ => return None,
-    })
+/// Every starter template id, for the "use …" hints.
+fn template_ids() -> String {
+    crate::session::Template::ALL.iter().map(|t| t.id()).collect::<Vec<_>>().join(", ")
 }
 
 /// Arguments for `remove_node`.
@@ -3014,20 +3007,17 @@ impl McpServer {
     }
 
     /// Load a starter template, replacing the patch.
-    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: lead_reverb | drums_bass | ambient_pad | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face; the three guitarix units need the Guitarix card installed) | demo | multi_rig (the two demo patches exist in the running app only).")]
+    #[tool(name = "load_template", description = "Load a starter template, replacing the current patch (Command::LoadGraph + its default knob values). name: cathedral_organ (Aeolus pipe organ, full stops, cathedral reverb) | jazz_organ (setBfree tonewheel 88 8000 000, percussion, slow Leslie) | rock_organ (setBfree through the Guitarix amp + cabinet) | ambient_pad (Surge → delay → reverb) | synth_lead (Surge → slap delay → reverb) | guitar_rig (Audio In → Scream → Delay → Reverb → Amp → Cabinet → Master: a live guitar/mic input with a tuner on the Audio In unit's face) | demo | multi_rig (the two demo patches exist in the running app only). The result lists any catalog plugins the template needs that are not installed (install them with install_instrument).")]
     fn load_template(&self, Parameters(args): Parameters<LoadTemplateArgs>) -> Result<CallToolResult, McpError> {
         if matches!(self.state.lock().unwrap().backend, Backend::Remote) {
             return Self::ui_bridge_tool("load_template", json!({"name": args.name}));
         }
         let name = args.name.to_lowercase();
         if matches!(name.as_str(), "demo" | "multi_rig" | "rigs") {
-            return tool_err("demo and multi_rig are demo patches of the running app; headless templates are lead_reverb, drums_bass, ambient_pad, guitar_rig");
+            return tool_err(format!("demo and multi_rig are demo patches of the running app; headless templates are {}", template_ids()));
         }
-        let Some(t) = template_by_name(&name) else {
-            return tool_err(format!(
-                "unknown template '{}' (use lead_reverb, drums_bass, ambient_pad, guitar_rig, demo, multi_rig)",
-                args.name
-            ));
+        let Some(t) = crate::session::Template::from_name(&name) else {
+            return tool_err(format!("unknown template '{}' (use {}, demo, multi_rig)", args.name, template_ids()));
         };
         let s = t.session();
         let mut st = self.state.lock().unwrap();
@@ -3047,6 +3037,15 @@ impl McpServer {
             "edges": s.graph.edges.len(),
         });
         note_silent_claps(&st, &mut result);
+        // Headless: the same on-disk bundle probe list_instruments uses.
+        let roots_raw = crate::catalog::plugin_roots(&crate::catalog::home_dir());
+        let roots: Vec<&std::path::Path> = roots_raw.iter().map(|p| p.as_path()).collect();
+        let scan = crate::catalog::ScanSet::default();
+        let missing = crate::catalog::missing(t.plugins(), |e| crate::catalog::installed(e, &scan, &roots));
+        if !missing.is_empty() {
+            result["missing_plugins"] = json!(missing.iter().map(|e| e.id).collect::<Vec<_>>());
+            result["install_hint"] = json!(crate::catalog::install_hint(&missing));
+        }
         ok_json(result)
     }
 

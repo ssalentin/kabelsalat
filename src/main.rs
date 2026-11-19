@@ -37,6 +37,7 @@ mod instruments;
 mod meter;
 mod midi;
 mod player;
+mod plugins;
 mod plugin_window;
 mod preview;
 mod record;

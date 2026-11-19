@@ -57,6 +57,15 @@ agents are in [AGENTS.md](../AGENTS.md).
   only its two startup voices.
 - `lv2.rs` — hand-written lilv FFI; LV2 effects and instruments, presets,
   MIDNAM programme names, loader thread, `LILV_LOCK`.
+- `plugins.rs` — what kind of plugin each one is. Every built-in unit, CLAP
+  and LV2 plugin becomes one classified `Entry` (`PluginType`: instrument,
+  effect, MIDI FX, utility; `PluginSubtype`: Synths, Organs, Delay & Reverb,
+  Dynamics, Analyzers, …). LV2 plugins are sorted by the scan's instrument /
+  MIDI flags (rule 72) and then their lv2core class, CLAP plugins by their
+  declared features. The Plugins stage, the Mixer's insert picker, the in-app
+  assistant and MCP `list_plugins` all filter this one list
+  (`PluginListFilter`), so they never disagree about a plugin. Only CLAP
+  instruments can be hosted; CLAP effects are listed and marked as such.
 - `sounds.rs` — one sound library per instrument a rig can hold. The
   instrument (`Instrument`: a CLAP id or an LV2 URI) is the key and
   `Instrument::source` the table: Surge `.fxp` patches, Dexed DX7 cartridge

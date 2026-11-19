@@ -830,10 +830,16 @@ pub fn standard_rig_graph(with_synth: bool) -> Graph {
 /// A rig around one CLAP instrument: Keys → plugin → Master (MIDI + stereo
 /// L/R). `name` labels the synth unit.
 pub fn plugin_rig_graph(plugin_id: &str, name: &str) -> Graph {
+    instrument_rig_graph(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name)
+}
+
+/// Single-instrument rig for any instrument node (CLAP or LV2): Keys →
+/// instrument → Master, its output on both master inputs.
+pub fn instrument_rig_graph(instrument: NodeKind, name: &str) -> Graph {
     let mut g = Graph::default();
     g.reserve(16, 16);
     let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-    let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(plugin_id) }, name_bytes(&name.to_uppercase()));
+    let synth = g.add_node(instrument, name_bytes(&name.to_uppercase()));
     let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
     g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, PortKind::Midi);
     g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 0 }, PortKind::Audio);

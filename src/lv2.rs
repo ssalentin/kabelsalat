@@ -291,6 +291,7 @@ extern "C" {
     fn lilv_plugins_next(collection: *const LilvPlugins, iter: *const LilvIter) -> *mut LilvIter;
     fn lilv_plugin_get_uri(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_name(plugin: *const LilvPlugin) -> *mut LilvNode;
+    fn lilv_plugin_get_author_name(plugin: *const LilvPlugin) -> *mut LilvNode;
     fn lilv_plugin_get_num_ports(plugin: *const LilvPlugin) -> c_uint;
     fn lilv_plugin_get_class(plugin: *const LilvPlugin) -> *const LilvPluginClass;
     fn lilv_plugin_class_get_uri(class: *const LilvPluginClass) -> *const LilvNode;
@@ -340,10 +341,15 @@ pub enum FxOutEvent {
     Midi([u8; 3]),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Lv2PluginInfo {
     pub uri: String,
     pub name: String,
+    pub author: String,
+    /// Most specific `lv2core` class local name (e.g. `"ReverbPlugin"`,
+    /// `"CompressorPlugin"`, `"InstrumentPlugin"`, `"AnalyserPlugin"`), or
+    /// empty when only generic `lv2:Plugin` is declared.
+    pub lv2_class: String,
     pub num_ports: u32,
     pub is_instrument: bool,
     /// A MIDI-only unit: events in, events out, no audio port at all.
@@ -769,6 +775,51 @@ unsafe fn node_owned(node: *mut LilvNode) -> String {
     s
 }
 
+/// Pick the most specific `lv2core` plugin class local name from a plugin's
+/// `rdf:type` list (e.g. `ReverbPlugin` over `DelayPlugin`/`SimulatorPlugin`,
+/// `CompressorPlugin` over `DynamicsPlugin`, `ParaEQPlugin` over `FilterPlugin`).
+pub fn primary_lv2_class(types: &[String]) -> String {
+    fn rank(local: &str) -> u8 {
+        match local {
+            "InstrumentPlugin" => 100,
+            "ReverbPlugin" => 95,
+            "ChorusPlugin" | "FlangerPlugin" | "PhaserPlugin" => 92,
+            "ParaEQPlugin" | "MultiEQPlugin" => 90,
+            "LowpassPlugin" | "HighpassPlugin" | "BandpassPlugin" | "CombPlugin" | "AllpassPlugin" => 88,
+            "CompressorPlugin" | "LimiterPlugin" | "GatePlugin" | "ExpanderPlugin" | "EnvelopePlugin" => 86,
+            "WaveshaperPlugin" => 84,
+            "PitchPlugin" => 82,
+            "AnalyserPlugin" => 80,
+            "MixerPlugin" | "ConverterPlugin" | "FunctionPlugin" => 78,
+            "OscillatorPlugin" | "ConstantPlugin" => 76,
+            "EQPlugin" => 74,
+            "FilterPlugin" => 70,
+            "DistortionPlugin" => 68,
+            "AmplifierPlugin" => 66,
+            "DelayPlugin" => 64,
+            "ModulatorPlugin" => 62,
+            "SpectralPlugin" | "SpatialPlugin" => 60,
+            "SimulatorPlugin" => 58,
+            "DynamicsPlugin" => 54,
+            "GeneratorPlugin" => 50,
+            "UtilityPlugin" => 40,
+            _ => 10,
+        }
+    }
+    let mut best: Option<(&str, u8)> = None;
+    for t in types {
+        let Some(local) = t.strip_prefix(LV2_CORE_PREFIX) else { continue };
+        if local == "Plugin" || local == "PluginBase" || !local.ends_with("Plugin") {
+            continue;
+        }
+        let r = rank(local);
+        if best.is_none_or(|(_, br)| r > br) {
+            best = Some((local, r));
+        }
+    }
+    best.map(|(s, _)| s.to_string()).unwrap_or_default()
+}
+
 /// Discover all installed LV2 plugins (loads the lilv world, enumerates, frees).
 pub fn discover() -> Vec<Lv2PluginInfo> {
     let _lilv = lilv_guard();
@@ -779,29 +830,36 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
         }
         lilv_world_load_all(world);
         let plugins = lilv_world_get_all_plugins(world);
-        let audio = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#AudioPort\0".as_ptr() as *const c_char);
-        let atom = lilv_new_uri(world, b"http://lv2plug.in/ns/ext/atom#AtomPort\0".as_ptr() as *const c_char);
-        let input = lilv_new_uri(world, b"http://lv2plug.in/ns/lv2core#InputPort\0".as_ptr() as *const c_char);
         let mut out = Vec::new();
         if !plugins.is_null() {
             let mut iter = lilv_plugins_begin(plugins);
             while !iter.is_null() && !lilv_plugins_is_end(plugins, iter) {
                 let plugin = lilv_plugins_get(plugins, iter);
                 if !plugin.is_null() {
+                    let types = plugin_types(world, plugin);
+                    let is_instrument = instrument_from_types(&types).unwrap_or_else(|| {
+                        let (atom_in, audio_in, audio_out) = port_counts(world, plugin);
+                        atom_in && audio_in == 0 && audio_out > 0
+                    });
+                    let is_midi_fx = if is_instrument {
+                        false
+                    } else {
+                        let (atom_in, atom_out, audio) = midi_shape(world, plugin);
+                        atom_in && atom_out && audio == 0
+                    };
                     out.push(Lv2PluginInfo {
                         uri: node_borrowed(lilv_plugin_get_uri(plugin)),
                         name: node_owned(lilv_plugin_get_name(plugin)),
+                        author: node_owned(lilv_plugin_get_author_name(plugin)),
+                        lv2_class: primary_lv2_class(&types),
                         num_ports: lilv_plugin_get_num_ports(plugin),
-                        is_instrument: classify_instrument(world, plugin),
-                        is_midi_fx: classify_midi_fx(world, plugin),
+                        is_instrument,
+                        is_midi_fx,
                     });
                 }
                 iter = lilv_plugins_next(plugins, iter);
             }
         }
-        lilv_node_free(audio);
-        lilv_node_free(atom);
-        lilv_node_free(input);
         lilv_world_free(world);
         instruments_first(&mut out);
         out
@@ -843,7 +901,20 @@ pub fn run_test() -> anyhow::Result<()> {
     let instruments: Vec<&Lv2PluginInfo> = plugins.iter().filter(|p| p.is_instrument).collect();
     println!("{} instruments (atom input + audio output):", instruments.len());
     for p in instruments.iter().take(20) {
-        println!("  [inst] {} — {}", p.name, p.uri);
+        println!("  [inst] {} ({}) — {}", p.name, p.author, p.uri);
+    }
+    println!("By type:");
+    let subs: Vec<_> = plugins.iter().map(crate::plugins::classify_lv2).collect();
+    for ty in crate::plugins::PluginType::ALL {
+        let per_sub: Vec<String> = crate::plugins::PluginSubtype::subtypes_for(ty)
+            .iter()
+            .filter_map(|sub| {
+                let n = subs.iter().filter(|s| *s == sub).count();
+                (n > 0).then(|| format!("{}={n}", sub.label()))
+            })
+            .collect();
+        let n = subs.iter().filter(|s| s.plugin_type() == ty).count();
+        println!("  {}: {n} ({})", ty.label(), per_sub.join(", "));
     }
     anyhow::ensure!(!plugins.is_empty(), "no LV2 plugins discovered");
     println!("lv2-test: OK — lilv linkage + discovery verified");
@@ -2686,6 +2757,19 @@ mod tests {
         retire(plugin);
         eprintln!("setbfree note peak: {peak:.4}");
         assert!(peak > 1e-3, "setBfree produced no audio while a key was held: peak={peak}");
+    }
+
+    #[test]
+    fn primary_lv2_class_picks_most_specific_core_class() {
+        let mk = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| format!("http://lv2plug.in/ns/lv2core#{n}")).collect()
+        };
+        assert_eq!(primary_lv2_class(&mk(&["Plugin", "DelayPlugin", "SimulatorPlugin", "ReverbPlugin"])), "ReverbPlugin");
+        assert_eq!(primary_lv2_class(&mk(&["Plugin", "DynamicsPlugin", "CompressorPlugin"])), "CompressorPlugin");
+        assert_eq!(primary_lv2_class(&mk(&["Plugin", "FilterPlugin", "EQPlugin", "ParaEQPlugin"])), "ParaEQPlugin");
+        assert_eq!(primary_lv2_class(&mk(&["Plugin", "UtilityPlugin", "AnalyserPlugin"])), "AnalyserPlugin");
+        assert_eq!(primary_lv2_class(&mk(&["Plugin", "GeneratorPlugin", "InstrumentPlugin"])), "InstrumentPlugin");
+        assert_eq!(primary_lv2_class(&mk(&["Plugin"])), "");
     }
 }
 

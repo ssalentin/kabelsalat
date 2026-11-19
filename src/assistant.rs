@@ -1019,8 +1019,8 @@ pub(crate) fn tools() -> Value {
         }},
         {"type":"function","function":{
             "name":"list_plugins",
-            "description":"List installed CLAP and LV2 plugins (name, id/uri, features) available to host.",
-            "parameters":{"type":"object","properties":{}}
+            "description":"List built-in units and installed CLAP/LV2 plugins organized by type (Instruments, Effects, MIDI FX, Utilities) and effect subcategory (Delay & Reverb, EQ & Filter, Dynamics, Drive & Amp, Modulation, Pitch & Spatial, Multi-FX, Analyzers, …). Pass optional type, category, format, or query to narrow large LV2 lists.",
+            "parameters":{"type":"object","properties":{"type":{"type":"string","enum":["all","instrument","effect","midi_fx","utility"],"description":"Filter by plugin type (default all)"},"category":{"type":"string","description":"Filter by subcategory (e.g. synth, organ, sampler, delay_reverb, eq_filter, dynamics, drive_amp, modulation, pitch_spatial, multi_fx, arpeggiator, analyzer, mixer_routing)"},"format":{"type":"string","enum":["all","builtin","clap","lv2"],"description":"Filter by plugin format (default all)"},"query":{"type":"string","description":"Optional search words matching name, author/vendor, uri/id, or category"},"limit":{"type":"integer","description":"Max items per section (default 24 unfiltered, 60 filtered)"}}}
         }},
         {"type":"function","function":{
             "name":"list_instruments",

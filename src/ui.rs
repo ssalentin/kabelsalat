@@ -44,6 +44,11 @@ use crate::host::{
 use clack_host::prelude::ClapId;
 use crate::lv2::{discover as lv2_discover, Lv2PluginInfo};
 use crate::matrix::{CcTarget, MixControl, SourceId};
+use crate::plugins::{
+    clap_hostable, clap_subtitle, classify_clap, classify_dsp, classify_lv2, format_list_plugins,
+    lv2_class_label, lv2_is_audio_insert, lv2_subtitle, matches_query, BuiltinAction, PluginFormat,
+    PluginListFilter, PluginSubtype, PluginType,
+};
 use crate::rope::{self, Rope};
 use crate::session::Template;
 use crate::theme;
@@ -2062,11 +2067,118 @@ enum NavJumpTarget {
 enum PluginCategory {
     #[default]
     All,
-    Clap,
-    Lv2,
-    BuiltIn,
-    /// The instrument browser's installable catalog (issue #10).
+    Instruments,
+    Effects,
+    MidiFx,
+    Utilities,
+    /// The curated installable plugin catalog (issue #10).
     Install,
+}
+
+impl PluginCategory {
+    const fn of_type(ty: PluginType) -> Self {
+        match ty {
+            PluginType::Instrument => PluginCategory::Instruments,
+            PluginType::Effect => PluginCategory::Effects,
+            PluginType::MidiFx => PluginCategory::MidiFx,
+            PluginType::Utility => PluginCategory::Utilities,
+        }
+    }
+
+    const fn plugin_type(self) -> Option<PluginType> {
+        match self {
+            PluginCategory::Instruments => Some(PluginType::Instrument),
+            PluginCategory::Effects => Some(PluginType::Effect),
+            PluginCategory::MidiFx => Some(PluginType::MidiFx),
+            PluginCategory::Utilities => Some(PluginType::Utility),
+            PluginCategory::All | PluginCategory::Install => None,
+        }
+    }
+}
+
+/// What a click in the Plugins browser asks for, applied after the frame's
+/// list is drawn.
+enum BrowserAction {
+    NewClapRig(String, String),
+    NewLv2Rig(String, String),
+    AddInstrument(NodeKind, String),
+    AddEffect(NodeKind, String),
+    AddMasterEffect(NodeKind, String),
+    AddArp,
+    AddMetronome,
+    AddMidiFx(Option<String>, String),
+    Install(String),
+    ShowType(PluginType),
+}
+
+/// What a Plugins-browser card shows for one plugin: its subtitle, the id or
+/// uri on hover, and its buttons (the first is the primary one), or a note
+/// when it cannot be hosted.
+struct BrowserCard {
+    subtitle: String,
+    id: String,
+    note: Option<&'static str>,
+    actions: Vec<(&'static str, &'static str, BrowserAction)>,
+}
+
+impl BrowserCard {
+    fn of(e: &crate::plugins::Entry) -> Self {
+        use crate::plugins::Source;
+        const RIG: &str = "add it to the active rig";
+        const MASTER: &str = "insert it on the master bus, before the limiter";
+        const NEW_RIG: &str = "a new rig: Keys → it → Master";
+        const STRIP: &str = "a MIDI strip between the active rig's keys and its instruments";
+        let name = e.name().to_string();
+        let effect = |kind: NodeKind| {
+            vec![
+                ("Add to rig", RIG, BrowserAction::AddEffect(kind.clone(), name.clone())),
+                ("Master FX", MASTER, BrowserAction::AddMasterEffect(kind, name.clone())),
+            ]
+        };
+        let (subtitle, id, note, actions) = match e.source {
+            Source::Builtin(b) => {
+                let actions = match &b.action {
+                    BuiltinAction::Dsp(DspKind::Metronome) => vec![("Add to rig", RIG, BrowserAction::AddMetronome)],
+                    BuiltinAction::Dsp(kind) => effect(NodeKind::Dsp(kind.clone())),
+                    BuiltinAction::Arp => vec![("Add MIDI strip", STRIP, BrowserAction::AddArp)],
+                    BuiltinAction::MidiTranspose => {
+                        vec![("Add MIDI strip", STRIP, BrowserAction::AddMidiFx(None, "Transpose".into()))]
+                    }
+                };
+                (b.description.to_string(), b.id.to_string(), None, actions)
+            }
+            Source::Clap(p) if clap_hostable(p) => (
+                clap_subtitle(p),
+                p.id.clone(),
+                None,
+                vec![
+                    ("New rig", NEW_RIG, BrowserAction::NewClapRig(p.id.clone(), name.clone())),
+                    ("Add to rig", RIG, BrowserAction::AddInstrument(NodeKind::Clap { plugin_id: name_bytes(&p.id) }, name.clone())),
+                ],
+            ),
+            Source::Clap(p) => {
+                let note = if e.ty() == PluginType::MidiFx {
+                    "CLAP MIDI effects not hostable yet"
+                } else {
+                    "CLAP audio effects not hostable yet"
+                };
+                (clap_subtitle(p), p.id.clone(), Some(note), Vec::new())
+            }
+            Source::Lv2(p) => {
+                let kind = NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) };
+                let actions = match e.ty() {
+                    PluginType::MidiFx => vec![("Add MIDI strip", STRIP, BrowserAction::AddMidiFx(Some(p.uri.clone()), name.clone()))],
+                    PluginType::Instrument => vec![
+                        ("New rig", NEW_RIG, BrowserAction::NewLv2Rig(p.uri.clone(), name.clone())),
+                        ("Add to rig", RIG, BrowserAction::AddInstrument(kind, name.clone())),
+                    ],
+                    PluginType::Effect | PluginType::Utility => effect(kind),
+                };
+                (lv2_subtitle(p), p.uri.clone(), None, actions)
+            }
+        };
+        Self { subtitle, id, note, actions }
+    }
 }
 
 /// One progress event from an install worker thread.
@@ -2516,6 +2628,10 @@ struct DemoApp {
     plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>)>>,
     plugin_filter: String,
     plugin_category: PluginCategory,
+    plugin_subtype: Option<PluginSubtype>,
+    plugin_format: Option<PluginFormat>,
+    /// The Install view's instrument / effect filter.
+    plugin_catalog_type: Option<PluginType>,
     plugin_msg: String,
     /// Instrument-browser install (issue #10): the running/last worker.
     install: Option<InstallState>,
@@ -2757,6 +2873,8 @@ struct DemoApp {
     insert_pick: Option<Option<u32>>,
     /// Insert picker's filter text.
     insert_filter: String,
+    insert_subtype: Option<PluginSubtype>,
+    insert_builtin_only: bool,
     /// Navigator side panel (issue #108): hidden by default, never saved.
     nav_open: bool,
     nav_filter: NavFilter,
@@ -3076,6 +3194,9 @@ impl DemoApp {
             plugin_scan: None,
             plugin_filter: String::new(),
             plugin_category: PluginCategory::All,
+            plugin_subtype: None,
+            plugin_format: None,
+            plugin_catalog_type: None,
             plugin_msg: String::new(),
             install: None,
             catalog_roots: None,
@@ -3200,6 +3321,8 @@ impl DemoApp {
             strip_color_pick: None,
             insert_pick: None,
             insert_filter: String::new(),
+            insert_subtype: None,
+            insert_builtin_only: false,
             nav_open: false,
             nav_filter: NavFilter::Channels,
             nav_folded: std::collections::HashSet::new(),
@@ -6855,7 +6978,7 @@ impl DemoApp {
                         if !self.plugin_lists_ready() {
                             return "scanning installed plugins in the background (first run) — try add_insert again in a few seconds".into();
                         }
-                        let known = self.plugins_lv2.iter().find(|p| p.uri == uri && !p.is_instrument);
+                        let known = self.plugins_lv2.iter().find(|p| p.uri == uri && lv2_is_audio_insert(p));
                         let label = match known {
                             Some(p) => p.name.clone(),
                             None => return format!("add_insert: '{uri}' is not an installed LV2 effect (see list_plugins)"),
@@ -7054,18 +7177,10 @@ impl DemoApp {
                 if !self.plugin_lists_ready() {
                     return "scanning installed plugins in the background (first run) — ask again in a few seconds".into();
                 }
-                let clap = self.plugins_clap.clone();
-                let lv2 = self.plugins_lv2.clone();
-                let mut s = format!("CLAP plugins ({}):\n", clap.len());
-                for p in clap.iter().take(20) {
-                    s.push_str(&format!("  {} [{}] {}\n", p.name, p.id, p.features.join(",")));
+                match PluginListFilter::from_args(args) {
+                    Ok(filter) => format_list_plugins(&self.plugins_clap, &self.plugins_lv2, &filter),
+                    Err(e) => format!("list_plugins: {e}"),
                 }
-                s.push_str(&format!("LV2 plugins ({}):\n", lv2.len()));
-                for p in lv2.iter().take(30) {
-                    let kind = if p.is_instrument { " [instrument]" } else { "" };
-                    s.push_str(&format!("  {}{} — {}\n", p.name, kind, p.uri));
-                }
-                s
             }
             "list_instruments" => {
                 let installing_id = self.install.as_ref().map(|i| i.id.clone());
@@ -7394,10 +7509,15 @@ impl DemoApp {
                         if !self.plugin_lists_ready() {
                             return "scanning installed plugins in the background (first run) — try add_rig again in a few seconds".into();
                         }
-                        let known = self.plugins_clap.iter().find(|p| p.id == id).map(|p| p.name.clone());
-                        let Some(label) = known else {
+                        let known = self.plugins_clap.iter().find(|p| p.id == id);
+                        let Some(plugin) = known else {
                             return format!("add_rig failed: no installed CLAP plugin with id '{id}' (see list_plugins)");
                         };
+                        if !clap_hostable(plugin) {
+                            let ty = classify_clap(plugin).plugin_type().singular().to_ascii_lowercase();
+                            return format!("add_rig failed: '{}' ({id}) is a CLAP {ty}, not a CLAP instrument", plugin.name);
+                        }
+                        let label = plugin.name.clone();
                         self.edit_rigs_with(None, Some(name.unwrap_or(&label)), Some((id, &label)));
                     }
                     None => self.edit_rigs_named(None, name),
@@ -10309,6 +10429,14 @@ impl DemoApp {
     /// `edit_rigs_named`; an added rig is built around `plugin` = (CLAP id,
     /// display name) instead of the default Surge rig.
     fn edit_rigs_with(&mut self, delete: Option<usize>, add_name: Option<&str>, plugin: Option<(&str, &str)>) {
+        let graph = plugin.map(|(id, label)| crate::control::plugin_rig_graph(id, label));
+        self.edit_rigs_with_graph(delete, add_name, graph);
+    }
+
+    /// `edit_rigs_named` with an explicit graph for the added rig (CLAP or LV2
+    /// instrument rig). Keeps every surviving rig's patch, knob values, synth
+    /// state, device binding and mixer.
+    fn edit_rigs_with_graph(&mut self, delete: Option<usize>, add_name: Option<&str>, add_graph: Option<Graph>) {
         let n = self.rig_count();
         match delete {
             None if n >= Self::MAX_RIGS => {
@@ -10343,10 +10471,7 @@ impl DemoApp {
                 let name = add_name.map(|s| s.trim().chars().take(24).collect::<String>()).filter(|s| !s.is_empty())
                     .or_else(|| (b'A'..=b'Z').map(|c| format!("Rig {}", c as char)).find(|n| !used.contains(n)))
                     .unwrap_or_else(|| format!("Rig {}", n + 1));
-                let graph = match plugin {
-                    Some((id, label)) => crate::control::plugin_rig_graph(id, label),
-                    None => crate::control::standard_rig_graph(true),
-                };
+                let graph = add_graph.unwrap_or_else(|| crate::control::standard_rig_graph(true));
                 rigs.push((None, crate::control::Rig::new(name.clone(), graph, None)));
                 format!("Added {name}")
             }
@@ -11892,70 +12017,124 @@ impl DemoApp {
         }
     }
 
-    /// The proven LV2 effect chain: Keys → Surge → <lv2> → Master (+ dry path).
-    /// Mirrors engine::lv2_engine_test.
-    fn build_lv2_chain_graph(uri: &str, name: &str) -> Graph {
-        let mut g = Graph::default();
-        g.reserve(16, 16);
-        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let synth = g.add_node(NodeKind::Clap { plugin_id: name_bytes(SURGE_ID) }, name_bytes("SURGE"));
-        let fx = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes(name));
-        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
-        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: synth, port: 0 }, CPortKind::Midi);
-        g.connect_with_id(2, PortRef { node: synth, port: 0 }, PortRef { node: fx, port: 0 }, CPortKind::Audio);
-        g.connect_with_id(3, PortRef { node: fx, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
-        g.connect_with_id(4, PortRef { node: synth, port: 0 }, PortRef { node: master, port: 1 }, CPortKind::Audio);
-        g
-    }
 
-    /// Add an LV2 effect: rebuild the rack as Keys→Surge→effect→Master and
-    /// rewire the engine (same path as loading a template).
-    fn add_lv2_effect(&mut self, uri: &str, name: &str) {
-        let g = Self::build_lv2_chain_graph(uri, name);
-        let s = crate::session::Session::new(format!("LV2: {name}"), g);
-        match self.apply_session(&s) {
-            Ok(_) => {
-                self.plugin_msg = format!("Added '{name}' — Keys→Surge→{name}→Master");
-                self.stage_view = StageView::Rack;
-            }
-            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
-        }
-    }
-
-    /// The LV2 instrument rig: Keys → <lv2 instrument> → Master. Mirrors
-    /// engine::lv2_instrument_engine_test (MIDI to the instrument, audio out).
-    fn build_lv2_instrument_graph(uri: &str, name: &str) -> Graph {
-        let mut g = Graph::default();
-        g.reserve(16, 16);
-        let keys = g.add_node(NodeKind::Keys, name_bytes("KEYS"));
-        let inst = g.add_node(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name_bytes(name));
-        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
-        g.connect_with_id(1, PortRef { node: keys, port: 0 }, PortRef { node: inst, port: 0 }, CPortKind::Midi);
-        g.connect_with_id(2, PortRef { node: inst, port: 0 }, PortRef { node: master, port: 0 }, CPortKind::Audio);
-        g
-    }
-
-    /// Add an LV2 instrument as a rig: rebuild the rack as Keys→LV2→Master and
-    /// rewire the engine (same apply_session path as add-effect).
-    fn add_lv2_instrument(&mut self, uri: &str, name: &str) {
-        let g = Self::build_lv2_instrument_graph(uri, name);
-        let s = crate::session::Session::new(format!("LV2 inst: {name}"), g);
-        match self.apply_session(&s) {
-            Ok(_) => {
-                self.plugin_msg = format!("Added '{name}' as instrument — Keys→{name}→Master");
-                self.stage_view = StageView::Rack;
-            }
-            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
-        }
-    }
-
-    /// Start a fresh single-instrument CLAP rig for any CLAP plugin.
+    /// Add a new CLAP instrument rig alongside existing rigs (keeps existing
+    /// rigs, knobs, states and mixer intact).
     fn add_clap_rig(&mut self, plugin_id: &str, name: &str) {
-        let g = crate::control::plugin_rig_graph(plugin_id, name);
-        let s = crate::session::Session::new(&format!("{name} rig"), g);
-        match self.apply_session(&s) {
-            Ok(_) => {
-                self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
+        if self.rig_count() >= Self::MAX_RIGS {
+            self.plugin_msg = format!("At most {} rigs", Self::MAX_RIGS);
+            return;
+        }
+        let before = self.rig_count();
+        self.edit_rigs_with(None, Some(name), Some((plugin_id, name)));
+        if self.rig_count() > before {
+            self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
+            self.stage_view = StageView::Rack;
+        } else {
+            self.plugin_msg = format!("Add failed: {}", self.session_msg);
+        }
+    }
+
+    /// Add a new LV2 instrument rig alongside existing rigs.
+    fn add_lv2_instrument_rig(&mut self, uri: &str, name: &str) {
+        if self.rig_count() >= Self::MAX_RIGS {
+            self.plugin_msg = format!("At most {} rigs", Self::MAX_RIGS);
+            return;
+        }
+        let before = self.rig_count();
+        let graph = crate::control::instrument_rig_graph(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, name);
+        self.edit_rigs_with_graph(None, Some(name), Some(graph));
+        if self.rig_count() > before {
+            self.plugin_msg = format!("New {name} rig — Keys→{name}→Master");
+            self.stage_view = StageView::Rack;
+        } else {
+            self.plugin_msg = format!("Add failed: {}", self.session_msg);
+        }
+    }
+
+    /// Add an instrument (CLAP or LV2) into the active rig, wired
+    /// Keys → Instrument → Master L/R, preserving every existing rig and unit.
+    fn add_instrument_to_active_rig(&mut self, kind: NodeKind, name: &str) {
+        let rig = self.active_rig as u8;
+        let mut g = self.mirror_graph();
+        let node = g.add_node(kind, name_bytes(&name.to_uppercase()));
+        g.set_rig(node, rig);
+        g.wire_instrument(node);
+        match self.reload_with_graph(g) {
+            Ok(()) => {
+                self.plugin_msg = format!("Added {name} to {} — Keys→{name}→Master", self.rig_name(self.active_rig));
+                self.stage_view = StageView::Rack;
+            }
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
+    /// Add an audio effect or utility (built-in DSP or LV2) to the active rig:
+    /// chains it onto the active rig's primary linear source when one exists,
+    /// otherwise adds the unit to the active rig for patching on the back.
+    fn add_effect_to_active_rig(&mut self, kind: NodeKind, name: &str) {
+        let rig = self.active_rig as u8;
+        let linear_src = self
+            .rig_strip_sources(rig)
+            .into_iter()
+            .find(|&u| self.strip_chain(u).is_some())
+            .map(|u| self.units[u].node_id);
+        if let Some(src) = linear_src {
+            match self.strip_insert_edit(src, StripInsertEdit::Add { kind, name: name.to_string() }) {
+                Ok(msg) => {
+                    self.plugin_msg = format!("{msg} in {}", self.rig_name(self.active_rig));
+                    self.stage_view = StageView::Rack;
+                }
+                Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+            }
+            return;
+        }
+        let mut g = self.mirror_graph();
+        let node = g.add_node(kind, name_bytes(&name.to_uppercase()));
+        g.set_rig(node, rig);
+        match self.reload_with_graph(g) {
+            Ok(()) => {
+                self.plugin_msg = format!("Added {name} to {} — press Tab to patch on the back", self.rig_name(self.active_rig));
+                self.stage_view = StageView::Rack;
+            }
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
+    /// Add an audio effect or analyzer as a master insert (runs on the whole
+    /// mix before the master limiter).
+    fn add_effect_to_master(&mut self, kind: NodeKind, name: &str) {
+        match self.master_insert_edit(StripInsertEdit::Add { kind, name: name.to_string() }) {
+            Ok(msg) => {
+                self.plugin_msg = msg;
+                self.stage_view = StageView::Rack;
+            }
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
+    }
+
+    /// Add the built-in Arpeggiator / Chord unit to the active rig between Keys
+    /// and its instruments.
+    fn add_arp_to_active_rig(&mut self) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::AddNode {
+                kind: NodeKind::Arp,
+                name: name_bytes("ARP"),
+                rig: self.active_rig as u8,
+                wire: true,
+            });
+            self.plugin_msg = format!("Added Arpeggiator to {} — Keys → Arp → synth", self.rig_name(self.active_rig));
+            self.stage_view = StageView::Rack;
+            return;
+        }
+        let rig = self.active_rig as u8;
+        let mut g = self.mirror_graph();
+        let node = g.add_node(NodeKind::Arp, name_bytes("ARP"));
+        g.set_rig(node, rig);
+        g.wire_arp(node);
+        match self.reload_with_graph(g) {
+            Ok(()) => {
+                self.plugin_msg = format!("Added Arpeggiator to {} — Keys → Arp → synth", self.rig_name(self.active_rig));
                 self.stage_view = StageView::Rack;
             }
             Err(e) => self.plugin_msg = format!("Add failed: {e}"),
@@ -11963,24 +12142,36 @@ impl DemoApp {
     }
 
     /// Add a MIDI strip (LV2 MIDI plugin, or the built-in transposer when
-    /// `uri` is None) to the active rig: the engine inserts it between the
-    /// rig's Keys and its instruments (`Graph::wire_midi_fx`).
+    /// `uri` is None) to the active rig: inserts it between the rig's Keys and
+    /// its instruments (`Graph::wire_midi_fx`).
     fn add_midi_fx_to_active_rig(&mut self, uri: Option<&str>, name: &str) {
         let plugin = match uri {
             Some(u) => crate::control::MidiFxPlugin::Lv2 { uri: Lv2Uri::new(u) },
             None => crate::control::MidiFxPlugin::Builtin { semis: 0 },
         };
-        let Some(bus) = &self.bus else {
-            self.plugin_msg = "No engine attached".into();
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::AddNode {
+                kind: NodeKind::MidiFx { plugin },
+                name: name_bytes(name),
+                rig: self.active_rig as u8,
+                wire: true,
+            });
+            self.plugin_msg = format!("Added MIDI strip '{name}' — Keys → {name} → instruments");
+            self.stage_view = StageView::Rack;
             return;
-        };
-        let _ = bus.lock().unwrap().send(Command::AddNode {
-            kind: NodeKind::MidiFx { plugin },
-            name: name_bytes(name),
-            rig: self.active_rig as u8,
-            wire: true,
-        });
-        self.plugin_msg = format!("Added MIDI strip '{name}' — Keys → {name} → instruments");
+        }
+        let rig = self.active_rig as u8;
+        let mut g = self.mirror_graph();
+        let node = g.add_node(NodeKind::MidiFx { plugin }, name_bytes(&name.to_uppercase()));
+        g.set_rig(node, rig);
+        g.wire_midi_fx(node);
+        match self.reload_with_graph(g) {
+            Ok(()) => {
+                self.plugin_msg = format!("Added MIDI strip '{name}' — Keys → {name} → instruments");
+                self.stage_view = StageView::Rack;
+            }
+            Err(e) => self.plugin_msg = format!("Add failed: {e}"),
+        }
     }
 
     /// One insert edit (#74): add, remove or move an FX inside a strip's
@@ -12156,16 +12347,7 @@ impl DemoApp {
         let master = self.units.iter()
             .find(|u| matches!(u.node_kind, UnitKind::Master) && (self.rig_count() <= 1 || u.rig == rig))
             .map(|u| u.node_id);
-        let mut g = self.base_graph.clone();
-        // Rebuild edges from living cables so user rewires survive.
-        g.edges.clear();
-        for c in &self.cables {
-            if c.dying >= 0.0 { continue; }
-            if let (Some(sn), Some(dn)) = (self.units.get(c.src).map(|u| u.node_id), self.units.get(c.dst).map(|u| u.node_id)) {
-                let kind = match c.kind { PortKind::Midi => CPortKind::Midi, PortKind::Audio => CPortKind::Audio };
-                g.connect_with_id(c.id, PortRef { node: sn, port: c.src_port as u8 }, PortRef { node: dn, port: c.dst_port as u8 }, kind);
-            }
-        }
+        let mut g = self.mirror_graph();
         let metro = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("METRONOME"));
         g.set_rig(metro, rig);
         if let Some(m) = master {
@@ -12260,8 +12442,11 @@ impl DemoApp {
             });
     }
 
-    /// Main-stage plugin browser (one-window rule, F9 / B / Plugins chip).
+    /// Main-stage plugin browser (one-window rule, F9 / B / Plugins chip),
+    /// grouped by type (Instruments, Effects, MIDI FX, Utilities) and
+    /// subcategory, with a format filter and the install catalog.
     fn plugins_stage(&mut self, ui: &mut egui::Ui) {
+
         let rect = ui.available_rect_before_wrap();
         self.stage_rect = rect;
         let painter = ui.painter().clone();
@@ -12281,7 +12466,7 @@ impl DemoApp {
                     ui.add_space(12.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("CLAP instruments, LV2 plugins and built-ins · Tab / Esc: back to the rack")
+                            egui::RichText::new("Instruments, effects, MIDI FX and utilities · Tab / Esc: back to the rack")
                                 .size(13.0)
                                 .color(theme::INK_2),
                         )
@@ -12289,7 +12474,7 @@ impl DemoApp {
                     );
                 });
                 if !self.plugin_msg.is_empty() {
-                    let col = if self.plugin_msg.contains("failed") {
+                    let col = if self.plugin_msg.contains("failed") || self.plugin_msg.contains("At most") {
                         theme::CLIP_BRIGHT
                     } else {
                         theme::LIVE_TEAL
@@ -12297,61 +12482,118 @@ impl DemoApp {
                     ui.add_space(4.0);
                     ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
                 }
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
+                // Counts on the chips follow the format filter; the
+                // subcategory chips belong to the type in view.
+                let (type_counts, sub_counts) = {
+                    let all = crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2);
+                    let shown: Vec<&crate::plugins::Entry> =
+                        all.iter().filter(|e| self.plugin_format.is_none_or(|f| f == e.format())).collect();
+                    let type_counts = PluginType::ALL.map(|ty| shown.iter().filter(|e| e.ty() == ty).count());
+                    let sub_counts: Vec<(PluginSubtype, usize)> = self
+                        .plugin_category
+                        .plugin_type()
+                        .map(PluginSubtype::subtypes_for)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&sub| (sub, shown.iter().filter(|e| e.sub == sub).count()))
+                        .filter(|&(_, n)| n > 0)
+                        .collect();
+                    (type_counts, sub_counts)
+                };
+
+                // A chip that does not fit moves to the next line whole,
+                // never letter by letter (rule 100).
+                let chip_row = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                        add(ui);
+                    });
+                };
                 let mut do_refresh = false;
-                ui.horizontal_wrapped(|ui| {
-                    let search_w = (ui.available_width() * 0.28).clamp(180.0, 320.0);
-                    Self::recessed_input(ui, &mut self.plugin_filter, search_w, "Search plugins by name or vendor…");
-                    if !self.plugin_filter.is_empty() && theme::chip_button(ui, "Clear", false).clicked() {
+                chip_row(ui, &mut |ui| {
+                    let search_w = (ui.available_width() * 0.25).clamp(160.0, 280.0);
+                    Self::recessed_input(ui, &mut self.plugin_filter, search_w, "Search plugins by name, type or vendor…");
+                    if !self.plugin_filter.is_empty() && theme::wrapped_chip_button(ui, "Clear", false).clicked() {
                         self.plugin_filter.clear();
                     }
-                    ui.add_space(6.0);
-                    for (cat, label) in [
-                        (PluginCategory::All, "All".to_string()),
-                        (PluginCategory::BuiltIn, "Built-in (1)".to_string()),
-                        (PluginCategory::Clap, format!("CLAP ({})", self.plugins_clap.len())),
-                        (PluginCategory::Lv2, format!("LV2 ({})", self.plugins_lv2.len())),
-                        (PluginCategory::Install, format!("Install ({})", crate::catalog::CATALOG.len())),
-                    ] {
-                        if theme::chip_button(ui, &label, self.plugin_category == cat).clicked() {
+                    let mut cats = vec![(PluginCategory::All, "All".to_string())];
+                    for (ty, n) in PluginType::ALL.into_iter().zip(type_counts) {
+                        cats.push((PluginCategory::of_type(ty), format!("{} ({n})", ty.label())));
+                    }
+                    cats.push((PluginCategory::Install, format!("Install ({})", crate::catalog::CATALOG.len())));
+                    for (cat, label) in cats {
+                        if theme::wrapped_chip_button(ui, &label, self.plugin_category == cat).clicked() && self.plugin_category != cat {
                             self.plugin_category = cat;
+                            self.plugin_subtype = None;
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::chip_button(ui, "Refresh", false)
-                            .on_hover_text("rescan, retrying plugins that failed before")
-                            .clicked()
-                        {
-                            do_refresh = true;
-                        }
-                    });
+                    if theme::wrapped_chip_button(ui, "Refresh", false)
+                        .on_hover_text("rescan plugins, retrying bundles that failed before")
+                        .clicked()
+                    {
+                        do_refresh = true;
+                    }
                 });
                 if do_refresh {
                     self.refresh_plugins_with(true);
                 }
 
                 ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("Adding a CLAP or LV2 plugin rebuilds the current patch · Metronome and MIDI strips add to the active rig")
-                        .size(12.0)
-                        .color(theme::INK_2),
-                );
+                if self.plugin_category == PluginCategory::Install {
+                    chip_row(ui, &mut |ui| {
+                        let n_of = |ty| crate::catalog::CATALOG.iter().filter(|e| e.plugin_type == ty).count();
+                        if theme::wrapped_chip_button(ui, "All catalog", self.plugin_catalog_type.is_none()).clicked() {
+                            self.plugin_catalog_type = None;
+                        }
+                        for ty in [PluginType::Instrument, PluginType::Effect] {
+                            let on = self.plugin_catalog_type == Some(ty);
+                            if theme::wrapped_chip_button(ui, &format!("{} ({})", ty.label(), n_of(ty)), on).clicked() {
+                                self.plugin_catalog_type = if on { None } else { Some(ty) };
+                            }
+                        }
+                    });
+                } else {
+                    if sub_counts.len() > 1 {
+                        chip_row(ui, &mut |ui| {
+                            if theme::wrapped_chip_button(ui, "All", self.plugin_subtype.is_none()).clicked() {
+                                self.plugin_subtype = None;
+                            }
+                            for &(sub, n) in &sub_counts {
+                                let on = self.plugin_subtype == Some(sub);
+                                if theme::wrapped_chip_button(ui, &format!("{} ({n})", sub.label()), on).clicked() {
+                                    self.plugin_subtype = if on { None } else { Some(sub) };
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                    }
+                    chip_row(ui, &mut |ui| {
+                        if theme::wrapped_chip_button(ui, "All formats", self.plugin_format.is_none()).clicked() {
+                            self.plugin_format = None;
+                        }
+                        for fmt in PluginFormat::ALL {
+                            let on = self.plugin_format == Some(fmt);
+                            if theme::wrapped_chip_button(ui, fmt.label(), on).clicked() {
+                                self.plugin_format = if on { None } else { Some(fmt) };
+                            }
+                        }
+                    });
+                }
+
                 if self.plugin_scan.is_some() {
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Scanning plugins…").size(12.0).color(theme::CREAM_DIM));
                 }
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 Self::stage_hairline(ui);
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                let filter = self.plugin_filter.trim().to_lowercase();
-                let list_h = ui.available_height().max(80.0);
-                let mut add_metro = false;
-                let mut add_clap: Option<(String, String)> = None;
-                let mut add_lv2: Option<(String, String, bool)> = None;
-                let mut add_midi_fx: Option<(Option<String>, String)> = None;
-                let mut install_request: Option<String> = None;
+                let filter = self.plugin_filter.trim().to_string();
+                let list_h = ui.available_height().max(1.0);
+                let mut action: Option<BrowserAction> = None;
 
                 egui::ScrollArea::vertical()
                     .id_salt("plugins_scroll")
@@ -12372,18 +12614,18 @@ impl DemoApp {
                             let matches: Vec<&crate::catalog::CatalogEntry> = crate::catalog::CATALOG
                                 .iter()
                                 .filter(|e| {
-                                    filter.is_empty()
-                                        || e.name.to_lowercase().contains(&filter)
-                                        || e.description.to_lowercase().contains(&filter)
-                                        || e.id.to_lowercase().contains(&filter)
-                                        || e.repo.to_lowercase().contains(&filter)
+                                    self.plugin_catalog_type.is_none_or(|t| e.plugin_type == t)
+                                        && matches_query(
+                                            &[e.name, e.description, e.id, e.repo, e.format.label(), e.plugin_type.label()],
+                                            &filter,
+                                        )
                                 })
                                 .collect();
 
                             theme::section_label(ui, &format!("Install from the catalog ({})", matches.len()));
                             ui.add_space(4.0);
                             ui.label(
-                                egui::RichText::new("Hand-picked instruments from GitHub: a distro package where one exists, else a prebuilt release or a source build into ~/.clap or ~/.lv2")
+                                egui::RichText::new("Hand-picked plugins from GitHub: a distro package where one exists, else a prebuilt release or a source build into ~/.clap or ~/.lv2")
                                     .size(12.0)
                                     .color(theme::INK_2),
                             );
@@ -12428,11 +12670,21 @@ impl DemoApp {
                                         let active = self.install.as_ref().filter(|i| i.id == e.id);
                                         let running = active.is_some_and(|i| i.running);
                                         let failed = active.and_then(|i| i.error.as_deref());
+                                        let badge = format!(
+                                            "{} · {}",
+                                            e.format.label(),
+                                            if e.plugin_type == PluginType::Instrument { "INST" } else { "FX" }
+                                        );
+                                        let badge_col = if e.plugin_type == PluginType::Instrument {
+                                            theme::ACCENT_BRIGHT
+                                        } else {
+                                            theme::LIVE_TEAL
+                                        };
                                         Self::catalog_card(ui, card_w, |ui, iw| {
                                             ui.horizontal(|ui| {
                                                 ui.set_width(iw);
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    theme::tracked_label(ui, e.format.label(), 9.5, 0.12, theme::ACCENT_BRIGHT);
+                                                    theme::tracked_label(ui, &badge, 9.5, 0.12, badge_col);
                                                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                                         ui.add(
                                                             egui::Label::new(
@@ -12486,7 +12738,7 @@ impl DemoApp {
                                                         .on_hover_text(err);
                                                 } else if route.is_some() {
                                                     if theme::primary_button(ui, "Install").on_hover_text(&how).clicked() {
-                                                        install_request = Some(e.id.to_string());
+                                                        action = Some(BrowserAction::Install(e.id.to_string()));
                                                     }
                                                 }
                                                 let source = crate::catalog::repo_url(e.repo);
@@ -12507,35 +12759,21 @@ impl DemoApp {
                             return;
                         }
 
-                        let show_builtin = matches!(self.plugin_category, PluginCategory::All | PluginCategory::BuiltIn)
-                            && (filter.is_empty() || "metronome".contains(&filter) || "tempo tap count-in".contains(&filter));
-                        let clap_matches: Vec<&ClapPluginInfo> = if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Clap) {
-                            self.plugins_clap
-                                .iter()
-                                .filter(|p| {
-                                    filter.is_empty()
-                                        || p.name.to_lowercase().contains(&filter)
-                                        || p.vendor.to_lowercase().contains(&filter)
-                                        || p.id.to_lowercase().contains(&filter)
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
+                        let wanted = crate::plugins::PluginListFilter {
+                            plugin_type: self.plugin_category.plugin_type(),
+                            subtype: self.plugin_subtype,
+                            format: self.plugin_format,
+                            query: filter.clone(),
+                            limit: None,
                         };
-                        let lv2_matches: Vec<&Lv2PluginInfo> = if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Lv2) {
-                            self.plugins_lv2
-                                .iter()
-                                .filter(|p| {
-                                    filter.is_empty()
-                                        || p.name.to_lowercase().contains(&filter)
-                                        || p.uri.to_lowercase().contains(&filter)
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                        let mut entries: Vec<crate::plugins::Entry> =
+                            crate::plugins::entries(&self.plugins_clap, &self.plugins_lv2)
+                                .into_iter()
+                                .filter(|e| wanted.matches(e))
+                                .collect();
+                        crate::plugins::sort_for_browsing(&mut entries);
 
-                        if !show_builtin && clap_matches.is_empty() && lv2_matches.is_empty() {
+                        if entries.is_empty() {
                             ui.add_space(12.0);
                             let empty = if filter.is_empty() {
                                 "No plugins found in this category.".to_string()
@@ -12545,8 +12783,6 @@ impl DemoApp {
                             ui.label(egui::RichText::new(empty).size(13.0).color(theme::INK_2));
                             return;
                         }
-
-                        let mut need_divider = false;
 
                         let card_header = |ui: &mut egui::Ui, title: &str, badge: &str, badge_col: Color32, inner_w: f32| {
                             ui.horizontal(|ui| {
@@ -12567,177 +12803,125 @@ impl DemoApp {
                             });
                         };
 
-                        if show_builtin {
-                            theme::section_label(ui, "Built-in");
-                            ui.add_space(8.0);
-                            ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = gap;
-                                Self::plugin_card(ui, card_w, |ui, iw| {
-                                    card_header(ui, "Metronome", "BUILT-IN", theme::LIVE_TEAL, iw);
-                                    ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("tempo · tap · count-in").size(12.0).color(theme::INK_2));
-                                    ui.add_space(12.0);
-                                    if theme::primary_button(ui, "Add to rig").clicked() {
-                                        add_metro = true;
+                        // In the overview a badge names the subcategory too;
+                        // a type view already heads each group with it.
+                        let show_sub_badge = self.plugin_category == PluginCategory::All;
+                        let draw_entry_grid = |ui: &mut egui::Ui, items: &[&crate::plugins::Entry], action: &mut Option<BrowserAction>| {
+                            for row in items.chunks(cols) {
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = gap;
+                                    for e in row {
+                                        let card = BrowserCard::of(e);
+                                        Self::plugin_card(ui, card_w, |ui, iw| {
+                                            let fmt = match e.format() {
+                                                PluginFormat::BuiltIn => "BUILT-IN",
+                                                PluginFormat::Clap => "CLAP",
+                                                PluginFormat::Lv2 => "LV2",
+                                            };
+                                            let badge = if show_sub_badge { format!("{fmt} · {}", e.sub.badge()) } else { fmt.to_string() };
+                                            let badge_col = match e.ty() {
+                                                PluginType::Instrument => theme::ACCENT_BRIGHT,
+                                                PluginType::Effect => theme::LIVE_TEAL,
+                                                PluginType::MidiFx => theme::MIDI_BLUE,
+                                                PluginType::Utility => theme::CREAM_META,
+                                            };
+                                            card_header(ui, e.name(), &badge, badge_col, iw);
+                                            ui.add_space(4.0);
+                                            ui.add(
+                                                egui::Label::new(egui::RichText::new(&card.subtitle).size(12.0).color(theme::INK_2))
+                                                    .truncate(),
+                                            )
+                                            .on_hover_text(&card.id);
+                                            ui.add_space(10.0);
+                                            ui.horizontal(|ui| {
+                                                ui.set_min_height(26.0);
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                if let Some(note) = card.note {
+                                                    ui.label(egui::RichText::new(note).size(11.5).color(theme::CREAM_DIM));
+                                                }
+                                                for (i, (label, hint, act)) in card.actions.into_iter().enumerate() {
+                                                    let resp = if i == 0 { theme::primary_button(ui, label) } else { theme::chip_button(ui, label, false) };
+                                                    if resp.on_hover_text(hint).clicked() {
+                                                        *action = Some(act);
+                                                    }
+                                                }
+                                            });
+                                        });
                                     }
                                 });
-                                if cols > 1 {
-                                    Self::plugin_card(ui, card_w, |ui, iw| {
-                                        card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
-                                        ui.add_space(4.0);
-                                        ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
-                                        ui.add_space(12.0);
-                                        if theme::primary_button(ui, "Add MIDI strip").clicked() {
-                                            add_midi_fx = Some((None, "Transpose".to_string()));
-                                        }
-                                    });
-                                }
-                            });
-                            if cols == 1 {
                                 ui.add_space(gap);
-                                Self::plugin_card(ui, card_w, |ui, iw| {
-                                    card_header(ui, "MIDI transpose", "MIDI FX", theme::LIVE_TEAL, iw);
-                                    ui.add_space(4.0);
-                                    ui.label(egui::RichText::new("shifts every note, between keys and synth").size(12.0).color(theme::INK_2));
-                                    ui.add_space(12.0);
-                                    if theme::primary_button(ui, "Add MIDI strip").clicked() {
-                                        add_midi_fx = Some((None, "Transpose".to_string()));
-                                    }
-                                });
+                            }
+                        };
+
+                        let mut need_divider = false;
+                        let mut divider = |ui: &mut egui::Ui| {
+                            if need_divider {
+                                ui.add_space(10.0);
+                                Self::stage_hairline(ui);
+                                ui.add_space(10.0);
                             }
                             need_divider = true;
-                        }
-
-                        if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Clap)
-                            && (!clap_matches.is_empty() || filter.is_empty())
-                        {
-                            if need_divider {
-                                ui.add_space(14.0);
-                                Self::stage_hairline(ui);
-                                ui.add_space(14.0);
-                            }
-                            theme::section_label(ui, &format!("CLAP instruments ({})", clap_matches.len()));
-                            ui.add_space(8.0);
-                            if clap_matches.is_empty() {
-                                ui.label(egui::RichText::new("No CLAP plugins found.").size(12.5).color(theme::INK_2));
-                            } else {
-                                for row in clap_matches.chunks(cols) {
-                                    ui.horizontal_top(|ui| {
-                                        ui.spacing_mut().item_spacing.x = gap;
-                                        for p in row {
-                                            Self::plugin_card(ui, card_w, |ui, iw| {
-                                                card_header(ui, &p.name, "CLAP", theme::ACCENT_BRIGHT, iw);
-                                                ui.add_space(4.0);
-                                                let vendor = if !p.vendor.is_empty() && p.vendor != "?" {
-                                                    p.vendor.as_str()
-                                                } else {
-                                                    "instrument plugin"
-                                                };
-                                                ui.add(
-                                                    egui::Label::new(egui::RichText::new(vendor).size(12.0).color(theme::INK_2))
-                                                        .truncate(),
-                                                );
-                                                ui.add_space(12.0);
-                                                if theme::primary_button(ui, "New rig")
-                                                    .on_hover_text(format!("{} · create Keys → {} → Master", p.id, p.name))
-                                                    .clicked()
-                                                {
-                                                    add_clap = Some((p.id.clone(), p.name.clone()));
-                                                }
-                                            });
+                        };
+                        match self.plugin_category.plugin_type() {
+                            // The overview: one row per type, with a jump into
+                            // the full type view when the row cut some off.
+                            None => {
+                                for ty in PluginType::ALL {
+                                    let group: Vec<&crate::plugins::Entry> = entries.iter().filter(|e| e.ty() == ty).collect();
+                                    if group.is_empty() {
+                                        continue;
+                                    }
+                                    divider(ui);
+                                    let truncated = filter.is_empty() && group.len() > cols;
+                                    ui.horizontal(|ui| {
+                                        ui.set_min_height(26.0);
+                                        theme::section_label(ui, &format!("{} ({})", ty.label(), group.len()));
+                                        if truncated {
+                                            ui.add_space(10.0);
+                                            if theme::chip_button(ui, &format!("See all {}", group.len()), false).clicked() {
+                                                action = Some(BrowserAction::ShowType(ty));
+                                            }
                                         }
                                     });
-                                    ui.add_space(gap);
+                                    ui.add_space(6.0);
+                                    draw_entry_grid(ui, &group[..if truncated { cols } else { group.len() }], &mut action);
                                 }
                             }
-                            need_divider = true;
-                        }
-
-                        if matches!(self.plugin_category, PluginCategory::All | PluginCategory::Lv2)
-                            && (!lv2_matches.is_empty() || filter.is_empty())
-                        {
-                            if need_divider {
-                                ui.add_space(14.0);
-                                Self::stage_hairline(ui);
-                                ui.add_space(14.0);
-                            }
-                            theme::section_label(ui, &format!("LV2 plugins ({})", lv2_matches.len()));
-                            ui.add_space(8.0);
-                            if lv2_matches.is_empty() {
-                                ui.label(egui::RichText::new("No LV2 plugins found.").size(12.5).color(theme::INK_2));
-                            } else {
-                                for row in lv2_matches.chunks(cols) {
-                                    ui.horizontal_top(|ui| {
-                                        ui.spacing_mut().item_spacing.x = gap;
-                                        for p in row {
-                                            Self::plugin_card(ui, card_w, |ui, iw| {
-                                                let (badge, bcol) = if p.is_midi_fx {
-                                                    ("MIDI FX", theme::LIVE_TEAL)
-                                                } else if p.is_instrument {
-                                                    ("INST", theme::LIVE_TEAL)
-                                                } else {
-                                                    ("FX", theme::INK_2)
-                                                };
-                                                card_header(ui, &p.name, badge, bcol, iw);
-                                                ui.add_space(4.0);
-                                                ui.add(
-                                                    egui::Label::new(egui::RichText::new(&p.uri).size(11.0).color(theme::INK_2))
-                                                        .truncate(),
-                                                );
-                                                ui.add_space(12.0);
-                                                if p.is_midi_fx {
-                                                    if theme::primary_button(ui, "Add MIDI strip").on_hover_text(&p.uri).clicked() {
-                                                        add_midi_fx = Some((Some(p.uri.clone()), p.name.clone()));
-                                                    }
-                                                    return;
-                                                }
-                                                ui.horizontal(|ui| {
-                                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                                    let inst_resp = if p.is_instrument {
-                                                        theme::primary_button(ui, "Add instrument")
-                                                    } else {
-                                                        theme::chip_button(ui, "Add instrument", false)
-                                                    };
-                                                    if inst_resp.on_hover_text(&p.uri).clicked() {
-                                                        add_lv2 = Some((p.uri.clone(), p.name.clone(), true));
-                                                    }
-                                                    let fx_resp = if p.is_instrument {
-                                                        theme::chip_button(ui, "Add effect", false)
-                                                    } else {
-                                                        theme::primary_button(ui, "Add effect")
-                                                    };
-                                                    if fx_resp.on_hover_text(&p.uri).clicked() {
-                                                        add_lv2 = Some((p.uri.clone(), p.name.clone(), false));
-                                                    }
-                                                });
-                                            });
-                                        }
-                                    });
-                                    ui.add_space(gap);
+                            // A type view: grouped by subcategory.
+                            Some(ty) => {
+                                for &sub in PluginSubtype::subtypes_for(ty) {
+                                    let group: Vec<&crate::plugins::Entry> = entries.iter().filter(|e| e.sub == sub).collect();
+                                    if group.is_empty() {
+                                        continue;
+                                    }
+                                    divider(ui);
+                                    theme::section_label(ui, &format!("{} ({})", sub.label(), group.len()));
+                                    ui.add_space(8.0);
+                                    draw_entry_grid(ui, &group, &mut action);
                                 }
                             }
                         }
                     });
 
-                if add_metro {
-                    self.add_metronome_to_active_rig();
-                }
-                if let Some((uri, name)) = add_midi_fx {
-                    self.add_midi_fx_to_active_rig(uri.as_deref(), &name);
-                }
-                if let Some((id, name)) = add_clap {
-                    self.add_clap_rig(&id, &name);
-                }
-                if let Some((uri, name, as_inst)) = add_lv2 {
-                    if as_inst {
-                        self.add_lv2_instrument(&uri, &name);
-                    } else {
-                        self.add_lv2_effect(&uri, &name);
-                    }
-                }
-                if let Some(id) = install_request {
-                    if let Err(e) = self.start_install(&id) {
-                        self.plugin_msg = format!("Install: {e}");
+                if let Some(act) = action {
+                    match act {
+                        BrowserAction::NewClapRig(id, name) => self.add_clap_rig(&id, &name),
+                        BrowserAction::NewLv2Rig(uri, name) => self.add_lv2_instrument_rig(&uri, &name),
+                        BrowserAction::AddInstrument(kind, name) => self.add_instrument_to_active_rig(kind, &name),
+                        BrowserAction::AddEffect(kind, name) => self.add_effect_to_active_rig(kind, &name),
+                        BrowserAction::AddMasterEffect(kind, name) => self.add_effect_to_master(kind, &name),
+                        BrowserAction::AddArp => self.add_arp_to_active_rig(),
+                        BrowserAction::AddMetronome => self.add_metronome_to_active_rig(),
+                        BrowserAction::AddMidiFx(uri, name) => self.add_midi_fx_to_active_rig(uri.as_deref(), &name),
+                        BrowserAction::Install(id) => {
+                            if let Err(e) = self.start_install(&id) {
+                                self.plugin_msg = format!("Install: {e}");
+                            }
+                        }
+                        BrowserAction::ShowType(ty) => {
+                            self.plugin_category = PluginCategory::of_type(ty);
+                            self.plugin_subtype = None;
+                        }
                     }
                 }
             });
@@ -17699,8 +17883,9 @@ impl DemoApp {
         }
     }
 
-    /// The insert picker (#74): built-in DSP effects and the installed LV2
-    /// effects (from the background scan — rule 57), with a filter.
+    /// The insert picker (#74): built-in DSP effects and installed LV2 audio
+    /// effects/utilities (from the background scan — rule 57), organized by
+    /// effect category with a live filter.
     fn insert_picker_ui(&mut self, ctx: &egui::Context, edits: &mut Vec<PendingInsertEdit>) {
         let Some(source) = self.insert_pick else { return };
         let mut chosen: Option<(NodeKind, String)> = None;
@@ -17708,7 +17893,7 @@ impl DemoApp {
         let screen = self.stage_rect;
         let area = egui::Area::new(egui::Id::unique("insert_picker"))
             .order(egui::Order::Foreground)
-            .fixed_pos(screen.center() - egui::vec2(150.0, 160.0))
+            .fixed_pos(screen.center() - egui::vec2(175.0, 190.0))
             .constrain(true)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -17718,44 +17903,106 @@ impl DemoApp {
                     .inner_margin(egui::Margin::same(10))
                     .shadow(egui::Shadow { offset: [0, 6], blur: 16, spread: 0, color: Color32::from_black_alpha(130) })
                     .show(ui, |ui| {
-                        ui.set_min_width(280.0);
+                        ui.set_width(340.0);
                         ui.label(egui::RichText::new("Add insert").font(theme::medium_font(12.5)).color(theme::INK));
                         ui.add_space(4.0);
-                        let words: Vec<String> = self.insert_filter.to_lowercase().split_whitespace().map(str::to_string).collect();
                         ui.add_sized([ui.available_width(), 20.0],
-                            egui::TextEdit::singleline(&mut self.insert_filter).hint_text("filter effects…"));
-                        ui.add_space(4.0);
-                        egui::ScrollArea::vertical().id_salt("insert_picker_scroll").max_height(240.0).auto_shrink([false, false]).show(ui, |ui| {
-                            let matches = |name: &str| {
-                                let low = name.to_lowercase();
-                                words.iter().all(|w| low.contains(w.as_str()))
-                            };
+                            egui::TextEdit::singleline(&mut self.insert_filter).hint_text("filter effects by name or category…"));
+                        ui.add_space(6.0);
+                        // Category chips: a few hundred LV2 effects are too many to scroll.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                            if theme::wrapped_chip_button(ui, "All", self.insert_subtype.is_none() && !self.insert_builtin_only).clicked() {
+                                self.insert_subtype = None;
+                                self.insert_builtin_only = false;
+                            }
+                            if theme::wrapped_chip_button(ui, "Built-in", self.insert_builtin_only).clicked() {
+                                self.insert_builtin_only = !self.insert_builtin_only;
+                                if self.insert_builtin_only {
+                                    self.insert_subtype = None;
+                                }
+                            }
+                            for (sub, lbl) in [
+                                (PluginSubtype::DelayReverb, "Delay & Reverb"),
+                                (PluginSubtype::EqFilter, "EQ & Filter"),
+                                (PluginSubtype::Dynamics, "Dynamics"),
+                                (PluginSubtype::DriveAmp, "Drive & Amp"),
+                                (PluginSubtype::Modulation, "Modulation"),
+                                (PluginSubtype::Analyzer, "Analyzers"),
+                            ] {
+                                let on = self.insert_subtype == Some(sub) && !self.insert_builtin_only;
+                                if theme::wrapped_chip_button(ui, lbl, on).clicked() {
+                                    self.insert_builtin_only = false;
+                                    self.insert_subtype = if on { None } else { Some(sub) };
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        let filter = self.insert_filter.trim().to_string();
+                        egui::ScrollArea::vertical().id_salt("insert_picker_scroll").max_height(250.0).auto_shrink([false, false]).show(ui, |ui| {
                             let mut shown = 0usize;
-                            for (kind, label) in [
+                            let dsp_items = [
                                 (DspKind::Delay, "Delay"), (DspKind::Reverb, "Reverb"), (DspKind::Filter, "Filter"),
                                 (DspKind::Eq3, "Eq 3"), (DspKind::Saturation, "Saturation"), (DspKind::Limiter, "Limiter"),
                                 (DspKind::Gain, "Gain"), (DspKind::Pan, "Pan"),
-                            ] {
-                                if !words.is_empty() && !matches(label) { continue; }
-                                shown += 1;
-                                if theme::chip_button(ui, label, false).clicked() {
-                                    chosen = Some((NodeKind::Dsp(kind), label.to_string()));
-                                }
-                            }
-                            if self.plugin_lists_ready() {
-                                for p in self.plugins_lv2.iter().filter(|p| !p.is_instrument) {
-                                    if !words.is_empty() && !matches(&p.name) { continue; }
-                                    if shown > 200 { break; }
+                            ];
+                            let matched_dsp: Vec<(DspKind, &str)> = dsp_items
+                                .into_iter()
+                                .filter(|(k, label)| {
+                                    let sub = classify_dsp(k);
+                                    if self.insert_subtype.is_some_and(|s| s != sub) { return false; }
+                                    matches_query(&[label, sub.plugin_type().label(), sub.label(), "built-in builtin"], &filter)
+                                })
+                                .collect();
+                            if !matched_dsp.is_empty() {
+                                theme::section_label(ui, "Built-in");
+                                ui.add_space(4.0);
+                                for (kind, label) in matched_dsp {
                                     shown += 1;
-                                    if theme::chip_button(ui, &p.name, false).on_hover_text(&p.uri).clicked() {
-                                        chosen = Some((NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) }, p.name.clone()));
+                                    if theme::chip_button(ui, label, false).clicked() {
+                                        chosen = Some((NodeKind::Dsp(kind), label.to_string()));
                                     }
                                 }
-                            } else if words.is_empty() {
-                                ui.label(egui::RichText::new("scanning installed LV2 effects in the background…").size(11.0).color(theme::INK_2));
                             }
-                            if words.is_empty() {
-                                ui.label(egui::RichText::new("filter to see LV2 effects too").size(10.5).color(theme::CREAM_DIM));
+                            if !self.insert_builtin_only {
+                                if self.plugin_lists_ready() {
+                                    let mut lv2_fx: Vec<(&Lv2PluginInfo, PluginSubtype)> = self
+                                        .plugins_lv2
+                                        .iter()
+                                        .filter(|p| lv2_is_audio_insert(p))
+                                        .filter_map(|p| {
+                                            let sub = classify_lv2(p);
+                                            if self.insert_subtype.is_some_and(|s| s != sub) { return None; }
+                                            let cls = lv2_class_label(&p.lv2_class);
+                                            if !matches_query(&[&p.name, &p.author, &p.uri, cls, sub.plugin_type().label(), sub.label(), "lv2"], &filter) {
+                                                return None;
+                                            }
+                                            Some((p, sub))
+                                        })
+                                        .collect();
+                                    lv2_fx.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase())));
+                                    let mut last_sub: Option<PluginSubtype> = None;
+                                    for (p, sub) in lv2_fx {
+                                        if shown > 200 { break; }
+                                        if last_sub != Some(sub) {
+                                            if shown > 0 { ui.add_space(6.0); }
+                                            theme::section_label(ui, sub.label());
+                                            ui.add_space(3.0);
+                                            last_sub = Some(sub);
+                                        }
+                                        shown += 1;
+                                        if theme::chip_button(ui, &p.name, false).on_hover_text(lv2_subtitle(p)).clicked() {
+                                            chosen = Some((NodeKind::Lv2 { uri: Lv2Uri::new(&p.uri) }, p.name.clone()));
+                                        }
+                                    }
+                                } else if filter.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.label(egui::RichText::new("scanning installed LV2 effects in the background…").size(11.0).color(theme::INK_2));
+                                }
+                            }
+                            if shown == 0 {
+                                ui.label(egui::RichText::new("No matching effects.").size(11.5).color(theme::INK_2));
                             }
                         });
                     });
@@ -17766,6 +18013,8 @@ impl DemoApp {
         if chosen.is_some() || close {
             self.insert_pick = None;
             self.insert_filter.clear();
+            self.insert_subtype = None;
+            self.insert_builtin_only = false;
             if let Some((kind, name)) = chosen {
                 edits.push(PendingInsertEdit { source, edit: StripInsertEdit::Add { kind, name } });
             }
@@ -20797,20 +21046,19 @@ pub fn run_session_test() -> anyhow::Result<()> {
         println!("  template '{}': {} units, {} cables, {} stack col(s), {} row(s) — OK",
             t.title(), app.units.len(), app.cables.len(), app.stack_cols.len(), app.layout_rows);
     }
-    // --- LV2 plugin-browser graphs (task-18 effect / task-20 instrument) ---
-    // Effect chain: Keys→Surge→LV2→Master (+dry) = 4 units, 4 cables.
-    app.add_lv2_effect("http://example.org/lv2/gain", "TEST GAIN");
-    anyhow::ensure!(app.units.len() == 4, "lv2 effect unit count");
-    anyhow::ensure!(app.cables.len() == 4, "lv2 effect cable count");
-    // Instrument rig: Keys→LV2→Master = 3 units, 2 cables (1 MIDI + 1 audio).
-    app.add_lv2_instrument("http://example.org/lv2/osc", "TEST OSC");
-    anyhow::ensure!(app.units.len() == 3, "lv2 instrument unit count");
-    anyhow::ensure!(app.cables.len() == 2, "lv2 instrument cable count");
-    anyhow::ensure!(app.keys_unit.is_some() && app.master_unit.is_some(), "lv2 instrument keys/master");
-    let n_midi = app.cables.iter().filter(|c| c.kind == PortKind::Midi).count();
-    let n_audio = app.cables.iter().filter(|c| c.kind == PortKind::Audio).count();
-    anyhow::ensure!(n_midi == 1 && n_audio == 1, "lv2 instrument cable kinds (midi={n_midi} audio={n_audio})");
-    println!("  lv2 browser: effect 4u/4c, instrument 3u/2c (1 MIDI + 1 audio) — OK");
+    // --- Plugins browser adds never wipe the rack: an LV2 effect joins the
+    // active rig, an LV2 instrument becomes a rig beside the others. ---
+    let (units, rigs) = (app.units.len(), app.rig_count());
+    app.add_effect_to_active_rig(NodeKind::Lv2 { uri: Lv2Uri::new("http://example.org/lv2/gain") }, "TEST GAIN");
+    anyhow::ensure!(app.units.len() == units + 1, "lv2 effect joins the rack ({units} -> {} units): {}", app.units.len(), app.plugin_msg);
+    app.add_lv2_instrument_rig("http://example.org/lv2/osc", "TEST OSC");
+    anyhow::ensure!(app.rig_count() == rigs + 1, "lv2 instrument rig beside the others: {}", app.plugin_msg);
+    let osc = app.units.iter().position(|u| u.name == "TEST OSC")
+        .ok_or_else(|| anyhow::anyhow!("lv2 instrument unit missing"))?;
+    let n_midi = app.cables.iter().filter(|c| c.kind == PortKind::Midi && c.dst == osc).count();
+    let n_audio = app.cables.iter().filter(|c| c.kind == PortKind::Audio && c.src == osc).count();
+    anyhow::ensure!(n_midi == 1 && n_audio == 2, "lv2 instrument cables (midi in={n_midi}, audio out={n_audio})");
+    println!("  plugins browser: effect joins rig, instrument rig added (1 MIDI in, 2 audio out) — OK");
 
     // --- Ctrl+drag rearrange (task-21): reorder must keep a valid partition and
     // reflow with no overlaps; unit indices (cable endpoints) stay untouched. ---
@@ -21303,7 +21551,7 @@ impl EvalRig {
             }
             EvalStart::TwoRigs => self.app.load_multi_rig_demo(),
             EvalStart::SurgeAndYanes => self.load_two_rigs("YANES", crate::control::plugin_rig_graph(EVAL_YANES, "YANES")),
-            EvalStart::SurgeAndOrgan => self.load_two_rigs("Organ", DemoApp::build_lv2_instrument_graph(EVAL_ORGAN, "setBfree")),
+            EvalStart::SurgeAndOrgan => self.load_two_rigs("Organ", crate::control::instrument_rig_graph(NodeKind::Lv2 { uri: Lv2Uri::new(EVAL_ORGAN) }, "setBfree")),
             EvalStart::OneRigMetronome => {
                 let mut g = crate::control::standard_rig_graph(true);
                 let master = eval_node(&g, 0, "master", |k| matches!(k, NodeKind::MasterOut)).map_err(anyhow::Error::msg)?;
@@ -25056,7 +25304,7 @@ mod split_bpm_tests {
         }
         let mut app = DemoApp::new_with_sink(None);
         let ctx = egui::Context::default();
-        app.add_lv2_instrument("urn:distrho:vitalium", "Vitalium");
+        app.add_lv2_instrument_rig("urn:distrho:vitalium", "Vitalium");
         frame(&mut app, &ctx, vec![]);
         let u = app.units.iter().find(|u| u.lv2_inst).expect("Vitalium unit");
         assert!(u.lv2_inst, "Vitalium must be classified as lv2_inst");
@@ -25076,11 +25324,11 @@ mod split_bpm_tests {
     #[test]
     fn session_load_classifies_lv2_from_the_background_scan() {
         let uri = "urn:test:organ";
-        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst, is_midi_fx: false };
+        let info = |inst| Lv2PluginInfo { uri: uri.into(), name: "Organ".into(), num_ports: 3, is_instrument: inst, ..Default::default() };
         let mut app = DemoApp::new_with_sink(None);
         app.plugins_lv2 = vec![info(false)];
         app.plugins_loaded = true;
-        let s = crate::session::Session::new("organ", DemoApp::build_lv2_instrument_graph(uri, "Organ"));
+        let s = crate::session::Session::new("organ", crate::control::instrument_rig_graph(NodeKind::Lv2 { uri: Lv2Uri::new(uri) }, "Organ"));
         app.apply_session(&s).unwrap();
         let node = s.graph.nodes.iter().find(|n| matches!(n.kind, NodeKind::Lv2 { .. })).unwrap().id;
         let organ = |app: &DemoApp| app.units.iter().position(|u| u.node_id == node).expect("organ unit");
@@ -25980,9 +26228,9 @@ mod stage_views_tests {
         app.plugins_lv2 = vec![Lv2PluginInfo {
             uri: "http://example.org/lv2/verb".into(),
             name: "Lush Verb".into(),
+            lv2_class: "ReverbPlugin".into(),
             num_ports: 4,
-            is_instrument: false,
-            is_midi_fx: false,
+            ..Default::default()
         }];
         let ctx = egui::Context::default();
         let size = Vec2::new(1600.0, 1000.0);
@@ -26077,9 +26325,9 @@ mod stage_views_tests {
         app.plugins_lv2 = vec![Lv2PluginInfo {
             uri: "http://example.org/lv2/reverb".into(),
             name: "Room Reverb".into(),
+            lv2_class: "ReverbPlugin".into(),
             num_ports: 4,
-            is_instrument: false,
-            is_midi_fx: false,
+            ..Default::default()
         }];
         app.stage_view = StageView::Plugins;
         let ctx = egui::Context::default();
@@ -26092,7 +26340,7 @@ mod stage_views_tests {
         assert!(!bg.iter().any(|t| t == "Metronome"));
 
         app.plugin_filter.clear();
-        app.plugin_category = PluginCategory::Clap;
+        app.plugin_category = PluginCategory::Instruments;
         let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
         assert!(bg.iter().any(|t| t == "Surge XT"));
         assert!(!bg.iter().any(|t| t == "Room Reverb"));
@@ -26110,7 +26358,7 @@ mod stage_views_tests {
             features: vec!["instrument".into()],
         }];
         app.stage_view = StageView::Plugins;
-        app.plugin_category = PluginCategory::Clap;
+        app.plugin_category = PluginCategory::Instruments;
         let ctx = egui::Context::default();
         let size = Vec2::new(1600.0, 1000.0);
         let run = |app: &mut DemoApp, events: Vec<egui::Event>| {
@@ -26143,6 +26391,196 @@ mod stage_views_tests {
         assert_eq!(app.stage_view, StageView::Rack, "clicking New rig returns to the rack");
         assert!(app.units.iter().any(|u| u.name == "DEXED"), "rack rebuilt with the chosen plugin");
         assert!(app.plugin_msg.contains("New Dexed rig"), "{}", app.plugin_msg);
+        assert_eq!(app.rig_count(), 2, "New rig keeps the existing rig instead of wiping it");
+    }
+
+    #[test]
+    fn plugins_stage_organizes_by_type_subcategory_and_format_and_adds_nondestructively() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_clap = vec![
+            ClapPluginInfo {
+                id: SURGE_ID.into(),
+                name: "Surge XT".into(),
+                vendor: "Surge Synth Team".into(),
+                features: vec!["instrument".into(), "synthesizer".into()],
+            },
+            ClapPluginInfo {
+                id: "org.surge-synth-team.surge-xt-fx".into(),
+                name: "Surge XT Effects".into(),
+                vendor: "Surge Synth Team".into(),
+                features: vec!["audio-effect".into(), "multi-effects".into()],
+            },
+        ];
+        app.plugins_lv2 = vec![
+            Lv2PluginInfo {
+                uri: "http://gareus.org/oss/lv2/b_synth".into(),
+                name: "setBfree DSP Tonewheel Organ".into(),
+                author: "Robin Gareus".into(),
+                lv2_class: "InstrumentPlugin".into(),
+                num_ports: 4,
+                is_instrument: true,
+                is_midi_fx: false,
+            },
+            Lv2PluginInfo {
+                uri: "http://lsp-plug.in/plugins/lv2/compressor_lr".into(),
+                name: "LSP Compressor Stereo".into(),
+                author: "LSP Plugins".into(),
+                lv2_class: "CompressorPlugin".into(),
+                num_ports: 12,
+                is_instrument: false,
+                is_midi_fx: false,
+            },
+            Lv2PluginInfo {
+                uri: "http://guitarix.sourceforge.net/plugins/gx_zita_rev1_stereo".into(),
+                name: "GxZita Reverb".into(),
+                author: "Guitarix".into(),
+                lv2_class: "ReverbPlugin".into(),
+                num_ports: 8,
+                is_instrument: false,
+                is_midi_fx: false,
+            },
+            Lv2PluginInfo {
+                uri: "http://kxstudio.sf.net/carla/plugins/miditranspose".into(),
+                name: "Carla MIDI Transpose".into(),
+                author: "falkTX".into(),
+                lv2_class: "UtilityPlugin".into(),
+                num_ports: 3,
+                is_instrument: false,
+                is_midi_fx: true,
+            },
+            Lv2PluginInfo {
+                uri: "http://guitarix.sourceforge.net/plugins/gxtuner#tuner".into(),
+                name: "GxTuner".into(),
+                author: "Guitarix".into(),
+                lv2_class: "AnalyserPlugin".into(),
+                num_ports: 4,
+                is_instrument: false,
+                is_midi_fx: false,
+            },
+        ];
+        app.stage_view = StageView::Plugins;
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+
+        // Instruments lists CLAP and LV2 instruments and no effect.
+        app.plugin_category = PluginCategory::Instruments;
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Surge XT"), "CLAP synth in Instruments: {bg:?}");
+        assert!(bg.iter().any(|t| t == "setBfree DSP Tonewheel Organ"), "LV2 organ in Instruments: {bg:?}");
+        assert!(!bg.iter().any(|t| t == "Surge XT Effects"), "CLAP FX stays out of Instruments");
+        assert!(!bg.iter().any(|t| t == "LSP Compressor Stereo"), "LV2 FX stays out of Instruments");
+
+        // Effects › Dynamics: the built-in Limiter and the LV2 compressor, no reverb.
+        app.plugin_category = PluginCategory::Effects;
+        app.plugin_subtype = Some(PluginSubtype::Dynamics);
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "LSP Compressor Stereo"), "LV2 compressor in Dynamics: {bg:?}");
+        assert!(bg.iter().any(|t| t == "Limiter"), "built-in limiter in Dynamics: {bg:?}");
+        assert!(!bg.iter().any(|t| t == "GxZita Reverb"), "reverb filtered out of Dynamics");
+
+        // Effects › Multi-FX: Surge XT Effects, marked not hostable, without a New rig button.
+        app.plugin_subtype = Some(PluginSubtype::MultiFx);
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Surge XT Effects"), "CLAP FX under Multi-FX: {bg:?}");
+        assert!(bg.iter().any(|t| t == "CLAP audio effects not hostable yet"), "non-hostable note shown: {bg:?}");
+        assert!(!bg.iter().any(|t| t == "New rig"), "CLAP FX never gets a New rig button");
+
+        // The format filter: Built-in shows the built-in delay and reverb, not the LV2 one.
+        app.plugin_subtype = Some(PluginSubtype::DelayReverb);
+        app.plugin_format = Some(PluginFormat::BuiltIn);
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Delay") && bg.iter().any(|t| t == "Reverb"));
+        assert!(!bg.iter().any(|t| t == "GxZita Reverb"));
+        app.plugin_format = None;
+
+        // MIDI FX: the built-in arpeggiator and transposer and the LV2 MIDI plugin.
+        app.plugin_category = PluginCategory::MidiFx;
+        app.plugin_subtype = None;
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Arpeggiator"), "built-in Arp in MIDI FX: {bg:?}");
+        assert!(bg.iter().any(|t| t == "MIDI transpose"));
+        assert!(bg.iter().any(|t| t == "Carla MIDI Transpose"));
+
+        // Utilities: the metronome and the LV2 tuner.
+        app.plugin_category = PluginCategory::Utilities;
+        let (bg, _) = run_frame(&mut app, &ctx, size, vec![]);
+        assert!(bg.iter().any(|t| t == "Metronome"));
+        assert!(bg.iter().any(|t| t == "GxTuner"));
+
+        // add_rig refuses a CLAP audio effect.
+        let refuse = app.exec_tool("add_rig", &serde_json::json!({"plugin_id": "org.surge-synth-team.surge-xt-fx"}));
+        assert!(refuse.contains("not a CLAP instrument"), "{refuse}");
+
+        // Add to rig chains the effect into the active rig and keeps every unit.
+        let before_units = app.units.len();
+        app.add_effect_to_active_rig(
+            NodeKind::Lv2 { uri: Lv2Uri::new("http://lsp-plug.in/plugins/lv2/compressor_lr") },
+            "LSP Compressor Stereo",
+        );
+        assert_eq!(app.stage_view, StageView::Rack);
+        assert_eq!(app.units.len(), before_units + 1, "effect added without wiping the rack");
+
+        // Master FX inserts after the master.
+        app.stage_view = StageView::Plugins;
+        app.add_effect_to_master(NodeKind::Dsp(DspKind::Limiter), "Limiter");
+        assert_eq!(app.stage_view, StageView::Rack);
+        assert!(!app.master_chain().is_empty(), "master insert added");
+
+        // New rig adds a rig beside rig A.
+        let rigs_before = app.rig_count();
+        app.stage_view = StageView::Plugins;
+        app.add_lv2_instrument_rig("http://gareus.org/oss/lv2/b_synth", "setBfree");
+        assert_eq!(app.stage_view, StageView::Rack);
+        assert_eq!(app.rig_count(), rigs_before + 1);
+    }
+
+    #[test]
+    fn insert_picker_excludes_lv2_midi_fx_and_filters_by_category() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.plugins_loaded = true;
+        app.plugins_lv2 = vec![
+            Lv2PluginInfo {
+                uri: "http://lsp-plug.in/plugins/lv2/compressor_lr".into(),
+                name: "LSP Compressor".into(),
+                author: "LSP Plugins".into(),
+                lv2_class: "CompressorPlugin".into(),
+                num_ports: 12,
+                is_instrument: false,
+                is_midi_fx: false,
+            },
+            Lv2PluginInfo {
+                uri: "http://kxstudio.sf.net/carla/plugins/miditranspose".into(),
+                name: "Carla MIDI Transpose".into(),
+                author: "falkTX".into(),
+                lv2_class: "UtilityPlugin".into(),
+                num_ports: 3,
+                is_instrument: false,
+                is_midi_fx: true,
+            },
+        ];
+        app.stage_view = StageView::Mixer;
+        let surge_id = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+        app.insert_pick = Some(Some(surge_id));
+        app.insert_subtype = Some(PluginSubtype::Dynamics);
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 800.0);
+        let mut texts = Vec::new();
+        for i in 0..3 {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, size));
+            raw.time = Some(i as f64);
+            let mut out = ctx.run_ui(raw, |ui| app.frame_ui(ui));
+            out.textures_delta.clear();
+            texts.clear();
+            for cs in &out.shapes {
+                walk_texts(&cs.shape, &mut texts);
+            }
+        }
+        assert!(texts.iter().any(|t| t == "LSP Compressor"), "Dynamics LV2 appears in insert picker: {texts:?}");
+        assert!(texts.iter().any(|t| t == "Limiter"), "built-in Limiter appears under Dynamics");
+        assert!(!texts.iter().any(|t| t == "Carla MIDI Transpose"), "MIDI FX never appears in audio insert picker");
+        assert!(!texts.iter().any(|t| t == "Delay"), "Delay filtered out when Dynamics is active");
     }
 
     #[test]
@@ -26964,7 +27402,7 @@ mod ui_polish_agent_tests {
         live.engine.spawn_lv2_loader();
         live.run_batch(vec![call("load_template", serde_json::json!({"name": "multi_rig"}))]);
         for _ in 0..6 { live.frame(); }
-        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        let lv2 = |uri: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri: uri.into(), name: uri.into(), num_ports: 4, is_instrument, ..Default::default() };
         live.app.plugins_lv2 = vec![lv2(TEST_ORGAN, true), lv2("urn:test:fx", false)];
         live.app.plugins_loaded = true;
         let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
@@ -26985,9 +27423,43 @@ mod ui_polish_agent_tests {
         assert!(!g.edges.iter().any(|e| e.from.node == fx || e.to.node == fx), "an effect is not wired: {:?}", g.edges);
     }
 
+    /// The Plugins browser's buttons reach the engine, not only the rack:
+    /// "Add to rig" wires an instrument Keys → it → Master L/R in the active
+    /// rig, "Master FX" puts an effect after the master, "New rig" adds a
+    /// rig beside the others, and rig A keeps every unit it had.
+    #[test]
+    fn the_plugins_browser_adds_reach_the_engine_without_wiping_the_rack() {
+        let mut live = Live::new();
+        live.engine.spawn_lv2_loader();
+        let engine_graph = |live: &Live| live.app.graph_pub.as_ref().unwrap().lock().unwrap().graph.clone();
+        let settle = |live: &mut Live| for _ in 0..12 { live.frame(); };
+        let rig_a_before = engine_graph(&live).nodes.iter().filter(|n| n.rig == 0).count();
+
+        live.app.add_instrument_to_active_rig(NodeKind::Lv2 { uri: Lv2Uri::new(TEST_ORGAN) }, "Organ");
+        settle(&mut live);
+        live.app.add_effect_to_master(NodeKind::Lv2 { uri: Lv2Uri::new("urn:test:fx") }, "Fx");
+        settle(&mut live);
+        live.app.add_lv2_instrument_rig(TEST_OSC, "Osc");
+        settle(&mut live);
+
+        let g = engine_graph(&live);
+        let node = |uri: &str| g.nodes.iter().find(|n| matches!(&n.kind, NodeKind::Lv2 { uri: u } if u.as_str() == uri)).unwrap_or_else(|| panic!("{uri} in the engine: {:?}", g.nodes));
+        let in_rig = |rig: u8, kind: fn(&NodeKind) -> bool| g.nodes.iter().find(|n| n.rig == rig && kind(&n.kind)).map(|n| n.id).unwrap();
+        let (keys, master) = (in_rig(0, |k| matches!(k, NodeKind::Keys)), in_rig(0, |k| matches!(k, NodeKind::MasterOut)));
+        let (organ, fx, osc) = (node(TEST_ORGAN), node("urn:test:fx"), node(TEST_OSC));
+        assert_eq!(organ.rig, 0, "Add to rig lands in the active rig");
+        assert!(g.has_route(keys, organ.id, CPortKind::Midi), "Keys -> organ: {:?}", g.edges);
+        assert!(g.has_route_port(organ.id, master, 0, CPortKind::Audio) && g.has_route_port(organ.id, master, 1, CPortKind::Audio), "organ -> Master L/R: {:?}", g.edges);
+        assert!(g.edges.iter().any(|e| e.from.node == master && e.to.node == fx.id), "Master FX is fed by the master: {:?}", g.edges);
+        assert_eq!(osc.rig, 1, "New rig is a rig of its own");
+        let rig_a_after = g.nodes.iter().filter(|n| n.rig == 0).count();
+        assert_eq!(rig_a_after, rig_a_before + 2, "rig A keeps its units and gains the organ and the master FX");
+        assert_eq!(live.app.rig_count(), 2);
+    }
+
     #[test]
     fn the_agent_finds_an_lv2_instrument_behind_hundreds_of_effects() {
-        let lv2 = |uri: String, name: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri, name: name.into(), num_ports: 4, is_instrument, is_midi_fx: false };
+        let lv2 = |uri: String, name: &str, is_instrument| crate::lv2::Lv2PluginInfo { uri, name: name.into(), num_ports: 4, is_instrument, ..Default::default() };
         let mut plugins: Vec<_> = (0..290).map(|i| lv2(format!("http://example.org/fx{i:03}"), "Fx", false)).collect();
         plugins.push(lv2("urn:distrho:vitalium".into(), "Vitalium", true));
         crate::lv2::instruments_first(&mut plugins);
@@ -32140,6 +32612,49 @@ mod offline_shots {
             let mut app = DemoApp::new_with_sink(None);
             app.stage_view = StageView::Plugins;
             shot(&mut app, Vec2::new(w, h), &dir.join(format!("{w}x{h}-plugins.png")));
+        }
+    }
+
+    /// Screenshots of the type-organized Plugins stage (All, Instruments,
+    /// Effects with subcategories, MIDI FX, Utilities, Install) using the
+    /// machine's real scanned CLAP + LV2 plugins.
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat plugin_categories_shots -- --ignored"]
+    fn plugin_categories_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clap = crate::host::list_clap_plugins();
+        let lv2 = crate::lv2::discover();
+        let cases: &[(&str, PluginCategory, Option<PluginSubtype>, Vec2)] = &[
+            ("1600x1000-all.png", PluginCategory::All, None, Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-instruments.png", PluginCategory::Instruments, None, Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-effects.png", PluginCategory::Effects, None, Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-effects-drive.png", PluginCategory::Effects, Some(PluginSubtype::DriveAmp), Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-midifx.png", PluginCategory::MidiFx, None, Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-utilities.png", PluginCategory::Utilities, None, Vec2::new(1600.0, 1000.0)),
+            ("1600x1000-install.png", PluginCategory::Install, None, Vec2::new(1600.0, 1000.0)),
+            ("781x950-effects.png", PluginCategory::Effects, None, Vec2::new(781.0, 950.0)),
+            ("760x520-all.png", PluginCategory::All, None, Vec2::new(760.0, 520.0)),
+        ];
+        {
+            let mut app = DemoApp::new_with_sink(None);
+            app.plugins_loaded = true;
+            app.plugins_lv2 = lv2.clone();
+            app.stage_view = StageView::Mixer;
+            let synth = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+            app.insert_pick = Some(Some(synth));
+            app.insert_subtype = Some(PluginSubtype::Dynamics);
+            shot(&mut app, Vec2::new(1600.0, 1000.0), &dir.join("1600x1000-insert-picker-dynamics.png"));
+        }
+        for (file, cat, sub, size) in cases {
+            let mut app = DemoApp::new_with_sink(None);
+            app.plugins_loaded = true;
+            app.plugins_clap = clap.clone();
+            app.plugins_lv2 = lv2.clone();
+            app.stage_view = StageView::Plugins;
+            app.plugin_category = *cat;
+            app.plugin_subtype = *sub;
+            shot(&mut app, *size, &dir.join(file));
         }
     }
 

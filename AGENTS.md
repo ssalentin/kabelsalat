@@ -1157,6 +1157,16 @@ Learned so far (2026-11-15, UI polish pass):
     built from parts) keeps the engine's target, `Some(OFF)` turns it off.
     A plain default would have switched the target off on every rig add,
     because those rebuild the session from parts (rule 65 class).
+166. **An envelope's window is longer than a cycle of what it follows, and a
+    flaky measurement is judged by its margin:** `transport-test`'s onset
+    detector took the RMS of one 64-frame hop (1.3 ms), shorter than a cycle
+    of the held chord, so most "onsets" were waveform cycles. The gate grid
+    scored 0.27 and a harmonic of the loudness pattern came within 0.5 % of
+    it, so 4 of 74 runs read 2.48 Hz (#18; blamed on "the first run after a
+    build", which it never depended on). `ONSET_WINDOW_HOPS` spans 21 ms
+    (`onsets_of_a_gated_low_chord_sit_on_the_gate_grid`). Before blaming
+    timing, dump the measured signal of 40+ runs and look at how far the
+    passing ones are from the threshold.
 
 ## Working on kabelsalat
 

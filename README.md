@@ -211,9 +211,16 @@ shifts the start. With sync on and the transport rolling, it starts on the next
 bar line.
 
 ### Ask the assistant — or your own AI agent
-The built-in assistant (bring your own DeepSeek or OpenRouter key, entered under
-**Settings → Agent → API keys**) can set things up for you:
-"add a reverb to this rig", "split the keys at C4", "load a warm pad". Everything
+The built-in assistant (bring your own [OpenRouter](https://openrouter.ai/keys)
+key, entered under **Settings → Agent → API key**) can set things up for you:
+"add a reverb to this rig", "split the keys at C4", "load a warm pad". One key
+reaches every model: **Settings → Agent → Models** picks the chat model, the
+decisions model and the listening model, or takes any OpenRouter model id. While
+it works, the assistant says what it is doing ("Planning the next step · after
+Load sound"), and when it listens to your sound a bar shows how long it still
+records, in the dock, on the top bar's button and on the rack's hint line.
+Don't want it? Switch **Assistant** off on the same page and it leaves the top
+bar and the dock. Everything
 an agent changes lights up in the rack, and **Ctrl+Z** undoes the whole request
 in one step. External AI agents (Claude, …) can drive the running app through
 the built-in MCP server; the top bar shows when one is connected and pauses it

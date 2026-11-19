@@ -32,6 +32,14 @@ You need Rust (rustup), `alsa-lib`, `lilv` and PipeWire or ALSA. Surge XT
   architectures, and a PR merges only when it is green. Locally, spend the
   time on what CI cannot test: self-tests with real plugins, audio and MIDI
   hardware.
+- **A bench test.** If your machine could not test something (no audio
+  interface, no MIDI device, no display, nobody listening), say so under
+  `## Bench test` in the PR description: what is needed, the steps and what
+  to expect, or `none: <reason>`. When the PR merges, that section becomes
+  an issue labelled
+  [`bench`](https://github.com/ssalentin/kabelsalat/labels/bench) for a
+  machine that has the devices
+  ([AGENTS.md](AGENTS.md#bench-tests-hand-over-what-this-machine-cannot-test-user-2026-11-19)).
 - **Its README entry.** A new feature updates [README.md](README.md) in the
   same PR — its entry under "What you can do" (or "Install"), plus fresh
   screenshots when it changes what users see (captured with

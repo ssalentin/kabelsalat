@@ -49,6 +49,30 @@ The logic is `scripts/ci/readme-check.sh`, self-tested on real `gh api`
 output (`--selftest`); like every check except the two test jobs it is
 advisory until someone makes it required.
 
+### Bench tests for what no server can check
+
+CI and the development servers have no sound card, MIDI device, display or
+listener. Every PR body says what is left to test on a machine that has
+them, under `## Bench test`: `none: <reason>`, or a `Needs:` line (`audio`,
+`midi`, `display`, `human`) and the steps (AGENTS.md, "Bench tests").
+`.github/workflows/bench.yml` runs `scripts/ci/bench.py` (self-tested on a
+real PR body, `--selftest`):
+
+- `bench-check` fails a PR whose section is missing or malformed. It runs
+  when the PR is opened or its description is edited, and is advisory like
+  `readme-check`.
+- `bench-issue` runs when a PR merges and opens one issue labelled `bench`,
+  `bench:<need>` and the PR's area labels, with the steps and the merge
+  commit. A PR that merged without a valid section gets an issue asking for
+  the steps instead. Release PRs and bot PRs get none. Running it twice
+  opens nothing new; `gh workflow run bench.yml -f pr=<number>` backfills
+  one PR.
+
+A bench session on a machine with the devices works the queue
+(`.claude/skills/bench-session/SKILL.md`): it closes an issue on a pass and
+opens a bug labelled `bench-failed` on a fail. Merges do not wait for any of
+this; releases do (below).
+
 ### Branch protection and a red main
 
 `main` requires `test (x86_64)` and `test (aarch64)`, but not that a branch
@@ -218,7 +242,11 @@ Cut a release with one action:
 gh workflow run prepare-release.yml -f bump=minor   # patch | minor | major | X.Y.Z
 ```
 
-1. `prepare-release.yml` runs `scripts/release.py prepare <bump>`: it bumps
+1. `prepare-release.yml` first runs `scripts/ci/bench.py gate` and stops
+   while an issue labelled `bench` or `bench-failed` is open: a merged
+   change nobody has tested on real hardware. Clear the queue with a bench
+   session, or release anyway with `-f skip_bench=true`. Then it runs
+   `scripts/release.py prepare <bump>`: it bumps
    `Cargo.toml` and `Cargo.lock`, folds the fragments and the Unreleased
    block into `## [X.Y.Z] — <date>` (with compare links), adds the metainfo
    `<release>` entry and deletes the fragments. It opens the PR

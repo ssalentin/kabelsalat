@@ -15,6 +15,7 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::control::{Send, SendSource};
 use crate::control::{
     name_str, split_port, AudioInChannel, Command, CommandDrain, DspKind, Graph, MidiFxPlugin,
     NodeId, NodeKind, ParamId, PortKind, RigSnapshot,
@@ -86,6 +87,10 @@ fn dsp_native_param(kind: &DspKind, p: ParamId) -> Option<u32> {
         },
         // Metronome has no native params: tempo comes from transport SetBpm.
         DspKind::Metronome => None,
+        DspKind::Bus => match p {
+            0 => Some(0),
+            _ => None,
+        },
     }
 }
 
@@ -101,6 +106,7 @@ pub fn dsp_param_choices(kind: &DspKind) -> &'static [(ParamId, &'static str)] {
         DspKind::Saturation => &[(0, "Drive"), (1, "Mix")],
         DspKind::Pan => &[(0, "Pan")],
         DspKind::Metronome => &[],
+        DspKind::Bus => &[(0, "Level")],
     }
 }
 
@@ -173,6 +179,7 @@ pub fn knob_specs(kind: &NodeKind) -> &'static [KnobSpec] {
             DspKind::Saturation => knobs!(ks("DRIVE", 0.4, Some(0), &[]), ks("MIX", 0.5, Some(1), &[])),
             DspKind::Pan => knobs!(ks("PAN", 0.5, Some(0), &[])),
             DspKind::Metronome => &[],
+            DspKind::Bus => knobs!(ks("LEVEL", 1.0, Some(0), &["VOLUME", "VOL"])),
         },
         // setBfree has no control ports: its face drives MIDI CCs (`organ`).
         // Drawbars are hidden knobs, painted as faders.
@@ -744,6 +751,101 @@ fn strip_gains_of(
     Some((g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt()))
 }
 
+/// Aux buses the render path serves per block (issue #5); a ninth bus is
+/// silent. Their send accumulators are one allocation made in the constructor.
+pub const MAX_BUSES: usize = 8;
+/// One bus accumulator: a stereo block of the largest device buffer.
+const BUS_SPAN: usize = 8192 * 2;
+/// Sends the engine tracks and publishes; one past it is dropped.
+pub const MAX_SENDS: usize = 64;
+
+/// The aux buses of one block: their nodes (in DSP slot order) and the
+/// accumulators the sends add into (`MAX_BUSES` stereo blocks, back to back).
+struct BusTaps<'a> {
+    nodes: [NodeId; MAX_BUSES],
+    n: usize,
+    acc: &'a mut [f32],
+    /// Stride between two buses' accumulators.
+    span: usize,
+}
+
+impl BusTaps<'_> {
+    fn buf(&mut self, bus: usize, n2: usize) -> &mut [f32] {
+        &mut self.acc[bus * self.span..bus * self.span + n2]
+    }
+
+    /// Add every send of `from` tapped at this point (`pre` or post fader)
+    /// into its bus. Allocation-free; no work at all without sends.
+    fn tap(&mut self, sends: &[Send], from: SendSource, pre: bool, src: &[f32]) {
+        for s in sends {
+            if s.from != from || s.pre != pre || s.level <= 0.0 { continue; }
+            let Some(b) = self.nodes[..self.n].iter().position(|n| *n == s.bus) else { continue };
+            let n2 = src.len();
+            for (o, x) in self.buf(b, n2).iter_mut().zip(src) {
+                *o += *x * s.level;
+            }
+        }
+    }
+}
+
+/// One source's output stage: the pre-fader send tap, its level, the strip
+/// mix (mute/solo/pan, #73) and the post-fader send tap, in that order. A
+/// muted or soloed-out source sends nothing, pre or post.
+#[allow(clippy::too_many_arguments)]
+fn source_out(
+    strips: &[(NodeId, StripMix)],
+    graph: &Graph,
+    solo_rigs: &[bool; 8],
+    sends: &[Send],
+    taps: &mut BusTaps,
+    node: NodeId,
+    level: f32,
+    buf: &mut [f32],
+) {
+    let gains = strip_gains_of(strips, graph, node, solo_rigs);
+    let silenced = gains == Some((0.0, 0.0));
+    if !sends.is_empty() && !silenced {
+        taps.tap(sends, SendSource::Node(node), true, buf);
+    }
+    if level != 1.0 {
+        for x in buf.iter_mut() { *x *= level; }
+    }
+    if let Some((gl, gr)) = gains {
+        if gl == gr {
+            if gl != 1.0 {
+                for x in buf.iter_mut() { *x *= gl; }
+            }
+        } else {
+            for f in buf.chunks_exact_mut(2) {
+                f[0] *= gl;
+                f[1] *= gr;
+            }
+        }
+    }
+    if !sends.is_empty() && !silenced {
+        taps.tap(sends, SendSource::Node(node), false, buf);
+    }
+}
+
+/// Add `src` into `out` the way its cables into `dest` say: a cable into
+/// port 2 (a master's MONO input) centres the left channel, any other is
+/// stereo. Nothing without a route.
+fn add_routed(graph: &Graph, node: NodeId, dest: NodeId, src: &[f32], out: &mut [f32]) {
+    if !graph.has_route(node, dest, PortKind::Audio) { return; }
+    if graph.has_route_port(node, dest, 2, PortKind::Audio) {
+        for (o, x) in out.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
+            o[0] += x[0];
+            o[1] += x[0];
+        }
+    } else {
+        for (o, x) in out.iter_mut().zip(src) { *o += *x; }
+    }
+}
+
+/// The published send table (`GraphPub::sends`): empty slots have
+/// `bus == NodeId::MAX`.
+pub const NO_SEND: Send = Send { from: SendSource::Rig(0), bus: NodeId::MAX, level: 0.0, pre: false };
+
 /// Is this FX node bypassed (#74)? Allocation-free linear scan.
 fn strip_bypassed(strips: &[(NodeId, StripMix)], node: NodeId) -> bool {
     strips.iter().any(|(n, m)| *n == node && m.bypass)
@@ -827,6 +929,7 @@ impl Default for GraphPub {
             rules: Vec::new(),
             mix: [RigMix::DEFAULT; 8],
             strips: [StripPub::EMPTY; MAX_STRIP_MIXES],
+            sends: [NO_SEND; MAX_SENDS],
             system_gain: 0.0,
             mix_rev: 0,
             voices: Vec::new(),
@@ -936,6 +1039,8 @@ pub struct GraphPub {
     /// Per-node strip state (#73/#74): pan/mute/solo on sources, bypass on
     /// FX nodes — same publication discipline as `mix` (fixed-size copy).
     pub strips: [StripPub; MAX_STRIP_MIXES],
+    /// Sends into aux buses (issue #5), same publication as `strips`.
+    pub sends: [Send; MAX_SENDS],
     /// System-audio capture gain, published with the mix (same `mix_rev`).
     pub system_gain: f32,
     pub mix_rev: u64,
@@ -1099,6 +1204,13 @@ pub struct GraphEngine {
     /// sources, bypass on FX nodes. Capacity is fixed (MAX_STRIP_MIXES): a
     /// node past it keeps playing at unity. Linear scans, like the rest.
     strips: Vec<(NodeId, StripMix)>,
+    /// Sends into aux buses (SetSend, issue #5). Capacity MAX_SENDS, fixed.
+    sends: Vec<Send>,
+    /// The buses' send accumulators: MAX_BUSES stereo blocks back to back.
+    bus_acc: Vec<f32>,
+    /// Per effect (DSP slots, then LV2 slots): it sits in a bus's insert
+    /// chain and runs after the rig sums. Rebuilt each block that has a bus.
+    fx_after_bus: Vec<bool>,
     /// A SetRigMix awaits publication to `graph_pub` (retried each block:
     /// the audio thread only ever `try_lock`s the publication).
     mix_dirty: bool,
@@ -1251,6 +1363,9 @@ impl GraphEngine {
             lv2,
             lv2_in: vec![0.0; 8192 * 2],
             fx_done: Vec::with_capacity(256),
+            fx_after_bus: Vec::with_capacity(256),
+            sends: Vec::with_capacity(MAX_SENDS),
+            bus_acc: vec![0.0; MAX_BUSES * BUS_SPAN],
             master_vol: 0.75,
             master_warm: 0.15,
             master_lim: MasterLimiter::new(sample_rate),
@@ -2170,6 +2285,95 @@ impl GraphEngine {
         first
     }
 
+    /// Mark the effects that sit in a bus's insert chain (`fx_after_bus`,
+    /// issue #5): an audio path leads from a bus to them. They run after the
+    /// rig sums, because a rig's send only exists then. Returns whether the
+    /// graph has a bus at all. Allocation-free (the table is reserved).
+    fn mark_after_bus(&mut self) -> bool {
+        let n_dsp = self.dsp.len();
+        let n_fx = n_dsp + self.lv2.len();
+        self.fx_after_bus.clear();
+        self.fx_after_bus.extend(std::iter::repeat(false).take(n_fx));
+        if !self.dsp.iter().any(|d| d.kind == DspKind::Bus) { return false; }
+        loop {
+            let mut changed = false;
+            for f in 0..n_fx {
+                if self.fx_after_bus[f] || self.fx_is_bus(f) { continue; }
+                let to = self.fx_node(f);
+                let fed = (0..n_fx).any(|g| {
+                    g != f && (self.fx_after_bus[g] || self.fx_is_bus(g))
+                        && self.graph.has_route(self.fx_node(g), to, PortKind::Audio)
+                });
+                if fed {
+                    self.fx_after_bus[f] = true;
+                    changed = true;
+                }
+            }
+            if !changed { return true; }
+        }
+    }
+
+    /// Node of effect `f` (DSP slots first, then LV2 slots).
+    fn fx_node(&self, f: usize) -> NodeId {
+        if f < self.dsp.len() { self.dsp[f].node } else { self.lv2[f - self.dsp.len()].node }
+    }
+
+    fn fx_is_bus(&self, f: usize) -> bool {
+        f < self.dsp.len() && self.dsp[f].kind == DspKind::Bus
+    }
+
+    /// Is `node` in a bus's insert chain right now?
+    fn is_after_bus(&mut self, node: NodeId) -> bool {
+        self.mark_after_bus()
+            && (0..self.fx_after_bus.len()).any(|f| self.fx_after_bus[f] && self.fx_node(f) == node)
+    }
+
+    /// Run every effect `fx_done` leaves open — built-in DSP and LV2 alike —
+    /// in signal-flow order, each summing EVERY audio source wired into it:
+    /// instruments (CLAP and LV2), audio inputs, metronomes, buses and other
+    /// effects. A feedback loop reads the previous block's output of the
+    /// effect not yet run. `taps` = the send taps of this pass (None for a
+    /// bus's own chain, which cannot send).
+    fn run_effects(&mut self, bus: &mut [f32], frames: usize, solo_rigs: &[bool; 8], mut taps: Option<&mut BusTaps>) {
+        let n2 = frames * 2;
+        let n_dsp = self.dsp.len();
+        let n_fx = n_dsp + self.lv2.len();
+        while let Some(f) = self.next_effect(n_dsp, n_fx) {
+            let node_t0 = std::time::Instant::now();
+            self.fx_done[f] = true;
+            let node = self.fx_node(f);
+            self.sum_audio_into(node, &mut bus[..n2]);
+            // Bypass (#74): the slot passes its summed input through
+            // unchanged; its knobs keep their values for when it returns.
+            let bypassed = strip_bypassed(&self.strips, node);
+            if f < n_dsp {
+                let d = &mut self.dsp[f];
+                d.buf[..n2].copy_from_slice(&bus[..n2]);
+                if !bypassed {
+                    d.proc.process(&mut d.buf[..n2], frames);
+                }
+            } else {
+                let slot = &mut self.lv2[f - n_dsp];
+                if bypassed {
+                    slot.buf[..n2].copy_from_slice(&bus[..n2]);
+                } else {
+                    slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
+                }
+            }
+            // An LV2 node that is a SOURCE (an instrument) carries strip
+            // state; effects do not (their strip row is the bypass flag).
+            let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
+            match taps.as_deref_mut() {
+                Some(t) => source_out(&self.strips, &self.graph, solo_rigs, &self.sends, t, node, 1.0, &mut buf[..n2]),
+                None => {
+                    let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
+                    source_out(&self.strips, &self.graph, solo_rigs, &[], &mut none, node, 1.0, &mut buf[..n2]);
+                }
+            }
+            self.node_timer.record(node, node_t0.elapsed());
+        }
+    }
+
     /// Sum every audio source wired into `dest` into `out` (stereo
     /// interleaved). Allocation-free.
     fn sum_audio_into(&self, dest: NodeId, out: &mut [f32]) {
@@ -2191,7 +2395,8 @@ impl GraphEngine {
     fn rigs_with_solo_source(&self) -> [bool; 8] {
         let mut solo = [false; 8];
         for (node, m) in &self.strips {
-            if !m.solo { continue; }
+            // A bus's solo is its own scope (it silences the dry rigs).
+            if !m.solo || self.graph.is_bus(*node) { continue; }
             let rig = self.graph.node(*node).map(|n| n.rig as usize).unwrap_or(0).min(7);
             solo[rig] = true;
         }
@@ -2962,6 +3167,8 @@ impl GraphEngine {
                             *slot = crate::control::EdgeId::MAX;
                         }
                         self.graph.wire_arp(id);
+                    } else if matches!(kind, NodeKind::Dsp(DspKind::Bus)) {
+                        self.graph.wire_bus(id);
                     } else {
                         self.graph.wire_instrument(id);
                     }
@@ -3029,6 +3236,9 @@ impl GraphEngine {
                     }
                 }
                 self.dsp.retain(|s| s.node != id);
+                let before = self.sends.len();
+                self.sends.retain(|s| s.bus != id && s.from != SendSource::Node(id));
+                if self.sends.len() != before { self.mix_dirty = true; }
                 self.audio_in.retain(|s| s.node != id);
                 self.arp.retain(|s| s.node != id);
                 if let Some(i) = self.lv2.iter().position(|s| s.node == id) {
@@ -3216,6 +3426,7 @@ impl GraphEngine {
                 self.active_rig = 0;
                 self.rig_mix = [RigMix::DEFAULT; 8];
                 self.strips.clear();
+                self.sends.clear();
                 if self.master_clock.is_counting_in() {
                     self.master_clock = MasterClock::Stopped;
                     self.transport.set_playing(false);
@@ -3399,6 +3610,27 @@ impl GraphEngine {
             }
             Command::SetStripMix { node, pan, mute, solo } => {
                 self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo });
+            }
+            Command::SetSend { from, bus, level, pre } => {
+                let ok_from = match from {
+                    SendSource::Rig(r) => r < 8,
+                    SendSource::Node(n) => {
+                        self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n)
+                    }
+                };
+                if !self.graph.is_bus(bus) || !ok_from { return; }
+                let i = match self.sends.iter().position(|s| s.from == from && s.bus == bus) {
+                    Some(i) => i,
+                    None => {
+                        if self.sends.len() >= MAX_SENDS { return; }
+                        self.sends.push(Send { from, bus, level: 0.0, pre: false });
+                        self.sends.len() - 1
+                    }
+                };
+                if let Some(l) = level { self.sends[i].level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
+                if let Some(p) = pre { self.sends[i].pre = p; }
+                self.sends.retain(|s| !s.is_default());
+                self.mix_dirty = true;
             }
             Command::SetStripBypass { node, bypass } => {
                 if bypass {
@@ -4006,6 +4238,8 @@ impl GraphEngine {
                 Some(p) => if let Ok(mut g) = p.try_lock() {
                     g.mix = self.rig_mix;
                     g.strips = self.strips_pub();
+                    g.sends = [NO_SEND; MAX_SENDS];
+                    g.sends[..self.sends.len()].copy_from_slice(&self.sends);
                     g.system_gain = self.system_gain;
                     g.mix_rev = g.mix_rev.wrapping_add(1);
                     self.mix_dirty = false;
@@ -4026,6 +4260,19 @@ impl GraphEngine {
         // Per-source strip state (#73), once per block: which rigs have a
         // soloed source decides every source's mute/solo gain below.
         let solo_rigs = self.rigs_with_solo_source();
+        // Aux buses (issue #5): this block's send accumulators, cleared.
+        let has_bus = self.mark_after_bus();
+        let mut bus_acc = std::mem::take(&mut self.bus_acc);
+        let mut taps = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut bus_acc, span: BUS_SPAN };
+        for d in &self.dsp {
+            if d.kind == DspKind::Bus && taps.n < MAX_BUSES {
+                taps.nodes[taps.n] = d.node;
+                taps.n += 1;
+            }
+        }
+        for b in 0..taps.n {
+            taps.buf(b, n2).fill(0.0);
+        }
 
         // 1. Every instrument renders and applies its level.
         self.node_timer.begin_block();
@@ -4034,23 +4281,10 @@ impl GraphEngine {
             // A free voice (no Clap node bound): skip the plugin entirely.
             if s.node == NodeId::MAX { continue; }
             s.voice.render(&mut s.scratch[..n2], self.transport);
-            for x in s.scratch[..n2].iter_mut() {
-                *x *= s.level;
-            }
-            // Strip mix (mute/solo/pan) at the source's own output: the edge
-            // levels published from this buffer stay post-fader (rule 53).
-            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, s.node, &solo_rigs) {
-                if gl == gr {
-                    if gl != 1.0 {
-                        for x in s.scratch[..n2].iter_mut() { *x *= gl; }
-                    }
-                } else {
-                    for f in s.scratch[..n2].chunks_exact_mut(2) {
-                        f[0] *= gl;
-                        f[1] *= gr;
-                    }
-                }
-            }
+            // Level and strip mix (mute/solo/pan) at the source's own output:
+            // the edge levels published from this buffer stay post-fader
+            // (rule 53). Sends tap on either side of it.
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, s.node, s.level, &mut s.scratch[..n2]);
             // One clock read per voice: each ends where the next begins.
             let now = std::time::Instant::now();
             self.node_timer.record(s.node, now - node_t0);
@@ -4061,18 +4295,7 @@ impl GraphEngine {
         // buffer, map the chosen channel, apply gain. Allocation- and lock-free.
         self.fill_audio_in(frames);
         for a in &mut self.audio_in {
-            if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, a.node, &solo_rigs) {
-                if gl == gr {
-                    if gl != 1.0 {
-                        for x in a.buf[..n2].iter_mut() { *x *= gl; }
-                    }
-                } else {
-                    for f in a.buf[..n2].chunks_exact_mut(2) {
-                        f[0] *= gl;
-                        f[1] *= gr;
-                    }
-                }
-            }
+            source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, a.node, 1.0, &mut a.buf[..n2]);
         }
 
         // 2a. Metronome nodes: click generators gated by their OWN playing
@@ -4109,18 +4332,7 @@ impl GraphEngine {
         for d in &mut self.dsp {
             if d.kind == DspKind::Metronome {
                 render_metronome(&mut d.transport, &mut d.buf[..n2], frames, sr, bpm, suppress_wrap_click);
-                if let Some((gl, gr)) = strip_gains_of(&self.strips, &self.graph, d.node, &solo_rigs) {
-                    if gl == gr {
-                        if gl != 1.0 {
-                            for x in d.buf[..n2].iter_mut() { *x *= gl; }
-                        }
-                    } else {
-                        for f in d.buf[..n2].chunks_exact_mut(2) {
-                            f[0] *= gl;
-                            f[1] *= gr;
-                        }
-                    }
-                }
+                source_out(&self.strips, &self.graph, &solo_rigs, &self.sends, &mut taps, d.node, 1.0, &mut d.buf[..n2]);
             }
         }
         if counting_in_this_block {
@@ -4210,59 +4422,18 @@ impl GraphEngine {
             }
         }
 
-        // 2b. Effects — built-in DSP and LV2 alike — in signal-flow order,
-        // each summing EVERY audio source wired into it: instruments (CLAP and
-        // LV2), audio inputs, metronomes and other effects. Built-in effects
+        // 2b. Effects in signal-flow order (`run_effects`). Built-in effects
         // used to hear only CLAP voices and audio inputs, and LV2 ran after
-        // them, so setBfree → Drive and Delay → Reverb were silent. A feedback
-        // loop reads the previous block's output of the effect not yet run.
+        // them, so setBfree → Drive and Delay → Reverb were silent. A bus and
+        // its insert chain wait for the rig sums below.
         let mut bus = std::mem::take(&mut self.lv2_in);
         let n_dsp = self.dsp.len();
-        let n_fx = n_dsp + self.lv2.len();
         self.fx_done.clear();
-        self.fx_done.extend((0..n_dsp).map(|i| self.dsp[i].kind == DspKind::Metronome));
-        self.fx_done.extend(std::iter::repeat(false).take(self.lv2.len()));
-        while let Some(f) = self.next_effect(n_dsp, n_fx) {
-            let node_t0 = std::time::Instant::now();
-            self.fx_done[f] = true;
-            let node = if f < n_dsp { self.dsp[f].node } else { self.lv2[f - n_dsp].node };
-            self.sum_audio_into(node, &mut bus[..n2]);
-            // Bypass (#74): the slot passes its summed input through
-            // unchanged; its knobs keep their values for when it returns.
-            let bypassed = strip_bypassed(&self.strips, node);
-            let strip_gain = strip_gains_of(&self.strips, &self.graph, node, &solo_rigs);
-            if f < n_dsp {
-                let d = &mut self.dsp[f];
-                d.buf[..n2].copy_from_slice(&bus[..n2]);
-                if !bypassed {
-                    d.proc.process(&mut d.buf[..n2], frames);
-                }
-            } else {
-                let slot = &mut self.lv2[f - n_dsp];
-                if bypassed {
-                    slot.buf[..n2].copy_from_slice(&bus[..n2]);
-                } else {
-                    slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
-                }
-            }
-            // An LV2 node that is a SOURCE (an instrument) carries strip
-            // state; effects do not (their strip row is the bypass flag).
-            if let Some((gl, gr)) = strip_gain {
-                let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
-                if gl == gr {
-                    if gl != 1.0 {
-                        for x in buf[..n2].iter_mut() { *x *= gl; }
-                    }
-                } else {
-                    for fr in buf[..n2].chunks_exact_mut(2) {
-                        fr[0] *= gl;
-                        fr[1] *= gr;
-                    }
-                }
-            }
-            self.node_timer.record(node, node_t0.elapsed());
+        for f in 0..n_dsp + self.lv2.len() {
+            let later = self.fx_is_bus(f) || self.fx_after_bus[f];
+            self.fx_done.push(later || (f < n_dsp && self.dsp[f].kind == DspKind::Metronome));
         }
-        self.node_timer.end_block();
+        self.run_effects(&mut bus, frames, &solo_rigs, Some(&mut taps));
         self.lv2_in = bus;
 
         // 3. Master sums everything wired to it.
@@ -4289,101 +4460,121 @@ impl GraphEngine {
                 n_masters += 1;
             }
         }
+        // The mix bus (`lv2_in`, unused after step 2b) and the per-rig
+        // scratch leave `self` for the stage, so the bus chains can run.
+        let mut acc_v = std::mem::take(&mut self.lv2_in);
+        let mut rig_v = std::mem::take(&mut self.rig_buf);
         if n_masters > 0 {
             // Per-rig mix gains, once per block (rig_mix changes only via
             // commands drained at block start). Constant-power pan, unity
             // center: gl = sqrt(1-pan), gr = sqrt(1+pan).
             let any_solo = self.rig_mix.iter().any(|m| m.solo);
-            let mut gains = [(1.0f32, 1.0f32); 8];
+            // (sounds at all, gain L, gain R): a muted or soloed-out rig
+            // sends nothing either.
+            let mut gains = [(true, 1.0f32, 1.0f32); 8];
             for mi in 0..n_masters {
                 let rig = self.graph.node(masters[mi]).map(|n| n.rig as usize).unwrap_or(0).min(7);
                 let m = self.rig_mix[rig];
-                let g = if m.mute || (any_solo && !m.solo) { 0.0 } else { m.vol };
-                gains[mi] = (g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt());
+                let open = !(m.mute || (any_solo && !m.solo));
+                gains[mi] = (open, m.vol * (1.0 - m.pan).sqrt(), m.vol * (1.0 + m.pan).sqrt());
             }
-            // Reuse `lv2_in` (unused after step 2b) as the stereo mix bus so
-            // route checks happen once per node per block, not per sample.
-            let acc = &mut self.lv2_in[..n2];
+            // A soloed bus leaves only the returns in the mix.
+            let bus_solo = has_bus && self.strips.iter().any(|(n, m)| m.solo && self.graph.is_bus(*n));
+            let n_dsp = self.dsp.len();
+            let acc = &mut acc_v[..n2];
             for x in acc.iter_mut() {
                 *x = 0.0;
             }
             for mi in 0..n_masters {
                 let master = masters[mi];
                 let rig = self.graph.node(master).map(|n| n.rig as usize).unwrap_or(0).min(7);
-                let (gl, gr) = gains[mi];
-                let rig_buf = &mut self.rig_buf[..n2];
+                let (open, gl, gr) = gains[mi];
+                let from = SendSource::Rig(rig as u8);
+                let rig_buf = &mut rig_v[..n2];
                 for x in rig_buf.iter_mut() {
                     *x = 0.0;
                 }
-                if gl != 0.0 || gr != 0.0 {
+                let sends = self.sends.iter().any(|s| s.from == from);
+                if open && (gl != 0.0 || gr != 0.0 || sends) {
+                    // The rig's dry sum at unity: everything wired into its
+                    // master except the buses and their chains (the returns).
                     for v in &self.voices {
-                        if v.node == NodeId::MAX || !self.graph.has_route(v.node, master, PortKind::Audio) {
-                            continue;
-                        }
-                        if self.graph.has_route_port(v.node, master, 2, PortKind::Audio) {
-                            for i in 0..frames {
-                                let m = v.scratch[i * 2]; // mono in: center to both
-                                rig_buf[i * 2] += m * gl;
-                                rig_buf[i * 2 + 1] += m * gr;
-                            }
-                        } else {
-                            for i in 0..frames {
-                                rig_buf[i * 2] += v.scratch[i * 2] * gl;
-                                rig_buf[i * 2 + 1] += v.scratch[i * 2 + 1] * gr;
-                            }
+                        if v.node != NodeId::MAX {
+                            add_routed(&self.graph, v.node, master, &v.scratch[..n2], rig_buf);
                         }
                     }
-                    for d in &self.dsp {
-                        if !self.graph.has_route(d.node, master, PortKind::Audio) {
-                            continue;
-                        }
-                        if self.graph.has_route_port(d.node, master, 2, PortKind::Audio) {
-                            for i in 0..frames {
-                                let m = d.buf[i * 2];
-                                rig_buf[i * 2] += m * gl;
-                                rig_buf[i * 2 + 1] += m * gr;
-                            }
-                        } else {
-                            for i in 0..frames {
-                                rig_buf[i * 2] += d.buf[i * 2] * gl;
-                                rig_buf[i * 2 + 1] += d.buf[i * 2 + 1] * gr;
-                            }
+                    for (i, d) in self.dsp.iter().enumerate() {
+                        if d.kind != DspKind::Bus && !self.fx_after_bus[i] {
+                            add_routed(&self.graph, d.node, master, &d.buf[..n2], rig_buf);
                         }
                     }
-                    for slot in &self.lv2 {
-                        if !self.graph.has_route(slot.node, master, PortKind::Audio) {
-                            continue;
-                        }
-                        if self.graph.has_route_port(slot.node, master, 2, PortKind::Audio) {
-                            for i in 0..frames {
-                                let m = slot.buf[i * 2];
-                                rig_buf[i * 2] += m * gl;
-                                rig_buf[i * 2 + 1] += m * gr;
-                            }
-                        } else {
-                            for i in 0..frames {
-                                rig_buf[i * 2] += slot.buf[i * 2] * gl;
-                                rig_buf[i * 2 + 1] += slot.buf[i * 2 + 1] * gr;
-                            }
+                    for (i, slot) in self.lv2.iter().enumerate() {
+                        if !self.fx_after_bus[n_dsp + i] {
+                            add_routed(&self.graph, slot.node, master, &slot.buf[..n2], rig_buf);
                         }
                     }
                     // Audio In wired into this master (OUT jack → graph routing).
                     for a in &self.audio_in {
-                        if !self.graph.has_route(a.node, master, PortKind::Audio) {
-                            continue;
-                        }
-                        for i in 0..frames {
-                            rig_buf[i * 2] += a.buf[i * 2] * gl;
-                            rig_buf[i * 2 + 1] += a.buf[i * 2 + 1] * gr;
+                        if self.graph.has_route(a.node, master, PortKind::Audio) {
+                            for (o, x) in rig_buf.iter_mut().zip(&a.buf[..n2]) { *o += *x; }
                         }
                     }
-                    for i in 0..n2 {
-                        acc[i] += rig_buf[i];
+                    // Sends tap the rig bus on either side of its fader.
+                    if sends { taps.tap(&self.sends, from, true, rig_buf); }
+                    if gl != 1.0 || gr != 1.0 {
+                        for f in rig_buf.chunks_exact_mut(2) {
+                            f[0] *= gl;
+                            f[1] *= gr;
+                        }
+                    }
+                    if sends { taps.tap(&self.sends, from, false, rig_buf); }
+                    if !bus_solo {
+                        for i in 0..n2 {
+                            acc[i] += rig_buf[i];
+                        }
                     }
                 }
                 if let Some(rec) = &mut self.recorder {
                     if rec.is_stem_active(rig as u8) {
                         rec.push_rig_stereo(rig as u8, rig_buf);
+                    }
+                }
+            }
+            // Aux buses (issue #5): each bus is what was sent to it, through
+            // its fader and strip mix; its insert chain runs now, and what
+            // reaches a master from there returns past the rig faders.
+            if has_bus {
+                for b in 0..taps.n {
+                    let node = taps.nodes[b];
+                    let m = self.strips.iter().find(|(n, _)| *n == node).map(|(_, m)| *m).unwrap_or(StripMix::DEFAULT);
+                    let g = if m.mute || (bus_solo && !m.solo) { 0.0 } else { 1.0 };
+                    let (gl, gr) = (g * (1.0 - m.pan).sqrt(), g * (1.0 + m.pan).sqrt());
+                    let Some(d) = self.dsp.iter_mut().find(|d| d.node == node) else { continue };
+                    d.buf[..n2].copy_from_slice(taps.buf(b, n2));
+                    d.proc.process(&mut d.buf[..n2], frames);
+                    if gl != 1.0 || gr != 1.0 {
+                        for f in d.buf[..n2].chunks_exact_mut(2) {
+                            f[0] *= gl;
+                            f[1] *= gr;
+                        }
+                    }
+                }
+                self.fx_done.clear();
+                for f in 0..self.fx_after_bus.len() {
+                    self.fx_done.push(!self.fx_after_bus[f]);
+                }
+                // A source's solo is its rig's business, not the returns'.
+                self.run_effects(&mut rig_v, frames, &[false; 8], None);
+                for &master in &masters[..n_masters] {
+                    for (i, d) in self.dsp.iter().enumerate() {
+                        if d.kind == DspKind::Bus || self.fx_after_bus[i] {
+                            add_routed(&self.graph, d.node, master, &d.buf[..n2], acc);
+                        }
+                    }
+                    for (i, slot) in self.lv2.iter().enumerate() {
+                        if self.fx_after_bus[n_dsp + i] {
+                            add_routed(&self.graph, slot.node, master, &slot.buf[..n2], acc);
+                        }
                     }
                 }
             }
@@ -4498,6 +4689,10 @@ impl GraphEngine {
             // honest (they must decay, not hold stale energy).
             self.meter.process_silence(frames);
         }
+        self.node_timer.end_block();
+        self.lv2_in = acc_v;
+        self.rig_buf = rig_v;
+        self.bus_acc = bus_acc;
         self.publish_meter();
         self.out_peak.store(peak.to_bits(), Ordering::Relaxed);
         self.publish_edge_levels(n2, sys);
@@ -8568,4 +8763,241 @@ pub fn bench() -> anyhow::Result<()> {
         println!("limiter {label:<12} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  hash={hash:016x}");
     }
     Ok(())
+}
+
+/// Sends and aux buses (issue #5), on signals the test controls: two rigs,
+/// each an Audio In fed an in-phase sine (0.5 and 0.25), and one bus.
+#[cfg(test)]
+mod send_tests {
+    use super::*;
+    use crate::control::{command_bus, name_bytes, AudioInChannel, Command, CommandBus, PortRef};
+
+    const N: usize = 256;
+
+    struct Rack {
+        engine: GraphEngine,
+        bus: CommandBus,
+        feeds: Vec<(rtrb::Producer<f32>, f32)>,
+        phase: usize,
+        out: Vec<f32>,
+        ins: [NodeId; 2],
+        masters: [NodeId; 2],
+        aux: NodeId,
+    }
+
+    impl Rack {
+        fn new() -> Self {
+            let (mut bus, drain) = command_bus();
+            let mut g = Graph::default();
+            g.reserve(32, 32);
+            let mut ins = [0; 2];
+            let mut masters = [0; 2];
+            for rig in 0..2u8 {
+                let a = g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes("IN"));
+                let m = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+                g.set_rig(a, rig);
+                g.set_rig(m, rig);
+                g.connect_with_id(1 + rig as u32, PortRef { node: a, port: 0 }, PortRef { node: m, port: 0 }, PortKind::Audio);
+                ins[rig as usize] = a;
+                masters[rig as usize] = m;
+            }
+            let mut engine = GraphEngine::new(g, drain, 48000.0, vec![]);
+            let (mut side_tx, side_rx) = rtrb::RingBuffer::new(8);
+            engine.set_audio_in_channel(side_rx);
+            let mut feeds = Vec::new();
+            for (i, amp) in [0.5f32, 0.25].into_iter().enumerate() {
+                let (tx, rx) = rtrb::RingBuffer::<f32>::new(N * 4);
+                let _ = side_tx.push((ins[i], rx));
+                feeds.push((tx, amp));
+            }
+            // The bus comes in the way the app adds one: wired to its rig's master.
+            bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Bus), name: name_bytes("BUS A"), rig: 0, wire: true });
+            let mut r = Rack { engine, bus, feeds, phase: 0, out: vec![0.0; N * 2], ins, masters, aux: 0 };
+            r.render(1);
+            r.aux = r.engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).expect("a bus").id;
+            r
+        }
+
+        /// Render `blocks` blocks; returns the output peak of the last one.
+        fn render(&mut self, blocks: usize) -> f32 {
+            for _ in 0..blocks {
+                for i in 0..N {
+                    let s = (std::f32::consts::TAU * 440.0 * (self.phase + i) as f32 / 48000.0).sin();
+                    for (tx, amp) in &mut self.feeds {
+                        let _ = tx.push(s * *amp);
+                        let _ = tx.push(s * *amp);
+                    }
+                }
+                self.phase += N;
+                self.engine.render(&mut self.out, 2);
+            }
+            block_peak(&self.out)
+        }
+
+        fn send(&mut self, from: SendSource, level: f32, pre: bool) {
+            let bus = self.aux;
+            self.bus.send(Command::SetSend { from, bus, level: Some(level), pre: Some(pre) });
+        }
+
+        /// Peak of a DSP node's last block (a bus: post its fader and strip).
+        fn peak(&self, node: NodeId) -> f32 {
+            let d = self.engine.dsp.iter().find(|d| d.node == node).expect("a dsp slot");
+            block_peak(&d.buf[..N * 2])
+        }
+
+        fn in_peak(&self, i: usize) -> f32 {
+            block_peak(&self.engine.audio_in.iter().find(|a| a.node == self.ins[i]).unwrap().buf[..N * 2])
+        }
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 2e-4
+    }
+
+    #[test]
+    fn two_rigs_send_into_one_bus_and_the_return_is_their_sum() {
+        let mut r = Rack::new();
+        r.render(2);
+        assert_eq!(r.peak(r.aux), 0.0, "a bus nobody sends to is silent");
+        r.send(SendSource::Rig(0), 0.5, false);
+        r.render(2);
+        let (pa, pb) = (r.in_peak(0), r.in_peak(1));
+        assert!(pa > 0.49 && pb > 0.24, "the inputs play ({pa}, {pb})");
+        assert!(close(r.peak(r.aux), 0.5 * pa), "rig 1 alone at half level: {}", r.peak(r.aux));
+        r.send(SendSource::Rig(1), 1.0, false);
+        r.render(2);
+        assert!(close(r.peak(r.aux), 0.5 * pa + pb), "both rigs summed: {} vs {}", r.peak(r.aux), 0.5 * pa + pb);
+        // The engine publishes what it holds (rule 33).
+        let pubd = std::sync::Arc::new(std::sync::Mutex::new(GraphPub::default()));
+        r.engine.set_graph_pub(pubd.clone());
+        r.send(SendSource::Rig(1), 0.75, false);
+        r.render(1);
+        let g = pubd.lock().unwrap();
+        let listed: Vec<Send> = g.sends.iter().copied().filter(|s| s.bus != NodeId::MAX).collect();
+        assert_eq!(listed, vec![
+            Send { from: SendSource::Rig(0), bus: r.aux, level: 0.5, pre: false },
+            Send { from: SendSource::Rig(1), bus: r.aux, level: 0.75, pre: false },
+        ]);
+    }
+
+    #[test]
+    fn a_send_level_is_independent_of_the_rig_fader_when_pre_and_follows_it_when_post() {
+        let mut r = Rack::new();
+        r.send(SendSource::Rig(0), 1.0, false);
+        r.bus.send(Command::SetRigMix { rig: 0, vol: Some(0.25), pan: None, mute: None, solo: None });
+        r.render(2);
+        let pa = r.in_peak(0);
+        assert!(close(r.peak(r.aux), 0.25 * pa), "post fader follows the rig fader: {}", r.peak(r.aux));
+        r.send(SendSource::Rig(0), 1.0, true);
+        r.render(2);
+        assert!(close(r.peak(r.aux), pa), "pre fader keeps its level: {}", r.peak(r.aux));
+        r.bus.send(Command::SetRigMix { rig: 0, vol: Some(0.0), pan: None, mute: None, solo: None });
+        r.render(2);
+        assert!(close(r.peak(r.aux), pa), "a rig fader at zero still sends pre fader: {}", r.peak(r.aux));
+        r.bus.send(Command::SetRigMix { rig: 0, vol: None, pan: None, mute: Some(true), solo: None });
+        r.render(2);
+        assert_eq!(r.peak(r.aux), 0.0, "a muted rig sends nothing, pre or post");
+    }
+
+    #[test]
+    fn a_source_sends_from_its_own_output_pre_or_post_its_strip() {
+        let mut r = Rack::new();
+        let src = r.ins[1];
+        r.send(SendSource::Node(src), 0.5, false);
+        r.bus.send(Command::SetStripMix { node: src, pan: Some(-1.0), mute: None, solo: None });
+        r.render(2);
+        let d = r.engine.dsp.iter().find(|d| d.node == r.aux).unwrap();
+        let right = d.buf[..N * 2].chunks(2).fold(0.0f32, |m, f| m.max(f[1].abs()));
+        assert_eq!(right, 0.0, "post fader carries the strip's pan: nothing on the right");
+        assert!(r.peak(r.aux) > 0.1, "and the left plays: {}", r.peak(r.aux));
+        r.send(SendSource::Node(src), 0.5, true);
+        r.render(2);
+        let d = r.engine.dsp.iter().find(|d| d.node == r.aux).unwrap();
+        let right = d.buf[..N * 2].chunks(2).fold(0.0f32, |m, f| m.max(f[1].abs()));
+        assert!(close(right, 0.5 * 0.25), "pre fader ignores the pan: {right}");
+        r.bus.send(Command::SetStripMix { node: src, pan: None, mute: Some(true), solo: None });
+        r.render(2);
+        assert_eq!(r.peak(r.aux), 0.0, "a muted source sends nothing");
+    }
+
+    #[test]
+    fn the_return_passes_the_rig_faders_and_the_bus_has_its_own_fader_mute_and_solo() {
+        let mut r = Rack::new();
+        // Both rig faders down: only a pre-fader send can reach the output.
+        for rig in 0..2 {
+            r.bus.send(Command::SetRigMix { rig, vol: Some(0.0), pan: None, mute: None, solo: None });
+        }
+        assert!(r.render(40) < 1e-4, "faders down, no send: silence");
+        r.send(SendSource::Rig(1), 1.0, true);
+        let wet = r.render(40);
+        assert!(wet > 0.05, "the return is heard past both closed rig faders: {wet}");
+        // The bus fader (its LEVEL knob, param 0).
+        let aux = r.aux;
+        r.bus.send(Command::SetParam { node: aux, param: 0, value: 0.0 });
+        assert!(r.render(40) < 1e-4, "bus fader down: silence");
+        r.bus.send(Command::SetParam { node: aux, param: 0, value: 1.0 });
+        r.bus.send(Command::SetStripMix { node: aux, pan: None, mute: Some(true), solo: None });
+        assert!(r.render(40) < 1e-4, "bus muted: silence");
+        r.bus.send(Command::SetStripMix { node: aux, pan: None, mute: Some(false), solo: None });
+        assert!(r.render(40) > 0.05, "bus back");
+        // A source's solo in the bus's home rig leaves the return alone, and
+        // a bus's solo leaves only returns.
+        r.bus.send(Command::SetStripMix { node: r.ins[0], pan: None, mute: None, solo: Some(true) });
+        assert!(r.render(40) > 0.05, "a soloed source does not silence the return");
+        r.bus.send(Command::SetStripMix { node: r.ins[0], pan: None, mute: None, solo: Some(false) });
+        for rig in 0..2 {
+            r.bus.send(Command::SetRigMix { rig, vol: Some(1.0), pan: None, mute: None, solo: None });
+        }
+        r.send(SendSource::Rig(1), 0.0, false);
+        r.bus.send(Command::SetStripMix { node: aux, pan: None, mute: None, solo: Some(true) });
+        assert!(r.render(40) < 1e-4, "a soloed bus nobody sends to: the dry rigs are silent");
+    }
+
+    #[test]
+    fn a_bus_insert_runs_in_the_same_block_on_what_was_sent() {
+        let mut r = Rack::new();
+        let aux = r.aux;
+        r.bus.send(Command::AddNode { kind: NodeKind::Dsp(DspKind::Gain), name: name_bytes("GAIN"), rig: 0, wire: false });
+        r.render(1);
+        let gain = r.engine.graph().nodes.iter().find(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Gain))).unwrap().id;
+        // Bus → Gain → Master A, the way the mixer's insert slot wires it.
+        let ret: Vec<u32> = r.engine.graph().edges.iter().filter(|e| e.from.node == aux).map(|e| e.id).collect();
+        assert_eq!(ret.len(), 2, "add_bus wired the return (L and R)");
+        for id in ret { r.bus.send(Command::Disconnect(id)); }
+        r.bus.send(Command::Connect { id: 50, from: PortRef { node: aux, port: 0 }, to: PortRef { node: gain, port: 0 }, kind: PortKind::Audio });
+        r.bus.send(Command::Connect { id: 51, from: PortRef { node: gain, port: 0 }, to: PortRef { node: r.masters[0], port: 0 }, kind: PortKind::Audio });
+        r.bus.send(Command::SetParam { node: gain, param: 0, value: 0.25 }); // (2·0.25)² = 0.25
+        r.send(SendSource::Rig(0), 1.0, false);
+        r.render(40);
+        let pa = r.in_peak(0);
+        assert!(close(r.peak(gain), 0.25 * pa), "the insert hears the bus: {} vs {}", r.peak(gain), 0.25 * pa);
+        // Same block: a send closed now is gone from the insert's output now.
+        r.send(SendSource::Rig(0), 0.0, false);
+        r.render(1);
+        assert_eq!(r.peak(gain), 0.0, "no block of delay between send and insert");
+        // A node of the chain cannot send (feedback), nor can a bus.
+        r.bus.send(Command::SetSend { from: SendSource::Node(gain), bus: aux, level: Some(1.0), pre: None });
+        r.bus.send(Command::SetSend { from: SendSource::Node(aux), bus: aux, level: Some(1.0), pre: None });
+        r.bus.send(Command::SetSend { from: SendSource::Rig(0), bus: gain, level: Some(1.0), pre: None });
+        r.render(1);
+        assert!(r.engine.sends.is_empty(), "refused: {:?}", r.engine.sends);
+    }
+
+    #[test]
+    fn sends_go_with_their_bus_and_with_a_load() {
+        let mut r = Rack::new();
+        r.send(SendSource::Rig(0), 1.0, false);
+        r.send(SendSource::Node(r.ins[1]), 0.5, true);
+        r.render(1);
+        assert_eq!(r.engine.sends.len(), 2);
+        r.bus.send(Command::RemoveNode(r.ins[1]));
+        r.render(1);
+        assert_eq!(r.engine.sends.len(), 1, "a removed source takes its send along");
+        let aux = r.aux;
+        r.bus.send(Command::RemoveNode(aux));
+        r.render(1);
+        assert!(r.engine.sends.is_empty(), "a removed bus takes its sends along");
+        // The rack plays on without the bus.
+        assert!(r.render(20) > 0.05);
+    }
 }

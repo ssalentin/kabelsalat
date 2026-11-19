@@ -111,6 +111,9 @@ pub struct Session {
     /// Explicit mixer quick-knob overrides (#107), keyed by node id (knob
     /// label or parameter name/id). Unlisted nodes use their default quick knob.
     strip_knobs: BTreeMap<NodeId, String>,
+    /// Sends into aux buses (issue #5), keyed by node and rig like the
+    /// engine's table; `remap_session` carries them across reloads.
+    sends: Vec<crate::control::Send>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -164,6 +167,7 @@ impl Session {
             strips: Vec::new(),
             strip_order: Vec::new(),
             strip_knobs: BTreeMap::new(),
+            sends: Vec::new(),
         }
     }
 
@@ -177,6 +181,7 @@ impl Session {
             && self.strips == other.strips
             && self.strip_order == other.strip_order
             && self.strip_knobs == other.strip_knobs
+            && self.sends == other.sends
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -279,6 +284,33 @@ impl Session {
         self.strips.retain(|s| !s.is_plain());
     }
 
+    /// Sends into aux buses (issue #5).
+    pub fn sends(&self) -> &[crate::control::Send] {
+        &self.sends
+    }
+
+    /// Replace the sends. One entry per (source, bus); entries that do
+    /// nothing, point at a node the patch lacks or at a non-bus are dropped.
+    pub fn set_sends(&mut self, sends: Vec<crate::control::Send>) {
+        self.sends.clear();
+        for s in sends {
+            if !s.is_default() && !self.sends.iter().any(|o| o.from == s.from && o.bus == s.bus) {
+                self.sends.push(s);
+            }
+        }
+        self.prune_sends();
+    }
+
+    fn prune_sends(&mut self) {
+        let g = &self.graph;
+        self.sends.retain(|s| {
+            g.is_bus(s.bus) && match s.from {
+                crate::control::SendSource::Rig(r) => g.nodes.iter().any(|n| n.rig == r),
+                crate::control::SendSource::Node(n) => g.node(n).is_some(),
+            }
+        });
+    }
+
     /// All strip rows (sorted by node).
     pub fn strips(&self) -> &[StripSaved] {
         &self.strips
@@ -323,6 +355,7 @@ impl Session {
         self.strips.retain(|s| self.graph.node(s.node).is_some());
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
         self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
+        self.prune_sends();
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -427,6 +460,19 @@ impl Session {
                 );
             }
         }
+        for s in &self.sends {
+            if !self.graph.is_bus(s.bus) {
+                bail!("A send goes to node {} which is not an aux bus of the patch.", s.bus);
+            }
+            if let crate::control::SendSource::Node(n) = s.from {
+                if self.graph.node(n).is_none() {
+                    bail!("A send comes from node {n} which is no longer in the patch.");
+                }
+            }
+            if !s.level.is_finite() || !(0.0..=1.0).contains(&s.level) {
+                bail!("The send into bus {} has a level outside 0..1.", s.bus);
+            }
+        }
         Ok(())
     }
 
@@ -461,6 +507,7 @@ impl Session {
             strips: self.strips.clone(),
             strip_order: self.strip_order.clone(),
             strip_knobs: self.strip_knobs.clone(),
+            sends: self.sends.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -499,6 +546,7 @@ impl Session {
             strips: manifest.strips,
             strip_order: manifest.strip_order,
             strip_knobs: manifest.strip_knobs,
+            sends: manifest.sends,
         };
         session.validate()?;
         Ok(session)
@@ -609,6 +657,9 @@ struct SessionFile {
     /// Explicit mixer quick-knob overrides (#107), keyed by node id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     strip_knobs: BTreeMap<NodeId, String>,
+    /// Sends into aux buses (issue #5); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sends: Vec<crate::control::Send>,
 }
 
 #[derive(Serialize, Deserialize)]

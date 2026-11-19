@@ -1586,6 +1586,13 @@ fn make_unit(node: &Node) -> Unit {
             // the audio cable no longer crosses the MIDI jack (vision review).
             vec![(Dir::In, 1, 0.22, "MIDI IN"), (Dir::Out, 0, 0.48, "OUT"), (Dir::In, 0, 0.74, "IN")],
         ),
+        // An aux bus (issue #5) has no input jack: sends feed it, and the
+        // cables from its OUT are its insert chain and its return.
+        NodeKind::Dsp(DspKind::Bus) => (
+            UnitKind::Dsp(DspKind::Bus), "aux bus · fed by sends".into(),
+            vec![], vec![PortKind::Audio],
+            vec![(Dir::Out, 0, 0.62, "OUT")],
+        ),
         NodeKind::Dsp(kind) => {
             let sub: &str = match kind {
                 DspKind::Reverb => "reverb",
@@ -1596,7 +1603,7 @@ fn make_unit(node: &Node) -> Unit {
                 DspKind::Saturation => "saturation",
                 DspKind::Pan => "panner",
                 DspKind::Metronome => "metronome · transport click",
-                DspKind::Delay => unreachable!(),
+                DspKind::Delay | DspKind::Bus => unreachable!(),
             };
             (
                 UnitKind::Dsp(kind.clone()), sub.into(),
@@ -15926,6 +15933,8 @@ impl DemoApp {
                 UnitKind::Clap => true,
                 UnitKind::AudioIn => true,
                 UnitKind::Keys | UnitKind::Master | UnitKind::MidiFx | UnitKind::Arp => false,
+                // Aux buses have their own group (`bus_units`).
+                UnitKind::Dsp(DspKind::Bus) => false,
                 UnitKind::Dsp(_) => u.lv2_inst
                     || (!u.jacks.iter().any(|j| j.dir == Dir::In) && u.jacks.iter().any(|j| j.dir == Dir::Out)),
             })

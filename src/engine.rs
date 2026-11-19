@@ -754,6 +754,7 @@ fn strip_gains_of(
 /// Aux buses the render path serves per block (issue #5); a ninth bus is
 /// silent. Their send accumulators are one allocation made in the constructor.
 pub const MAX_BUSES: usize = 8;
+const _: () = assert!(MAX_BUSES == crate::matrix::MixControl::SEND_SLOTS as usize);
 /// One bus accumulator: a stereo block of the largest device buffer.
 const BUS_SPAN: usize = 8192 * 2;
 /// Sends the engine tracks and publishes; one past it is dropped.
@@ -2868,6 +2869,30 @@ impl GraphEngine {
         self.mix_dirty = true;
     }
 
+    /// One send into an aux bus (SetSend, or a CC bound to its level). False
+    /// when `bus` is no bus, `from` cannot send (a bus, a node of a bus's
+    /// chain: feedback) or the table is full. Allocation-free.
+    fn set_send(&mut self, from: SendSource, bus: NodeId, level: Option<f32>, pre: Option<bool>) -> bool {
+        let ok_from = match from {
+            SendSource::Rig(r) => r < 8,
+            SendSource::Node(n) => self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n),
+        };
+        if !self.graph.is_bus(bus) || !ok_from { return false; }
+        let i = match self.sends.iter().position(|s| s.from == from && s.bus == bus) {
+            Some(i) => i,
+            None => {
+                if self.sends.len() >= MAX_SENDS { return false; }
+                self.sends.push(AuxSend { from, bus, level: 0.0, pre: false });
+                self.sends.len() - 1
+            }
+        };
+        if let Some(l) = level { self.sends[i].level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
+        if let Some(p) = pre { self.sends[i].pre = p; }
+        self.sends.retain(|s| !s.is_default());
+        self.mix_dirty = true;
+        true
+    }
+
     /// A controller bound to a mixer control (`CcTarget::Mix`): the rig bus
     /// when `dest` is a MasterOut, else that node's source strip. The mix is
     /// published back like any other mix edit (rule 33). False when the
@@ -2879,6 +2904,11 @@ impl GraphEngine {
         };
         if ctl.fits(rig_bus).is_err() { return false; }
         let e = ctl.edit(norm);
+        if let Some((slot, level)) = e.send {
+            let Some(bus) = self.graph.bus_at(slot as usize) else { return false };
+            let from = if rig_bus { SendSource::Rig(rig) } else { SendSource::Node(dest) };
+            return self.set_send(from, bus, Some(level), None);
+        }
         if rig_bus { self.set_rig_mix(rig, e) } else { self.set_strip_mix(dest, e) }
         true
     }
@@ -3613,31 +3643,13 @@ impl GraphEngine {
                 }
             }
             Command::SetRigMix { rig, vol, pan, mute, solo } => {
-                self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo });
+                self.set_rig_mix(rig, crate::matrix::MixEdit { vol, pan, mute, solo, send: None });
             }
             Command::SetStripMix { node, pan, mute, solo } => {
-                self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo });
+                self.set_strip_mix(node, crate::matrix::MixEdit { vol: None, pan, mute, solo, send: None });
             }
             Command::SetSend { from, bus, level, pre } => {
-                let ok_from = match from {
-                    SendSource::Rig(r) => r < 8,
-                    SendSource::Node(n) => {
-                        self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n)
-                    }
-                };
-                if !self.graph.is_bus(bus) || !ok_from { return; }
-                let i = match self.sends.iter().position(|s| s.from == from && s.bus == bus) {
-                    Some(i) => i,
-                    None => {
-                        if self.sends.len() >= MAX_SENDS { return; }
-                        self.sends.push(AuxSend { from, bus, level: 0.0, pre: false });
-                        self.sends.len() - 1
-                    }
-                };
-                if let Some(l) = level { self.sends[i].level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
-                if let Some(p) = pre { self.sends[i].pre = p; }
-                self.sends.retain(|s| !s.is_default());
-                self.mix_dirty = true;
+                self.set_send(from, bus, level, pre);
             }
             Command::SetStripBypass { node, bypass } => {
                 if bypass {
@@ -9099,6 +9111,33 @@ mod send_tests {
         r.bus.send(Command::SetSend { from: SendSource::Rig(0), bus: gain, level: Some(1.0), pre: None });
         r.render(1);
         assert!(r.engine.sends.is_empty(), "refused: {:?}", r.engine.sends);
+    }
+
+    #[test]
+    fn a_cc_bound_to_a_send_level_drives_that_send() {
+        use crate::matrix::MixControl;
+        let mut r = Rack::new();
+        let dev = SourceId::Hardware(0);
+        let aux = r.aux;
+        assert_eq!(r.engine.graph().bus_at(0), Some(aux));
+        // The rig bus of rig 2 and a source of rig 1, both into bus slot 0;
+        // slot 1 has no bus, so that binding moves nothing.
+        for (dest, cc, slot) in [(r.masters[1], 20, 0), (r.ins[0], 21, 0), (r.masters[0], 22, 1)] {
+            r.bus.send(Command::MatrixCcMap {
+                source: dev, dest, cc, param: Some(MixControl::Send(slot).param()), target: CcTarget::Mix, scale: Default::default(),
+            });
+        }
+        r.send(SendSource::Rig(1), 0.1, true);
+        for (cc, value) in [(20, 127), (21, 64), (22, 127)] {
+            r.bus.send(Command::Cc { source: dev, channel: 0, cc, value });
+        }
+        r.render(2);
+        assert_eq!(r.engine.sends, vec![
+            AuxSend { from: SendSource::Rig(1), bus: aux, level: 1.0, pre: true },
+            AuxSend { from: SendSource::Node(r.ins[0]), bus: aux, level: 64.0 / 127.0, pre: false },
+        ], "the controller sets the level and leaves pre/post alone");
+        let (pa, pb) = (r.in_peak(0), r.in_peak(1));
+        assert!(close(r.peak(aux), pb + 64.0 / 127.0 * pa), "and the bus plays it: {}", r.peak(aux));
     }
 
     #[test]

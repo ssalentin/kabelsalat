@@ -89,13 +89,14 @@ knob assignments are saved with the session.
 <p align="center"><img src="docs/shots/mixer.png" width="85%" alt="The mixer: a channel strip per source with dB faders, pan, mute and solo, the rig bus, and the master with its inserts"/></p>
 
 ### Share an effect with sends
-**+ Aux bus** in the mixer adds a bus: a channel that nothing is cabled into.
+**+ Aux bus** under the mixer's master strip adds a bus: a channel that nothing is cabled into.
 Every rig bus and every source strip gets a **SENDS** row for it. Turn the
 row's knob to send some of that signal to the bus (double-click: off or 0 dB)
 and click **PRE** to tap it before the strip's fader, so the send keeps its
 level when the fader moves. Put a reverb or a delay on the bus as an insert
 and several rigs share it. The bus has its own fader, pan, mute and solo and
 returns to the master past the rig faders; soloing it leaves only the returns.
+Right-click a send knob to bind it to a hardware controller, like the faders.
 Sends are saved with the session.
 
 <p align="center"><img src="docs/shots/sends.png" width="85%" alt="The mixer with an aux bus called Verb carrying a reverb, and SENDS rows under the rig buses and source strips that feed it"/></p>

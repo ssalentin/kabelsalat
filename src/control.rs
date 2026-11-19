@@ -506,6 +506,17 @@ impl Graph {
         added
     }
 
+    /// The aux bus in send slot `slot`: the patch's buses in node order.
+    /// A learned send binding names its bus this way (`MixControl::Send`).
+    pub fn bus_at(&self, slot: usize) -> Option<NodeId> {
+        self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).nth(slot).map(|n| n.id)
+    }
+
+    /// The send slot of an aux bus (see [`Graph::bus_at`]).
+    pub fn bus_slot(&self, bus: NodeId) -> Option<usize> {
+        self.nodes.iter().filter(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus))).position(|n| n.id == bus)
+    }
+
     /// Is this node an aux bus (issue #5)?
     pub fn is_bus(&self, node: NodeId) -> bool {
         self.node(node).is_some_and(|n| matches!(n.kind, NodeKind::Dsp(DspKind::Bus)))

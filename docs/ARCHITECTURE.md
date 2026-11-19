@@ -299,7 +299,9 @@ agents are in [AGENTS.md](../AGENTS.md).
   send (no feedback, no block of delay anywhere). Mute and solo silence a
   source's sends in both modes; a bus's solo silences the dry rigs instead of
   the other sources of its rig. Limits: `MAX_BUSES` 8, `MAX_SENDS` 64, both
-  allocated in the constructor. Not in it: a bus output other than the master
+  allocated in the constructor. A send level is a learnable mixer control
+  (`MixControl::Send(slot)`, the slot being the bus's place among the
+  patch's buses), bound on the strip it leaves from. Not in it: a bus output other than the master
   (#31) and delay compensation for latent plugins on a bus (#76). Check with
   `kabelsalat send-test` (two Surge rigs into one reverb bus).
 - **2026-11-15** — **No squished racks** (user): the assistant panel only takes

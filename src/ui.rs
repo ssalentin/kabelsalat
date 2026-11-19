@@ -8561,6 +8561,24 @@ impl DemoApp {
     /// (rule 51).
     fn apply_mix_cc(&mut self, node: u32, ctl: MixControl, norm: f64, resend: bool) {
         let e = ctl.edit(norm);
+        if let Some((slot, level)) = e.send {
+            // A send level (issue #5): the strip's send into that slot's bus.
+            let Some(bus) = self.base_graph.bus_at(slot as usize) else { return };
+            let from = match self.rig_of_bus_node(node) {
+                Some(rig) => SendSource::Rig(rig as u8),
+                None => SendSource::Node(node),
+            };
+            if resend {
+                let _ = self.set_send(from, bus, Some(level), None);
+            } else if self.units.iter().any(|u| u.node_id == node) {
+                let mut x = self.send_of(from, bus);
+                x.level = level;
+                self.sends.retain(|o| !(o.from == from && o.bus == bus));
+                if !x.is_default() { self.sends.push(x); }
+                self.ui_send_grace = self.ui_time + 0.6;
+            }
+            return;
+        }
         if let Some(rig) = self.rig_of_bus_node(node) {
             let m = &mut self.rig_mix[rig.min(7)];
             if let Some(v) = e.vol { m.vol = v; }
@@ -16305,8 +16323,7 @@ impl DemoApp {
                                 w + gap
                             }).sum::<f32>()
                         };
-                        let add_bus_w = theme::chip_button_width(ui, "+ Aux bus") + gap;
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + add_bus_w + sys + 152.0 + 2.0 * gap;
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + 152.0 + 2.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -16379,20 +16396,6 @@ impl DemoApp {
                                         });
                                     });
                                 }
-                                // "+ Aux bus" stands where the next bus will.
-                                // Its width is set: a chip in a column that may shrink
-                                // wraps letter by letter (rule 100).
-                                let chip_w = theme::chip_button_width(ui, "+ Aux bus");
-                                ui.allocate_ui_with_layout(egui::vec2(chip_w, 36.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                                    ui.set_width(chip_w);
-                                    ui.add_space(6.0);
-                                    if theme::chip_button(ui, "+ Aux bus", false)
-                                        .on_hover_text("add an aux bus: rigs and sources send into it, its inserts run on the sum, and it returns to Master out past the rig faders")
-                                        .clicked()
-                                    {
-                                        self.pending_bus_edit = Some(BusEdit::Add);
-                                    }
-                                });
                                 // System audio: every other app that is playing
                                 // (YouTube in the browser, …) gets a strip —
                                 // its PipeWire stream volume and mute.
@@ -16903,6 +16906,15 @@ impl DemoApp {
             if ui.add(rmb).on_hover_text("arm the master mix for recording").clicked() {
                 self.set_record_arm(None, !arm_m);
             }
+            // Aux buses return here; a new one is added here (issue #5). In
+            // this column it costs the strips no width.
+            ui.add_space(6.0);
+            if theme::chip_button(ui, "+ Aux bus", false)
+                .on_hover_text("add an aux bus: rigs and sources send into it, its inserts run on the sum, and it returns to Master out past the rig faders")
+                .clicked()
+            {
+                self.pending_bus_edit = Some(BusEdit::Add);
+            }
         });
         if let (Some((mu, vk)), Some(g)) = (master_knob, gain) {
             self.set_unit_knob(mu, vk, g);
@@ -17108,12 +17120,27 @@ impl DemoApp {
             let tresp = ui.interact(tag, egui::Id::new(("send_pre", key)), egui::Sense::click());
             let kresp = ui.interact(knob_rect, egui::Id::new(("send_level", key)), egui::Sense::click_and_drag());
             self.mixer_send_rects.push((from, bus, knob_rect, tag));
+            // MIDI learn (#75): the send level is a mixer control of this
+            // strip, named by the bus's slot.
+            let strip_node = match from {
+                SendSource::Rig(r) => self.rig_bus_node(r as usize),
+                SendSource::Node(n) => Some(n),
+            };
+            let learn: Option<CcDest> = strip_node.zip(self.base_graph.bus_slot(bus))
+                .filter(|(_, slot)| *slot < MixControl::SEND_SLOTS as usize)
+                .map(|(n, slot)| (n, MixControl::Send(slot as u8).param(), CcTarget::Mix));
+            self.mixer_learn_ui(ui, &kresp, knob_rect, learn);
+            let cc_tag = self.cc_tag(learn);
             let on = x.level > 0.0;
             ui.painter().rect_filled(plate_rect, 2.0, theme::DARK_PANEL_HI);
             ui.painter().text(Pos2::new(plate_rect.left() + PLATE_PAD_X, plate_rect.center().y), egui::Align2::LEFT_CENTER,
                 "PRE", theme::medium_font(8.0), if x.pre { theme::LIVE_TEAL } else { theme::MUTED });
-            paint_slot_texts(ui.painter(), plate_rect, tag.right() + 2.0, &name, Some(&send_readout(x.level)),
-                if on { theme::CREAM } else { theme::CREAM_DIM }, theme::CREAM_MID);
+            // While learning the caption says so; a bound send names its CC
+            // in the hover text and wears the MIDI outline.
+            let caption = if cc_tag.as_deref() == Some("LEARN") { "LEARN".to_string() } else { send_readout(x.level) };
+            paint_slot_texts(ui.painter(), plate_rect, tag.right() + 2.0, &name, Some(&caption),
+                if on { theme::CREAM } else { theme::CREAM_DIM },
+                if cc_tag.as_deref() == Some("LEARN") { theme::MIDI_BLUE } else { theme::CREAM_MID });
             let mut level = None;
             if kresp.hovered() { ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical); }
             if kresp.dragged() {
@@ -17146,7 +17173,8 @@ impl DemoApp {
                 QUICK_KNOB_ARC_GAP,
                 1.4,
             );
-            kresp.on_hover_text(format!("send to {name}: {} · drag · double-click: off / 0 dB", db_readout(x.level)));
+            let bound = cc_tag.filter(|t| t != "LEARN").map(|t| format!(" · {t}")).unwrap_or_default();
+            kresp.on_hover_text(format!("send to {name}: {}{bound} · drag · double-click: off / 0 dB · right-click: MIDI learn", db_readout(x.level)));
             let pre = tresp.clicked().then_some(!x.pre);
             tresp.on_hover_text(if x.pre {
                 "pre fader: this send keeps its level when the fader moves · click: post fader"
@@ -29947,6 +29975,45 @@ mod mixer_midi_learn_tests {
     }
 
     #[test]
+    fn a_send_level_learns_a_cc_and_follows_it() {
+        // Issue #5 on top of #75: a send level is a mixer control too.
+        let (mut app, ctx, mut drain) = mixer_app();
+        let bus_node = app.add_bus(None, 0).expect("an aux bus");
+        for _ in 0..3 { frame(&mut app, &ctx, vec![]); }
+        sent(&mut drain);
+        let master = app.rig_bus_node(0).unwrap();
+        let send = (master, MixControl::Send(0).param(), CcTarget::Mix);
+        let from = SendSource::Rig(0);
+
+        let pos = at(&app, send);
+        let texts = rclick(&mut app, &ctx, pos);
+        assert!(app.cc_learn.as_ref().is_some_and(|l| (l.dest, l.param, l.target) == send), "right-click arms MIDI learn");
+        assert!(texts.iter().any(|t| t == "LEARN"), "the send row says LEARN: {texts:?}");
+
+        cc(&mut app, &ctx, 2, 20, 64);
+        assert!(app.cc_learn.is_none(), "the CC completed the learn");
+        assert_eq!(mapping(&app, 2, send).map(|m| m.cc), Some(20));
+        assert_eq!(app.send_of(from, bus_node).level, 64.0 / 127.0, "the send moves on screen (rule 109)");
+        let cmds = sent(&mut drain);
+        assert!(cmds.iter().any(|c| matches!(c, Command::MatrixCcMap { cc: 20, target: CcTarget::Mix, dest, .. } if *dest == master)),
+            "the binding goes to the engine: {cmds:?}");
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetSend { from: SendSource::Rig(0), bus, level: Some(l), .. }
+            if *bus == bus_node && *l == 64.0 / 127.0)), "one catch-up SetSend (rule 51): {cmds:?}");
+
+        // From then on the engine applies the CC; the app only follows.
+        cc(&mut app, &ctx, 2, 20, 127);
+        assert_eq!(app.send_of(from, bus_node).level, 1.0);
+        assert!(!sent(&mut drain).iter().any(|c| matches!(c, Command::SetSend { .. })), "no echo back to the engine");
+        // The rig's fader, on the same node, did not take the binding.
+        assert_eq!(app.rig_mix[0].vol, 1.0);
+        // An agent binds one by name.
+        let src = first_source(&app);
+        let out = app.exec_tool("set_cc_map", &serde_json::json!({ "node": src, "source": "hw:2", "cc": 21, "mix": "send1" }));
+        assert!(out.contains("\"target\":\"mix\""), "{out}");
+        assert_eq!(mapping(&app, 2, (src, MixControl::Send(0).param(), CcTarget::Mix)).map(|m| m.cc), Some(21));
+    }
+
+    #[test]
     fn mute_solo_and_pan_learn_on_the_bus_and_on_a_source_strip() {
         let (mut app, ctx, mut drain) = mixer_app();
         let node = first_source(&app);
@@ -30200,7 +30267,7 @@ mod mixer_midi_learn_tests {
         // A source strip has no fader of its own; the answer says what to bind.
         let refused = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "mix": "vol"}));
         assert!(refused.contains("LEVEL") && app.rule_edits.get(&(SourceId::Hardware(0), node)).is_none(), "{refused}");
-        let bad = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "target": "mix", "param": 9}));
+        let bad = app.exec_tool("set_cc_map", &serde_json::json!({"node": node, "source": "hw:0", "cc": 9, "target": "mix", "param": 99}));
         assert!(bad.contains("no mixer control"), "{bad}");
         // learn_cc arms the same learn a right-click does.
         let armed = app.exec_tool("learn_cc", &serde_json::json!({"node": node, "mix": "solo"}));

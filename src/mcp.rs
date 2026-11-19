@@ -551,7 +551,7 @@ struct SetCcMapArgs {
     target: Option<String>,
     /// Optional rack unit knob label (e.g. "LEVEL", "MIX", "VOLUME") — resolves `param` + `target` automatically.
     knob: Option<String>,
-    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo". On a rig's Master out node it is that rig's bus; on a source node the source strip's pan, mute or solo. Resolves `param` + `target` ("mix").
+    /// Optional MIXER control: "vol" | "pan" | "mute" | "solo" | "send1".."send8" (the send level into the 1st..8th aux bus, see get_sends). On a rig's Master out node it is that rig's bus; on a source node the source strip's pan, mute, solo or send. Resolves `param` + `target` ("mix").
     mix: Option<String>,
     /// Lowest parameter value the controller reaches (0..1, default 0).
     min: Option<f32>,
@@ -2053,7 +2053,7 @@ impl McpServer {
         // target='mix' with a bare param must name a control of that strip.
         if let (crate::matrix::CcTarget::Mix, Some(p)) = (target, param) {
             let fits = crate::matrix::MixControl::from_param(p)
-                .ok_or_else(|| format!("no mixer control {p}: pass mix='vol'|'pan'|'mute'|'solo'"))
+                .ok_or_else(|| format!("no mixer control {p}: pass mix='vol'|'pan'|'mute'|'solo'|'send1'..'send8'"))
                 .and_then(|c| c.fits(matches!(node_kind, NodeKind::MasterOut)).map_err(String::from));
             if let Err(e) = fits {
                 return tool_err(e);

@@ -384,6 +384,13 @@ struct SetAudioOutputArgs {
     output: Option<String>,
 }
 
+/// Arguments for `set_buffer_size`.
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetBufferSizeArgs {
+    /// Output buffer size in frames: 64, 128, 256, 512, 1024, or 2048.
+    frames: u32,
+}
+
 /// Arguments for `set_app_stream`.
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SetAppStreamArgs {
@@ -1857,6 +1864,11 @@ impl McpServer {
     #[tool(name = "set_audio_output", description = "Choose the sound card kabelsalat plays to (name from list_audio_outputs; omit/empty = system default). Moves the live stream, remembered across restarts. Needs the running app.")]
     fn set_audio_output(&self, Parameters(args): Parameters<SetAudioOutputArgs>) -> Result<CallToolResult, McpError> {
         Self::ui_bridge_tool("set_audio_output", json!({"output": args.output}))
+    }
+
+    #[tool(name = "set_buffer_size", description = "Change the audio output buffer size in frames (64, 128, 256, 512, 1024, or 2048). Smaller reduces latency; larger gives more headroom against dropouts (xruns). Reopens the audio stream live and is remembered across restarts. Needs the running app.")]
+    fn set_buffer_size(&self, Parameters(args): Parameters<SetBufferSizeArgs>) -> Result<CallToolResult, McpError> {
+        Self::ui_bridge_tool("set_buffer_size", json!({"frames": args.frames}))
     }
 
     #[tool(name = "list_app_streams", description = "List other apps playing audio right now (YouTube, Spotify, …): index, app, title, volume, muted — the mixer's System audio strips. Needs the running app.")]

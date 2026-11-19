@@ -238,9 +238,44 @@ fn pactl(args: &[&str]) -> Option<String> {
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
-/// One scan + enforce pass: list outputs, find our stream, move it to
-/// `wanted` if it plays elsewhere. Blocking I/O — scan thread only.
-pub fn scan_and_apply(wanted: Option<&str>) -> OutputState {
+/// Where the scan thread should hold our stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target<'a> {
+    /// Leave it where PipeWire put it (no choice made).
+    Follow,
+    /// The user went back to "System default": move it to the default sink
+    /// once, then follow.
+    Default,
+    /// The chosen output; re-applied on every pass (restarts, re-plugs).
+    Sink(&'a str),
+}
+
+/// What the next pass does, from the stored choice and the one the previous
+/// pass saw: a choice that was just dropped moves the stream back once.
+pub fn target_for<'a>(wanted: Option<&'a str>, previous: Option<&str>) -> Target<'a> {
+    match (wanted, previous) {
+        (Some(w), _) => Target::Sink(w),
+        (None, Some(_)) => Target::Default,
+        (None, None) => Target::Follow,
+    }
+}
+
+/// The choice the next pass compares against: a dropped choice stays
+/// remembered until a pass has seen our stream on the default sink, so the
+/// move back is asked for again when PipeWire did not carry it out.
+pub fn remember(wanted: Option<String>, previous: Option<String>, seen: &OutputState) -> Option<String> {
+    let on_default = seen.current.as_ref()
+        .is_some_and(|c| seen.outputs.iter().any(|o| o.default && &o.raw == c));
+    match wanted {
+        Some(w) => Some(w),
+        None if on_default => None,
+        None => previous,
+    }
+}
+
+/// One scan + enforce pass: list outputs, find our stream, move it to the
+/// target if it plays elsewhere. Blocking I/O — scan thread only.
+pub fn scan_and_apply(target: Target) -> OutputState {
     let default = pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string();
     let sinks_json = pactl(&["-f", "json", "list", "sinks"]).unwrap_or_default();
     let outputs = parse_sinks(&sinks_json, &default);
@@ -256,20 +291,193 @@ pub fn scan_and_apply(wanted: Option<&str>) -> OutputState {
         std::process::id(),
     );
     let streams = parse_app_streams(&inputs_json, stream.map(|(i, _)| i));
-    let mut current = stream.and_then(|(_, sink)| index_to_name(sink));
+    let current = stream.and_then(|(_, sink)| index_to_name(sink));
+    let wanted = match target {
+        Target::Follow => None,
+        Target::Default => Some(default.as_str()),
+        Target::Sink(w) => Some(w),
+    };
     if let (Some((input, _)), Some(w)) = (stream, wanted) {
         let available = outputs.iter().any(|o| o.raw == w);
         if available && current.as_deref() != Some(w) {
             let ok = std::process::Command::new("pactl")
                 .args(["move-sink-input", &input.to_string(), w])
                 .status().is_ok_and(|s| s.success());
-            if ok {
-                eprintln!("audio out: moved to {w}");
-                current = Some(w.to_string());
-            }
+            // `current` stays what pactl listed: PipeWire answers a move with
+            // success before it happened, and sometimes without doing it. The
+            // next pass reads where the stream really is and asks again.
+            if ok { eprintln!("audio out: asked PipeWire to move the stream to {w}"); }
         }
     }
     OutputState { outputs, current, streams }
+}
+
+/// `kabelsalat audio-out-test`: the whole of this module against the
+/// machine's real PipeWire. It opens a real output stream (silence), starts a
+/// second process that plays a tone as "another app", and checks through
+/// `pactl` that the stream is found, moved to a chosen output, moved back to
+/// the default, left alone for an output that is not there, and that the
+/// other app is listed, metered, turned down and muted. Two null sinks are
+/// loaded for it and unloaded at the end, so nothing is heard.
+pub fn run_test() -> anyhow::Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    /// Unloads the test's null sinks and ends the tone, also on a failed check.
+    struct Cleanup { modules: Vec<String>, app: Option<std::process::Child>, default: String }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.app.take() { let _ = c.kill(); let _ = c.wait(); }
+            if !self.default.is_empty() { let _ = pactl(&["set-default-sink", &self.default]); }
+            for m in &self.modules { let _ = pactl(&["unload-module", m]); }
+        }
+    }
+    fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> anyhow::Result<T> {
+        let end = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(v) = f() { return Ok(v); }
+            anyhow::ensure!(Instant::now() < end, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    }
+    fn sink_of_input(input: u64) -> Option<String> {
+        let inputs: Value = serde_json::from_str(&pactl(&["-f", "json", "list", "sink-inputs"])?).ok()?;
+        let sink = inputs.as_array()?.iter().find(|i| i.get("index").and_then(Value::as_u64) == Some(input))?
+            .get("sink")?.as_u64()?;
+        let sinks: Value = serde_json::from_str(&pactl(&["-f", "json", "list", "sinks"])?).ok()?;
+        sinks.as_array()?.iter().find(|s| s.get("index").and_then(Value::as_u64) == Some(sink))?
+            .get("name")?.as_str().map(str::to_string)
+    }
+
+    let info = pactl(&["info"]).ok_or_else(|| anyhow::anyhow!("pactl info failed: no PipeWire/PulseAudio server"))?;
+    println!("server: {}", info.lines().find(|l| l.starts_with("Server Name")).unwrap_or("?"));
+    let mut cleanup = Cleanup {
+        modules: Vec::new(), app: None,
+        default: pactl(&["get-default-sink"]).unwrap_or_default().trim().to_string(),
+    };
+    let (home, other) = ("kabelsalat_test_home", "kabelsalat_test_other");
+    for (name, label) in [(home, "Test-Home"), (other, "Test-Other")] {
+        let id = pactl(&["load-module", "module-null-sink", &format!("sink_name={name}"),
+            &format!("sink_properties=device.description={label}")])
+            .ok_or_else(|| anyhow::anyhow!("could not load a null sink"))?;
+        cleanup.modules.push(id.trim().to_string());
+    }
+    anyhow::ensure!(pactl(&["set-default-sink", home]).is_some(), "set-default-sink failed");
+
+    // Our own output stream, the way the engine opens it (cpal, default device).
+    let device = cpal::default_host().default_output_device()
+        .ok_or_else(|| anyhow::anyhow!("no default output device"))?;
+    let config: cpal::StreamConfig = device.default_output_config()?.into();
+    let stream = device.build_output_stream(
+        config,
+        |data: &mut [f32], _: &cpal::OutputCallbackInfo| data.fill(0.0),
+        |_err: cpal::Error| {},
+        None,
+    )?;
+    stream.play()?;
+
+    // "Another app": a second process playing a 440 Hz tone.
+    let mut app = std::process::Command::new("pacat")
+        .args(["--playback", &format!("--device={home}"), "--format=float32le", "--rate=48000", "--channels=2",
+            "--client-name=Test Browser", "--stream-name=(2) Backing track - Video", "--latency-msec=50"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn().map_err(|e| anyhow::anyhow!("pacat: {e}"))?;
+    let mut tone_in = app.stdin.take().expect("piped stdin");
+    cleanup.app = Some(app);
+    std::thread::spawn(move || {
+        let mut phase = 0.0f32;
+        let mut buf = Vec::with_capacity(4800 * 8);
+        loop {
+            buf.clear();
+            for _ in 0..4800 {
+                phase = (phase + 440.0 / 48000.0).fract();
+                let v = ((phase * std::f32::consts::TAU).sin() * 0.5).to_le_bytes();
+                buf.extend_from_slice(&v);
+                buf.extend_from_slice(&v);
+            }
+            if tone_in.write_all(&buf).is_err() { break; }
+        }
+    });
+
+    // 1. No choice: our stream is found where PipeWire put it, both outputs are listed.
+    let st = until("our stream in the scan", || Some(scan_and_apply(Target::Follow)).filter(|s| s.current.is_some()))?;
+    println!("outputs: {:?}", st.outputs.iter().map(|o| (&o.raw, &o.name, o.default)).collect::<Vec<_>>());
+    // Not necessarily the default: the session manager restores the sink a
+    // stream of this name was last moved to.
+    let start = st.current.clone().unwrap_or_default();
+    anyhow::ensure!(st.outputs.iter().any(|o| o.raw == start), "our stream plays to a listed sink, got {start:?}");
+    anyhow::ensure!(st.outputs.first().is_some_and(|o| o.raw == home && o.default), "the default sink is listed first");
+    anyhow::ensure!(st.outputs.iter().any(|o| o.raw == other && o.name == "Test-Other"), "the other sink is listed by its description");
+    let clients = pactl(&["-f", "json", "list", "clients"]).unwrap_or_default();
+    let (ours, _) = find_our_stream(&pactl(&["-f", "json", "list", "sink-inputs"]).unwrap_or_default(), &clients, std::process::id())
+        .ok_or_else(|| anyhow::anyhow!("our stream is not in pactl's list"))?;
+    println!("ok: our stream is sink-input {ours} on {start}");
+
+    // The scan thread's loop: one pass per call, with its memory of the choice.
+    let mut previous: Option<String> = None;
+    let mut pass = |wanted: Option<&str>| {
+        let st = scan_and_apply(target_for(wanted, previous.as_deref()));
+        previous = remember(wanted.map(str::to_string), previous.take(), &st);
+        st
+    };
+
+    // 2. A chosen output: the stream moves there, and pactl agrees.
+    let mut passes = 0;
+    until("pactl showing the stream on the chosen sink", || { passes += 1; pass(Some(other)); (sink_of_input(ours).as_deref() == Some(other)).then_some(()) })?;
+    anyhow::ensure!(pass(Some(other)).current.as_deref() == Some(other), "the next pass finds it there");
+    println!("ok: chosen output {other}: stream moved after {passes} pass(es) (pactl: {:?})", sink_of_input(ours));
+
+    // 3. An output that is not there: the stream stays.
+    let st = pass(Some("kabelsalat_test_unplugged"));
+    anyhow::ensure!(st.current.as_deref() == Some(other) && sink_of_input(ours).as_deref() == Some(other),
+        "a missing output leaves the stream alone, got {:?}", st.current);
+    println!("ok: a missing output leaves the stream on {other}");
+    pass(Some(other));
+
+    // 4. Back to "System default": asked for until the stream is there, then left alone.
+    let mut passes = 0;
+    until("pactl showing the stream back on the default sink", || { passes += 1; pass(None); (sink_of_input(ours).as_deref() == Some(home)).then_some(()) })?;
+    pass(None);
+    anyhow::ensure!(previous.is_none(), "once it is back, the dropped choice is forgotten");
+    anyhow::ensure!(target_for(None, previous.as_deref()) == Target::Follow, "and the stream is left alone from then on");
+    println!("ok: back to the system default {home} after {passes} pass(es)");
+
+    // 5. The other app: listed with app and title, never our own stream.
+    let theirs = until("the other app's stream", || scan_and_apply(Target::Follow).streams.into_iter().find(|s| s.app == "Test Browser"))?;
+    println!("app stream: {theirs:?}");
+    anyhow::ensure!(theirs.title == "(2) Backing track - Video", "title, got {:?}", theirs.title);
+    anyhow::ensure!((theirs.volume - 1.0).abs() < 0.02 && !theirs.muted, "starts at 100 %, unmuted: {theirs:?}");
+    anyhow::ensure!(scan_and_apply(Target::Follow).streams.iter().all(|s| s.index != ours), "our own stream is not an app strip");
+
+    // 6. Its meter moves while it plays.
+    let levels: StreamLevels = Default::default();
+    let mut meters = StreamMeters::new(levels.clone());
+    meters.sync(std::slice::from_ref(&theirs));
+    let level = until("a meter reading of the tone", || Some(stream_level(&levels, theirs.index)).filter(|l| *l > 0.2))?;
+    anyhow::ensure!((level - 0.5).abs() < 0.1, "a 0.5 peak tone meters near 0.5, got {level}");
+    println!("ok: meter reads {level:.3} for a 0.5 peak tone");
+
+    // 7. Volume and mute reach the stream.
+    apply_stream_cmds(vec![StreamCmd::Volume(theirs.index, 0.9), StreamCmd::Volume(theirs.index, 0.5), StreamCmd::Mute(theirs.index, true)]);
+    let now = until("the new volume and mute in the scan", || scan_and_apply(Target::Follow).streams.into_iter()
+        .find(|s| s.index == theirs.index).filter(|s| (s.volume - 0.5).abs() < 0.02 && s.muted))?;
+    println!("ok: volume {:.2}, muted {} (the latest of two volume changes won)", now.volume, now.muted);
+    apply_stream_cmds(vec![StreamCmd::Volume(theirs.index, 1.0), StreamCmd::Mute(theirs.index, false)]);
+    until("volume and mute restored", || scan_and_apply(Target::Follow).streams.into_iter()
+        .find(|s| s.index == theirs.index).filter(|s| (s.volume - 1.0).abs() < 0.02 && !s.muted))?;
+
+    // 8. The app stops: its strip and its meter reader go.
+    if let Some(mut c) = cleanup.app.take() { let _ = c.kill(); let _ = c.wait(); }
+    let st = until("the stream leaving the scan", || Some(scan_and_apply(Target::Follow)).filter(|s| s.streams.iter().all(|x| x.index != theirs.index)))?;
+    meters.sync(&st.streams);
+    anyhow::ensure!(!meters.readers.contains_key(&theirs.index), "the meter reader of an ended stream is stopped");
+    anyhow::ensure!(stream_level(&levels, theirs.index) == 0.0, "an ended stream reads silent");
+    println!("ok: the app stopped, its strip and meter are gone");
+
+    drop(stream);
+    println!("audio-out-test: PASS");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -289,6 +497,28 @@ mod tests {
         let old = std::time::Instant::now() - std::time::Duration::from_millis(400);
         levels.lock().unwrap().insert(7, (0.4, old));
         assert_eq!(stream_level(&levels, 7), 0.0, "a paused tab stops sending: shown silent, not frozen");
+    }
+
+    #[test]
+    fn dropping_the_chosen_output_goes_back_to_the_default_once() {
+        assert_eq!(target_for(Some("m2"), None), Target::Sink("m2"));
+        assert_eq!(target_for(Some("m2"), Some("speakers")), Target::Sink("m2"));
+        assert_eq!(target_for(None, Some("m2")), Target::Default, "System default after a choice moves the stream back");
+        assert_eq!(target_for(None, None), Target::Follow, "no choice ever made: never move the stream");
+        // The dropped choice is kept until the stream is seen on the default.
+        let seen = |current: &str| OutputState {
+            outputs: vec![
+                OutputDevice { raw: "speakers".into(), name: "Speakers".into(), default: true },
+                OutputDevice { raw: "m2".into(), name: "M2".into(), default: false },
+            ],
+            current: Some(current.into()),
+            streams: Vec::new(),
+        };
+        let m2 = || Some("m2".to_string());
+        assert_eq!(remember(None, m2(), &seen("m2")), m2(), "still on the old card: ask again next pass");
+        assert_eq!(remember(None, m2(), &OutputState::default()), m2(), "stream not found yet: keep asking");
+        assert_eq!(remember(None, m2(), &seen("speakers")), None, "arrived: done");
+        assert_eq!(remember(m2(), None, &seen("speakers")), m2());
     }
 
     #[test]

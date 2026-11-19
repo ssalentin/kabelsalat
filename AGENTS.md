@@ -1105,6 +1105,23 @@ Learned so far (2026-11-15, UI polish pass):
     (`a_focused_text_field_types_without_the_desktops_input_method`). Live
     check: headless sway + fcitx5, type with `wtype`, `kill -STOP` fcitx5,
     type again.
+159. **A `pactl` move that answered "ok" may not have happened:** on
+    PipeWire, `move-sink-input` returns success before the stream is
+    relinked, and right after a default-sink change it sometimes does
+    nothing at all. The output scan reported the wanted sink as current, so
+    the UI showed a card the sound was not on; and "System default" after a
+    choice never moved the stream back (it stayed on the M2, and WirePlumber
+    restored that target on the next start). `scan_and_apply` reports only
+    what `pactl` lists, a chosen sink is re-applied every pass, and a dropped
+    choice is remembered (`audio_out::remember`) until a pass has seen the
+    stream on the default sink. Check with `kabelsalat audio-out-test` on a
+    machine with PipeWire.
+160. **A strip for something outside the patch names it on the strip:** the
+    System audio strips showed a fader, a meter and "M", and the app's name
+    only in a tooltip, so two playing apps could not be told apart. App and
+    title are fitted lines above the fader
+    (`another_apps_strip_names_the_app_and_its_fader_and_mute_reach_the_stream`).
+    Their meter key is the stream's index (rule 135), never the slot in the row.
 
 ## Working on kabelsalat
 
@@ -1142,6 +1159,8 @@ Learned so far (2026-11-15, UI polish pass):
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
+  `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
+  temporary null sinks, so nothing is heard),
   `main-controls-test`, `engine-bench` (offline render timing and output hash),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,

@@ -634,14 +634,14 @@ impl ClapVoice {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, 0, self.rt_cmds[i]);
+            push_cmd(&mut self.ev_in, &self.param_ranges, 0, self.rt_cmds[i]);
         }
         self.rt_cmds.clear();
         while let Ok(cmd) = self.cmds_rx.pop() {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, 0, cmd);
+            push_cmd(&mut self.ev_in, &self.param_ranges, 0, cmd);
         }
         while self.sched_idx < self.schedule.len()
             && self.schedule[self.sched_idx].0 < self.frame + n as u64
@@ -650,7 +650,7 @@ impl ClapVoice {
                 break;
             }
             let (t, cmd) = self.schedule[self.sched_idx];
-            push_cmd(&mut self.ev_in, (t - self.frame) as u32, cmd);
+            push_cmd(&mut self.ev_in, &self.param_ranges, (t - self.frame) as u32, cmd);
             self.sched_idx += 1;
         }
 
@@ -740,8 +740,17 @@ fn transport_event(t: &Transport) -> TransportEvent {
     }
 }
 
-fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
+/// Whether the plugin declared parameter `id` (`ranges` is sorted by id).
+fn has_param(ranges: &[(u32, f64, f64)], id: u32) -> bool {
+    ranges.binary_search_by_key(&id, |&(pid, _, _)| pid).is_ok()
+}
+
+/// Queue `cmd` as a CLAP event. A parameter event for an id the plugin did
+/// not declare is dropped: CLAP allows only declared ids, and Surge XT
+/// dereferences the parameter it did not find (#29).
+fn push_cmd(ev_in: &mut EventBuffer, params: &[(u32, f64, f64)], time: u32, cmd: VoiceCmd) {
     match cmd {
+        VoiceCmd::Param(id, _) if !has_param(params, id.get()) => {}
         VoiceCmd::NoteOn(k, v) => {
             ev_in.push(&NoteOnEvent::new(time, Pckn::new(0u16, 0u16, k, k as u32), v))
         }
@@ -760,6 +769,24 @@ fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
             v,
         )),
         VoiceCmd::Midi(data) => ev_in.push(&MidiEvent::new(time, 0, data)),
+    }
+}
+
+#[cfg(test)]
+mod param_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_parameter_event_reaches_the_plugin_only_for_an_id_it_declared() {
+        let declared = [(7u32, 0.0, 1.0), (40, -1.0, 1.0)];
+        let mut events = EventBuffer::with_capacity(4);
+        push_cmd(&mut events, &declared, 0, VoiceCmd::Param(ClapId::new(8), 0.5));
+        assert_eq!(events.len(), 0, "an undeclared id is dropped");
+        push_cmd(&mut events, &declared, 0, VoiceCmd::Param(ClapId::new(40), 0.5));
+        push_cmd(&mut events, &declared, 0, VoiceCmd::NoteOn(60, 0.9));
+        assert_eq!(events.len(), 2, "declared parameters and notes pass");
+        push_cmd(&mut events, &[], 0, VoiceCmd::Param(ClapId::new(40), 0.5));
+        assert_eq!(events.len(), 2, "a plugin without parameters gets none");
     }
 }
 

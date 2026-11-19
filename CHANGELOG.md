@@ -127,6 +127,9 @@ releases may still change behaviour and session files.
   labels with full hover tooltips).
 
 ### Fixed
+- **The Load rig preset dialog has a clean layout.** "Load into" lists the new
+  rig and every rig to replace as one row each with a radio mark; long rig
+  names no longer wrap letter by letter into tall columns.
 - **A new delay echoes instead of distorting:** the TIME knob started at
   21 ms with feedback, a metallic comb that sounded like distortion. Its
   range is now 50 ms to 2 s, so a new delay starts at about 220 ms. Saved

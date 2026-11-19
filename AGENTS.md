@@ -675,6 +675,12 @@ Learned so far (2026-11-15, UI polish pass):
     the caller's relative `./target/release/kabelsalat` ("No such file"), so
     the first release run failed on both arches. Use `realpath` on every
     path argument at the top of a script that changes directory.
+118. **A list of choices is one row per choice, never a wrapping chip row:**
+    the load-rig dialog put "Replace N · name" chips in `horizontal_wrapped`;
+    the last ones wrapped letter by letter into towers and the modal grew to
+    856 px. Options whose labels carry user text (rig, preset, device names)
+    are full-width rows with truncated labels (`load_target_row`); test the
+    dialog with long names (`load_rig_dialog_keeps_its_width_with_many_long_rig_names`).
 118. **Plugin actions that change the rack return to `StageView::Rack` on success:**
     `add_clap_rig`, `add_lv2_instrument`, `add_lv2_effect`, and
     `add_metronome_to_active_rig` left `stage_view` on `StageView::Plugins`,

@@ -1122,7 +1122,21 @@ Learned so far (2026-11-15, UI polish pass):
     title are fitted lines above the fader
     (`another_apps_strip_names_the_app_and_its_fader_and_mute_reach_the_stream`).
     Their meter key is the stream's index (rule 135), never the slot in the row.
-161. **A meter is tested at a level you can state in advance:** the master
+161. **A CLAP voice sends a parameter event only for an id its plugin
+    declared:** Surge XT dereferences the parameter it did not find, so one
+    event with another plugin's id (a knob or editor slider whose voice
+    mapping moved) was a SIGSEGV inside `process()` on the audio thread
+    (#29). `push_cmd` checks the voice's own `param_ranges`; never add a
+    path that puts a parameter event into `ev_in` around it.
+162. **A state save never runs beside the block that applies a state load:**
+    Surge XT applies `state.load` inside `process()` and its save reads the
+    patch without a lock, so `save_state` right after `load_state` (undo
+    snapshot, session capture) crashed inside the plugin. `StateGate` holds
+    such a save until no block is in flight and the voice renders silence
+    meanwhile; the audio thread never waits. Check with
+    `kabelsalat state-race-test [seconds] [patch.fxp...]` (real Surge: SIGSEGV
+    or abort within seconds before the fix).
+163. **A meter is tested at a level you can state in advance:** the master
     meter's true peak was `10·log10` of an amplitude (a −6 dBFS sine read −3)
     behind an interpolator built from `sinc(d)`, no low-pass at all (the same
     sine read −4.2); its only test asked for "more than the sample peak" and
@@ -1131,14 +1145,14 @@ Learned so far (2026-11-15, UI polish pass):
     a test with a known answer (`true_peak_of_a_half_scale_sine_reads_minus_6_dbtp`,
     `integrated_loudness_averages_energy_not_db`); peaks are `amp_db`, mean
     squares `to_db`.
-162. **A control loop through the limiter measures its own yield:** the
+164. **A control loop through the limiter measures its own yield:** the
     loudness target added the missing LU as dB of trim, but into the limiter
     a dB gives 0.4 LU or less, so "club" was 1.3 LU short after four matches,
     and at the default VOLUME it is out of reach altogether. `MasterTarget::matched`
     divides a step by the yield of the previous one and stops (`limited`, with
     a readout that says why) when a raise gave back under a third. Check any
     change to the master chain with `kabelsalat target-test` (real Surge).
-163. **What a session does not state, a load leaves alone:** the loudness
+165. **What a session does not state, a load leaves alone:** the loudness
     target is `Option` in `Session`: `None` (template, older file, a session
     built from parts) keeps the engine's target, `Some(OFF)` turns it off.
     A plain default would have switched the target off on every rig add,
@@ -1182,6 +1196,7 @@ Learned so far (2026-11-15, UI polish pass):
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
+  `state-race-test [seconds] [patch.fxp...]`,
   `main-controls-test`, `engine-bench` (offline render timing and output hash),
   `meter-test`, `target-test` (the master's loudness target on a real phrase),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,

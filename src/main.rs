@@ -48,7 +48,7 @@ mod transport;
 mod ui;
 mod vital;
 
-const MODES: &str = "app, preview, audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, preset-test, add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
+const MODES: &str = "app, preview, audio-test, audio-in-test, audio-out-test, monitor-latency-test, guitar-rig-test, midi-test, host-test, ui-demo, mcp [--attach], send, agent-eval [--model <id>] [--runs N] [--task <name>] [--no-jev], jev-test, listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>] [--save <dir>], session-test, capture-test, player-test, lv2-test, lv2-host-test, lv2-voice-test, lv2-engine-test, metro-test, transport-test, clock-test, record-test, cc-map-test, meter-test, target-test, clap-scan-test, edge-level-test, lv2-instrument-test, lv2-instrument-engine-test, midifx-test, main-controls-test, sound-library-test, many-voices-test, arp-test, preset-test, state-race-test [seconds] [patch.fxp...], add-node-test, mono-master-test, multi-rig-test, multi-rig-load-test, rig-mix-test, lv2-async-test, organ-test, editor-test [plugin-id...], catalog-install-test [id...]";
 
 fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "app".into());
@@ -60,6 +60,11 @@ fn main() -> anyhow::Result<()> {
         "host-test" => host::run_test(),
         "editor-test" => host::run_editor_test(&std::env::args().skip(2).collect::<Vec<_>>()),
         "preset-test" => host::run_preset_test(),
+        "state-race-test" => {
+            let seconds = std::env::args().nth(2).and_then(|n| n.parse().ok()).unwrap_or(20);
+            let patches: Vec<_> = std::env::args().skip(3).map(std::path::PathBuf::from).collect();
+            host::run_state_race_test(seconds, &patches)
+        }
         "ui-demo" => ui::run_demo(),
         "mcp" => {
             // --attach (or KABELSALAT_ATTACH): proxy the same tools to the

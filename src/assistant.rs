@@ -640,6 +640,7 @@ fn system_prompt() -> String {
      list_channels (rigs, source channels with colours, and their plugin chains), \
      get_status, list_plugins, measure_mix (loudness/true-peak/band metering — \
      verify your own mix moves, e.g. is a note too loud, is the bass mono-safe), \
+     get_master_target (the master's loudness target with loudness before and after), \
      get_engine_info (DSP load, buffer and latency, xruns, CPU time per unit — for \
      \"why does it crackle\" or \"what uses the CPU\"; reset_engine_peaks restarts its maxima).\n\
      - Hear: listen records the next seconds of the master and a listening model scores \
@@ -678,6 +679,11 @@ fn system_prompt() -> String {
      one; select_rig changes the view; add_node \
      takes rig=<index>; set_rig_mix sets a rig's vol/pan/mute/solo; \
      save_rig/load_rig/list_rig_presets save and load one rig preset independently of sessions. \
+     - Loudness (\"make it streaming-ready\", \"master to -14\", \"club loud\"): set_master_target \
+     (target spotify/youtube/tidal = -14 LUFS, apple = -16, club = -8, off, or lufs=<number>). It \
+     trims the level in front of the master limiter from the loudness measured so far and holds \
+     the true peak under -1 dBTP; sound must have played. Tell the user the loudness before and, \
+     once sound played again, after (get_master_target). \
      - Mixing (the Mixer view, F10): every source strip has set_strip_mix (pan/mute/solo at \
      the source itself — solo stays within its rig), set_node_bypass, and its inserts are the \
      rack cables: add_insert/remove_insert edit the chain (omit source for a MASTER insert, \
@@ -755,6 +761,19 @@ pub(crate) fn tools() -> Value {
             "name":"measure_mix",
             "description":"Read the master-bus loudness/profile meter (Bravo measure loop): momentary (400 ms) and short-term (3 s) LUFS, gated integrated LUFS since the last reset, true peak (dBTP), low-end (< 120 Hz) phase correlation + a mono-compat flag, and a 4-band energy summary (< 120, 120-500, 500-4000, > 4000 Hz) in dB. Read-only; pass reset=true to restart the integrated-loudness measurement now (this resets the integration, not the signal).",
             "parameters":{"type":"object","properties":{"reset":{"type":"boolean","description":"Restart the integrated-loudness gate from now"}}}
+        }},
+        {"type":"function","function":{
+            "name":"set_master_target",
+            "description":"Master the mix to a loudness: give target (spotify, youtube or tidal = -14 LUFS, apple = -16, club = -8, off = no target) or lufs (a number, -36 to -6). The engine trims the level in front of the master limiter by the difference to the integrated loudness measured so far, and holds the true peak under -1 dBTP. Sound must have played first (play_note, or the user playing); the result gives the loudness before and the trim. Then let sound play and read the loudness after with get_master_target; call set_master_target again with the same target to correct what is still off.",
+            "parameters":{"type":"object","properties":{
+                "target":{"type":"string","description":"spotify | youtube | tidal | apple | club | off"},
+                "lufs":{"type":"number","description":"Target integrated loudness in LUFS, instead of target"}
+            }}
+        }},
+        {"type":"function","function":{
+            "name":"get_master_target",
+            "description":"Read the master's loudness target and its before/after readout: target_lufs, gain_db (the trim), before_lufs (the mix without the trim), after_lufs (integrated loudness measured since the trim was set; null until sound played), true_peak_dbtp with true_peak_ok (ceiling -1 dBTP) and a status line.",
+            "parameters":{"type":"object","properties":{}}
         }},
         {"type":"function","function":{
             "name":"listen",

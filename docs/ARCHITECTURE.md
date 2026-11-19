@@ -116,6 +116,16 @@ agents are in [AGENTS.md](../AGENTS.md).
   short-term and gated integrated LUFS (ITU-R BS.1770-4, non-overlapping 400 ms
   gating blocks, integration window ≈ 13.6 min), 4× true peak, low-end mono
   check, 4-band summary; allocation-free, published via `GraphPub.meter`.
+  It also holds the master's loudness target (#12, `MasterTarget`):
+  `set_master_target` makes the engine move a trim in front of the master
+  limiter by the difference between the target and the integrated loudness
+  measured so far (`matched`, a pure function every frontend shares), then
+  restart the meter so the next reading is the "after". A step is sized by
+  the loudness the previous step yielded per dB, and stops when the limiter
+  gives nothing back. A guard after the chain turns the output down by any
+  true-peak excess over −1 dBTP (after the fact: the master has no
+  lookahead). Trim and guard are exactly 1.0 without a target. The state is
+  published as `GraphPub.master_target` and saved with the session.
 - `listen.rs` — the audio judge behind the agent's `listen` tool (#35): an
   armed master tap (pushes only while a listen records), the clip sent as mono
   16 kHz WAV with the meter's numbers to an audio-capable OpenRouter model

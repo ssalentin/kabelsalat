@@ -995,6 +995,7 @@ fn remap_session(
 ) -> crate::session::Session {
     let mut ns = crate::session::Session::new(s.name.clone(), graph);
     ns.rig_names = s.rig_names.clone(); // names follow their rig (#33)
+    ns.master_target = s.master_target; // session-level, no node ids (#12)
     for p in s.params() {
         if let Some(nid) = remap(p.node) { ns.set_param(nid, p.param, p.value); }
     }
@@ -2115,6 +2116,23 @@ struct VoiceRow {
     patch_name: Option<String>,
 }
 
+/// Width of the Mixer's loudness column beside Master out.
+const LOUDNESS_W: f32 = 152.0;
+
+/// A dB/LU value with a real minus sign and an explicit plus: "\u{2212}14", "+7.1".
+fn signed_db(v: f32, decimals: usize) -> String {
+    let body = format!("{:.*}", decimals, v.abs());
+    if v < 0.0 && body.trim_matches(|c| c == '0' || c == '.') != "" { format!("\u{2212}{body}") }
+    else if v > 0.0 { format!("+{body}") }
+    else { body }
+}
+
+/// The text with its first letter in upper case (a status line as a message).
+fn sentence_first(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+}
+
 /// Tools the running app serves to `kabelsalat mcp --attach` over the UI
 /// bridge (they need the app's UI-thread state). Every MCP tool that calls
 /// `ui_bridge_tool("…")` must be listed — `ui_bridge_tools_cover_mcp` checks.
@@ -2132,6 +2150,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "add_bus", "remove_bus", "set_send", "get_sends",
     "list_channels",
     "get_midi_clock", "set_midi_clock",
+    "get_master_target", "set_master_target",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -2677,6 +2696,11 @@ struct DemoApp {
     last_meter_rev: u64,
     /// Mirrored master-bus meter snapshot (read by `measure_mix`, `get_status`).
     master_meter: crate::meter::MeterSnapshot,
+    /// Mirrored loudness target of the master (#12), published with the meter.
+    master_target: crate::meter::MasterTarget,
+    /// The Mixer's loudness buttons as drawn this frame: 1 LU down, 1 LU up,
+    /// Match (hit targets for tests and `scripts/click.sh`).
+    master_target_rects: [Rect; 3],
     /// A `listen` call in flight: its thread records the master and asks the
     /// listening model, and the tool batch waits for this answer.
     listening: Option<std::sync::mpsc::Receiver<String>>,
@@ -3108,6 +3132,8 @@ impl DemoApp {
             last_mix_rev: 0,
             last_meter_rev: 0,
             master_meter: crate::meter::MeterSnapshot::default(),
+            master_target: crate::meter::MasterTarget::OFF,
+            master_target_rects: [Rect::NOTHING; 3],
             listening: None,
             confirm_delete_rig: None,
             pending_confirm: None,
@@ -4281,6 +4307,7 @@ impl DemoApp {
         if g.meter_rev != self.last_meter_rev {
             self.last_meter_rev = g.meter_rev;
             self.master_meter = g.meter;
+            self.master_target = g.master_target;
         }
         let mut transport_changed = false;
         if g.transport_rev != self.last_transport_rev {
@@ -4753,6 +4780,15 @@ impl DemoApp {
             "get_rigs" => "List rigs".into(),
             "list_channels" => "List channels".into(),
             "measure_mix" => "Measure mix".into(),
+            "get_master_target" => "Read loudness target".into(),
+            "set_master_target" => match crate::meter::parse_target(
+                args.get("target").and_then(|v| v.as_str()),
+                args.get("lufs").and_then(|v| v.as_f64()).or_else(|| args.get("target").and_then(|v| v.as_f64())),
+            ) {
+                Ok(Some(l)) => format!("Master target {l:.0} LUFS"),
+                Ok(None) => "Master target off".into(),
+                Err(_) => "Master target".into(),
+            },
             "get_engine_info" => "Check engine load".into(),
             "reset_engine_peaks" => "Reset engine peaks".into(),
             "play_note" => {
@@ -5363,6 +5399,7 @@ impl DemoApp {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
+        s.master_target = Some(self.master_target);
         // Mixer strips (#72–77): pan/mute/solo/bypass + colour/collapse +
         // display order, keyed by node like every other session value.
         for u in &self.units {
@@ -5595,7 +5632,43 @@ impl DemoApp {
         self.sends = s.sends().to_vec();
         self.mixer_knob_drag = None;
         self.send_all_strip_state();
+        // The loudness target the session was saved with (#12). A session
+        // that says nothing (template, older file) leaves it as it is.
+        if let Some(target) = s.master_target {
+            self.restore_master_target(target);
+        }
         Ok(())
+    }
+
+    /// Aim the master at `lufs` integrated loudness (`None` = off), from the
+    /// Mixer or a tool: the engine moves its trim by what its meter says is
+    /// missing. Returns the readout; the mirror is set to what the engine
+    /// will publish (the same `matched` on the same measurement), so the
+    /// answer does not wait for a frame.
+    fn set_master_target(&mut self, lufs: Option<f32>) -> serde_json::Value {
+        use crate::meter::{MasterTarget, MeterSnapshot};
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetMasterTarget { lufs });
+        }
+        let measured = self.master_meter.integrated_lufs;
+        self.master_target = match lufs {
+            Some(l) => self.master_target.matched(l, measured.is_finite().then_some(measured)),
+            None => MasterTarget::OFF,
+        };
+        // The engine starts its measurement over: nothing is "after" yet.
+        self.master_meter = MeterSnapshot::default();
+        self.master_target.readout(&self.master_meter)
+    }
+
+    /// Put a saved target back (session load, undo): no measuring.
+    fn restore_master_target(&mut self, target: crate::meter::MasterTarget) {
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::RestoreMasterTarget { target });
+        }
+        if self.master_target != target {
+            self.master_target = target;
+            self.master_meter = crate::meter::MeterSnapshot::default();
+        }
     }
 
     /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
@@ -5788,6 +5861,7 @@ impl DemoApp {
                     "assistant_h": if self.assistant_open() { self.assistant_rect.height() } else { 0.0 },
                 },
                 "meter": serde_json::to_value(self.master_meter).unwrap_or(serde_json::json!({})),
+                "master_target": self.master_target.readout(&self.master_meter),
                 "audio_in": self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::AudioIn)).map(|u| serde_json::json!({
                     "node": u.node_id,
                     "device": u.device,
@@ -5825,6 +5899,22 @@ impl DemoApp {
                 serde_json::to_value(self.master_meter)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|e| format!("meter: {e}"))
+            }
+            "get_master_target" => self.master_target.readout(&self.master_meter).to_string(),
+            "set_master_target" => {
+                let preset = args.get("target").and_then(|v| v.as_str());
+                let number = args.get("lufs").and_then(|v| v.as_f64())
+                    .or_else(|| args.get("target").and_then(|v| v.as_f64()));
+                match crate::meter::parse_target(preset, number) {
+                    Ok(lufs) => {
+                        let out = self.set_master_target(lufs);
+                        let nodes: Vec<u32> = self.units.iter().filter(|u| matches!(u.node_kind, UnitKind::Master)).map(|u| u.node_id).collect();
+                        let label = self.human_tool_label(name, args);
+                        self.agent_activity.record(origin, label, nodes, now);
+                        out.to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
             }
             "play_note" => {
                 let note = args.get("note").and_then(|v| v.as_u64()).unwrap_or(60).min(127);
@@ -16324,7 +16414,7 @@ impl DemoApp {
                                 w + gap
                             }).sum::<f32>()
                         };
-                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + 152.0 + 2.0 * gap;
+                        let content_w = sources_w + n as f32 * (15.0 + gap) + buses_w + sys + 152.0 + LOUDNESS_W + 3.0 * gap;
                         let pad = ((scroll_w - content_w) / 2.0).max(0.0);
                         egui::ScrollArea::both().id_salt("mixer_scroll").auto_shrink([false, false]).max_height(view_h).show(ui, |ui| {
                             ui.horizontal_top(|ui| {
@@ -16455,6 +16545,13 @@ impl DemoApp {
                                 let (r, _) = ui.allocate_exact_size(egui::vec2(15.0, h - 8.0), egui::Sense::hover());
                                 ui.painter().line_segment([r.center_top(), r.center_bottom()], Stroke::new(1.0, theme::HAIRLINE_DARK));
                                 self.master_strip_ui(ui, fader_h, (outputs, out_current, out_wanted), &mut out_pick, &mut edits);
+                                // Loudness target (#12): its own column of the
+                                // master section, so it never pushes the fader
+                                // or falls under the fold of a short window.
+                                ui.vertical(|ui| {
+                                    ui.set_width(LOUDNESS_W);
+                                    self.master_target_ui(ui);
+                                });
                             });
                         });
                     });
@@ -16485,6 +16582,80 @@ impl DemoApp {
         for (index, vol, mute) in stream_changes { self.set_app_stream(index, vol, mute); }
         if let Some(o) = out_pick { self.set_audio_output(o); }
         if self.show_help { self.draw_help(&painter, rect); }
+    }
+
+    /// Loudness target of the master (#12): the target menu, one-LU steps,
+    /// "Match" (measure again and correct the trim), and the before/after
+    /// readout. Picking a target moves the trim in front of the limiter by
+    /// what the meter says is missing.
+    fn master_target_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::meter::{TARGET_PRESETS, TARGET_RANGE_LUFS, TRUE_PEAK_CEILING_DB};
+        let t = self.master_target;
+        let lufs_text = |l: f32| format!("{} LUFS", signed_db(l, if l.fract() == 0.0 { 0 } else { 1 }));
+        theme::section_label(ui, "Loudness");
+        let selected = t.lufs.map_or("No target".to_string(), lufs_text);
+        let mut pick: Option<Option<f32>> = None;
+        theme::Dropdown::new("dd_master_target", &selected)
+            .width(144.0)
+            .popup_min_width(240.0)
+            .text_size(11.5)
+            .show_ui(ui, |menu| {
+                if menu.item(t.lufs.is_none(), "No target") { pick = Some(None); }
+                let mut seen: Vec<f32> = Vec::new();
+                for &(_, _, lufs) in TARGET_PRESETS {
+                    if seen.contains(&lufs) { continue; }
+                    seen.push(lufs);
+                    let names: Vec<&str> = TARGET_PRESETS.iter().filter(|p| p.2 == lufs).map(|p| p.1).collect();
+                    if menu.item(t.lufs == Some(lufs), &format!("{} · {}", lufs_text(lufs), names.join(", "))) {
+                        pick = Some(Some(lufs));
+                    }
+                }
+                if let Some(l) = t.lufs.filter(|l| !seen.contains(l)) {
+                    let _ = menu.item(true, &lufs_text(l));
+                }
+            })
+            .on_hover_text("integrated loudness the master is trimmed to, true peak held under \u{2212}1 dBTP");
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.set_min_height(26.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let base = t.lufs.unwrap_or(-14.0);
+            let down = theme::chip_button(ui, "\u{2212}", false).on_hover_text("1 LU quieter");
+            if down.clicked() { pick = Some(Some((base - 1.0).max(TARGET_RANGE_LUFS.0))); }
+            let up = theme::chip_button(ui, "+", false).on_hover_text("1 LU louder");
+            if up.clicked() { pick = Some(Some((base + 1.0).min(TARGET_RANGE_LUFS.1))); }
+            let again = ui.add_enabled_ui(t.lufs.is_some(), |ui| theme::chip_button(ui, "Match", false)).inner
+                .on_hover_text("measure what was played since the last change and correct the trim");
+            if again.clicked() { pick = Some(t.lufs); }
+            self.master_target_rects = [down.rect, up.rect, again.rect];
+        });
+        let small = |ui: &mut egui::Ui, text: String, color: Color32| {
+            ui.label(egui::RichText::new(text).size(10.5).color(color));
+        };
+        let m = self.master_meter;
+        match (t.lufs, t.before_lufs) {
+            (None, _) => small(ui, "play, then pick a target".into(), theme::INK_2),
+            (Some(_), None) => small(ui, "nothing measured yet: play, then press Match".into(), theme::INK_2),
+            (Some(_), Some(before)) => {
+                small(ui, format!("before {}", lufs_text((before * 10.0).round() / 10.0)), theme::INK_2);
+                if m.integrated_lufs.is_finite() {
+                    small(ui, format!("now {}", lufs_text((m.integrated_lufs * 10.0).round() / 10.0)), theme::INK);
+                } else {
+                    small(ui, "now: play to measure".into(), theme::INK_2);
+                }
+                if m.true_peak_max_db > -119.0 {
+                    let over = m.true_peak_max_db > TRUE_PEAK_CEILING_DB + 0.05;
+                    small(ui, format!("true peak {} dBTP", signed_db(m.true_peak_max_db, 1)),
+                        if over { theme::CLIP_BRIGHT } else { theme::INK_2 });
+                }
+                let guard = if t.guard_db < -0.05 { format!(" · guard {} dB", signed_db(t.guard_db, 1)) } else { String::new() };
+                small(ui, format!("trim {} dB{guard}", signed_db(t.gain_db, 1)), theme::INK_2);
+            }
+        }
+        if let Some(lufs) = pick {
+            let out = self.set_master_target(lufs);
+            self.session_msg = out.get("status").and_then(|s| s.as_str()).map(sentence_first).unwrap_or_default();
+        }
     }
 
     /// One source strip (#72–77): name (click renames, drag reorders),
@@ -23581,6 +23752,43 @@ mod rig_switch_tests {
     }
 
     #[test]
+    fn the_mixers_loudness_buttons_aim_and_match_the_master() {
+        // #12: − / + step the target by 1 LU, Match corrects the trim from
+        // what was measured since; the readout follows.
+        let (mut app, ctx) = two_rigs();
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        open_mixer(&mut app, &ctx);
+        let click = |app: &mut DemoApp, which: usize| {
+            for _ in 0..2 { frame(app, &ctx, vec![]); }
+            let c = app.master_target_rects[which].center();
+            let b = |pressed| egui::Event::PointerButton { pos: c, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            frame(app, &ctx, vec![egui::Event::PointerMoved(c)]);
+            frame(app, &ctx, vec![b(true)]);
+            frame(app, &ctx, vec![b(false)]);
+        };
+        app.master_meter.integrated_lufs = -20.0;
+        click(&mut app, 1); // "+" from no target: −14 + 1
+        assert_eq!((app.master_target.lufs, app.master_target.gain_db, app.master_target.before_lufs), (Some(-13.0), 7.0, Some(-20.0)));
+        // The limiter held 2 LU back: Match makes up for them (at the yield
+        // the first step had, 5 LU for 7 dB), "before" stays.
+        app.master_meter.integrated_lufs = -15.0;
+        click(&mut app, 2);
+        let t = app.master_target;
+        assert!((t.gain_db - 9.8).abs() < 1e-3 && t.lufs == Some(-13.0) && t.before_lufs == Some(-20.0), "{t:?}");
+        app.master_meter.integrated_lufs = -13.0;
+        click(&mut app, 0); // "−": one LU quieter
+        let t = app.master_target;
+        assert!(t.lufs == Some(-14.0) && t.gain_db < 9.8 - 1.0 && t.gain_db > 9.8 - 3.0, "{t:?}");
+        let mut sent = Vec::new();
+        drain.drain(|c| if let Command::SetMasterTarget { lufs } = c { sent.push(lufs) });
+        assert_eq!(sent, vec![Some(-13.0), Some(-13.0), Some(-14.0)], "every click reaches the engine");
+        for r in app.master_target_rects {
+            assert!(r.width() >= 24.0 && r.height() >= 20.0, "a button you can hit: {r:?}");
+        }
+    }
+
+    #[test]
     fn mixer_lists_every_source_per_rig() {
         let (app, _ctx) = two_rigs();
         for rig in 0..2u8 {
@@ -25338,6 +25546,69 @@ mod split_bpm_tests {
         app.exec_tool("undo", &serde_json::json!({}));
         frame(&mut app, &ctx, vec![]);
         assert!(!app.arm_rigs[0] && app.arm_master, "undoing the arm job restores the defaults");
+    }
+
+    #[test]
+    fn the_master_target_tools_aim_read_undo_and_travel_with_the_session() {
+        // Rule 6/23: in the assistant's table, exec_tool and the bridge list.
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        for tool in ["set_master_target", "get_master_target"] {
+            assert!(names.contains(&tool), "assistant tools missing {tool}");
+            assert!(UI_BRIDGE_TOOLS.contains(&tool), "UI_BRIDGE_TOOLS missing {tool}");
+        }
+        assert!(tool_is_read_only("get_master_target") && !tool_is_read_only("set_master_target"));
+
+        let mut app = DemoApp::new_with_sink(None);
+        let (tx, mut drain) = crate::control::command_bus();
+        app.bus = Some(Arc::new(Mutex::new(tx)));
+        let json = |s: String| -> serde_json::Value { serde_json::from_str(&s).unwrap_or_else(|_| panic!("not JSON: {s}")) };
+        assert!(json(app.exec_tool("get_master_target", &serde_json::json!({})))["target_lufs"].is_null());
+
+        // The mix measured −21.5 LUFS so far; Apple Music wants −16.
+        app.master_meter.integrated_lufs = -21.5;
+        let out = json(app.exec_tool("set_master_target", &serde_json::json!({"target": "apple"})));
+        assert_eq!((out["target_lufs"].as_f64(), out["gain_db"].as_f64(), out["before_lufs"].as_f64()), (Some(-16.0), Some(5.5), Some(-21.5)), "{out}");
+        assert!(out["after_lufs"].is_null(), "nothing is 'after' until sound played: {out}");
+        let mut cmds = Vec::new();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::SetMasterTarget { lufs: Some(l) } if *l == -16.0)), "{cmds:?}");
+        // The engine publishes its new measurement; the readout shows it.
+        app.master_meter.integrated_lufs = -16.2;
+        app.master_meter.true_peak_max_db = -1.4;
+        let read = json(app.exec_tool("get_master_target", &serde_json::json!({})));
+        assert_eq!((read["after_lufs"].as_f64(), read["true_peak_ok"].as_bool()), (Some(-16.2), Some(true)), "{read}");
+        let status = json(app.exec_tool("get_status", &serde_json::json!({})));
+        assert_eq!(status["master_target"]["target_lufs"], -16.0, "get_status carries the readout");
+
+        // A number, and what is no target.
+        let custom = json(app.exec_tool("set_master_target", &serde_json::json!({"lufs": -12})));
+        assert_eq!(custom["target_lufs"], -12.0);
+        assert!(app.exec_tool("set_master_target", &serde_json::json!({"target": "loud"})).starts_with("error:"));
+        assert!(app.exec_tool("set_master_target", &serde_json::json!({"lufs": 4})).starts_with("error:"));
+        assert_eq!(app.master_target.lufs, Some(-12.0), "a refused call changes nothing");
+
+        // The session carries it (rule 65) and a load puts it back without measuring.
+        let held = app.master_target;
+        let saved = app.capture_session("t").unwrap();
+        assert_eq!(saved.master_target, Some(held));
+        // Undo (rule 59, from a non-default value): the next job's change is reverted.
+        app.undo_job = None; // a new request opens a new undo step
+        let _ = app.exec_tool("set_master_target", &serde_json::json!({"target": "off"}));
+        assert_eq!(app.master_target, crate::meter::MasterTarget::OFF);
+        let undone = app.exec_tool("undo", &serde_json::json!({}));
+        assert!(undone.contains("undid"), "{undone}");
+        assert_eq!(app.master_target, held, "undo restored target, trim and 'before'");
+        cmds.clear();
+        drain.drain(|c| cmds.push(c));
+        assert!(cmds.iter().any(|c| matches!(c, Command::RestoreMasterTarget { target } if *target == held)), "the engine is told: {cmds:?}");
+        // A session that says nothing (a template) leaves the target alone.
+        app.apply_session(&crate::session::Session::new("plain", Graph::demo_patch())).unwrap();
+        assert_eq!(app.master_target, held);
+        let mut off = crate::session::Session::new("off", Graph::demo_patch());
+        off.master_target = Some(crate::meter::MasterTarget::OFF);
+        app.apply_session(&off).unwrap();
+        assert_eq!(app.master_target, crate::meter::MasterTarget::OFF, "a session saved without a target turns it off");
     }
 
     #[test]
@@ -29485,6 +29756,32 @@ mod mixer_parity_tests {
             "the strip moved to slot 2");
     }
 
+    /// The Mixer's loudness block (#12) without a target and with one:
+    /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat master_target_shots -- --ignored`
+    #[test]
+    #[ignore = "writes PNGs"]
+    fn master_target_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (w, h) in [(1280.0, 800.0), (781.0, 950.0), (760.0, 520.0)] {
+            for with_target in [false, true] {
+                // A fresh app per image (rule 148).
+                let mut app = DemoApp::new_with_sink(None);
+                app.stage_view = StageView::Mixer;
+                app.master_meter.integrated_lufs = -21.4;
+                if with_target {
+                    let out = app.exec_tool("set_master_target", &serde_json::json!({ "target": "spotify" }));
+                    assert!(out.contains("\"gain_db\":7.4"), "{out}");
+                    // What the engine publishes once the phrase played again.
+                    app.master_meter.integrated_lufs = -14.2;
+                    app.master_meter.true_peak_max_db = -1.3;
+                }
+                let name = format!("loudness-{}-{w}x{h}.png", if with_target { "target" } else { "none" });
+                super::offline_shots::shot(&mut app, Vec2::new(w, h), &dir.join(name));
+            }
+        }
+    }
+
     /// A populated mixer (inserts, colours, collapse, mute, pan, a master
     /// insert) written as PNGs for the PR's evidence:
     /// `KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat mixer_parity_shots -- --ignored`
@@ -31249,12 +31546,18 @@ mod window_size_layout_tests {
         assert!(bad.is_empty(), "{} layout defects:\n{}", bad.len(), bad.join("\n"));
     }
 
-    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 10] = [
+    const VIEWS: [(&str, &dyn Fn(&mut DemoApp)); 11] = [
             ("rack", &|_| {}),
             ("rack back", &|a| a.side = Side::Back),
             ("two rigs", &|a| a.load_multi_rig_demo()),
             ("mixer", &|a| a.stage_view = StageView::Mixer),
             ("two-rig mixer", &|a| { a.load_multi_rig_demo(); a.stage_view = StageView::Mixer }),
+            ("mixer with a loudness target", &|a| {
+                a.stage_view = StageView::Mixer;
+                a.master_target = crate::meter::MasterTarget { lufs: Some(-14.0), gain_db: 7.4, before_lufs: Some(-21.4), guard_db: -0.6, last_point: None, limited: false };
+                a.master_meter.integrated_lufs = -14.2;
+                a.master_meter.true_peak_max_db = -1.1;
+            }),
             ("matrix", &|a| a.stage_view = StageView::Matrix),
             ("matrix with clock ports", &|a| {
                 a.stage_view = StageView::Matrix;

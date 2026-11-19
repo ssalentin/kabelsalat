@@ -114,6 +114,10 @@ pub struct Session {
     /// Sends into aux buses (issue #5), keyed by node and rig like the
     /// engine's table; `remap_session` carries them across reloads.
     sends: Vec<crate::control::AuxSend>,
+    /// The master's loudness target with its trim (#12). `None` = this
+    /// session says nothing about it (older files, templates, rig edits
+    /// built from parts): a load then leaves the engine's target alone.
+    pub master_target: Option<crate::meter::MasterTarget>,
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -168,6 +172,7 @@ impl Session {
             strip_order: Vec::new(),
             strip_knobs: BTreeMap::new(),
             sends: Vec::new(),
+            master_target: None,
         }
     }
 
@@ -182,6 +187,7 @@ impl Session {
             && self.strip_order == other.strip_order
             && self.strip_knobs == other.strip_knobs
             && self.sends == other.sends
+            && self.master_target == other.master_target
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -508,6 +514,7 @@ impl Session {
             strip_order: self.strip_order.clone(),
             strip_knobs: self.strip_knobs.clone(),
             sends: self.sends.clone(),
+            master_target: self.master_target,
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -547,6 +554,7 @@ impl Session {
             strip_order: manifest.strip_order,
             strip_knobs: manifest.strip_knobs,
             sends: manifest.sends,
+            master_target: manifest.master_target,
         };
         session.validate()?;
         Ok(session)
@@ -660,6 +668,9 @@ struct SessionFile {
     /// Sends into aux buses (issue #5); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sends: Vec<crate::control::AuxSend>,
+    /// The master's loudness target (#12); older sessions have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    master_target: Option<crate::meter::MasterTarget>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1558,6 +1569,30 @@ mod tests {
         assert!(err.contains("newer kabelsalat"), "{err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_master_target_round_trips_and_old_sessions_have_none() {
+        use crate::meter::MasterTarget;
+        let dir = std::env::temp_dir().join(format!("ksalat-mastertarget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("t.ksalat");
+        let mut s = Session::new("t", Graph::demo_patch());
+        let target = MasterTarget { lufs: Some(-14.0), gain_db: 6.5, before_lufs: Some(-20.5), guard_db: -0.3, last_point: None, limited: false };
+        s.master_target = Some(target);
+        s.save(&pkg).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().master_target, Some(target));
+        // "Off" is a statement too: a load turns a target off again.
+        s.master_target = Some(MasterTarget::OFF);
+        s.save(&pkg).unwrap();
+        assert_eq!(Session::load(&pkg).unwrap().master_target, Some(MasterTarget::OFF));
+        s.master_target = None;
+        let pkg2 = dir.join("plain.ksalat");
+        s.save(&pkg2).unwrap();
+        let json = std::fs::read_to_string(pkg2.join(SESSION_FILE)).unwrap();
+        assert!(!json.contains("master_target"), "absent when unset: old readers stay happy");
+        assert_eq!(Session::load(&pkg2).unwrap().master_target, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

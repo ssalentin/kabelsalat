@@ -1147,6 +1147,13 @@ pub enum Command {
     /// the integrated-loudness gate, windows, true-peak hold and band/LFE
     /// accumulators so a fresh integrated measurement starts now.
     ResetMeter,
+    /// Aim the master at an integrated loudness (#12): the engine moves the
+    /// trim in front of the limiter by what its meter says is missing and
+    /// starts a fresh measurement for the "after" reading. `None` = off.
+    SetMasterTarget { lufs: Option<f32> },
+    /// Put a saved loudness target back as it was (session load, undo): no
+    /// measuring, and a no-op when the engine already holds it.
+    RestoreMasterTarget { target: crate::meter::MasterTarget },
 }
 
 /// Lock-free UI/frontend → engine command bus (rtrb SPSC ring).
@@ -1315,6 +1322,10 @@ mod tests {
             Command::SetRecordArm { rig: None, armed: true },
             Command::SetRecordArm { rig: Some(1), armed: true },
             Command::ResetMeter,
+            Command::SetMasterTarget { lufs: Some(-14.0) },
+            Command::SetMasterTarget { lufs: None },
+            Command::RestoreMasterTarget { target: crate::meter::MasterTarget { lufs: Some(-16.0), gain_db: 4.5, before_lufs: Some(-20.5), guard_db: -0.4, last_point: None, limited: false } },
+            Command::RestoreMasterTarget { target: crate::meter::MasterTarget::OFF },
             Command::SetAudioIn { node: 9, device: None, channels: Some(AudioInChannel::MonoR) },
             Command::SetAudioIn { node: 9, device: Some("USB Audio".into()), channels: None },
         ];

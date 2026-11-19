@@ -1168,6 +1168,12 @@ Learned so far (2026-11-15, UI polish pass):
     timing, dump the measured signal of 40+ runs and look at how far the
     passing ones are from the threshold.
 
+167. **Tests never list or write the user's sessions:** `sessions_dir()`
+    pointed at `~/kabelsalat-sessions` in tests too, so the session popover
+    and Library of every headless shot listed the user's real session names,
+    and a test autosave would have written there. Under `cfg(test)` it is a
+    per-process temp dir; check any new path helper the same way (rule 37).
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

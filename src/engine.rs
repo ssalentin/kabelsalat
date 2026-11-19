@@ -830,17 +830,12 @@ fn source_out(
 
 /// Add `src` into `out` the way its cables into `dest` say: a cable into
 /// port 2 (a master's MONO input) centres the left channel, any other is
-/// stereo. Nothing without a route.
-fn add_routed(graph: &Graph, node: NodeId, dest: NodeId, src: &[f32], out: &mut [f32]) {
+/// stereo; through its compensation delay when the plan has one. Nothing
+/// without a route.
+fn add_routed(graph: &Graph, pdc: &mut pdc::Pdc, node: NodeId, dest: NodeId, src: &[f32], out: &mut [f32]) {
     if !graph.has_route(node, dest, PortKind::Audio) { return; }
-    if graph.has_route_port(node, dest, 2, PortKind::Audio) {
-        for (o, x) in out.chunks_exact_mut(2).zip(src.chunks_exact(2)) {
-            o[0] += x[0];
-            o[1] += x[0];
-        }
-    } else {
-        for (o, x) in out.iter_mut().zip(src) { *o += *x; }
-    }
+    let mono = graph.has_route_port(node, dest, 2, PortKind::Audio);
+    pdc.mix(node, dest, src, mono, (1.0, 1.0), out);
 }
 
 /// The published send table (`GraphPub::sends`): empty slots have
@@ -1304,6 +1299,9 @@ pub struct GraphEngine {
     record_sync_pending: bool,
     // Master-bus meter (Bravo 1): fed the final stereo output every block.
     meter: MasterMeter,
+    /// Delay lines that keep parallel paths in phase (`pdc`), replanned on
+    /// graph edits.
+    pdc: pdc::Pdc,
 }
 
 impl GraphEngine {
@@ -1361,7 +1359,7 @@ impl GraphEngine {
             .filter(|n| matches!(n.kind, NodeKind::MidiFx { .. }))
             .map(midi_fx_slot)
             .collect();
-        Self {
+        let mut engine = Self {
             graph,
             drain,
             sample_rate,
@@ -1441,7 +1439,10 @@ impl GraphEngine {
             record_sync: false,
             record_sync_pending: false,
             meter: MasterMeter::new(sample_rate),
-        }
+            pdc: pdc::Pdc::default(),
+        };
+        engine.replan_delays();
+        engine
     }
 
     /// Instantiate LV2 plugins, parse their presets and free them on a
@@ -2181,9 +2182,18 @@ impl GraphEngine {
         self.graph_pub = Some(p);
     }
 
+    /// Plan the delays that keep parallel paths in phase. Built-in units
+    /// report their latency; LV2 and CLAP latency are not read yet.
+    fn replan_delays(&mut self) {
+        let dsp = &self.dsp;
+        self.pdc.replan(&self.graph, &self.sends, |id| dsp.iter().find(|d| d.node == id).map_or(0, |d| d.proc.latency_frames()));
+    }
+
     /// Publish the current graph (structural ops only). A poisoned lock is
     /// skipped, not fatal — the publication is advisory frontend state.
+    /// Every structural edit ends here, so the delay plan follows it here.
     fn publish_graph(&mut self) {
+        self.replan_delays();
         let tp = self.transport_pub();
         if let Some(p) = &self.graph_pub {
             if let Ok(mut g) = p.lock() {
@@ -2408,14 +2418,21 @@ impl GraphEngine {
                     slot.plugin.process(&bus[..n2], &mut slot.buf[..n2], frames);
                 }
             }
-            // An LV2 node that is a SOURCE (an instrument) carries strip
-            // state; effects do not (their strip row is the bypass flag).
+            // A bypassed unit with a lookahead still delays by it, so the
+            // paths it meets stay in phase.
+            let source = f >= n_dsp && self.lv2[f - n_dsp].plugin.is_instrument();
             let buf = if f < n_dsp { &mut self.dsp[f].buf } else { &mut self.lv2[f - n_dsp].buf };
+            self.pdc.bypass(node, &bus[..n2], &mut buf[..n2], bypassed);
+            // Another source's solo silences sources, never effects: it took
+            // the soloed source's own chain with it. An LV2 instrument is a
+            // source; an effect keeps only what its own strip entry says.
+            let solo = if source { solo_rigs } else { &[false; 8] };
+            let strips = &self.strips;
             match taps.as_deref_mut() {
-                Some(t) => source_out(&self.strips, &self.graph, solo_rigs, &self.sends, t, node, 1.0, &mut buf[..n2]),
+                Some(t) => source_out(strips, &self.graph, solo, &self.sends, t, node, 1.0, &mut buf[..n2]),
                 None => {
                     let mut none = BusTaps { nodes: [NodeId::MAX; MAX_BUSES], n: 0, acc: &mut [], span: 0 };
-                    source_out(&self.strips, &self.graph, solo_rigs, &[], &mut none, node, 1.0, &mut buf[..n2]);
+                    source_out(strips, &self.graph, solo, &[], &mut none, node, 1.0, &mut buf[..n2]);
                 }
             }
             self.node_timer.record(node, node_t0.elapsed());
@@ -2423,12 +2440,14 @@ impl GraphEngine {
     }
 
     /// Sum every audio source wired into `dest` into `out` (stereo
-    /// interleaved). Allocation-free.
-    fn sum_audio_into(&self, dest: NodeId, out: &mut [f32]) {
+    /// interleaved), each through its compensation delay when the plan has
+    /// one. Allocation-free.
+    fn sum_audio_into(&mut self, dest: NodeId, out: &mut [f32]) {
         out.fill(0.0);
+        let (graph, pdc) = (&self.graph, &mut self.pdc);
         let mut add = |src: NodeId, buf: &[f32]| {
-            if src != dest && self.graph.has_route(src, dest, PortKind::Audio) {
-                for (o, x) in out.iter_mut().zip(buf) { *o += *x; }
+            if src != dest && graph.has_route(src, dest, PortKind::Audio) {
+                pdc.mix(src, dest, buf, false, (1.0, 1.0), out);
             }
         };
         for v in &self.voices { if v.node != NodeId::MAX { add(v.node, &v.scratch); } }
@@ -2925,6 +2944,8 @@ impl GraphEngine {
             SendSource::Node(n) => self.graph.node(n).is_some() && !self.graph.is_bus(n) && !self.is_after_bus(n),
         };
         if !self.graph.is_bus(bus) || !ok_from { return false; }
+        let sounding = |sends: &[AuxSend]| sends.iter().any(|s| s.from == from && s.bus == bus && s.level > 0.0);
+        let was = sounding(&self.sends);
         let i = match self.sends.iter().position(|s| s.from == from && s.bus == bus) {
             Some(i) => i,
             None => {
@@ -2936,6 +2957,11 @@ impl GraphEngine {
         if let Some(l) = level { self.sends[i].level = if l.is_finite() { l.clamp(0.0, 1.0) } else { 0.0 }; }
         if let Some(p) = pre { self.sends[i].pre = p; }
         self.sends.retain(|s| !s.is_default());
+        // A send that starts or stops sounding changes how late its bus is;
+        // a level move does not.
+        if sounding(&self.sends) != was {
+            self.replan_delays();
+        }
         self.mix_dirty = true;
         true
     }
@@ -4577,30 +4603,40 @@ impl GraphEngine {
                     *x = 0.0;
                 }
                 let sends = self.sends.iter().any(|s| s.from == from);
-                if open && (gl != 0.0 || gr != 0.0 || sends) {
+                let live = open && (gl != 0.0 || gr != 0.0 || sends);
+                // A rig with compensation delays sums while silent too, or
+                // its delay lines would replay stale audio when it returns.
+                if live || self.pdc.feeds(master) {
                     // The rig's dry sum at unity: everything wired into its
-                    // master except the buses and their chains (the returns).
+                    // master except the buses and their chains (the returns),
+                    // each through its compensation delay when the plan has
+                    // one.
                     for v in &self.voices {
                         if v.node != NodeId::MAX {
-                            add_routed(&self.graph, v.node, master, &v.scratch[..n2], rig_buf);
+                            add_routed(&self.graph, &mut self.pdc, v.node, master, &v.scratch[..n2], rig_buf);
                         }
                     }
                     for (i, d) in self.dsp.iter().enumerate() {
                         if d.kind != DspKind::Bus && !self.fx_after_bus[i] {
-                            add_routed(&self.graph, d.node, master, &d.buf[..n2], rig_buf);
+                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], rig_buf);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
                         if !self.fx_after_bus[n_dsp + i] {
-                            add_routed(&self.graph, slot.node, master, &slot.buf[..n2], rig_buf);
+                            add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], rig_buf);
                         }
                     }
-                    // Audio In wired into this master (OUT jack → graph routing).
+                    // Audio In wired into this master (OUT jack → graph
+                    // routing) always sums stereo.
                     for a in &self.audio_in {
                         if self.graph.has_route(a.node, master, PortKind::Audio) {
-                            for (o, x) in rig_buf.iter_mut().zip(&a.buf[..n2]) { *o += *x; }
+                            self.pdc.mix(a.node, master, &a.buf[..n2], false, (1.0, 1.0), rig_buf);
                         }
                     }
+                }
+                if !live {
+                    rig_buf.fill(0.0);
+                } else {
                     // Sends tap the rig bus on either side of its fader.
                     if sends { taps.tap(&self.sends, from, true, rig_buf); }
                     if gl != 1.0 || gr != 1.0 {
@@ -4610,6 +4646,9 @@ impl GraphEngine {
                         }
                     }
                     if sends { taps.tap(&self.sends, from, false, rig_buf); }
+                }
+                self.pdc.rig_out(master, rig_buf);
+                if live {
                     if !bus_solo {
                         for i in 0..n2 {
                             acc[i] += rig_buf[i];
@@ -4650,12 +4689,12 @@ impl GraphEngine {
                 for &master in &masters[..n_masters] {
                     for (i, d) in self.dsp.iter().enumerate() {
                         if d.kind == DspKind::Bus || self.fx_after_bus[i] {
-                            add_routed(&self.graph, d.node, master, &d.buf[..n2], acc);
+                            add_routed(&self.graph, &mut self.pdc, d.node, master, &d.buf[..n2], acc);
                         }
                     }
                     for (i, slot) in self.lv2.iter().enumerate() {
                         if self.fx_after_bus[n_dsp + i] {
-                            add_routed(&self.graph, slot.node, master, &slot.buf[..n2], acc);
+                            add_routed(&self.graph, &mut self.pdc, slot.node, master, &slot.buf[..n2], acc);
                         }
                     }
                 }
@@ -5025,6 +5064,9 @@ fn render_metronome(
 
 #[cfg(test)]
 mod held_notes;
+mod pdc;
+mod probe;
+pub mod analysis_test;
 
 #[cfg(test)]
 mod master_target_tests {
@@ -7317,29 +7359,6 @@ pub fn lv2_instrument_engine_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Share of the signal's power that is not the `freq` sine (least-squares
-/// fit of one sine+cosine over `x`): ~0 for a clean tone, grows with
-/// distortion. Robust to a slowly decaying envelope, unlike a single
-/// Goertzel bin.
-fn non_fundamental_share(x: &[f32], freq: f32, sr: f32) -> f32 {
-    let k = 2.0 * std::f32::consts::PI * freq / sr;
-    let (mut ss, mut cc, mut sc, mut xs, mut xc, mut xx) = (0f64, 0f64, 0f64, 0f64, 0f64, 0f64);
-    for (i, &v) in x.iter().enumerate() {
-        let (s, c) = ((k * i as f32).sin() as f64, (k * i as f32).cos() as f64);
-        let v = v as f64;
-        ss += s * s; cc += c * c; sc += s * c;
-        xs += v * s; xc += v * c; xx += v * v;
-    }
-    let det = ss * cc - sc * sc;
-    if det.abs() < 1e-9 || xx < 1e-12 {
-        return 0.0;
-    }
-    let a = (xs * cc - xc * sc) / det;
-    let b = (xc * ss - xs * sc) / det;
-    let fit = a * xs + b * xc;
-    ((xx - fit).max(0.0) / xx) as f32
-}
-
 /// `guitar-rig-test` (issue #92): the Guitar rig template end to end — a
 /// synthetic plucked-string input into the Audio In ring, through the
 /// template's stomps, amp and cabinet, audibly transformed at the Master.
@@ -7427,7 +7446,7 @@ pub fn guitar_rig_test() -> anyhow::Result<()> {
     let mid = &l[(n / 4)..(3 * n / 4)];
     // 100 ms of the middle: short enough that the pluck decay is flat.
     let win = &mid[mid.len() / 2..mid.len() / 2 + (sr as usize / 10)];
-    let ratio = non_fundamental_share(win, 220.0, sr);
+    let ratio = crate::analysis::non_fundamental_share(win, 220.0, sr);
     let rms = (mid.iter().map(|s| (s * s) as f64).sum::<f64>() / mid.len() as f64).sqrt() as f32;
 
     // The tail: input silent, the delay/reverb part of the chain still sounds.

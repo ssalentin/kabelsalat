@@ -1167,6 +1167,21 @@ Learned so far (2026-11-15, UI polish pass):
     (`onsets_of_a_gated_low_chord_sit_on_the_gate_grid`). Before blaming
     timing, dump the measured signal of 40+ runs and look at how far the
     passing ones are from the threshold.
+167. **A solo silences sources, never effects:** render step 2b asked
+    `strip_gains_of` for every effect, and a unit without a strip entry
+    counts as not soloed (rule 134), so a solo in a rig silenced every effect
+    of that rig, the soloed source's own chain included. Effects get no solo
+    flags (`run_effects`); only sources (instruments, Audio In, generators:
+    `mixer_sources`) are silenced by another's solo. Prove routing with the
+    noise probe (`noise_appears_exactly_where_it_is_routed`), not with
+    levels alone.
+168. **A delay plan counts every way audio travels, not only cables:**
+    sends are not cables, so the plan took an aux bus for "no delay" and
+    delayed the return of a whole-rig send a second time (480 frames against
+    the dry 240, a 5 ms comb on a parallel bus). A bus is as late as what is
+    sent into it (`pdc::compensation` takes the sends), and a send that
+    starts or stops sounding replans
+    (`a_bus_return_meets_the_dry_rig_in_phase`).
 
 ## Working on kabelsalat
 
@@ -1212,6 +1227,8 @@ Learned so far (2026-11-15, UI polish pass):
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,
+  `analysis-test [--save <dir>]` (spectra, master crackle, noise routing and
+  delay compensation through the engine without plugins; Surge adds a note),
   `listen-test [--model <id>] [--runs N] [--audio-only] [--reasoning <effort|default>] [--rate <Hz|native>]`
   (calls the listening model; prints rankings and latency),
   `catalog-install-test [id...]`

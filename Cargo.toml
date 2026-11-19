@@ -18,8 +18,16 @@ cpal = "0.18.2"
 # rtkit (D-Bus) realtime promotion of the audio callback thread: cpal skips
 # RT for pipewire-alsa (IOPLUG) devices, so the app promotes it itself.
 audio_thread_priority = { version = "0.35.1", features = ["with_dbus"] }
-eframe = "0.37.0"
+# Default features minus `accesskit`, the screen-reader bridge (AT-SPI over
+# zbus). The rack is custom-painted and exposes nothing through it. Add
+# "accesskit" back here to restore it for the standard widgets.
+eframe = { version = "0.37.0", default-features = false, features = [
+    "clipboard", "default_fonts", "links", "system_fonts", "wayland", "wgpu", "x11",
+] }
 egui = "0.37.0"
+# Keeps winit's default features (client-side window decorations on Wayland),
+# which eframe only turns on through its own default feature set.
+winit = "0.30.13"
 libc = "0.2"
 x11rb = "0.14.0"
 midir = "0.11.1"
@@ -36,8 +44,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "fs"
 zip = { version = "9.6.1", default-features = false, features = ["deflate"] }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+strip = true
 
 # The audio callback runs in debug builds too (the app is usually launched from
 # target/debug): unoptimized DSP + plugin hosting underran the 10.7 ms buffer.

@@ -1074,7 +1074,7 @@ Learned so far (2026-11-15, UI polish pass):
   `session-test`, `capture-test`, `player-test`, `record-test`, `metro-test`,
   `transport-test`, `edge-level-test`, `add-node-test`, `many-voices-test`, `mono-master-test`,
   `multi-rig-test`, `multi-rig-load-test`, `rig-mix-test`, `cc-map-test`,
-  `main-controls-test`,
+  `main-controls-test`, `engine-bench` (offline render timing and output hash),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
   `sound-library-test [id=query...]`, `organ-test`, `vital-test <patch.vital> [out.wav]`,

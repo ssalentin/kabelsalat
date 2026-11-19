@@ -4510,6 +4510,8 @@ struct MasterLimiter {
     /// its pole.
     dc: [(f32, f32); 2],
     dc_pole: f32,
+    /// `makeup(DRIVE_REF)`, constant.
+    makeup_ref: f32,
 }
 
 impl MasterLimiter {
@@ -4555,6 +4557,7 @@ impl MasterLimiter {
             ms_ref: 0.0, ms_cur: 0.0, ms_coef: coef(Self::LOUDNESS_SECS),
             dc: [(0.0, 0.0); 2],
             dc_pole: 1.0 - (std::f64::consts::TAU * Self::DC_CUTOFF_HZ / sample_rate) as f32,
+            makeup_ref: Self::makeup(Self::DRIVE_REF),
         }
     }
 
@@ -4588,8 +4591,13 @@ impl MasterLimiter {
         let g = self.gain_for(l, r);
         let (l, r) = (l * g, r * g);
         let (yl, yr) = ((l * drive).tanh(), (r * drive).tanh());
-        let m = Self::makeup(Self::DRIVE_REF);
-        let (rl, rr) = ((l * Self::DRIVE_REF).tanh() * m, (r * Self::DRIVE_REF).tanh() * m);
+        let m = self.makeup_ref;
+        // At the default WARM the reference chain is the chain itself.
+        let (rl, rr) = if drive == Self::DRIVE_REF {
+            (yl * m, yr * m)
+        } else {
+            ((l * Self::DRIVE_REF).tanh() * m, (r * Self::DRIVE_REF).tanh() * m)
+        };
         let c = self.ms_coef;
         self.ms_ref = c * self.ms_ref + (1.0 - c) * (rl * rl + rr * rr);
         self.ms_cur = c * self.ms_cur + (1.0 - c) * (yl * yl + yr * yr);
@@ -8338,4 +8346,85 @@ mod midifx_cc_tests {
             assert_eq!(semis(&engine, fx), -MIDIFX_SEMI_MAX, "{target:?}: zero CC = bottom");
         }
     }
+}
+
+/// `kabelsalat engine-bench`: time `GraphEngine::render` offline, with no
+/// audio device and no plugins. Two metronomes stand in for the demo rack's
+/// synths. Prints the median ns per frame over `REPS` runs, the master
+/// limiter's share of it, and an FNV hash of every output sample so two
+/// builds can be compared for bit-identical audio.
+pub fn bench() -> anyhow::Result<()> {
+    use crate::control::{command_bus, name_bytes, Command, Graph, NodeKind, PortKind, PortRef};
+    const REPS: usize = 9;
+    const SECONDS: usize = 20;
+    let sr = 48000.0;
+
+    let mut g = Graph::default();
+    g.reserve(64, 256);
+    let src_a = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("SRC A"));
+    let delay_a = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY A"));
+    let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER OUT"));
+    let src_b = g.add_node(NodeKind::Dsp(DspKind::Metronome), name_bytes("SRC B"));
+    let delay_b = g.add_node(NodeKind::Dsp(DspKind::Delay), name_bytes("DELAY B"));
+    let edges = [(3, src_a, delay_a, 0), (4, delay_a, master, 0), (5, src_a, master, 1),
+                 (7, src_b, delay_b, 0), (8, delay_b, master, 0), (9, src_b, master, 2)];
+    for (id, from, to, port) in edges {
+        anyhow::ensure!(g.connect_with_id(id, PortRef { node: from, port: 0 }, PortRef { node: to, port }, PortKind::Audio));
+    }
+
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        (v[v.len() / 2], v[0], v[v.len() - 1])
+    };
+    println!("engine-bench: {SECONDS} s of audio per run, median of {REPS} runs");
+    for frames in [128usize, 256, 512] {
+        let blocks = SECONDS * sr as usize / frames;
+        let mut runs = Vec::with_capacity(REPS);
+        let (mut hash, mut peak) = (0u64, 0.0f32);
+        for _ in 0..REPS {
+            let (mut bus, drain) = command_bus();
+            let mut engine = GraphEngine::new(Graph::default(), drain, sr, vec![]);
+            bus.send(Command::LoadGraph { graph: g.clone() });
+            bus.send(Command::TransportPlay);
+            let mut buf = vec![0.0f32; frames * 2];
+            hash = 0xcbf29ce484222325;
+            peak = 0.0;
+            let mut spent = std::time::Duration::ZERO;
+            for _ in 0..blocks {
+                let t = std::time::Instant::now();
+                engine.render(std::hint::black_box(&mut buf), 2);
+                spent += t.elapsed();
+                for s in &buf {
+                    hash = (hash ^ s.to_bits() as u64).wrapping_mul(0x100000001b3);
+                    peak = peak.max(s.abs());
+                }
+            }
+            runs.push(spent.as_nanos() as f64 / (blocks * frames) as f64);
+        }
+        let (med, lo, hi) = median(runs);
+        println!(
+            "render  buffer={frames:<4} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  block={:6.2} us  peak={peak:.3}  hash={hash:016x}",
+            med * frames as f64 / 1000.0,
+        );
+    }
+    for (label, warm) in [("default warm", 0.15f32), ("warm 60%", 0.6)] {
+        let drive = 1.0 + warm * 3.0;
+        let n = SECONDS * sr as usize;
+        let mut runs = Vec::with_capacity(REPS);
+        let mut hash = 0u64;
+        for _ in 0..REPS {
+            let mut lim = MasterLimiter::new(sr);
+            hash = 0xcbf29ce484222325;
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                let x = (i as f32 * 0.031).sin() * 0.9;
+                let (l, r) = lim.process(std::hint::black_box(x), x * 0.5, drive, 0.75);
+                hash = (hash ^ l.to_bits() as u64 ^ ((r.to_bits() as u64) << 32)).wrapping_mul(0x100000001b3);
+            }
+            runs.push(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        let (med, lo, hi) = median(runs);
+        println!("limiter {label:<12} median={med:7.2} ns/frame  range={lo:.2}..{hi:.2}  hash={hash:016x}");
+    }
+    Ok(())
 }

@@ -534,6 +534,20 @@ pub fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
 /// hairline. Tomato stays reserved for the flip CTA, selection and primary
 /// actions — a row of engaged chips reads calm, not alarming. Text color is
 /// driven by the widget visuals so hover feedback applies.
+/// `chip_button` inside a `horizontal_wrapped` row. The chip's own scope
+/// only gets the rest of the current line, so it never wraps by itself: it
+/// overflowed the row and widened everything below. Start the next line
+/// first when the chip would not fit.
+pub fn wrapped_chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
+    // In a wrapping layout `available_width` is the whole row, not what is
+    // left of the line.
+    let left_of_line = ui.max_rect().right() - ui.cursor().min.x;
+    if left_of_line < chip_button_width(ui, text) && ui.cursor().min.x > ui.max_rect().left() + 0.5 {
+        ui.end_row();
+    }
+    chip_button(ui, text, on)
+}
+
 pub fn chip_button(ui: &mut egui::Ui, text: &str, on: bool) -> egui::Response {
     ui.scope(|ui| {
         let (fill, txt) = if on { (CHIP_ON, DARK_PANEL) } else { (DARK_PANEL_HI, CREAM) };

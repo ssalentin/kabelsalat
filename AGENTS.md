@@ -1201,6 +1201,21 @@ Learned so far (2026-11-15, UI polish pass):
     and Library of every headless shot listed the user's real session names,
     and a test autosave would have written there. Under `cfg(test)` it is a
     per-process temp dir; check any new path helper the same way (rule 37).
+169. **A chip in a wrapping row goes through `theme::wrapped_chip_button`:**
+    `chip_button` draws inside `ui.scope`, whose child holds only the rest
+    of the line, so egui never moves it to the next one. The Plugins filter
+    row ran past a 760 px window, widened the sheet's content and pushed
+    the cards past its edge; with text wrapping on, the "LV2" chip broke
+    into one letter per line. In a wrapping layout `available_width()` is
+    the whole row: measure what is left as `max_rect().right() -
+    cursor().min.x` (`every_view_fits_small_windows`).
+170. **What kind of plugin something is comes from `plugins::entries`:**
+    the browser called every CLAP plugin an instrument, so Surge XT Effects
+    got a New rig button kabelsalat cannot honour. The Plugins view, the
+    insert picker, the assistant and MCP filter one classified list
+    (`PluginListFilter`); a new screen or tool uses it too, and only a
+    `clap_hostable` plugin gets a CLAP add button
+    (`clap_plugins_classify_into_instruments_effects_and_midi_fx`).
 
 ## Working on kabelsalat
 

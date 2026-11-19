@@ -52,6 +52,20 @@ you are looking at with **1–9**. Any installed CLAP or LV2 instrument works
 (Surge XT, Dexed, Vitalium, …), and each unit shows which instrument and sound
 it has loaded.
 
+### Browse and install plugins by type
+Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
+rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,
+**Utilities** and the **Install** catalog. Narrow **Effects** by subcategory
+(**Delay & Reverb**, **EQ & Filter**, **Dynamics**, **Drive & Amp**,
+**Modulation**, **Pitch & Spatial**, **Multi-FX**) or filter by format
+(**Built-in**, **CLAP**, **LV2**). Add an instrument as a **New rig** alongside
+your existing rigs or layer it into the active rig, insert any effect onto the
+active rig or straight onto the **Master FX** bus, and filter the mixer's
+**+ insert** picker by the same effect categories. The assistant and MCP agents
+search the same taxonomy with `list_plugins`.
+
+<p align="center"><img src="docs/shots/plugins.png" width="85%" alt="The Plugins view organized by type (Instruments, Effects, MIDI FX, Utilities) with effect subcategory and format filters"/></p>
+
 ### Put MIDI effects in front of an instrument
 A **MIDI strip** sits between your keys and the instrument and changes the notes
 on the way: the built-in **MIDI transpose**, or any installed LV2 MIDI plugin

@@ -1105,13 +1105,13 @@ Learned so far (2026-11-15, UI polish pass):
     (`a_focused_text_field_types_without_the_desktops_input_method`). Live
     check: headless sway + fcitx5, type with `wtype`, `kill -STOP` fcitx5,
     type again.
-158. **A CLAP voice sends a parameter event only for an id its plugin
+159. **A CLAP voice sends a parameter event only for an id its plugin
     declared:** Surge XT dereferences the parameter it did not find, so one
     event with another plugin's id (a knob or editor slider whose voice
     mapping moved) was a SIGSEGV inside `process()` on the audio thread
     (#29). `push_cmd` checks the voice's own `param_ranges`; never add a
     path that puts a parameter event into `ev_in` around it.
-159. **A state save never runs beside the block that applies a state load:**
+160. **A state save never runs beside the block that applies a state load:**
     Surge XT applies `state.load` inside `process()` and its save reads the
     patch without a lock, so `save_state` right after `load_state` (undo
     snapshot, session capture) crashed inside the plugin. `StateGate` holds

@@ -1202,6 +1202,13 @@ Learned so far (2026-11-15, UI polish pass):
     and a test autosave would have written there. Under `cfg(test)` it is a
     per-process temp dir; check any new path helper the same way (rule 37).
 
+173. **A stereo LV2 effect hears L and R apart:** `Lv2Plugin::process`
+    filled every audio input from the left channel, so every stereo LV2
+    effect (Dragonfly, LSP, ZL, x42, stereo Guitarix units) got L twice and
+    the right channel was lost. Inputs take L and R in port order; a mono
+    plugin takes L (`a_stereo_effect_hears_left_and_right_apart`, real
+    Carla Audio Gain, red before: right peak 0.50 from a left-only tone).
+
 ## Working on kabelsalat
 
 - **Where things live (one place each, never mirrored):** planned work, bugs

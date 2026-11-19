@@ -1635,9 +1635,13 @@ impl Lv2Plugin {
             w.drain_responses();
         }
         unsafe {
-            for &i in &self.audio_in {
+            // A stereo plugin's inputs take L and R in port order; a mono
+            // one takes L.
+            let stereo = self.audio_in.len() >= 2;
+            for (k, &i) in self.audio_in.iter().enumerate() {
+                let ch = if stereo { k % 2 } else { 0 };
                 for f in 0..frames {
-                    self.buffers[i][f] = input.get(f * 2).copied().unwrap_or(0.0);
+                    self.buffers[i][f] = input.get(f * 2 + ch).copied().unwrap_or(0.0);
                 }
             }
             // Atom outputs: an empty Chunk of full capacity before every run (#38).
@@ -2482,6 +2486,29 @@ mod tests {
         }
         assert!(peak > 1e-4, "a reused instance still plays: peak={peak}");
         retire(again);
+    }
+
+    #[test]
+    fn a_stereo_effect_hears_left_and_right_apart() {
+        // Carla's stereo Audio Gain passes each channel through on its own:
+        // a tone on the left only must leave the right output silent. Every
+        // input read the left channel before. Skips where Carla is missing.
+        let Ok(mut gain) = Lv2Plugin::load("http://kxstudio.sf.net/carla/plugins/audiogain_s", 48000.0, 256) else { return };
+        let block = 256usize;
+        let mut inp = vec![0.0f32; block * 2];
+        let mut out = vec![0.0f32; block * 2];
+        let (mut left, mut right) = (0.0f32, 0.0f32);
+        for b in 0..20 {
+            for i in 0..block {
+                inp[i * 2] = (2.0 * std::f32::consts::PI * 440.0 * ((b * block + i) as f32 / 48000.0)).sin() * 0.5;
+            }
+            gain.process(&inp, &mut out, block);
+            left = out.iter().step_by(2).fold(left, |m, s| m.max(s.abs()));
+            right = out.iter().skip(1).step_by(2).fold(right, |m, s| m.max(s.abs()));
+        }
+        retire(gain);
+        assert!(left > 0.1, "the left tone comes through: peak {left}");
+        assert!(right < 1e-4, "the right output stays silent: peak {right}");
     }
 
     #[test]

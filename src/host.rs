@@ -324,6 +324,67 @@ macro_rules! out_port {
     };
 }
 
+/// Keeps a state save apart from the `process()` call that applies a state
+/// load (#29). Surge XT applies a loaded state inside `process()` and its
+/// save reads the patch without a lock, so a save on the main thread while
+/// that block renders crashed inside the plugin.
+///
+/// The main side holds the gate for a save while a load is pending. The
+/// audio side never waits: a block that finds the gate held is silent and
+/// keeps its events for the next one.
+#[derive(Default)]
+struct StateGate {
+    /// The audio side is inside `process()`.
+    processing: AtomicBool,
+    /// `process()` calls that returned.
+    processed: AtomicU64,
+    /// The main side wants no `process()` call to run.
+    held: AtomicBool,
+}
+
+impl StateGate {
+    /// Audio side, before `process()`: false while the main side holds the
+    /// gate. After true, `leave` follows the call.
+    fn enter(&self) -> bool {
+        self.processing.store(true, Ordering::SeqCst);
+        if self.held.load(Ordering::SeqCst) {
+            self.processing.store(false, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    fn leave(&self) {
+        self.processed.fetch_add(1, Ordering::SeqCst);
+        self.processing.store(false, Ordering::SeqCst);
+    }
+
+    /// Main side: a count no `process()` call that began before now can
+    /// reach or pass without one more call after it. A load enqueued before
+    /// this is applied once `processed` is past it.
+    fn mark(&self) -> u64 {
+        let running = self.processing.load(Ordering::SeqCst) as u64;
+        self.processed.load(Ordering::SeqCst) + running
+    }
+
+    /// Main side: whether a `process()` call that began after `mark` was
+    /// taken has returned.
+    fn passed(&self, mark: u64) -> bool {
+        self.processed.load(Ordering::SeqCst) > mark
+    }
+
+    /// Main side: run `f` with no `process()` call in flight.
+    fn hold<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.held.store(true, Ordering::SeqCst);
+        while self.processing.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let out = f();
+        self.held.store(false, Ordering::SeqCst);
+        out
+    }
+}
+
 /// A live Surge XT voice: the CLAP audio processor plus preallocated buffers.
 ///
 /// `Send` but `!Sync`: create it on the main thread, then move it to the audio
@@ -357,6 +418,7 @@ pub struct ClapVoice {
     ev_in: EventBuffer,
     ev_out: EventBuffer,
     process_errors: u64,
+    gate: Arc<StateGate>,
 }
 
 impl ClapVoice {
@@ -483,6 +545,7 @@ impl ClapVoice {
             .map_err(|_| anyhow!("start_processing failed"))?;
 
         let (cmds_tx, cmds_rx) = rtrb::RingBuffer::<VoiceCmd>::new(CMD_RING);
+        let gate = Arc::new(StateGate::default());
         let n_out = out_chs.len();
         let voice = ClapVoice {
             voice_id: NEXT_VOICE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -512,6 +575,7 @@ impl ClapVoice {
             ev_in: EventBuffer::with_capacity(EVENT_CAP as usize),
             ev_out: EventBuffer::with_capacity(EVENT_CAP as usize),
             process_errors: 0,
+            gate: gate.clone(),
         };
         let main_id = id_str;
         let mut main = ClapVoiceMain {
@@ -520,6 +584,8 @@ impl ClapVoice {
             main_controls: MainControls::default(),
             main_controls_rechecks: 0,
             editor: None,
+            gate,
+            load_mark: None,
             _entry: entry,
         };
         main.refresh_main_controls();
@@ -626,6 +692,10 @@ impl ClapVoice {
     }
 
     fn render_block(&mut self, n: usize, out: &mut [f32], transport: &Transport) {
+        if !self.gate.enter() {
+            out[..n * 2].fill(0.0);
+            return;
+        }
         self.ev_in.clear();
         self.ev_out.clear();
 
@@ -634,14 +704,14 @@ impl ClapVoice {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, 0, self.rt_cmds[i]);
+            push_cmd(&mut self.ev_in, &self.param_ranges, 0, self.rt_cmds[i]);
         }
         self.rt_cmds.clear();
         while let Ok(cmd) = self.cmds_rx.pop() {
             if self.ev_in.len() >= EVENT_CAP {
                 break;
             }
-            push_cmd(&mut self.ev_in, 0, cmd);
+            push_cmd(&mut self.ev_in, &self.param_ranges, 0, cmd);
         }
         while self.sched_idx < self.schedule.len()
             && self.schedule[self.sched_idx].0 < self.frame + n as u64
@@ -650,7 +720,7 @@ impl ClapVoice {
                 break;
             }
             let (t, cmd) = self.schedule[self.sched_idx];
-            push_cmd(&mut self.ev_in, (t - self.frame) as u32, cmd);
+            push_cmd(&mut self.ev_in, &self.param_ranges, (t - self.frame) as u32, cmd);
             self.sched_idx += 1;
         }
 
@@ -693,6 +763,7 @@ impl ClapVoice {
             Some(self.frame),
             Some(&transport_event(transport)),
         );
+        self.gate.leave();
         if status.is_err() {
             self.process_errors += 1;
         }
@@ -740,8 +811,17 @@ fn transport_event(t: &Transport) -> TransportEvent {
     }
 }
 
-fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
+/// Whether the plugin declared parameter `id` (`ranges` is sorted by id).
+fn has_param(ranges: &[(u32, f64, f64)], id: u32) -> bool {
+    ranges.binary_search_by_key(&id, |&(pid, _, _)| pid).is_ok()
+}
+
+/// Queue `cmd` as a CLAP event. A parameter event for an id the plugin did
+/// not declare is dropped: CLAP allows only declared ids, and Surge XT
+/// dereferences the parameter it did not find (#29).
+fn push_cmd(ev_in: &mut EventBuffer, params: &[(u32, f64, f64)], time: u32, cmd: VoiceCmd) {
     match cmd {
+        VoiceCmd::Param(id, _) if !has_param(params, id.get()) => {}
         VoiceCmd::NoteOn(k, v) => {
             ev_in.push(&NoteOnEvent::new(time, Pckn::new(0u16, 0u16, k, k as u32), v))
         }
@@ -760,6 +840,79 @@ fn push_cmd(ev_in: &mut EventBuffer, time: u32, cmd: VoiceCmd) {
             v,
         )),
         VoiceCmd::Midi(data) => ev_in.push(&MidiEvent::new(time, 0, data)),
+    }
+}
+
+#[cfg(test)]
+mod state_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_is_skipped_while_the_gate_is_held() {
+        let gate = StateGate::default();
+        assert!(gate.enter(), "an open gate lets the block in");
+        gate.leave();
+        gate.hold(|| assert!(!gate.enter(), "a held gate turns the block away"));
+        assert!(gate.enter(), "and lets the next one in");
+        gate.leave();
+        assert_eq!(gate.processed.load(Ordering::SeqCst), 2, "a skipped block is not a processed one");
+    }
+
+    #[test]
+    fn holding_the_gate_waits_for_the_block_in_flight() {
+        let gate = Arc::new(StateGate::default());
+        let finished = Arc::new(AtomicBool::new(false));
+        let (began_tx, began_rx) = mpsc::channel();
+        let block = std::thread::spawn({
+            let (gate, finished) = (gate.clone(), finished.clone());
+            move || {
+                assert!(gate.enter());
+                began_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+                finished.store(true, Ordering::SeqCst);
+                gate.leave();
+            }
+        });
+        began_rx.recv().unwrap();
+        gate.hold(|| assert!(finished.load(Ordering::SeqCst), "the save ran beside a block"));
+        block.join().unwrap();
+    }
+
+    #[test]
+    fn a_load_is_applied_by_a_block_that_began_after_it() {
+        let gate = StateGate::default();
+        let idle = gate.mark();
+        assert!(!gate.passed(idle));
+        assert!(gate.enter());
+        // This block began before the load below returned: it may have
+        // missed it, so its end does not settle the load.
+        let in_flight = gate.mark();
+        gate.leave();
+        assert!(gate.passed(idle), "no block ran at the first load: this one applied it");
+        assert!(!gate.passed(in_flight));
+        gate.hold(|| assert!(!gate.enter()));
+        assert!(!gate.passed(in_flight), "a skipped block applies nothing");
+        assert!(gate.enter());
+        gate.leave();
+        assert!(gate.passed(in_flight));
+    }
+}
+
+#[cfg(test)]
+mod param_event_tests {
+    use super::*;
+
+    #[test]
+    fn a_parameter_event_reaches_the_plugin_only_for_an_id_it_declared() {
+        let declared = [(7u32, 0.0, 1.0), (40, -1.0, 1.0)];
+        let mut events = EventBuffer::with_capacity(4);
+        push_cmd(&mut events, &declared, 0, VoiceCmd::Param(ClapId::new(8), 0.5));
+        assert_eq!(events.len(), 0, "an undeclared id is dropped");
+        push_cmd(&mut events, &declared, 0, VoiceCmd::Param(ClapId::new(40), 0.5));
+        push_cmd(&mut events, &declared, 0, VoiceCmd::NoteOn(60, 0.9));
+        assert_eq!(events.len(), 2, "declared parameters and notes pass");
+        push_cmd(&mut events, &[], 0, VoiceCmd::Param(ClapId::new(40), 0.5));
+        assert_eq!(events.len(), 2, "a plugin without parameters gets none");
     }
 }
 
@@ -998,6 +1151,9 @@ pub struct ClapVoiceMain {
     main_controls_rechecks: u8,
     /// The plugin's own editor, while it is open.
     editor: Option<ClapEditor>,
+    gate: Arc<StateGate>,
+    /// `StateGate::mark` of the last state load, until a block applied it.
+    load_mark: Option<u64>,
     _entry: PluginEntry,
 }
 
@@ -1139,8 +1295,23 @@ impl ClapVoiceMain {
     pub fn save_state(&mut self) -> Result<Vec<u8>> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         let mut buf = Vec::new();
-        state.save(&mut self.instance.plugin_handle(), &mut buf).context("saving plugin state")?;
+        let pending = self.load_pending();
+        let mut handle = self.instance.plugin_handle();
+        if pending {
+            self.gate.hold(|| state.save(&mut handle, &mut buf))
+        } else {
+            state.save(&mut handle, &mut buf)
+        }
+        .context("saving plugin state")?;
         Ok(buf)
+    }
+
+    /// Whether a block may still be applying the last state load.
+    fn load_pending(&mut self) -> bool {
+        if self.load_mark.is_some_and(|mark| self.gate.passed(mark)) {
+            self.load_mark = None;
+        }
+        self.load_mark.is_some()
     }
 
     /// Restore plugin state. Surge applies it on the audio thread: keep
@@ -1148,6 +1319,7 @@ impl ClapVoiceMain {
     pub fn load_state(&mut self, data: &[u8]) -> Result<()> {
         let state = self.exts.state.ok_or_else(|| anyhow!("Surge XT has no state extension"))?;
         state.load(&mut self.instance.plugin_handle(), &mut &data[..]).context("loading plugin state")?;
+        self.load_mark = Some(self.gate.mark());
         self.main_controls_rechecks = MAIN_CONTROLS_RECHECKS;
         Ok(())
     }
@@ -1183,15 +1355,16 @@ impl ClapVoiceMain {
         me.instance.deactivate(stopped);
         // SAFETY: `me` is never used or dropped again, and each field is read
         // exactly once (the editor is closed, so there is nothing else to free).
-        let (instance, exts, entry, controls) = unsafe {
+        let (instance, exts, entry, controls, gate) = unsafe {
             (
                 std::ptr::read(&me.instance),
                 std::ptr::read(&me.exts),
                 std::ptr::read(&me._entry),
                 std::ptr::read(&me.main_controls),
+                std::ptr::read(&me.gate),
             )
         };
-        drop(controls);
+        drop((controls, gate));
         let parked = ParkedClap { plugin_id, instance, exts, _entry: entry };
         CLAP_PARKED.with(|pool| {
             if let Ok(mut pool) = pool.try_borrow_mut() {
@@ -1745,6 +1918,80 @@ pub fn run_preset_test() -> Result<()> {
     let diff = (zc_a - zc_b).abs() / zc_a.max(1.0) + (rms_a - rms_b).abs() / rms_a.max(1e-6);
     anyhow::ensure!(diff > 0.15, "sound did not change (diff {diff:.3})");
     println!("preset-test: OK — '{}' loaded, timbre changed (diff {diff:.2})", flute.name);
+    Ok(())
+}
+
+/// `kabelsalat state-race-test [seconds] [patch.fxp...]`: the two ways the
+/// host crashed Surge XT (#29), on the installed plugin. A crash ends the
+/// process with its signal, so reaching the end is the pass.
+///
+/// 1. A parameter event whose id the plugin does not have. Surge
+///    dereferences the parameter it did not find, inside `process()`.
+/// 2. States saved on the main thread while the render thread applies the
+///    state loaded just before. Surge applies a load inside `process()` and
+///    its save reads the patch without a lock.
+///
+/// Without patch files the first installed factory patches are used.
+pub fn run_state_race_test(seconds: u64, patches: &[PathBuf]) -> Result<()> {
+    let mut states = Vec::new();
+    let paths: Vec<PathBuf> = if patches.is_empty() {
+        list_surge_patches().into_iter().step_by(97).take(6).map(|p| p.path).collect()
+    } else {
+        patches.to_vec()
+    };
+    for path in &paths {
+        states.push(fxp_to_state(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)?);
+    }
+    anyhow::ensure!(states.len() >= 2, "state-race-test needs two Surge patches (installed, or as arguments)");
+    let (mut voice, mut main) = ClapVoice::new(48_000.0)?;
+    let ctl = voice.controller();
+    let known: Vec<u32> = main.param_list().iter().map(|p| p.id).collect();
+    let unknown = (0xDEAD_0000u32..).find(|id| !known.contains(id)).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let render = std::thread::spawn({
+        let stop = stop.clone();
+        move || {
+            let mut buf = [0.0f32; BLOCK * 2];
+            let (mut blocks, mut peak) = (0u64, 0.0f32);
+            while !stop.load(Ordering::SeqCst) {
+                voice.render(&mut buf, Transport::default());
+                peak = buf.iter().fold(peak, |p, x| p.max(x.abs()));
+                blocks += 1;
+            }
+            (voice, blocks, peak)
+        }
+    });
+    for key in [48, 55, 60, 64] {
+        ctl.note_on(key, 0.9);
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    ctl.set_param(ClapId::new(unknown), 0.5);
+    std::thread::sleep(Duration::from_millis(50));
+    println!("1. a parameter event with the unknown id {unknown:#x} was rendered");
+
+    let end = Instant::now() + Duration::from_secs(seconds);
+    let (mut loads, mut saves) = (0u64, 0u64);
+    while Instant::now() < end {
+        main.load_state(&states[loads as usize % states.len()])?;
+        loads += 1;
+        // Saves land before, inside and after the block that applies the load.
+        for pause_us in [0, 150, 700] {
+            std::thread::sleep(Duration::from_micros(pause_us));
+            anyhow::ensure!(!main.save_state()?.is_empty(), "an empty state");
+            saves += 1;
+        }
+        for key in [48, 55, 60, 64] {
+            ctl.note_on(key, 0.9);
+        }
+    }
+    stop.store(true, Ordering::SeqCst);
+    let (voice, blocks, peak) = render.join().map_err(|_| anyhow!("the render thread panicked"))?;
+    println!("2. {loads} loads and {saves} saves against {blocks} rendered blocks (peak {peak:.3})");
+    anyhow::ensure!(voice.process_errors() == 0, "process() reported {} errors", voice.process_errors());
+    anyhow::ensure!(peak > 1e-3, "the voice stayed silent: nothing was rendered between the loads");
+    main.retire(voice);
+    println!("state-race-test: OK");
     Ok(())
 }
 

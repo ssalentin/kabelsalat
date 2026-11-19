@@ -4032,7 +4032,7 @@ impl DemoApp {
         let mut meters = crate::audio_out::StreamMeters::new(self.stream_levels.clone());
         std::thread::Builder::new()
             .name("kabelsalat-audio-out".into())
-            .spawn(move || loop {
+            .spawn(move || { let mut previous: Option<String> = None; loop {
                 let mut cmds = Vec::new();
                 match rx.recv_timeout(std::time::Duration::from_secs(1)) {
                     Ok(c) => { cmds.push(c); while let Ok(c) = rx.try_recv() { cmds.push(c); } }
@@ -4041,10 +4041,11 @@ impl DemoApp {
                 }
                 crate::audio_out::apply_stream_cmds(cmds);
                 let w = wanted.lock().ok().and_then(|w| w.clone());
-                let st = crate::audio_out::scan_and_apply(w.as_deref());
+                let st = crate::audio_out::scan_and_apply(crate::audio_out::target_for(w.as_deref(), previous.as_deref()));
+                previous = crate::audio_out::remember(w, previous, &st);
                 meters.sync(&st.streams);
                 if let Ok(mut s) = state.lock() { *s = st; }
-            })
+            }})
             .ok();
     }
 
@@ -16413,16 +16414,23 @@ impl DemoApp {
                                         ui.painter().line_segment([rule.left_center(), rule.right_center()], Stroke::new(1.0, theme::HAIRLINE));
                                         ui.add_space(4.0);
                                         ui.horizontal_top(|ui| {
-                                            for (si, st) in app_streams.iter().enumerate() {
+                                            for st in &app_streams {
                                                 ui.allocate_ui_with_layout(egui::vec2(STRIP_W, fader_h + 150.0), egui::Layout::top_down(egui::Align::Center), |ui| {
-                                                    // "(2) Neo Soul … - YouTube" → "Neo Soul …": the tab counter is noise.
-                                                    let title = st.title.trim_start_matches(|c: char| c == '(' || c.is_ascii_digit() || c == ')' || c == ' ');
+                                                    let title = app_stream_title(&st.title);
+                                                    // Which app, and what it plays: one fitted line each,
+                                                    // like the rig bus header (the full text is the tip).
+                                                    for (text, size, color) in [(st.app.as_str(), 13.0, theme::INK), (title, 10.5, theme::INK_2)] {
+                                                        let (lr, _) = ui.allocate_exact_size(egui::vec2(STRIP_W - 8.0, size + 5.0), egui::Sense::hover());
+                                                        let g = fit_galley(ui.painter(), text, egui::FontId::proportional, &[size], lr.width(), color);
+                                                        ui.painter().galley(lr.center() - g.size() * 0.5, g, color);
+                                                    }
+                                                    ui.add_space(4.0);
                                                     let shown = st.volume.min(1.0);
                                                     let mut v = shown;
                                                     // What the app plays, dB-scaled (rule 62), with the
                                                     // same peak hold + clip as the patch strips (#72).
                                                     let level = crate::audio_out::stream_level(&self.stream_levels, st.index);
-                                                    let key = app_stream_key(si);
+                                                    let key = app_stream_key(st.index);
                                                     let fr = self.strip_fader_ui(ui, key, &mut v, level, fader_h, None);
                                                     ui.interact(fr, egui::Id::unique(("app_stream_tip", st.index)), egui::Sense::hover())
                                                         .on_hover_text(format!("{} — {}", st.app, title));
@@ -19950,8 +19958,19 @@ fn strip_ms_button(ui: &mut egui::Ui, row: &mut StripUiRow, which: char) -> egui
 
 /// Meter-table key of an app-stream strip (they share the strip peak table;
 /// the patch's node ids live far below the top of the u32 range).
-fn app_stream_key(slot: usize) -> u32 {
-    u32::MAX - 40 - slot.min(24) as u32
+/// Keyed by the stream, not by its place in the row (rule 135): when another
+/// app stops playing, the strips move up and must keep their own peak hold.
+fn app_stream_key(index: u64) -> u32 {
+    u32::MAX - 40 - (index % 4096) as u32
+}
+
+/// "(2) Neo Soul … - YouTube" → "Neo Soul … - YouTube": a browser tab's
+/// unread counter is noise on a strip. Only a leading "(digits) " goes.
+fn app_stream_title(title: &str) -> &str {
+    title.strip_prefix('(')
+        .and_then(|t| t.split_once(") "))
+        .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map_or(title, |(_, rest)| rest)
 }
 
 /// The strip colour palette (#77): warm/neutral jacket hues (rule 3 — tomato
@@ -28385,6 +28404,169 @@ mod settings_and_dropdown_tests {
                     "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}",
                 );
             }
+        }
+    }
+
+    // ---- #31: other apps' audio and the output device ---------------------
+
+    /// An app with one other app playing and two sound cards, as the scan
+    /// thread would report them, and the receiving end of its commands.
+    fn app_with_system_audio() -> (DemoApp, std::sync::mpsc::Receiver<crate::audio_out::StreamCmd>) {
+        use crate::audio_out::{AppStream, OutputDevice, OutputState};
+        let mut app = DemoApp::new_with_sink(None);
+        *app.audio_out.lock().unwrap() = OutputState {
+            outputs: vec![
+                OutputDevice { raw: "alsa_output.speakers".into(), name: "Built-in Speakers".into(), default: true },
+                OutputDevice { raw: "alsa_output.m2".into(), name: "MOTU M2".into(), default: false },
+            ],
+            current: Some("alsa_output.speakers".into()),
+            streams: vec![AppStream {
+                index: 77, app: "Zen".into(),
+                title: "(2) Neo Soul Guitar Backing Track in A minor - YouTube".into(),
+                volume: 1.0, muted: false,
+            }],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.stream_cmds = Some(tx);
+        app.stage_view = StageView::Mixer;
+        (app, rx)
+    }
+
+    #[test]
+    fn another_apps_strip_names_the_app_and_its_fader_and_mute_reach_the_stream() {
+        use crate::audio_out::StreamCmd;
+        for size in [Vec2::new(1600.0, 1000.0), Vec2::new(1280.0, 800.0)] {
+            let (mut app, rx) = app_with_system_audio();
+            let ctx = egui::Context::default();
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (_, meter) = app.mixer_meter_rects.iter().copied().find(|(k, _)| *k == app_stream_key(77))
+                .expect("the app's strip with its meter");
+            let fader_x = meter.left() - 25.0;
+            let in_strip = |r: &Rect| (r.center().x - fader_x).abs() < STRIP_W * 0.5;
+            assert!(texts.iter().any(|(t, _)| t == "System audio"), "{size:?}: the section is titled");
+            // Which app, and what it plays (the tab counter dropped, the long
+            // title cut to the strip): both inside the strip, above the fader.
+            let (_, app_r) = texts.iter().find(|(t, r)| t == "Zen" && in_strip(r)).expect("the app's name on its strip");
+            let (title, title_r) = texts.iter().find(|(t, r)| t.starts_with("Neo Soul") && in_strip(r))
+                .expect("what the app plays on its strip");
+            assert!(title.ends_with('\u{2026}'), "{size:?}: a long title is cut, not wrapped: {title:?}");
+            for r in [app_r, title_r] {
+                assert!(r.width() <= STRIP_W && r.bottom() <= meter.top() + 1.0, "{size:?}: label {r:?} fits above the fader {meter:?}");
+            }
+            assert!(app_r.bottom() <= title_r.top() + 1.0, "{size:?}: name {app_r:?} above title {title_r:?}");
+
+            // Pull the fader down: the stream gets a lower volume, and the
+            // strip keeps it although the scan still reports the old one.
+            let (from, to) = (Pos2::new(fader_x, meter.top() + 8.0), Pos2::new(fader_x, meter.center().y));
+            let ptr = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+            run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(from)]);
+            run_frame(&mut app, &ctx, size, vec![ptr(from, true)]);
+            for i in 1..=6 {
+                run_frame(&mut app, &ctx, size, vec![egui::Event::PointerMoved(from + (to - from) * (i as f32 / 6.0))]);
+            }
+            run_frame(&mut app, &ctx, size, vec![ptr(to, false)]);
+            let vols: Vec<f32> = rx.try_iter().map(|c| match c {
+                StreamCmd::Volume(77, v) => v,
+                other => panic!("{size:?}: only volume changes of stream 77, got {other:?}"),
+            }).collect();
+            let last = *vols.last().expect("the drag sent volume changes");
+            assert!(last > 0.02 && last < 0.6, "{size:?}: half-way down is well below 100 % ({last})");
+            let shown = app.app_streams_shown();
+            assert_eq!(shown[0].volume, last, "{size:?}: the strip shows the fader's value until the scan catches up");
+
+            // The M button under it mutes that app.
+            let (texts, _, _) = run_frame(&mut app, &ctx, size, vec![]);
+            let m = texts.iter().filter(|(t, r)| t == "M" && in_strip(r) && r.top() > meter.bottom())
+                .map(|(_, r)| r.center()).next().expect("the strip's mute button");
+            click_at(&mut app, &ctx, size, m);
+            assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![StreamCmd::Mute(77, true)], "{size:?}");
+            assert!(app.app_streams_shown()[0].muted, "{size:?}: the button lights at once");
+        }
+    }
+
+    #[test]
+    fn a_strip_keeps_its_meter_when_another_app_stops_playing() {
+        // Keyed by the stream (rule 135), so a strip that moves up in the row
+        // does not inherit the peak hold and clip light of the one that left.
+        let (mut app, _rx) = app_with_system_audio();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1600.0, 1000.0);
+        let second = crate::audio_out::AppStream { index: 91, app: "Spotify".into(), title: "Song".into(), volume: 0.5, muted: false };
+        app.audio_out.lock().unwrap().streams.push(second);
+        warm(&mut app, &ctx, size);
+        app.mixer_peaks.get_mut(&app_stream_key(77)).expect("first strip's peak hold").clip = true;
+        app.audio_out.lock().unwrap().streams.remove(0);
+        warm(&mut app, &ctx, size);
+        assert!(app.mixer_meter_rects.iter().any(|(k, _)| *k == app_stream_key(91)), "the remaining app keeps its strip");
+        assert!(!app.mixer_peaks[&app_stream_key(91)].clip, "and did not take over the clip light of the app that stopped");
+        assert_eq!(app_stream_title("(12) Song - YouTube"), "Song - YouTube");
+        assert_eq!(app_stream_title("(null)"), "(null)", "only a tab counter is dropped");
+        assert_eq!(app_stream_title("(Live) Song"), "(Live) Song");
+    }
+
+    #[test]
+    fn the_master_output_menu_picks_a_sound_card_and_returns_to_the_default() {
+        let (mut app, _rx) = app_with_system_audio();
+        let ctx = egui::Context::default();
+        let size = Vec2::new(1280.0, 900.0);
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        assert!(texts.iter().any(|(t, _)| t == "\u{2192} Built-in Speakers"), "the card it plays to now is named under the menu");
+        let trigger = texts.iter().find(|(t, _)| t == "System default").expect("the output menu at Master out").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        let m2 = texts.iter().find(|(t, _)| t == "MOTU M2").expect("the M2 in the menu").1.center();
+        click_at(&mut app, &ctx, size, m2);
+        assert_eq!(app.wanted_output.lock().unwrap().as_deref(), Some("alsa_output.m2"), "picked by its PipeWire name");
+        let (texts, _, _) = warm(&mut app, &ctx, size);
+        let trigger = texts.iter().find(|(t, _)| t == "MOTU M2").expect("the menu shows the choice").1.center();
+        let (texts, _, _) = open_dropdown(&mut app, &ctx, size, trigger);
+        let default = texts.iter().find(|(t, _)| t == "System default").expect("System default in the menu").1.center();
+        click_at(&mut app, &ctx, size, default);
+        assert_eq!(*app.wanted_output.lock().unwrap(), None, "back to following the system");
+    }
+
+    #[test]
+    fn agents_choose_the_output_and_turn_other_apps_down() {
+        use crate::audio_out::StreamCmd;
+        let (mut app, rx) = app_with_system_audio();
+        let outs: serde_json::Value = serde_json::from_str(&app.exec_tool("list_audio_outputs", &serde_json::json!({}))).unwrap();
+        assert_eq!(outs["outputs"][1], serde_json::json!({"name": "alsa_output.m2", "label": "MOTU M2", "default": false}));
+        assert_eq!(outs["current"], "alsa_output.speakers");
+        assert_eq!(outs["selected"], serde_json::Value::Null);
+
+        let refused = app.exec_tool("set_audio_output", &serde_json::json!({"output": "MOTU M2"}));
+        assert!(refused.contains("no output named"), "a label is not a name: {refused}");
+        assert_eq!(*app.wanted_output.lock().unwrap(), None, "a refused name changes nothing");
+        let ok = app.exec_tool("set_audio_output", &serde_json::json!({"output": "alsa_output.m2"}));
+        assert!(ok.contains("alsa_output.m2"), "{ok}");
+        let outs: serde_json::Value = serde_json::from_str(&app.exec_tool("list_audio_outputs", &serde_json::json!({}))).unwrap();
+        assert_eq!(outs["selected"], "alsa_output.m2");
+        for back in [serde_json::json!({"output": ""}), serde_json::json!({"output": null}), serde_json::json!({})] {
+            *app.wanted_output.lock().unwrap() = Some("alsa_output.m2".into());
+            let out = app.exec_tool("set_audio_output", &back);
+            assert!(out.contains("system default"), "{out}");
+            assert_eq!(*app.wanted_output.lock().unwrap(), None, "{back}");
+        }
+
+        let streams: serde_json::Value = serde_json::from_str(&app.exec_tool("list_app_streams", &serde_json::json!({}))).unwrap();
+        assert_eq!(streams["streams"][0]["index"], 77);
+        assert_eq!(streams["streams"][0]["app"], "Zen");
+        assert_eq!(streams["streams"][0]["title"], "(2) Neo Soul Guitar Backing Track in A minor - YouTube");
+        let gone = app.exec_tool("set_app_stream", &serde_json::json!({"index": 5, "volume": 0.2}));
+        assert!(gone.contains("no playing app stream 5"), "{gone}");
+        assert!(app.exec_tool("set_app_stream", &serde_json::json!({"volume": 0.2})).contains("needs 'index'"));
+        assert!(rx.try_recv().is_err(), "a refused call sends nothing");
+        app.exec_tool("set_app_stream", &serde_json::json!({"index": 77, "volume": 0.25, "muted": true}));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![StreamCmd::Volume(77, 0.25), StreamCmd::Mute(77, true)]);
+        let streams: serde_json::Value = serde_json::from_str(&app.exec_tool("list_app_streams", &serde_json::json!({}))).unwrap();
+        assert_eq!(streams["streams"][0]["volume"], 0.25, "the next read answers with what was just set");
+        assert_eq!(streams["streams"][0]["muted"], true);
+        app.exec_tool("set_app_stream", &serde_json::json!({"index": 77, "volume": 9.0}));
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![StreamCmd::Volume(77, 1.5)], "volume is held to 150 %");
+        // Both tool tables offer all four (rule 6).
+        let tools = crate::assistant::tools().to_string();
+        for t in ["list_audio_outputs", "set_audio_output", "list_app_streams", "set_app_stream"] {
+            assert!(tools.contains(&format!("\"{t}\"")), "the assistant has {t}");
+            assert!(UI_BRIDGE_TOOLS.contains(&t), "attached MCP agents reach {t}");
         }
     }
 

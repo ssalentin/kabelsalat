@@ -69,9 +69,11 @@ fn spectra(clips: &mut Vec<Clip>) -> anyhow::Result<()> {
     let c = click();
     let s = Spectrum::of(&c, SR);
     let pitch = s.fundamental_hz().unwrap_or(0.0);
-    println!("  metronome click: pitch {pitch:.2} Hz (its tone is 1000 Hz), centroid {:.0} Hz", s.centroid_hz());
-    anyhow::ensure!((pitch - 1000.0).abs() < 1.0, "the metronome click measures {pitch:.2} Hz, not 1000 Hz");
-    clips.push(Clip { file: "click-1khz", listen: "a clean 1 kHz tick, no thump or buzz", samples: stereo(&c) });
+    // The first click of a started metronome is the bar's accent (#87).
+    let tone = super::CLICK_ACCENT_HZ;
+    println!("  metronome click: pitch {pitch:.2} Hz (the bar accent's tone is {tone} Hz), centroid {:.0} Hz", s.centroid_hz());
+    anyhow::ensure!((pitch - tone).abs() < 1.0, "the metronome's first click measures {pitch:.2} Hz, not {tone} Hz");
+    clips.push(Clip { file: "click-accent", listen: "a clean 1.5 kHz tick, no thump or buzz", samples: stereo(&c) });
 
     for (hz, amp) in [(440.0f64, 0.3f32), (3000.0, 0.9)] {
         let out = through(None, sine(hz, amp));

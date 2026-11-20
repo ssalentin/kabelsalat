@@ -144,6 +144,21 @@ impl Probe {
         run
     }
 
+    /// Feed one block and render it into `out` (stereo, one block long);
+    /// the time is `render`'s alone (`engine-bench`).
+    pub fn render_timed(&mut self, out: &mut [f32]) -> std::time::Duration {
+        for f in &mut self.feeds {
+            for _ in 0..self.block {
+                let s = f.signal.next().unwrap_or(0.0);
+                let _ = f.ring.push(s);
+                let _ = f.ring.push(s);
+            }
+        }
+        let t = std::time::Instant::now();
+        self.engine.render(out, 2);
+        t.elapsed()
+    }
+
     /// Render and discard (feeds keep running).
     /// Feed and render one block into `out` and keep nothing: what the
     /// audio thread does, so a test can count its allocations.
@@ -250,7 +265,7 @@ pub(super) fn wire(g: &mut Graph, id: u32, from: NodeId, to: NodeId, port: u8) {
     assert!(g.connect_with_id(id, PortRef { node: from, port: 0 }, PortRef { node: to, port }, PortKind::Audio));
 }
 
-fn audio_in(g: &mut Graph, name: &str) -> NodeId {
+pub(super) fn audio_in(g: &mut Graph, name: &str) -> NodeId {
     g.add_node(NodeKind::AudioIn { device: None, channels: AudioInChannel::Stereo }, name_bytes(name))
 }
 
@@ -502,6 +517,33 @@ mod tests {
                 panic!("{step}: {e}");
             }
         }
+    }
+
+    /// An effect hears every unit wired into it, also more of them than the
+    /// engine's short list of a unit's inputs holds (16): one input through
+    /// 20 unity gains into one more gain, which then carries 20 times what
+    /// one of them does.
+    #[test]
+    fn an_effect_with_twenty_inputs_hears_all_of_them() {
+        let mut g = Graph::default();
+        g.reserve(64, 256);
+        let ain = audio_in(&mut g, "IN");
+        let sum = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("SUM"));
+        let master = g.add_node(NodeKind::MasterOut, name_bytes("MASTER"));
+        wire(&mut g, 1, sum, master, 0);
+        let mut one = sum;
+        for i in 0..20 {
+            one = g.add_node(NodeKind::Dsp(DspKind::Gain), name_bytes("GAIN"));
+            wire(&mut g, 10 + i, ain, one, 0);
+            wire(&mut g, 100 + i, one, sum, 0);
+        }
+        let mut probe = Probe::new(g);
+        probe.feed("noise", ain, noise(5).map(|x| x * 0.1));
+        probe.settle(SETTLE_BLOCKS);
+        let run = probe.run(8, &[Tap::Node(one), Tap::Node(sum)]);
+        let (one, sum) = (analysis::peak(&run.taps[0].1), analysis::peak(&run.taps[1].1));
+        assert!(one > 1e-3, "the gains carry the input: peak {one}");
+        assert!((sum / one - 20.0).abs() < 0.01, "the sum carries {:.3} times one input, expected 20", sum / one);
     }
 
     /// The crackle regression (rules 49, 62, 120): a loud 16-note chord at

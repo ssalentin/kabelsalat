@@ -227,7 +227,11 @@ and never passed off as tested.**
   `audio-out-test` (needs PipeWire with `pactl`, `parec` and `pacat`; loads two
   temporary null sinks, so nothing is heard),
   `state-race-test [seconds] [patch.fxp...]`,
-  `main-controls-test`, `engine-bench` (offline render timing and output hash),
+  `main-controls-test`, `engine-bench [render|session|routing|units]` (offline render timing
+  and output hashes: the demo rack, a full rack of 4 rigs and 20 effects, the
+  same rack with plain gains, every built-in unit and the master meter),
+  `ui-bench [frames] [scene]` (time and vertices per UI frame, headless: rack
+  front and back, mixer and matrix, small and full racks),
   `meter-test`, `target-test` (the master's loudness target on a real phrase),
   `lv2-test`, `lv2-host-test`, `lv2-voice-test`, `lv2-engine-test`,
   `lv2-instrument-test`, `lv2-instrument-engine-test`, `midifx-test`, `lv2-async-test`,
@@ -1546,3 +1550,9 @@ Learned so far (2026-11-15, UI polish pass):
     sessions asked whether to open a PR instead of opening one by default.
     Keep `## Ground rules` and all operational sections at the top of
     `AGENTS.md` (< 20 KB total), with the append-only learned rules last.
+187. **A change to what a CLI self-test asserts runs that self-test:** the
+    time signature (#87) made a started metronome's first click the bar
+    accent (1500 Hz), and `analysis-test`, which CI does not run, still
+    asked for 1000 Hz and failed on `main` before its routing and delay
+    sections. Before a push, `grep` the self-tests for the constant or
+    behaviour you changed and run the ones that name it.

@@ -1,2 +1,0 @@
-### Added
-- **Unsampled Piano in the plugin catalog (#247):** added [Unsampled Piano](https://unsampled.mgth.fr) (`fr.mgth.unsampled-piano`, GPL-3.0-or-later), a physically modelled acoustic grand piano CLAP plugin with felt hammers, coupled stiff strings, modal soundboard, lid/room reflections, sympathetic resonance and full pedal support (prebuilt release on x86-64, built from source on aarch64).

@@ -1,2 +1,0 @@
-### Added
-- **Per-rig stems (#6):** the mixer's rig bus strips get a record-arm button (**R**), and Master out gets **ARM**. One REC press records every armed target at once: the master mix and each armed rig's post-fader sum, each in its own 32-bit float WAV named after the rig, all in one take folder. Pressed while the transport rolls, REC starts and stops on the next bar (press stop twice to stop at once). Stopping the transport keeps the take running, so effect tails are captured. Agents arm targets with `set_record_arm`; `record_status` lists the stems and arms.

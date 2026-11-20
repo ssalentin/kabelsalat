@@ -1,2 +1,0 @@
-### Fixed
-- **Imported Vital patches show up without a restart (#136):** `kabelsalat vital-import` added patches on disk, but a running kabelsalat kept its old sound list until it was restarted. The sound library now notices that Vitalium's patch folders changed and reads them again on the next search or load. The same holds for patches copied in by hand, for Odin 2 soundbanks, and for `kabelsalat mcp`.

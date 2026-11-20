@@ -1,2 +1,0 @@
-### Added
-- **Breath from a wind controller reaches your instruments (#68):** channel aftertouch, how an EWI or another wind controller sends breath, now plays CLAP and LV2 instruments. Wind patches like the Electrowinds Vital bank open with your breath instead of staying silent. Poly aftertouch reaches them too, and follows the split and transpose of the key it presses. `kabelsalat wind-test [patch]` plays a Vital wind patch with a breath swell through the engine.

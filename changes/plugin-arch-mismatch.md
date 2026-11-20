@@ -1,2 +1,0 @@
-### Fixed
-- **Plugins built for another CPU say so (#135):** a CLAP or LV2 plugin built for a different processor (an x86_64 `Vital.clap` on an ARM machine) was reported as "No such file or directory". kabelsalat now reads what the file was built for and says, for example, "Vital.clap is built for x86_64; this machine is aarch64, so it cannot be loaded". The Plugins view names such plugins, LV2 plugins that cannot run here are no longer listed, and a catalog card no longer calls one "Installed".

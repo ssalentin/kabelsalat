@@ -14,8 +14,10 @@
 //! Which rack parameter a role drives is the target's business
 //! ([`target`]); the profile never names a parameter.
 
-use crate::control::{NodeKind, ParamId};
-use crate::matrix::{CcScale, CcTarget};
+use serde_json::{json, Value};
+
+use crate::control::{name_str, Graph, NodeId, NodeKind, ParamId};
+use crate::matrix::{CcScale, CcTarget, SourceId};
 use crate::organ;
 
 const BUILTIN: &[(&str, &str)] = &[("nord-electro-2", include_str!("../instruments/nord-electro-2.csv"))];
@@ -200,6 +202,112 @@ fn split_csv_line(line: &str) -> Vec<String> {
         }
     }
     fields
+}
+
+/// One binding a device's profile holds in the matrix: the device, the node
+/// it drives, and the controller.
+pub type Bound = (SourceId, NodeId, Binding);
+
+/// The profile an agent names: its id or its title, whatever the case.
+/// "none" (or nothing) is "no profile". An unknown name is refused with the
+/// ids that exist.
+pub fn find<'a>(profiles: &'a [Profile], query: &str) -> Result<Option<&'a Profile>, String> {
+    let q = query.trim().to_lowercase();
+    if matches!(q.as_str(), "" | "none" | "no profile" | "off") {
+        return Ok(None);
+    }
+    profiles.iter().find(|p| p.id.to_lowercase() == q || p.title().to_lowercase() == q).map(Some).ok_or_else(|| {
+        let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+        format!("no instrument profile '{}': pass one of {ids:?}, or \"none\"", query.trim())
+    })
+}
+
+/// Every binding the devices' profiles ask for on this rack: one per device,
+/// node the device plays (`plays`), and controller.
+pub fn wanted<'a>(
+    devices: impl IntoIterator<Item = (u32, &'a Profile)>,
+    graph: &Graph,
+    plays: impl Fn(SourceId, NodeId) -> bool,
+) -> Vec<Bound> {
+    let mut wanted = Vec::new();
+    for (d, profile) in devices {
+        let src = SourceId::Hardware(d);
+        for node in &graph.nodes {
+            let bindings = profile.bindings(&node.kind);
+            if bindings.is_empty() || !plays(src, node.id) {
+                continue;
+            }
+            wanted.extend(bindings.into_iter().map(|b| (src, node.id, b)));
+        }
+    }
+    wanted
+}
+
+/// The matrix edits that bring it from what profiles bound before (`bound`)
+/// to what they ask for now (`wanted`): `(device, node, binding, on)`, on =
+/// bind, off = take back. A controller the user rebound by hand since
+/// (`holds` says no) is left alone, and a binding already in place is not
+/// sent again.
+pub fn changes(bound: &[Bound], wanted: &[Bound], holds: impl Fn(&Bound) -> bool) -> Vec<(Bound, bool)> {
+    let stale = bound.iter().filter(|x| !wanted.contains(x) && holds(x)).map(|x| (*x, false));
+    let missing = wanted.iter().filter(|x| !holds(x)).map(|x| (*x, true));
+    stale.chain(missing).collect()
+}
+
+/// What the agent tools list: every profile, with the rack nodes it would
+/// drive and which controller lands on which parameter there.
+pub fn listing(profiles: &[Profile], graph: &Graph) -> Value {
+    let rows: Vec<Value> = profiles
+        .iter()
+        .map(|p| {
+            let drives: Vec<Value> = graph
+                .nodes
+                .iter()
+                .filter_map(|n| {
+                    let b = p.bindings(&n.kind);
+                    (!b.is_empty()).then(|| {
+                        json!({
+                            "node": n.id, "name": name_str(&n.name), "rig": n.rig,
+                            "controls": b.iter().map(|b| json!({
+                                "cc": b.cc,
+                                "control": p.control(b.cc).map_or("", |c| c.name.as_str()),
+                                "param": b.param,
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                })
+                .collect();
+            json!({
+                "id": p.id, "name": p.title(),
+                "controllers": p.controls.len(),
+                "with_a_role": p.controls.iter().filter(|c| c.role.is_some()).count(),
+                "drives": drives,
+            })
+        })
+        .collect();
+    Value::Array(rows)
+}
+
+/// What `set_device_instrument` answers: the device's profile now, and what
+/// it drives of `bound` (the bindings in place after the change).
+pub fn device_report(d: u32, name: &str, profile: Option<&Profile>, bound: &[Bound], graph: &Graph) -> Value {
+    let src = SourceId::Hardware(d);
+    let mut drives: Vec<Value> = Vec::new();
+    for node in &graph.nodes {
+        let controls = bound.iter().filter(|(s, n, _)| *s == src && *n == node.id).count();
+        if controls > 0 {
+            drives.push(json!({"node": node.id, "name": name_str(&node.name), "controls": controls}));
+        }
+    }
+    let mut v = json!({
+        "device": d, "source": format!("hw:{d}"), "name": name,
+        "profile": profile.map(|p| p.id.as_str()),
+        "drives": drives,
+    });
+    if profile.is_some() && v["drives"].as_array().is_some_and(|a| a.is_empty()) {
+        v["note"] = json!("nothing in the rack for this profile to drive yet (it drives the organ, setBfree, on a rig this device plays); the bindings appear when there is");
+    }
+    v
 }
 
 pub fn builtin() -> Vec<Profile> {

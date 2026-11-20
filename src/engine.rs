@@ -1282,7 +1282,7 @@ pub struct GraphEngine {
     #[cfg(test)]
     note_log: Vec<(NodeId, u8, bool)>,
     #[cfg(test)]
-    cc_log: Vec<(NodeId, ParamId, f64)>,
+    pub(crate) cc_log: Vec<(NodeId, ParamId, f64)>,
     #[cfg(test)]
     cc_passthrough_log: Vec<(NodeId, u8, u8)>,
     // Multi-rig state (LoadRigs): rig names/devices + the UI-selected rig.

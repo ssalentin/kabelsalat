@@ -8,6 +8,13 @@ releases may still change behaviour and session files.
 ## [Unreleased]
 
 ### Added
+- **MIDI-controlled parameters appear on the interface automatically:** binding
+  a MIDI CC (via MIDI learn, the MIDI Matrix, an agent/MCP tool, or a loaded
+  session) to a CLAP or LV2 parameter that is not currently shown on the unit's
+  face now adds it as a face knob (with its `CC n` badge, live value tracking,
+  and right-click MIDI menu), yielding an unbound main control when needed and
+  prioritizing MIDI-controlled knobs on narrow faces. Clearing the binding
+  removes the auto-added knob and restores the unit's main controls.
 - **Controller range on a MIDI-mapped knob:** right-click a bound knob and
   set MIN / MAX under *Controller range*. The controller's whole travel then
   spans only that stretch, so an expression pedal on organ drive can be held

@@ -153,7 +153,7 @@ impl DemoApp {
     fn console_mains(&self, target: Option<usize>, n: usize) -> Vec<(String, f32)> {
         target.map(|t| {
             self.units[t].knobs.iter()
-                .filter(|k| matches!(k.source, KnobSource::Main(_)))
+                .filter(|k| k.source != KnobSource::BuiltIn)
                 .take(n)
                 .map(|k| (k.label.clone(), k.display_value))
                 .collect()
@@ -162,7 +162,7 @@ impl DemoApp {
 
     fn console_set_main(&mut self, target: Option<usize>, label: &str, v: f32) {
         let Some(t) = target else { return };
-        if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && matches!(k.source, KnobSource::Main(_))) {
+        if let Some(k) = self.units[t].knobs.iter_mut().find(|k| k.label == label && k.source != KnobSource::BuiltIn) {
             k.set_immediate(v);
         }
     }

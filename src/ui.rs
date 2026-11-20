@@ -7518,6 +7518,7 @@ impl DemoApp {
                                 crate::matrix::CcTarget::Knob => self.knob_param_label(node, m.param),
                                 crate::matrix::CcTarget::PluginParam => choices.iter().find(|(id, _)| *id == m.param).map(|(_, n)| n.clone()),
                                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param),
+                                crate::matrix::CcTarget::ChannelPressure => Some("Channel pressure (breath)".to_string()),
                             };
                             serde_json::json!({"cc": m.cc, "param": m.param, "target": m.target.as_str(), "name": name, "range": m.scale.range_json()})
                         }).collect();
@@ -9113,7 +9114,8 @@ impl DemoApp {
                 .filter_map(|n| self.units.iter().find(|u| u.node_id == *n))
                 .map(|u| sentence_case(&u.name))
                 .collect();
-            let text = if names.is_empty() { "nothing in the rack to drive".to_string() } else { format!("{count} controls → {}", names.join(", ")) };
+            let noun = if count == 1 { "control" } else { "controls" };
+            let text = if names.is_empty() { "nothing in the rack to drive".to_string() } else { format!("{count} {noun} → {}", names.join(", ")) };
             ui.add(egui::Label::new(egui::RichText::new(text).size(11.5).color(theme::INK_2)).wrap_mode(egui::TextWrapMode::Extend));
         }
         pick
@@ -9827,10 +9829,12 @@ impl DemoApp {
     /// unit, plugin and knob targets reach the same engine param
     /// (`apply_engine_param`), so the agent's `param: 0` is the learned CUTOFF.
     fn binds_knob(&self, node_id: u32, m: &crate::matrix::CcMapping, param: u32, target: crate::matrix::CcTarget) -> bool {
-        // A mixer control shares its node with the unit's knobs and params,
-        // and its param numbers with them: only its own target is the same
-        // binding.
-        if m.target == CcTarget::Mix || target == CcTarget::Mix {
+        // A mixer control or channel-pressure binding shares its node with
+        // the unit's knobs and params, and its param numbers with them: only
+        // its own target is the same binding.
+        if matches!(m.target, CcTarget::Mix | CcTarget::ChannelPressure)
+            || matches!(target, CcTarget::Mix | CcTarget::ChannelPressure)
+        {
             return m.target == target && m.param == param;
         }
         let is_clap = self.units.iter().any(|u| u.node_id == node_id && matches!(u.node_kind, UnitKind::Clap));
@@ -9886,6 +9890,9 @@ impl DemoApp {
             }
             for m in &edit.cc_map {
                 if m.cc != cc { continue; }
+                if m.target == CcTarget::ChannelPressure {
+                    continue;
+                }
                 if m.target == CcTarget::Mix {
                     if let Some(ctl) = MixControl::from_param(m.param) {
                         mixer.push((*dest, ctl, m.scale.norm(val)));
@@ -10009,6 +10016,7 @@ impl DemoApp {
             Err(e) => return format!("set_device_instrument: {e}"),
         };
         self.pick_device_profile(d, &id);
+        self.adopt_hw_devices();
         self.sync_instrument_maps();
         let mut touched: Vec<u32> = self.instrument_bound.iter().filter(|(s, _, _)| *s == SourceId::Hardware(d)).map(|(_, n, _)| *n).collect();
         touched.dedup();
@@ -10162,6 +10170,8 @@ impl DemoApp {
         theme::section_label(ui, "CC Maps");
         let cc_hint = if edit.cc_map.is_empty() {
             "empty = all CCs pass through"
+        } else if edit.cc_map.iter().all(|m| matches!(m.target, CcTarget::ChannelPressure)) {
+            "breath → channel pressure · other CCs pass through"
         } else {
             "whitelist active · unmapped CCs filtered"
         };
@@ -10179,6 +10189,7 @@ impl DemoApp {
                     .unwrap_or_else(|| format!("Param {}", m.param)),
                 crate::matrix::CcTarget::Mix => Self::mix_param_label(m.param)
                     .unwrap_or_else(|| format!("Mixer {}", m.param)),
+                crate::matrix::CcTarget::ChannelPressure => "Channel pressure (breath)".to_string(),
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("CC {:>3}", m.cc)).size(12.0).color(theme::MIDI_BLUE));
@@ -24155,6 +24166,7 @@ impl DemoApp {
         for main in &mut self._surge_main {
             main.pump();
         }
+        self.adopt_hw_devices();
         self.sync_instrument_maps();
         self.poll_plugin_scan();
         self.poll_install();
@@ -30980,6 +30992,73 @@ mod ui_polish_agent_tests {
         super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
         let cc_map: Vec<(u8, u32)> = app.rule_edits.get(&(nord, organ)).map_or(vec![], |e| e.cc_map.iter().map(|m| (m.cc, m.param)).collect());
         assert_eq!(cc_map, vec![(111, crate::organ::P_REVERB)], "the profile's bindings are gone, the hand-made one stays");
+    }
+
+    #[test]
+    fn ewi_5000_auto_matches_usb_port_and_ewi_4000s_picks_on_din_interface() {
+        let mut app = DemoApp::new_with_sink(None);
+        let (bus, mut drain) = command_bus();
+        app.bus = Some(Arc::new(Mutex::new(bus)));
+        *app.hw_midi.devices.lock().unwrap() = vec![
+            ("EWI5000:EWI5000 MIDI 1 24:0".into(), true),
+            ("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0".into(), true),
+        ];
+        app.hw_midi.rev.fetch_add(1, Ordering::Release);
+        let surge = app.units.iter().find(|u| matches!(u.node_kind, UnitKind::Clap)).unwrap().node_id;
+
+        let ctx = egui::Context::default();
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+
+        // EWI 5000 is recognised from its USB port name without picking.
+        assert_eq!(app.device_profile(0).map(|p| p.id.as_str()), Some("akai-ewi-5000"));
+        assert!(app.device_profile(1).is_none(), "DIN interface needs an explicit pick");
+
+        let mut bound_5k = false;
+        drain.drain(|c| {
+            if matches!(
+                c,
+                Command::MatrixCcMap {
+                    source: SourceId::Hardware(0),
+                    dest,
+                    cc: 2,
+                    param: Some(0),
+                    target: crate::matrix::CcTarget::ChannelPressure,
+                    ..
+                } if dest == surge
+            ) {
+                bound_5k = true;
+            }
+        });
+        assert!(bound_5k, "EWI 5000 auto-binds CC 2 → ChannelPressure on Surge");
+
+        // Pick EWI 4000s on the DIN interface (device 1).
+        app.pick_device_profile(1, "akai-ewi-4000s");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        let mut bound_4k = false;
+        drain.drain(|c| {
+            if matches!(
+                c,
+                Command::MatrixCcMap {
+                    source: SourceId::Hardware(1),
+                    dest,
+                    cc: 2,
+                    param: Some(0),
+                    target: crate::matrix::CcTarget::ChannelPressure,
+                    ..
+                } if dest == surge
+            ) {
+                bound_4k = true;
+            }
+        });
+        assert!(bound_4k, "EWI 4000s binds CC 2 → ChannelPressure on Surge");
+
+        // Unpicking EWI 4000s removes its binding cleanly.
+        app.pick_device_profile(1, "");
+        super::face_layout_tests::frame_at(&mut app, &ctx, Vec2::new(1600.0, 1000.0));
+        assert!(
+            app.rule_edits.get(&(SourceId::Hardware(1), surge)).map_or(true, |e| e.cc_map.is_empty()),
+            "unpicking EWI 4000s clears its breath binding"
+        );
     }
 
     /// #56: an agent lists the profiles and picks one per port, and that is

@@ -4197,6 +4197,39 @@ impl GraphEngine {
                         .node(dest)
                         .map_or(false, |n| matches!(n.kind, NodeKind::Clap { .. }));
                     let norm = mapping.map_or(m.data[1] as f64 / 127.0, |b| b.scale.norm(m.data[1]));
+                    if let Some(CcMapping { target: CcTarget::ChannelPressure, scale, .. }) = mapping {
+                        let pressure = (scale.norm(m.data[1]) * 127.0).round().clamp(0.0, 127.0) as u8;
+                        let has_midi = self.has_midi_cable(dest);
+                        if let Some(s) = self.voices.iter_mut().find(|s| s.node == dest) {
+                            if has_midi && source_accepted(s, source) {
+                                s.voice.send_cc_rt(m.channel, m.data[0], m.data[1]);
+                                let (wire, _) = MidiMsg::channel_aftertouch(m.channel, pressure).wire();
+                                s.voice.send_midi_rt(wire);
+                                #[cfg(test)]
+                                {
+                                    self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                                    self.cc_passthrough_log.push((dest, pressure, 0));
+                                }
+                            }
+                        } else if is_clap_node {
+                            #[cfg(test)]
+                            if has_midi {
+                                self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                                self.cc_passthrough_log.push((dest, pressure, 0));
+                            }
+                        } else if let Some(s) = self.lv2.iter_mut().find(|s| s.node == dest) {
+                            if s.plugin.is_instrument() && has_midi {
+                                s.plugin.control_change(m.data[0], m.data[1]);
+                                s.plugin.channel_pressure(pressure);
+                                #[cfg(test)]
+                                {
+                                    self.cc_passthrough_log.push((dest, m.data[0], m.data[1]));
+                                    self.cc_passthrough_log.push((dest, pressure, 0));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(CcMapping { param: pid, target: CcTarget::Mix, .. }) = mapping {
                         if self.apply_mix_cc(dest, pid, norm) {
                             #[cfg(test)]
@@ -7135,6 +7168,51 @@ mod tests {
         bus.send(Command::NoteOn { note: 62, velocity: 0.8, source: dev, channel: 0 });
         engine.render(&mut buf, 2);
         assert!(engine.note_log.iter().any(|&(d, n, on)| d == 1 && n == 62 && on), "{:?}", engine.note_log);
+    }
+
+    /// An EWI profile binds CC 2 (breath) to `CcTarget::ChannelPressure`:
+    /// CC 2 reaches the synth both as CC 2 and as channel aftertouch, while
+    /// glide (CC 5), sustain (CC 64), and portamento switch (CC 65) keep
+    /// passing straight through.
+    #[test]
+    fn ewi_breath_binding_forwards_channel_pressure_and_keeps_other_ccs() {
+        let (mut bus, drain) = command_bus();
+        let mut engine = super::GraphEngine::new(crate::control::Graph::default(), drain, 48000.0, vec![]);
+        bus.send(Command::LoadGraph { graph: crate::control::Graph::demo_patch() });
+        let mut buf = vec![0.0f32; 64 * 2];
+        engine.render(&mut buf, 2);
+        let ewi = SourceId::Hardware(0);
+        bus.send(Command::MatrixCcMap {
+            source: ewi,
+            dest: 1,
+            cc: 2,
+            param: Some(0),
+            target: CcTarget::ChannelPressure,
+            scale: Default::default(),
+        });
+        engine.render(&mut buf, 2);
+        engine.cc_passthrough_log.clear();
+        bus.send(Command::Cc { source: ewi, channel: 0, cc: 2, value: 100 });
+        bus.send(Command::Cc { source: ewi, channel: 0, cc: 5, value: 40 });
+        bus.send(Command::Cc { source: ewi, channel: 0, cc: 64, value: 127 });
+        bus.send(Command::Cc { source: ewi, channel: 0, cc: 65, value: 127 });
+        engine.render(&mut buf, 2);
+        let for_node = |n| engine.cc_passthrough_log.iter().copied().filter(|&(d, _, _)| d == n).collect::<Vec<_>>();
+        assert_eq!(
+            for_node(1),
+            vec![
+                (1, 2, 100),   // CC 2 breath itself
+                (1, 100, 0),   // Channel pressure from CC 2
+                (1, 5, 40),    // Glide / portamento time
+                (1, 64, 127),  // Hold / sustain
+                (1, 65, 127),  // Glide switch / portamento on
+            ]
+        );
+        assert_eq!(
+            for_node(4),
+            vec![(4, 2, 100), (4, 5, 40), (4, 64, 127), (4, 65, 127)],
+            "unbound synth receives raw CCs only, no synthetic channel pressure"
+        );
     }
 
     /// A stepped binding (an instrument's switch) reaches the organ as the

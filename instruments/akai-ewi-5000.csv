@@ -1,0 +1,19 @@
+manufacturer,device,section,parameter_name,parameter_description,cc_msb,cc_lsb,cc_min_value,cc_max_value,cc_default_value,nrpn_msb,nrpn_lsb,nrpn_min_value,nrpn_max_value,nrpn_default_value,orientation,notes,usage,role
+Akai,EWI 5000,Program,Bank select MSB,,0,32,0,127,,,,,,,0-based,,,
+Akai,EWI 5000,Bite sensor,Modulation,,1,,0,127,,,,,,,0-based,Assignable bite CC (bt),,
+Akai,EWI 5000,Mouthpiece,Breath sensor MSB,,2,34,0,127,,,,,,,0-based,Default breath controller output (bS); Hi-Res MSB with CC 34,,breath
+Akai,EWI 5000,Glide plate,Portamento time,,5,,0,127,,,,,,,0-based,Default glide plate output in Pt mode,,glide
+Akai,EWI 5000,Mouthpiece,Channel volume,,7,,0,127,,,,,,,0-based,Alternate breath output,,
+Akai,EWI 5000,Mouthpiece,Expression MSB,,11,43,0,127,,,,,,,0-based,Alternate breath output; Hi-Res MSB with CC 43,,
+Akai,EWI 5000,Program,Bank select LSB,,32,,0,127,,,,,,,0-based,,,
+Akai,EWI 5000,Mouthpiece,Breath sensor LSB,,34,,0,127,,,,,,,0-based,Hi-Res breath LSB paired with CC 2,,
+Akai,EWI 5000,Mouthpiece,Expression LSB,,43,,0,127,,,,,,,0-based,Hi-Res expression LSB paired with CC 11,,
+Akai,EWI 5000,Hold button,Sustain,,64,,0,127,,,,,,,0-based,Hold button in Sustain mode,0~63: Off; 64~127: On,hold
+Akai,EWI 5000,Glide plate,Portamento on/off,,65,,0,127,,,,,,,0-based,Glide plate in Pedal Switch mode,0~63: Off; 64~127: On,glide.switch
+Akai,EWI 5000,Hold button,Sostenuto,,66,,0,127,,,,,,,0-based,Hold button in Sostenuto mode,0~63: Off; 64~127: On,sostenuto
+Akai,EWI 5000,Performance,Filter resonance,,71,,0,127,,,,,,,0-based,Assignable filter resonance,,
+Akai,EWI 5000,Performance,Filter cutoff,,74,,0,127,,,,,,,0-based,Assignable filter cutoff / brightness,,
+Akai,EWI 5000,Glide plate,Legato time,,104,,0,127,,,,,,,0-based,Glide plate in Legato Time mode (Lt),,legato.time
+Akai,EWI 5000,Channel mode,All sound off,,120,,0,0,,,,,,,0-based,,,
+Akai,EWI 5000,Channel mode,Reset all controllers,,121,,0,0,,,,,,,0-based,,,
+Akai,EWI 5000,Channel mode,All notes off,,123,,0,0,,,,,,,0-based,,,

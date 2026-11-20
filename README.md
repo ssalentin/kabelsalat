@@ -285,9 +285,12 @@ again or clear it. The bindings are saved with the session and stay with their
 rig when you add or delete rigs.
 
 A whole hardware instrument maps in one step with an instrument profile. Pick
-it for the instrument's port in the MIDI matrix (the Nord Electro 2 is built
-in; more are MIDI Guide CSV files in `~/.config/kabelsalat/instruments/`) and
-its drawbars, rotary switch, percussion and drive move the organ. The
+it for the instrument's port in the MIDI matrix (Nord Electro 2, Akai EWI 4000s
+and Akai EWI 5000 are built in; more are MIDI Guide CSV files in
+`~/.config/kabelsalat/instruments/`): the Nord's drawbars, rotary switch,
+percussion and drive move the organ, while an EWI forwards CC 2 breath as
+channel pressure alongside CC 2 so both breath-CC and aftertouch wind patches
+respond (and the EWI 5000 is matched automatically by its USB port name). The
 assistant and MCP agents do the same with `list_instrument_profiles` and
 `set_device_instrument`: "the Nord is on the second port".
 

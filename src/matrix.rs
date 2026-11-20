@@ -196,6 +196,12 @@ pub enum CcTarget {
     /// (`SetRigMix`), any other node for its own source strip (`SetStripMix`).
     #[serde(alias = "mix")]
     Mix,
+    /// Forward a controller (such as CC 2 breath from an EWI) as channel
+    /// aftertouch (0xD0) alongside the CC itself. Unlike parameter bindings,
+    /// a `ChannelPressure` entry does not turn `cc_map` into a whitelist, so
+    /// other performance CCs (glide, sustain, modulation) keep passing through.
+    #[serde(alias = "pressure", alias = "aftertouch", alias = "channel_pressure")]
+    ChannelPressure,
 }
 
 impl CcTarget {
@@ -204,6 +210,7 @@ impl CcTarget {
             CcTarget::PluginParam => "plugin",
             CcTarget::Knob => "knob",
             CcTarget::Mix => "mix",
+            CcTarget::ChannelPressure => "channel_pressure",
         }
     }
 
@@ -213,7 +220,8 @@ impl CcTarget {
             None | Some("plugin") | Some("plugin_param") | Some("pluginparam") => Ok(CcTarget::PluginParam),
             Some("knob") => Ok(CcTarget::Knob),
             Some("mix") => Ok(CcTarget::Mix),
-            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob' or 'mix')")),
+            Some("channel_pressure") | Some("pressure") | Some("aftertouch") => Ok(CcTarget::ChannelPressure),
+            Some(other) => Err(format!("unknown target '{other}' (expected 'plugin', 'knob', 'mix' or 'channel_pressure')")),
         }
     }
 }
@@ -619,7 +627,10 @@ impl Rule {
                 Some(out)
             }
             CONTROL_CHANGE => {
-                if !self.cc_map.is_empty() && self.param_for_cc(ev.data[0]).is_none() {
+                // Parameter bindings whitelist CCs; ChannelPressure (breath)
+                // leaves other performance CCs (glide, sustain, mod) passing.
+                let whitelists = self.cc_map.iter().any(|m| !matches!(m.target, CcTarget::ChannelPressure));
+                if whitelists && self.param_for_cc(ev.data[0]).is_none() {
                     return None;
                 }
                 Some(ev)
@@ -966,6 +977,19 @@ mod tests {
         m.add_rule(Rule::new(SourceId::Keys, SURGE_A).map_cc(1, 5));
         assert!(m.route(SourceId::Keys, MidiMsg::cc(0, 2, 90)).is_empty());
         assert!(m.route(SourceId::Keys, MidiMsg::cc(0, 64, 127)).is_empty());
+    }
+
+    #[test]
+    fn cc_channel_pressure_passes_other_performance_ccs() {
+        let mut m = Matrix::new();
+        m.add_rule(Rule::new(SourceId::Hardware(0), SURGE_A).map_cc_target(2, 0, CcTarget::ChannelPressure));
+        for cc in [1u8, 2, 5, 11, 64, 65, 66, 104] {
+            let ev = MidiMsg::cc(0, cc, 80);
+            assert_eq!(m.route(SourceId::Hardware(0), ev), vec![(SURGE_A, ev)], "CC {cc} must pass");
+        }
+        assert_eq!(CcTarget::parse(Some("channel_pressure")), Ok(CcTarget::ChannelPressure));
+        assert_eq!(CcTarget::parse(Some("aftertouch")), Ok(CcTarget::ChannelPressure));
+        assert_eq!(CcTarget::ChannelPressure.as_str(), "channel_pressure");
     }
 
     #[test]

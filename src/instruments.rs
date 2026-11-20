@@ -20,7 +20,11 @@ use crate::control::{name_str, Graph, NodeId, NodeKind, ParamId};
 use crate::matrix::{CcScale, CcTarget, SourceId};
 use crate::organ;
 
-const BUILTIN: &[(&str, &str)] = &[("nord-electro-2", include_str!("../instruments/nord-electro-2.csv"))];
+const BUILTIN: &[(&str, &str)] = &[
+    ("nord-electro-2", include_str!("../instruments/nord-electro-2.csv")),
+    ("akai-ewi-4000s", include_str!("../instruments/akai-ewi-4000s.csv")),
+    ("akai-ewi-5000", include_str!("../instruments/akai-ewi-5000.csv")),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Manual {
@@ -41,6 +45,18 @@ pub enum Role {
     Drive,
     /// Reverb amount.
     Reverb,
+    /// Wind controller breath sensor (default CC 2).
+    Breath,
+    /// Wind controller glide / portamento time (default CC 5).
+    Glide,
+    /// Wind controller glide / portamento on/off switch (default CC 65).
+    GlideSwitch,
+    /// Wind controller legato time (EWI 5000 `Lt` mode, CC 104).
+    LegatoTime,
+    /// Sustain / hold (CC 64).
+    Hold,
+    /// Sostenuto (CC 66).
+    Sostenuto,
 }
 
 impl Role {
@@ -55,6 +71,12 @@ impl Role {
             "percussion" => Some(Role::Percussion),
             "drive" => Some(Role::Drive),
             "reverb" => Some(Role::Reverb),
+            "breath" => Some(Role::Breath),
+            "glide" => Some(Role::Glide),
+            "glide.switch" => Some(Role::GlideSwitch),
+            "legato.time" => Some(Role::LegatoTime),
+            "hold" => Some(Role::Hold),
+            "sostenuto" => Some(Role::Sostenuto),
             _ => {
                 if let Some(n) = s.strip_prefix("drawbar.upper.") {
                     drawbar(Manual::Upper, n)
@@ -99,15 +121,27 @@ impl Profile {
         format!("{} {}", self.manufacturer, self.device)
     }
 
-    /// Does an ALSA port name belong to this instrument? Both the maker and
-    /// the model must appear ("Nord Stage 3 MIDI 1"); an interface between
-    /// instrument and computer (a 5-pin DIN cable into a USB adapter) hides
-    /// the instrument, and the user picks the profile instead.
+    /// Does an ALSA port name belong to this instrument? Normally both the
+    /// maker and the model must appear ("Nord Stage 3 MIDI 1"); an interface
+    /// between instrument and computer (a 5-pin DIN cable into a USB adapter)
+    /// hides the instrument, and the user picks the profile instead.
+    /// Spaces and punctuation are ignored so USB descriptors like
+    /// `EWI5000:EWI5000 MIDI 1` (which omit the maker name and space) match
+    /// `Akai EWI 5000`.
     pub fn matches_port(&self, port: &str) -> bool {
-        let port = port.to_lowercase();
-        !self.device.is_empty()
-            && port.contains(&self.manufacturer.to_lowercase())
-            && port.contains(&self.device.to_lowercase())
+        let norm = |s: &str| {
+            s.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        };
+        let port = norm(port);
+        let maker = norm(&self.manufacturer);
+        let dev = norm(&self.device);
+        if dev.is_empty() {
+            return false;
+        }
+        (port.contains(&maker) && port.contains(&dev)) || (dev.starts_with("ewi") && port.contains(&dev))
     }
 
     /// Every binding this profile gives a node of `kind`, one per CC.
@@ -129,20 +163,40 @@ impl Profile {
 /// The parameter a role drives on a node of `kind`, and how the instrument's
 /// control lands on it. None = this node has nothing for the role.
 fn target(kind: &NodeKind, role: Role) -> Option<(ParamId, CcTarget, CcScale)> {
-    if !organ::is_organ(kind) {
-        return None;
-    }
-    let knob = |param, scale| Some((param, CcTarget::Knob, scale));
     match role {
-        // The organ face plays the upper manual; it has no lower drawbars.
-        Role::Drawbar { manual: Manual::Upper, bar } => knob(organ::drawbar_param(bar), CcScale::stepped(9, 0, 127)),
-        Role::Drawbar { manual: Manual::Lower, .. } => None,
-        // LESLIE steps STOP / SLOW / FAST: the switch lands on SLOW or FAST.
-        Role::RotarySpeed => knob(organ::P_LESLIE, CcScale::stepped(2, 64, 127)),
-        // PERC steps OFF / ON / SOFT: the switch lands on OFF or ON.
-        Role::Percussion => knob(organ::P_PERC, CcScale::stepped(2, 0, 64)),
-        Role::Drive => knob(organ::P_DRIVE, CcScale::IDENTITY),
-        Role::Reverb => knob(organ::P_REVERB, CcScale::IDENTITY),
+        // Wind breath (CC 2) is forwarded as channel pressure alongside CC 2
+        // on synths (so both Vitalium-style aftertouch patches and Surge/Dexed/
+        // Starbreath CC 2 patches respond), without hijacking organs.
+        Role::Breath => match kind {
+            NodeKind::Clap { plugin_id } if plugin_id.as_str() != crate::aeolus::AEOLUS_ID => {
+                Some((0, CcTarget::ChannelPressure, CcScale::IDENTITY))
+            }
+            NodeKind::Lv2 { .. } if !organ::is_organ(kind) => {
+                Some((0, CcTarget::ChannelPressure, CcScale::IDENTITY))
+            }
+            _ => None,
+        },
+        // Glide, hold, sostenuto and legato time pass straight through as
+        // standard MIDI CCs rather than binding a rack knob.
+        Role::Glide | Role::GlideSwitch | Role::LegatoTime | Role::Hold | Role::Sostenuto => None,
+        _ => {
+            if !organ::is_organ(kind) {
+                return None;
+            }
+            let knob = |param, scale| Some((param, CcTarget::Knob, scale));
+            match role {
+                // The organ face plays the upper manual; it has no lower drawbars.
+                Role::Drawbar { manual: Manual::Upper, bar } => knob(organ::drawbar_param(bar), CcScale::stepped(9, 0, 127)),
+                Role::Drawbar { manual: Manual::Lower, .. } => None,
+                // LESLIE steps STOP / SLOW / FAST: the switch lands on SLOW or FAST.
+                Role::RotarySpeed => knob(organ::P_LESLIE, CcScale::stepped(2, 64, 127)),
+                // PERC steps OFF / ON / SOFT: the switch lands on OFF or ON.
+                Role::Percussion => knob(organ::P_PERC, CcScale::stepped(2, 0, 64)),
+                Role::Drive => knob(organ::P_DRIVE, CcScale::IDENTITY),
+                Role::Reverb => knob(organ::P_REVERB, CcScale::IDENTITY),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -305,7 +359,7 @@ pub fn device_report(d: u32, name: &str, profile: Option<&Profile>, bound: &[Bou
         "drives": drives,
     });
     if profile.is_some() && v["drives"].as_array().is_some_and(|a| a.is_empty()) {
-        v["note"] = json!("nothing in the rack for this profile to drive yet (it drives the organ, setBfree, on a rig this device plays); the bindings appear when there is");
+        v["note"] = json!("nothing in the rack for this profile to drive yet (add a matching instrument on a rig this device plays); the bindings appear when there is");
     }
     v
 }
@@ -420,5 +474,45 @@ mod tests {
         assert!(parse("x", typo).unwrap_err().contains("unknown role"));
         let twice = "manufacturer,device,parameter_name,cc_msb\nNord,X,A,16\nNord,X,B,16\n";
         assert!(parse("x", twice).unwrap_err().contains("twice"));
+    }
+
+    #[test]
+    fn ewi_4000s_and_5000_profiles_parse_bind_breath_and_match_usb_port() {
+        let profiles = builtin();
+        let ewi4k = profiles.iter().find(|p| p.id == "akai-ewi-4000s").expect("ewi 4000s built-in");
+        let ewi5k = profiles.iter().find(|p| p.id == "akai-ewi-5000").expect("ewi 5000 built-in");
+
+        assert_eq!(ewi4k.title(), "Akai EWI 4000s");
+        assert_eq!(ewi5k.title(), "Akai EWI 5000");
+        assert_eq!(ewi4k.control(2).unwrap().role, Some(Role::Breath));
+        assert_eq!(ewi4k.control(5).unwrap().role, Some(Role::Glide));
+        assert_eq!(ewi4k.control(64).unwrap().role, Some(Role::Hold));
+        assert_eq!(ewi4k.control(65).unwrap().role, Some(Role::GlideSwitch));
+        assert_eq!(ewi4k.control(66).unwrap().role, Some(Role::Sostenuto));
+        assert!(ewi4k.control(104).is_none(), "Legato time CC 104 is EWI 5000 specific");
+
+        assert_eq!(ewi5k.control(2).unwrap().role, Some(Role::Breath));
+        assert_eq!(ewi5k.control(34).unwrap().name, "Breath sensor LSB");
+        assert_eq!(ewi5k.control(43).unwrap().name, "Expression LSB");
+        assert_eq!(ewi5k.control(104).unwrap().role, Some(Role::LegatoTime));
+
+        // Both EWIs bind CC 2 breath → ChannelPressure on CLAP & LV2 synths, not on organs.
+        let surge = NodeKind::Clap { plugin_id: crate::control::ClapId::new("org.surge-synth-team.surge-xt") };
+        let vital = NodeKind::Lv2 { uri: crate::control::Lv2Uri::new("https://vital.audio") };
+        let aeolus = NodeKind::Clap { plugin_id: crate::control::ClapId::new(crate::aeolus::AEOLUS_ID) };
+        let expected = vec![Binding { cc: 2, param: 0, target: CcTarget::ChannelPressure, scale: CcScale::IDENTITY }];
+        for p in [ewi4k, ewi5k] {
+            assert_eq!(p.bindings(&surge), expected, "{} on CLAP synth", p.id);
+            assert_eq!(p.bindings(&vital), expected, "{} on LV2 synth", p.id);
+            assert!(p.bindings(&organ_kind()).is_empty(), "{} skips setBfree organ", p.id);
+            assert!(p.bindings(&aeolus).is_empty(), "{} skips Aeolus pipe organ", p.id);
+        }
+
+        // EWI 5000 USB ALSA port auto-matches even without "Akai" or space.
+        assert!(ewi5k.matches_port("EWI5000:EWI5000 MIDI 1 24:0"));
+        assert!(ewi5k.matches_port("Akai EWI 5000:Akai EWI 5000 MIDI 1 24:0"));
+        assert!(!ewi4k.matches_port("EWI5000:EWI5000 MIDI 1 24:0"));
+        assert!(!ewi4k.matches_port("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0"));
+        assert!(!ewi5k.matches_port("ESI MIDIMATE eX:ESI MIDIMATE eX MIDI 1 28:0"));
     }
 }

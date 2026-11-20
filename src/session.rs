@@ -133,6 +133,8 @@ pub struct Session {
     /// `params` (rule 44). A synth without a row listens to the keyboard and
     /// all hardware, which is also what an older file means.
     midi_sources: Vec<MidiSources>,
+    /// The gig's setlist (#204): ordered songs and parts over the loaded rigs.
+    pub setlist: crate::setlist::Setlist,
 }
 
 /// One CLAP synth's input selection (#124): the keyboard switch, the
@@ -215,11 +217,12 @@ impl Session {
             keyboard_mode: None,
             time_sig: None,
             midi_sources: Vec::new(),
+            setlist: crate::setlist::Setlist::default(),
         }
     }
 
     /// True when both hold the same patch, knobs, plugin states, routes, rig
-    /// names and mixer strips; the session name is not compared.
+    /// names, mixer strips, and setlist; the session name is not compared.
     pub fn same_content(&self, other: &Session) -> bool {
         self.params == other.params
             && self.states == other.states
@@ -235,6 +238,7 @@ impl Session {
             && self.keyboard_mode == other.keyboard_mode
             && self.time_sig == other.time_sig
             && self.midi_sources == other.midi_sources
+            && self.setlist == other.setlist
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -452,6 +456,7 @@ impl Session {
         self.midi_sources.retain(|m| self.graph.node(m.node).is_some());
         self.prune_sends();
         self.prune_bus_outs();
+        self.setlist.prune_to_graph(&self.graph);
     }
 
     /// Plain-language integrity check, run on save and load: every edge must
@@ -569,6 +574,7 @@ impl Session {
                 bail!("The send into bus {} has a level outside 0..1.", s.bus);
             }
         }
+        self.setlist.validate(&self.graph)?;
         Ok(())
     }
 
@@ -610,6 +616,7 @@ impl Session {
             keyboard_mode: self.keyboard_mode,
             time_signature: self.time_sig,
             midi_sources: self.midi_sources.clone(),
+            setlist: self.setlist.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -638,6 +645,8 @@ impl Session {
             );
         }
         let states = read_state_files(package, &manifest.states, "session")?;
+        let mut setlist = manifest.setlist;
+        setlist.normalize();
         let session = Session {
             name: manifest.name,
             graph: manifest.graph,
@@ -656,6 +665,7 @@ impl Session {
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
             midi_sources: manifest.midi_sources,
+            setlist,
         };
         session.validate()?;
         Ok(session)
@@ -787,6 +797,9 @@ struct SessionFile {
     /// Input selection of CLAP synths (#124); older sessions have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     midi_sources: Vec<MidiSources>,
+    /// The setlist (#204); older/plain sessions omit it.
+    #[serde(default, skip_serializing_if = "crate::setlist::Setlist::is_empty")]
+    setlist: crate::setlist::Setlist,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1239,6 +1252,7 @@ struct Snapshot {
     graph: Graph,
     params: Vec<ParamValue>,
     matrix: Option<Value>,
+    setlist: crate::setlist::Setlist,
 }
 
 /// Snapshot undo stack. Usage: `history.record(&session)` *before* each
@@ -1277,6 +1291,7 @@ impl History {
             graph: s.graph.clone(),
             params: s.params.clone(),
             matrix: s.matrix.clone(),
+            setlist: s.setlist.clone(),
         }
     }
 
@@ -1284,6 +1299,7 @@ impl History {
         s.graph = snap.graph;
         s.params = snap.params;
         s.matrix = snap.matrix;
+        s.setlist = snap.setlist;
     }
 
     /// Record the current state before an edit. Clears the redo branch
@@ -2375,6 +2391,40 @@ mod tests {
         orphaned.prune_to_graph();
         orphaned.validate().unwrap();
         assert!(orphaned.strip_knobs().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn setlist_round_trip_and_prune() {
+        use crate::setlist::{FootSwitch, Part, PartRig, SetlistPos, Song};
+        let dir = test_dir("setlist");
+        let mut s = sample_session();
+        let mut verse = Part::new(
+            "Verse",
+            vec![PartRig { rig: 0, key_lo: 36, key_hi: 84, transpose: -12, level: 0.8 }],
+        );
+        verse.set_param(1, P_LEVEL, 0.65);
+        let mut song = Song::new("Opener", vec![verse]);
+        song.bpm = Some(124.0);
+        song.time_sig = Some(crate::transport::TimeSig::normalized(6, 8));
+        s.setlist.songs.push(song);
+        s.setlist.active = Some(SetlistPos { song: 0, part: 0 });
+        s.setlist.next_cc = Some(FootSwitch { cc: 64, channel: None });
+        s.setlist.prev_cc = Some(FootSwitch { cc: 67, channel: Some(0) });
+
+        let pkg = Session::package_path(&dir, "Gig").unwrap();
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.setlist, s.setlist);
+        assert!(loaded.same_content(&s));
+
+        // Removing the node referenced by a part's stored knob fails validate until pruned.
+        let mut orphaned = loaded.clone();
+        orphaned.graph.remove_node(1);
+        assert!(orphaned.validate().is_err());
+        orphaned.prune_to_graph();
+        orphaned.validate().unwrap();
+        assert!(orphaned.setlist.songs[0].parts[0].params.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

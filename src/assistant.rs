@@ -612,6 +612,13 @@ fn system_prompt() -> String {
      get_midi_clock/set_midi_clock control the MIDI Clock Send: kabelsalat as the master \
      beat clock (24 per beat, Start/Stop) for external hardware and apps.\n\
      - Sessions: save_session/load_session/list_sessions.\n\
+     - Setlist (live song & part switching without cutting held notes or tails): \
+     get_setlist reads the songs, parts, active position and foot-switch CCs; \
+     set_setlist_song adds, updates, moves or removes a song and its parts (each part names \
+     which rigs are live with key_lo/key_hi, transpose, level and optional stored knobs); \
+     select_setlist_part jumps to a song/part or steps next_part/prev_part/next_song/prev_song/clear; \
+     add_song_from_session imports a saved session's rigs into the current gig and makes a song \
+     of them; set_setlist_footswitch binds or clears a hardware MIDI CC for next/prev part.\n\
      - Patching: load_template (starter patches), add_node/connect/disconnect/\
      remove_node (build custom graphs; use get_graph for node/cable ids). Added dsp/lv2 nodes \
      sound once wired.\n\
@@ -1062,6 +1069,31 @@ pub(crate) fn tools() -> Value {
             "name":"set_time_signature",
             "description":"Set the time signature: numerator = beats per bar (1..=12), denominator = the note value of one beat (2, 4, 8 or 16). The metronome accents the first beat of each bar and clicks once per beat (eighths in x/8), the count-in lasts whole bars of it, bar-quantized recording and file-player starts wait for its bar line, and hosted plugins are told. Saved with the session; tempo stays in quarter notes per minute.",
             "parameters":{"type":"object","properties":{"numerator":{"type":"integer"},"denominator":{"type":"integer"}},"required":["numerator","denominator"]}
+        }},
+        {"type":"function","function":{
+            "name":"get_setlist",
+            "description":"Read the session's setlist: every song (index, name, optional bpm and time_signature, parts with their live rigs, key ranges, transpose, level and stored knob count), the active song/part (null = all rigs open), and any learned foot-switch CCs.",
+            "parameters":{"type":"object","properties":{}}
+        }},
+        {"type":"function","function":{
+            "name":"set_setlist_song",
+            "description":"Add, update, reorder or remove a song in the setlist. Omit song to append a new song (name required); pass song (0-based index) to update it, move_to to reorder it, or remove=true to delete it. Optional bpm (20..300, null clears) and time_signature (e.g. '4/4', '3/4', '6/8', or null to clear). Optional parts: JSON array string of parts, each {name, rigs: [{rig, key_lo?, key_hi?, transpose?, level?}], capture_knobs?}. When creating a song without parts, one 'Main' part is created from the active rig.",
+            "parameters":{"type":"object","properties":{"song":{"type":"integer"},"name":{"type":"string"},"bpm":{"type":["number","null"]},"time_signature":{"type":["string","null"]},"parts":{"type":"string"},"move_to":{"type":"integer"},"remove":{"type":"boolean"}}}
+        }},
+        {"type":"function","function":{
+            "name":"select_setlist_part",
+            "description":"Switch the active setlist song/part without changing routing: held notes on outgoing rigs keep sounding until released and effect tails ring out, while new notes play only the new part's rigs. Pass action ('next_part' | 'prev_part' | 'next_song' | 'prev_song' | 'clear') OR song (0-based index) with optional part (default 0).",
+            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next_part","prev_part","next_song","prev_song","clear"]},"song":{"type":"integer"},"part":{"type":"integer"}}}
+        }},
+        {"type":"function","function":{
+            "name":"add_song_from_session",
+            "description":"Import a saved session's rigs into the current gig (up to 8 rigs total) and append a new song in the setlist pointing at those imported rigs. session = saved session name from list_sessions; optional name overrides the song title.",
+            "parameters":{"type":"object","properties":{"session":{"type":"string"},"name":{"type":"string"}},"required":["session"]}
+        }},
+        {"type":"function","function":{
+            "name":"set_setlist_footswitch",
+            "description":"Bind or clear a hardware MIDI CC foot-switch to step the setlist on rising edge (value >= 64). action: 'next' | 'prev'. cc: 0..127 (omit or null to clear). channel: optional 0..15 (omit = any channel).",
+            "parameters":{"type":"object","properties":{"action":{"type":"string","enum":["next","prev"]},"cc":{"type":["integer","null"]},"channel":{"type":["integer","null"]}},"required":["action"]}
         }},
         {"type":"function","function":{
             "name":"get_midi_clock",

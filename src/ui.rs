@@ -1108,8 +1108,11 @@ fn remap_session(
         };
         Some(BusOut { bus, ..*o })
     }).collect();
+    let setlist = s.setlist.remap(&rig_of, &remap);
     ns.set_sends(sends);
     ns.set_bus_outs(outs);
+    // Setlist (#204): rig indices and stored part knobs follow the remap (rule 44).
+    ns.setlist = setlist;
     ns
 }
 
@@ -2473,6 +2476,7 @@ enum StageView {
     Rack,
     Matrix,
     Mixer,
+    Setlist,
     Sessions,
     Plugins,
     Settings,
@@ -2885,6 +2889,7 @@ const UI_BRIDGE_TOOLS: &[&str] = &[
     "set_time_signature",
     "list_instrument_profiles", "set_device_instrument",
     "play_demo", "stop_demo",
+    "get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch",
 ];
 
 /// Agent undo depth (snapshots hold plugin states — keep it bounded).
@@ -3421,6 +3426,24 @@ struct DemoApp {
     rule_param_cache: Option<(u32, Vec<(u32, String)>)>,
     /// Per-rig mixer mirror (AUM overview strip): vol/pan/mute/solo.
     rig_mix: [crate::engine::RigMix; 8],
+    /// Per-rig setlist zone mirror (#204): what each rig takes from its sources.
+    rig_zones: [crate::control::RigZone; 8],
+    /// Grace deadline (`ui_time`) so our own SetRigZones echo does not clobber local state.
+    ui_zone_grace: f32,
+    /// Session setlist (#204): songs, parts, active cursor, and foot-switch CCs.
+    setlist: crate::setlist::Setlist,
+    /// When armed, the next hardware MIDI CC binds that foot-switch action.
+    setlist_footswitch_learn: Option<crate::setlist::FootSwitchAction>,
+    /// Tracks rising edge (>= 64) per `(channel, cc)` for foot-switch triggers.
+    setlist_cc_high: std::collections::HashMap<(u8, u8), bool>,
+    /// Song index currently selected for editing in the Setlist view.
+    setlist_edit_song: Option<usize>,
+    /// Text input for adding a new song in the Setlist view.
+    setlist_new_song_name: String,
+    /// Text input for adding a new part in the Setlist view.
+    setlist_new_part_name: String,
+    /// Whether the "Add song from session" picker is expanded in the Setlist view.
+    setlist_import_open: bool,
     /// Per-node strip mirror (#72–77): a source's pan/mute/solo, an FX node's
     /// bypass, plus the UI-local strip colour and collapse flag. Keyed by
     /// node id like the session's strips (`remap_session` carries them).
@@ -3970,6 +3993,15 @@ impl DemoApp {
             rule_param_filter: String::new(),
             rule_param_cache: None,
             rig_mix: [crate::engine::RigMix::DEFAULT; 8],
+            rig_zones: [crate::control::RigZone::OPEN; 8],
+            ui_zone_grace: -1.0,
+            setlist: crate::setlist::Setlist::default(),
+            setlist_footswitch_learn: None,
+            setlist_cc_high: std::collections::HashMap::new(),
+            setlist_edit_song: None,
+            setlist_new_song_name: String::new(),
+            setlist_new_part_name: String::new(),
+            setlist_import_open: false,
             strips: Vec::new(),
             sends: Vec::new(),
             bus_outs: Vec::new(),
@@ -5248,6 +5280,9 @@ impl DemoApp {
             if now >= self.ui_master_mute_grace {
                 self.master_mute = g.master_mute;
             }
+            if now >= self.ui_zone_grace {
+                self.rig_zones = g.zones;
+            }
             // Sends (issue #5): the engine's table is the truth (rule 33),
             // once a local edit's echo is back.
             if now >= self.ui_send_grace {
@@ -5966,6 +6001,25 @@ impl DemoApp {
                 args.get("numerator").and_then(|v| v.as_u64()).unwrap_or(4),
                 args.get("denominator").and_then(|v| v.as_u64()).unwrap_or(4),
             ),
+            "get_setlist" => "Read setlist".into(),
+            "set_setlist_song" => match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) if !n.trim().is_empty() => format!("Setlist · {n}"),
+                _ if args.get("remove").and_then(|v| v.as_bool()) == Some(true) => "Remove setlist song".into(),
+                _ => "Update setlist song".into(),
+            },
+            "select_setlist_part" => match args.get("action").and_then(|v| v.as_str()) {
+                Some("next_part") => "Next setlist part".into(),
+                Some("prev_part") => "Previous setlist part".into(),
+                Some("next_song") => "Next song".into(),
+                Some("prev_song") => "Previous song".into(),
+                Some("clear") => "Clear active setlist".into(),
+                _ => "Switch setlist part".into(),
+            },
+            "add_song_from_session" => format!(
+                "Import song · {}",
+                args.get("session").and_then(|v| v.as_str()).unwrap_or("session")
+            ),
+            "set_setlist_footswitch" => "Setlist foot-switch".into(),
             "get_midi_clock" => "MIDI clock status".into(),
             "set_midi_clock" => "Set MIDI clock".into(),
             "record_start" => "Start recording".into(),
@@ -6608,6 +6662,8 @@ impl DemoApp {
         }
         s.set_sends(self.sends.clone());
         s.set_bus_outs(self.bus_outs.clone());
+        s.setlist = self.setlist.clone();
+        s.setlist.prune_to_graph(&s.graph);
         Ok(s)
     }
 
@@ -6841,6 +6897,16 @@ impl DemoApp {
         if let Some(sig) = s.time_sig {
             self.set_time_sig(sig);
         }
+        // Setlist (#204): restore songs/parts and send the active zones (if any).
+        self.setlist = s.setlist.clone();
+        self.setlist.prune_to_graph(&s.graph);
+        self.setlist_footswitch_learn = None;
+        self.setlist_edit_song = self.setlist.active.map(|p| p.song)
+            .or_else(|| (!self.setlist.songs.is_empty()).then_some(0));
+        self.rig_zones = self.setlist.active_zones();
+        if self.setlist.active.is_some() {
+            self.send_rig_zones();
+        }
         Ok(())
     }
 
@@ -6881,6 +6947,482 @@ impl DemoApp {
         if let Some(bus) = &self.bus {
             let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetMasterMute { muted });
         }
+    }
+
+    // -- setlist (#204) ------------------------------------------------------
+
+    /// Publish `self.rig_zones` to the engine (`Command::SetRigZones`).
+    fn send_rig_zones(&mut self) {
+        self.ui_zone_grace = self.ui_time + 0.6;
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetRigZones { zones: self.rig_zones });
+        }
+    }
+
+    /// Recall the currently active setlist part (or open every rig when none is
+    /// active): sends `SetRigZones` (never touches routing), updates tempo/time
+    /// signature if specified on the song, recalls rig levels and stored knobs,
+    /// and switches the rack view to the first live rig if needed.
+    fn apply_setlist_part(&mut self) {
+        self.rig_zones = self.setlist.active_zones();
+        self.send_rig_zones();
+        let Some((song_bpm, song_sig, song_name, part_name, part_rigs, part_params)) =
+            self.setlist.current().map(|(s, p, _)| {
+                (s.bpm, s.time_sig, s.name.clone(), p.name.clone(), p.rigs.clone(), p.params.clone())
+            })
+        else {
+            return;
+        };
+        if let Some(bpm) = song_bpm {
+            let bpm = bpm.clamp(20.0, 300.0);
+            self.bpm = bpm;
+            self.ui_transport_grace = self.ui_time + 0.6;
+            if let Some(bus) = &self.bus {
+                let _ = bus.lock().unwrap_or_else(|e| e.into_inner()).send(Command::SetBpm { bpm });
+            }
+        }
+        if let Some(sig) = song_sig {
+            self.set_time_sig(sig);
+        }
+        let n_rigs = self.rig_count();
+        for pr in &part_rigs {
+            let r = pr.rig as usize;
+            if r < n_rigs && r < 8 {
+                self.rig_mix[r].vol = pr.level.clamp(0.0, 1.0);
+                self.send_rig_mix(r);
+            }
+        }
+        let rm = self.reduce_motion;
+        if !part_params.is_empty() {
+            for p in &part_params {
+                let v = (p.value as f32).clamp(0.0, 1.0);
+                if let Some(u) = self.units.iter_mut().find(|u| u.node_id == p.node) {
+                    for k in &mut u.knobs {
+                        if k.param == Some(p.param) {
+                            k.glide_to(v, rm);
+                            k.sent = Some(v);
+                        }
+                    }
+                }
+            }
+            if let Some(bus) = &self.bus {
+                let mut b = bus.lock().unwrap_or_else(|e| e.into_inner());
+                for p in &part_params {
+                    let _ = b.send(Command::SetParam { node: p.node, param: p.param, value: p.value });
+                }
+            }
+        }
+        if !part_rigs.is_empty() && !part_rigs.iter().any(|r| r.rig as usize == self.active_rig) {
+            let target = part_rigs[0].rig as usize;
+            if target < n_rigs {
+                self.set_active_rig(target);
+            }
+        }
+        self.session_msg = format!("{song_name} · {part_name}");
+    }
+
+    /// Snapshot current knob values for every unit belonging to any rig in `rigs`.
+    fn capture_part_knobs(&self, rigs: &[crate::setlist::PartRig]) -> Vec<crate::session::ParamValue> {
+        let mut out = Vec::new();
+        for u in &self.units {
+            if !rigs.iter().any(|r| r.rig == u.rig) {
+                continue;
+            }
+            for k in &u.knobs {
+                if let Some(p) = k.param {
+                    out.push(crate::session::ParamValue {
+                        node: u.node_id,
+                        param: p,
+                        value: k.value as f64,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|p| (p.node, p.param));
+        out.dedup_by_key(|p| (p.node, p.param));
+        out
+    }
+
+    /// Step or clear the setlist and recall the new part.
+    fn step_setlist(&mut self, action: &str) -> Result<Option<crate::setlist::SetlistPos>, String> {
+        let moved = match action {
+            "next_part" => self.setlist.next_part(),
+            "prev_part" => self.setlist.prev_part(),
+            "next_song" => self.setlist.next_song(),
+            "prev_song" => self.setlist.prev_song(),
+            "clear" => {
+                self.setlist.active = None;
+                self.apply_setlist_part();
+                return Ok(None);
+            }
+            other => return Err(format!("unknown action '{other}' (use next_part, prev_part, next_song, prev_song or clear)")),
+        };
+        if let Some(pos) = moved {
+            self.setlist_edit_song = Some(pos.song);
+            self.apply_setlist_part();
+        }
+        Ok(self.setlist.active)
+    }
+
+    /// Jump directly to `(song, part)` and recall it.
+    fn select_setlist(&mut self, song: usize, part: usize) -> Result<crate::setlist::SetlistPos, String> {
+        let pos = self.setlist.select(song, part)
+            .ok_or_else(|| format!("song {song} part {part} is out of range"))?;
+        self.setlist_edit_song = Some(pos.song);
+        self.apply_setlist_part();
+        Ok(pos)
+    }
+
+    /// JSON view of the setlist for `get_setlist` and mutating tools.
+    fn setlist_json(&self) -> serde_json::Value {
+        let songs: Vec<serde_json::Value> = self.setlist.songs.iter().enumerate().map(|(si, s)| {
+            let parts: Vec<serde_json::Value> = s.parts.iter().enumerate().map(|(pi, p)| {
+                let rigs: Vec<serde_json::Value> = p.rigs.iter().map(|r| serde_json::json!({
+                    "rig": r.rig,
+                    "rig_name": self.rig_name(r.rig as usize),
+                    "key_lo": r.key_lo,
+                    "key_hi": r.key_hi,
+                    "transpose": r.transpose,
+                    "level": r.level,
+                })).collect();
+                serde_json::json!({
+                    "index": pi,
+                    "name": p.name,
+                    "rigs": rigs,
+                    "params_count": p.params.len(),
+                })
+            }).collect();
+            serde_json::json!({
+                "index": si,
+                "name": s.name,
+                "bpm": s.bpm,
+                "time_signature": s.time_sig.map(|t| t.to_json()),
+                "parts": parts,
+            })
+        }).collect();
+        let active = self.setlist.current().map(|(s, p, pos)| serde_json::json!({
+            "song": pos.song,
+            "part": pos.part,
+            "song_name": s.name,
+            "part_name": p.name,
+        }));
+        let fs = |f: Option<crate::setlist::FootSwitch>| {
+            f.map(|x| serde_json::json!({"cc": x.cc, "channel": x.channel}))
+        };
+        serde_json::json!({
+            "songs": songs,
+            "active": active,
+            "foot_switch": {
+                "next_cc": fs(self.setlist.next_cc),
+                "prev_cc": fs(self.setlist.prev_cc),
+            },
+        })
+    }
+
+    /// Execute `set_setlist_song` from the assistant or MCP.
+    fn exec_setlist_song(&mut self, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+        use crate::setlist::{Part, PartRig, Song};
+        let n_rigs = self.rig_count();
+        let parse_sig = |v: &serde_json::Value| -> Result<crate::transport::TimeSig, String> {
+            if let Some(s) = v.as_str() {
+                let (ns, ds) = s.trim().split_once('/').ok_or("time_signature must be like '4/4' or '6/8'")?;
+                let num: u64 = ns.trim().parse().map_err(|_| "time_signature numerator must be a whole number")?;
+                let den: u64 = ds.trim().parse().map_err(|_| "time_signature denominator must be a whole number")?;
+                return crate::transport::TimeSig::checked(num, den);
+            }
+            let num = v.get("numerator").and_then(|x| x.as_u64()).ok_or("time_signature.numerator required")?;
+            let den = v.get("denominator").and_then(|x| x.as_u64()).ok_or("time_signature.denominator required")?;
+            crate::transport::TimeSig::checked(num, den)
+        };
+        let parse_parts = |arr: &[serde_json::Value]| -> Result<Vec<Part>, String> {
+            if arr.is_empty() { return Err("a song needs at least one part".into()); }
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let name = item.get("name").and_then(|v| v.as_str()).map(str::trim)
+                    .filter(|s| !s.is_empty()).ok_or("each part needs a non-empty name")?;
+                let mut part = Part::new(name, Vec::new());
+                if let Some(rigs) = item.get("rigs").and_then(|v| v.as_array()) {
+                    for r in rigs {
+                        let rig = r.get("rig").and_then(|v| v.as_u64()).ok_or("part rig needs 'rig' index")? as usize;
+                        if rig >= n_rigs || rig >= crate::setlist::MAX_RIGS {
+                            return Err(format!("rig {rig} is out of range (loaded rigs: 0..{n_rigs})"));
+                        }
+                        let key_lo = r.get("key_lo").and_then(|v| v.as_u64()).unwrap_or(0).min(127) as u8;
+                        let key_hi = r.get("key_hi").and_then(|v| v.as_u64()).unwrap_or(127).min(127) as u8;
+                        let transpose = r.get("transpose").and_then(|v| v.as_i64()).unwrap_or(0).clamp(-48, 48) as i8;
+                        let level = r.get("level").and_then(|v| v.as_f64())
+                            .map(|v| (v as f32).clamp(0.0, 1.0))
+                            .unwrap_or_else(|| self.rig_mix[rig].vol);
+                        part.set_rig(PartRig { rig: rig as u8, key_lo: key_lo.min(key_hi), key_hi: key_lo.max(key_hi), transpose, level });
+                    }
+                }
+                if item.get("capture_knobs").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    part.params = self.capture_part_knobs(&part.rigs);
+                }
+                out.push(part);
+            }
+            Ok(out)
+        };
+        let parsed_parts = match args.get("parts") {
+            Some(serde_json::Value::Array(arr)) => Some(parse_parts(arr)?),
+            Some(serde_json::Value::String(s)) => {
+                let arr: Vec<serde_json::Value> = serde_json::from_str(s)
+                    .map_err(|e| format!("parts must be a JSON array: {e}"))?;
+                Some(parse_parts(&arr)?)
+            }
+            _ => None,
+        };
+        if let Some(idx) = args.get("song").and_then(|v| v.as_u64()).map(|n| n as usize) {
+            if idx >= self.setlist.songs.len() {
+                return Err(format!("no song at index {idx} (setlist has {})", self.setlist.songs.len()));
+            }
+            if args.get("remove").and_then(|v| v.as_bool()) == Some(true) {
+                self.setlist.remove_song(idx);
+                self.apply_setlist_part();
+                return Ok(self.setlist_json());
+            }
+            if let Some(name) = args.get("name").and_then(|v| v.as_str()) {
+                let t = name.trim();
+                if t.is_empty() { return Err("song name cannot be empty".into()); }
+                self.setlist.songs[idx].name = t.to_string();
+            }
+            if let Some(bpm_v) = args.get("bpm") {
+                if bpm_v.is_null() {
+                    self.setlist.songs[idx].bpm = None;
+                } else if let Some(b) = bpm_v.as_f64() {
+                    let b = b as f32;
+                    if !b.is_finite() || !(20.0..=300.0).contains(&b) { return Err("bpm must be 20..300".into()); }
+                    self.setlist.songs[idx].bpm = Some(b);
+                }
+            }
+            if let Some(sig_v) = args.get("time_signature") {
+                self.setlist.songs[idx].time_sig = if sig_v.is_null() { None } else { Some(parse_sig(sig_v)?) };
+            }
+            if let Some(parts) = parsed_parts {
+                self.setlist.songs[idx].parts = parts;
+            }
+            if let Some(to) = args.get("move_to").and_then(|v| v.as_u64()).map(|n| n as usize) {
+                if to >= self.setlist.songs.len() { return Err(format!("move_to {to} is out of range")); }
+                self.setlist.move_song(idx, to);
+            }
+            self.setlist.clamp_active();
+            if self.setlist.active.is_some() {
+                self.apply_setlist_part();
+            }
+            Ok(self.setlist_json())
+        } else {
+            let name = args.get("name").and_then(|v| v.as_str()).map(str::trim)
+                .filter(|s| !s.is_empty()).ok_or("name is required when creating a song")?;
+            let parts = match parsed_parts {
+                Some(parts) => parts,
+                None => {
+                    let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
+                    let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
+                    let mut p = Part::new("Main", vec![pr]);
+                    p.params = self.capture_part_knobs(&p.rigs);
+                    vec![p]
+                }
+            };
+            let mut song = Song::new(name, parts);
+            if let Some(b) = args.get("bpm").and_then(|v| v.as_f64()) {
+                let b = b as f32;
+                if !b.is_finite() || !(20.0..=300.0).contains(&b) { return Err("bpm must be 20..300".into()); }
+                song.bpm = Some(b);
+            }
+            if let Some(sig_v) = args.get("time_signature") {
+                if !sig_v.is_null() {
+                    song.time_sig = Some(parse_sig(sig_v)?);
+                }
+            }
+            self.setlist.songs.push(song);
+            let idx = self.setlist.songs.len() - 1;
+            self.setlist_edit_song = Some(idx);
+            Ok(self.setlist_json())
+        }
+    }
+
+    /// "Add song from session" (#204): import a saved session's rigs into the
+    /// current gig (up to MAX_RIGS = 8) and create a song pointing at them.
+    fn add_song_from_session_in(
+        &mut self,
+        dir: &std::path::Path,
+        session_name: &str,
+        song_name: Option<&str>,
+    ) -> Result<(usize, Vec<usize>), String> {
+        let imported = crate::session::Session::package_path(dir, session_name)
+            .and_then(|p| crate::session::Session::load(&p))
+            .map_err(|e| format!("Could not load session '{session_name}': {e}"))?;
+        let imported = canonical_rig_session(&imported);
+        let (imp_graphs, imp_bases) = crate::control::split_rigs(&imported.graph);
+        if imp_graphs.is_empty() {
+            return Err(format!("Session '{session_name}' has no rigs."));
+        }
+        let cur_n = self.rig_count();
+        if cur_n + imp_graphs.len() > Self::MAX_RIGS {
+            return Err(format!(
+                "Cannot import {} rig(s) from '{session_name}': {cur_n} rig(s) already loaded (max {}).",
+                imp_graphs.len(),
+                Self::MAX_RIGS
+            ));
+        }
+        let cur = self.capture_session("Import")
+            .map_err(|e| format!("Could not capture current rack: {e}"))?;
+        let voice_rows = self.voice_rows();
+        let (cur_graphs, cur_bases) = crate::control::split_rigs(&cur.graph);
+        let devices: Vec<Option<u32>> = {
+            let snap = self.rig_snapshot.lock().ok();
+            (0..cur_graphs.len())
+                .map(|i| snap.as_ref().and_then(|sn| sn.rigs.get(i).and_then(|m| m.midi_device)))
+                .collect()
+        };
+        let mut list: Vec<crate::control::Rig> = cur_graphs.into_iter().enumerate()
+            .map(|(i, g)| crate::control::Rig::new(self.rig_name(i), g, devices[i]))
+            .collect();
+        let first_new_rig = list.len();
+        let mut new_rig_indices = Vec::with_capacity(imp_graphs.len());
+        for (i, g) in imp_graphs.into_iter().enumerate() {
+            let base_name = imported.rig_names.get(i)
+                .filter(|n| !n.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    if imp_bases.len() == 1 {
+                        imported.name.clone()
+                    } else {
+                        format!("{} {}", imported.name, (b'A' + i.min(25) as u8) as char)
+                    }
+                });
+            let rname: String = base_name.trim().chars().take(24).collect();
+            let idx = list.len();
+            list.push(crate::control::Rig::new(rname, g, None));
+            new_rig_indices.push(idx);
+        }
+        let new_bases = crate::control::rig_bases(&list);
+        let merged = crate::control::merge_rigs(&list);
+        let remap_cur = |old: u32| -> Option<u32> {
+            let o = cur.graph.node(old)?.rig as usize;
+            Some(new_bases[o] + (old - cur_bases[o]))
+        };
+        let remap_imp = |old: u32| -> Option<u32> {
+            let o = imported.graph.node(old)?.rig as usize;
+            let dst = first_new_rig + o;
+            Some(new_bases[dst] + (old - imp_bases[o]))
+        };
+        let mut ns = remap_session(&cur, merged, remap_cur);
+        // Copy imported params, plugin states, matrix rules, strips, sends, bus_outs.
+        let mut imported_params = Vec::new();
+        for p in imported.params() {
+            if let Some(nid) = remap_imp(p.node) {
+                ns.set_param(nid, p.param, p.value);
+                imported_params.push(crate::session::ParamValue { node: nid, param: p.param, value: p.value });
+            }
+        }
+        for st in imported.plugin_states() {
+            if let Some(nid) = remap_imp(st.node) {
+                ns.set_plugin_state(nid, st.plugin_id.clone(), st.data.clone());
+            }
+        }
+        let mut rules: Vec<SavedRule> = ns.matrix()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let imp_rules: Vec<SavedRule> = imported.matrix()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        for mut r in imp_rules {
+            if let Some(nid) = remap_imp(r.dest) {
+                r.dest = nid;
+                rules.push(r);
+            }
+        }
+        if !rules.is_empty() {
+            ns.set_matrix(serde_json::to_value(&rules).ok());
+        }
+        for st in imported.strips() {
+            if let Some(node) = remap_imp(st.node) {
+                ns.set_strip(crate::session::StripSaved { node, ..*st });
+            }
+        }
+        for (&old, label) in imported.strip_knobs() {
+            if let Some(node) = remap_imp(old) {
+                ns.set_strip_knob(node, label.clone());
+            }
+        }
+        // Build the new song pointing at the imported rigs.
+        let title = song_name
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&imported.name)
+            .to_string();
+        let part_rigs: Vec<crate::setlist::PartRig> = new_rig_indices.iter()
+            .map(|&r| crate::setlist::PartRig::new(r as u8))
+            .collect();
+        let mut main_part = crate::setlist::Part::new("Main", part_rigs);
+        main_part.params = imported_params;
+        let mut song = crate::setlist::Song::new(title, vec![main_part]);
+        song.time_sig = imported.time_sig;
+        ns.setlist.songs.push(song);
+        let song_idx = ns.setlist.songs.len() - 1;
+
+        let saved_mix = self.rig_mix;
+        let saved_arms = self.arm_rigs;
+        let active = self.active_rig;
+        self.load_as_rigs = Some((list.clone(), active));
+        self.apply_session(&ns).map_err(|e| format!("Import failed: {e}"))?;
+        if let Ok(mut snap) = self.rig_snapshot.lock() {
+            snap.rigs = list.iter().map(|r| crate::control::RigMeta { name: r.name.clone(), midi_device: r.midi_device }).collect();
+            snap.active = active;
+        }
+        self.adopt_rig_devices();
+        let voice_rows: Vec<VoiceRow> = voice_rows.into_iter()
+            .filter_map(|r| remap_cur(r.node).map(|node| VoiceRow { node, ..r }))
+            .collect();
+        self.restore_voice_rows(&voice_rows);
+        for i in 0..first_new_rig.min(8) {
+            self.rig_mix[i] = saved_mix[i];
+            self.send_rig_mix(i);
+            self.set_record_arm(Some(i), saved_arms[i]);
+        }
+        self.active_rig = usize::MAX;
+        self.set_active_rig(active);
+        self.setlist_edit_song = Some(song_idx);
+        self.session_msg = format!("Added song from '{session_name}'");
+        Ok((song_idx, new_rig_indices))
+    }
+
+    /// Handle incoming hardware MIDI CC for setlist foot-switch learn or step.
+    /// Returns `true` if the CC was consumed by setlist learn or trigger.
+    fn handle_setlist_cc(&mut self, ch: u8, cc: u8, val: u8) -> bool {
+        let cc = cc & 0x7F;
+        let high = val >= 64;
+        if let Some(action) = self.setlist_footswitch_learn.take() {
+            let fs = crate::setlist::FootSwitch { cc, channel: None };
+            match action {
+                crate::setlist::FootSwitchAction::Next => {
+                    self.setlist.next_cc = Some(fs);
+                    self.session_msg = format!("Learned CC {cc} for Next part");
+                }
+                crate::setlist::FootSwitchAction::Prev => {
+                    self.setlist.prev_cc = Some(fs);
+                    self.session_msg = format!("Learned CC {cc} for Previous part");
+                }
+            }
+            self.setlist_cc_high.insert((ch, cc), high);
+            return true;
+        }
+        let prev_high = self.setlist_cc_high.insert((ch, cc), high).unwrap_or(false);
+        let rising = high && !prev_high;
+        if self.setlist.next_cc.is_some_and(|fs| fs.matches(ch, cc)) {
+            if rising && !self.setlist.songs.is_empty() {
+                let _ = self.step_setlist("next_part");
+            }
+            return true;
+        }
+        if self.setlist.prev_cc.is_some_and(|fs| fs.matches(ch, cc)) {
+            if rising && !self.setlist.songs.is_empty() {
+                let _ = self.step_setlist("prev_part");
+            }
+            return true;
+        }
+        false
     }
 
     /// Restore an LV2 node's plugin state (a Vital patch) and keep it for
@@ -7038,6 +7580,10 @@ impl DemoApp {
         self.strip_knobs.clear();
         self.master_mute = false;
         self.mixer_knob_drag = None;
+        self.setlist = crate::setlist::Setlist::default();
+        self.rig_zones = [crate::control::RigZone::OPEN; 8];
+        self.setlist_footswitch_learn = None;
+        self.setlist_edit_song = None;
         self.begin_load_fade();
         self.sync_clap_slots(&merged, None);
         if let Some(bus) = &self.bus {
@@ -8465,6 +9011,67 @@ impl DemoApp {
                         sig.to_json().to_string()
                     }
                     Err(e) => format!("error: {e}"),
+                }
+            }
+            "get_setlist" => self.setlist_json().to_string(),
+            "set_setlist_song" => match self.exec_setlist_song(args) {
+                Ok(val) => {
+                    self.agent_activity.record(origin, "Setlist updated", Vec::new(), now);
+                    val.to_string()
+                }
+                Err(e) => format!("error: {e}"),
+            },
+            "select_setlist_part" => {
+                let res = if let Some(action) = args.get("action").and_then(|v| v.as_str()) {
+                    self.step_setlist(action).map(|_| ())
+                } else if let Some(song) = args.get("song").and_then(|v| v.as_u64()).map(|n| n as usize) {
+                    let part = args.get("part").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    self.select_setlist(song, part).map(|_| ())
+                } else {
+                    Err("pass either action or song".into())
+                };
+                match res {
+                    Ok(()) => {
+                        self.agent_activity.record(origin, "Setlist switched", Vec::new(), now);
+                        self.setlist_json().to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            "add_song_from_session" => {
+                let session = args.get("session").and_then(|v| v.as_str()).unwrap_or("");
+                let song_name = args.get("name").and_then(|v| v.as_str());
+                let dir = self.effective_sessions_dir();
+                match self.add_song_from_session_in(&dir, session, song_name) {
+                    Ok((song_idx, rigs)) => {
+                        self.agent_activity.record(origin, format!("Imported song from {session}"), Vec::new(), now);
+                        serde_json::json!({
+                            "song": song_idx,
+                            "imported_rigs": rigs,
+                            "setlist": self.setlist_json(),
+                        }).to_string()
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            "set_setlist_footswitch" => {
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                let fs = args.get("cc").and_then(|v| v.as_u64()).map(|cc| crate::setlist::FootSwitch {
+                    cc: (cc as u8) & 0x7F,
+                    channel: args.get("channel").and_then(|v| v.as_u64()).map(|c| (c as u8) & 0x0F),
+                });
+                match action {
+                    "next" => {
+                        self.setlist.next_cc = fs;
+                        self.agent_activity.record(origin, "Setlist foot-switch", Vec::new(), now);
+                        self.setlist_json().to_string()
+                    }
+                    "prev" => {
+                        self.setlist.prev_cc = fs;
+                        self.agent_activity.record(origin, "Setlist foot-switch", Vec::new(), now);
+                        self.setlist_json().to_string()
+                    }
+                    other => format!("error: unknown action '{other}' (use 'next' or 'prev')"),
                 }
             }
             "get_midi_clock" => self.midi_clock_json().to_string(),
@@ -14081,7 +14688,7 @@ impl DemoApp {
                 let take_w = if show_take { 180.0 } else { 0.0 };
                 let right_w = 26.0 /* settings */ + gap + dsp.width + gap + sync_w + (if show_sync { gap } else { 0.0 })
                     + rec_w + gap + take_w + agent_w + (if agent_visible { gap } else { 0.0 }) + dock_w + 10.0;
-                let view_w = if compact { 188.0 } else { 212.0 };
+                let view_w = if compact { 240.0 } else { 268.0 };
 
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), ROW_H),
@@ -14117,7 +14724,7 @@ impl DemoApp {
                         }
 
                         // ── Session document pill (● Name ▾) ──
-                        let session_max_w = if narrow { 82.0 } else if compact { 108.0 } else { 150.0 };
+                        let session_max_w = if narrow { 62.0 } else if compact { 104.0 } else { 150.0 };
                         let pill_name = self.session_pill_label();
                         let sp = session_pill_button(ui, &pill_name, self.session_is_saved(), self.session_popover_open, session_max_w)
                             .on_hover_text(format!("Session: {pill_name} · click to save, load or open templates (Ctrl+O)"));
@@ -14137,8 +14744,8 @@ impl DemoApp {
 
                             let left_used = ui.cursor().left();
                             let bar_right = ui.max_rect().right();
-                            let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(86.0);
-                            let active_max_w = if narrow { 72.0 } else if compact { 88.0 } else { 116.0 };
+                            let rig_budget = (bar_right - left_used - right_w - view_w - gap * 3.0 - 8.0).max(if narrow { 56.0 } else { 86.0 });
+                            let active_max_w = if narrow { 56.0 } else if compact { 84.0 } else { 116.0 };
                             let est_pills_w = active_max_w + (n.min(9).saturating_sub(1) as f32) * 30.0 + 30.0;
                             let needs_scroll = est_pills_w > rig_budget;
 
@@ -14151,8 +14758,22 @@ impl DemoApp {
                                     let dev = self.rig_device_label(rig);
                                     let level = self.rig_levels.get(rig).copied().unwrap_or(0.0);
                                     let agent_t = self.agent_activity.rig_alpha(rig, self.ui_time);
+                                    let zone_active = self.setlist.active.is_some();
+                                    let zone = self.rig_zones.get(rig).copied().unwrap_or(crate::control::RigZone::OPEN);
+                                    let zone_tip = if !zone_active {
+                                        String::new()
+                                    } else if zone.live {
+                                        format!(" · LIVE ({}–{})", crate::setlist::note_label(zone.key_lo), crate::setlist::note_label(zone.key_hi))
+                                    } else {
+                                        " · out of song".to_string()
+                                    };
                                     let chip = inline_rig_pill(ui, rig, &name, active, level, agent_t, active_max_w)
-                                        .on_hover_text(format!("{} · {name} ({dev}) · right-click for rig actions", rig + 1));
+                                        .on_hover_text(format!("{} · {name} ({dev}){zone_tip} · right-click for rig actions", rig + 1));
+                                    if zone_active {
+                                        let dot_col = if zone.live { theme::LIVE_TEAL } else { theme::MUTED };
+                                        let dot_c = Pos2::new(chip.rect.right() - 4.5, chip.rect.top() + 4.5);
+                                        ui.painter().circle_filled(dot_c, 2.5, dot_col);
+                                    }
                                     if chip.clicked() { switch_rig = Some(rig); }
                                     if chip.double_clicked() { self.rename_rig_dialog = Some((rig, name.clone())); }
                                     chip.context_menu(|ui| {
@@ -14211,12 +14832,14 @@ impl DemoApp {
 
                         nav_separator(ui);
 
-                        // ── VIEW group: 4 live workspace views (Rack, Mixer, Matrix, Plugins) ──
+                        // ── VIEW group: 5 live workspace views (Rack, Mixer, Matrix, Setlist, Plugins) ──
+                        let tight_views = win_w < 840.0;
                         let views = [
                             ("Rack", StageView::Rack),
                             ("Mixer", StageView::Mixer),
                             ("Matrix", StageView::Matrix),
-                            ("Plugins", StageView::Plugins),
+                            (if tight_views { "Set" } else { "Setlist" }, StageView::Setlist),
+                            (if tight_views { "Plug" } else { "Plugins" }, StageView::Plugins),
                         ];
                         let mut pick = None;
                         let group = ui.scope(|ui| {
@@ -14229,6 +14852,51 @@ impl DemoApp {
                         self.view_group_rect = group;
                         if let Some(view) = pick {
                             if view == StageView::Rack || view != self.stage_view { self.toggle_stage(view); }
+                        }
+
+                        // ── Setlist stepper (shown when a setlist has songs and there is room) ──
+                        if !self.setlist.songs.is_empty() && (ui.available_width() - right_w) >= 100.0 {
+                            nav_separator(ui);
+                            let mut step_act: Option<&'static str> = None;
+                            let mut open_sl = false;
+                            let label = match self.setlist.current() {
+                                Some((s, p, pos)) => format!("{}. {} · {}", pos.song + 1, s.name, p.name),
+                                None => format!("Setlist ({})", self.setlist.songs.len()),
+                            };
+                            let active = self.setlist.active.is_some();
+                            let max_lbl = ((ui.available_width() - right_w) - 62.0).clamp(56.0, 200.0);
+                            ui.scope(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if theme::chip_button(ui, "‹", false)
+                                    .on_hover_text("Previous part · PageUp")
+                                    .clicked()
+                                {
+                                    step_act = Some("prev_part");
+                                }
+                                let mid = ui.add_sized(
+                                    [max_lbl, 22.0],
+                                    egui::Button::new(
+                                        egui::RichText::new(&label)
+                                            .size(11.5)
+                                            .color(if active { theme::INK } else { theme::INK_2 }),
+                                    )
+                                    .fill(if active { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT })
+                                    .stroke(Stroke::new(1.0, if active { theme::LIVE_TEAL } else { theme::HAIRLINE }))
+                                    .truncate(),
+                                )
+                                .on_hover_text("Open Setlist view (F12) · PageUp/PageDown step parts");
+                                if mid.clicked() { open_sl = true; }
+                                if theme::chip_button(ui, "›", false)
+                                    .on_hover_text("Next part · PageDown")
+                                    .clicked()
+                                {
+                                    step_act = Some("next_part");
+                                }
+                            });
+                            if let Some(a) = step_act { let _ = self.step_setlist(a); }
+                            if open_sl && self.stage_view != StageView::Setlist {
+                                self.toggle_stage(StageView::Setlist);
+                            }
                         }
 
                         // ── Info line (I toggles): fits in the middle slack, else moves to hint footer ──
@@ -14493,6 +15161,588 @@ impl DemoApp {
                     Err(e) => self.session_msg = format!("Autosave failed: {e}"),
                 }
             }
+        }
+    }
+
+    /// Main-stage view for the gig's Setlist (#204): songs and parts over the
+    /// loaded rigs, switched without cutting held notes or effect tails.
+    fn setlist_stage(&mut self, ui: &mut egui::Ui) {
+        let dir = self.effective_sessions_dir();
+        self.setlist_stage_in(ui, &dir);
+    }
+
+    fn setlist_stage_in(&mut self, ui: &mut egui::Ui, sessions_dir: &std::path::Path) {
+        use crate::setlist::{FootSwitchAction, Part, PartRig, Song};
+        let rect = ui.available_rect_before_wrap();
+        self.stage_rect = rect;
+        let painter = ui.painter().clone();
+        theme::paper_bg(&painter, rect);
+        let (sheet, inner) = self.stage_sheet_rects(rect, 200.0);
+        painter.rect_filled(sheet, 28.0, theme::DARK_PANEL);
+        let help = self.show_help;
+        let n_rigs = self.rig_count();
+        let rig_names: Vec<String> = (0..n_rigs).map(|r| self.rig_name(r)).collect();
+
+        // Keep selected song index valid.
+        if self.setlist.songs.is_empty() {
+            self.setlist_edit_song = None;
+        } else if self.setlist_edit_song.is_none_or(|i| i >= self.setlist.songs.len()) {
+            self.setlist_edit_song = self.setlist.active.map(|p| p.song).or(Some(0));
+        }
+
+        let mut step_action: Option<&'static str> = None;
+        let mut jump_to: Option<(usize, usize)> = None;
+        let mut add_song = false;
+        let mut import_session: Option<String> = None;
+        let mut move_song: Option<(usize, usize)> = None;
+        let mut remove_song: Option<usize> = None;
+        let mut add_part_for: Option<usize> = None;
+        let mut remove_part: Option<(usize, usize)> = None;
+        let mut capture_knobs_for: Option<(usize, usize)> = None;
+        let mut active_part_dirty = false;
+
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            ui.shrink_clip_rect(sheet);
+            ui.add_enabled_ui(!help, |ui| {
+                // ── Header ──
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Setlist").font(theme::medium_font(18.0)).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new("songs & parts over loaded rigs · PageUp / PageDown step · F12 / Esc: rack")
+                            .size(12.5)
+                            .color(theme::INK_2),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if self.setlist.active.is_some() {
+                            if theme::chip_button(ui, "All rigs", false)
+                                .on_hover_text("Deactivate setlist so every rig plays openly")
+                                .clicked()
+                            {
+                                step_action = Some("clear");
+                            }
+                        }
+                        if !self.setlist.songs.is_empty() {
+                            if theme::chip_button(ui, "Next ›", false).clicked() {
+                                step_action = Some("next_part");
+                            }
+                            if theme::chip_button(ui, "‹ Prev", false).clicked() {
+                                step_action = Some("prev_part");
+                            }
+                        }
+                        if let Some((s, p, pos)) = self.setlist.current() {
+                            ui.label(
+                                egui::RichText::new(format!("LIVE  {}. {} · {}", pos.song + 1, s.name, p.name))
+                                    .size(12.5)
+                                    .strong()
+                                    .color(theme::LIVE_TEAL),
+                            );
+                        }
+                    });
+                });
+                ui.add_space(10.0);
+                Self::stage_hairline(ui);
+                ui.add_space(12.0);
+
+                let avail_w = ui.available_width();
+                let avail_h = ui.available_height().max(120.0);
+                let two_col = avail_w >= 680.0;
+                let left_w = if two_col { (avail_w * 0.36).clamp(240.0, 360.0) } else { avail_w };
+                let right_w = if two_col { (avail_w - left_w - 22.0).max(260.0) } else { avail_w };
+
+                let draw_left = |ui: &mut egui::Ui,
+                                 setlist: &mut crate::setlist::Setlist,
+                                 edit_song: &mut Option<usize>,
+                                 new_song_name: &mut String,
+                                 import_open: &mut bool,
+                                 learn: &mut Option<FootSwitchAction>,
+                                 add_song: &mut bool,
+                                 import_session: &mut Option<String>,
+                                 move_song: &mut Option<(usize, usize)>,
+                                 remove_song: &mut Option<usize>,
+                                 jump_to: &mut Option<(usize, usize)>| {
+                    theme::section_label(ui, "Songs");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let fw = (ui.available_width() - 62.0).max(100.0);
+                        let ed = Self::recessed_input(ui, new_song_name, fw, "New song name…");
+                        if ed.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            *add_song = true;
+                        }
+                        if theme::primary_button(ui, "Add").clicked() {
+                            *add_song = true;
+                        }
+                    });
+                    ui.add_space(6.0);
+                    if theme::chip_button(ui, if *import_open { "Add song from session ▴" } else { "Add song from session ▾" }, *import_open)
+                        .on_hover_text("Import a saved session's rigs into this gig and create a song")
+                        .clicked()
+                    {
+                        *import_open = !*import_open;
+                    }
+                    if *import_open {
+                        ui.add_space(4.0);
+                        let saved = Self::list_saved_sessions(sessions_dir);
+                        egui::Frame::new()
+                            .fill(theme::DARK_PANEL_HI)
+                            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                if saved.is_empty() {
+                                    ui.label(egui::RichText::new("No saved sessions yet.").size(11.5).color(theme::INK_2));
+                                } else {
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("setlist_import_sessions")
+                                        .min_scrolled_height(0.0)
+                                        .max_height(110.0)
+                                        .show(ui, |ui| {
+                                            for name in saved {
+                                                if ui.add(
+                                                    egui::Button::new(egui::RichText::new(&name).size(12.0).color(theme::INK))
+                                                        .fill(Color32::TRANSPARENT)
+                                                        .min_size(egui::vec2(ui.available_width(), 24.0)),
+                                                ).clicked() {
+                                                    *import_session = Some(name);
+                                                    *import_open = false;
+                                                }
+                                            }
+                                        });
+                                }
+                            });
+                    }
+                    ui.add_space(10.0);
+
+                    let list_h = (avail_h - 210.0).max(80.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("setlist_songs_scroll")
+                        .min_scrolled_height(list_h.min(80.0))
+                        .max_height(list_h)
+                        .show(ui, |ui| {
+                            if setlist.songs.is_empty() {
+                                ui.label(egui::RichText::new("No songs yet.").size(12.5).color(theme::INK_2));
+                            }
+                            let count = setlist.songs.len();
+                            for (si, song) in setlist.songs.iter().enumerate() {
+                                let selected = *edit_song == Some(si);
+                                let is_live = setlist.active.is_some_and(|p| p.song == si);
+                                let stroke_col = if is_live {
+                                    theme::LIVE_TEAL
+                                } else if selected {
+                                    theme::ACCENT
+                                } else {
+                                    theme::HAIRLINE
+                                };
+                                egui::Frame::new()
+                                    .fill(if selected { theme::DARK_PANEL_HI } else { Color32::TRANSPARENT })
+                                    .stroke(Stroke::new(1.0, stroke_col))
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 6))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let meta = {
+                                                let mut bits = vec![format!("{} part{}", song.parts.len(), if song.parts.len() == 1 { "" } else { "s" })];
+                                                if let Some(b) = song.bpm { bits.push(format!("{} BPM", b.round() as u32)); }
+                                                if let Some(sig) = song.time_sig { bits.push(sig.to_string()); }
+                                                bits.join(" · ")
+                                            };
+                                            let title = format!("{}. {}", si + 1, song.name);
+                                            let r = ui.vertical(|ui| {
+                                                ui.label(egui::RichText::new(&title).size(13.0).strong().color(if is_live { theme::LIVE_TEAL } else { theme::INK }));
+                                                ui.label(egui::RichText::new(meta).size(11.0).color(theme::INK_2));
+                                            }).response.interact(egui::Sense::click());
+                                            if r.clicked() { *edit_song = Some(si); }
+                                            if r.double_clicked() { *jump_to = Some((si, 0)); }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = 3.0;
+                                                if theme::chip_button(ui, "×", false).on_hover_text("Remove song").clicked() {
+                                                    *remove_song = Some(si);
+                                                }
+                                                if si + 1 < count && theme::chip_button(ui, "↓", false).on_hover_text("Move down").clicked() {
+                                                    *move_song = Some((si, si + 1));
+                                                }
+                                                if si > 0 && theme::chip_button(ui, "↑", false).on_hover_text("Move up").clicked() {
+                                                    *move_song = Some((si, si - 1));
+                                                }
+                                                if theme::chip_button(ui, "▶", is_live).on_hover_text("Play song (part 1)").clicked() {
+                                                    *jump_to = Some((si, 0));
+                                                }
+                                            });
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        });
+
+                    ui.add_space(10.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(8.0);
+                    theme::section_label(ui, "Foot-switch CC");
+                    ui.add_space(6.0);
+                    for (label, action, binding) in [
+                        ("Next part", FootSwitchAction::Next, setlist.next_cc),
+                        ("Prev part", FootSwitchAction::Prev, setlist.prev_cc),
+                    ] {
+                        let learning = *learn == Some(action);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(label).size(12.0).color(theme::INK));
+                            let txt = if learning {
+                                "Press pedal…".to_string()
+                            } else if let Some(fs) = binding {
+                                format!("CC {}", fs.cc)
+                            } else {
+                                "Unbound".to_string()
+                            };
+                            ui.label(egui::RichText::new(txt).size(11.5).monospace().color(if learning { theme::ACCENT } else { theme::INK_2 }));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if binding.is_some() && theme::chip_button(ui, "Clear", false).clicked() {
+                                    match action {
+                                        FootSwitchAction::Next => setlist.next_cc = None,
+                                        FootSwitchAction::Prev => setlist.prev_cc = None,
+                                    }
+                                }
+                                if theme::chip_button(ui, if learning { "Cancel" } else { "Learn" }, learning).clicked() {
+                                    *learn = if learning { None } else { Some(action) };
+                                }
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                };
+
+                let draw_right = |ui: &mut egui::Ui,
+                                  setlist: &mut crate::setlist::Setlist,
+                                  edit_song: Option<usize>,
+                                  new_part_name: &mut String,
+                                  add_part_for: &mut Option<usize>,
+                                  remove_part: &mut Option<(usize, usize)>,
+                                  capture_knobs_for: &mut Option<(usize, usize)>,
+                                  jump_to: &mut Option<(usize, usize)>,
+                                  active_part_dirty: &mut bool| {
+                    let Some(si) = edit_song.filter(|&i| i < setlist.songs.len()) else {
+                        ui.add_space(24.0);
+                        ui.label(
+                            egui::RichText::new("Build your gig setlist")
+                                .font(theme::medium_font(15.0))
+                                .color(theme::INK),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Add a song on the left — or import one from a saved session. \
+                                 Every rig stays loaded; each part chooses which rigs take new notes, \
+                                 their key range, transpose, level and knobs. Switching parts never cuts \
+                                 held notes or reverb tails.",
+                            )
+                            .size(12.5)
+                            .color(theme::INK_2),
+                        );
+                        return;
+                    };
+                    let active_pos = setlist.active;
+                    let song = &mut setlist.songs[si];
+                    let is_active_song = active_pos.is_some_and(|p| p.song == si);
+
+                    // Song title + optional BPM & Time signature
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        Self::recessed_input(ui, &mut song.name, 190.0, "Song title");
+                        let mut has_bpm = song.bpm.is_some();
+                        if theme::chip_button(ui, "BPM", has_bpm).clicked() {
+                            has_bpm = !has_bpm;
+                            song.bpm = if has_bpm { Some(120.0) } else { None };
+                            if is_active_song { *active_part_dirty = true; }
+                        }
+                        if let Some(bpm) = &mut song.bpm {
+                            if ui.add(egui::DragValue::new(bpm).range(20.0..=300.0).speed(0.5).suffix(" BPM")).changed() {
+                                if is_active_song { *active_part_dirty = true; }
+                            }
+                        }
+                        let has_sig = song.time_sig.is_some();
+                        if theme::chip_button(ui, "Metre", has_sig).clicked() {
+                            song.time_sig = if has_sig { None } else { Some(crate::transport::TimeSig::default()) };
+                            if is_active_song { *active_part_dirty = true; }
+                        }
+                        if let Some(sig) = &mut song.time_sig {
+                            let label = sig.to_string();
+                            if theme::chip_button(ui, &label, true)
+                                .on_hover_text("Cycle common time signatures")
+                                .clicked()
+                            {
+                                *sig = match (sig.num, sig.den) {
+                                    (4, 4) => crate::transport::TimeSig::normalized(3, 4),
+                                    (3, 4) => crate::transport::TimeSig::normalized(6, 8),
+                                    (6, 8) => crate::transport::TimeSig::normalized(5, 4),
+                                    (5, 4) => crate::transport::TimeSig::normalized(7, 8),
+                                    (7, 8) => crate::transport::TimeSig::normalized(2, 4),
+                                    _ => crate::transport::TimeSig::normalized(4, 4),
+                                };
+                                if is_active_song { *active_part_dirty = true; }
+                            }
+                        }
+                    });
+                    ui.add_space(10.0);
+
+                    // Add part row
+                    ui.horizontal(|ui| {
+                        theme::section_label(ui, "Parts");
+                        ui.add_space(8.0);
+                        let fw = (ui.available_width() - 96.0).clamp(100.0, 220.0);
+                        let ed = Self::recessed_input(ui, new_part_name, fw, "Verse, Chorus, Solo…");
+                        if ed.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                            *add_part_for = Some(si);
+                        }
+                        if theme::chip_button(ui, "+ Part", false).clicked() {
+                            *add_part_for = Some(si);
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    let parts_h = (avail_h - 104.0).max(100.0);
+                    let part_count = song.parts.len();
+                    egui::ScrollArea::vertical()
+                        .id_salt("setlist_parts_scroll")
+                        .min_scrolled_height(parts_h.min(100.0))
+                        .max_height(parts_h)
+                        .show(ui, |ui| {
+                            for (pi, part) in song.parts.iter_mut().enumerate() {
+                                let is_live = active_pos == Some(crate::setlist::SetlistPos { song: si, part: pi });
+                                egui::Frame::new()
+                                    .fill(theme::DARK_PANEL_HI)
+                                    .stroke(Stroke::new(1.0, if is_live { theme::LIVE_TEAL } else { theme::HAIRLINE }))
+                                    .corner_radius(8.0)
+                                    .inner_margin(egui::Margin::same(10))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            Self::recessed_input(ui, &mut part.name, 140.0, "Part name");
+                                            if is_live {
+                                                ui.label(egui::RichText::new("LIVE").size(11.0).strong().color(theme::LIVE_TEAL));
+                                            } else if theme::chip_button(ui, "▶ Play", false).clicked() {
+                                                *jump_to = Some((si, pi));
+                                            }
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                if part_count > 1 && theme::chip_button(ui, "×", false).on_hover_text("Remove part").clicked() {
+                                                    *remove_part = Some((si, pi));
+                                                }
+                                                let knob_lbl = if part.params.is_empty() {
+                                                    "Save knobs".to_string()
+                                                } else {
+                                                    format!("Save knobs ({})", part.params.len())
+                                                };
+                                                if theme::chip_button(ui, &knob_lbl, !part.params.is_empty())
+                                                    .on_hover_text("Snapshot current rack knobs of this part's live rigs")
+                                                    .clicked()
+                                                {
+                                                    *capture_knobs_for = Some((si, pi));
+                                                }
+                                            });
+                                        });
+                                        ui.add_space(6.0);
+                                        for (ri, rname) in rig_names.iter().enumerate() {
+                                            let r_u8 = ri as u8;
+                                            let existing_idx = part.rigs.iter().position(|r| r.rig == r_u8);
+                                            let mut on = existing_idx.is_some();
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 6.0;
+                                                if theme::chip_button(ui, &format!("{} · {rname}", ri + 1), on).clicked() {
+                                                    on = !on;
+                                                    if on {
+                                                        part.set_rig(PartRig::new(r_u8));
+                                                    } else {
+                                                        part.remove_rig(r_u8);
+                                                    }
+                                                    if is_live { *active_part_dirty = true; }
+                                                }
+                                                if let Some(pr) = part.rigs.iter_mut().find(|r| r.rig == r_u8) {
+                                                    ui.label(egui::RichText::new("Keys").size(11.0).color(theme::INK_2));
+                                                    let lo_lbl = crate::setlist::note_label(pr.key_lo);
+                                                    if ui.add(
+                                                        egui::DragValue::new(&mut pr.key_lo)
+                                                            .range(0..=127)
+                                                            .speed(0.25)
+                                                            .custom_formatter(|v, _| crate::setlist::note_label(v.round() as u8)),
+                                                    ).on_hover_text(format!("Lowest key: {lo_lbl}")).changed() {
+                                                        if pr.key_lo > pr.key_hi { pr.key_hi = pr.key_lo; }
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
+                                                    ui.label(egui::RichText::new("–").size(11.0).color(theme::INK_2));
+                                                    let hi_lbl = crate::setlist::note_label(pr.key_hi);
+                                                    if ui.add(
+                                                        egui::DragValue::new(&mut pr.key_hi)
+                                                            .range(0..=127)
+                                                            .speed(0.25)
+                                                            .custom_formatter(|v, _| crate::setlist::note_label(v.round() as u8)),
+                                                    ).on_hover_text(format!("Highest key: {hi_lbl}")).changed() {
+                                                        if pr.key_hi < pr.key_lo { pr.key_lo = pr.key_hi; }
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
+                                                    ui.label(egui::RichText::new("Tr").size(11.0).color(theme::INK_2));
+                                                    if ui.add(
+                                                        egui::DragValue::new(&mut pr.transpose)
+                                                            .range(-48..=48)
+                                                            .speed(0.2)
+                                                            .suffix(" st"),
+                                                    ).changed() {
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
+                                                    ui.label(egui::RichText::new("Lvl").size(11.0).color(theme::INK_2));
+                                                    let mut pct = (pr.level * 100.0).round() as i32;
+                                                    if ui.add(egui::DragValue::new(&mut pct).range(0..=100).speed(0.5).suffix("%")).changed() {
+                                                        pr.level = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                                                        if is_live { *active_part_dirty = true; }
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    });
+                                ui.add_space(8.0);
+                            }
+                        });
+                };
+
+                if two_col {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(left_w, avail_h), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            draw_left(
+                                ui,
+                                &mut self.setlist,
+                                &mut self.setlist_edit_song,
+                                &mut self.setlist_new_song_name,
+                                &mut self.setlist_import_open,
+                                &mut self.setlist_footswitch_learn,
+                                &mut add_song,
+                                &mut import_session,
+                                &mut move_song,
+                                &mut remove_song,
+                                &mut jump_to,
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.allocate_ui_with_layout(egui::vec2(right_w, avail_h), egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                            draw_right(
+                                ui,
+                                &mut self.setlist,
+                                self.setlist_edit_song,
+                                &mut self.setlist_new_part_name,
+                                &mut add_part_for,
+                                &mut remove_part,
+                                &mut capture_knobs_for,
+                                &mut jump_to,
+                                &mut active_part_dirty,
+                            );
+                        });
+                    });
+                } else {
+                    draw_left(
+                        ui,
+                        &mut self.setlist,
+                        &mut self.setlist_edit_song,
+                        &mut self.setlist_new_song_name,
+                        &mut self.setlist_import_open,
+                        &mut self.setlist_footswitch_learn,
+                        &mut add_song,
+                        &mut import_session,
+                        &mut move_song,
+                        &mut remove_song,
+                        &mut jump_to,
+                    );
+                    ui.add_space(12.0);
+                    Self::stage_hairline(ui);
+                    ui.add_space(10.0);
+                    draw_right(
+                        ui,
+                        &mut self.setlist,
+                        self.setlist_edit_song,
+                        &mut self.setlist_new_part_name,
+                        &mut add_part_for,
+                        &mut remove_part,
+                        &mut capture_knobs_for,
+                        &mut jump_to,
+                        &mut active_part_dirty,
+                    );
+                }
+            });
+        });
+
+        // Apply deferred actions outside the UI borrows.
+        if add_song {
+            let name = self.setlist_new_song_name.trim().to_string();
+            let title = if name.is_empty() {
+                format!("Song {}", self.setlist.songs.len() + 1)
+            } else {
+                name
+            };
+            self.setlist_new_song_name.clear();
+            let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
+            let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
+            let mut part = Part::new("Main", vec![pr]);
+            part.params = self.capture_part_knobs(&part.rigs);
+            self.setlist.songs.push(Song::new(title, vec![part]));
+            self.setlist_edit_song = Some(self.setlist.songs.len() - 1);
+        }
+        if let Some(sess) = import_session {
+            if let Err(e) = self.add_song_from_session_in(sessions_dir, &sess, None) {
+                self.session_msg = e;
+            }
+        }
+        if let Some((from, to)) = move_song {
+            if self.setlist.move_song(from, to) {
+                if self.setlist_edit_song == Some(from) {
+                    self.setlist_edit_song = Some(to);
+                }
+            }
+        }
+        if let Some(idx) = remove_song {
+            self.setlist.remove_song(idx);
+            self.apply_setlist_part();
+        }
+        if let Some(si) = add_part_for {
+            if let Some(part_len) = self.setlist.songs.get(si).map(|s| s.parts.len()) {
+                let raw = self.setlist_new_part_name.trim().to_string();
+                let pname = if raw.is_empty() {
+                    const DEFAULTS: [&str; 4] = ["Verse", "Chorus", "Bridge", "Solo"];
+                    DEFAULTS.get(part_len).copied().map(str::to_string)
+                        .unwrap_or_else(|| format!("Part {}", part_len + 1))
+                } else {
+                    raw
+                };
+                self.setlist_new_part_name.clear();
+                let rig = self.active_rig.min(n_rigs.saturating_sub(1)) as u8;
+                let pr = PartRig { rig, level: self.rig_mix[rig as usize].vol, ..PartRig::default() };
+                let mut part = Part::new(pname, vec![pr]);
+                part.params = self.capture_part_knobs(&part.rigs);
+                if let Some(song) = self.setlist.songs.get_mut(si) {
+                    song.parts.push(part);
+                }
+            }
+        }
+        if let Some((si, pi)) = remove_part {
+            if let Some(song) = self.setlist.songs.get_mut(si) {
+                if song.parts.len() > 1 && pi < song.parts.len() {
+                    song.parts.remove(pi);
+                    self.setlist.clamp_active();
+                    self.apply_setlist_part();
+                }
+            }
+        }
+        if let Some((si, pi)) = capture_knobs_for {
+            if let Some(rigs) = self.setlist.songs.get(si).and_then(|s| s.parts.get(pi)).map(|p| p.rigs.clone()) {
+                let knobs = self.capture_part_knobs(&rigs);
+                if let Some(part) = self.setlist.songs.get_mut(si).and_then(|s| s.parts.get_mut(pi)) {
+                    part.params = knobs;
+                }
+            }
+        }
+        if let Some(act) = step_action {
+            let _ = self.step_setlist(act);
+        }
+        if let Some((si, pi)) = jump_to {
+            let _ = self.select_setlist(si, pi);
+        } else if active_part_dirty {
+            self.apply_setlist_part();
         }
     }
 
@@ -20612,6 +21862,7 @@ impl DemoApp {
         let mut load_multi = false;
         let mut rig_switch: Option<usize> = None;
         let mut rig_cycle: i8 = 0;
+        let mut setlist_step: Option<&'static str> = None;
         // Pan an overflowing rack with the wheel / trackpad — only over the
         // bare stage (never over a panel or window that scrolls itself).
         let ov = self.rack_overflow;
@@ -20640,6 +21891,12 @@ impl DemoApp {
             }
             if i.consume_key(Modifiers::NONE, Key::ArrowLeft) { rig_cycle = -1; }
             if i.consume_key(Modifiers::NONE, Key::ArrowRight) { rig_cycle = 1; }
+            // Setlist stepping (#204): page-turner pedals send PageUp/PageDown;
+            // Shift+PageUp/PageDown jump whole songs. Check Shift BEFORE NONE.
+            if i.consume_key(Modifiers::SHIFT, Key::PageUp) { setlist_step = Some("prev_song"); }
+            if i.consume_key(Modifiers::SHIFT, Key::PageDown) { setlist_step = Some("next_song"); }
+            if i.consume_key(Modifiers::NONE, Key::PageUp) { setlist_step = Some("prev_part"); }
+            if i.consume_key(Modifiers::NONE, Key::PageDown) { setlist_step = Some("next_part"); }
             // Multi-rig demo (two independent rigs), F4.
             if i.consume_key(Modifiers::NONE, Key::F4) { load_multi = true; }
             // Starter templates on F5–F7 and Shift+F5–F7 (template_key),
@@ -20662,6 +21919,10 @@ impl DemoApp {
             // Hot-wire MIDI matrix.
             if i.consume_key(Modifiers::NONE, Key::F11) {
                 self.toggle_stage(StageView::Matrix);
+            }
+            // Setlist view (#204).
+            if i.consume_key(Modifiers::NONE, Key::F12) {
+                self.toggle_stage(StageView::Setlist);
             }
             // Letter shortcuts to the views (user 2026-11-15) — letters the
             // laptop piano does not use: M mixer · N matrix · B browser.
@@ -20715,6 +21976,7 @@ impl DemoApp {
                 else if self.scale_menu.is_some() { self.scale_menu = None; }
                 else if self.pending.is_some() { self.pending = None; }
                 else if self.cc_learn.is_some() { self.cc_learn = None; }
+                else if self.setlist_footswitch_learn.is_some() { self.setlist_footswitch_learn = None; }
                 else if self.stage_view == StageView::Matrix && self.rule_editor.is_some() { self.rule_editor = None; }
                 else if self.confirm_session.is_some() { self.confirm_session = None; }
                 else if self.stage_view != StageView::Rack { self.stage_view = StageView::Rack; }
@@ -20749,6 +22011,11 @@ impl DemoApp {
             self.notify_patch("one rig loaded — its stacks share a master · F4 loads two independent rigs, then 1–9 / ←→ switch");
         }
         if let Some(r) = rig_switch { self.set_active_rig(r); }
+        if let Some(step) = setlist_step {
+            if !self.setlist.songs.is_empty() {
+                let _ = self.step_setlist(step);
+            }
+        }
         if rig_cycle != 0 {
             let n = self.rig_count();
             if n > 1 {
@@ -25661,6 +26928,9 @@ impl DemoApp {
                 if let Some(l) = self.hw_leds.get_mut(d as usize) { *l = 1.0; }
             }
             self.last_midi = Some(self.midi_event_text(src, &format!("CC{cc} {val}")));
+            if self.handle_setlist_cc(ch, cc, val) {
+                continue;
+            }
             let learned = self.feed_cc_learn(src, cc, val);
             self.apply_cc_to_knobs(src, ch, cc, val, learned);
         }
@@ -25696,6 +26966,7 @@ impl DemoApp {
                 StageView::Rack => self.draw(ui),
                 StageView::Matrix => self.matrix_stage(ui),
                 StageView::Mixer => self.mixer_stage(ui),
+                StageView::Setlist => self.setlist_stage(ui),
                 StageView::Sessions => self.sessions_stage(ui),
                 StageView::Plugins => self.plugins_stage(ui),
                 StageView::Settings => self.settings_stage(ui),
@@ -40589,5 +41860,145 @@ mod navigator_tests {
             app.demo_playing = playing;
             super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join(format!("{name}.png")));
         }
+    }
+
+    #[test]
+    fn setlist_ui_tests_tools_persistence_rig_edits_undo_and_footswitch() {
+        // 1. Agent / MCP parity (rules 6, 23).
+        let tools = crate::assistant::tools();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        for name in ["get_setlist", "set_setlist_song", "select_setlist_part", "add_song_from_session", "set_setlist_footswitch"] {
+            assert!(names.contains(&name), "assistant tools missing {name}");
+            assert!(UI_BRIDGE_TOOLS.contains(&name), "UI_BRIDGE_TOOLS missing {name}");
+        }
+        assert!(tool_is_read_only("get_setlist"));
+        assert!(!tool_is_read_only("set_setlist_song"));
+        assert!(!tool_is_read_only("select_setlist_part"));
+
+        // 2. Build a 2-rig app and create a song with two parts via exec_tool.
+        let (mut app, _) = two_rigs_with_inserts(true);
+        let res = app.exec_tool("set_setlist_song", &serde_json::json!({
+            "name": "Opener",
+            "bpm": 118.0,
+            "time_signature": {"numerator": 4, "denominator": 4},
+            "parts": [
+                {"name": "Verse", "rigs": [{"rig": 0, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.9}], "capture_knobs": true},
+                {"name": "Chorus", "rigs": [
+                    {"rig": 0, "key_lo": 0, "key_hi": 59, "transpose": 0, "level": 0.85},
+                    {"rig": 1, "key_lo": 60, "key_hi": 127, "transpose": 12, "level": 0.8}
+                ], "capture_knobs": true}
+            ]
+        }));
+        let v: serde_json::Value = serde_json::from_str(&res).expect("valid setlist json");
+        assert_eq!(v["songs"].as_array().unwrap().len(), 1);
+        assert_eq!(v["songs"][0]["parts"].as_array().unwrap().len(), 2);
+
+        // Select part 0 (Verse): rig 0 live, rig 1 gated.
+        let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 0}));
+        assert!(app.rig_zones[0].live && !app.rig_zones[1].live);
+        assert!((app.bpm - 118.0).abs() < 1e-3);
+
+        // Step next_part (Chorus): both rigs live, rig 1 transposed +12.
+        let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"action": "next_part"}));
+        assert!(app.rig_zones[0].live && app.rig_zones[0].key_hi == 59);
+        assert!(app.rig_zones[1].live && app.rig_zones[1].key_lo == 60 && app.rig_zones[1].transpose == 12);
+
+        // 3. Foot-switch CC learn & rising-edge trigger (no double-step on hold/release).
+        app.setlist_footswitch_learn = Some(crate::setlist::FootSwitchAction::Prev);
+        assert!(app.handle_setlist_cc(0, 67, 127), "learn consumes CC");
+        assert_eq!(app.setlist.prev_cc, Some(crate::setlist::FootSwitch { cc: 67, channel: None }));
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
+        // Release pedal (val 0), then press again (val 127): steps back to Verse (part 0).
+        assert!(app.handle_setlist_cc(0, 67, 0));
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 1 }));
+        assert!(app.handle_setlist_cc(0, 67, 127));
+        assert_eq!(app.setlist.active, Some(crate::setlist::SetlistPos { song: 0, part: 0 }));
+
+        // 4. Survives save/load round-trip.
+        let dir = std::env::temp_dir().join(format!("kabelsalat-setlist-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let saved = app.capture_session("Gig").unwrap();
+        let pkg = crate::session::Session::package_path(&dir, "Gig").unwrap();
+        saved.save(&pkg).unwrap();
+        let loaded = crate::session::Session::load(&pkg).unwrap();
+        assert_eq!(loaded.setlist, app.setlist);
+
+        // 5. Survives rig delete (rig 0 removed → Chorus keeps rig 1 remapped to rig 0).
+        app.edit_rigs(Some(0));
+        let chorus = &app.setlist.songs[0].parts[1];
+        assert_eq!(chorus.rigs.len(), 1);
+        assert_eq!(chorus.rigs[0].rig, 0);
+        assert_eq!(chorus.rigs[0].transpose, 12);
+
+        // 6. Add song from saved session imports its rigs and appends a song.
+        let single_pkg = crate::session::Session::package_path(&dir, "PianoSong").unwrap();
+        let mut s_one = crate::session::Template::SynthLead.session();
+        s_one.name = "PianoSong".into();
+        s_one.save(&single_pkg).unwrap();
+        let before_rigs = app.rig_count();
+        let (song_idx, new_rigs) = app.add_song_from_session_in(&dir, "PianoSong", Some("Encore")).unwrap();
+        assert_eq!(app.rig_count(), before_rigs + 1);
+        assert_eq!(new_rigs.len(), 1);
+        assert_eq!(app.setlist.songs[song_idx].name, "Encore");
+        assert_eq!(app.setlist.songs[song_idx].parts[0].rigs[0].rig as usize, new_rigs[0]);
+
+        // 7. Undo/redo restores setlist edits.
+        app.undo_job = None;
+        let _ = app.exec_tool("set_setlist_song", &serde_json::json!({"name": "Temp Song"}));
+        let after_add = app.setlist.songs.len();
+        let _ = app.undo_agent(true).unwrap();
+        assert_eq!(app.setlist.songs.len(), after_add - 1);
+        let _ = app.undo_agent(false).unwrap();
+        assert_eq!(app.setlist.songs.len(), after_add);
+
+        // 8. Renders cleanly at narrow and desktop sizes.
+        app.stage_view = StageView::Setlist;
+        let ctx = egui::Context::default();
+        for (w, h) in [(900.0, 700.0), (1280.0, 800.0)] {
+            let _ = run_frame_at(&mut app, &ctx, Vec2::new(w, h), vec![]);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "writes PNGs: KABELSALAT_SHOTS=<dir> cargo test --bin kabelsalat setlist_shots -- --ignored"]
+    fn setlist_shots() {
+        let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make_app = || {
+            let (mut app, _) = two_rigs_with_inserts(true);
+            let _ = app.rename_rig(0, "Piano");
+            let _ = app.rename_rig(1, "Warm Pad");
+            let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": "Opening Night",
+                "bpm": 118.0,
+                "time_signature": {"numerator": 4, "denominator": 4},
+                "parts": [
+                    {"name": "Verse", "rigs": [{"rig": 0, "key_lo": 36, "key_hi": 96, "transpose": 0, "level": 0.9}], "capture_knobs": true},
+                    {"name": "Chorus", "rigs": [
+                        {"rig": 0, "key_lo": 36, "key_hi": 59, "transpose": 0, "level": 0.85},
+                        {"rig": 1, "key_lo": 60, "key_hi": 96, "transpose": 12, "level": 0.8}
+                    ], "capture_knobs": true}
+                ]
+            }));
+            let _ = app.exec_tool("set_setlist_song", &serde_json::json!({
+                "name": "Midnight Waltz",
+                "bpm": 76.0,
+                "time_signature": {"numerator": 3, "denominator": 4},
+                "parts": [
+                    {"name": "Theme", "rigs": [{"rig": 1, "key_lo": 0, "key_hi": 127, "transpose": 0, "level": 0.85}]}
+                ]
+            }));
+            let _ = app.exec_tool("set_setlist_footswitch", &serde_json::json!({"action": "next", "cc": 64}));
+            let _ = app.exec_tool("select_setlist_part", &serde_json::json!({"song": 0, "part": 1}));
+            app
+        };
+        let mut app = make_app();
+        app.stage_view = StageView::Setlist;
+        super::offline_shots::shot(&mut app, Vec2::new(1280.0, 800.0), &dir.join("setlist.png"));
+        let mut app_rack = make_app();
+        app_rack.stage_view = StageView::Rack;
+        super::offline_shots::shot(&mut app_rack, Vec2::new(1280.0, 800.0), &dir.join("setlist-rack.png"));
     }
 }

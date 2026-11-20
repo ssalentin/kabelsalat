@@ -90,6 +90,21 @@ organ, drums, or wind with CC 2 and aftertouch breath) on the engine clock at
 the session tempo — turn knobs, swap sounds or add effects and hear them right
 away without a MIDI keyboard (`play_demo` / `stop_demo` for agents).
 
+### Play a setlist without a gap
+Press **F12** (or click **Setlist**) to organize a gig into songs and parts
+(Verse, Chorus, Solo) over the loaded rigs. Every rig stays loaded; each part
+says which rigs take new notes, with per-rig key range, transpose, level and
+stored knob values, and each song can set its own tempo and time signature.
+Switching parts never cuts held notes or reverb tails — outgoing rigs keep
+sounding until you release the keys or sustain pedal, while new notes play the
+next part from the same audio block on. Step parts from the top bar, with
+**PageUp / PageDown** (**Shift+PageUp / Shift+PageDown** for songs — works with
+page-turner pedals), or bind a hardware MIDI foot-switch CC. **Add song from
+session** pulls a saved session's rigs into the gig as a new song, and the
+assistant and MCP agents can read, build and step the setlist.
+
+<p align="center"><img src="docs/shots/setlist.png" width="85%" alt="The Setlist view: songs with tempo and time signature on the left, parts with per-rig key ranges, transpose, level and knob capture on the right, and the song/part stepper in the top bar"/></p>
+
 ### Browse and install plugins by type
 Press **F9** (or **B**) to open **Plugins**, organized by what each unit does
 rather than by plugin format: **Instruments**, **Effects**, **MIDI FX**,

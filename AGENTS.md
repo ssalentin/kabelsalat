@@ -1348,6 +1348,25 @@ Learned so far (2026-11-15, UI polish pass):
     restores it (`a_reused_vitalium_plays_the_init_patch_not_the_last_units`).
     A test of a pooled instance takes every parked one, not the one it hopes
     to get.
+183. **State a frame reads belongs to the app or its egui context, never to
+    the process:** tests run as threads of one process, so a `static` one
+    test writes is in every other test's frame. `theme::MEDIUM_INSTALLED` was
+    set by any test that called `install_fonts`, and all other contexts then
+    asked for a "medium" family they never bound and laid text out wider:
+    `every_view_fits_small_windows` failed in parallel `ui::` runs on machines
+    that have NotoSans-Medium (#137; Ubuntu's `fonts-noto-core` has none, so
+    CI stayed green). `bridge::LAST_REMOTE_MS` put the "Agent connected" chip
+    into every top bar whenever a bridge test ran. Faces live in the context's
+    data (`theme::use_fonts_of`, first call of a frame), the agent state in
+    `DemoApp::remote` (the real app swaps in `bridge::remote()`, like the
+    clock). To find such a leak, print which texts or glyphs appear only in
+    the parallel run. Still shared and unmeasured: `bridge::UI_INBOX`,
+    `REMOTE_CMDS`, `CONFIGURED_BUFFER_FRAMES`.
+184. **A test never reads a wall clock it also races:** a status line showed
+    "0 of 4 s" for a recording started "now"; on a busy machine two frames
+    took over half a second and it read "1 of 4 s". Give the test a time that
+    cannot move (here a recording that starts in the future), never a bigger
+    margin (`a_listen_shows_its_recording_progress_and_then_the_judging_model`).
 
 ## Working on kabelsalat
 

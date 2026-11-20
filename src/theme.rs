@@ -12,7 +12,6 @@
 //! selection/CTA = tomato · active/playing = teal · clip/danger = red.
 //! Cable jackets: six-color CABLE_PALETTE (shape separates audio/MIDI).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -747,8 +746,31 @@ pub fn visuals() -> egui::Visuals {
 // reserved for the flip-pill large label.
 // ---------------------------------------------------------------------------
 
-static BOLD_INSTALLED: AtomicBool = AtomicBool::new(false);
-static MEDIUM_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Which of the optional faces `install_fonts` bound in a context. Kept in
+/// that context's own data: a face is a property of the context that draws,
+/// and a process has several of them (every test builds its own).
+#[derive(Clone, Copy, Default)]
+struct Faces {
+    medium: bool,
+    bold: bool,
+}
+
+thread_local! {
+    /// The faces of the context this thread is drawing with: set by
+    /// `use_fonts_of` at the start of a frame and by `install_fonts`.
+    static FACES: std::cell::Cell<Faces> = const { std::cell::Cell::new(Faces { medium: false, bold: false }) };
+}
+
+fn faces_id() -> egui::Id {
+    egui::Id::new("kabelsalat_font_faces")
+}
+
+/// Draw with the faces `ctx` has. Call it first in every frame, before any
+/// `medium_font`/`bold_font`: a font id naming a family the context never
+/// bound is laid out in another face, with other widths.
+pub fn use_fonts_of(ctx: &egui::Context) {
+    FACES.set(ctx.data(|d| d.get_temp::<Faces>(faces_id())).unwrap_or_default());
+}
 
 fn load_font(fonts: &mut egui::FontDefinitions, name: &str, path: &str) -> bool {
     match std::fs::read(path) {
@@ -831,14 +853,14 @@ pub fn install_fonts(ctx: &egui::Context) {
     if bold {
         let fam = if reg { family(&["noto-bold", "noto"]) } else { family(&["noto-bold"]) };
         fonts.families.insert(FontFamily::Name("bold".into()), fam);
-        BOLD_INSTALLED.store(true, Ordering::Relaxed);
     }
     if med {
         let fam = if reg { family(&["noto-medium", "noto"]) } else { family(&["noto-medium"]) };
         fonts.families.insert(FontFamily::Name("medium".into()), fam);
-        MEDIUM_INSTALLED.store(true, Ordering::Relaxed);
     }
     ctx.set_fonts(fonts);
+    ctx.data_mut(|d| d.insert_temp(faces_id(), Faces { medium: med, bold }));
+    use_fonts_of(ctx);
 }
 
 /// Bold proportional face (falls back to the regular proportional face when
@@ -846,7 +868,7 @@ pub fn install_fonts(ctx: &egui::Context) {
 /// kept installed for large-label emphasis.
 #[allow(dead_code)]
 pub fn bold_font(size: f32) -> FontId {
-    if BOLD_INSTALLED.load(Ordering::Relaxed) {
+    if FACES.get().bold {
         FontId::new(size, FontFamily::Name("bold".into()))
     } else {
         FontId::proportional(size)
@@ -856,7 +878,7 @@ pub fn bold_font(size: f32) -> FontId {
 /// Medium proportional face for display/headings/unit names (weight 500 ≈
 /// the reference's 400–550). Falls back to regular when unavailable.
 pub fn medium_font(size: f32) -> FontId {
-    if MEDIUM_INSTALLED.load(Ordering::Relaxed) {
+    if FACES.get().medium {
         FontId::new(size, FontFamily::Name("medium".into()))
     } else {
         FontId::proportional(size)
@@ -1150,6 +1172,30 @@ mod font_coverage_tests {
     /// symbol faces installed, every one has a glyph in the regular, medium
     /// and monospace families. Runs wherever the Noto fonts are installed
     /// (CI installs `fonts-noto-core`); CI fails without them.
+    /// A face belongs to the context that bound it. The flag was one per
+    /// process, so one test's `install_fonts` switched every other test's
+    /// context to a family it never bound (#137).
+    #[test]
+    fn the_medium_face_is_used_only_in_a_context_that_bound_it() {
+        let bound = egui::Context::default();
+        bound.data_mut(|d| d.insert_temp(faces_id(), Faces { medium: true, bold: false }));
+        let plain = egui::Context::default();
+        use_fonts_of(&plain);
+        assert_eq!(medium_font(13.0), FontId::proportional(13.0));
+        // Another thread draws with a context that has the face.
+        let other = bound.clone();
+        std::thread::spawn(move || {
+            use_fonts_of(&other);
+            assert_eq!(medium_font(13.0), FontId::new(13.0, FontFamily::Name("medium".into())));
+        }).join().unwrap();
+        assert_eq!(medium_font(13.0), FontId::proportional(13.0), "this thread's context still has no medium face");
+        // One thread, two contexts: each frame draws with its own.
+        use_fonts_of(&bound);
+        assert_eq!(medium_font(13.0), FontId::new(13.0, FontFamily::Name("medium".into())));
+        use_fonts_of(&plain);
+        assert_eq!(medium_font(13.0), FontId::proportional(13.0));
+    }
+
     #[test]
     fn every_ui_symbol_has_a_glyph() {
         let missing_files: Vec<&str> = std::iter::once("NotoSans-Regular.ttf")

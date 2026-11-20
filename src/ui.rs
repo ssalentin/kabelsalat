@@ -3531,6 +3531,9 @@ struct DemoApp {
     /// thread. The real app swaps in `clocksend::global()`; tests keep
     /// their own, so none of them touches another's or the user's.
     clock: Arc<crate::clocksend::ClockControl>,
+    /// External agents: when the bridge last heard one and whether the user
+    /// paused them. The real app swaps in `bridge::remote()`, like the clock.
+    remote: Arc<crate::bridge::Remote>,
     /// File-player control (decode thread); engine owns the ring consumer.
     player_ctrl: Option<crate::player::PlayerControl>,
     /// Retired player buffers the engine handed back: dropped here (UI
@@ -3938,6 +3941,7 @@ impl DemoApp {
             rig_snapshot: Arc::new(Mutex::new(crate::control::RigSnapshot::default())),
             graph_pub: None,
             clock: crate::clocksend::ClockControl::new(),
+            remote: Arc::default(),
             last_graph_rev: 0,
             player_ctrl: None,
             player_retire_rx: None,
@@ -12887,8 +12891,8 @@ impl DemoApp {
                 let dsp = self.dsp_chip_layout(ui);
 
                 use std::sync::atomic::Ordering::Relaxed;
-                let agent_paused = crate::bridge::REMOTE_PAUSED.load(Relaxed);
-                let agent_last = crate::bridge::LAST_REMOTE_MS.load(Relaxed);
+                let agent_paused = self.remote.paused.load(Relaxed);
+                let agent_last = self.remote.last_ms.load(Relaxed);
                 let agent_recent = agent_last > 0 && crate::bridge::now_ms().saturating_sub(agent_last) < 15_000;
                 let agent_visible = agent_paused || agent_recent;
 
@@ -13162,7 +13166,7 @@ impl DemoApp {
                                     ui.painter().rect_stroke(r.rect, 2.0, Stroke::new(1.2, theme::AGENT_COLOR), egui::StrokeKind::Inside);
                                 }
                                 self.agent_chip_rect = r.rect;
-                                if r.clicked() { crate::bridge::REMOTE_PAUSED.store(!agent_paused, Relaxed); }
+                                if r.clicked() { self.remote.paused.store(!agent_paused, Relaxed); }
                             }
 
                             // Dock group (`Keyboard` | `Assistant`, compact `Keys` | `AI`),
@@ -24020,6 +24024,7 @@ impl DemoApp {
 
     fn frame_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        theme::use_fonts_of(&ctx);
         self.popup_open_at_start = egui::Popup::is_any_open(&ctx);
         // Subtitles first: a changed instrument name is laid out this frame.
         self.refresh_instrument_subs();
@@ -25692,6 +25697,7 @@ fn run_inner(sink: Option<NoteSink>, with_audio: bool) -> anyhow::Result<()> {
                     app.rig_snapshot = rig_snapshot;
                     app.graph_pub = Some(graph_pub);
                     app.clock = crate::clocksend::global();
+                    app.remote = crate::bridge::remote();
                     app.player_ctrl = Some(player_ctrl);
                     app.player_retire_rx = Some(player_retire_rx);
                     app.recorder = Some(recorder);
@@ -27682,10 +27688,10 @@ mod rig_switch_tests {
         // Sizes in points (egui's screen_rect unit): the minimum window, the
         // user's ~780-point tile, and a full screen.
         // Worst case on purpose: an external agent is connected, so its chip
-        // shows too (a global the bridge tests also set in parallel).
-        crate::bridge::LAST_REMOTE_MS.store(crate::bridge::now_ms() + 600_000, std::sync::atomic::Ordering::Relaxed);
+        // shows too.
         for width in [760.0f32, 900.0, 1600.0] {
             let mut app = DemoApp::new_with_sink(None);
+            app.remote.last_ms.store(crate::bridge::now_ms(), std::sync::atomic::Ordering::Relaxed);
             let ctx = egui::Context::default();
             app.show_stats = true;
             app.last_midi = Some("ESI MIDIMATE eX MIDI 1 · C4 v100 · a very long device name that keeps going and going".into());
@@ -27716,7 +27722,6 @@ mod rig_switch_tests {
             out.textures_delta.clear();
             assert_eq!(app.stage_view, StageView::Mixer, "{width} pt: the View buttons stay clickable");
         }
-        crate::bridge::LAST_REMOTE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -33815,7 +33820,10 @@ mod settings_and_dropdown_tests {
             doing: "Listen to the master".into(),
             user_idx: 0,
         });
-        crate::listen::set_stage(Some(Stage::Recording { since: std::time::Instant::now(), secs: 4.0 }));
+        // A recording about to start: it reads "0 of 4 s" however long the
+        // frames below take (on a busy machine they took over half a second,
+        // and the line read "1 of 4 s").
+        crate::listen::set_stage(Some(Stage::Recording { since: std::time::Instant::now() + std::time::Duration::from_secs(600), secs: 4.0 }));
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
         let size = Vec2::new(1280.0, 900.0);
@@ -36602,6 +36610,21 @@ mod engine_info_tests {
         }
     }
 
+
+    /// The agent chip shows what this app's bridge heard. A request another
+    /// app in the process handled (in tests: any bridge or MCP test) is not
+    /// this app's: it widened every top bar and added glyphs to every atlas.
+    #[test]
+    fn a_bridge_request_elsewhere_in_the_process_shows_no_agent_chip_here() {
+        let now = || crate::bridge::now_ms();
+        crate::bridge::remote().last_ms.store(now(), Ordering::Relaxed);
+        let (mut app, ctx) = app_at(counters(22.0), SIZE);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(!has(&texts, "● Agent connected"), "another app's agent shows here");
+        app.remote.last_ms.store(now(), Ordering::Relaxed);
+        let texts = run_frame(&mut app, &ctx, SIZE, vec![]);
+        assert!(has(&texts, "● Agent connected"), "this app's own agent shows");
+    }
 
     /// The readout and panel repaint changing numbers four times a second
     /// for as long as the app runs. egui clears a font atlas past 80 % and

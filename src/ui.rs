@@ -1038,6 +1038,10 @@ fn remap_session(
     for (&old, label) in s.strip_knobs() {
         if let Some(node) = remap(old) { ns.set_strip_knob(node, label.clone()); }
     }
+    // Each synth's input selection (#124) follows its node.
+    for m in s.midi_sources() {
+        if let Some(node) = remap(m.node) { ns.set_midi_sources(crate::session::MidiSources { node, ..m.clone() }); }
+    }
     // Sends (issue #5) follow their bus and their source: a node by its id, a
     // rig by where its nodes went (a deleted rig takes its sends along).
     let rig_of = |old: u8| -> Option<u8> {
@@ -6103,13 +6107,71 @@ impl DemoApp {
     fn restore_voice_rows(&mut self, rows: &[VoiceRow]) {
         for row in rows {
             let Some(slot) = self.voice_slot_of_node(row.node) else { continue };
-            self.rig_sources[slot] = row.sources;
-            self.rig_device[slot] = row.device;
             self.patch_names[slot] = row.patch_name.clone();
-            self.send_rig_source(row.node);
-            if let Some(bus) = &self.bus {
-                let _ = bus.lock().unwrap().send(Command::SetRigDevice { node: row.node, device: row.device });
+            self.set_voice_inputs(row.node, row.sources, row.device);
+        }
+    }
+
+    /// One synth's input selection, in the slot tables and in the engine.
+    fn set_voice_inputs(&mut self, node: u32, sources: (bool, bool), device: Option<u32>) {
+        let Some(slot) = self.voice_slot_of_node(node) else { return };
+        self.rig_sources[slot] = sources;
+        self.rig_device[slot] = device;
+        self.send_rig_source(node);
+        if let Some(bus) = &self.bus {
+            let _ = bus.lock().unwrap().send(Command::SetRigDevice { node, device });
+        }
+    }
+
+    /// Give every synth the input selection the session saved for it (#124),
+    /// once the load has reset them all.
+    fn restore_midi_sources(&mut self, s: &crate::session::Session) {
+        for row in s.midi_sources() {
+            let device = row.device.as_deref().map(|port| self.hw_device_of_port(port));
+            // The device list is full: no hardware, never all of it.
+            let hardware = row.hardware && device != Some(None);
+            self.set_voice_inputs(row.node, (row.keyboard, hardware), device.flatten());
+        }
+    }
+
+    /// The device index of a saved port name (`midi_port_key`). A device
+    /// that is not listed gets a place as an unplugged one: the synth stays
+    /// bound to it, and the hot-plug pass gives the device that index when
+    /// it shows up (`match_midi_device`). None = the list is full.
+    fn hw_device_of_port(&mut self, port: &str) -> Option<u32> {
+        if let Some(d) = self.hw_devices.iter().position(|n| midi_port_key(n) == port) {
+            return Some(d as u32);
+        }
+        let d = {
+            let mut listed = self.hw_midi.devices.lock().ok()?;
+            match listed.iter().position(|(n, _)| midi_port_key(n) == port) {
+                Some(d) => d,
+                None if listed.len() >= crate::engine::MAX_HW_DEVICES as usize => return None,
+                None => {
+                    listed.push((port.to_string(), false));
+                    listed.len() - 1
+                }
             }
+        };
+        self.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.adopt_hw_devices();
+        Some(d as u32)
+    }
+
+    /// Mirror the MIDI thread's device list when it changed (one atomic load).
+    fn adopt_hw_devices(&mut self) {
+        let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
+        if rev == self.hw_midi_rev { return; }
+        self.hw_midi_rev = rev;
+        if let Ok(d) = self.hw_midi.devices.lock() {
+            self.hw_devices = d.iter().map(|(n, _)| n.clone()).collect();
+            self.hw_live = d.iter().map(|(_, l)| *l).collect();
+            let live: Vec<&str> = d.iter().filter(|(_, l)| *l).map(|(n, _)| n.as_str()).collect();
+            self.hw_status = if live.is_empty() {
+                "no hardware MIDI — laptop keys live".into()
+            } else {
+                format!("MIDI in: {}", live.join(", "))
+            };
         }
     }
 
@@ -6304,6 +6366,16 @@ impl DemoApp {
         rules.sort_by_key(|r| (format!("{:?}", r.source), r.dest));
         if !rules.is_empty() {
             s.set_matrix(Some(serde_json::to_value(&rules)?));
+        }
+        // Each synth's input selection (#124). The device goes by its port
+        // name: its index is only its place in this run's scan (rule 58).
+        for row in self.voice_rows() {
+            let device = row.device.and_then(|d| self.hw_devices.get(d as usize)).map(|n| midi_port_key(n).to_string());
+            // An index no listed device has cannot be named. Such a synth
+            // hears no hardware now, and neither does it after a reload.
+            let unnamed = row.device.is_some() && device.is_none();
+            let (keyboard, hardware) = (row.sources.0, row.sources.1 && !unnamed);
+            s.set_midi_sources(crate::session::MidiSources { node: row.node, keyboard, hardware, device });
         }
         s.rig_names = (0..self.rig_count()).map(|r| self.rig_name(r)).collect();
         s.master_target = Some(self.master_target);
@@ -6506,6 +6578,7 @@ impl DemoApp {
         // Reset per-rig filters for the new graph (Keys splits travel IN the
         // graph — Node::split — so LoadGraph restores them).
         self.reset_rig_inputs();
+        self.restore_midi_sources(s);
         if let Some(bus) = &self.bus {
             let mut b = bus.lock().unwrap();
             for u in &mut self.units {
@@ -18753,21 +18826,8 @@ impl DemoApp {
                 self.note_leds[n] = 1.0;
             }
         }
-        // Adopt hot-plug changes from the MIDI thread (one atomic load).
-        let rev = self.hw_midi.rev.load(std::sync::atomic::Ordering::Acquire);
-        if rev != self.hw_midi_rev {
-            self.hw_midi_rev = rev;
-            if let Ok(d) = self.hw_midi.devices.lock() {
-                self.hw_devices = d.iter().map(|(n, _)| n.clone()).collect();
-                self.hw_live = d.iter().map(|(_, l)| *l).collect();
-                let live: Vec<&str> = d.iter().filter(|(_, l)| *l).map(|(n, _)| n.as_str()).collect();
-                self.hw_status = if live.is_empty() {
-                    "no hardware MIDI — laptop keys live".into()
-                } else {
-                    format!("MIDI in: {}", live.join(", "))
-                };
-            }
-        }
+        // Adopt hot-plug changes from the MIDI thread.
+        self.adopt_hw_devices();
         // Per-rig activity for the overview strip: instant attack, slow release.
         let n_rigs = self.rig_count();
         if self.rig_levels.len() != n_rigs { self.rig_levels.resize(n_rigs, 0.0); }
@@ -24324,6 +24384,32 @@ pub fn run_session_test() -> anyhow::Result<()> {
         println!("  mixer strips: name, colour, mute/pan, collapse, quick knob round-trip — OK");
     }
 
+    // --- Input selection of the CLAP synths (#124): keyboard, hardware and
+    // the device round-trip through the package, the device by its port
+    // name (rule 65). Non-default values; the device is not plugged in. ---
+    {
+        app.apply_session(&crate::session::Session::load(&pkg)?)?;
+        let port = "Selftest Keys:Selftest Keys MIDI 1";
+        let dev = app.hw_device_of_port(port).ok_or_else(|| anyhow::anyhow!("the MIDI device list is full"))?;
+        let unit = |app: &DemoApp, node: u32| app.units.iter().position(|u| u.node_id == node)
+            .ok_or_else(|| anyhow::anyhow!("no unit for node {node}"));
+        let (a, b) = (unit(&app, 1)?, unit(&app, 4)?);
+        app.matrix_toggle(a, MatrixRow::HwAll, false); // Surge A: the keyboard only
+        app.matrix_toggle(b, MatrixRow::Keys, false); // Surge B: that device only
+        app.matrix_toggle(b, MatrixRow::HwDev(dev), true);
+        let inputs_pkg = crate::session::Session::package_path(&dir, "selftest-inputs")?;
+        app.capture_session("selftest-inputs")?.save(&inputs_pkg)?;
+        app.load_demo_patch();
+        anyhow::ensure!(app.rig_sources.iter().all(|s| *s == (true, true)) && app.rig_device.iter().all(Option::is_none),
+            "the demo patch must start on the keyboard and all hardware");
+        app.apply_session(&crate::session::Session::load(&inputs_pkg)?)?;
+        let inputs = |app: &DemoApp, node: u32| app.voice_slot_of_node(node).map(|s| (app.rig_sources[s], app.rig_device[s]));
+        anyhow::ensure!(inputs(&app, 1) == Some(((true, false), None)), "Surge A inputs not restored: {:?}", inputs(&app, 1));
+        anyhow::ensure!(inputs(&app, 4) == Some(((false, true), Some(dev))), "Surge B inputs not restored: {:?}", inputs(&app, 4));
+        anyhow::ensure!(app.hw_devices.get(dev as usize).map(|n| midi_port_key(n)) == Some(port), "device {dev} is not '{port}'");
+        println!("  input selection: keyboard only / one device by port name ('{port}', not plugged in) round-trip — OK");
+    }
+
     // --- Starter templates: each must rebuild a correct, playable rack ---
     // (units, cables, Keys/Master present, default params applied, layout grouped)
     let expect = [
@@ -26698,12 +26784,12 @@ mod rig_switch_tests {
         assert_eq!(app.rig_count(), 2);
     }
 
-    const FM1_PORT: &str = "M-Wave FM-1:M-Wave FM-1 MIDI 1";
-    const U6_PORT: &str = "U6MIDI Pro:U6MIDI Pro MIDI 1";
+    pub(super) const FM1_PORT: &str = "M-Wave FM-1:M-Wave FM-1 MIDI 1";
+    pub(super) const U6_PORT: &str = "U6MIDI Pro:U6MIDI Pro MIDI 1";
 
     /// The hardware ports as the MIDI thread would list them, with ALSA's
     /// client:port numbers (tests never scan the machine, rule 48).
-    fn list_midi_ports(app: &mut DemoApp, ports: &[(&str, &str)]) {
+    pub(super) fn list_midi_ports(app: &mut DemoApp, ports: &[(&str, &str)]) {
         let names: Vec<String> = ports.iter().map(|(port, alsa)| format!("{port} {alsa}")).collect();
         *app.hw_midi.devices.lock().unwrap() = names.iter().map(|n| (n.clone(), true)).collect();
         app.hw_midi.rev.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -26825,8 +26911,25 @@ mod rig_switch_tests {
         assert_eq!(match_midi_device(&listed, &format!("{U6_PORT} 40:0")), Ok(Some(dev as usize)));
 
         let again = app.capture_session("still-missing").unwrap();
-        let (app, _) = reopened(&again, &[(U6_PORT, "28:0")]);
+        let (mut app, _) = reopened(&again, &[(U6_PORT, "28:0")]);
         assert_eq!(input_selection(&app, 1), (false, true, Some(U6_PORT.into())), "saved again while it was unplugged");
+
+        // A device index nothing is listed under has no name to save: such
+        // a synth hears no hardware, and is saved that way.
+        let (slot_b, node_b) = (app.rig_of_unit(clap_unit(&app, 1)).unwrap(), app.units[clap_unit(&app, 1)].node_id);
+        app.rig_device[slot_b] = Some(9);
+        let unnamed = app.capture_session("unnamed").unwrap();
+        let row = unnamed.midi_sources().iter().find(|m| m.node == node_b).expect("a row for rig B's synth");
+        assert_eq!((row.keyboard, row.hardware, row.device.as_deref()), (false, false, None));
+
+        // No place left in the device list: the synth hears no hardware,
+        // never all of it.
+        let others: Vec<String> = (0..crate::engine::MAX_HW_DEVICES).map(|i| format!("Port {i}:Port {i} MIDI 1")).collect();
+        let full: Vec<(&str, &str)> = others.iter().map(|n| (n.as_str(), "20:0")).collect();
+        let (app, sent) = reopened(&loaded, &full);
+        assert_eq!(input_selection(&app, 1), (false, false, None));
+        let node_b = app.units[clap_unit(&app, 1)].node_id;
+        assert_eq!(engine_inputs(&sent, node_b), (Some((false, false)), Some(None)));
     }
 
     /// A session file from before #124 says nothing about inputs: it loads,
@@ -36689,6 +36792,54 @@ mod voice_host_tests {
         rig.app.apply_session(&session).unwrap();
         assert_voiced(&mut rig, 8, "the session loaded back");
         assert_marks(&marks(&mut rig, &p), &own, "after the session round trip");
+    }
+
+    /// #124 at the engine's output, with real Surge voices: after a reopened
+    /// session a synth plays from its saved source only. Synth A was saved
+    /// on the U6MIDI Pro alone and synth B on nothing; the devices come
+    /// back in the other scan order.
+    #[test]
+    fn a_reopened_session_plays_a_synth_from_its_saved_device_only() {
+        use super::rig_switch_tests::{list_midi_ports, FM1_PORT, U6_PORT};
+        let Some(mut rig) = rig() else { return };
+        let peak_of = |rig: &mut EvalRig, source: SourceId| -> f32 {
+            let send = |rig: &mut EvalRig, cmd: Command| assert!(rig.app.bus.as_ref().unwrap().lock().unwrap().send(cmd));
+            send(rig, Command::NoteOn { note: 60, velocity: 0.9, source, channel: 0 });
+            let mut peak = 0.0f32;
+            for _ in 0..40 {
+                rig.frame();
+                peak = rig.buf.iter().fold(peak, |m, s| m.max(s.abs()));
+            }
+            send(rig, Command::NoteOff { note: 60, source, channel: 0 });
+            for _ in 0..200 { rig.frame(); }
+            peak
+        };
+        let heard = peak_of(&mut rig, SourceId::Keys);
+        assert!(heard > 1e-3, "the probe hears a synth that listens to the keyboard (peak {heard})");
+
+        list_midi_ports(&mut rig.app, &[(FM1_PORT, "24:0"), (U6_PORT, "32:0")]);
+        let synths: Vec<usize> = (0..rig.app.units.len()).filter(|&u| matches!(rig.app.units[u].node_kind, UnitKind::Clap)).collect();
+        let (a, b) = (synths[0], synths[1]);
+        rig.app.matrix_toggle(a, MatrixRow::Keys, false);
+        rig.app.matrix_toggle(a, MatrixRow::HwDev(1), true);
+        rig.app.matrix_toggle(b, MatrixRow::Keys, false);
+        rig.app.matrix_toggle(b, MatrixRow::HwAll, false);
+        let pkg = crate::session::Session::package_path(&DemoApp::sessions_dir(), "inputs-engine").unwrap();
+        rig.app.capture_session("inputs-engine").unwrap().save(&pkg).unwrap();
+
+        rig.app.load_demo_patch();
+        rig.settle();
+        list_midi_ports(&mut rig.app, &[(U6_PORT, "28:0"), (FM1_PORT, "36:0")]);
+        rig.app.apply_session(&crate::session::Session::load(&pkg).unwrap()).unwrap();
+        rig.settle();
+        for _ in 0..200 { rig.frame(); } // the baseline note's tail is gone (rule 133)
+
+        let keys = peak_of(&mut rig, SourceId::Keys);
+        assert!(keys < 1e-4, "both synths were saved with the keyboard off (peak {keys})");
+        let fm1 = peak_of(&mut rig, SourceId::Hardware(1));
+        assert!(fm1 < 1e-4, "the FM-1, device 1 in this scan, plays nothing (peak {fm1})");
+        let u6 = peak_of(&mut rig, SourceId::Hardware(0));
+        assert!(u6 > 1e-3, "the U6MIDI Pro, device 0 in this scan, plays synth A (peak {u6})");
     }
 
     /// The engine frees and binds voices on its own (remote AddNode /

@@ -1321,6 +1321,20 @@ Learned so far (2026-11-15, UI polish pass):
     apart sum to the level of one even before the limiter. Pan the sources
     apart (A hard left, B hard right) and ask whether a channel is silent:
     0.000000 against 0.31 in 40 of 40 runs, whatever the phases.
+183. **What a load resets, the session saves, and a device is saved by its
+    name:** `apply_session` resets every CLAP synth's input selection
+    (`reset_rig_inputs`), but only undo and rig edits carried it (`VoiceRow`),
+    so a reopened session had a Dexed that was bound to one keyboard on all
+    hardware again (#124). The selection is session content
+    (`Session::midi_sources`, keyed by node through `remap_session`, rule 44),
+    and its device is the port name (`midi_port_key`, rule 58), never the
+    index in this run's scan. A device that is not plugged in at load gets its
+    own unplugged place in the device list (`hw_device_of_port`), which the
+    hot-plug pass fills; it never turns into "all hardware" or another
+    device. When `apply_session` resets something, check that
+    `capture_session` saves it
+    (`a_reopened_session_keeps_each_synths_keyboard_hardware_and_device`,
+    `a_device_missing_at_load_stays_the_synths_device`).
 
 ## Working on kabelsalat
 

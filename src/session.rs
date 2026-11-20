@@ -127,6 +127,32 @@ pub struct Session {
     /// The time signature (#87). `None` = this session says nothing about
     /// it (older files, templates): a load then leaves the clock's as it is.
     pub time_sig: Option<crate::transport::TimeSig>,
+    /// Which sources play each CLAP synth (#124), keyed by node like
+    /// `params` (rule 44). A synth without a row listens to the keyboard and
+    /// all hardware, which is also what an older file means.
+    midi_sources: Vec<MidiSources>,
+}
+
+/// One CLAP synth's input selection (#124): the keyboard switch, the
+/// hardware switch and the one hardware device it listens to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MidiSources {
+    pub node: NodeId,
+    #[serde(default = "default_true")]
+    pub keyboard: bool,
+    #[serde(default = "default_true")]
+    pub hardware: bool,
+    /// The device's port name without ALSA's client:port numbers, which
+    /// change on a re-plug (rule 58). `None` = every device.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+impl MidiSources {
+    /// True for a synth nobody changed: keyboard and all hardware.
+    pub fn is_default(&self) -> bool {
+        self.keyboard && self.hardware && self.device.is_none()
+    }
 }
 
 /// One strip's persisted state (#72–77). Defaults mirror the engine's
@@ -185,6 +211,7 @@ impl Session {
             master_target: None,
             keyboard_mode: None,
             time_sig: None,
+            midi_sources: Vec::new(),
         }
     }
 
@@ -203,6 +230,7 @@ impl Session {
             && self.master_target == other.master_target
             && self.keyboard_mode == other.keyboard_mode
             && self.time_sig == other.time_sig
+            && self.midi_sources == other.midi_sources
             && serde_json::to_value(&self.graph).ok() == serde_json::to_value(&other.graph).ok()
     }
 
@@ -279,6 +307,22 @@ impl Session {
 
     pub fn set_matrix(&mut self, matrix: Option<Value>) {
         self.matrix = matrix;
+    }
+
+    // -- input selection of CLAP synths (#124) -------------------------------
+
+    /// The synths whose input selection is not the default, sorted by node.
+    pub fn midi_sources(&self) -> &[MidiSources] {
+        &self.midi_sources
+    }
+
+    /// Upsert one synth's input selection. A default one has no row.
+    pub fn set_midi_sources(&mut self, row: MidiSources) {
+        self.midi_sources.retain(|m| m.node != row.node);
+        if !row.is_default() {
+            self.midi_sources.push(row);
+            self.midi_sources.sort_by_key(|m| m.node);
+        }
     }
 
     // -- mixer strips (#72–77) ----------------------------------------------
@@ -401,6 +445,7 @@ impl Session {
         self.strips.retain(|s| self.graph.node(s.node).is_some());
         self.strip_order.retain(|n| self.graph.node(*n).is_some());
         self.strip_knobs.retain(|n, _| self.graph.node(*n).is_some());
+        self.midi_sources.retain(|m| self.graph.node(m.node).is_some());
         self.prune_sends();
         self.prune_bus_outs();
     }
@@ -559,6 +604,7 @@ impl Session {
             master_target: self.master_target,
             keyboard_mode: self.keyboard_mode,
             time_signature: self.time_sig,
+            midi_sources: self.midi_sources.clone(),
         };
         let json = serde_json::to_vec_pretty(&manifest)?;
         write_atomic(&dir.join(SESSION_FILE), &json)?;
@@ -603,6 +649,7 @@ impl Session {
             keyboard_mode: manifest.keyboard_mode,
             // A hand-edited file cannot give the clock a bar it cannot count.
             time_sig: manifest.time_signature.map(|s| crate::transport::TimeSig::normalized(s.num, s.den)),
+            midi_sources: manifest.midi_sources,
         };
         session.validate()?;
         Ok(session)
@@ -728,6 +775,9 @@ struct SessionFile {
     /// The time signature (#87); older sessions have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_signature: Option<crate::transport::TimeSig>,
+    /// Input selection of CLAP synths (#124); older sessions have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    midi_sources: Vec<MidiSources>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1724,6 +1774,34 @@ mod tests {
         let json = std::fs::read_to_string(pkg2.join("session.json")).unwrap();
         assert!(!json.contains("rig_names"), "absent when empty: old readers stay happy");
         assert!(Session::load(&pkg2).unwrap().rig_names.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn midi_sources_round_trip_through_the_package() {
+        let dir = std::env::temp_dir().join(format!("ksalat-midisources-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let one_device = MidiSources { node: 1, keyboard: false, hardware: true, device: Some("U6MIDI Pro:U6MIDI Pro MIDI 1".into()) };
+        let keyboard_only = MidiSources { node: 4, keyboard: true, hardware: false, device: None };
+        let mut s = Session::new("inputs", Graph::demo_patch());
+        s.set_midi_sources(keyboard_only.clone());
+        s.set_midi_sources(one_device.clone());
+        let pkg = dir.join("inputs.ksalat");
+        s.save(&pkg).unwrap();
+        let loaded = Session::load(&pkg).unwrap();
+        assert_eq!(loaded.midi_sources(), [one_device, keyboard_only.clone()]);
+        assert!(!loaded.same_content(&Session::new("inputs", Graph::demo_patch())), "an input selection is content");
+
+        // A synth back on the keyboard and all hardware has no row, and a
+        // row that names only its node means the same.
+        s.set_midi_sources(MidiSources { node: 1, keyboard: true, hardware: true, device: None });
+        assert_eq!(s.midi_sources(), [keyboard_only]);
+        let bare: MidiSources = serde_json::from_str(r#"{"node": 1}"#).unwrap();
+        assert!(bare.is_default());
+        // A row leaves with its node.
+        s.graph.remove_node(4);
+        s.prune_to_graph();
+        assert!(s.midi_sources().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1335,6 +1335,13 @@ Learned so far (2026-11-15, UI polish pass):
     `capture_session` saves it
     (`a_reopened_session_keeps_each_synths_keyboard_hardware_and_device`,
     `a_device_missing_at_load_stays_the_synths_device`).
+184. **Cached sound libraries check their folder stamp before answering:**
+    `kabelsalat vital-import` writes patches from another process without
+    notifying the running app (#136), leaving `list_sounds`/`load_sound` on
+    a stale cache. User-writable libraries (`VitalPatches`, `OdinSoundbanks`)
+    stamp their folders (`sounds::dirs_stamp`) before each scan and re-scan
+    whenever the stamp changes, and `serve_ui_inbox` defers `SOUND_TOOLS`
+    until the rescan finishes so the first bridge call sees the new patches.
 
 ## Working on kabelsalat
 

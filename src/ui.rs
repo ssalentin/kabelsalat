@@ -14291,6 +14291,16 @@ impl DemoApp {
                     else if dim(semi) { mix(key_fill, theme::PAPER, 0.62) }
                     else { key_fill };
                 p.rect_filled(kr, radius, fill);
+                // A tall key is lit from the front: its far end lies in
+                // shade, its near end catches the light.
+                if kr.height() >= Self::KB_SHADED_KEY_H {
+                    let face = kr.shrink(1.0);
+                    let near = face.height() * 0.3;
+                    console::vgrad(p, Rect::from_min_max(face.min, Pos2::new(face.right(), face.top() + face.height() * 0.22)),
+                        theme::alpha(Color32::BLACK, 0.16), theme::alpha(Color32::BLACK, 0.0));
+                    console::vgrad(p, Rect::from_min_max(Pos2::new(face.left(), face.bottom() - near), face.max),
+                        theme::alpha(Color32::WHITE, 0.0), theme::alpha(Color32::WHITE, if lit(semi) || sus(semi) { 0.2 } else { 0.1 }));
+                }
                 p.rect_stroke(kr, radius, Stroke::new(1.0, BLACK), egui::StrokeKind::Inside);
                 // The piano's key-front lip.
                 if surface == KeyboardType::Piano && kr.height() >= 50.0 {
@@ -14318,8 +14328,21 @@ impl DemoApp {
                         else if sus(semi) { theme::LIVE_TEAL }
                         else if dim(semi) { mix(BLACK, theme::PAPER, 0.45) }
                         else { BLACK };
+                    let shaded = kr.height() >= Self::KB_SHADED_KEY_H * 0.62;
+                    if shaded {
+                        // It stands over the whites and shades them.
+                        p.add(egui::epaint::RectShape::filled(kr.translate(egui::vec2(1.5, 3.0)), 2.0, theme::alpha(Color32::BLACK, 0.36)).with_blur_width(5.0));
+                    }
                     p.rect_filled(kr, 1.5, fill);
-                    p.rect_stroke(kr, 1.5, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+                    if shaded {
+                        // Its top face slopes down to the front edge.
+                        let front = (kr.height() * 0.1).clamp(5.0, 14.0);
+                        let top = Rect::from_min_max(Pos2::new(kr.left() + 2.0, kr.top()), Pos2::new(kr.right() - 2.0, kr.bottom() - front));
+                        console::vgrad(p, top, mix(fill, BLACK, 0.12), mix(fill, theme::CREAM, 0.13));
+                        p.line_segment([top.left_bottom(), top.right_bottom()], Stroke::new(1.0, theme::alpha(theme::CREAM, 0.3)));
+                        p.rect_filled(Rect::from_min_max(Pos2::new(kr.left() + 1.0, top.bottom() + 0.5), kr.max - egui::vec2(1.0, 1.0)), 1.0, mix(fill, Color32::BLACK, 0.45));
+                    }
+                    p.rect_stroke(kr, 1.5, Stroke::new(1.0, if shaded { Color32::from_rgb(0x08, 0x08, 0x08) } else { BORDER }), egui::StrokeKind::Inside);
                     if root(semi) && !lit(semi) {
                         p.circle_filled(Pos2::new(kr.center().x, kr.bottom() - 6.0), 2.0, theme::LIVE_TEAL);
                     }
@@ -14451,6 +14474,9 @@ impl DemoApp {
     const KB_WATERFALL: Color32 = Color32::from_rgb(0xE8, 0xE4, 0xD8);
     const KB_SYNTH_KEY: Color32 = Color32::from_rgb(0xEA, 0xEA, 0xE6);
     const KB_FELT: Color32 = Color32::from_rgb(0x6E, 0x24, 0x1C);
+    /// White keys at least this tall (the console's) are shaded as solid
+    /// keys; the dock's short keys stay flat.
+    const KB_SHADED_KEY_H: f32 = 84.0;
 
     /// Currently sounding notes (every source), for the chord readout.
     fn held_note_list(&self) -> Vec<u8> {
@@ -33660,7 +33686,11 @@ mod offline_shots {
             ("pipe-organ-preview-expanded", &|a| { a.kb_mode = KeyboardMode::Pinned(KeyboardType::PipeOrgan); a.kb_expanded = true }),
         ];
         let only = std::env::var("KABELSALAT_SHOTS_ONLY").ok();
-        for (w, h) in [(1600.0, 1000.0), (1000.0, 700.0), (781.0, 468.0)] {
+        // KABELSALAT_SHOTS_SIZES=781x950,1576x468 renders other window sizes.
+        let sizes: Vec<(f32, f32)> = std::env::var("KABELSALAT_SHOTS_SIZES").ok()
+            .map(|s| s.split(',').filter_map(|wh| { let (w, h) = wh.split_once('x')?; Some((w.parse().ok()?, h.parse().ok()?)) }).collect())
+            .unwrap_or_else(|| vec![(1600.0, 1000.0), (1000.0, 700.0), (781.0, 468.0)]);
+        for (w, h) in sizes {
             for (name, setup) in &views {
                 if only.as_deref().is_some_and(|o| !name.contains(o)) { continue; }
                 let mut app = DemoApp::new_with_sink(None); // rule 148: fresh per image

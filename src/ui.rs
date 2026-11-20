@@ -2980,7 +2980,10 @@ struct DemoApp {
     plugins_lv2: Vec<Lv2PluginInfo>,
     /// Plugin discovery running on a background thread (CLAP scan + LV2
     /// lilv load take seconds); adopted by `poll_plugin_scan`.
-    plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>)>>,
+    plugin_scan: Option<std::sync::mpsc::Receiver<(Vec<ClapPluginInfo>, Vec<Lv2PluginInfo>, Vec<String>)>>,
+    /// Installed plugins that can never load here (built for another CPU or
+    /// system, #135): one sentence each, shown in the Plugins view.
+    plugins_unloadable: Vec<String>,
     plugin_filter: String,
     plugin_category: PluginCategory,
     plugin_subtype: Option<PluginSubtype>,
@@ -3613,6 +3616,7 @@ impl DemoApp {
             plugins_clap: Vec::new(),
             plugins_lv2: Vec::new(),
             plugin_scan: None,
+            plugins_unloadable: Vec::new(),
             plugin_filter: String::new(),
             plugin_category: PluginCategory::All,
             plugin_subtype: None,
@@ -13512,10 +13516,12 @@ impl DemoApp {
     fn start_plugin_scan(&mut self, retry_failed: bool) {
         let scan = move || {
             let clap = if retry_failed { crate::host::list_clap_plugins_retry_failed() } else { list_clap_plugins() };
-            (clap, lv2_discover())
+            let (lv2, mut unloadable) = crate::lv2::discover_with_unloadable();
+            unloadable.splice(0..0, crate::host::unloadable_clap_bundles());
+            (clap, lv2, unloadable)
         };
         if cfg!(test) {
-            (self.plugins_clap, self.plugins_lv2) = scan();
+            (self.plugins_clap, self.plugins_lv2, self.plugins_unloadable) = scan();
             self.plugins_loaded = true;
             return;
         }
@@ -13543,9 +13549,10 @@ impl DemoApp {
     fn poll_plugin_scan(&mut self) {
         let Some(rx) = &self.plugin_scan else { return };
         match rx.try_recv() {
-            Ok((clap, lv2)) => {
+            Ok((clap, lv2, unloadable)) => {
                 self.plugins_clap = clap;
                 self.plugins_lv2 = lv2;
+                self.plugins_unloadable = unloadable;
                 self.plugins_loaded = true;
                 self.plugin_scan = None;
                 self.classify_lv2_units();
@@ -14136,6 +14143,25 @@ impl DemoApp {
                     };
                     ui.add_space(4.0);
                     ui.add(egui::Label::new(egui::RichText::new(&self.plugin_msg).size(12.5).color(col)).wrap());
+                }
+                // Installed, but built for another CPU: each on a row of its
+                // own (rule 136), so nobody looks for a plugin that is on
+                // disk and missing from the list.
+                const UNLOADABLE_ROWS: usize = 2;
+                for reason in self.plugins_unloadable.iter().take(UNLOADABLE_ROWS) {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(reason).size(12.5).color(theme::INK_2)).wrap());
+                }
+                if self.plugins_unloadable.len() > UNLOADABLE_ROWS {
+                    let more = self.plugins_unloadable.len() - UNLOADABLE_ROWS;
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(
+                        egui::RichText::new(if more == 1 {
+                            "1 more installed plugin is built for another CPU".to_string()
+                        } else {
+                            format!("{more} more installed plugins are built for another CPU")
+                        }).size(12.5).color(theme::INK_2),
+                    ).wrap());
                 }
                 ui.add_space(10.0);
 
@@ -28413,7 +28439,7 @@ mod split_bpm_tests {
         assert!(!app.units[organ(&app)].lv2_inst, "classified from the scan list, which says effect");
 
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send((Vec::new(), vec![info(true)])).unwrap();
+        tx.send((Vec::new(), vec![info(true)], Vec::new())).unwrap();
         app.plugin_scan = Some(rx);
         app.poll_plugin_scan();
         let u = &app.units[organ(&app)];
@@ -33136,6 +33162,40 @@ mod settings_and_dropdown_tests {
         }
     }
 
+    /// A plugin on disk that is missing from the list has its reason in the
+    /// Plugins view (#135), each on its own row and inside the sheet.
+    #[test]
+    fn plugins_built_for_another_cpu_are_named_in_the_plugins_view() {
+        let mut app = DemoApp::new_with_sink(None);
+        app.stage_view = StageView::Plugins;
+        app.plugins_loaded = true;
+        app.plugin_msg = "New Aeolus rig \u{2014} Keys\u{2192}Aeolus\u{2192}Master".into();
+        app.plugins_unloadable = ["Vital.clap", "Odin2.clap", "floe.so", "a.so", "b.so"]
+            .iter()
+            .map(|f| format!("{f} is built for x86_64; this machine is aarch64, so it cannot be loaded"))
+            .collect();
+        let ctx = egui::Context::default();
+        for size in [Vec2::new(781.0, 950.0), Vec2::new(760.0, 520.0), Vec2::new(1280.0, 900.0)] {
+            let (texts, _, _) = warm(&mut app, &ctx, size);
+            let (_, inner) = app.stage_sheet_rects(app.stage_rect, 200.0);
+            let notes: Vec<&(String, Rect)> = texts.iter().filter(|(t, _)| t.contains("built for")).collect();
+            assert!(notes.iter().any(|(t, _)| t.starts_with("Vital.clap is built for x86_64; this machine is aarch64")), "{size:?}: {notes:?}");
+            assert!(notes.iter().any(|(t, _)| t.starts_with("3 more installed plugins")), "{size:?}: the rest is counted: {notes:?}");
+            assert!(notes.iter().all(|(t, _)| !t.starts_with("floe.so")), "{size:?}: only the first rows are spelled out");
+            let header: Vec<&(String, Rect)> = texts
+                .iter()
+                .filter(|(t, r)| !t.is_empty() && r.top() >= inner.top() - 1.0 && r.bottom() <= notes.iter().map(|(_, r)| r.bottom()).fold(0.0, f32::max) + 1.0)
+                .collect();
+            for (i, (a, ra)) in header.iter().enumerate() {
+                assert!(ra.right() <= inner.right() + 1.0, "{size:?}: {a:?} {ra:?} leaves the sheet {inner:?}");
+                for (b, rb) in &header[i + 1..] {
+                    let o = ra.intersect(*rb);
+                    assert!(!(o.width() > 0.5 && o.height() > 0.5), "{size:?}: {a:?} {ra:?} overlaps {b:?} {rb:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn settings_models_and_prefs_reach_assistant_and_fit_narrow_windows() {
         let mut app = DemoApp::new_with_sink(None);
@@ -36642,7 +36702,7 @@ mod offline_shots {
     fn window_size_shots() {
         let dir = std::path::PathBuf::from(std::env::var("KABELSALAT_SHOTS").expect("KABELSALAT_SHOTS=<dir>"));
         std::fs::create_dir_all(&dir).unwrap();
-        let views: [(&str, &dyn Fn(&mut DemoApp)); 15] = [
+        let views: [(&str, &dyn Fn(&mut DemoApp)); 16] = [
             ("rack", &|_| {}),
             ("back", &|a| a.side = Side::Back),
             ("tworigs", &|a| a.load_multi_rig_demo()),
@@ -36660,6 +36720,13 @@ mod offline_shots {
                 a.clock.set_wired("MIDIMATE eX:MIDIMATE eX MIDI 1", true);
             }),
             ("plugins", &|a| a.stage_view = StageView::Plugins),
+            ("plugins-foreign", &|a| {
+                a.stage_view = StageView::Plugins;
+                a.plugins_unloadable = ["Vital.clap", "Aeolus.clap", "floe.so"]
+                    .iter()
+                    .map(|f| format!("{f} is built for x86_64; this machine is aarch64, so it cannot be loaded"))
+                    .collect();
+            }),
             ("settings", &|a| a.stage_view = StageView::Settings),
             ("settings-session", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Session }),
             ("settings-display", &|a| { a.stage_view = StageView::Settings; a.settings_page = SettingsPage::Display }),

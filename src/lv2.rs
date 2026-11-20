@@ -824,22 +824,61 @@ pub fn primary_lv2_class(types: &[String]) -> String {
     best.map(|(s, _)| s.to_string()).unwrap_or_default()
 }
 
+/// Why the plugin's binary can never load on this machine (built for another
+/// CPU or system, #135), read from the file's header.
+unsafe fn foreign_binary(plugin: *const LilvPlugin) -> Option<String> {
+    let lib = lilv_plugin_get_library_uri(plugin);
+    if lib.is_null() {
+        return None;
+    }
+    let path = lilv_file_uri_parse(lilv_node_as_uri(lib), std::ptr::null_mut());
+    if path.is_null() {
+        return None;
+    }
+    let file = std::path::PathBuf::from(std::ffi::CStr::from_ptr(path).to_string_lossy().into_owned());
+    lilv_free(path as *mut c_void);
+    crate::binarch::foreign(&file)
+}
+
 /// Discover all installed LV2 plugins (loads the lilv world, enumerates, frees).
 pub fn discover() -> Vec<Lv2PluginInfo> {
+    discover_with_unloadable().0
+}
+
+/// [`discover`], plus one sentence per plugin whose binary was built for
+/// another CPU or system. Those are not listed: lilv reads only their
+/// Turtle files, and they could never be instantiated.
+pub fn discover_with_unloadable() -> (Vec<Lv2PluginInfo>, Vec<String>) {
     let _lilv = lilv_guard();
     unsafe {
         let world = lilv_world_new();
         if world.is_null() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         lilv_world_load_all(world);
+        let found = collect_plugins(world);
+        lilv_world_free(world);
+        found
+    }
+}
+
+/// What [`discover_with_unloadable`] reports for the plugins `world` holds.
+unsafe fn collect_plugins(world: *mut LilvWorld) -> (Vec<Lv2PluginInfo>, Vec<String>) {
+    {
         let plugins = lilv_world_get_all_plugins(world);
         let mut out = Vec::new();
+        let mut unloadable: Vec<String> = Vec::new();
         if !plugins.is_null() {
             let mut iter = lilv_plugins_begin(plugins);
             while !iter.is_null() && !lilv_plugins_is_end(plugins, iter) {
                 let plugin = lilv_plugins_get(plugins, iter);
-                if !plugin.is_null() {
+                if let Some(reason) = if plugin.is_null() { None } else { foreign_binary(plugin) } {
+                    // One binary often holds several plugins: say it once.
+                    if !unloadable.contains(&reason) {
+                        eprintln!("skip LV2 plugin {}: {reason}", node_borrowed(lilv_plugin_get_uri(plugin)));
+                        unloadable.push(reason);
+                    }
+                } else if !plugin.is_null() {
                     let types = plugin_types(world, plugin);
                     let is_instrument = instrument_from_types(&types).unwrap_or_else(|| {
                         let (atom_in, audio_in, audio_out) = port_counts(world, plugin);
@@ -864,9 +903,8 @@ pub fn discover() -> Vec<Lv2PluginInfo> {
                 iter = lilv_plugins_next(plugins, iter);
             }
         }
-        lilv_world_free(world);
         instruments_first(&mut out);
-        out
+        (out, unloadable)
     }
 }
 
@@ -1362,6 +1400,9 @@ impl Lv2Plugin {
             };
             let features: [*const Lv2Feature; 4] = [&map_feature, &options_feature, &worker_feature, std::ptr::null()];
 
+            if let Some(reason) = foreign_binary(plugin) {
+                anyhow::bail!("{uri}: {reason}");
+            }
             let instance = lilv_plugin_instantiate(plugin, sample_rate, features.as_ptr());
             anyhow::ensure!(!instance.is_null(), "instantiate failed for {uri}");
             pin_plugin_library(plugin);
@@ -2369,6 +2410,46 @@ pub fn discover_presets(plugin_uri: &str) -> Vec<Lv2Preset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// lilv lists a plugin from its Turtle files alone, so one whose binary
+    /// was built for another CPU showed up and then failed to instantiate
+    /// (#135). It is left out, with the reason.
+    #[test]
+    fn a_plugin_built_for_another_cpu_is_not_listed_and_says_why() {
+        let dir = std::env::temp_dir().join(format!("kabelsalat-lv2-foreign-{}", std::process::id()));
+        let bundle = dir.join("foreign.lv2");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let ttl = |binary: &str, uri: &str| {
+            format!(
+                "@prefix lv2: <http://lv2plug.in/ns/lv2core#> .\n@prefix doap: <http://usefulinc.com/ns/doap#> .\n\
+                 <{uri}> a lv2:Plugin ; doap:name \"Probe\" ; lv2:binary <{binary}> .\n"
+            )
+        };
+        let (foreign, native) = ("urn:kabelsalat:test:foreign", "urn:kabelsalat:test:native");
+        std::fs::write(bundle.join("manifest.ttl"), ttl("foreign.so", foreign) + &ttl("native.so", native)).unwrap();
+        let (machine, name) = crate::binarch::other_machine();
+        std::fs::write(bundle.join("foreign.so"), crate::binarch::fake_elf(machine)).unwrap();
+        std::os::unix::fs::symlink(std::env::current_exe().unwrap(), bundle.join("native.so")).unwrap();
+
+        let _lilv = lilv_guard();
+        let (listed, unloadable) = unsafe {
+            let world = lilv_world_new();
+            let uri = std::ffi::CString::new(format!("file://{}/", bundle.display())).unwrap();
+            let node = lilv_new_uri(world, uri.as_ptr());
+            lilv_world_load_bundle(world, node);
+            lilv_node_free(node);
+            let found = collect_plugins(world);
+            lilv_world_free(world);
+            found
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        let uris: Vec<&str> = listed.iter().map(|p| p.uri.as_str()).collect();
+        assert_eq!(uris, vec![native], "only the plugin that can run here is listed");
+        assert_eq!(
+            unloadable,
+            vec![format!("foreign.so is built for {name}; this machine is {}, so it cannot be loaded", std::env::consts::ARCH)]
+        );
+    }
 
     #[test]
     fn atom_midi_events_append_within_a_block() {

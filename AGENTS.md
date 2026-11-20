@@ -1280,6 +1280,15 @@ Learned so far (2026-11-15, UI polish pass):
     and the master stage runs it. A stage that runs effects itself (bus
     chains, master inserts) sets `fx_done` for them
     (`a_master_insert_sounds_like_the_same_unit_in_a_strip`).
+180. **Ask the file what it was built for before `dlopen`:** glibc reports
+    an ELF of another CPU as "cannot open shared object file: No such file
+    or directory", so an x86_64 `Vital.clap` on this aarch64 machine read as
+    a missing file (#135). Every path that opens a plugin binary (CLAP scan
+    and load, LV2 discovery and instantiate, the catalog's bundle probe)
+    asks `binarch::foreign` first and passes its sentence on; a new loader
+    does too. Check with `CLAP_PATH=<dir with a foreign bundle> kabelsalat
+    clap-scan-test` (`readelf -h` shows what a bundle is; `file` is not
+    installed here).
 
 ## Working on kabelsalat
 
